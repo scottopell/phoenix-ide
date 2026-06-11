@@ -14,11 +14,56 @@ config {
     -- When empty/unset, auth is disabled (open access).
     password: String?
     auth_enabled: password != null
+
+    -- Consecutive Bearer-password failures from one peer before lockout.
+    max_login_failures: Integer
+    -- How long a peer stays locked out once the threshold is reached.
+    lockout_window: Duration
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- An inbound HTTP request. Carries the credentials the auth layer
+-- inspects: a session-token cookie and/or a Bearer-password header.
+-- Its peer is the connection's real address, used to key the throttle.
+external entity Request {
+    peer: Peer
+    session_cookie: String?     -- value of the phoenix-auth cookie, if present
+    bearer_password: String?    -- value of an Authorization: Bearer credential, if present
+}
+
+-- The remote end of a connection, identified by its real peer address.
+-- This is the throttle key; it cannot be spoofed on a direct connection.
+external entity Peer {
+    address: String
 }
 
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
+
+-- A session token minted at login and held server-side for the lifetime
+-- of the process. A request bearing this token in its cookie is the Owner.
+-- The password never travels in the cookie; only this opaque token does.
+entity SessionToken {
+    token: String               -- random, opaque, unguessable
+    created_at: Timestamp
+}
+
+-- A per-peer throttle bucket for Bearer-password verification. Counts
+-- consecutive failed password checks from one peer and locks the peer
+-- out for a back-off window once the threshold is reached. Session-token
+-- checks never touch this bucket.
+entity ThrottleBucket {
+    peer: Peer
+    consecutive_failures: Integer
+    locked_until: Timestamp?
+
+    -- The bucket is locked while a back-off window is in force.
+    is_locked: locked_until != null and locked_until > now
+}
 
 -- A share token grants read-only access to a single conversation.
 -- Created on demand when the owner navigates to /share/c/{slug}.
@@ -32,10 +77,22 @@ entity ShareToken {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- The authenticated owner. Identified by a valid password in the request.
--- When auth is disabled, all users are implicitly Owner.
+-- The authenticated owner. A request is the Owner when auth is disabled,
+-- or when it carries a valid session-token cookie, or when it carries a
+-- matching Bearer password. The password never identifies the Owner via a
+-- cookie -- only the minted session token does.
+--
+-- Identity predicates (black-box, pure over the request and current state):
+--   session_token_valid(request)    => the request's session_cookie names a
+--                                       SessionToken that exists in the store.
+--   bearer_password_matches(request) => the request's bearer_password equals
+--                                        config.password under constant-time
+--                                        comparison (see ConstantTimePasswordCheck).
 actor Owner {
-    identified_by: Request where config.auth_enabled implies password_matches(request)
+    identified_by: Request where
+        not config.auth_enabled
+        or session_token_valid(request)
+        or bearer_password_matches(request)
 }
 
 -- An unauthenticated viewer holding a valid share token.
@@ -119,6 +176,69 @@ surface SharedConversation {
 -- Rules
 ------------------------------------------------------------
 
+-- A login attempt presents the password at POST /api/auth/login. The
+-- attempt is keyed to the connection's real peer so failures throttle the
+-- peer, not the credential. Predicates (black-box, constant-time compare):
+--   password_matches(request) => the submitted password equals config.password
+--                                under constant-time comparison (the same
+--                                check used for a Bearer password).
+--   throttle_locked(peer)      => the peer's ThrottleBucket is_locked.
+
+-- Successful login: the password matches and the peer is not locked out.
+-- A fresh session token is minted and stored; the response sets it in the
+-- phoenix-auth cookie. Any prior failure count for the peer is cleared.
+rule LoginSucceeds {
+    when: AttemptLogin(request)
+
+    requires: config.auth_enabled
+    requires: not throttle_locked(request.peer)
+    requires: password_matches(request)
+
+    let bucket = ThrottleBucket{peer: request.peer}
+
+    ensures: SessionToken.created(token: random_token(), created_at: now)
+    ensures:
+        if exists bucket:
+            bucket.consecutive_failures = 0
+            bucket.locked_until = null
+
+    @guidance
+        -- POST /api/auth/login compares the submitted password against
+        -- config.password with a constant-time check. On success the minted
+        -- token is added to the process-lifetime SessionStore and returned in
+        -- the Set-Cookie: phoenix-auth=<token> header. Tokens are cleared on
+        -- restart, so browsers re-login transparently.
+}
+
+-- Failed login: the password does not match. The peer's failure counter is
+-- incremented; once it reaches max_login_failures the peer is locked out for
+-- lockout_window. Throttling is keyed on the real peer address only.
+rule LoginFails {
+    when: AttemptLogin(request)
+
+    requires: config.auth_enabled
+    requires: not throttle_locked(request.peer)
+    requires: not password_matches(request)
+
+    let bucket = ThrottleBucket{peer: request.peer}
+    let prior = if exists bucket: bucket.consecutive_failures else: 0
+    let next_failures = prior + 1
+
+    ensures:
+        if exists bucket:
+            bucket.consecutive_failures = next_failures
+        else:
+            ThrottleBucket.created(
+                peer: request.peer,
+                consecutive_failures: next_failures,
+                locked_until: null
+            )
+    ensures:
+        if next_failures >= config.max_login_failures:
+            let locked = ThrottleBucket{peer: request.peer}
+            locked.locked_until = now + config.lockout_window
+}
+
 -- Owner navigates to /share/c/{slug} to create a share token.
 -- If a token already exists for the conversation, redirect to it.
 -- If not, create one and redirect.
@@ -173,13 +293,23 @@ invariant NoTokensWithoutAuth {
     not config.auth_enabled implies ShareTokens.count = 0
 }
 
+-- Throttling applies to password verification only. A request authenticated
+-- by a valid session-token cookie is never subject to the per-peer lockout:
+-- session_token_valid(request) consults the session store and touches no
+-- ThrottleBucket. Only password_matches(request) -- at login and on Bearer
+-- requests -- feeds the throttle.
+invariant ThrottleScopedToPasswordChecks {
+    for bucket in ThrottleBuckets:
+        bucket.consecutive_failures >= 0
+}
+
 -- Implementation constraint: ConstantTimePasswordCheck
--- The server compares the request password against config.password
--- using constant-time comparison. No early-exit on first differing
--- byte. Enforced at the call site, not as a structural invariant
--- the model can verify -- the model has no notion of compare timing.
--- Implementation: see crates/phoenix-ide/src/api/auth.rs:19
--- (`constant_time_eq`).
+-- The server compares the submitted password against config.password
+-- using constant-time comparison, both at POST /api/auth/login and for an
+-- Authorization: Bearer password. No early-exit on first differing byte.
+-- Enforced at the call site, not as a structural invariant the model can
+-- verify -- the model has no notion of compare timing.
+-- Implementation: see crates/phoenix-ide/src/api/auth.rs (`constant_time_eq`).
 
 ------------------------------------------------------------
 -- Open Questions

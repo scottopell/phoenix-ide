@@ -40,18 +40,27 @@ should not impose friction.
 
 ---
 
-### REQ-AUTH-002: Stateless Password Verification
+### REQ-AUTH-002: Credential Verification
 
-WHEN a request includes a password (via cookie or Authorization header)
+WHEN a request presents a session-token cookie
+THE SYSTEM SHALL grant access if the token is a currently-valid
+server-issued session token
+
+WHEN a request presents a password via the `Authorization: Bearer` header
 THE SYSTEM SHALL compare it against `PHOENIX_PASSWORD` using constant-time
 string comparison
 AND grant access if the values match
 
-THE SYSTEM SHALL NOT maintain server-side session state for authentication
+THE SYSTEM SHALL rate-limit password comparisons per client peer address,
+locking out a peer after repeated failures within a window; session-token
+validation SHALL NOT be rate-limited
 
-**Rationale:** A single-user tool does not need session management. The
-password is the session. Stateless verification means no state to persist,
-expire, or clean up -- and auth survives server restarts for free.
+**Rationale:** Browsers hold an opaque server-issued session token, so the
+password never rides in a cookie; non-browser API clients present the
+password directly via Bearer. Throttling password comparisons (but not
+token checks) per real peer address blocks brute-force guessing through any
+password-checking endpoint without locking out legitimate token-bearing
+clients.
 
 ---
 
@@ -61,14 +70,16 @@ WHEN an unauthenticated user navigates to any page
 THE SYSTEM SHALL display a single-field password prompt instead of the app
 
 WHEN the user submits the correct password
-THE SYSTEM SHALL set a persistent cookie containing the password
-AND redirect to the originally requested page
+THE SYSTEM SHALL mint a session token, store it server-side, set it in a
+persistent cookie, AND redirect to the originally requested page
 
 WHEN the user submits an incorrect password
 THE SYSTEM SHALL display an error message and remain on the login page
 
-**Rationale:** The cookie persists across page refreshes so the user
-enters the password once per browser session, not on every page load.
+**Rationale:** The cookie carries a session token rather than the password,
+and persists across page refreshes so the user enters the password once per
+browser session, not on every page load. Tokens are cleared on restart;
+browsers re-login transparently.
 
 ---
 
