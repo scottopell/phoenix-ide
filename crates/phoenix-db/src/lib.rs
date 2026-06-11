@@ -2871,23 +2871,29 @@ impl Database {
     }
 
     /// Materialize the assistant message and completed tool results that an
-    /// in-flight `ToolExecuting` round carries only in its `ConvState` JSON, so
-    /// they survive the startup reset that overwrites the state with idle.
+    /// in-flight `ToolExecuting` or `CancellingTool` round carries only in its
+    /// `ConvState` JSON, so they survive the startup reset that overwrites the
+    /// state with idle.
     ///
-    /// A `ToolExecuting` state holds:
+    /// Both states bundle the un-persisted round for atomic end-of-round
+    /// persistence and hold the same recoverable data, differing only in how
+    /// the unfinished tools are named:
     ///   - `assistant_message`: the LLM turn (with one `tool_use` block per
     ///     dispatched tool) — broadcast over SSE and seen by the user, but not
     ///     yet in `messages`;
     ///   - `completed_results`: real outputs of tools that already finished;
-    ///   - `current_tool`: the tool that was running when the process exited;
-    ///   - `remaining_tools`: tools queued but not yet started.
+    ///   - the unfinished tools: `ToolExecuting` carries the running tool as
+    ///     `current_tool` (a `ToolCall`) plus `remaining_tools`; `CancellingTool`
+    ///     carries the tool being aborted as `tool_use_id` (just the id) plus
+    ///     `skipped_tools`. Both are normalized to a flat list of interrupted
+    ///     `tool_use` ids — that's all the builder needs to pair a synthetic
+    ///     result.
     ///
     /// Each `tool_use` needs exactly one paired `tool_result` or the next LLM
     /// request 400s. We write the assistant message, then one result per
-    /// `tool_use`: completed tools contribute their real result, and the
-    /// in-flight `current_tool` plus every not-yet-started `remaining_tool` get
-    /// a synthetic interrupted error. The whole round commits atomically via
-    /// [`Database::persist_tool_round`].
+    /// `tool_use`: completed tools contribute their real result, and every
+    /// unfinished tool gets a synthetic interrupted error. The whole round
+    /// commits atomically via [`Database::persist_tool_round`].
     ///
     /// The pairing count is checked before any write: if the materialized
     /// results don't match the assistant's `tool_use` count, we skip this
@@ -2900,10 +2906,12 @@ impl Database {
     async fn materialize_in_flight_tool_rounds(&self, now: &DateTime<Utc>) -> DbResult<()> {
         use phoenix_core::domain::sm_state::ConvState;
 
-        // Only `tool_executing` rows carry an un-persisted assistant turn.
+        // Both `tool_executing` and `cancelling_tool` rows carry an
+        // un-persisted assistant turn (the cancel snapshots the in-flight round
+        // until abort/complete persists the checkpoint).
         let conv_rows: Vec<(String, String)> = sqlx::query(
             "SELECT id, state FROM conversations
-             WHERE json_extract(state, '$.type') = 'tool_executing'",
+             WHERE json_extract(state, '$.type') IN ('tool_executing', 'cancelling_tool')",
         )
         .try_map(|row: SqliteRow| Ok((row.try_get("id")?, row.try_get("state")?)))
         .fetch_all(&self.pool)
@@ -2915,20 +2923,21 @@ impl Database {
                 Err(e) => {
                     tracing::warn!(
                         conv_id = %conv_id, error = %e,
-                        "could not parse tool_executing state for materialization; \
+                        "could not parse in-flight tool round state for materialization; \
                          leaving to reset + orphan repair",
                     );
                     continue;
                 }
             };
 
-            let ConvState::ToolExecuting {
-                current_tool,
-                remaining_tools,
-                completed_results,
-                assistant_message,
-                ..
-            } = state
+            // Normalize both states to (assistant_message, completed_results,
+            // interrupted tool ids). The unfinished tools are identified by id
+            // in both states; `build_materialized_tool_round` needs nothing
+            // more. The SQL `WHERE` already restricts rows to these two states,
+            // so `normalize_in_flight_round` returning `None` is unreachable —
+            // but kept total rather than panicking.
+            let Some((assistant_message, completed_results, interrupted_tool_ids)) =
+                normalize_in_flight_round(state)
             else {
                 continue;
             };
@@ -2940,8 +2949,7 @@ impl Database {
                 now,
                 &assistant_message,
                 &completed_results,
-                &current_tool,
-                &remaining_tools,
+                &interrupted_tool_ids,
             );
 
             // Pairing invariant: every `tool_use` in the assistant message gets
@@ -3810,21 +3818,71 @@ fn merge_duration_into_display(
 }
 
 /// Build the materialized message rows for an in-flight tool round recovered
-/// from a `ToolExecuting` state on restart: the assistant message followed by
-/// one tool-result row per `tool_use`, in round order. Completed tools
-/// contribute their real result; the in-flight `current_tool` and every
-/// not-yet-started `remaining_tool` get a synthetic interrupted error so each
-/// `tool_use` is paired. Sequence ids are allocated contiguously from
-/// `start_seq` (assistant lowest), matching the seq ordering the live persist
-/// path would have produced.
+/// from a `ToolExecuting` or `CancellingTool` state on restart: the assistant
+/// message followed by one tool-result row per `tool_use`, in round order.
+/// Completed tools contribute their real result; every interrupted tool
+/// (the in-flight/cancelling tool plus every not-yet-started tool) gets a
+/// synthetic interrupted error so each `tool_use` is paired. Sequence ids are
+/// allocated contiguously from `start_seq` (assistant lowest), matching the seq
+/// ordering the live persist path would have produced.
+///
+/// `interrupted_tool_ids` carries only the `tool_use` ids of the unfinished
+/// tools — both recovered states identify those tools by id (`ToolExecuting`
+/// via `current_tool.id` + `remaining_tools`, `CancellingTool` via
+/// `tool_use_id` + `skipped_tools`), so the builder needs nothing more than the
+/// ids to pair a synthetic result.
+/// Normalize a recovered in-flight tool round (`ToolExecuting` or
+/// `CancellingTool`) into the assistant message, the completed results, and the
+/// flat list of interrupted `tool_use` ids that
+/// [`build_materialized_tool_round`] consumes. Returns `None` for any other
+/// state — the materialization caller filters to these two states via SQL, so
+/// `None` is unreachable there, but keeping this total (rather than panicking)
+/// means a future caller can't trip an `unwrap`.
+fn normalize_in_flight_round(
+    state: phoenix_core::domain::sm_state::ConvState,
+) -> Option<(
+    phoenix_core::domain::sm_state::AssistantMessage,
+    Vec<ToolResult>,
+    Vec<String>,
+)> {
+    use phoenix_core::domain::sm_state::ConvState;
+
+    if let ConvState::ToolExecuting {
+        current_tool,
+        remaining_tools,
+        completed_results,
+        assistant_message,
+        ..
+    } = state
+    {
+        let interrupted_tool_ids = std::iter::once(current_tool.id)
+            .chain(remaining_tools.into_iter().map(|t| t.id))
+            .collect::<Vec<_>>();
+        return Some((assistant_message, completed_results, interrupted_tool_ids));
+    }
+    if let ConvState::CancellingTool {
+        tool_use_id,
+        skipped_tools,
+        completed_results,
+        assistant_message,
+        ..
+    } = state
+    {
+        let interrupted_tool_ids = std::iter::once(tool_use_id)
+            .chain(skipped_tools.into_iter().map(|t| t.id))
+            .collect::<Vec<_>>();
+        return Some((assistant_message, completed_results, interrupted_tool_ids));
+    }
+    None
+}
+
 fn build_materialized_tool_round(
     conv_id: &str,
     start_seq: i64,
     now: &DateTime<Utc>,
     assistant_message: &phoenix_core::domain::sm_state::AssistantMessage,
     completed_results: &[ToolResult],
-    current_tool: &phoenix_core::domain::sm_state::ToolCall,
-    remaining_tools: &[phoenix_core::domain::sm_state::ToolCall],
+    interrupted_tool_ids: &[String],
 ) -> (Message, Vec<Message>) {
     let mut next_seq = start_seq;
 
@@ -3865,15 +3923,16 @@ fn build_materialized_tool_round(
         next_seq += 1;
     }
 
-    // The in-flight tool and every queued-but-unstarted tool were interrupted.
-    for tool in std::iter::once(current_tool).chain(remaining_tools.iter()) {
+    // The in-flight/cancelling tool and every queued-but-unstarted tool were
+    // interrupted.
+    for tool_id in interrupted_tool_ids {
         let content = MessageContent::tool(
-            &tool.id,
+            tool_id,
             "[Tool execution interrupted by server restart]",
             true,
         );
         tool_msgs.push(Message {
-            message_id: tool_result_message_id(&tool.id),
+            message_id: tool_result_message_id(tool_id),
             conversation_id: conv_id.to_string(),
             sequence_id: next_seq,
             message_type: content.message_type(),
@@ -4880,6 +4939,144 @@ mod tests {
         db.reset_all_to_idle().await.unwrap();
         assert_eq!(
             db.get_messages("conv-1").await.unwrap().len(),
+            5,
+            "re-running reset must not duplicate materialized rows"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // single end-to-end restart scenario; splitting hurts clarity
+    async fn test_reset_materializes_cancelling_tool_round() {
+        use phoenix_core::domain::db_schema::ToolResult;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{
+            AssistantMessage, ConvState, ThinkInput, ToolCall, ToolInput,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-c", "slug-c", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        // The user message that prompted the turn is already persisted.
+        db.add_message(
+            "msg-user",
+            "conv-c",
+            &MessageContent::user("do three things"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Build an in-flight CancellingTool round: the user hit cancel while
+        // tool-2 was running. The assistant message holds three tool_use
+        // blocks; tool-1 finished (real result, in `completed_results`), tool-2
+        // is the tool being aborted (`tool_use_id`), and tool-3 was skipped.
+        // The assistant message + the tool-1 result live ONLY in the state JSON
+        // — never persisted to `messages` (the abort/complete checkpoint that
+        // would persist them never ran because the process exited first).
+        let think = |t: &str| ToolInput::Think(ThinkInput { thoughts: t.into() });
+        let assistant = AssistantMessage::new(
+            "asst-c".to_string(),
+            vec![
+                ContentBlock::text("Working on it."),
+                ContentBlock::tool_use("tool-1", "think", serde_json::json!({"thoughts": "a"})),
+                ContentBlock::tool_use("tool-2", "think", serde_json::json!({"thoughts": "b"})),
+                ContentBlock::tool_use("tool-3", "think", serde_json::json!({"thoughts": "c"})),
+            ],
+            None,
+            None,
+        );
+        let state = ConvState::CancellingTool {
+            tool_use_id: "tool-2".to_string(),
+            skipped_tools: vec![ToolCall::new("tool-3", think("c"))],
+            completed_results: vec![ToolResult::success(
+                "tool-1".to_string(),
+                "real output for tool-1".to_string(),
+            )],
+            assistant_message: assistant,
+            pending_sub_agents: vec![],
+        };
+        db.update_conversation_state("conv-c", &state)
+            .await
+            .unwrap();
+
+        // Only the user message is in `messages` so far.
+        assert_eq!(db.get_messages("conv-c").await.unwrap().len(), 1);
+
+        // Restart sweep.
+        db.reset_all_to_idle().await.unwrap();
+
+        // State reset to idle.
+        let conv = db.get_conversation("conv-c").await.unwrap();
+        assert!(
+            matches!(conv.state, ConvState::Idle),
+            "cancelling_tool must reset to idle after materialization"
+        );
+
+        let msgs = db.get_messages("conv-c").await.unwrap();
+        // user + assistant + 3 tool results.
+        assert_eq!(
+            msgs.len(),
+            5,
+            "expected user + assistant + 3 paired tool results, got {:?}",
+            msgs.iter().map(|m| &m.message_id).collect::<Vec<_>>()
+        );
+
+        // Assistant turn materialized with its three tool_use blocks intact.
+        let agent = msgs
+            .iter()
+            .find(|m| m.message_id == "asst-c")
+            .expect("assistant message must be materialized");
+        match &agent.content {
+            MessageContent::Agent(blocks) => {
+                let n_tool_uses = blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                    .count();
+                assert_eq!(
+                    n_tool_uses, 3,
+                    "assistant must carry all three tool_use blocks"
+                );
+            }
+            MessageContent::User(_)
+            | MessageContent::Tool(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_)
+            | MessageContent::Skill(_) => panic!("asst-c must be agent content"),
+        }
+
+        // Exactly one tool_result per tool_use, paired by id.
+        let by_id = |id: &str| {
+            msgs.iter().find_map(|m| match &m.content {
+                MessageContent::Tool(tc) if tc.tool_use_id == id => Some(tc.clone()),
+                MessageContent::Tool(_)
+                | MessageContent::User(_)
+                | MessageContent::Agent(_)
+                | MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Continuation(_)
+                | MessageContent::Skill(_) => None,
+            })
+        };
+        let r1 = by_id("tool-1").expect("tool-1 result present");
+        let r2 = by_id("tool-2").expect("tool-2 result present");
+        let r3 = by_id("tool-3").expect("tool-3 result present");
+
+        // Completed tool keeps its real output, not a placeholder.
+        assert_eq!(r1.content, "real output for tool-1");
+        assert!(!r1.is_error, "completed tool result must not be an error");
+
+        // Cancelling + skipped tools get synthetic interrupted errors.
+        assert!(r2.is_error && r2.content.contains("interrupted"));
+        assert!(r3.is_error && r3.content.contains("interrupted"));
+
+        // Idempotent: re-running the sweep must not duplicate or 400-trip.
+        db.reset_all_to_idle().await.unwrap();
+        assert_eq!(
+            db.get_messages("conv-c").await.unwrap().len(),
             5,
             "re-running reset must not duplicate materialized rows"
         );
