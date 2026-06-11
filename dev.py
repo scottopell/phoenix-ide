@@ -4284,6 +4284,75 @@ WantedBy=multi-user.target
 """
 
 
+def _assert_prod_bind_security(env: dict[str, str]) -> None:
+    """Fail fast if the deploy would produce a service that can't start.
+
+    The prod socket unit binds `ListenStream=PORT` — all interfaces, non-loopback.
+    The binary fails closed on a non-loopback bind unless PHOENIX_PASSWORD or
+    PHOENIX_ALLOW_INSECURE_BIND=1 is set (see main.rs, REQ-AUTH). Without one of
+    those, the unit installs cleanly but every start hits the guard and exits,
+    and Restart=always turns that into a crash loop. Enforce the same invariant
+    here, before anything is built or installed, so the operator gets actionable
+    guidance instead of a green deploy fronting a dead service.
+    """
+    if env.get("PHOENIX_PASSWORD", "").strip():
+        return
+    if env.get("PHOENIX_ALLOW_INSECURE_BIND", "").strip() == "1":
+        return
+
+    print(
+        f"ERROR: refusing to deploy — the prod socket binds all interfaces "
+        f"(0.0.0.0:{PROD_PORT}) but no auth is configured.\n"
+        f"\n"
+        f"An unauthenticated, network-reachable Phoenix lets anyone on the network "
+        f"run arbitrary commands as the service user. The binary would refuse to "
+        f"start, so this deploy would leave a crash-looping service.\n"
+        f"\n"
+        f"Fix one of these in {ROOT / '.phoenix-ide.env'}:\n"
+        f"  PHOENIX_PASSWORD=<strong-password>     # enable password auth (recommended)\n"
+        f"  PHOENIX_ALLOW_INSECURE_BIND=1           # only if Phoenix sits behind your own auth proxy\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _confirm_service_healthy(expect_replaces: str | None = None) -> str | None:
+    """Confirm the service settled on one live process that stays up.
+
+    Returns the stable MainPID, or None if it never settled. A single
+    `is-active` sample is not enough: a process that starts, hits a startup
+    guard, and exits under Restart=always flips active->failed->activating, and
+    one sample can catch a brief 'active' window. We require the same non-zero
+    MainPID to persist across consecutive `active` samples — a crash loop keeps
+    churning the PID and never reaches that. When expect_replaces is given, a
+    sample still showing that PID means the reload hasn't taken effect yet.
+    """
+    stable_pid: str | None = None
+    stable_count = 0
+    for _ in range(20):
+        time.sleep(1)
+        pid = subprocess.run(
+            ["systemctl", "show", PROD_SERVICE_NAME, "-p", "MainPID", "--value"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        active = subprocess.run(
+            ["systemctl", "is-active", PROD_SERVICE_NAME],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        live = active == "active" and pid not in ("0", "")
+        if expect_replaces is not None and pid == expect_replaces:
+            live = False  # still the old process; reload hasn't cycled yet
+        if live and pid == stable_pid:
+            stable_count += 1
+            if stable_count >= 3:
+                return stable_pid
+        elif live:
+            stable_pid, stable_count = pid, 1
+        else:
+            stable_pid, stable_count = None, 0
+    return None
+
+
 def native_prod_deploy(version: str | None = None):
     """Build and deploy to production (native Linux)."""
     # Check if systemd is available
@@ -4296,6 +4365,15 @@ def native_prod_deploy(version: str | None = None):
         print("  - Use './dev.py up' for development mode instead", file=sys.stderr)
         print("  - This system does not have systemd available", file=sys.stderr)
         sys.exit(1)
+
+    # Load .phoenix-ide.env overrides (LLM_API_KEY_HELPER, OPENAI_USE_CODEX_AUTH,
+    # PHOENIX_PASSWORD, etc.) and validate the bind/auth posture before doing any
+    # work — a missing password should fail here, not after a full build + install.
+    env_overrides: dict[str, str] = {}
+    env_file_loaded = _load_env_file(env_overrides)
+    _assert_prod_bind_security(env_overrides)
+    if env_file_loaded:
+        print(f"  Loaded env from {env_file_loaded}")
 
     # Build
     binary = prod_build(version)
@@ -4330,12 +4408,6 @@ def native_prod_deploy(version: str | None = None):
     # `-R` so an existing prod.db (and its sqlite -shm/-wal sidecars) created
     # under a previous service_user are migrated to the current one.
     subprocess.run(["sudo", "chown", "-R", f"{service_user}:{service_user}", str(native_db_dir)], check=True)
-
-    # Load .phoenix-ide.env overrides (LLM_API_KEY_HELPER, OPENAI_USE_CODEX_AUTH, etc.)
-    env_overrides: dict[str, str] = {}
-    env_file_loaded = _load_env_file(env_overrides)
-    if env_file_loaded:
-        print(f"  Loaded env from {env_file_loaded}")
 
     # Auto-detect gateway only if the env file didn't already provide LLM config (mirrors launchd).
     gateway = None if _env_provides_llm_config(env_overrides) else get_llm_gateway()
@@ -4418,22 +4490,14 @@ def native_prod_deploy(version: str | None = None):
         ).stdout.strip()
         subprocess.run(["sudo", "systemctl", "reload", PROD_SERVICE_NAME], check=True)
 
-        # Poll for new PID. SIGHUP graceful exit + Restart=always cycles the
-        # process; the new MainPID should appear within a few seconds.
-        new_pid = old_pid
-        for _ in range(15):
-            time.sleep(1)
-            new_pid = subprocess.run(
-                ["systemctl", "show", PROD_SERVICE_NAME, "-p", "MainPID", "--value"],
-                capture_output=True, text=True,
-            ).stdout.strip()
-            if new_pid not in ("0", "", old_pid):
-                break
-
-        if new_pid in ("0", "", old_pid):
+        # SIGHUP graceful exit + Restart=always cycles the process. Require the
+        # replacement to be a single PID that stays up -- a process that starts
+        # and immediately exits (e.g. the startup auth guard) crash-loops and
+        # never settles, which the old single is-active sample mistook for success.
+        if _confirm_service_healthy(expect_replaces=old_pid) is None:
             print(
-                f"\n✗ Reload did not replace the running process "
-                f"(MainPID still {old_pid or '<none>'}).",
+                f"\n✗ Reload did not produce a stable process "
+                f"(crash loop or reload never took effect; was MainPID {old_pid or '<none>'}).",
                 file=sys.stderr,
             )
             print(
@@ -4442,21 +4506,13 @@ def native_prod_deploy(version: str | None = None):
             )
             sys.exit(1)
 
-        # Verify it came back up
-        result = subprocess.run(
-            ["systemctl", "is-active", PROD_SERVICE_NAME],
-            capture_output=True, text=True
-        )
-        if result.stdout.strip() == "active":
-            write_deployed_sha()
-            print(f"\n✓ Deployed {version} to production (zero-downtime upgrade)")
-            print(f"  Service: {PROD_SERVICE_NAME}")
-            print(f"  Port: {PROD_PORT}")
-            print(f"  Socket: {PROD_SERVICE_NAME}.socket (keeps connections alive)")
-            print(f"  Database: {config.db_path}")
-            print(f"  URL: {_prod_display_url()}")
-        else:
-            print(f"\n⚠ Service restarting... check status with: systemctl status {PROD_SERVICE_NAME}")
+        write_deployed_sha()
+        print(f"\n✓ Deployed {version} to production (zero-downtime upgrade)")
+        print(f"  Service: {PROD_SERVICE_NAME}")
+        print(f"  Port: {PROD_PORT}")
+        print(f"  Socket: {PROD_SERVICE_NAME}.socket (keeps connections alive)")
+        print(f"  Database: {config.db_path}")
+        print(f"  URL: {_prod_display_url()}")
     else:
         # Service not running - start socket first, then service
         print("Starting socket and service...")
@@ -4467,25 +4523,22 @@ def native_prod_deploy(version: str | None = None):
         # Start the socket (service will be started on first connection or explicitly)
         subprocess.run(["sudo", "systemctl", "start", f"{PROD_SERVICE_NAME}.socket"], check=True)
         subprocess.run(["sudo", "systemctl", "start", PROD_SERVICE_NAME], check=True)
-        time.sleep(1)
 
-        # Verify it started
-        result = subprocess.run(
-            ["systemctl", "is-active", PROD_SERVICE_NAME],
-            capture_output=True, text=True
-        )
-        if result.stdout.strip() == "active":
-            write_deployed_sha()
-            print(f"\n✓ Deployed {version} to production")
-            print(f"  Service: {PROD_SERVICE_NAME}")
-            print(f"  Port: {PROD_PORT}")
-            print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
-            print(f"  Database: {config.db_path}")
-            print(f"  URL: {_prod_display_url()}")
-        else:
-            print(f"\n✗ Service failed to start", file=sys.stderr)
+        # Confirm it stays up. A single is-active sample can catch the brief
+        # 'active' window of a process that exits on a startup guard and is
+        # restarted by Restart=always; require a PID that persists instead.
+        if _confirm_service_healthy() is None:
+            print(f"\n✗ Service failed to stay up (crash loop or failed start)", file=sys.stderr)
             subprocess.run(["sudo", "journalctl", "-u", PROD_SERVICE_NAME, "-n", "20", "--no-pager"])
             sys.exit(1)
+
+        write_deployed_sha()
+        print(f"\n✓ Deployed {version} to production")
+        print(f"  Service: {PROD_SERVICE_NAME}")
+        print(f"  Port: {PROD_PORT}")
+        print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
+        print(f"  Database: {config.db_path}")
+        print(f"  URL: {_prod_display_url()}")
 
 
 def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> str | None:
@@ -5147,6 +5200,15 @@ def _launchd_stop_if_loaded():
 
 def launchd_prod_deploy(version: str | None = None):
     """Build and deploy to production via launchd (native macOS)."""
+    # Load .phoenix-ide.env and validate the bind/auth posture before building.
+    # The launchd socket binds IPv4v6 with no node name (all interfaces), so the
+    # binary fails closed without a password — catch that here, not after a build.
+    env_overrides: dict[str, str] = {}
+    env_file = _load_env_file(env_overrides)
+    _assert_prod_bind_security(env_overrides)
+    if env_file:
+        print(f"  Loaded env from {env_file}")
+
     # Build native macOS binary
     binary = prod_build(version, target=None)
 
@@ -5180,12 +5242,6 @@ def launchd_prod_deploy(version: str | None = None):
         check=True,
     )
 
-    # Load .phoenix-ide.env and detect LLM gateway
-    env_overrides: dict[str, str] = {}
-    env_file = _load_env_file(env_overrides)
-    if env_file:
-        print(f"  Loaded env from {env_file}")
-
     # Auto-detect gateway only if the env file didn't already provide LLM config
     gateway = None if _env_provides_llm_config(env_overrides) else get_llm_gateway()
 
@@ -5211,7 +5267,11 @@ def launchd_prod_deploy(version: str | None = None):
         print(f"ERROR: launchctl bootstrap failed: {result.stderr}", file=sys.stderr)
         sys.exit(1)
 
-    # Health check with retry (server may take a few seconds to bind the port)
+    # Health check with retry (server may take a few seconds to bind the port).
+    # A failed health check is a failed deploy -- the service exits on its startup
+    # guards (e.g. missing auth on a non-loopback bind) and KeepAlive relaunches it,
+    # so "process is loaded" is not evidence it is serving. Fail hard rather than
+    # printing success over a dead service.
     health_version = None
     for attempt in range(5):
         time.sleep(2)
@@ -5222,7 +5282,11 @@ def launchd_prod_deploy(version: str | None = None):
         except Exception:
             if attempt < 4:
                 continue
-            print("WARNING: Server started but health check failed after 10s", file=sys.stderr)
+
+    if health_version is None:
+        print("\n✗ Service did not pass a health check within 10s (crash loop or failed start).", file=sys.stderr)
+        print(f"  Inspect: tail -n 50 {LAUNCHD_LOG_PATH}", file=sys.stderr)
+        sys.exit(1)
 
     write_deployed_sha()
     llm_mode = _llm_mode_summary(env_overrides, gateway)
