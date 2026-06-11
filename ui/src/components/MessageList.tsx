@@ -7,6 +7,7 @@ import {
   QueuedUserMessage,
   AgentMessage,
   SubAgentStatus,
+  SkillCommandText,
   formatMessageTime,
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
@@ -95,12 +96,6 @@ function SkillFileChips({ files }: { files: { original_name: string; size_bytes:
   );
 }
 
-function extractSkillParts(trigger: string, name: string, fallbackArgs?: string): { token: string; args: string } {
-  const displayTrigger = trigger.trim() || [name ? `/${name}` : '/skill', fallbackArgs?.trim()].filter(Boolean).join(' ');
-  const match = displayTrigger.match(/^(\S+)(?:\s+([\s\S]*))?$/);
-  return { token: match?.[1] ?? '/skill', args: match?.[2] ?? '' };
-}
-
 type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
 
 function renderHistoricalUnit(
@@ -122,8 +117,8 @@ function renderHistoricalUnit(
         />
       );
     case 'skill': {
-      const c = unit.message.content as { name?: string; trigger?: string; args?: string; files?: { original_name: string; size_bytes: number; stored_path?: string }[] };
-      const { token, args } = extractSkillParts(c.trigger || '', c.name || '', c.args);
+      const c = unit.message.content as { name?: string; trigger?: string; args?: string; source?: string; snippet?: string; files?: { original_name: string; size_bytes: number; stored_path?: string }[] };
+      const trigger = c.trigger?.trim() || [c.name ? `/${c.name}` : '/skill', c.args?.trim()].filter(Boolean).join(' ');
       return (
         <div className="message user" data-sequence-id={unit.message.sequence_id}>
           <div className="message-header">
@@ -135,12 +130,7 @@ function renderHistoricalUnit(
             )}
           </div>
           <div className="message-content">
-            <span className="skill-inline" title={`Skill invocation: loaded instructions from ${token}/SKILL.md and delivered to the agent`}>
-              <span className="skill-inline-token">{token}</span>
-              {args && (
-                <span className="skill-inline-args"> {args}</span>
-              )}
-            </span>
+            <SkillCommandText text={trigger} source={c.source} snippet={c.snippet} />
             <SkillFileChips files={c.files ?? []} />
           </div>
         </div>

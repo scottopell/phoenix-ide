@@ -30,6 +30,15 @@ vi.mock('./MessageComponents', () => ({
     <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>
   ),
   SubAgentStatus: () => null,
+  SkillCommandText: ({ text }: { text: string }) => {
+    const [token = '', ...rest] = text.split(/\s+/);
+    return (
+      <span className="skill-command-inline">
+        <span className="skill-command-chip"><span className="skill-command-slash">/</span><span className="skill-command-name">{token.replace(/^\//, '')}</span></span>
+        {rest.length > 0 && <span className="skill-command-args"> {rest.join(' ')}</span>}
+      </span>
+    );
+  },
   formatMessageTime: () => '12:00',
 }));
 
@@ -132,8 +141,8 @@ describe('MessageList', () => {
     expect(message).toHaveTextContent('/dogfood http://localhost:8042');
     expect(message).toHaveTextContent('notes.txt');
     expect(message).toHaveTextContent('512 B');
-    expect(message?.querySelector('.skill-inline-token')).toHaveTextContent('/dogfood');
-    expect(message?.querySelector('.skill-inline-args')).toHaveTextContent('http://localhost:8042');
+    expect(message?.querySelector('.skill-command-name')).toHaveTextContent('dogfood');
+    expect(message?.querySelector('.skill-command-args')).toHaveTextContent('http://localhost:8042');
     expect(container).not.toHaveTextContent('skill:');
     expect(container.querySelector('.skill-indicator')).toBeNull();
   });

@@ -351,6 +351,91 @@ function formatToolInput(name: string, input: Record<string, unknown>, displayOv
   }
 }
 
+function parseSlashCommand(text: string): { token: string; args: string } | null {
+  const match = text.trim().match(/^(\/[A-Za-z0-9][\w:-]*)(?:\s+([\s\S]*))?$/);
+  if (!match) return null;
+  return { token: match[1] ?? '/skill', args: match[2] ?? '' };
+}
+
+function skillTitle(token: string, source?: string, snippet?: string): string {
+  return [
+    `Skill invocation: ${token}`,
+    source ? `Source: ${source}` : '',
+    snippet ? `Preview: ${snippet}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+export function SkillCommandText({
+  text,
+  source,
+  snippet,
+}: {
+  text: string;
+  source?: string | undefined;
+  snippet?: string | undefined;
+}) {
+  const parsed = parseSlashCommand(text);
+  if (!parsed) return <>{text}</>;
+  return (
+    <span className="skill-command-inline">
+      <span className="skill-command-chip" title={skillTitle(parsed.token, source, snippet)}>
+        <span className="skill-command-slash">/</span>
+        <span className="skill-command-name">{parsed.token.slice(1)}</span>
+      </span>
+      {parsed.args && <span className="skill-command-args"> {parsed.args}</span>}
+    </span>
+  );
+}
+
+function extractSkillResultDetails(resultText: string): { source?: string | undefined; snippet?: string | undefined } {
+  const source = resultText.match(/^Base directory for this skill:\s*(.+)$/m)?.[1]?.trim();
+  const contentLines = resultText
+    .split('\n')
+    .filter(line => line.trim() && !line.startsWith('Base directory for this skill:'));
+  const snippet = contentLines.find(line => line.startsWith('# ')) || contentLines[0] || '';
+  return {
+    source,
+    snippet: snippet ? truncateValue(snippet.replace(/^#\s*/, '').trim(), 120) : undefined,
+  };
+}
+
+function skillCommandFromInput(input: Record<string, unknown>): string {
+  const skillName = String(input['skill_name'] || 'skill').replace(/^\/+/, '');
+  const args = String(input['args'] || '').trim();
+  return args ? `/${skillName} ${args}` : `/${skillName}`;
+}
+
+function SkillToolInput({ input, resultText }: { input: Record<string, unknown>; resultText: string }) {
+  const details = extractSkillResultDetails(resultText);
+  return (
+    <div className="skill-tool-input">
+      <SkillCommandText
+        text={skillCommandFromInput(input)}
+        source={details.source ? `${details.source}/SKILL.md` : undefined}
+        snippet={details.snippet}
+      />
+    </div>
+  );
+}
+
+function SkillToolOutput({ resultText }: { resultText: string }) {
+  const details = extractSkillResultDetails(resultText);
+  if (!details.source && !details.snippet) return null;
+  return (
+    <div className="skill-tool-output">
+      {details.source && (
+        <div className="skill-tool-source">
+          <span className="skill-tool-source-label">source</span>
+          <code className="skill-tool-source-path">{details.source}/SKILL.md</code>
+        </div>
+      )}
+      {details.snippet && (
+        <div className="skill-tool-snippet">{details.snippet}</div>
+      )}
+    </div>
+  );
+}
+
 function truncateValue(s: string, max = 40): string {
   return s.length > max ? s.slice(0, max) + '…' : s;
 }
@@ -485,7 +570,7 @@ function UserMessageImpl({ message }: { message: Message }) {
         {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
       </div>
       <div className="message-content">
-        {text}
+        <SkillCommandText text={text} />
         {images.length > 0 && (
           <div className="message-images">
             {images.map((img, idx) => (
@@ -542,7 +627,7 @@ function QueuedUserMessageImpl({
         )}
       </div>
       <div className="message-content">
-        {message.text}
+        <SkillCommandText text={message.text} />
         {message.images.length > 0 && (
           <div className="message-images">
             {message.images.map((img, idx) => (
@@ -1629,6 +1714,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
 
   // Get the raw input for copying (not the formatted display)
   const rawInput = name === 'bash' ? bashInputCopyText(input as Record<string, unknown>) :
+                   name === 'skill' ? skillCommandFromInput(input as Record<string, unknown>) :
                    name === 'think' ? String(input['thoughts'] || '') :
                    name === 'read_file' ? String(input['path'] || '') :
                    name === 'ask_user_question' ? String(((input['questions'] as Array<{ question?: string }> | undefined)?.[0]?.question) || '') :
@@ -1645,10 +1731,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
     : 'Copy command';
 
   return (
-    <div className="tool-block" data-tool-id={toolId}>
+    <div className={`tool-block${name === 'skill' ? ' skill-tool-block' : ''}`} data-tool-id={toolId}>
       {/* Tool header with name */}
       <div className="tool-block-header">
-        <span className="tool-block-name">{name}</span>
+        <span className="tool-block-name">{name === 'skill' ? 'skill invocation' : name}</span>
         {hasOutput && (
           <span className={`tool-block-status ${isError ? 'error' : 'success'}`}>
             {isError ? <XIcon /> : <CheckIcon />}
@@ -1673,7 +1759,11 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
 
       {/* Tool input - always visible */}
       <div className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}>
-        {inputDisplay}
+        {name === 'skill' ? (
+          <SkillToolInput input={input as Record<string, unknown>} resultText={resultText} />
+        ) : (
+          inputDisplay
+        )}
         <CopyButton text={rawInput} title={bashCopyTitle} />
       </div>
 
@@ -1693,6 +1783,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
             <BashResponseView response={bashResponse} />
           ) : tmuxResponse ? (
             <TmuxResponseView response={tmuxResponse} />
+          ) : name === 'skill' && !isError ? (
+            <SkillToolOutput resultText={resultText} />
           ) : name === 'browser_profile' &&
               STRUCTURED_PROFILE_ACTIONS.has(
                 String((input as Record<string, unknown>)?.['action'] ?? ''),

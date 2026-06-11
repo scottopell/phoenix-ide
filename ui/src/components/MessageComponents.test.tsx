@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { SubAgentStatus, AgentMessage } from './MessageComponents';
+import { SubAgentStatus, AgentMessage, UserMessage } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
@@ -112,6 +112,55 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     pending_truncated: false,
   });
 }
+
+describe('skill command rendering', () => {
+  it('renders slash-command user messages as a flat command chip with normal args', () => {
+    render(
+      <UserMessage
+        message={{
+          message_id: 'user-skill',
+          sequence_id: 1,
+          conversation_id: 'agent-1',
+          message_type: 'user',
+          content: { text: '/dogfood http://localhost:8042' },
+          display_data: null,
+          created_at: '2026-01-01T00:00:00Z',
+        }}
+      />,
+    );
+
+    expect(screen.getByText('dogfood')).toHaveClass('skill-command-name');
+    expect(screen.getByText('http://localhost:8042')).toHaveClass('skill-command-args');
+    expect(document.querySelector('.skill-command-chip')).not.toBeNull();
+  });
+
+  it('renders skill tool calls with matching chip, source, and snippet', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-skill', [{
+            type: 'tool_use',
+            id: 'tool-skill',
+            name: 'skill',
+            input: { skill_name: 'agent-browser', args: 'http://localhost:8042' },
+          }])}
+          toolResults={new Map([
+            ['tool-skill', toolMessage(
+              'tool-skill',
+              'Base directory for this skill: /Users/test/.claude/skills/agent-browser\n# Browser Automation with agent-browser\nMore content',
+            )],
+          ])}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('skill invocation')).toBeInTheDocument();
+    expect(screen.getByText('agent-browser')).toHaveClass('skill-command-name');
+    expect(screen.getByText('http://localhost:8042')).toHaveClass('skill-command-args');
+    expect(screen.getByText('/Users/test/.claude/skills/agent-browser/SKILL.md')).toBeInTheDocument();
+    expect(screen.getByText('Browser Automation with agent-browser')).toHaveClass('skill-tool-snippet');
+  });
+});
 
 describe('agent message file paths', () => {
   beforeEach(() => {

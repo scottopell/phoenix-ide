@@ -1128,6 +1128,18 @@ body {
   font-family: var(--font-mono);
 }
 
+.skill-tool-block {
+  border-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 24%, var(--border-color));
+}
+
+.skill-tool-block .tool-block-header {
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 7%, var(--bg-tertiary));
+}
+
+.skill-tool-block .tool-block-name {
+  color: var(--accent-blue, #2563eb);
+}
+
 .tool-block-status {
   margin-left: auto;
   font-size: 14px;
@@ -1167,6 +1179,49 @@ body {
 .tool-block-input.multiline {
   max-height: 150px;
   overflow-y: auto;
+}
+
+.skill-tool-input {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-sans);
+  white-space: normal;
+}
+
+.skill-tool-output {
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 5%, var(--bg-primary));
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.skill-tool-source {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-secondary);
+}
+
+.skill-tool-source-label {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.skill-tool-source-path {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.skill-tool-snippet {
+  margin-top: 3px;
+  color: var(--text-primary);
+  font-weight: 500;
 }
 
 /* Tool output section */
@@ -8885,18 +8940,45 @@ html * {
 
 /* --- Skill Invocation Messages --- */
 
-.message-content .skill-inline {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+.skill-command-inline {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
-.message-content .skill-inline-token {
-  font-weight: 600;
-  color: var(--accent-blue, #3b82f6);
+.skill-command-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 1px 6px 2px;
+  border: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 28%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 9%, var(--bg-primary));
+  border-radius: 6px;
+  color: var(--accent-blue, #2563eb);
+  font-weight: 650;
+  line-height: 1.25;
+  white-space: nowrap;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 45%);
+  cursor: help;
 }
 
-.message-content .skill-inline-args {
-  color: var(--text-muted);
+.skill-command-chip:hover {
+  border-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 45%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 13%, var(--bg-primary));
+}
+
+.skill-command-slash {
+  opacity: 0.72;
+  font-weight: 800;
+}
+
+.skill-command-name {
+  font-weight: 700;
+}
+
+.skill-command-args {
+  color: var(--text-primary);
 }
 
 /* --- System Messages (task approval, completion, etc.) --- */
