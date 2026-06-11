@@ -2330,24 +2330,30 @@ def _classify_network_env() -> None:
 # ===========================================================================
 # Incremental check gating (Option A: path-based lane selection)
 # ===========================================================================
-# Lane key -> the input categories that, if touched, require the lane to run.
-# Keys match the thread names in cmd_check. Lanes absent from this table
-# (fast, pkglock) are always-on: they are sub-second and correctness-sensitive
-# (rustfmt, task validation, lockfile tripwire).
-_LANE_INPUTS = {
-    "rust": {"RUST"},
-    "clippy": {"RUST"},
-    "tsc": {"UI"},
-    "ui-lint": {"UI"},
-    "vitest": {"UI"},
-    "ast-grep": {"UI", "ASTGREP"},
-    "allium": {"SPECS"},
+# The lane registry: one row per check lane. Lane names match the thread
+# names in cmd_check. `inputs` lists the path categories that, if touched,
+# require the lane to run; None marks an always-on lane (sub-second and
+# correctness-sensitive: rustfmt, task validation, lockfile tripwire).
+# `desc` feeds the --pretty renderer and `check --lanes` validation errors.
+_LANE_DEFS = [
+    # (name, inputs, desc)
+    ("rust", {"RUST"}, "codegen + cargo test (+ musl smoke on macOS)"),
+    ("clippy", {"RUST"}, "cargo clippy --all-targets (own target dir)"),
+    ("tsc", {"UI"}, "tsc -b --noEmit project typecheck"),
+    ("ui-lint", {"UI"}, "eslint + stylelint"),
+    ("vitest", {"UI"}, "vitest run"),
+    ("ast-grep", {"UI", "ASTGREP"}, "structural lint rules over ui/src/"),
+    ("allium", {"SPECS"}, "allium spec validation"),
     # spec-anchors cross-validates REQ-* anchors in code against specs/, so a
     # change to either side can orphan or satisfy an anchor.
-    "spec-anchors": {"SPECS", "RUST", "UI"},
-    "e2e": {"RUST", "E2E"},
-}
-_ALWAYS_ON_LANES = {"fast", "pkglock"}
+    ("spec-anchors", {"SPECS", "RUST", "UI"}, "REQ-* anchor cross-validation"),
+    ("e2e", {"RUST", "E2E"}, "API-boundary tests via a real binary"),
+    ("fast", None, "cargo fmt + task validation"),
+    ("pkglock", None, "pnpm-lock drift tripwire"),
+]
+_LANE_INPUTS = {name: inputs for name, inputs, _ in _LANE_DEFS if inputs is not None}
+_ALWAYS_ON_LANES = {name for name, inputs, _ in _LANE_DEFS if inputs is None}
+_LANE_DESCS = {name: desc for name, _, desc in _LANE_DEFS}
 
 
 def _categorize_changed_paths(paths) -> set:
@@ -2442,10 +2448,38 @@ def _gate_lanes():
     if os.environ.get("PHOENIX_CHECK_ALL") == "1":
         return all_lanes, {}
 
-    paths = _changed_paths_vs_base()
-    if paths is None:
-        # Base undeterminable — fail safe, run everything.
-        return all_lanes, {}
+    # CI must choose its gating mode explicitly. Auto-derived gating in CI
+    # once skipped every lane on main pushes (merge-base(HEAD, origin/main)
+    # == HEAD -> empty diff -> 1-second green check), so a CI run that
+    # reaches here without an explicit base refuses loudly instead of
+    # guessing. Full runs opt out via --all / PHOENIX_CHECK_ALL=1; gated
+    # runs opt in via PHOENIX_CHECK_BASE.
+    if os.environ.get("CI"):
+        if not os.environ.get("PHOENIX_CHECK_BASE"):
+            print(
+                "✗ CI detected, but neither PHOENIX_CHECK_ALL=1 (full run) nor\n"
+                "  PHOENIX_CHECK_BASE (explicit gating base, e.g. origin/main) is set.\n"
+                "  Refusing to auto-derive an incremental-gating base in CI: on a\n"
+                "  push to the base branch the derived diff is empty and every lane\n"
+                "  would be silently skipped.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        paths = _changed_paths_vs_base()
+        if paths is None:
+            print(
+                f"✗ PHOENIX_CHECK_BASE={os.environ['PHOENIX_CHECK_BASE']} did not "
+                "resolve to a merge base.\n"
+                "  Fetch the ref in CI (e.g. checkout fetch-depth: 0) or run with "
+                "PHOENIX_CHECK_ALL=1.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
+        paths = _changed_paths_vs_base()
+        if paths is None:
+            # Base undeterminable locally — fail safe, run everything.
+            return all_lanes, {}
 
     cats = _categorize_changed_paths(paths)
     if "SELF" in cats:
@@ -2576,8 +2610,213 @@ def _rust_scope_crates(paths):
     return scope or None
 
 
-def cmd_check(gate: bool = True):
-    """Run lint, format check, tests, and task validation in parallel."""
+class _PlainReporter:
+    """Default check output: one line per event, printed as it happens.
+
+    This is the exact pre-existing `./dev.py check` output format; --pretty
+    swaps in _PrettyReporter, which renders the same event stream as a live
+    lane table instead.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def info(self, msg: str) -> None:
+        with self._lock:
+            print(f"  i  {msg}")
+
+    def banner(self, msg: str) -> None:
+        with self._lock:
+            print(msg)
+
+    def lane_start(self, lane: str) -> None:
+        pass
+
+    def lane_done(self, lane: str) -> None:
+        pass
+
+    def lane_skipped(self, lane: str, reason: str) -> None:
+        with self._lock:
+            print(f"  -  {lane:<18s} (skipped — {reason})")
+
+    def step_start(self, lane: str, step: str) -> None:
+        pass
+
+    def step_skipped(self, lane: str, step: str, reason: str) -> None:
+        with self._lock:
+            print(f"  -  {step:<18s} (skipped — {reason})")
+
+    def step_done(self, lane: str, step: str, rc: int, elapsed: float) -> None:
+        with self._lock:
+            sym = "✓" if rc == 0 else "✗"
+            print(f"  {sym} {step:<18s} ({elapsed:.1f}s)")
+
+    def close(self) -> None:
+        pass
+
+
+class _PrettyReporter:
+    """Live lane-table renderer for `--pretty` (requires rich).
+
+    One row per lane: status glyph, lane name, completed steps with their
+    times, and the currently running step with a live elapsed counter.
+    Consumes the same event stream _PlainReporter prints line-by-line.
+    """
+
+    def __init__(self, active: set, skipped: dict, descs: dict):
+        from rich.console import Console
+        from rich.live import Live
+        from rich.table import Table
+        from rich.text import Text
+
+        self._Table, self._Text = Table, Text
+        self._lock = threading.Lock()
+        self._t0 = time.monotonic()
+        self._infos: list[str] = []
+        self._lanes: dict[str, dict] = {}
+        for name in sorted(active):
+            self._lanes[name] = {
+                "status": "pending", "steps": [], "current": None,
+                "t_start": None, "t_end": None, "desc": descs.get(name, ""),
+            }
+        for name in sorted(skipped):
+            self._lanes[name] = {
+                "status": "skipped", "reason": skipped[name], "steps": [],
+                "current": None, "t_start": None, "t_end": None,
+                "desc": descs.get(name, ""),
+            }
+        # Live starts lazily on the first lane_start: everything before the
+        # fan-out (env probes, dep bootstrap, codegen) prints directly to
+        # stdout, and an active Live would garble those lines.
+        self._live = Live(
+            get_renderable=self._render, refresh_per_second=8,
+            console=Console(), transient=False,
+        )
+        self._started = False
+
+    def _ensure_live(self) -> None:
+        if not self._started:
+            self._started = True
+            self._live.start()
+
+    _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def _render(self):
+        with self._lock:
+            now = time.monotonic()
+            frame = self._SPINNER[int(now * 8) % len(self._SPINNER)]
+            table = self._Table(box=None, pad_edge=False, show_header=False, padding=(0, 1))
+            table.add_column("st", width=1)
+            table.add_column("lane", min_width=14)
+            table.add_column("detail", overflow="fold")
+            table.add_column("time", justify="right", min_width=7)
+            for info in self._infos:
+                table.add_row("", self._Text(info, style="dim"), "", "")
+            for name, st in self._lanes.items():
+                steps = self._Text()
+                for step, rc, elapsed in st["steps"]:
+                    steps.append(("✓" if rc == 0 else "✗") + step,
+                                 style="green" if rc == 0 else "red")
+                    steps.append(f" {elapsed:.1f}s  ", style="dim")
+                if st["current"]:
+                    cur, cur_t0 = st["current"]
+                    steps.append(f"{frame} {cur}", style="yellow")
+                    steps.append(f" {now - cur_t0:.0f}s", style="dim")
+                if st["status"] == "skipped":
+                    glyph, style = "-", "dim"
+                    steps = self._Text(f"skipped — {st['reason']}", style="dim")
+                elif st["status"] == "pending":
+                    glyph, style = "·", "dim"
+                    steps = self._Text(st["desc"], style="dim")
+                elif st["status"] == "running":
+                    glyph, style = frame, "yellow"
+                elif any(rc != 0 for _, rc, _ in st["steps"]):
+                    glyph, style = "✗", "red"
+                else:
+                    glyph, style = "✓", "green"
+                if st["t_end"] is not None and st["t_start"] is not None:
+                    t = f"{st['t_end'] - st['t_start']:.1f}s"
+                elif st["t_start"] is not None:
+                    t = f"{now - st['t_start']:.0f}s"
+                else:
+                    t = ""
+                table.add_row(self._Text(glyph, style=style),
+                              self._Text(name, style=style), steps,
+                              self._Text(t, style="dim"))
+            return table
+
+    def info(self, msg: str) -> None:
+        with self._lock:
+            self._infos.append(msg)
+
+    def banner(self, msg: str) -> None:
+        pass
+
+    def lane_start(self, lane: str) -> None:
+        self._ensure_live()
+        with self._lock:
+            st = self._lanes.setdefault(lane, {"steps": [], "current": None,
+                                               "t_end": None, "desc": ""})
+            st["status"] = "running"
+            st["t_start"] = time.monotonic()
+
+    def lane_done(self, lane: str) -> None:
+        with self._lock:
+            st = self._lanes[lane]
+            st["status"] = "done"
+            st["current"] = None
+            st["t_end"] = time.monotonic()
+
+    def lane_skipped(self, lane: str, reason: str) -> None:
+        with self._lock:
+            self._lanes[lane] = {"status": "skipped", "reason": reason,
+                                 "steps": [], "current": None,
+                                 "t_start": None, "t_end": None, "desc": ""}
+
+    def step_start(self, lane: str, step: str) -> None:
+        with self._lock:
+            self._lanes[lane]["current"] = (step, time.monotonic())
+
+    def step_skipped(self, lane: str, step: str, reason: str) -> None:
+        with self._lock:
+            self._infos.append(f"{step}: skipped — {reason}")
+
+    def step_done(self, lane: str, step: str, rc: int, elapsed: float) -> None:
+        with self._lock:
+            st = self._lanes[lane]
+            st["current"] = None
+            st["steps"].append((step, rc, elapsed))
+
+    def close(self) -> None:
+        if self._started:
+            self._live.stop()
+
+
+def _make_reporter(pretty: bool, active: set, skipped: dict):
+    """Build the requested reporter, degrading to plain if rich is missing.
+
+    rich is deliberately NOT in this script's PEP 723 dependencies — the
+    default (plain) path must never download it. main() re-execs through
+    `uv run --with rich` when --pretty is requested; if that bootstrap
+    didn't deliver an importable rich, fall back to plain with a notice.
+    """
+    if pretty:
+        try:
+            return _PrettyReporter(active, skipped, _LANE_DESCS)
+        except ImportError:
+            print("  i  rich not available — falling back to plain output",
+                  file=sys.stderr)
+    return _PlainReporter()
+
+
+def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False):
+    """Run lint, format check, tests, and task validation in parallel.
+
+    `lanes` is an optional comma-separated lane subset (CI splits the check
+    across runners with it); gating still applies within the subset unless
+    gate=False. `pretty` renders a live lane table instead of line-per-event
+    output.
+    """
     results = []  # (name, returncode, elapsed, output)
     results_lock = threading.Lock()
     t_start = time.monotonic()
@@ -2597,13 +2836,34 @@ def cmd_check(gate: bool = True):
         active, skipped = _gate_lanes()
     else:
         active, skipped = set(_LANE_INPUTS) | _ALWAYS_ON_LANES, {}
+
+    # --lanes: restrict this invocation to an explicit lane subset. Gating
+    # still applies within the subset (a gated-out lane stays skipped);
+    # lanes outside the subset are someone else's job (another CI runner)
+    # and get neither a result entry nor a skip line.
+    if lanes is not None:
+        requested = {l.strip() for l in lanes.split(",") if l.strip()}
+        known = {name for name, _, _ in _LANE_DEFS}
+        unknown = requested - known
+        if unknown:
+            print(f"✗ unknown lane(s): {', '.join(sorted(unknown))}\n"
+                  f"  valid lanes: {', '.join(sorted(known))}", file=sys.stderr)
+            sys.exit(1)
+        active &= requested
+        skipped = {k: v for k, v in skipped.items() if k in requested}
+        if not active:
+            print("  i  no requested lane is active for this change set")
+
+    reporter = _make_reporter(pretty, active, skipped)
+    if lanes is not None:
+        reporter.info(f"lane filter: [{', '.join(sorted(active | set(skipped)))}]")
     if skipped:
         ran = ", ".join(sorted(active))
-        print(f"  i  incremental gating: running [{ran}]")
+        reporter.info(f"incremental gating: running [{ran}]")
         for lane in sorted(skipped):
             with results_lock:
                 results.append((lane, 0, 0.0, ""))
-            print(f"  -  {lane:<18s} (skipped — {skipped[lane]})")
+            reporter.lane_skipped(lane, skipped[lane])
 
     # Lane groups whose shared, expensive setup is gated below. UI lanes need
     # Corepack/pnpm (ensure_ui_deps); cargo lanes need the rustc/sccache env
@@ -2625,8 +2885,8 @@ def cmd_check(gate: bool = True):
         _scope = _rust_scope_crates(_changed_paths_vs_base() or set())
         if _scope is not None:
             rust_scope = sorted(_scope)
-            print(f"  i  rust scope: -p {' -p '.join(rust_scope)} "
-                  f"(changed crate(s) + reverse-deps)")
+            reporter.info(f"rust scope: -p {' -p '.join(rust_scope)} "
+                          f"(changed crate(s) + reverse-deps)")
 
     def _pflags():
         """`-p crate` flags for the current rust scope, or [] for full workspace."""
@@ -2647,6 +2907,10 @@ def cmd_check(gate: bool = True):
         from collections import deque
         TAIL_LINES = 200
         t0 = time.monotonic()
+        # Lane attribution for the reporter: steps always run on their lane's
+        # thread, and lane threads are named after their lane.
+        lane = threading.current_thread().name
+        reporter.step_start(lane, name)
         # Captured lanes buffer stdout into `buf` and reprint it via plain
         # print() on failure, so terminal color codes are never wanted here —
         # they only mangle the buffered text (cargo clippy disables color on a
@@ -2718,12 +2982,13 @@ def cmd_check(gate: bool = True):
             output = tail
 
         with results_lock:
-            ok = "\u2713" if rc == 0 else "\u2717"
             results.append((name, rc, elapsed, output))
-            print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
+        reporter.step_done(lane, name, rc, elapsed)
+        return rc
 
     def lane_rust():
-        """Rust lane: test compile → test run → [musl smoke check].
+        """Rust lane: test compile → codegen export → staleness diff →
+        test run → [musl smoke check].
 
         The musl smoke check is **macOS-only and conditional** on the
         `x86_64-linux-musl-gcc` cross toolchain being on PATH; it never
@@ -2740,29 +3005,33 @@ def cmd_check(gate: bool = True):
         check. Build-time bundling of UI assets belongs to `prod_build`,
         which runs vite in its own worktree.
 
-        Test compile and run are split into two steps so each gets its own
+        Test compile and the later steps are split so each gets its own
         CHECK_TIMEOUT budget. Cold test-binary compiles on this codebase can
         approach 300s on their own, and when bundled with ~50s of test runtime
         the combined step exceeds the timeout even though nothing is wrong.
 
-        Codegen does NOT run in this lane. The ts-rs `export_bindings_*`
-        tests (re)write `ui/src/generated/` as a side effect; running them
-        here would race the tsc, vitest, eslint, and ast-grep lanes that read
-        that tree in parallel. A serial pre-step in cmd_check regenerates and
-        staleness-checks the tree before the fan-out, and `test_cmd` (built in
-        cmd_check) excludes `export_bindings` from this lane's verification
-        run so the generated tree stays frozen for the whole parallel phase.
-        The pre-step already exercised those tests, so the exclusion drops no
-        coverage. `compile_cmd`/`test_cmd`/the thread cap are computed once in
-        cmd_check and closed over here.
+        Codegen runs here, but never touches `ui/src/generated/`: the ts-rs
+        `export_bindings_*` tests run with TS_RS_EXPORT_DIR pointed at a
+        scratch dir under target/, and the staleness step diffs that scratch
+        export against the committed tree. The committed tree is therefore
+        frozen for the whole check — the tsc, vitest, eslint, and ast-grep
+        lanes read it concurrently with no ordering dependency on this lane.
+        `test_cmd` excludes `export_bindings` (the codegen step just ran
+        them — no lost coverage). `compile_cmd`/`test_cmd`/the thread cap are
+        computed once in cmd_check and closed over here.
         """
-        # The serial codegen pre-step compiled the workspace test binaries with
-        # normal rustc; this step reuses them (near-total cache hit). clippy is
-        # NOT in this lane — it runs in lane_clippy with its own target dir, so
-        # its RUSTC_WORKSPACE_WRAPPER=clippy-driver fingerprint churn can never
-        # invalidate this dir's build (and the two builds don't contend on the
-        # shared target lock).
-        run_step("cargo test compile", compile_cmd)
+        # clippy is NOT in this lane — it runs in lane_clippy with its own
+        # target dir, so its RUSTC_WORKSPACE_WRAPPER=clippy-driver fingerprint
+        # churn can never invalidate this dir's build (and the two builds
+        # don't contend on the shared target lock).
+        compile_rc = run_step("cargo test compile", compile_cmd)
+        if compile_rc == 0:
+            # TS_RS_EXPORT_DIR is read at test runtime (not macro expansion),
+            # so this run reuses the harnesses compiled above verbatim.
+            rc = run_step("codegen", codegen_cmd,
+                          env_extra={"TS_RS_EXPORT_DIR": str(codegen_export_base)})
+            if rc == 0:
+                codegen_stale_step()
         run_step("cargo test", test_cmd)
         if sys.platform == "darwin":
             # macOS prod deploy uses native target (launchd_prod_deploy → prod_build target=None),
@@ -2775,7 +3044,8 @@ def cmd_check(gate: bool = True):
                     "cargo", "check", "--target", "x86_64-unknown-linux-musl",
                 ])
             else:
-                print("  i  cargo check musl: skipped (x86_64-linux-musl-gcc not on PATH; see task 60001)")
+                reporter.step_skipped("rust", "cargo check musl",
+                                      "x86_64-linux-musl-gcc not on PATH; see task 60001")
 
     def lane_clippy():
         """Clippy in its own target dir so it runs fully parallel to lane_rust.
@@ -2817,12 +3087,12 @@ def cmd_check(gate: bool = True):
         # error list into the results tuple so a failure is readable in
         # the end-of-run summary.
         t0 = time.monotonic()
+        reporter.step_start("fast", "task validation")
         ok, detail = cmd_tasks_validate(quiet=True)
         elapsed = time.monotonic() - t0
         with results_lock:
-            sym = "\u2713" if ok else "\u2717"
             results.append(("task validation", 0 if ok else 1, elapsed, detail))
-            print(f"  {sym} {'task validation':<18s} ({elapsed:.1f}s)")
+        reporter.step_done("fast", "task validation", 0 if ok else 1, elapsed)
 
     def lane_e2e():
         """E2E API-boundary tests driven through a real running binary.
@@ -2878,7 +3148,7 @@ def cmd_check(gate: bool = True):
         if not shutil.which("ast-grep"):
             with results_lock:
                 results.append(("ast-grep", 0, 0.0, ""))
-                print(f"  - {'ast-grep':<18s} (skipped — not installed)")
+            reporter.step_skipped("ast-grep", "ast-grep", "not installed")
             return
         rules_dir = ROOT / "ast-grep-rules"
         if not rules_dir.exists():
@@ -2899,15 +3169,17 @@ def cmd_check(gate: bool = True):
         if not shutil.which("allium"):
             with results_lock:
                 results.append(("allium specs", 0, 0.0, ""))
-                print(f"  - {'allium specs':<18s} (skipped — install via 'cargo install allium-cli')")
+            reporter.step_skipped("allium", "allium specs",
+                                  "install via 'cargo install allium-cli'")
             return
         spec_files = sorted((ROOT / "specs").glob("*/*.allium"))
         if not spec_files:
             with results_lock:
                 results.append(("allium specs", 0, 0.0, ""))
-                print(f"  - {'allium specs':<18s} (skipped — no .allium files)")
+            reporter.step_skipped("allium", "allium specs", "no .allium files")
             return
         t0 = time.monotonic()
+        reporter.step_start("allium", "allium specs")
         try:
             proc = subprocess.run(
                 ["allium", "check", *[str(p) for p in spec_files]],
@@ -2917,7 +3189,7 @@ def cmd_check(gate: bool = True):
             elapsed = time.monotonic() - t0
             with results_lock:
                 results.append(("allium specs", 1, elapsed, "allium check timed out after 60s"))
-                print(f"  ✗ {'allium specs':<18s} ({elapsed:.1f}s)")
+            reporter.step_done("allium", "allium specs", 1, elapsed)
             return
         # Parse the concatenated JSON-doc stream that allium-cli emits
         # (one {...} per file passed). Use raw_decode to walk the stream
@@ -2998,11 +3270,11 @@ def cmd_check(gate: bool = True):
             out = "\n".join(lines)
             with results_lock:
                 results.append(("allium specs", 1, elapsed, out))
-                print(f"  ✗ {'allium specs':<18s} ({elapsed:.1f}s)")
+            reporter.step_done("allium", "allium specs", 1, elapsed)
         else:
             with results_lock:
                 results.append(("allium specs", 0, elapsed, ""))
-                print(f"  ✓ {'allium specs':<18s} ({elapsed:.1f}s)")
+            reporter.step_done("allium", "allium specs", 0, elapsed)
 
     def check_spec_anchors():
         """REQ-* anchor cross-validator. Fails on orphan code anchors —
@@ -3012,6 +3284,7 @@ def cmd_check(gate: bool = True):
         unanchored-half is on the standalone subcommand only (too
         noisy as a build gate)."""
         t0 = time.monotonic()
+        reporter.step_start("spec-anchors", "spec anchors")
         try:
             spec_decls = _scan_for_canonical_req_decls(ROOT / "specs")
             code_anchors = {}
@@ -3030,7 +3303,7 @@ def cmd_check(gate: bool = True):
             elapsed = time.monotonic() - t0
             with results_lock:
                 results.append(("spec anchors", 1, elapsed, f"scan failed: {e}"))
-                print(f"  ✗ {'spec anchors':<18s} ({elapsed:.1f}s)")
+            reporter.step_done("spec-anchors", "spec anchors", 1, elapsed)
             return
 
         elapsed = time.monotonic() - t0
@@ -3051,11 +3324,11 @@ def cmd_check(gate: bool = True):
             out = "\n".join(lines)
             with results_lock:
                 results.append(("spec anchors", 1, elapsed, out))
-                print(f"  ✗ {'spec anchors':<18s} ({elapsed:.1f}s)")
+            reporter.step_done("spec-anchors", "spec anchors", 1, elapsed)
         else:
             with results_lock:
                 results.append(("spec anchors", 0, elapsed, ""))
-                print(f"  ✓ {'spec anchors':<18s} ({elapsed:.1f}s)")
+            reporter.step_done("spec-anchors", "spec anchors", 0, elapsed)
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
@@ -3117,15 +3390,15 @@ def cmd_check(gate: bool = True):
             os.environ["GIT_CONFIG_COUNT"] = "1"
             os.environ["GIT_CONFIG_KEY_0"] = "commit.gpgsign"
             os.environ["GIT_CONFIG_VALUE_0"] = "false"
-            print("  i  commit signing probe failed — disabling commit.gpgsign for tests")
+            reporter.info("commit signing probe failed — disabling commit.gpgsign for tests")
 
     # nextest probe, thread sizing, and codegen command shapes are rust-only.
     if "rust" in active:
-        # Probe nextest and size the test-thread cap here in cmd_check scope (not
-        # in lane_rust) so both the serial codegen pre-step below and lane_rust's
-        # closed-over verification run share one decision. Neither probe touches
-        # the cargo target lock (`cargo nextest --version` only prints a version;
-        # the /proc/meminfo read is pure Python).
+        # Probe nextest and size the test-thread cap here in cmd_check scope
+        # (not in lane_rust) so the closed-over commands are built once.
+        # Neither probe touches the cargo target lock (`cargo nextest
+        # --version` only prints a version; the /proc/meminfo read is pure
+        # Python).
         #
         # This probe runs on the main path before any lane (and its
         # LANE_JOIN_TIMEOUT) exists, so a rustup/network/cargo-home stall here
@@ -3139,7 +3412,7 @@ def cmd_check(gate: bool = True):
             ).returncode == 0
         except (subprocess.TimeoutExpired, OSError):
             has_nextest = False
-            print("  i  cargo nextest probe stalled/failed — using plain `cargo test`")
+            reporter.info("cargo nextest probe stalled/failed — using plain `cargo test`")
         # nextest defaults to available_parallelism (= num_cpus). On low-RAM
         # boxes, num_cpus parallel test threads can swap and stall sensitive
         # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
@@ -3157,89 +3430,127 @@ def cmd_check(gate: bool = True):
             mem_cap = cpus
         test_threads = max(2, min(cpus - 1, mem_cap))
         if test_threads < cpus:
-            print(f"  i  cargo test: capping to {test_threads} threads "
-                  f"(cpus={cpus}, mem_cap={mem_cap})")
+            reporter.info(f"cargo test: capping to {test_threads} threads "
+                          f"(cpus={cpus}, mem_cap={mem_cap})")
 
-        # ts-rs emits a `#[test] export_bindings_*` per `#[ts(export)]` type; those
-        # tests' side effect IS the codegen — they (re)write ui/src/generated/.
-        # Running them inside the parallel fan-out races every lane that reads that
-        # tree (tsc, vitest, eslint, ast-grep), since ts-rs truncates each file
-        # before refilling it (a reader can catch an empty/partial file). So codegen
-        # is pulled out of the fan-out into this serial pre-step: regenerate once,
-        # staleness-check, and only then fan out the readers against a tree that
-        # stays frozen for the rest of the run. lane_rust's verification run
-        # excludes export_bindings (regen already exercised them — no lost
-        # coverage) so it never writes the tree during the parallel phase.
+        # ts-rs emits a `#[test] export_bindings_*` per `#[ts(export)]` type;
+        # those tests' side effect IS the codegen. In check they run with
+        # TS_RS_EXPORT_DIR pointed at a scratch dir under target/, so the
+        # committed ui/src/generated/ tree is never written during a check —
+        # the lanes that read it (tsc, vitest, eslint, ast-grep) have no
+        # ordering dependency on the rust lane. The staleness step then diffs
+        # the scratch export against the committed tree. (In-place
+        # regeneration is `./dev.py codegen`.)
         #
         # Discovery is preserved: every type still self-registers via its emitted
         # test, so a new #[ts(export)] type is regenerated automatically with no
         # hand-maintained root list to forget.
-        # `_pflags()` narrows compile + verification to the rust scope (changed
-        # crate(s)+rdeps) when gating set one; empty => full workspace. Codegen
-        # is deliberately NOT narrowed: ts-rs `export_bindings_*` tests live in
-        # phoenix-core but a change anywhere could in principle touch a derived
-        # type's shape, and the staleness guard must see the whole generated
-        # tree — so codegen always runs full.
+        #
+        # The compile step is NOT narrowed by the rust scope: the codegen run
+        # is always full-workspace (a change anywhere could in principle touch
+        # a derived type's shape, and the staleness guard must see the whole
+        # generated tree), so the harness compile must be full-workspace too.
+        # `_pflags()` still narrows the verification run.
         if has_nextest:
-            compile_cmd = ["cargo", "nextest", "run", *_pflags(), "--no-run"]
+            compile_cmd = ["cargo", "nextest", "run", "--no-run"]
             test_cmd = ["cargo", "nextest", "run", *_pflags(),
                         "-E", "not test(/export_bindings/)",
                         "--test-threads", str(test_threads)]
             codegen_cmd = ["cargo", "nextest", "run", "-E", "test(/export_bindings/)"]
         else:
-            compile_cmd = ["cargo", "test", *_pflags(), "--no-run"]
+            compile_cmd = ["cargo", "test", "--no-run"]
             test_cmd = ["cargo", "test", *_pflags(), "--",
                         "--test-threads", str(test_threads), "--skip", "export_bindings"]
             codegen_cmd = ["cargo", "test", "export_bindings"]
 
-        print("Regenerating codegen (serial, pre-fan-out)...\n")
-        # Cold-target safety: compile the test harnesses under their own
-        # CHECK_TIMEOUT before running the tiny codegen tests, mirroring
-        # lane_rust's compile/run split. On a cold target/CI the harness compile
-        # alone can approach the timeout; bundling it with the codegen run under
-        # one budget would reintroduce exactly the timeout case that split exists
-        # to avoid (and the later lane_rust `cargo test compile` cannot rescue a
-        # pre-step that has already timed out). lane_rust's own compile step then
-        # rides this warm cache.
-        run_step("codegen compile", compile_cmd)
-        run_step("codegen", codegen_cmd)
-        # Staleness guard: a non-empty porcelain status under ui/src/generated/ —
-        # modified or untracked — means the developer's Rust types and the
-        # committed TS don't line up. Recorded (not aborted) so the parallel phase
-        # still runs and the developer gets every failure in one pass; the readers
-        # below then validate against the freshly-regenerated (correct) tree.
-        run_step("codegen-stale", ["bash", "-c", (
-            'out=$(git status --porcelain -- ui/src/generated/); '
-            'if [ -n "$out" ]; then '
-            '  echo "ui/src/generated/ has uncommitted changes:"; '
-            '  echo "$out"; '
-            '  echo ""; '
-            '  echo "Run \'./dev.py codegen\' and commit the result."; '
-            '  exit 1; '
-            'fi'
-        )])
+        # Scratch base for the ts-rs export. Every `#[ts(export_to)]` in the
+        # workspace uses a `../../../ui/src/generated/` path relative to the
+        # export base, so three sacrificial levels keep the resolved output
+        # inside the scratch dir: <scratch>/x/x/x/../../../ -> <scratch>/.
+        codegen_scratch = ROOT / "target" / "codegen-scratch"
+        if codegen_scratch.exists():
+            shutil.rmtree(codegen_scratch)
+        codegen_export_base = codegen_scratch / "x" / "x" / "x"
+        codegen_export_base.mkdir(parents=True)
 
-    print("\nRunning checks in parallel...\n")
+        def codegen_stale_step():
+            """Diff the scratch ts-rs export against committed ui/src/generated/.
 
-    # Threads carry the lane name so a hung-thread report names the lane.
-    _all_threads = [
-        threading.Thread(target=lane_rust, name="rust"),
-        threading.Thread(target=lane_clippy, name="clippy"),
-        # Use the `typecheck` script so contributors running `pnpm typecheck`
-        # locally exercise the same `tsc -b --noEmit` invocation this lane
-        # uses. Project references + exactOptionalPropertyTypes only fire
-        # under `-b`; bare `pnpm exec tsc --noEmit` silently misses them.
-        threading.Thread(target=run_step, args=("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR), name="tsc"),
-        threading.Thread(target=lane_ui_lint, name="ui-lint"),
-        threading.Thread(target=run_step, args=("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR), name="vitest"),
-        threading.Thread(target=lane_fast, name="fast"),
-        threading.Thread(target=check_ast_grep, name="ast-grep"),
-        threading.Thread(target=check_allium, name="allium"),
-        threading.Thread(target=check_spec_anchors, name="spec-anchors"),
-        threading.Thread(target=check_package_lock_clean, name="pkglock"),
-        threading.Thread(target=lane_e2e, name="e2e"),
+            A mismatch means the developer's Rust types and the committed TS
+            don't line up. Recorded (not aborted) so the rest of the lane and
+            the parallel phase still run and every failure lands in one pass.
+            """
+            step, t0 = "codegen-stale", time.monotonic()
+            reporter.step_start("rust", step)
+            # Only ts-rs-generated files participate: the directory also
+            # holds the hand-authored sse.ts barrel, which ts-rs never
+            # exports. Generated files are identified by the header ts-rs
+            # writes as their first line.
+            def _is_generated(p: Path) -> bool:
+                with open(p, encoding="utf-8") as f:
+                    return f.readline().startswith("// This file was generated by")
+            committed = {p.name: p
+                         for p in (ROOT / "ui" / "src" / "generated").glob("*.ts")
+                         if _is_generated(p)}
+            exported = {p.name: p for p in codegen_scratch.rglob("*.ts")}
+            problems = []
+            if not exported:
+                problems.append(
+                    f"no .ts files found under {codegen_scratch} — "
+                    "TS_RS_EXPORT_DIR was not honored by the export tests?"
+                )
+            problems += [f"not committed: ui/src/generated/{n}"
+                         for n in sorted(exported.keys() - committed.keys())]
+            problems += [f"committed but no longer exported: ui/src/generated/{n}"
+                         for n in sorted(committed.keys() - exported.keys())]
+            problems += [f"stale: ui/src/generated/{n}"
+                         for n in sorted(exported.keys() & committed.keys())
+                         if exported[n].read_bytes() != committed[n].read_bytes()]
+            rc, detail = (1, (
+                "ui/src/generated/ does not match a fresh ts-rs export:\n"
+                + "\n".join(f"  {p}" for p in problems)
+                + "\n\nRun './dev.py codegen' and commit the result."
+            )) if problems else (0, "")
+            elapsed = time.monotonic() - t0
+            with results_lock:
+                results.append((step, rc, elapsed, detail))
+            reporter.step_done("rust", step, rc, elapsed)
+
+    reporter.banner("\nRunning checks in parallel...\n")
+
+    def _lane(fn):
+        """Wrap a lane body with reporter lifecycle events."""
+        def wrapped():
+            lane = threading.current_thread().name
+            reporter.lane_start(lane)
+            try:
+                fn()
+            finally:
+                reporter.lane_done(lane)
+        return wrapped
+
+    # Threads carry the lane name so a hung-thread report names the lane
+    # (and so run_step can attribute steps to lanes for the reporter).
+    _lane_targets = [
+        ("rust", lane_rust),
+        ("clippy", lane_clippy),
+        # tsc: use the `typecheck` script so contributors running
+        # `pnpm typecheck` locally exercise the same `tsc -b --noEmit`
+        # invocation this lane uses. Project references +
+        # exactOptionalPropertyTypes only fire under `-b`; bare
+        # `pnpm exec tsc --noEmit` silently misses them.
+        ("tsc", lambda: run_step("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR)),
+        ("ui-lint", lane_ui_lint),
+        ("vitest", lambda: run_step("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
+        ("fast", lane_fast),
+        ("ast-grep", check_ast_grep),
+        ("allium", check_allium),
+        ("spec-anchors", check_spec_anchors),
+        ("pkglock", check_package_lock_clean),
+        ("e2e", lane_e2e),
     ]
-    threads = [t for t in _all_threads if t.name in active]
+    threads = [threading.Thread(target=_lane(fn), name=name)
+               for name, fn in _lane_targets if name in active]
     # daemon=True so a hung lane does not block interpreter shutdown after
     # we report it as failed and call sys.exit(1). Non-daemon threads cause
     # Python to wait at exit, defeating the hung-lane detection below.
@@ -3259,6 +3570,9 @@ def cmd_check(gate: bool = True):
     for t in threads:
         t.join(timeout=LANE_JOIN_TIMEOUT)
     stuck = [t for t in threads if t.is_alive()]
+    # Stop the live renderer before any direct printing below (hung-lane
+    # lines, failure dumps, summary) — plain mode's close() is a no-op.
+    reporter.close()
     for t in stuck:
         with results_lock:
             label = f"hung: {t.name}"
@@ -5000,11 +5314,11 @@ def cmd_prod_build(version: str | None = None):
         sys.exit(1)
 
 
-def cmd_prod_deploy(version: str | None = None):
+def cmd_prod_deploy(version: str | None = None, pretty: bool = False):
     """Build and deploy to production (auto-detects environment)."""
     print("Running pre-deploy checks...\n")
     # Deploys always run the full suite — never gate by changed paths.
-    cmd_check(gate=False)
+    cmd_check(gate=False, pretty=pretty)
     print()
 
     env = detect_prod_env()
@@ -5093,6 +5407,32 @@ def cmd_prod_override_unset(name: str):
 # Main
 # =============================================================================
 
+def _bootstrap_rich() -> None:
+    """Make rich importable for --pretty without it being a standing dep.
+
+    rich is deliberately absent from this script's PEP 723 dependencies so
+    the default path never downloads it. When --pretty is requested and rich
+    isn't importable, re-exec through `uv run --with rich` (uv caches the
+    resulting environment, so this costs one resolve on first use). If the
+    bootstrap already ran and rich still isn't importable, fall through —
+    _make_reporter degrades to plain output with a notice.
+    """
+    try:
+        import rich  # noqa: F401
+        return
+    except ImportError:
+        pass
+    if os.environ.get("_PHOENIX_PRETTY_BOOTSTRAP") == "1":
+        return
+    env = dict(os.environ, _PHOENIX_PRETTY_BOOTSTRAP="1")
+    os.execvpe(
+        "uv",
+        ["uv", "run", "--with", "rich>=13,<15", str(Path(__file__).resolve()),
+         *sys.argv[1:]],
+        env,
+    )
+
+
 def main():
     # `taskmd` is a verbatim passthrough to the bundled taskmd CLI — intercept
     # it before argparse so flags like `--version` / `--help` reach taskmd
@@ -5103,6 +5443,10 @@ def main():
         return
 
     parser = argparse.ArgumentParser(prog="dev.py", description="Phoenix development tasks")
+    parser.add_argument(
+        "--pretty", dest="pretty_global", action="store_true", default=False,
+        help="Render long-running commands (check, prod deploy) as a live lane table",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # up
@@ -5139,6 +5483,15 @@ def main():
     check_parser.add_argument(
         "--all", dest="check_all", action="store_true", default=False,
         help="Run every lane, disabling incremental path-gating (also: PHOENIX_CHECK_ALL=1)",
+    )
+    check_parser.add_argument(
+        "--lanes", default=None, metavar="A,B,...",
+        help="Run only this comma-separated lane subset (CI splits the check "
+             "across runners with it); gating still applies within the subset",
+    )
+    check_parser.add_argument(
+        "--pretty", action="store_true", default=False,
+        help="Render lanes as a live table instead of line-per-step output",
     )
 
     # audit-specs (manual / verbose run; the orphan-anchor half also
@@ -5181,6 +5534,10 @@ def main():
     build_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
     deploy_parser = prod_sub.add_parser("deploy", help="Build and deploy to production")
     deploy_parser.add_argument("version", nargs="?", help="Git tag (default: HEAD)")
+    deploy_parser.add_argument(
+        "--pretty", action="store_true", default=False,
+        help="Render the pre-deploy check as a live lane table",
+    )
     prod_sub.add_parser("status", help="Show production status")
     prod_sub.add_parser("stop", help="Stop production service")
     # Override management
@@ -5206,6 +5563,11 @@ def main():
 
     args = parser.parse_args()
 
+    # --pretty composes from the global flag and the per-subcommand flag.
+    pretty = args.pretty_global or getattr(args, "pretty", False)
+    if pretty:
+        _bootstrap_rich()
+
     if args.command == "up":
         cmd_up(
             phoenix_port=args.port,
@@ -5222,7 +5584,7 @@ def main():
     elif args.command == "status":
         cmd_status()
     elif args.command == "check":
-        cmd_check(gate=not args.check_all)
+        cmd_check(gate=not args.check_all, lanes=args.lanes, pretty=pretty)
     elif args.command == "codegen":
         if not cmd_codegen():
             sys.exit(1)
@@ -5245,7 +5607,7 @@ def main():
         if args.prod_command == "build":
             cmd_prod_build(args.version)
         elif args.prod_command == "deploy":
-            cmd_prod_deploy(args.version)
+            cmd_prod_deploy(args.version, pretty=pretty)
         elif args.prod_command == "status":
             cmd_prod_status()
         elif args.prod_command == "stop":

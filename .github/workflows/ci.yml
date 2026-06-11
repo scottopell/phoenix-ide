@@ -15,14 +15,46 @@ concurrency:
 
 jobs:
   check:
-    name: ./dev.py check
+    # The check is split across parallel runners by lane (dev.py check
+    # --lanes); wall clock is the slowest leg instead of the sum. Gating
+    # mode is explicit per event — dev.py refuses to auto-derive a gating
+    # base under CI (a derived base on a main push diffs HEAD against
+    # itself and silently skips every lane):
+    #   - push to main:  PHOENIX_CHECK_ALL=1 — always the full suite.
+    #   - pull_request:  PHOENIX_CHECK_BASE=origin/main — lanes untouched
+    #     by the PR are skipped; main re-runs the full suite post-merge and
+    #     the notify-main-failure job below files an issue if that breaks.
+    name: check (${{ matrix.lane-group }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # rust: codegen + cargo test (+ fmt/task validation riding along).
+          # Chrome so the browser tests run instead of auto-skipping.
+          - lane-group: rust
+            lanes: rust,fast
+            needs-ui: false
+            needs-chrome: true
+          - lane-group: clippy
+            lanes: clippy
+            needs-ui: false
+            needs-chrome: false
+          # e2e drives a real phoenix-ide binary over HTTP/SSE; no browser,
+          # no UI toolchain (the embedded-assets read tolerates empty ui/dist).
+          - lane-group: e2e
+            lanes: e2e
+            needs-ui: false
+            needs-chrome: false
+          # Everything that reads the committed UI tree + the spec lanes.
+          - lane-group: ui
+            lanes: tsc,ui-lint,vitest,ast-grep,allium,spec-anchors,pkglock
+            needs-ui: true
+            needs-chrome: false
 
     env:
-      # GH runners have outbound network — let network-gated Rust tests run
-      # instead of auto-skipping. (dev.py probes and would skip on failure;
-      # leaving this unset keeps the probe authoritative.)
       CARGO_TERM_COLOR: always
       # sccache wraps rustc and content-addresses every compilation, so a PR
       # reuses object files for any crate whose source is unchanged vs the
@@ -30,14 +62,22 @@ jobs:
       # rust-cache target/ snapshot. Backs up the Cache Cargo step below.
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
+      # Explicit gating mode — see the job comment above.
+      PHOENIX_CHECK_ALL: ${{ github.event_name == 'push' && '1' || '' }}
+      PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so PR gating can compute merge-base(HEAD, origin/main).
+          fetch-depth: 0
 
       # --- Toolchains -----------------------------------------------------
 
       # Reads rust-toolchain.toml: pins 1.94.1, pulls rustfmt + clippy and
-      # the x86_64-unknown-linux-musl target declared there.
+      # the x86_64-unknown-linux-musl target declared there. Every leg gets
+      # Rust: rust/clippy/e2e compile; ui needs cargo for the allium binary
+      # install fallback.
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -48,14 +88,12 @@ jobs:
         with:
           # Keep ~/.cargo/bin (cargo-nextest, allium) across runs.
           cache-bin: true
-          # One bucket shared by main + every PR (no per-branch key). A PR
-          # whose Cargo.lock differs from main misses the exact key but hits
+          # One bucket per lane group (their target/ contents differ),
+          # shared by main + every PR (no per-branch key). A PR whose
+          # Cargo.lock differs from main misses the exact key but hits
           # rust-cache's restore-key prefix and warm-starts from main's
           # dependency artifacts, recompiling only what actually changed.
-          # (An earlier `key: profile-${hashFiles('Cargo.toml')}` exiled every
-          # branch with any Cargo.toml delta to its own cold bucket that the
-          # post-step never re-saved — persistent full cold compiles.)
-          shared-key: check
+          shared-key: check-${{ matrix.lane-group }}
           # Only main writes the bucket; PRs restore it read-only, so one
           # continuously-warm cache survives instead of PR branches evicting
           # main's under the 10 GB limit.
@@ -72,12 +110,14 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Set up pnpm
+        if: matrix.needs-ui
         uses: pnpm/action-setup@v4
         # Reads packageManager from ui/package.json — single source of truth.
         with:
           package_json_file: ui/package.json
 
       - name: Set up Node
+        if: matrix.needs-ui
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
@@ -88,6 +128,7 @@ jobs:
       # signing keys). The corepack bundled with older Node LTS is too old;
       # install the latest so dev.py's preflight passes.
       - name: Upgrade corepack
+        if: matrix.needs-ui
         run: |
           npm i -g corepack@latest
           corepack enable
@@ -99,16 +140,19 @@ jobs:
       # --- Optional check dependencies (so nothing is skipped) ------------
 
       - name: Install cargo-nextest
+        if: matrix.lane-group == 'rust' || matrix.lane-group == 'e2e'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
 
       - name: Install ast-grep
+        if: matrix.needs-ui
         run: npm i -g @ast-grep/cli
 
       # allium-cli has no prebuilt binstall artifact; compile it. Cached in
       # ~/.cargo/bin by the rust-cache step above (cache-bin: true).
       - name: Install allium-cli
+        if: matrix.needs-ui
         run: |
           if ! command -v allium >/dev/null 2>&1; then
             cargo install allium-cli --locked
@@ -118,6 +162,7 @@ jobs:
       # PHOENIX_CHROME_EXECUTABLE and the browser tests run instead of
       # auto-skipping.
       - name: Set up Chrome
+        if: matrix.needs-chrome
         uses: browser-actions/setup-chrome@v1
         with:
           install-dependencies: true
@@ -135,13 +180,14 @@ jobs:
       # ensure_ui_deps() finds node_modules and skips a non-frozen install
       # (which could otherwise drift the lockfile and trip pkglock-clean).
       - name: Install UI dependencies
+        if: matrix.needs-ui
         run: pnpm install --frozen-lockfile
         working-directory: ui
 
       # --- The gate -------------------------------------------------------
 
-      - name: ./dev.py check
-        run: ./dev.py check
+      - name: ./dev.py check (${{ matrix.lanes }})
+        run: ./dev.py check --lanes "${{ matrix.lanes }}"
 
   # A failed `check` on main would otherwise be silent. Track it as a single
   # deduplicated issue: open (or comment on) it on failure, close it on the

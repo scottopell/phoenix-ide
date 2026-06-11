@@ -136,6 +136,13 @@ Mid-QA on a sub-agent's commit you spot drift in a file that was out of their sc
 ./dev.py check       # clippy + fmt + tests + task validation
 ```
 
+`check` extras: `--all` disables incremental path-gating; `--lanes a,b` runs a
+lane subset (CI splits the check across runners with it); `--pretty` renders a
+live lane table (also works as a global flag, e.g. `./dev.py --pretty check`).
+In CI, gating mode must be explicit: full runs set `PHOENIX_CHECK_ALL=1`, gated
+runs set `PHOENIX_CHECK_BASE`; `check` refuses to auto-derive a base under
+`CI=true` (a derived base on a main push would silently skip every lane).
+
 **Workflow:** `./dev.py up` → make changes → `./dev.py restart` (Rust changes) or save (UI auto-reloads via Vite) → `./dev.py check` → commit
 
 In dev mode, Vite serves `ui/` with hot reload. In production, `ui/dist/` is embedded into the Rust binary via RustEmbed.
