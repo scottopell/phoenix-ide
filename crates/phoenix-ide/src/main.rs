@@ -471,17 +471,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // redirect base known, background MCP discovery (which may immediately
     // hit a 401 and start an OAuth flow) can start.
     {
-        let scheme = if loaded_tls.is_some() { "https" } else { "http" };
+        let scheme = if loaded_tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
         let ip = bind_address.ip();
         let host = if ip.is_unspecified() || ip.is_loopback() {
             "localhost".to_string()
         } else {
             ip.to_string()
         };
-        mcp_manager.set_oauth_redirect_base(format!(
-            "{scheme}://{host}:{}",
-            bind_address.port()
-        ));
+        mcp_manager.set_oauth_redirect_base(format!("{scheme}://{host}:{}", bind_address.port()));
     }
     mcp_manager.start_background_discovery();
 
