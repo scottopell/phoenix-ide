@@ -16,14 +16,14 @@ natively, without the `mcp-remote` subprocess bridge.
 
 | Requirement | Title | Status | Notes |
 |---|---|---|---|
-| REQ-MCP-001 | Transport-Tagged Config Discovery | Partial | `read_all_configs` discovers + merges stdio entries; HTTP entries are skipped today. HTTP classification is the change. |
+| REQ-MCP-001 | Transport-Tagged Config Discovery | Complete | `read_all_configs` merges entries first-seen-wins; `classify_config_entry` tags each as `Stdio` (a `command`) or `Http` (`type: "http"` + `url`, with generic `headers` and an optional `auth` credential), skipping unusable entries at `debug`. |
 | REQ-MCP-002 | Transport-Agnostic JSON-RPC Protocol | Complete | Protocol (initialize / paginated `tools/list` / `tools/call` / notification handling via `ServerMessageSink`) lives on `McpServer` over the `McpTransport` trait; failures are the typed `TransportError`. `StdioTransport` is the sole impl until M2. |
 | REQ-MCP-003 | Stdio Transport | Complete | `StdioTransport::spawn` / `McpServer::initialize` / `list_tools`; crash detection (`is_alive`, `TransportError::Disconnected` classification) + `respawn` in `mcp.rs`. |
-| REQ-MCP-004 | Streamable HTTP Transport | Not started | M2. POST + `application/json`/`text/event-stream` response handling; `MCP-Protocol-Version` header. |
-| REQ-MCP-005 | HTTP Session Lifecycle | Not started | M2. `Mcp-Session-Id` capture/echo; DELETE on shutdown; 404 → re-initialize. |
+| REQ-MCP-004 | Streamable HTTP Transport | Complete | `HttpTransport` (`mcp/http.rs`): POST with the dual `Accept` pair, unary-JSON and SSE-stream response handling (`SseFramer`), `MCP-Protocol-Version` echoed after `initialize`, 202-with-empty-body accepted for notifications. |
+| REQ-MCP-005 | HTTP Session Lifecycle | Complete | `Mcp-Session-Id` captured at `initialize` and echoed on every request; DELETE on shutdown (`HttpTransport::shutdown`); 404 → `TransportError::SessionExpired` → re-initialize before one retry. |
 | REQ-MCP-006 | Server-Initiated Stream and Resumability | Not started | M4. GET SSE stream; `tools/list_changed`; `Last-Event-ID` replay. |
-| REQ-MCP-007 | HTTP Connection Recovery | Not started | M2. Reconnect on transport error, distinct from stdio respawn. |
-| REQ-MCP-008 | Static Token / Header Authentication | Not started | M2. Config-supplied bearer/headers attached per request. Falls out of transport header plumbing. |
+| REQ-MCP-007 | HTTP Connection Recovery | Complete | `McpServer::should_reestablish`: HTTP recovers from `Disconnected`/`Timeout`/`SessionExpired` by rebuilding the client + handshake, distinct from the stdio respawn (which recovers only from `Disconnected`). |
+| REQ-MCP-008 | Static Token / Header Authentication | Complete | `HttpAuth::Static` (bearer or designated auth headers) attached to every request; generic `headers` ride every request without classifying the server. The 401-versus-OAuth routing distinction becomes observable when the OAuth flow exists (M3). |
 | REQ-MCP-009 | OAuth 2.1 Authorization Discovery | Not started | M3. 401 → PRM (RFC 9728) → AS metadata (RFC 8414). |
 | REQ-MCP-010 | Client Identity Acquisition | Not started | M3. Prefer pre-configured / cached registration / Client ID Metadata Document; RFC 7591 DCR as fallback. `OAuthRegistration` keyed by authorization server. |
 | REQ-MCP-011 | Authorization Code Flow with PKCE | Not started | M3. Native auth-code + PKCE; no `mcp-remote`. |
@@ -42,9 +42,9 @@ This spec set is M0 of the native HTTP MCP build-out. The milestones:
 
 - **M1** (done) -- Extract the `McpTransport` trait; turn `McpServerConfig`
   into a `Stdio | Http` enum. No behavior change (REQ-MCP-002, REQ-MCP-015).
-- **M2** -- Streamable HTTP transport substrate with static/no auth
-  (REQ-MCP-004, -005, -007, -008). Prerequisite for OAuth, not an independent
-  release.
+- **M2** (done) -- Streamable HTTP transport substrate with static/no auth
+  (REQ-MCP-001, -004, -005, -007, -008). Prerequisite for OAuth, not an
+  independent release.
 - **M3** -- OAuth 2.1, the value driver. First releasable unit = M2 + M3
   (REQ-MCP-009 .. -013).
 - **M4** -- Server-initiated SSE stream + resumability (REQ-MCP-006).

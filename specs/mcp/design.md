@@ -137,7 +137,12 @@ struct PreconfiguredClient {
 ```
 
 `read_all_configs` classifies each `mcpServers` entry into a variant
-(REQ-MCP-001). Crucially, presence of the generic `headers` map alone does
+(REQ-MCP-001). The JSON shape of an HTTP entry is `{"type": "http", "url":
+..., "headers": {...}, "auth": ...}` where `auth` is absent (`HttpAuth::None`),
+`{"bearer": "<token>"}`, or `{"headers": {...}}` (the two `StaticCred` shapes).
+An entry whose `auth` has an unrecognized shape is skipped at `debug` rather
+than downgraded to no-auth -- silently dropping an intended credential would
+change which authorization path a 401 takes. Crucially, presence of the generic `headers` map alone does
 **not** make a server `Static`: only an explicit auth credential
 (`StaticCred`) does. So three cases are distinct: a header-authed internal
 server (`Static(Headers)`) whose rejected key yields `StaticAuthRejected`; an
