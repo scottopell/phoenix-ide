@@ -74,10 +74,9 @@ Two layers cooperate:
 
 ## Mode rules (summary)
 
-- **Explore parent** → top-level Explore registries do not expose
-  `spawn_agents`. If an Explore-origin spawn request is nevertheless handled
-  (for example from an older in-flight turn), Work mode is rejected and only
-  Explore sub-agents are valid.
+- **Explore parent** → can spawn Explore sub-agents only when the process-wide
+  Explore policy has OS sandbox support. A Work spawn request from an Explore
+  parent is rejected at spawn time.
 - **Work / Branch / Direct parent** → can spawn either mode; at most one
   Work sub-agent active at a time per parent (one-writer invariant), and
   per single `spawn_agents` call. Multiple Explore sub-agents in parallel

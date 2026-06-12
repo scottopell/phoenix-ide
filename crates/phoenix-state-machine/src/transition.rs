@@ -4235,6 +4235,7 @@ mod tests {
         // Create a sub-agent context
         let subagent_ctx = ConvContext {
             mode_context: None,
+            explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
             working_dir: PathBuf::from("/tmp"),
@@ -4625,6 +4626,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
             working_dir: PathBuf::from("/tmp"),
@@ -4732,6 +4734,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
             working_dir: PathBuf::from("/tmp"),
@@ -4785,6 +4788,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
             working_dir: PathBuf::from("/tmp"),
@@ -4845,6 +4849,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
             working_dir: PathBuf::from("/tmp"),

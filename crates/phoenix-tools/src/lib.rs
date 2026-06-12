@@ -59,7 +59,9 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 pub use browser::BrowserSession;
+use phoenix_core::domain::sm_state::ExploreBashCapability;
 use phoenix_core::llm_service::LlmSelector;
+use phoenix_core::platform::PlatformCapability;
 use phoenix_core::work_scope::WorkScope;
 
 /// Test-only `LlmSelector` that offers no completion service.
@@ -573,7 +575,54 @@ fn parent_terminal_tools() -> Vec<Arc<dyn Tool>> {
     ]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExploreToolPolicy {
+    bash: ExploreBashCapability,
+}
+
+impl ExploreToolPolicy {
+    #[must_use]
+    pub fn from_platform(platform: &PlatformCapability) -> Self {
+        Self {
+            bash: if platform.has_sandbox() {
+                ExploreBashCapability::Sandboxed
+            } else {
+                ExploreBashCapability::Unavailable
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn bash(self) -> ExploreBashCapability {
+        self.bash
+    }
+
+    #[must_use]
+    pub const fn has_sandboxed_bash(self) -> bool {
+        matches!(self.bash, ExploreBashCapability::Sandboxed)
+    }
+
+    #[must_use]
+    pub const fn allow_top_level_spawn_agents(self) -> bool {
+        self.has_sandboxed_bash()
+    }
+}
+
 impl ToolRegistry {
+    #[must_use]
+    pub fn explore(
+        tasks_dir_name: &str,
+        agents: Vec<phoenix_agents::AgentDefinition>,
+        policy: ExploreToolPolicy,
+    ) -> Self {
+        match policy.bash() {
+            ExploreBashCapability::Sandboxed => {
+                Self::explore_with_sandbox(tasks_dir_name, agents, policy)
+            }
+            ExploreBashCapability::Unavailable => Self::explore_no_sandbox(tasks_dir_name),
+        }
+    }
+
     /// Create tool registry for Explore mode WITHOUT sandbox.
     ///
     /// REQ-PROJ-002, REQ-PROJ-013: Restricted tool set — no bash, no
@@ -581,11 +630,9 @@ impl ToolRegistry {
     /// task files under the project's tasks dir before calling
     /// `propose_task`; writes outside that dir are rejected at runtime.
     #[must_use]
-    pub fn explore_no_sandbox(
-        tasks_dir_name: &str,
-        _agents: Vec<phoenix_agents::AgentDefinition>,
-    ) -> Self {
+    pub fn explore_no_sandbox(tasks_dir_name: &str) -> Self {
         let mut tools = read_only_tools();
+        tools.extend(browser_tools());
         tools.extend(explore_coordination_tools());
         tools.push(Arc::new(PatchTool::for_task_proposal_drafts(
             tasks_dir_name,
@@ -601,11 +648,17 @@ impl ToolRegistry {
     #[must_use]
     pub fn explore_with_sandbox(
         tasks_dir_name: &str,
-        _agents: Vec<phoenix_agents::AgentDefinition>,
+        agents: Vec<phoenix_agents::AgentDefinition>,
+        policy: ExploreToolPolicy,
     ) -> Self {
+        debug_assert!(policy.has_sandboxed_bash());
         let mut tools = read_only_tools();
         tools.push(Arc::new(SandboxedBashTool));
-        tools.extend(explore_coordination_tools());
+        if policy.allow_top_level_spawn_agents() {
+            tools.extend(parent_coordination_tools(agents));
+        } else {
+            tools.extend(explore_coordination_tools());
+        }
         tools.push(Arc::new(PatchTool::for_task_proposal_drafts(
             tasks_dir_name,
         )));
@@ -645,18 +698,28 @@ impl ToolRegistry {
         self
     }
 
-    /// Tool registry for Explore-mode sub-agents (REQ-PROJ-008).
-    /// Read-only tools + `submit_result`/`submit_error`. No bash, no tmux, no
-    /// patch, no spawn, no `ask_user`, no skill, no `propose_task`.
-    /// The tmux session belongs to the worktree's owning conversation, not
-    /// its sub-agents (task 03001).
-    ///
-    /// Bash is intentionally omitted so Explore read-only mode is actually
-    /// read-only — mirroring the parent `explore_no_sandbox` registry, which
-    /// also excludes bash. Once read-only/sandboxed bash exists (REQ-BASH-008),
-    /// it can be re-added here.
+    /// Tool registry for Explore-mode sub-agents using the OS-enforced
+    /// read-only bash sandbox.
     #[must_use]
-    pub fn for_subagent_explore() -> Self {
+    pub fn for_subagent_explore_with_sandbox() -> Self {
+        let mut tools = read_only_tools();
+        tools.push(Arc::new(SandboxedBashTool));
+        tools.extend(browser_tools());
+        tools.extend(sub_agent_terminal_tools());
+        Self { tools }
+    }
+
+    #[must_use]
+    pub fn for_subagent_explore(policy: ExploreToolPolicy) -> Self {
+        match policy.bash() {
+            ExploreBashCapability::Sandboxed => Self::for_subagent_explore_with_sandbox(),
+            ExploreBashCapability::Unavailable => Self::for_subagent_explore_no_sandbox(),
+        }
+    }
+
+    /// Tool registry for Explore-mode sub-agents without sandbox support.
+    #[must_use]
+    pub fn for_subagent_explore_no_sandbox() -> Self {
         let mut tools = read_only_tools();
         tools.extend(browser_tools());
         tools.extend(sub_agent_terminal_tools());
@@ -669,17 +732,19 @@ impl ToolRegistry {
     /// bash is expected here (unlike read-only Explore).
     #[must_use]
     pub fn for_subagent_work() -> Self {
-        let mut registry = Self::for_subagent_explore();
-        registry.tools.push(Arc::new(BashTool));
-        registry.tools.push(Arc::new(PatchTool::default()));
-        registry
+        let mut tools = read_only_tools();
+        tools.push(Arc::new(BashTool));
+        tools.extend(browser_tools());
+        tools.extend(sub_agent_terminal_tools());
+        tools.push(Arc::new(PatchTool::default()));
+        Self { tools }
     }
 
     /// Create tool registry for sub-agents (different tool set)
     #[deprecated(note = "Use for_subagent_explore() or for_subagent_work() instead")]
     #[must_use]
     pub fn for_subagent() -> Self {
-        Self::for_subagent_explore()
+        Self::for_subagent_explore_no_sandbox()
     }
 
     /// Create tool registry with options.
@@ -840,6 +905,18 @@ mod tests {
             .collect()
     }
 
+    fn sandbox_policy() -> ExploreToolPolicy {
+        ExploreToolPolicy {
+            bash: ExploreBashCapability::Sandboxed,
+        }
+    }
+
+    fn no_sandbox_policy() -> ExploreToolPolicy {
+        ExploreToolPolicy {
+            bash: ExploreBashCapability::Unavailable,
+        }
+    }
+
     #[test]
     fn test_browser_tools_registered() {
         let names = names(&ToolRegistry::standard());
@@ -882,13 +959,16 @@ mod tests {
             ("direct", ToolRegistry::direct(Vec::new())),
             (
                 "explore_no_sandbox",
-                ToolRegistry::explore_no_sandbox("tasks", Vec::new()),
+                ToolRegistry::explore("tasks", Vec::new(), no_sandbox_policy()),
             ),
             (
                 "explore_with_sandbox",
-                ToolRegistry::explore_with_sandbox("tasks", Vec::new()),
+                ToolRegistry::explore("tasks", Vec::new(), sandbox_policy()),
             ),
-            ("subagent_explore", ToolRegistry::for_subagent_explore()),
+            (
+                "subagent_explore",
+                ToolRegistry::for_subagent_explore(sandbox_policy()),
+            ),
             ("subagent_work", ToolRegistry::for_subagent_work()),
         ];
 
@@ -914,6 +994,7 @@ mod tests {
     /// terminal capability now and must only appear in Direct/Work —
     /// never in Explore (sandboxed or not) or in sub-agents.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn registry_mode_matrix_capability_boundaries() {
         const PARENT_TERMINAL_TOOLS: &[&str] =
             &["terminal_last_command", "terminal_command_history"];
@@ -949,7 +1030,11 @@ mod tests {
         assert!(direct_fork.contains("patch"));
 
         // Explore (sandbox): read-only/planning tools + sandboxed bash.
-        let work = names(&ToolRegistry::explore_with_sandbox("tasks", Vec::new()));
+        let work = names(&ToolRegistry::explore(
+            "tasks",
+            Vec::new(),
+            sandbox_policy(),
+        ));
         assert!(work.contains("bash"));
         assert!(work.contains("patch"));
         assert!(!work.contains("tmux_run"));
@@ -969,7 +1054,11 @@ mod tests {
         // (limited to the configured tasks dir at runtime; `"tasks"` here
         // is the fixture name). No bash, no tmux, no terminal — the agent
         // only sees what's in the repo here.
-        let explore = names(&ToolRegistry::explore_no_sandbox("tasks", Vec::new()));
+        let explore = names(&ToolRegistry::explore(
+            "tasks",
+            Vec::new(),
+            no_sandbox_policy(),
+        ));
         assert!(explore.contains("propose_task"));
         assert!(explore.contains("ask_user_question"));
         assert!(!explore.contains("spawn_agents"));
@@ -985,15 +1074,10 @@ mod tests {
             );
         }
 
-        // Sub-agent Explore: read-only + submit. No bash (read-only mode must be
-        // actually read-only until sandboxed bash exists, REQ-BASH-008), no
-        // tmux, no patch, no spawn, no ask_user, no propose_task, no
-        // parent-terminal tools.
-        let sub_explore = names(&ToolRegistry::for_subagent_explore());
-        assert!(
-            !sub_explore.contains("bash"),
-            "sub-agent explore must not have bash — read-only mode (REQ-BASH-008)"
-        );
+        // Sub-agent Explore with sandbox: read-only + sandboxed bash + submit.
+        // no ask_user, no propose_task, no parent-terminal tools.
+        let sub_explore = names(&ToolRegistry::for_subagent_explore(sandbox_policy()));
+        assert!(sub_explore.contains("bash"));
         assert!(
             !sub_explore.contains("tmux_run"),
             "sub-agent explore must not have tmux_run (task 94001)"
@@ -1015,6 +1099,11 @@ mod tests {
                 "Sub-agent should not have parent terminal tool {tool}"
             );
         }
+
+        let sub_explore_no_sandbox =
+            names(&ToolRegistry::for_subagent_explore(no_sandbox_policy()));
+        assert!(!sub_explore_no_sandbox.contains("bash"));
+        assert!(sub_explore_no_sandbox.contains("submit_result"));
 
         // Sub-agent Work: Explore + patch.
         let sub_work = names(&ToolRegistry::for_subagent_work());
@@ -1051,6 +1140,10 @@ mod tests {
     fn bash_input_schema_flows_through_to_subagent_registries() {
         for (label, registry) in [
             ("direct", ToolRegistry::direct(Vec::new())),
+            (
+                "subagent_explore",
+                ToolRegistry::for_subagent_explore(sandbox_policy()),
+            ),
             ("subagent_work", ToolRegistry::for_subagent_work()),
         ] {
             let bash = registry

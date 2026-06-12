@@ -27,8 +27,8 @@ use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
 use crate::tools::browser::session::BrowserSessionLifecycleEvent;
 use crate::tools::{
-    BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, TmuxLifecycleEvent,
-    TmuxRegistry, ToolRegistry,
+    BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, ExploreToolPolicy,
+    TmuxLifecycleEvent, TmuxRegistry, ToolRegistry,
 };
 use phoenix_core::work_scope::WorkScope;
 
@@ -939,9 +939,12 @@ pub enum SseEvent {
 /// time). So `Explore` variant means an Explore sub-agent, anything
 /// else means a Work sub-agent. See subagents.allium
 /// `SubAgentRegistryOnResume`.
-fn sub_agent_registry_for_conv_mode(conv_mode: &ConvMode) -> ToolRegistry {
+fn sub_agent_registry_for_conv_mode(
+    conv_mode: &ConvMode,
+    policy: ExploreToolPolicy,
+) -> ToolRegistry {
     match conv_mode {
-        ConvMode::Explore { .. } => ToolRegistry::for_subagent_explore(),
+        ConvMode::Explore { .. } => ToolRegistry::for_subagent_explore(policy),
         ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
             ToolRegistry::for_subagent_work()
         }
@@ -1719,6 +1722,7 @@ impl RuntimeManager {
         );
         conv_context.max_turns = spec.max_turns;
         conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode));
+        conv_context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         conv_context.mode = match &sub_conv_mode {
             ConvMode::Direct => ModeKind::Direct,
             ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
@@ -1753,8 +1757,9 @@ impl RuntimeManager {
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), spec.model_id.clone());
         // Select tool registry based on sub-agent mode (REQ-PROJ-008).
         // Sub-agents get MCP access via the parent's MCP manager.
+        let explore_policy = ExploreToolPolicy::from_platform(&self.platform);
         let registry = match spec.mode {
-            SubAgentMode::Explore => ToolRegistry::for_subagent_explore(),
+            SubAgentMode::Explore => ToolRegistry::for_subagent_explore(explore_policy),
             SubAgentMode::Work => ToolRegistry::for_subagent_work(),
         };
         // Sub-agents cannot spawn, so they carry an empty agent catalog.
@@ -1955,6 +1960,7 @@ impl RuntimeManager {
             ConvContext::new(&conv.id, conv_cwd.path_buf(), &model_id, context_window)
         };
         context.mode_context = Some(mode_context);
+        context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
         context.desired_base_branch = conv.desired_base_branch.clone();
         context.mode = match &conv.conv_mode {
             ConvMode::Direct => ModeKind::Direct,
@@ -2045,7 +2051,10 @@ impl RuntimeManager {
             Arc::from(phoenix_agents::discover_agents(&context.working_dir))
         };
         let tool_executor = if is_sub_agent {
-            let registry = sub_agent_registry_for_conv_mode(&conv.conv_mode);
+            let registry = sub_agent_registry_for_conv_mode(
+                &conv.conv_mode,
+                ExploreToolPolicy::from_platform(&self.platform),
+            );
             ToolRegistryExecutor::with_mcp(
                 registry,
                 self.mcp_manager.clone(),
@@ -2054,19 +2063,11 @@ impl RuntimeManager {
         } else {
             use crate::db::ConvMode;
             let registry = match conv.conv_mode {
-                ConvMode::Explore { .. } => {
-                    if self.platform.has_sandbox() {
-                        ToolRegistry::explore_with_sandbox(
-                            &context.tasks_dir_name,
-                            agent_catalog.to_vec(),
-                        )
-                    } else {
-                        ToolRegistry::explore_no_sandbox(
-                            &context.tasks_dir_name,
-                            agent_catalog.to_vec(),
-                        )
-                    }
-                }
+                ConvMode::Explore { .. } => ToolRegistry::explore(
+                    &context.tasks_dir_name,
+                    agent_catalog.to_vec(),
+                    ExploreToolPolicy::from_platform(&self.platform),
+                ),
                 ConvMode::Direct => {
                     // Full tool suite for Direct mode. `propose_task` (the
                     // fork proposal) is offered only when the working dir is
@@ -2632,12 +2633,19 @@ mod sub_agent_registry_resume_tests {
     //! contract so a future refactor cannot quietly regress it.
     use super::sub_agent_registry_for_conv_mode;
     use crate::db::{ConvMode, NonEmptyString};
+    use crate::platform::PlatformCapability;
+    use crate::tools::ExploreToolPolicy;
 
     fn registry_has(conv_mode: &ConvMode, tool: &str) -> bool {
-        sub_agent_registry_for_conv_mode(conv_mode)
-            .definitions()
-            .iter()
-            .any(|d| d.name == tool)
+        sub_agent_registry_for_conv_mode(
+            conv_mode,
+            ExploreToolPolicy::from_platform(&PlatformCapability::None {
+                details: "test".into(),
+            }),
+        )
+        .definitions()
+        .iter()
+        .any(|d| d.name == tool)
     }
 
     #[test]

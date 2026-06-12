@@ -2015,6 +2015,12 @@ pub enum ModeKind {
     Branch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExploreBashCapability {
+    Sandboxed,
+    Unavailable,
+}
+
 /// Context for a conversation (immutable configuration)
 #[derive(Debug, Clone)]
 pub struct ConvContext {
@@ -2034,6 +2040,10 @@ pub struct ConvContext {
     pub context_exhaustion_behavior: ContextExhaustionBehavior,
     /// Conversation mode context for system prompt (stable per mode, updated on Explore->Work)
     pub mode_context: Option<crate::domain::mode_context::ModeContext>,
+    /// Explore-mode bash authority surfaced to the system prompt. This is a
+    /// typed capability (not inferred from tool names) so sandboxed and
+    /// unavailable bash cannot be conflated.
+    pub explore_bash: ExploreBashCapability,
     /// Maximum LLM turns for this conversation (0 = unlimited, for parent conversations)
     pub max_turns: u32,
     /// Desired base branch for Managed mode (set at creation, consumed at task approval)
@@ -2085,6 +2095,7 @@ impl ConvContext {
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
             mode_context: None,
+            explore_bash: ExploreBashCapability::Unavailable,
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
@@ -2112,6 +2123,7 @@ impl ConvContext {
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             mode_context: None,
+            explore_bash: ExploreBashCapability::Unavailable,
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,

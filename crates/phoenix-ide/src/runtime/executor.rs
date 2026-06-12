@@ -3383,6 +3383,7 @@ where
         let mode_context = self.context.mode_context.clone();
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
+        let explore_bash = self.context.explore_bash;
 
         // Token streaming channel (REQ-BED-025).
         //
@@ -3494,9 +3495,12 @@ where
             // Build tool definitions before the mode prompt so Explore prose can
             // describe the same tool surface the model receives.
             let tools = tool_executor.definitions_for_language(llm_language).await;
-            let explore_bash_available =
-                matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. }))
-                    && tools.iter().any(|t| t.name == "bash");
+            let explore_bash_capability =
+                if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
+                    explore_bash
+                } else {
+                    phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable
+                };
 
             // Build system prompt with AGENTS.md content + mode context
             // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
@@ -3507,7 +3511,7 @@ where
                 mode_context.as_ref(),
                 llm_language,
                 persona.as_deref(),
-                explore_bash_available,
+                explore_bash_capability,
             );
 
             // Build request — normalize messages against current tool set

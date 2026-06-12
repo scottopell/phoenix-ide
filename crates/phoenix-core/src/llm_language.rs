@@ -15,6 +15,7 @@
 //! (`app_settings.default_llm_language`). Chain continuations and sub-agent
 //! conversations inherit their parent's language.
 
+use crate::domain::sm_state::ExploreBashCapability;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -164,18 +165,22 @@ pub fn sub_agent_suffix(lang: LlmLanguage) -> &'static str {
 // version uses so language is a pure swap.
 
 #[must_use]
-pub fn mode_explore(lang: LlmLanguage, tasks_dir_name: &str, bash_available: bool) -> String {
-    let bash_guidance = match (lang, bash_available) {
-        (LlmLanguage::PhoenixNative, true) => {
+pub fn mode_explore(
+    lang: LlmLanguage,
+    tasks_dir_name: &str,
+    bash: ExploreBashCapability,
+) -> String {
+    let bash_guidance = match (lang, bash) {
+        (LlmLanguage::PhoenixNative, ExploreBashCapability::Sandboxed) => {
             "`bash` is available for read-only local investigation under an OS sandbox: it can read broadly, but source/Git metadata writes and network access are blocked, and only task proposals, scratch, synthetic home, and platform temp are writable."
         }
-        (LlmLanguage::PhoenixNative, false) => {
+        (LlmLanguage::PhoenixNative, ExploreBashCapability::Unavailable) => {
             "`bash` is unavailable because this host cannot enforce the Explore sandbox; use read-only tools instead."
         }
-        (LlmLanguage::Caveman, true) => {
+        (LlmLanguage::Caveman, ExploreBashCapability::Sandboxed) => {
             "Bash can look wide but no write code and no network."
         }
-        (LlmLanguage::Caveman, false) => "No bash here.",
+        (LlmLanguage::Caveman, ExploreBashCapability::Unavailable) => "No bash here.",
     };
     match lang {
         LlmLanguage::PhoenixNative => format!(

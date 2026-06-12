@@ -8,8 +8,10 @@ conversation. Each sub-agent runs in isolation and cannot spawn its own
 sub-agents. The parent specifies mode (explore for read-only research,
 work for write access) and optionally a model and turn budget per
 sub-agent. Mode enforcement rejects Work sub-agent requests from Explore parents
-when such requests are received, but top-level Explore registries do not expose
-`spawn_agents`; Work, Branch, and Direct parents can spawn either, with at
+when such requests are received. Top-level Explore exposes `spawn_agents` only
+when the process has OS sandbox support; in that case spawned Explore
+sub-agents receive sandboxed bash under the same process-wide Explore policy.
+Work, Branch, and Direct parents can spawn either, with at
 most one Work sub-agent active at a time per parent (and per
 `spawn_agents` call). When the parent owns a worktree (Work or Branch
 mode), a Work sub-agent's effective cwd — including any `task.cwd`
