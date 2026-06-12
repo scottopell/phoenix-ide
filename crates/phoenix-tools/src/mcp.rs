@@ -109,6 +109,11 @@ pub trait McpTransport: Send + Sync {
     /// Send a JSON-RPC notification (no id, no response expected).
     async fn notify(&self, notification: &Value) -> Result<(), TransportError>;
 
+    /// The protocol revision advertised in the `initialize` request. A
+    /// transport property: stdio predates the Streamable HTTP transport,
+    /// while HTTP servers negotiate from the revision that introduced it.
+    fn requested_protocol_version(&self) -> &'static str;
+
     /// Whether the underlying connection is still usable
     /// (stdio: the child process is running).
     fn is_alive(&mut self) -> bool;
@@ -294,7 +299,7 @@ impl McpServer {
     /// Returns a display string when the handshake request or response fails.
     pub async fn initialize(&mut self) -> Result<(), String> {
         let params = serde_json::json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": self.transport.requested_protocol_version(),
             "capabilities": {
                 "tools": { "listChanged": true }
             },
@@ -993,17 +998,35 @@ impl McpClientManager {
 
     /// Classify an HTTP entry's `auth` object: `{"bearer": "<token>"}` or
     /// `{"headers": {...}}` is an explicit static credential (REQ-MCP-008).
-    /// An unrecognized shape skips the server -- silently downgrading an
-    /// intended credential to no-auth would change which authorization path
-    /// a 401 takes.
+    /// An unrecognized or malformed shape skips the server -- silently
+    /// downgrading an intended credential to no-auth (or dropping part of
+    /// it) would change which authorization path a 401 takes.
     fn classify_http_auth(name: &str, auth: &Value) -> Option<HttpAuth> {
         if let Some(token) = auth.get("bearer").and_then(|v| v.as_str()) {
             return Some(HttpAuth::Static(StaticCred::Bearer(token.to_string())));
         }
-        if auth.get("headers").is_some() {
-            return Some(HttpAuth::Static(StaticCred::Headers(string_map(
-                auth.get("headers"),
-            ))));
+        if let Some(headers_value) = auth.get("headers") {
+            let Some(object) = headers_value.as_object() else {
+                tracing::debug!(server = %name, "'auth.headers' is not an object");
+                return None;
+            };
+            let mut headers = HashMap::new();
+            for (key, value) in object {
+                let Some(value) = value.as_str() else {
+                    tracing::debug!(
+                        server = %name,
+                        header = %key,
+                        "'auth.headers' value is not a string"
+                    );
+                    return None;
+                };
+                headers.insert(key.clone(), value.to_string());
+            }
+            if headers.is_empty() {
+                tracing::debug!(server = %name, "'auth.headers' is empty");
+                return None;
+            }
+            return Some(HttpAuth::Static(StaticCred::Headers(headers)));
         }
         tracing::debug!(server = %name, "HTTP MCP server with unrecognized 'auth' shape");
         None
@@ -1498,6 +1521,24 @@ mod tests {
             McpClientManager::classify_config_entry("s", &bad_auth),
             None
         );
+
+        // Malformed auth.headers must not become a partial/empty credential.
+        for headers in [
+            serde_json::json!("not-an-object"),
+            serde_json::json!({"X-Api-Key": 42}),
+            serde_json::json!({}),
+        ] {
+            let malformed = serde_json::json!({
+                "type": "http",
+                "url": "https://example.com/mcp",
+                "auth": {"headers": headers},
+            });
+            assert_eq!(
+                McpClientManager::classify_config_entry("s", &malformed),
+                None,
+                "auth.headers {malformed} must skip the server"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1556,6 +1597,10 @@ mod tests {
             Ok(())
         }
 
+        fn requested_protocol_version(&self) -> &'static str {
+            "2024-11-05"
+        }
+
         fn is_alive(&mut self) -> bool {
             true
         }
@@ -1610,6 +1655,11 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, "initialize");
+        assert_eq!(
+            requests[0].1.get("protocolVersion").and_then(Value::as_str),
+            Some("2024-11-05"),
+            "stdio advertises the pre-Streamable-HTTP revision"
+        );
         let notifications = notifications.lock().unwrap();
         assert_eq!(notifications.len(), 1);
         assert_eq!(

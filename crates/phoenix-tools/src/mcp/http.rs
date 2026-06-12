@@ -91,28 +91,34 @@ impl HttpTransport {
     }
 
     /// A POST to the MCP endpoint carrying the base headers, the Accept pair,
-    /// and the session/protocol-version headers when negotiated.
-    fn post(&self, timeout: Duration) -> reqwest::RequestBuilder {
+    /// and the session/protocol-version headers when negotiated. Also returns
+    /// the session id this request carries: concurrent requests classify a
+    /// later 404 against what *they* sent, not the shared state, which
+    /// another request's recovery may have changed meanwhile.
+    fn post(&self, timeout: Duration) -> (reqwest::RequestBuilder, Option<String>) {
+        let session_id = self.session_id.lock().unwrap().clone();
         let mut builder = self
             .client
             .post(&self.url)
             .timeout(timeout)
             .headers(self.base_headers.clone())
             .header(ACCEPT, ACCEPT_BOTH);
-        if let Some(session_id) = self.session_id.lock().unwrap().clone() {
-            builder = builder.header(MCP_SESSION_ID, session_id);
+        if let Some(session_id) = &session_id {
+            builder = builder.header(MCP_SESSION_ID, session_id.as_str());
         }
         if let Some(version) = self.protocol_version.lock().unwrap().clone() {
             builder = builder.header(MCP_PROTOCOL_VERSION, version);
         }
-        builder
+        (builder, session_id)
     }
 
     /// Classify an HTTP status into a `TransportError`, or pass a success
     /// status through. `Ok` carries the response back for body handling.
+    /// `sent_session_id` is the session id this particular request carried.
     fn classify_status(
         &self,
         response: reqwest::Response,
+        sent_session_id: Option<&str>,
     ) -> Result<reqwest::Response, TransportError> {
         let status = response.status();
         if status.is_success() {
@@ -126,10 +132,15 @@ impl HttpTransport {
         match status.as_u16() {
             401 => Err(TransportError::Unauthorized { www_authenticate }),
             403 => Err(TransportError::InsufficientScope { www_authenticate }),
-            404 if self.session_id.lock().unwrap().is_some() => {
+            404 if sent_session_id.is_some() => {
                 // The server-side session is gone; the next initialize must
-                // not echo the dead id (REQ-MCP-005).
-                *self.session_id.lock().unwrap() = None;
+                // not echo the dead id (REQ-MCP-005). Clear only if the
+                // stored id is still the one this request sent -- a
+                // concurrent recovery may already hold a fresh session.
+                let mut stored = self.session_id.lock().unwrap();
+                if stored.as_deref() == sent_session_id {
+                    *stored = None;
+                }
                 Err(TransportError::SessionExpired)
             }
             _ => Err(TransportError::Protocol(format!(
@@ -221,8 +232,8 @@ impl McpTransport for HttpTransport {
             "params": params,
         });
 
-        let response = self
-            .post(timeout)
+        let (builder, sent_session_id) = self.post(timeout);
+        let response = builder
             .json(&body)
             .send()
             .await
@@ -239,7 +250,7 @@ impl McpTransport for HttpTransport {
             }
         }
 
-        let response = self.classify_status(response)?;
+        let response = self.classify_status(response, sent_session_id.as_deref())?;
 
         let content_type = response
             .headers()
@@ -299,8 +310,8 @@ impl McpTransport for HttpTransport {
     }
 
     async fn notify(&self, notification: &Value) -> Result<(), TransportError> {
-        let response = self
-            .post(super::NOTIFY_TIMEOUT)
+        let (builder, sent_session_id) = self.post(super::NOTIFY_TIMEOUT);
+        let response = builder
             .json(notification)
             .send()
             .await
@@ -309,7 +320,15 @@ impl McpTransport for HttpTransport {
         // A conforming server acknowledges an accepted notification with
         // 202 Accepted and no body (REQ-MCP-004); any 2xx is success and the
         // body, if present, is ignored.
-        self.classify_status(response).map(|_| ())
+        self.classify_status(response, sent_session_id.as_deref())
+            .map(|_| ())
+    }
+
+    fn requested_protocol_version(&self) -> &'static str {
+        // The revision that introduced the Streamable HTTP transport;
+        // earlier revisions speak the deprecated HTTP+SSE transport
+        // (REQ-MCP-019).
+        "2025-03-26"
     }
 
     fn is_alive(&mut self) -> bool {
@@ -323,14 +342,18 @@ impl McpTransport for HttpTransport {
         // expiry (REQ-MCP-005). Stateless servers have nothing to delete.
         let session_id = self.session_id.lock().unwrap().take();
         if let Some(session_id) = session_id {
-            let result = self
+            let mut builder = self
                 .client
                 .delete(&self.url)
                 .timeout(Duration::from_secs(5))
                 .headers(self.base_headers.clone())
-                .header(MCP_SESSION_ID, session_id)
-                .send()
-                .await;
+                .header(MCP_SESSION_ID, session_id);
+            // The negotiated protocol version rides every post-initialize
+            // request, the session DELETE included (REQ-MCP-004).
+            if let Some(version) = self.protocol_version.lock().unwrap().clone() {
+                builder = builder.header(MCP_PROTOCOL_VERSION, version);
+            }
+            let result = builder.send().await;
             if let Err(e) = result {
                 tracing::debug!(server = %self.name, "MCP session DELETE failed: {e}");
             }
@@ -674,7 +697,8 @@ mod tests {
         let requests = server.requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
 
-        // initialize: advertises both response framings, no session yet.
+        // initialize: advertises both response framings and a Streamable
+        // HTTP protocol revision, no session yet.
         assert_eq!(requests[0].rpc_method(), "initialize");
         assert_eq!(
             requests[0].header("accept"),
@@ -682,6 +706,14 @@ mod tests {
         );
         assert_eq!(requests[0].header("mcp-session-id"), None);
         assert_eq!(requests[0].header("x-org"), Some("acme"));
+        let init_body: Value = serde_json::from_str(&requests[0].body).expect("json body");
+        assert_eq!(
+            init_body
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str),
+            Some("2025-03-26"),
+            "HTTP must not advertise the stdio-era HTTP+SSE revision"
+        );
 
         // Every request after initialize echoes the session id and the
         // negotiated protocol version.
@@ -836,6 +868,55 @@ mod tests {
         let last = requests.last().expect("requests recorded");
         assert_eq!(last.http_method(), "DELETE");
         assert_eq!(last.header("mcp-session-id"), Some("sess-1"));
+        assert_eq!(
+            last.header("mcp-protocol-version"),
+            Some("2025-03-26"),
+            "the negotiated version rides the session DELETE too"
+        );
+    }
+
+    struct NullSink;
+
+    impl ServerMessageSink for NullSink {
+        fn on_message(&self, _message: Value) {}
+    }
+
+    #[tokio::test]
+    async fn http_concurrent_404s_both_classify_as_session_expired() {
+        let server =
+            TestServer::start(vec![status_response(404, &[]), status_response(404, &[])]).await;
+        let transport =
+            HttpTransport::connect("remote", &server.url, &HashMap::new(), &HttpAuth::None)
+                .expect("connect");
+        *transport.session_id.lock().unwrap() = Some("sess-1".to_string());
+
+        // Both in-flight requests carried the expired session id; the first
+        // 404 clearing the shared state must not demote the second to a
+        // generic protocol error.
+        let (first, second) = tokio::join!(
+            transport.request(
+                "tools/call",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+                &NullSink,
+            ),
+            transport.request(
+                "tools/call",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+                &NullSink,
+            ),
+        );
+
+        assert_eq!(
+            first.expect_err("404 must fail"),
+            TransportError::SessionExpired
+        );
+        assert_eq!(
+            second.expect_err("404 must fail"),
+            TransportError::SessionExpired
+        );
+        assert!(transport.session_id.lock().unwrap().is_none());
     }
 
     #[test]

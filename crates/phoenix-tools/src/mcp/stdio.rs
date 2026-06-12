@@ -255,6 +255,10 @@ impl McpTransport for StdioTransport {
             .map_err(|e| TransportError::Disconnected(format!("notification flush failed: {e}")))
     }
 
+    fn requested_protocol_version(&self) -> &'static str {
+        "2024-11-05"
+    }
+
     fn is_alive(&mut self) -> bool {
         // try_wait returns Ok(Some(status)) if exited, Ok(None) if still running.
         matches!(self.child.try_wait(), Ok(None))
