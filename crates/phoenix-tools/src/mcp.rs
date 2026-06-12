@@ -987,27 +987,34 @@ impl McpClientManager {
     }
 
     /// One `tools/call` attempt via the read-lock path. A call arriving while
-    /// the server is held out of the map for recovery joins the parked claim
-    /// instead of failing with "not connected"; with no claim parked, the
-    /// re-lookup settles whether the server is genuinely gone or a recovery
-    /// just finished.
+    /// the server is held out of the map joins the parked claim instead of
+    /// failing with "not connected", and keeps re-joining if a new claim is
+    /// parked between a release and the re-lookup (back-to-back recoveries);
+    /// absence with no claim parked is settled.
     async fn attempt_call(
         &self,
         server_name: &str,
         tool_name: &str,
         arguments: &Value,
     ) -> Result<CallAttempt, String> {
-        let servers = self.servers.read().await;
-        if let Some(server) = servers.get(server_name) {
-            return Ok(CallAttempt::run(server, tool_name, arguments).await);
+        loop {
+            {
+                let servers = self.servers.read().await;
+                if let Some(server) = servers.get(server_name) {
+                    return Ok(CallAttempt::run(server, tool_name, arguments).await);
+                }
+            }
+            let receiver = self
+                .recovering_map()
+                .get(server_name)
+                .map(tokio::sync::watch::Sender::subscribe);
+            match receiver {
+                Some(mut receiver) => {
+                    let _ = receiver.changed().await;
+                }
+                None => return Err(format!("MCP server '{server_name}' is not connected")),
+            }
         }
-        drop(servers);
-        self.await_claim_release(server_name).await;
-        let servers = self.servers.read().await;
-        let server = servers
-            .get(server_name)
-            .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
-        Ok(CallAttempt::run(server, tool_name, arguments).await)
     }
 
     /// Route a tool call to the correct server.
@@ -1153,16 +1160,13 @@ impl McpClientManager {
             }
         }
 
-        // Retry once via the normal read-lock path after recovery. The server
-        // can be absent here when a followed recovery failed and dropped it.
-        let servers = self.servers.read().await;
-        let server = servers.get(server_name).ok_or_else(|| {
-            format!("MCP server '{server_name}' is not connected after a failed recovery")
-        })?;
-        server
-            .call_tool(tool_name, arguments)
-            .await
-            .map_err(|e| e.into_message(server_name))
+        // Retry once via the same claim-joining lookup. The "not connected"
+        // error here means a followed (or this call's own) recovery failed
+        // and dropped the server.
+        let retry = self
+            .attempt_call(server_name, tool_name, &arguments)
+            .await?;
+        retry.result.map_err(|e| e.into_message(server_name))
     }
 
     /// Connect and initialize a single MCP server. A failed handshake shuts
@@ -1442,7 +1446,21 @@ impl McpClientManager {
 
                     let servers = Arc::clone(&self.servers);
                     let tickets = Arc::clone(&self.connect_tickets);
+                    // Supersede any in-flight connect for this name BEFORE
+                    // acting on the observed absence: with the new ticket
+                    // issued, a stale publish landing from here on is
+                    // discarded by the ticket check. One landing earlier --
+                    // between the absence observation and this issue -- is
+                    // evicted below, so an old attempt's server can neither
+                    // race the new connect nor outlive a failed one.
                     let ticket = self.issue_connect_ticket(&name);
+                    if let Some(mut stale) = self.servers.write().await.remove(&name) {
+                        tracing::warn!(
+                            server = %name,
+                            "Evicting a stale connect that landed before reload superseded it"
+                        );
+                        stale.terminate().await;
+                    }
                     tokio::spawn(async move {
                         let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
                         match result {
@@ -1469,6 +1487,12 @@ impl McpClientManager {
                     unchanged.push(name);
                 }
                 Some(_) => {
+                    // Supersede any in-flight connect BEFORE removing the old
+                    // server: with the new ticket issued, a stale publish can
+                    // no longer slip into the window between the removal and
+                    // the new connect (the removal below sweeps anything that
+                    // landed earlier).
+                    let ticket = self.issue_connect_ticket(&name);
                     let old_server = {
                         let mut servers = self.servers.write().await;
                         match servers.get(&name) {
@@ -1488,7 +1512,6 @@ impl McpClientManager {
                     let oauth = Arc::clone(&self.pending_oauth_urls);
                     let servers = Arc::clone(&self.servers);
                     let tickets = Arc::clone(&self.connect_tickets);
-                    let ticket = self.issue_connect_ticket(&name);
                     restart_pending.insert(name.clone());
                     // The connect runs as a detached task: when the reload
                     // deadline drops the awaiting future below, the task is
@@ -1504,8 +1527,16 @@ impl McpClientManager {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
                                 let tool_count = server.tools.len();
-                                publish_if_current(&servers, &tickets, &name, ticket, server).await;
-                                (name, Ok(tool_count))
+                                if publish_if_current(&servers, &tickets, &name, ticket, server)
+                                    .await
+                                {
+                                    (name, Ok(tool_count))
+                                } else {
+                                    // Nothing was published; reporting this
+                                    // as restarted would describe a server
+                                    // that does not exist.
+                                    (name, Err("superseded by a newer reload".to_string()))
+                                }
                             }
                             Err(error) => (name, Err(error)),
                         }

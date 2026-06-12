@@ -1253,6 +1253,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_call_survives_back_to_back_recovery_claims() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // The server is held under claim 1; when that claim releases the
+        // server is STILL absent because claim 2 is parked in the same
+        // instant (a second recovery starting back-to-back). The call must
+        // keep waiting on the new claim instead of failing "not connected".
+        let (first_claim, _) = tokio::sync::watch::channel(());
+        manager
+            .recovering_map()
+            .insert("remote".to_string(), first_claim);
+        let held = manager
+            .servers
+            .write()
+            .await
+            .remove("remote")
+            .expect("server present");
+        let holder = Arc::clone(&manager);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Replacing the entry drops claim 1 (waking waiters) with claim 2
+            // already parked, atomically under the map lock.
+            let (second_claim, _) = tokio::sync::watch::channel(());
+            holder
+                .recovering_map()
+                .insert("remote".to_string(), second_claim);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            holder
+                .servers
+                .write()
+                .await
+                .insert("remote".to_string(), held);
+            holder.recovering_map().remove("remote");
+        });
+
+        let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
+        server.push_responses(vec![echo_id_response(&call_result)]);
+
+        let output = manager
+            .call_tool("remote", "report", serde_json::json!({}))
+            .await
+            .expect("call must survive consecutive claims");
+        assert_eq!(output, "ok");
+    }
+
+    #[tokio::test]
+    async fn superseded_restart_is_reported_failed_not_restarted() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // Reload 1 restarts the server with a changed config; its connect is
+        // held open for 300ms. Reload 2 (at 100ms) removes the server from
+        // config, revoking the ticket. Reload 1's restart must then report a
+        // failure -- not a successful restart of a discarded server.
+        server.push_responses(vec![delete_ack()]); // old server's terminate
+        let mut recovery = handshake_responses("sess-2");
+        recovery[0] = delayed(recovery[0].clone(), 300);
+        server.push_responses(recovery);
+        server.push_responses(vec![delete_ack()]); // discarded publish's terminate
+
+        let changed = http_config(
+            &server.url,
+            HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
+        );
+        let reloader = Arc::clone(&manager);
+        let first_reload = tokio::spawn(async move {
+            reloader
+                .reload_from_configs(vec![("remote".to_string(), changed)])
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = manager.reload_from_configs(Vec::new()).await;
+        assert!(second.failed.is_empty());
+
+        let first = first_reload.await.expect("first reload");
+        assert!(first.restarted.is_empty(), "nothing was published");
+        assert_eq!(first.failed.len(), 1);
+        assert_eq!(first.failed[0].server, "remote");
+        assert!(
+            first.failed[0].error.contains("superseded"),
+            "got: {}",
+            first.failed[0].error
+        );
+        assert!(manager.servers.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn http_failed_refresh_recovery_drops_the_server() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = McpClientManager::new();
