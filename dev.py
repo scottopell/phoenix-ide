@@ -4416,6 +4416,7 @@ def native_prod_deploy(version: str | None = None):
             ["systemctl", "show", PROD_SERVICE_NAME, "-p", "MainPID", "--value"],
             capture_output=True, text=True,
         ).stdout.strip()
+        t0 = time.monotonic()
         subprocess.run(["sudo", "systemctl", "reload", PROD_SERVICE_NAME], check=True)
 
         # Poll for new PID. SIGHUP graceful exit + Restart=always cycles the
@@ -4442,21 +4443,19 @@ def native_prod_deploy(version: str | None = None):
             )
             sys.exit(1)
 
-        # Verify it came back up
-        result = subprocess.run(
-            ["systemctl", "is-active", PROD_SERVICE_NAME],
-            capture_output=True, text=True
-        )
-        if result.stdout.strip() == "active":
-            write_deployed_sha()
-            print(f"\n✓ Deployed {version} to production (zero-downtime upgrade)")
-            print(f"  Service: {PROD_SERVICE_NAME}")
-            print(f"  Port: {PROD_PORT}")
-            print(f"  Socket: {PROD_SERVICE_NAME}.socket (keeps connections alive)")
-            print(f"  Database: {config.db_path}")
-            print(f"  URL: {_prod_display_url()}")
-        else:
-            print(f"\n⚠ Service restarting... check status with: systemctl status {PROD_SERVICE_NAME}")
+        health_version, elapsed = _wait_for_health(t0, timeout_secs=20.0)
+        if health_version is None:
+            print("WARNING: Health check failed after 20s", file=sys.stderr)
+
+        write_deployed_sha()
+        print(f"\n✓ Deployed {version} to production (zero-downtime upgrade)")
+        print(f"  Version: {health_version or 'unknown'}")
+        print(f"  Startup: {elapsed:.1f}s")
+        print(f"  Service: {PROD_SERVICE_NAME}")
+        print(f"  Port: {PROD_PORT}")
+        print(f"  Socket: {PROD_SERVICE_NAME}.socket (keeps connections alive)")
+        print(f"  Database: {config.db_path}")
+        print(f"  URL: {_prod_display_url()}")
     else:
         # Service not running - start socket first, then service
         print("Starting socket and service...")
@@ -4466,26 +4465,31 @@ def native_prod_deploy(version: str | None = None):
 
         # Start the socket (service will be started on first connection or explicitly)
         subprocess.run(["sudo", "systemctl", "start", f"{PROD_SERVICE_NAME}.socket"], check=True)
+        t0 = time.monotonic()
         subprocess.run(["sudo", "systemctl", "start", PROD_SERVICE_NAME], check=True)
-        time.sleep(1)
 
-        # Verify it started
         result = subprocess.run(
             ["systemctl", "is-active", PROD_SERVICE_NAME],
             capture_output=True, text=True
         )
-        if result.stdout.strip() == "active":
-            write_deployed_sha()
-            print(f"\n✓ Deployed {version} to production")
-            print(f"  Service: {PROD_SERVICE_NAME}")
-            print(f"  Port: {PROD_PORT}")
-            print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
-            print(f"  Database: {config.db_path}")
-            print(f"  URL: {_prod_display_url()}")
-        else:
+        if result.stdout.strip() != "active":
             print(f"\n✗ Service failed to start", file=sys.stderr)
             subprocess.run(["sudo", "journalctl", "-u", PROD_SERVICE_NAME, "-n", "20", "--no-pager"])
             sys.exit(1)
+
+        health_version, elapsed = _wait_for_health(t0, timeout_secs=20.0)
+        if health_version is None:
+            print("WARNING: Health check failed after 20s", file=sys.stderr)
+
+        write_deployed_sha()
+        print(f"\n✓ Deployed {version} to production")
+        print(f"  Version: {health_version or 'unknown'}")
+        print(f"  Startup: {elapsed:.1f}s")
+        print(f"  Service: {PROD_SERVICE_NAME}")
+        print(f"  Port: {PROD_PORT}")
+        print(f"  Socket: {PROD_SERVICE_NAME}.socket (zero-downtime upgrades enabled)")
+        print(f"  Database: {config.db_path}")
+        print(f"  URL: {_prod_display_url()}")
 
 
 def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> str | None:
@@ -4625,6 +4629,28 @@ def _open_prod_health(env: dict[str, str] | None = None, timeout: float = 5.0):
     return urllib.request.urlopen(_prod_local_health_url(env), timeout=timeout, context=context)
 
 
+def _wait_for_health(
+    t0: float,
+    env: dict[str, str] | None = None,
+    timeout_secs: float = 20.0,
+    poll_interval: float = 0.1,
+) -> tuple[str | None, float]:
+    """Poll the health endpoint until it responds or timeout_secs elapses.
+
+    Returns (version_string_or_None, elapsed_seconds_from_t0).
+    t0 should be time.monotonic() captured just before the launch command.
+    """
+    deadline = t0 + timeout_secs
+    while time.monotonic() < deadline:
+        try:
+            with _open_prod_health(env, timeout=poll_interval * 5) as resp:
+                version = resp.read().decode().strip()
+                return version, time.monotonic() - t0
+        except Exception:
+            time.sleep(poll_interval)
+    return None, time.monotonic() - t0
+
+
 def prod_daemon_deploy():
     """Deploy as background daemon in ~/.phoenix-ide/ (no systemd).
 
@@ -4676,6 +4702,7 @@ def prod_daemon_deploy():
     # Start daemonized process. Fresh log per deploy, then append: the binary's
     # appender and this redirect both open O_APPEND so writes interleave safely.
     prod_log_path.write_text("")
+    t0 = time.monotonic()
     with open(prod_log_path, "a") as log:
         proc = subprocess.Popen(
             [str(binary)],
@@ -4689,26 +4716,22 @@ def prod_daemon_deploy():
     with open(prod_pid_path, "w") as f:
         f.write(str(proc.pid))
 
-    # Verify startup
-    time.sleep(2)
-    if proc.poll() is not None:
-        print("ERROR: Server failed to start. Check logs:", file=sys.stderr)
-        print(f"  {prod_log_path}", file=sys.stderr)
-        sys.exit(1)
+    # Bail early if the process dies before the endpoint comes up.
+    def _check_alive() -> None:
+        if proc.poll() is not None:
+            print("ERROR: Server failed to start. Check logs:", file=sys.stderr)
+            print(f"  {prod_log_path}", file=sys.stderr)
+            sys.exit(1)
 
-    # Health check
-    try:
-        import urllib.request
-        with _open_prod_health(env, timeout=5) as resp:
-            version_text = resp.read().decode().strip()
-            version_info = {"version": version_text}
-    except Exception as e:
-        print(f"WARNING: Server started but health check failed: {e}", file=sys.stderr)
-        version_info = {"version": "unknown"}
+    health_version, elapsed = _wait_for_health(t0, env, timeout_secs=20.0)
+    _check_alive()
+    if health_version is None:
+        print("WARNING: Server started but health check failed after 20s", file=sys.stderr)
 
     write_deployed_sha()
     print(f"\n✓ Deployed daemon to production")
-    print(f"  Version: {version_info.get('version', 'unknown')}")
+    print(f"  Version: {health_version or 'unknown'}")
+    print(f"  Startup: {elapsed:.1f}s")
     print(f"  Port: {PROD_PORT}")
     print(f"  Database: {prod_db_path}")
     print(f"  Logs: {prod_log_path}")
@@ -5203,6 +5226,7 @@ def launchd_prod_deploy(version: str | None = None):
 
     # Bootstrap (load + start) the service
     uid = os.getuid()
+    t0 = time.monotonic()
     result = subprocess.run(
         ["launchctl", "bootstrap", f"gui/{uid}", str(LAUNCHD_PLIST_PATH)],
         capture_output=True, text=True,
@@ -5211,24 +5235,15 @@ def launchd_prod_deploy(version: str | None = None):
         print(f"ERROR: launchctl bootstrap failed: {result.stderr}", file=sys.stderr)
         sys.exit(1)
 
-    # Health check with retry (server may take a few seconds to bind the port)
-    health_version = None
-    for attempt in range(5):
-        time.sleep(2)
-        try:
-            with _open_prod_health(env_overrides, timeout=5) as resp:
-                health_version = resp.read().decode().strip()
-            break
-        except Exception:
-            if attempt < 4:
-                continue
-            print("WARNING: Server started but health check failed after 10s", file=sys.stderr)
+    health_version, elapsed = _wait_for_health(t0, env_overrides, timeout_secs=20.0)
+    if health_version is None:
+        print("WARNING: Server started but health check failed after 20s", file=sys.stderr)
 
     write_deployed_sha()
     llm_mode = _llm_mode_summary(env_overrides, gateway)
     print(f"\n✓ Deployed {version} to production (launchd)")
-    if health_version:
-        print(f"  Version: {health_version}")
+    print(f"  Version: {health_version or 'unknown'}")
+    print(f"  Startup: {elapsed:.1f}s")
     print(f"  Database: {PROD_DB_PATH}")
     print(f"  Logs: {LAUNCHD_LOG_PATH}")
     print(f"  LLM: {llm_mode}")
