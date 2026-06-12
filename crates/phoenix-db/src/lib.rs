@@ -2931,6 +2931,49 @@ impl Database {
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
+    /// Resolve the real terminal outcome of each pending sub-agent by reading
+    /// its child conversation row (created with `id == agent_id`). A sub-agent
+    /// that reached `Completed`/`Failed` before the restart is returned with its
+    /// real `Success`/`Failure` outcome; one still running (or whose row is
+    /// missing/corrupt/non-terminal) is omitted, so the caller falls back to the
+    /// "interrupted by server restart" synthetic outcome. Best-effort: a query
+    /// or parse error for one agent simply omits it (never fails the sweep).
+    async fn resolve_pending_sub_agent_outcomes(
+        &self,
+        pending: &[phoenix_core::domain::sm_state::PendingSubAgent],
+    ) -> std::collections::HashMap<String, phoenix_core::domain::sm_state::SubAgentOutcome> {
+        use phoenix_core::domain::sm_state::{ConvState, SubAgentOutcome};
+        use std::collections::HashMap;
+
+        let mut outcomes = HashMap::new();
+        for agent in pending {
+            let row: Option<String> =
+                sqlx::query_scalar("SELECT state FROM conversations WHERE id = ?1")
+                    .bind(&agent.agent_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .ok()
+                    .flatten();
+            let Some(state_json) = row else { continue };
+            let Ok(state) = serde_json::from_str::<ConvState>(&state_json) else {
+                continue;
+            };
+            // Only the two terminal sub-agent states carry a real outcome; any
+            // other (still running) state leaves the agent absent so the caller
+            // uses the interrupted fallback. `if let` chain rather than a match
+            // with a wildcard arm (denied by `wildcard_enum_match_arm`).
+            if let ConvState::Completed { result } = state {
+                outcomes.insert(agent.agent_id.clone(), SubAgentOutcome::Success { result });
+            } else if let ConvState::Failed { error, error_kind } = state {
+                outcomes.insert(
+                    agent.agent_id.clone(),
+                    SubAgentOutcome::Failure { error, error_kind },
+                );
+            }
+        }
+        outcomes
+    }
+
     async fn materialize_in_flight_tool_rounds(&self, now: &DateTime<Utc>) -> DbResult<()> {
         use phoenix_core::domain::sm_state::ConvState;
 
@@ -2974,6 +3017,14 @@ impl Database {
                 continue;
             };
 
+            // A sub-agent can have reached its own terminal state (persisted in
+            // its child conversation row) while the parent only buffered the
+            // result in memory. Read those real outcomes so a finished sub-agent
+            // is fanned in as success/failure rather than "interrupted".
+            let sub_agent_outcomes = self
+                .resolve_pending_sub_agent_outcomes(&pending_sub_agents)
+                .await;
+
             let start_seq = self.next_sequence_id(&conv_id).await?;
             let (agent_msg, tool_msgs) = build_materialized_tool_round(
                 &conv_id,
@@ -2983,6 +3034,7 @@ impl Database {
                 &completed_results,
                 &interrupted_tool_ids,
                 &pending_sub_agents,
+                &sub_agent_outcomes,
             );
 
             // Pairing invariant: every `tool_use` in the assistant message gets
@@ -3934,6 +3986,10 @@ fn synthesize_spawn_fan_ins(
     assistant_message: &phoenix_core::domain::sm_state::AssistantMessage,
     completed_results: &[ToolResult],
     pending_sub_agents: &[phoenix_core::domain::sm_state::PendingSubAgent],
+    sub_agent_outcomes: &std::collections::HashMap<
+        String,
+        phoenix_core::domain::sm_state::SubAgentOutcome,
+    >,
 ) -> std::collections::HashMap<String, (String, serde_json::Value)> {
     use phoenix_core::domain::llm_types::ContentBlock;
     use std::collections::HashMap;
@@ -4006,17 +4062,26 @@ fn synthesize_spawn_fan_ins(
         .iter()
         .map(|r| {
             let agents = by_spawn.remove(&r.tool_use_id).unwrap_or_default();
-            let results: Vec<phoenix_core::domain::sm_state::SubAgentResult> = agents
-                .iter()
-                .map(|a| phoenix_core::domain::sm_state::SubAgentResult {
-                    agent_id: a.agent_id.clone(),
-                    task: a.task.clone(),
-                    outcome: phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
-                        error: "Sub-agent interrupted by server restart".to_string(),
-                        error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
-                    },
-                })
-                .collect();
+            let results: Vec<phoenix_core::domain::sm_state::SubAgentResult> =
+                agents
+                    .iter()
+                    .map(|a| phoenix_core::domain::sm_state::SubAgentResult {
+                        agent_id: a.agent_id.clone(),
+                        task: a.task.clone(),
+                        // The child conversation's real terminal outcome if it
+                        // already finished (success/failure) before the restart;
+                        // otherwise it was genuinely interrupted mid-flight. Without
+                        // this, a sub-agent that succeeded would be reported as a
+                        // failure.
+                        outcome: sub_agent_outcomes.get(&a.agent_id).cloned().unwrap_or_else(
+                            || phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
+                                error: "Sub-agent interrupted by server restart".to_string(),
+                                error_kind:
+                                    phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
+                            },
+                        ),
+                    })
+                    .collect();
             (r.tool_use_id.clone(), build_sub_agent_fan_in(&results))
         })
         .collect()
@@ -4081,6 +4146,7 @@ fn build_sub_agent_fan_in(
 /// `PersistSubAgentResults` path produces (LLM-readable summary + a
 /// `subagent_summary` `display_data`), so the recovered chain reflects "agents
 /// spawned, interrupted by restart" rather than a dangling spawn.
+#[allow(clippy::too_many_arguments)]
 fn build_materialized_tool_round(
     conv_id: &str,
     start_seq: i64,
@@ -4089,6 +4155,10 @@ fn build_materialized_tool_round(
     completed_results: &[ToolResult],
     interrupted_tool_ids: &[String],
     pending_sub_agents: &[phoenix_core::domain::sm_state::PendingSubAgent],
+    sub_agent_outcomes: &std::collections::HashMap<
+        String,
+        phoenix_core::domain::sm_state::SubAgentOutcome,
+    >,
 ) -> (Message, Vec<Message>) {
     let mut next_seq = start_seq;
 
@@ -4108,8 +4178,12 @@ fn build_materialized_tool_round(
     // Map each completed result to its tool's name (from the assistant turn's
     // `tool_use` blocks) so we can identify `spawn_agents` placeholders
     // structurally rather than by matching their output text.
-    let spawn_fan_ins =
-        synthesize_spawn_fan_ins(assistant_message, completed_results, pending_sub_agents);
+    let spawn_fan_ins = synthesize_spawn_fan_ins(
+        assistant_message,
+        completed_results,
+        pending_sub_agents,
+        sub_agent_outcomes,
+    );
 
     let mut tool_msgs: Vec<Message> = Vec::new();
 
@@ -5492,6 +5566,123 @@ mod tests {
         // Idempotent: re-running the sweep must not duplicate or 400-trip.
         db.reset_all_to_idle().await.unwrap();
         assert_eq!(db.get_messages("conv-sa").await.unwrap().len(), 4);
+    }
+
+    /// A pending sub-agent that ALREADY reached its terminal state in its child
+    /// conversation before the restart must be fanned in with its REAL outcome
+    /// (success/failure), not rewritten as "interrupted by server restart". A
+    /// sibling still running keeps the interrupted fallback.
+    #[tokio::test]
+    async fn test_materialize_uses_real_outcome_for_completed_sub_agent() {
+        use phoenix_core::domain::db_schema::ToolResult;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{
+            AssistantMessage, ConvState, PendingSubAgent, SubAgentMode, ThinkInput, ToolCall,
+            ToolInput,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-p", "slug-p", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message("m-u", "conv-p", &MessageContent::user("go"), None, None)
+            .await
+            .unwrap();
+
+        let done_agent = "33333333-3333-4333-8333-333333333333";
+        let running_agent = "44444444-4444-4444-8444-444444444444";
+
+        // The done agent's child conversation (created with id == agent_id)
+        // reached terminal `Completed`.
+        db.create_conversation(done_agent, "sub-done", "/tmp", false, Some("conv-p"), None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            done_agent,
+            &ConvState::Completed {
+                result: "found the bug in the parser".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        // The running agent has a child row that is NOT terminal.
+        db.create_conversation(
+            running_agent,
+            "sub-run",
+            "/tmp",
+            false,
+            Some("conv-p"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let think = |t: &str| ToolInput::Think(ThinkInput { thoughts: t.into() });
+        let assistant = AssistantMessage::new(
+            "asst-p".to_string(),
+            vec![
+                ContentBlock::tool_use(
+                    "sp",
+                    "spawn_agents",
+                    serde_json::json!({"tasks": [{"task": "a"}, {"task": "b"}]}),
+                ),
+                ContentBlock::tool_use("th", "think", serde_json::json!({"thoughts": "t"})),
+            ],
+            None,
+            None,
+        );
+        let placeholder = format!("Spawning 2 sub-agent(s): {done_agent}, {running_agent}");
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new("th", think("t")),
+            remaining_tools: vec![],
+            completed_results: vec![ToolResult::success("sp".to_string(), placeholder)],
+            pending_sub_agents: vec![
+                PendingSubAgent {
+                    agent_id: done_agent.to_string(),
+                    task: "investigate the parser".to_string(),
+                    mode: SubAgentMode::Explore,
+                },
+                PendingSubAgent {
+                    agent_id: running_agent.to_string(),
+                    task: "audit the lexer".to_string(),
+                    mode: SubAgentMode::Explore,
+                },
+            ],
+            assistant_message: assistant,
+        };
+        db.update_conversation_state("conv-p", &state)
+            .await
+            .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        let msgs = db.get_messages("conv-p").await.unwrap();
+        let spawn = msgs
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::Tool(tc) if tc.tool_use_id == "sp" => Some(tc.clone()),
+                MessageContent::Tool(_)
+                | MessageContent::User(_)
+                | MessageContent::Agent(_)
+                | MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Continuation(_)
+                | MessageContent::Skill(_) => None,
+            })
+            .expect("spawn fan-in present");
+
+        // The done agent's real result is fanned in; it is NOT "interrupted".
+        assert!(
+            spawn.content.contains("found the bug in the parser"),
+            "completed sub-agent must show its real result, got: {}",
+            spawn.content
+        );
+        // The still-running agent keeps the interrupted fallback.
+        assert!(
+            spawn.content.contains("interrupted by server restart"),
+            "still-running sub-agent must show interrupted, got: {}",
+            spawn.content
+        );
     }
 
     #[tokio::test]
