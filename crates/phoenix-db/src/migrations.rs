@@ -1376,7 +1376,10 @@ mod tests {
         )
         .execute(&pool)
         .await;
-        assert!(dup.is_err(), "second token row for one server must violate the primary key");
+        assert!(
+            dup.is_err(),
+            "second token row for one server must violate the primary key"
+        );
     }
 
     #[tokio::test]

@@ -844,16 +844,14 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         Ok(
-            row.map(
-                |(client_id, client_secret, token_endpoint_auth_method)| {
-                    McpOAuthRegistrationRow {
-                        auth_server: auth_server.to_string(),
-                        client_id,
-                        client_secret,
-                        token_endpoint_auth_method,
-                    }
-                },
-            ),
+            row.map(|(client_id, client_secret, token_endpoint_auth_method)| {
+                McpOAuthRegistrationRow {
+                    auth_server: auth_server.to_string(),
+                    client_id,
+                    client_secret,
+                    token_endpoint_auth_method,
+                }
+            }),
         )
     }
 
