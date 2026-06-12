@@ -791,6 +791,19 @@ impl McpServer {
 // protocol mechanics in `mcp/oauth.rs`.
 // ---------------------------------------------------------------------------
 
+/// The authorization server a config pins via a pre-configured client, as a
+/// normalized issuer key. `None` for a dynamically discovered issuer and for
+/// non-OAuth configs.
+fn pinned_auth_server(config: &McpServerConfig) -> Option<String> {
+    match config {
+        McpServerConfig::Http {
+            auth: HttpAuth::OAuth(Some(preconfigured)),
+            ..
+        } => Some(oauth::normalize_issuer(&preconfigured.auth_server)),
+        McpServerConfig::Http { .. } | McpServerConfig::Stdio { .. } => None,
+    }
+}
+
 /// The URL of an HTTP server whose 401s drive the OAuth flow: an explicit
 /// static credential opts out (`StaticAuthRejected`, REQ-MCP-008), stdio has no
 /// auth at all.
@@ -1252,23 +1265,30 @@ impl McpClientManager {
     }
 
     /// Drop a pending authorization flow, releasing any held claim and the
-    /// surfaced URL (`PendingAuthorizationCancelled`). Returns whether a flow
-    /// existed.
-    async fn cancel_pending_oauth_flow(&self, name: &str) -> bool {
+    /// surfaced URL (`PendingAuthorizationCancelled`). Returns the cancelled
+    /// flow's config when one existed.
+    async fn cancel_pending_oauth_flow(&self, name: &str) -> Option<McpServerConfig> {
         let flow = self.oauth.pending.lock().unwrap().remove(name);
-        let existed = flow.is_some();
+        let config = flow.as_ref().map(|flow| flow.config.clone());
         drop(flow);
-        if existed {
+        if config.is_some() {
             self.pending_oauth_urls.write().await.remove(name);
             tracing::info!(server = %name, "Cancelled pending MCP OAuth authorization");
         }
-        existed
+        config
     }
 
     /// Discard a stored token the reloaded config can no longer use: the
-    /// resource was repointed, or auth moved away from OAuth
-    /// (`ReloadInvalidatesOAuth`, REQ-MCP-012).
-    async fn invalidate_oauth_on_config_change(&self, name: &str, new_config: &McpServerConfig) {
+    /// resource was repointed, auth moved away from OAuth, or the pinned
+    /// authorization server changed — a token minted under the old issuer
+    /// must not restore against the new one (`ReloadInvalidatesOAuth`,
+    /// REQ-MCP-012).
+    async fn invalidate_oauth_on_config_change(
+        &self,
+        name: &str,
+        old_config: &McpServerConfig,
+        new_config: &McpServerConfig,
+    ) {
         let token = match self.oauth.store().token(name).await {
             Ok(Some(token)) => token,
             Ok(None) => return,
@@ -1277,12 +1297,20 @@ impl McpClientManager {
                 return;
             }
         };
-        let still_usable = oauth_resource_url(new_config)
+        let resource_matches = oauth_resource_url(new_config)
             .is_some_and(|url| oauth::canonical_resource(url) == token.resource);
-        if !still_usable {
+        // The token row does not record its issuer, so an authorization-server
+        // change is detected from the config delta: any change to the pinned
+        // auth server (repinned, newly pinned, or unpinned) invalidates. A
+        // dynamically discovered issuer that changed server-side is caught at
+        // use instead: the resource 401s, the refresh against the new issuer
+        // fails, and the failure path discards the token and re-prompts.
+        let pinned_auth_server_changed =
+            pinned_auth_server(old_config) != pinned_auth_server(new_config);
+        if !resource_matches || pinned_auth_server_changed {
             tracing::info!(
                 server = %name,
-                "Reload repointed or de-OAuthed this server; discarding its stored token"
+                "Reload repointed, de-OAuthed, or re-pinned this server; discarding its stored token"
             );
             if let Err(e) = self.oauth.store().delete_token(name).await {
                 tracing::warn!(server = %name, "Failed to delete invalidated OAuth token: {e}");
@@ -2205,7 +2233,11 @@ impl McpClientManager {
             oauth_rt
                 .store()
                 .upsert_registration(&OAuthRegistrationRecord {
-                    auth_server: preconfigured.auth_server.clone(),
+                    // Normalized: lookups are keyed by the metadata-advertised
+                    // issuer, which fetch_auth_server_metadata normalizes the
+                    // same way, so a trailing-slash difference between config
+                    // and metadata cannot strand the seeded client.
+                    auth_server: oauth::normalize_issuer(&preconfigured.auth_server),
                     client_id: preconfigured.client_id.clone(),
                     client_secret: preconfigured.client_secret.clone(),
                     token_endpoint_auth_method: preconfigured.token_endpoint_auth_method.clone(),
@@ -2217,6 +2249,27 @@ impl McpClientManager {
         }
 
         let bearer: SharedBearer = Arc::default();
+        if oauth_resource_url(entry).is_none() {
+            // The config no longer selects OAuth (static credentials or
+            // stdio): a token left from an OAuth-era config — e.g. the auth
+            // mode changed while Phoenix was stopped, so no reload rule saw
+            // the transition — must not linger to be restored if the config
+            // later flips back (ReloadInvalidatesOAuth's invariant, applied
+            // at connect time).
+            match oauth_rt.store().token(name).await {
+                Ok(Some(_)) => {
+                    tracing::info!(
+                        server = %name,
+                        "Config no longer selects OAuth; discarding the stored token"
+                    );
+                    if let Err(e) = oauth_rt.store().delete_token(name).await {
+                        tracing::warn!(server = %name, "Failed to delete stale OAuth token: {e}");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(server = %name, "OAuth token lookup failed: {e}"),
+            }
+        }
         if let Some(url) = oauth_resource_url(entry) {
             match oauth_rt.store().token(name).await {
                 Ok(Some(token)) => {
@@ -2689,8 +2742,9 @@ impl McpClientManager {
                         unchanged.push(name);
                         continue;
                     }
-                    if self.cancel_pending_oauth_flow(&name).await {
-                        self.invalidate_oauth_on_config_change(&name, &entry).await;
+                    if let Some(old_flow_config) = self.cancel_pending_oauth_flow(&name).await {
+                        self.invalidate_oauth_on_config_change(&name, &old_flow_config, &entry)
+                            .await;
                     }
 
                     let oauth = Arc::clone(&self.pending_oauth_urls);
@@ -2762,7 +2816,7 @@ impl McpClientManager {
                 Some(current) if current == entry => {
                     unchanged.push(name);
                 }
-                Some(_) => {
+                Some(old_config) => {
                     // A changed config cancels any pending authorization
                     // (ReloadCancelsPendingAuth) -- BEFORE the slot loop
                     // below, which would otherwise wait on a claim the
@@ -2770,7 +2824,8 @@ impl McpClientManager {
                     // discards a stored token the new config can no longer
                     // use (ReloadInvalidatesOAuth).
                     self.cancel_pending_oauth_flow(&name).await;
-                    self.invalidate_oauth_on_config_change(&name, &entry).await;
+                    self.invalidate_oauth_on_config_change(&name, &old_config, &entry)
+                        .await;
 
                     // Supersede any in-flight connect BEFORE removing the old
                     // server: with the new ticket issued, a stale publish can

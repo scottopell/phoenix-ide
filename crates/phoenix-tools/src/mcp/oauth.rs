@@ -203,6 +203,45 @@ pub fn is_insufficient_scope_challenge(www_authenticate: &str) -> bool {
         .is_some_and(|e| e == "insufficient_scope")
 }
 
+/// Select the Bearer challenge from a response's `WWW-Authenticate` values.
+/// A response may carry several challenges — across repeated headers and/or
+/// comma-separated within one header value (RFC 9110 §11.6.1) — and the
+/// Bearer one is not necessarily first (e.g. `Basic realm=…, Bearer
+/// error="insufficient_scope"`). Returns the value from the Bearer scheme
+/// token onward, so `parse_bearer_challenge` sees its parameters.
+pub fn select_bearer_challenge<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    for value in values {
+        let trimmed = value.trim_start();
+        if starts_with_bearer(trimmed) {
+            return Some(trimmed.to_string());
+        }
+        // A Bearer challenge after another scheme: scheme names appear as
+        // bare tokens following a comma, unlike `key=value` parameters. A
+        // quoted parameter value containing ", Bearer " would false-match,
+        // but selecting it is still harmless — the parser just yields that
+        // challenge's params.
+        for (index, _) in trimmed.match_indices(',') {
+            let Some(rest) = trimmed.get(index + 1..).map(str::trim_start) else {
+                continue;
+            };
+            if starts_with_bearer(rest) {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn starts_with_bearer(value: &str) -> bool {
+    let (Some(prefix), rest) = (value.get(..6), value.get(6..)) else {
+        return value.eq_ignore_ascii_case("bearer");
+    };
+    prefix.eq_ignore_ascii_case("bearer")
+        && rest
+            .and_then(|r| r.chars().next())
+            .is_none_or(|c| c == ' ' || c == '\t')
+}
+
 // ---------------------------------------------------------------------------
 // Canonical resource URI (RFC 8707)
 // ---------------------------------------------------------------------------
@@ -219,6 +258,8 @@ pub fn canonical_resource(url: &str) -> String {
     };
     parsed.set_fragment(None);
     let scheme = parsed.scheme().to_ascii_lowercase();
+    // host_str() keeps an IPv6 literal's brackets ("[::1]"), so the value is
+    // splice-safe as-is.
     let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
     let port = match (parsed.port(), scheme.as_str()) {
         (Some(443), "https") | (Some(80), "http") | (None, _) => String::new(),
@@ -358,6 +399,15 @@ pub async fn fetch_protected_resource_metadata(
     ))
 }
 
+/// The identity of an authorization server as a registration key: trailing
+/// slash dropped, so a configured issuer and the metadata-advertised one
+/// differing only cosmetically still resolve to the same stored client
+/// (REQ-MCP-010).
+#[must_use]
+pub fn normalize_issuer(issuer: &str) -> String {
+    issuer.trim_end_matches('/').to_string()
+}
+
 /// The metadata URL candidates for an authorization server issuer: RFC 8414
 /// path-insertion, then OIDC discovery in both its path-insertion and
 /// path-appending forms (REQ-MCP-009 requires trying both families).
@@ -442,7 +492,11 @@ pub async fn fetch_auth_server_metadata(
         }
 
         return Ok(AuthServerMetadata {
-            issuer: advertised_issuer.to_string(),
+            // Normalized (no trailing slash) because the issuer is the key
+            // registrations are stored and looked up under: a pre-configured
+            // client seeded as `https://as.example` must be found when the
+            // metadata advertises `https://as.example/`.
+            issuer: normalize_issuer(advertised_issuer),
             authorization_endpoint: authorization_endpoint.to_string(),
             token_endpoint: token_endpoint.to_string(),
             registration_endpoint: doc
@@ -637,15 +691,24 @@ async fn token_grant(
     params: Vec<(&str, &str)>,
 ) -> Result<TokenResponse, TokenGrantError> {
     let mut form: Vec<(&str, &str)> = params;
-    form.push(("client_id", &registration.client_id));
     let mut request = client.post(token_endpoint);
-    if let Some(secret) = &registration.client_secret {
-        if registration.token_endpoint_auth_method == "client_secret_basic" {
+    match &registration.client_secret {
+        // Exactly one client-authentication method per request (RFC 6749
+        // §2.3.1): a Basic-authenticated client must not also carry its
+        // identity in the body, or a strict server rejects the grant as
+        // invalid_client.
+        Some(secret) if registration.token_endpoint_auth_method == "client_secret_basic" => {
             request = request.basic_auth(&registration.client_id, Some(secret));
-        } else {
-            // client_secret_post and any unrecognized method carrying a
-            // secret: send it in the body, the most widely accepted form.
+        }
+        // client_secret_post and any unrecognized method carrying a secret:
+        // send both halves in the body, the most widely accepted form.
+        Some(secret) => {
+            form.push(("client_id", &registration.client_id));
             form.push(("client_secret", secret));
+        }
+        // Public client: body client_id only.
+        None => {
+            form.push(("client_id", &registration.client_id));
         }
     }
     let response = request
@@ -778,6 +841,43 @@ mod tests {
     }
 
     #[test]
+    fn bearer_challenge_is_selected_among_multiple_schemes() {
+        // Repeated headers, Bearer second.
+        let values = ["Basic realm=\"legacy\"", "Bearer scope=\"a\""];
+        assert_eq!(
+            select_bearer_challenge(values.into_iter()).as_deref(),
+            Some("Bearer scope=\"a\"")
+        );
+
+        // Both challenges combined in one header value.
+        let combined = "Basic realm=\"legacy\", Bearer error=insufficient_scope, scope=\"w\"";
+        let selected = select_bearer_challenge(std::iter::once(combined)).expect("bearer found");
+        assert!(is_insufficient_scope_challenge(&selected));
+
+        // Case-insensitive scheme; a `bearer`-prefixed parameter name or
+        // token (`bearerish=1`) is not a scheme match.
+        assert!(select_bearer_challenge(std::iter::once("bearer realm=\"x\"")).is_some());
+        assert_eq!(
+            select_bearer_challenge(std::iter::once("Basic bearerish=1")),
+            None
+        );
+        assert_eq!(select_bearer_challenge(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn issuer_normalization_drops_trailing_slash() {
+        assert_eq!(
+            normalize_issuer("https://as.example/"),
+            "https://as.example"
+        );
+        assert_eq!(normalize_issuer("https://as.example"), "https://as.example");
+        assert_eq!(
+            normalize_issuer("https://as.example/tenant/"),
+            "https://as.example/tenant"
+        );
+    }
+
+    #[test]
     fn canonical_resource_normalizes_case_port_and_fragment() {
         assert_eq!(
             canonical_resource("HTTPS://Example.COM:443/MCP/#frag"),
@@ -792,6 +892,15 @@ mod tests {
         assert_eq!(
             canonical_resource("https://host/Path?x=1"),
             "https://host/Path?x=1"
+        );
+        // IPv6 literals keep their brackets.
+        assert_eq!(
+            canonical_resource("http://[::1]:8080/mcp"),
+            "http://[::1]:8080/mcp"
+        );
+        assert_eq!(
+            canonical_resource("https://[2001:DB8::1]/mcp"),
+            "https://[2001:db8::1]/mcp"
         );
     }
 

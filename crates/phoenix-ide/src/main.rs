@@ -465,24 +465,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // The MCP OAuth callback redirect must point at an address a browser on
-    // the operator's machine can reach: an unspecified/loopback bind is
-    // reachable as localhost, anything else by its own address. With the
-    // redirect base known, background MCP discovery (which may immediately
-    // hit a 401 and start an OAuth flow) can start.
+    // The MCP OAuth callback redirect must point at an address the
+    // *operator's browser* can reach. PHOENIX_EXTERNAL_URL pins it for
+    // remote deployments — an all-interfaces bind says nothing about the
+    // name remote browsers reach the host by, so the derived fallback
+    // (localhost for unspecified/loopback binds, the bare IP otherwise) only
+    // serves same-machine access. With the redirect base known, background
+    // MCP discovery (which may immediately hit a 401 and start an OAuth
+    // flow) can start.
     {
-        let scheme = if loaded_tls.is_some() {
-            "https"
+        let configured = std::env::var("PHOENIX_EXTERNAL_URL")
+            .ok()
+            .map(|url| url.trim().trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty());
+        let redirect_base = if let Some(external) = configured {
+            external
         } else {
-            "http"
+            let scheme = if loaded_tls.is_some() {
+                "https"
+            } else {
+                "http"
+            };
+            let ip = bind_address.ip();
+            let host = if ip.is_unspecified() || ip.is_loopback() {
+                "localhost".to_string()
+            } else {
+                ip.to_string()
+            };
+            if ip.is_unspecified() {
+                tracing::info!(
+                    "MCP OAuth redirect base defaulting to {scheme}://localhost:{}; set \
+                     PHOENIX_EXTERNAL_URL to the browser-reachable URL when operating \
+                     Phoenix from another machine",
+                    bind_address.port()
+                );
+            }
+            format!("{scheme}://{host}:{}", bind_address.port())
         };
-        let ip = bind_address.ip();
-        let host = if ip.is_unspecified() || ip.is_loopback() {
-            "localhost".to_string()
-        } else {
-            ip.to_string()
-        };
-        mcp_manager.set_oauth_redirect_base(format!("{scheme}://{host}:{}", bind_address.port()));
+        mcp_manager.set_oauth_redirect_base(redirect_base);
     }
     mcp_manager.start_background_discovery();
 

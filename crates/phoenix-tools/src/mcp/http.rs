@@ -144,11 +144,18 @@ impl HttpTransport {
         if status.is_success() {
             return Ok(response);
         }
-        let www_authenticate = response
-            .headers()
-            .get("www-authenticate")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        // A response may carry several challenges across repeated
+        // WWW-Authenticate headers (e.g. Basic first, Bearer second); the
+        // Bearer one carries the OAuth discovery and step-up parameters
+        // (resource_metadata, error, scope), so it is selected explicitly
+        // rather than taking whichever header happens to be first.
+        let www_authenticate = super::oauth::select_bearer_challenge(
+            response
+                .headers()
+                .get_all("www-authenticate")
+                .iter()
+                .filter_map(|v| v.to_str().ok()),
+        );
         match status.as_u16() {
             401 => Err(TransportError::Unauthorized { www_authenticate }),
             403 => Err(TransportError::InsufficientScope { www_authenticate }),
@@ -1914,16 +1921,23 @@ mod tests {
         }
     }
 
+    /// A 401 whose Bearer challenge arrives SECOND, behind a Basic one --
+    /// the multi-challenge shape real gateways produce. Every flow driven
+    /// through this helper proves the Bearer challenge is selected rather
+    /// than whichever header is first.
     fn unauthorized(server: &TestServer) -> CannedResponse {
         status_response(
             401,
-            &[(
-                "www-authenticate",
-                &format!(
-                    "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\"",
-                    server.base()
+            &[
+                ("www-authenticate", "Basic realm=\"legacy\""),
+                (
+                    "www-authenticate",
+                    &format!(
+                        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\"",
+                        server.base()
+                    ),
                 ),
-            )],
+            ],
         )
     }
 
@@ -2559,15 +2573,19 @@ mod tests {
             .insert("remote".to_string(), mcp);
 
         install_oauth_discovery(&server, true);
-        // The 403 step-up challenge names the missing scope; the old session
-        // is DELETEd during the step-up teardown.
+        // The 403 step-up challenge names the missing scope -- delivered
+        // behind a Basic challenge, which must not mask the step-up
+        // classification. The old session is DELETEd during the teardown.
         server.push_responses(vec![
             status_response(
                 403,
-                &[(
-                    "www-authenticate",
-                    "Bearer error=\"insufficient_scope\", scope=\"write\"",
-                )],
+                &[
+                    ("www-authenticate", "Basic realm=\"legacy\""),
+                    (
+                        "www-authenticate",
+                        "Bearer error=\"insufficient_scope\", scope=\"write\"",
+                    ),
+                ],
             ),
             delete_ack(),
         ]);
@@ -2733,8 +2751,10 @@ mod tests {
 
         let manager = Arc::new(McpClientManager::new());
         manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        // Configured with a trailing slash the metadata issuer does not have:
+        // issuer normalization must still resolve the seeded registration.
         let auth = HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
-            auth_server: server.base(),
+            auth_server: format!("{}/", server.base()),
             client_id: "pre-1".to_string(),
             client_secret: None,
             token_endpoint_auth_method: "none".to_string(),
@@ -2752,6 +2772,174 @@ mod tests {
             "the pre-configured client must be reused (OAuthClientReused)"
         );
         assert!(server.recorded_for_path("/register").is_empty());
+    }
+
+    #[tokio::test]
+    async fn confidential_basic_client_authenticates_without_body_client_id() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        install_oauth_discovery(&server, false);
+        server.route("/token", token_response("at-1", None, None));
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        let auth = HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
+            auth_server: server.base(),
+            client_id: "conf-1".to_string(),
+            client_secret: Some("s3cret".to_string()),
+            token_endpoint_auth_method: "client_secret_basic".to_string(),
+        }));
+        connect_http_managed(&manager, &server, auth)
+            .await
+            .err()
+            .expect("connect blocks on authorization");
+
+        let auth_url = pending_auth_url(&manager).await.expect("pending url");
+        let state = query_params(&auth_url).get("state").unwrap().clone();
+        server.push_responses(handshake_responses("sess-1"));
+        manager
+            .complete_oauth_authorization(&state, "code-1", Some(&server.base()))
+            .await
+            .expect("authorization completes");
+
+        // Exactly one client-authentication method (RFC 6749 §2.3.1): HTTP
+        // Basic carries the identity; the body must not duplicate it.
+        let requests = server.requests.lock().unwrap();
+        let token_request = requests
+            .iter()
+            .find(|r| r.path() == "/token")
+            .expect("token request");
+        let authorization = token_request
+            .header("authorization")
+            .expect("basic auth header");
+        assert!(authorization.starts_with("Basic "), "got: {authorization}");
+        let form = parse_form(&token_request.body);
+        assert!(
+            !form.contains_key("client_id"),
+            "body client_id must be absent"
+        );
+        assert!(
+            !form.contains_key("client_secret"),
+            "body secret must be absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_auth_server_repin_discards_the_stored_token() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-1",
+                Some("rt-1"),
+                &["read"],
+                far_future(),
+            ))
+            .await
+            .unwrap();
+        let preconfigured = |auth_server: String| McpServerConfig::Http {
+            url: server.url.clone(),
+            headers: HashMap::new(),
+            auth: HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
+                auth_server,
+                client_id: "cid-1".to_string(),
+                client_secret: None,
+                token_endpoint_auth_method: "none".to_string(),
+            })),
+        };
+        let mcp = McpClientManager::connect_one(
+            "remote",
+            &preconfigured("https://as-one.example".to_string()),
+            Arc::clone(&manager.pending_oauth_urls),
+            Arc::clone(&manager.oauth),
+        )
+        .await
+        .expect("connect with restored token");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // Same URL, different pinned authorization server: the token was
+        // minted under the old issuer and must not restore against the new
+        // one (ReloadInvalidatesOAuth). The restarted handshake therefore
+        // runs unauthenticated.
+        server.push_responses(vec![delete_ack()]);
+        server.push_responses(handshake_responses("sess-2"));
+        let result = manager
+            .reload_from_configs(vec![(
+                "remote".to_string(),
+                preconfigured("https://as-two.example".to_string()),
+            )])
+            .await;
+
+        assert_eq!(result.restarted, vec!["remote"]);
+        assert!(
+            manager
+                .oauth
+                .store()
+                .token("remote")
+                .await
+                .unwrap()
+                .is_none(),
+            "a re-pinned authorization server must discard the stored token"
+        );
+        let requests = server.requests.lock().unwrap();
+        let last_init = requests
+            .iter()
+            .rfind(|r| r.rpc_method() == "initialize")
+            .expect("restart initialize");
+        assert_eq!(last_init.header("authorization"), None);
+    }
+
+    #[tokio::test]
+    async fn cold_start_de_oauthed_config_discards_the_stored_token() {
+        // The auth mode moved to a static credential while Phoenix was down,
+        // so no reload rule saw the transition: connect must still discard
+        // the OAuth-era token rather than leave it to restore if the config
+        // later flips back.
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-old",
+                Some("rt-old"),
+                &[],
+                far_future(),
+            ))
+            .await
+            .unwrap();
+
+        connect_http_managed(
+            &manager,
+            &server,
+            HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
+        )
+        .await
+        .expect("static connect");
+
+        assert!(
+            manager
+                .oauth
+                .store()
+                .token("remote")
+                .await
+                .unwrap()
+                .is_none(),
+            "a non-OAuth config must not leave a stored OAuth token behind"
+        );
+        // The static credential, not the stale OAuth bearer, rode the wire.
+        let requests = server.requests.lock().unwrap();
+        for request in requests.iter() {
+            assert_eq!(request.header("authorization"), Some("Bearer tok"));
+        }
     }
 
     #[tokio::test]
