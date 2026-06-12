@@ -103,6 +103,29 @@ pub enum ContinueOutcome {
     ParentNotContextExhausted { state_variant: &'static str },
 }
 
+/// One `mcp_oauth_registrations` row: the OAuth client identity for an
+/// authorization server, shared by every MCP server behind it (REQ-MCP-010).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpOAuthRegistrationRow {
+    pub auth_server: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub token_endpoint_auth_method: String,
+}
+
+/// One `mcp_oauth_tokens` row: the OAuth token for an MCP server,
+/// audience-bound to `resource_uri` (REQ-MCP-012). `scopes` is the
+/// space-separated granted scope set; `expires_at` is unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpOAuthTokenRow {
+    pub server_name: String,
+    pub resource_uri: String,
+    pub scopes: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkScopePrObservation {
     pub repo_owner: String,
@@ -796,6 +819,127 @@ impl Database {
     pub async fn enable_mcp_server(&self, name: &str) -> DbResult<()> {
         sqlx::query("DELETE FROM mcp_disabled_servers WHERE server_name = ?1")
             .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ==================== MCP OAuth Store (REQ-MCP-010, REQ-MCP-012) ====================
+
+    /// Fetch the persisted OAuth client registration for an authorization
+    /// server, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_mcp_oauth_registration(
+        &self,
+        auth_server: &str,
+    ) -> DbResult<Option<McpOAuthRegistrationRow>> {
+        let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT client_id, client_secret, token_endpoint_auth_method \
+             FROM mcp_oauth_registrations WHERE auth_server = ?1",
+        )
+        .bind(auth_server)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(
+            row.map(
+                |(client_id, client_secret, token_endpoint_auth_method)| {
+                    McpOAuthRegistrationRow {
+                        auth_server: auth_server.to_string(),
+                        client_id,
+                        client_secret,
+                        token_endpoint_auth_method,
+                    }
+                },
+            ),
+        )
+    }
+
+    /// Insert or replace the OAuth client registration for an authorization
+    /// server.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn upsert_mcp_oauth_registration(
+        &self,
+        registration: &McpOAuthRegistrationRow,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO mcp_oauth_registrations \
+             (auth_server, client_id, client_secret, token_endpoint_auth_method) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&registration.auth_server)
+        .bind(&registration.client_id)
+        .bind(&registration.client_secret)
+        .bind(&registration.token_endpoint_auth_method)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Fetch the persisted OAuth token for an MCP server, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_mcp_oauth_token(
+        &self,
+        server_name: &str,
+    ) -> DbResult<Option<McpOAuthTokenRow>> {
+        let row: Option<(String, String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT resource_uri, scopes, access_token, refresh_token, expires_at \
+             FROM mcp_oauth_tokens WHERE server_name = ?1",
+        )
+        .bind(server_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(resource_uri, scopes, access_token, refresh_token, expires_at)| McpOAuthTokenRow {
+                server_name: server_name.to_string(),
+                resource_uri,
+                scopes,
+                access_token,
+                refresh_token,
+                expires_at,
+            },
+        ))
+    }
+
+    /// Insert or replace the OAuth token for an MCP server. The primary key on
+    /// `server_name` keeps at most one token per server.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn upsert_mcp_oauth_token(&self, token: &McpOAuthTokenRow) -> DbResult<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO mcp_oauth_tokens \
+             (server_name, resource_uri, scopes, access_token, refresh_token, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&token.server_name)
+        .bind(&token.resource_uri)
+        .bind(&token.scopes)
+        .bind(&token.access_token)
+        .bind(&token.refresh_token)
+        .bind(token.expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete the OAuth token for an MCP server (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn delete_mcp_oauth_token(&self, server_name: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM mcp_oauth_tokens WHERE server_name = ?1")
+            .bind(server_name)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -3573,6 +3717,88 @@ mod tests {
             db.get_app_setting("key").await.unwrap().as_deref(),
             Some("value-2")
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_registration_roundtrips_keyed_by_auth_server() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        assert!(db
+            .get_mcp_oauth_registration("https://as.example.com")
+            .await
+            .unwrap()
+            .is_none());
+
+        let registration = McpOAuthRegistrationRow {
+            auth_server: "https://as.example.com".to_string(),
+            client_id: "cid-1".to_string(),
+            client_secret: None,
+            token_endpoint_auth_method: "none".to_string(),
+        };
+        db.upsert_mcp_oauth_registration(&registration)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_mcp_oauth_registration("https://as.example.com")
+                .await
+                .unwrap(),
+            Some(registration.clone())
+        );
+
+        // Upsert replaces in place (still one row per authorization server).
+        let confidential = McpOAuthRegistrationRow {
+            client_secret: Some("sec".to_string()),
+            token_endpoint_auth_method: "client_secret_post".to_string(),
+            ..registration
+        };
+        db.upsert_mcp_oauth_registration(&confidential)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_mcp_oauth_registration("https://as.example.com")
+                .await
+                .unwrap(),
+            Some(confidential)
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_token_roundtrips_and_deletes() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        assert!(db.get_mcp_oauth_token("linear").await.unwrap().is_none());
+
+        let token = McpOAuthTokenRow {
+            server_name: "linear".to_string(),
+            resource_uri: "https://mcp.linear.app/mcp".to_string(),
+            scopes: "read write".to_string(),
+            access_token: "at-1".to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expires_at: 1_900_000_000,
+        };
+        db.upsert_mcp_oauth_token(&token).await.unwrap();
+        assert_eq!(
+            db.get_mcp_oauth_token("linear").await.unwrap(),
+            Some(token.clone())
+        );
+
+        // Upsert (e.g. a refresh persisting a rotated refresh token) replaces
+        // the row — OneTokenPerServer.
+        let rotated = McpOAuthTokenRow {
+            access_token: "at-2".to_string(),
+            refresh_token: Some("rt-2".to_string()),
+            ..token
+        };
+        db.upsert_mcp_oauth_token(&rotated).await.unwrap();
+        assert_eq!(
+            db.get_mcp_oauth_token("linear").await.unwrap(),
+            Some(rotated)
+        );
+
+        db.delete_mcp_oauth_token("linear").await.unwrap();
+        assert!(db.get_mcp_oauth_token("linear").await.unwrap().is_none());
+        // Idempotent.
+        db.delete_mcp_oauth_token("linear").await.unwrap();
     }
 
     #[tokio::test]

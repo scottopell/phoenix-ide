@@ -119,6 +119,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "normalize_explore_taskmd_id_hint",
         sql: MIGRATION_021,
     },
+    Migration {
+        version: 22,
+        name: "create_mcp_oauth_tables",
+        sql: MIGRATION_022,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -506,6 +511,34 @@ WHERE json_extract(conv_mode, '$.mode') = 'Explore'
   AND json_extract(conv_mode, '$.next_taskmd_id_hint') IS NULL;
 ";
 
+/// MCP OAuth 2.1 persistence (`specs/mcp/` REQ-MCP-010, REQ-MCP-012).
+///
+/// `mcp_oauth_registrations` holds one client identity per **authorization
+/// server** (not per MCP server), so resources sharing an authorization server
+/// share a registration. `mcp_oauth_tokens` holds at most one token per MCP
+/// server (`OneTokenPerServer` in `specs/mcp/mcp.allium`), audience-bound to
+/// `resource_uri`; `scopes` is the space-separated granted scope set, kept so
+/// a post-restart `insufficient_scope` step-up can request the union of prior
+/// and challenged scopes. Tokens are plaintext by design — the database file's
+/// on-disk protection is the trust boundary.
+const MIGRATION_022: &str = r"
+CREATE TABLE IF NOT EXISTS mcp_oauth_registrations (
+    auth_server TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    client_secret TEXT,
+    token_endpoint_auth_method TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
+    server_name TEXT PRIMARY KEY,
+    resource_uri TEXT NOT NULL,
+    scopes TEXT NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT,
+    expires_at INTEGER NOT NULL
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -625,7 +658,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 21);
+        assert_eq!(first, 22);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -1276,6 +1309,74 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
+    }
+
+    /// Migration 022: the MCP OAuth tables exist with the expected columns and
+    /// per-key uniqueness (one registration per authorization server, one token
+    /// per MCP server).
+    #[tokio::test]
+    async fn migration_022_creates_mcp_oauth_tables() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let reg_columns: Vec<String> = sqlx::query("PRAGMA table_info(mcp_oauth_registrations)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        for expected in [
+            "auth_server",
+            "client_id",
+            "client_secret",
+            "token_endpoint_auth_method",
+        ] {
+            assert!(
+                reg_columns.iter().any(|c| c == expected),
+                "Expected mcp_oauth_registrations column {expected:?}, got: {reg_columns:?}"
+            );
+        }
+
+        let token_columns: Vec<String> = sqlx::query("PRAGMA table_info(mcp_oauth_tokens)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        for expected in [
+            "server_name",
+            "resource_uri",
+            "scopes",
+            "access_token",
+            "refresh_token",
+            "expires_at",
+        ] {
+            assert!(
+                token_columns.iter().any(|c| c == expected),
+                "Expected mcp_oauth_tokens column {expected:?}, got: {token_columns:?}"
+            );
+        }
+
+        // OneTokenPerServer: the primary key makes a second insert for the
+        // same server a constraint violation, not a duplicate row.
+        sqlx::query(
+            "INSERT INTO mcp_oauth_tokens (server_name, resource_uri, scopes, access_token, expires_at) \
+             VALUES ('s', 'https://example.com/mcp', 'a b', 'tok', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dup = sqlx::query(
+            "INSERT INTO mcp_oauth_tokens (server_name, resource_uri, scopes, access_token, expires_at) \
+             VALUES ('s', 'https://other.com/mcp', '', 'tok2', 2)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(dup.is_err(), "second token row for one server must violate the primary key");
     }
 
     #[tokio::test]
