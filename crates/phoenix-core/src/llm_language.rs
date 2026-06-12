@@ -164,7 +164,19 @@ pub fn sub_agent_suffix(lang: LlmLanguage) -> &'static str {
 // version uses so language is a pure swap.
 
 #[must_use]
-pub fn mode_explore(lang: LlmLanguage, tasks_dir_name: &str) -> String {
+pub fn mode_explore(lang: LlmLanguage, tasks_dir_name: &str, bash_available: bool) -> String {
+    let bash_guidance = match (lang, bash_available) {
+        (LlmLanguage::PhoenixNative, true) => {
+            "`bash` is available for read-only local investigation under an OS sandbox: it can read broadly, but source/Git metadata writes and network access are blocked, and only task proposals, scratch, synthetic home, and platform temp are writable."
+        }
+        (LlmLanguage::PhoenixNative, false) => {
+            "`bash` is unavailable because this host cannot enforce the Explore sandbox; use read-only tools instead."
+        }
+        (LlmLanguage::Caveman, true) => {
+            "Bash can look wide but no write code and no network."
+        }
+        (LlmLanguage::Caveman, false) => "No bash here.",
+    };
     match lang {
         LlmLanguage::PhoenixNative => format!(
             "\n\nYou are in Explore mode. This conversation is read-only \
@@ -196,10 +208,7 @@ pub fn mode_explore(lang: LlmLanguage, tasks_dir_name: &str) -> String {
                 reject. On approval, an isolated worktree is created and \
                 you gain full write access.\n\n\
              The `patch` tool is restricted to `{tasks_dir_name}/` in this \
-             mode. `bash` is available for read-only local investigation under \
-             an OS sandbox: it can read broadly, but source/Git metadata writes \
-             and network access are blocked, and only task proposals, scratch, \
-             synthetic home, and platform temp are writable. If the user asks \
+             mode. {bash_guidance} If the user asks \
              you to change code directly, explain that you must propose a task \
              first."
         ),
@@ -208,8 +217,7 @@ pub fn mode_explore(lang: LlmLanguage, tasks_dir_name: &str) -> String {
              To do work: write plan in `{tasks_dir_name}/` (file like \
              `12345-p2-ready--slug.md`), then call propose_task with that file. \
              Big caveman say yes? You get new cave with write power. \
-             Bash can look wide but no write code and no network. patch only \
-             in `{tasks_dir_name}/`."
+             {bash_guidance} patch only in `{tasks_dir_name}/`."
         ),
     }
 }

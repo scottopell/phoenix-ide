@@ -2100,6 +2100,9 @@ async fn get_system_prompt(
     // Mirror the mode context the live request uses (worktree boundaries,
     // Explore guidance) so the inspected prompt matches what the model sees.
     let mode_context = crate::runtime::conv_mode_to_context(&conversation.conv_mode);
+    let explore_bash_available = matches!(mode_context, crate::system_prompt::ModeContext::Explore)
+        && !is_sub_agent
+        && state.platform.has_sandbox();
     let system_prompt = crate::system_prompt::build_system_prompt(
         &cwd,
         &tasks_dir_name,
@@ -2107,6 +2110,7 @@ async fn get_system_prompt(
         Some(&mode_context),
         conversation.llm_language,
         persona.as_deref(),
+        explore_bash_available,
     );
 
     Ok(Json(SystemPromptResponse { system_prompt }))

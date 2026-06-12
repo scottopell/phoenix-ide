@@ -113,6 +113,7 @@ pub fn build_system_prompt(
     mode: Option<&ModeContext>,
     language: LlmLanguage,
     persona: Option<&str>,
+    explore_bash_available: bool,
 ) -> String {
     let builtin_dir = crate::skills::builtin::default_extract_dir();
     build_system_prompt_with_options(
@@ -124,6 +125,7 @@ pub fn build_system_prompt(
         builtin_dir.as_deref(),
         language,
         persona,
+        explore_bash_available,
     )
 }
 
@@ -141,6 +143,7 @@ pub fn build_system_prompt_with_options(
     builtin_dir: Option<&Path>,
     language: LlmLanguage,
     persona: Option<&str>,
+    explore_bash_available: bool,
 ) -> String {
     // REQ-AG-006: a named agent's persona replaces the generic assistant
     // preamble at the head of the prompt. Everything below (guidance, skills,
@@ -215,7 +218,11 @@ pub fn build_system_prompt_with_options(
             ModeContext::Explore {
                 next_taskmd_id_hint,
             } => {
-                prompt.push_str(&llm_language::mode_explore(language, tasks_dir_name));
+                prompt.push_str(&llm_language::mode_explore(
+                    language,
+                    tasks_dir_name,
+                    explore_bash_available,
+                ));
                 if let Some(next_id) = next_taskmd_id_hint {
                     prompt.push_str(&llm_language::next_taskmd_id_hint(
                         language,
@@ -327,6 +334,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         assert!(prompt.contains("helpful AI assistant"));
@@ -347,6 +355,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::PhoenixNative,
             None,
+            false,
         );
         let caveman = build_system_prompt_with_options(
             temp.path(),
@@ -357,6 +366,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::Caveman,
             None,
+            false,
         );
         assert!(native.contains("helpful AI assistant"));
         assert!(caveman.contains("smart caveman"));
@@ -383,6 +393,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::Caveman,
             None,
+            false,
         );
         assert!(caveman.contains("work cave"));
         // Phoenix-native phrasing must not bleed through.
@@ -403,6 +414,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         assert!(prompt.contains("<project_guidance>"));
@@ -423,6 +435,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         assert!(prompt.contains("sub-agent"));
@@ -444,6 +457,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             Some(persona),
+            false,
         );
 
         assert!(
@@ -502,6 +516,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         assert!(prompt.contains("<available_skills>"));
@@ -523,6 +538,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         assert!(!prompt.contains("<available_skills>"));
@@ -552,6 +568,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         assert!(prompt.contains("Explore mode"));
@@ -585,6 +602,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         assert!(prompt.contains("Explore mode"));
@@ -609,6 +627,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
         assert!(!prompt.contains("next available taskmd ID"));
     }
@@ -637,6 +656,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         let expected_id = taskmd_core::ids::next_id(&tasks_dir);
@@ -713,6 +733,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         assert!(prompt.contains("Work mode"));
@@ -760,6 +781,7 @@ mod tests {
             Some(&extract_dir),
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
         assert!(prompt.contains("**spears**"));
         // Built-ins use the (built-in) marker rather than exposing the extract path

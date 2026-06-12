@@ -548,6 +548,10 @@ fn parent_coordination_tools(agents: Vec<phoenix_agents::AgentDefinition>) -> Ve
     ]
 }
 
+fn explore_coordination_tools() -> Vec<Arc<dyn Tool>> {
+    vec![Arc::new(AskUserQuestionTool), Arc::new(SkillTool)]
+}
+
 /// Sub-agent terminal tools — how a sub-agent reports its result or error
 /// back to the parent. Only available to sub-agents.
 fn sub_agent_terminal_tools() -> Vec<Arc<dyn Tool>> {
@@ -579,10 +583,10 @@ impl ToolRegistry {
     #[must_use]
     pub fn explore_no_sandbox(
         tasks_dir_name: &str,
-        agents: Vec<phoenix_agents::AgentDefinition>,
+        _agents: Vec<phoenix_agents::AgentDefinition>,
     ) -> Self {
         let mut tools = read_only_tools();
-        tools.extend(parent_coordination_tools(agents));
+        tools.extend(explore_coordination_tools());
         tools.push(Arc::new(PatchTool::for_task_proposal_drafts(
             tasks_dir_name,
         )));
@@ -597,11 +601,11 @@ impl ToolRegistry {
     #[must_use]
     pub fn explore_with_sandbox(
         tasks_dir_name: &str,
-        agents: Vec<phoenix_agents::AgentDefinition>,
+        _agents: Vec<phoenix_agents::AgentDefinition>,
     ) -> Self {
         let mut tools = read_only_tools();
         tools.push(Arc::new(SandboxedBashTool));
-        tools.extend(parent_coordination_tools(agents));
+        tools.extend(explore_coordination_tools());
         tools.push(Arc::new(PatchTool::for_task_proposal_drafts(
             tasks_dir_name,
         )));
@@ -968,6 +972,7 @@ mod tests {
         let explore = names(&ToolRegistry::explore_no_sandbox("tasks", Vec::new()));
         assert!(explore.contains("propose_task"));
         assert!(explore.contains("ask_user_question"));
+        assert!(!explore.contains("spawn_agents"));
         assert!(explore.contains("patch"));
         assert!(!explore.contains("bash"));
         assert!(!explore.contains("tmux_run"));

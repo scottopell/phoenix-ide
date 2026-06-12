@@ -631,16 +631,22 @@ THE Explore bash sandbox SHALL provide:
 - read-only Git metadata access sufficient for linked worktree commands such as
   `git status`, `git log`, and `git blame`
 - read-write filesystem access to taskmd-discovered task proposal directories
-  under the repo root
+  under the repo root; symlinked task directories whose canonical target escapes
+  the repo are not granted
 - read-write filesystem access to a Phoenix-owned scratch directory
 - a synthetic sandbox home under scratch, exposed as `PHOENIX_SANDBOX_HOME` and
   `HOME`
 - `PHOENIX_SANDBOX_SCRATCH` pointing at Phoenix-owned scratch
-- platform-compatible temporary directory writes, exposed as `TMPDIR`
+- platform-compatible temporary directory writes, exposed as `TMPDIR`; when the
+  repo itself lives under the platform temp root, `TMPDIR` falls back to a
+  Phoenix-owned scratch child so the temp grant cannot cover source files
 - inherited `PATH` preservation
 - blocked network access
 - a reduced environment that strips ambient SCM/OAuth, LLM-provider, and
   cloud/vendor credential variables
+
+THE SYSTEM SHALL remove Phoenix-owned per-command scratch/home directories after
+that sandboxed bash command reaches a terminal state
 
 WHEN `nono` blocks an operation in Explore mode
 THE SYSTEM SHALL return the kernel error (for example EACCES or EPERM) in the

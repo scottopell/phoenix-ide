@@ -42,8 +42,8 @@ The result gates which tool registry top-level Explore conversations receive:
 
 | `has_sandbox()` | Explore tool set | Bash available? |
 |-----------------|-----------------|-----------------|
-| `true` | read-only/planning tools, scoped `patch`, `propose_task`, and sandboxed `bash`; browser and tmux are omitted | Yes |
-| `false` | read-only/planning tools, scoped `patch`, and `propose_task`; browser, tmux, and bash are omitted | No |
+| `true` | read-only/planning tools, non-spawning coordination tools, scoped `patch`, `propose_task`, and sandboxed `bash`; browser, tmux, and `spawn_agents` are omitted | Yes |
+| `false` | read-only/planning tools, non-spawning coordination tools, scoped `patch`, and `propose_task`; browser, tmux, `spawn_agents`, and bash are omitted | No |
 
 The sandboxed bash path uses a Phoenix child-process launcher. The child applies
 `nono` to itself and then execs `/bin/bash -c <cmd>`, preserving the ordinary

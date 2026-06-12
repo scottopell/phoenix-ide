@@ -509,7 +509,7 @@ async fn run_run(
             ring_bytes_cap,
             spawn_mode,
         ) {
-            Ok((handle, child)) => {
+            Ok((handle, child, sandbox_scratch_dir)) => {
                 let inserted = handles.insert(handle.clone());
                 drop(handles);
                 // Spawn edge: a new bash handle exists for this scope. Emit a
@@ -517,7 +517,12 @@ async fn run_run(
                 // detached waiter started below carries the sink so it can
                 // emit the terminal edge off-thread.
                 registry.emit_lifecycle(&ctx.work_scope);
-                start_io_tasks(&inserted, child, registry.lifecycle_sink());
+                start_io_tasks(
+                    &inserted,
+                    child,
+                    registry.lifecycle_sink(),
+                    sandbox_scratch_dir,
+                );
                 race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
             }
             Err(e) => {
@@ -541,7 +546,14 @@ fn spawn_child(
     handle_id: HandleId,
     ring_bytes_cap: usize,
     spawn_mode: BashSpawnMode,
-) -> Result<(Arc<Handle>, tokio::process::Child), String> {
+) -> Result<
+    (
+        Arc<Handle>,
+        tokio::process::Child,
+        Option<std::path::PathBuf>,
+    ),
+    String,
+> {
     // Per bash.allium @guidance on HandleSpawned:
     //   "Spawn child via Command::new(\"bash\").args([\"-c\", cmd]) with
     //    pre_exec(setpgid(0,0))"
@@ -559,6 +571,7 @@ fn spawn_child(
     // itself is what gets signaled — same outcome as exec'd bash. The
     // load-bearing piece is the process-group leader bit (setpgid below)
     // so that `kill(-pgid, sig)` reaches the user's processes.
+    let mut sandbox_scratch_dir = None;
     let mut command = match spawn_mode {
         BashSpawnMode::Direct => {
             let mut command = Command::new("bash");
@@ -566,7 +579,9 @@ fn spawn_child(
             command
         }
         BashSpawnMode::ExploreReadOnly => {
-            Command::from(ExploreSandboxLauncher::command(cmd, &ctx.working_dir)?)
+            let sandbox_command = ExploreSandboxLauncher::command(cmd, &ctx.working_dir)?;
+            sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
+            Command::from(sandbox_command.command)
         }
     };
     command
@@ -588,9 +603,15 @@ fn spawn_child(
         });
     }
 
-    let child = command
-        .spawn()
-        .map_err(|e| format!("failed to spawn bash child: {e}"))?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            if let Some(dir) = &sandbox_scratch_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return Err(format!("failed to spawn bash child: {e}"));
+        }
+    };
 
     let pid = child
         .id()
@@ -607,13 +628,14 @@ fn spawn_child(
         pid,
         ring_bytes_cap,
     );
-    Ok((handle, child))
+    Ok((handle, child, sandbox_scratch_dir))
 }
 
 fn start_io_tasks(
     handle: &Arc<Handle>,
     mut child: tokio::process::Child,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
 ) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -640,7 +662,15 @@ fn start_io_tasks(
     // Waiter task: call wait(), drain readers, then demote the handle.
     let h = handle.clone();
     tokio::spawn(async move {
-        run_waiter(h, child, stdout_join, stderr_join, lifecycle_sink).await;
+        run_waiter(
+            h,
+            child,
+            stdout_join,
+            stderr_join,
+            lifecycle_sink,
+            sandbox_scratch_dir,
+        )
+        .await;
     });
 }
 
@@ -713,6 +743,7 @@ async fn run_waiter(
     stdout_join: Option<tokio::task::JoinHandle<()>>,
     stderr_join: Option<tokio::task::JoinHandle<()>>,
     lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
+    sandbox_scratch_dir: Option<std::path::PathBuf>,
 ) {
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
     let started_at = Instant::now();
@@ -761,6 +792,11 @@ async fn run_waiter(
                     "dropping bash terminal lifecycle event — sink closed"
                 );
             }
+        }
+    }
+    if let Some(dir) = sandbox_scratch_dir {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::debug!(path = %dir.display(), error = %e, "failed to remove explore bash scratch directory");
         }
     }
     panic_guard.disarm();

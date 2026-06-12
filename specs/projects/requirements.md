@@ -421,15 +421,16 @@ THE SYSTEM SHALL re-check capabilities on every startup
 
 WHILE sandbox is not available
 THE SYSTEM SHALL provide top-level Explore mode with read-only/planning tools,
-scoped task-proposal `patch`, and `propose_task`
-AND SHALL NOT provide `bash`, `tmux`, `tmux_run`, browser tools, or any tool that
-can execute arbitrary unsandboxed commands
+scoped task-proposal `patch`, `propose_task`, and non-spawning coordination tools
+AND SHALL NOT provide `bash`, `tmux`, `tmux_run`, `spawn_agents`, browser tools,
+or any tool that can execute arbitrary unsandboxed commands
 
 WHILE sandbox is available
 THE SYSTEM SHALL provide top-level Explore mode with read-only/planning tools,
-scoped task-proposal `patch`, `propose_task`, and sandboxed `bash`
-AND SHALL NOT provide `tmux`, `tmux_run`, or browser tools in the first-pass
-sandboxed Explore registry
+scoped task-proposal `patch`, `propose_task`, non-spawning coordination tools,
+and sandboxed `bash`
+AND SHALL NOT provide `tmux`, `tmux_run`, `spawn_agents`, or browser tools in
+the first-pass sandboxed Explore registry
 
 **Rationale:** Capabilities are a property of the running environment, not the
 application. On systems with OS-level sandboxing, bash is useful in Explore mode

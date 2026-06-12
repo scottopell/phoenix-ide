@@ -851,11 +851,19 @@ applies `nono::Sandbox::apply()` to itself, and then it execs `/bin/bash -c
 The Explore policy grants broad filesystem read access, task proposal
 directories read-write, a Phoenix-owned scratch directory read-write, a
 synthetic sandbox home under scratch, and platform-compatible temporary
-directory writes. `PHOENIX_SANDBOX_SCRATCH` names scratch,
+directory writes. If the worktree itself is under the platform temp root, the
+temp capability falls back to a Phoenix-owned scratch child so the temp grant
+cannot cover source files. Task proposal directories are canonicalized and only
+accepted when their resolved target remains under the repo root.
+`PHOENIX_SANDBOX_SCRATCH` names scratch,
 `PHOENIX_SANDBOX_HOME` and `HOME` name the synthetic home, and `TMPDIR` names
 the platform temp directory. Network access is blocked and the child
 environment is rebuilt from a small allowlist that preserves `PATH` while
 stripping ambient credential variables.
+
+The waiter removes Phoenix-owned per-command scratch/home directories when the
+sandboxed command reaches a terminal state. Platform temp is intentionally left
+to the platform.
 
 Broad read is deliberate: Explore already exposes read-only tools that can read
 arbitrary user-selected paths, and sandboxed bash follows that product contract.
@@ -890,7 +898,8 @@ process's lifetime regardless of subsequent peek/wait/kill calls.
   `git blame`, `rg`, and `cat` can read the worktree and other readable local
   files; source writes fail with kernel permission errors; task proposal,
   scratch, synthetic-home, and platform-temp writes succeed; network commands
-  fail; configured ambient credential variables are absent.
+  fail; configured ambient credential variables are absent; Phoenix-owned
+  scratch/home directories are reaped after terminal state.
 - Spawn → exits within wait_seconds → `status: "exited"` with exit code.
 - Spawn → wait_seconds elapses → `status: "still_running"` with handle.
 - Repeated `wait` on same handle returns same handle id on each re-timeout.

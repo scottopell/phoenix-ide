@@ -32,18 +32,25 @@ impl ExploreReadOnlyPolicy {
     /// or the scratch/home directories cannot be created.
     pub fn discover(working_dir: &Path) -> std::io::Result<Self> {
         let repo_root = working_dir.canonicalize()?;
-        let task_dirs = taskmd_core::discover::candidates(&repo_root)
+        let mut task_dirs: Vec<PathBuf> = taskmd_core::discover::candidates(&repo_root)
             .into_iter()
-            .map(|name| repo_root.join(name))
+            .filter_map(|name| {
+                let path = repo_root.join(name);
+                let canonical = path.canonicalize().ok()?;
+                canonical.starts_with(&repo_root).then_some(canonical)
+            })
             .filter(|path| path.is_dir())
             .collect();
+        task_dirs.sort();
+        task_dirs.dedup();
         let scratch_dir = std::env::temp_dir()
             .join("phoenix-ide")
             .join("explore-bash")
             .join(uuid::Uuid::new_v4().to_string());
         let sandbox_home = scratch_dir.join("home");
         std::fs::create_dir_all(&sandbox_home)?;
-        let platform_temp = platform_temp_dir();
+        let platform_temp = platform_temp_dir(&repo_root, &scratch_dir);
+        std::fs::create_dir_all(&platform_temp)?;
         let path = inherited_path();
         let sensitive_dirs = sensitive_dirs_for_home(std::env::var_os("HOME").as_deref());
         Ok(Self {
@@ -135,6 +142,11 @@ impl ExploreReadOnlyPolicy {
     }
 }
 
+pub struct ExploreSandboxCommand {
+    pub command: Command,
+    pub scratch_dir: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ExploreSandboxLauncher;
 
@@ -146,7 +158,7 @@ impl ExploreSandboxLauncher {
     ///
     /// Returns an error when the policy cannot be constructed or the current
     /// Phoenix executable cannot be resolved.
-    pub fn command(cmd: &str, working_dir: &Path) -> Result<Command, String> {
+    pub fn command(cmd: &str, working_dir: &Path) -> Result<ExploreSandboxCommand, String> {
         let policy = ExploreReadOnlyPolicy::discover(working_dir)
             .map_err(|e| format!("failed to create explore sandbox policy: {e}"))?;
         let exe = std::env::current_exe()
@@ -158,8 +170,12 @@ impl ExploreSandboxLauncher {
             .arg(cmd)
             .current_dir(&policy.repo_root)
             .env_clear();
+        let scratch_dir = policy.scratch_dir.clone();
         policy.to_command_env(&mut command);
-        Ok(command)
+        Ok(ExploreSandboxCommand {
+            command,
+            scratch_dir,
+        })
     }
 
     #[must_use]
@@ -232,8 +248,13 @@ fn inherited_path() -> OsString {
     std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
 }
 
-fn platform_temp_dir() -> PathBuf {
-    std::env::temp_dir()
+fn platform_temp_dir(repo_root: &Path, scratch_dir: &Path) -> PathBuf {
+    let temp = std::env::temp_dir();
+    if repo_root.starts_with(&temp) {
+        scratch_dir.join("platform-temp")
+    } else {
+        temp
+    }
 }
 
 fn sensitive_dirs_for_home(home: Option<&OsStr>) -> Vec<PathBuf> {
@@ -298,4 +319,80 @@ fn system_read_write_paths() -> &'static [PathBuf] {
     use std::sync::OnceLock;
     static PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
     PATHS.get_or_init(|| ["/dev"].into_iter().map(PathBuf::from).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discover_rejects_task_dir_symlink_outside_repo() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let external = temp.path().join("external-tasks");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(&external).expect("external tasks");
+        std::fs::write(
+            external.join(taskmd_core::constants::TEMPLATE_FILENAME),
+            "# Template\n",
+        )
+        .expect("template");
+        make_symlink(&external, &repo.join("tasks"));
+
+        let policy = ExploreReadOnlyPolicy::discover(&repo).expect("policy");
+        assert!(
+            policy.task_dirs.is_empty(),
+            "task dirs must not include symlink targets outside repo: {:?}",
+            policy.task_dirs
+        );
+    }
+
+    #[test]
+    fn discover_accepts_task_dir_symlink_inside_repo() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let real_tasks = repo.join("real-tasks");
+        std::fs::create_dir_all(&real_tasks).expect("real tasks");
+        std::fs::write(
+            real_tasks.join(taskmd_core::constants::TEMPLATE_FILENAME),
+            "# Template\n",
+        )
+        .expect("template");
+        make_symlink(&real_tasks, &repo.join("tasks"));
+
+        let policy = ExploreReadOnlyPolicy::discover(&repo).expect("policy");
+        assert_eq!(policy.task_dirs, vec![real_tasks.canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn platform_temp_falls_back_under_scratch_when_repo_is_under_temp() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = std::env::temp_dir().join(format!("phoenix-repo-{}", uuid::Uuid::new_v4()));
+        let scratch = temp.path().join("scratch");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let _cleanup = RemoveDirOnDrop(repo.clone());
+
+        assert_eq!(
+            platform_temp_dir(&repo, &scratch),
+            scratch.join("platform-temp")
+        );
+    }
+
+    struct RemoveDirOnDrop(PathBuf);
+
+    impl Drop for RemoveDirOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_symlink(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+    }
+
+    #[cfg(windows)]
+    fn make_symlink(target: &Path, link: &Path) {
+        std::os::windows::fs::symlink_dir(target, link).expect("symlink");
+    }
 }

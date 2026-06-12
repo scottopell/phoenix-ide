@@ -3491,6 +3491,13 @@ where
             )
             .await;
 
+            // Build tool definitions before the mode prompt so Explore prose can
+            // describe the same tool surface the model receives.
+            let tools = tool_executor.definitions_for_language(llm_language).await;
+            let explore_bash_available =
+                matches!(mode_context.as_ref(), Some(ModeContext::Explore))
+                    && tools.iter().any(|t| t.name == "bash");
+
             // Build system prompt with AGENTS.md content + mode context
             // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
             let system_prompt = build_system_prompt(
@@ -3500,12 +3507,10 @@ where
                 mode_context.as_ref(),
                 llm_language,
                 persona.as_deref(),
+                explore_bash_available,
             );
 
             // Build request — normalize messages against current tool set
-            // to remove tool_use/tool_result blocks for tools no longer
-            // available (e.g., propose_task after Explore→Work transition).
-            let tools = tool_executor.definitions_for_language(llm_language).await;
             let tool_names: std::collections::HashSet<&str> =
                 tools.iter().map(|t| t.name.as_str()).collect();
             let messages = strip_unavailable_tool_blocks(messages, &tool_names);
