@@ -909,6 +909,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_failed_refresh_recovery_drops_the_server() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = McpClientManager::new();
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        mcp.tools_changed
+            .store(true, std::sync::atomic::Ordering::Release);
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // The refresh 404s (recoverable), but the recovery handshake fails:
+        // the server must be dropped, not reinserted with stale definitions
+        // over a torn-down transport.
+        server.push_responses(vec![status_response(404, &[]), status_response(500, &[])]);
+
+        let defs = manager.tool_definitions().await;
+        assert!(defs.is_empty(), "stale definitions must not be advertised");
+        assert!(manager.status().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_call_arriving_mid_recovery_joins_it() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // The first call 404s and leads a recovery whose re-initialize is
+        // held open for 300ms. The second call STARTS at 100ms -- while the
+        // server is out of the map -- and must join the in-flight recovery
+        // at the initial lookup instead of failing with "not connected".
+        let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
+        server.push_responses(vec![status_response(404, &[])]);
+        let mut recovery = handshake_responses("sess-2");
+        recovery[0] = delayed(recovery[0].clone(), 300);
+        server.push_responses(recovery);
+        server.push_responses(vec![
+            echo_id_response(&call_result),
+            echo_id_response(&call_result),
+        ]);
+
+        let (first, second) = tokio::join!(
+            manager.call_tool("remote", "report", serde_json::json!({})),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                manager
+                    .call_tool("remote", "report", serde_json::json!({}))
+                    .await
+            },
+        );
+
+        assert_eq!(first.expect("leading call recovers"), "ok");
+        assert_eq!(second.expect("late call joins the recovery"), "ok");
+
+        let initializes = server
+            .recorded()
+            .iter()
+            .filter(|(_, rpc)| rpc == "initialize")
+            .count();
+        assert_eq!(initializes, 2, "connect + one shared recovery");
+    }
+
+    #[tokio::test]
     async fn http_concurrent_expired_calls_share_one_recovery() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = Arc::new(McpClientManager::new());

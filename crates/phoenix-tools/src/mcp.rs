@@ -605,6 +605,20 @@ impl McpClientManager {
         self.recovering.lock().unwrap()
     }
 
+    /// If a recovery claim is parked for `server_name`, wait (bounded) for it
+    /// to be released. The claim drops only after the recovered server is
+    /// back in the map, so a follow-up lookup observes the outcome. The bound
+    /// covers a leading task dying without releasing its claim.
+    async fn await_recovery(&self, server_name: &str) {
+        let receiver = self
+            .recovering_map()
+            .get(server_name)
+            .map(tokio::sync::watch::Sender::subscribe);
+        if let Some(mut receiver) = receiver {
+            let _ = tokio::time::timeout(CONNECT_TIMEOUT, receiver.changed()).await;
+        }
+    }
+
     /// Replace the disabled server set (called at startup with persisted state).
     pub async fn set_disabled_servers(&self, disabled: std::collections::HashSet<String>) {
         *self.disabled_servers.write().await = disabled;
@@ -759,13 +773,14 @@ impl McpClientManager {
             };
             // Lock dropped -- list_tools() runs with no lock held.
             if let Some(mut server) = server {
-                match server.list_tools().await {
+                let keep = match server.list_tools().await {
                     Ok(tools) => {
                         tracing::info!(
                             server = %name,
                             tools = tools.len(),
                             "Refreshed tool list after list_changed notification"
                         );
+                        true
                     }
                     // A recoverable transport failure (e.g. the HTTP session
                     // expired mid-refresh) re-establishes the connection,
@@ -778,12 +793,16 @@ impl McpClientManager {
                             error = %e.into_message(&name),
                             "Tool refresh hit a transport failure, re-establishing connection"
                         );
-                        if let Err(reestablish_err) = server.reestablish().await {
-                            tracing::warn!(
-                                server = %name,
-                                error = %reestablish_err,
-                                "Failed to re-establish connection after refresh failure"
-                            );
+                        match server.reestablish().await {
+                            Ok(()) => true,
+                            Err(reestablish_err) => {
+                                tracing::warn!(
+                                    server = %name,
+                                    error = %reestablish_err,
+                                    "Re-establish failed after refresh failure, dropping server"
+                                );
+                                false
+                            }
                         }
                     }
                     Err(e) => {
@@ -792,10 +811,16 @@ impl McpClientManager {
                             error = %e.into_message(&name),
                             "Failed to refresh tools after list_changed"
                         );
+                        true
                     }
+                };
+                // Reinsert under brief write lock -- unless re-establish
+                // failed, in which case the transport is torn down and stale
+                // definitions must not be advertised from it; a reload
+                // reconnects it (REQ-MCP-015).
+                if keep {
+                    self.servers.write().await.insert(name, server);
                 }
-                // Reinsert under brief write lock.
-                self.servers.write().await.insert(name, server);
             }
         }
 
@@ -837,10 +862,22 @@ impl McpClientManager {
         // Happy path: read lock -- McpServer.call_tool takes &self.
         let first_result = {
             let servers = self.servers.read().await;
-            let server = servers
-                .get(server_name)
-                .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
-            server.call_tool(tool_name, arguments.clone()).await
+            if let Some(server) = servers.get(server_name) {
+                server.call_tool(tool_name, arguments.clone()).await
+            } else {
+                // Absent: a call arriving while another task holds the server
+                // out of the map for recovery joins that recovery instead of
+                // failing with "not connected". When no claim is parked the
+                // server is genuinely gone (or recovery just finished -- the
+                // re-lookup settles which).
+                drop(servers);
+                self.await_recovery(server_name).await;
+                let servers = self.servers.read().await;
+                let server = servers
+                    .get(server_name)
+                    .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
+                server.call_tool(tool_name, arguments.clone()).await
+            }
         };
 
         match first_result {
