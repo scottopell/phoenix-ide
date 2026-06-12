@@ -1308,7 +1308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn superseded_restart_is_reported_failed_not_restarted() {
+    async fn overlapping_reloads_serialize_instead_of_orphaning() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = Arc::new(McpClientManager::new());
         let mcp = connect_http(&server, HttpAuth::None)
@@ -1321,14 +1321,15 @@ mod tests {
             .insert("remote".to_string(), mcp);
 
         // Reload 1 restarts the server with a changed config; its connect is
-        // held open for 300ms. Reload 2 (at 100ms) removes the server from
-        // config, revoking the ticket. Reload 1's restart must then report a
-        // failure -- not a successful restart of a discarded server.
+        // held open for 300ms. Reload 2 (arriving at 100ms, removing the
+        // server) must serialize behind it: reload 1 completes its restart,
+        // then reload 2 removes the fresh server. Interleaved, reload 2 could
+        // revoke reload 1's restart without replacing it.
         server.push_responses(vec![delete_ack()]); // old server's terminate
         let mut recovery = handshake_responses("sess-2");
         recovery[0] = delayed(recovery[0].clone(), 300);
         server.push_responses(recovery);
-        server.push_responses(vec![delete_ack()]); // discarded publish's terminate
+        server.push_responses(vec![delete_ack()]); // reload 2's removal terminate
 
         let changed = http_config(
             &server.url,
@@ -1342,18 +1343,49 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         let second = manager.reload_from_configs(Vec::new()).await;
-        assert!(second.failed.is_empty());
 
         let first = first_reload.await.expect("first reload");
-        assert!(first.restarted.is_empty(), "nothing was published");
-        assert_eq!(first.failed.len(), 1);
-        assert_eq!(first.failed[0].server, "remote");
-        assert!(
-            first.failed[0].error.contains("superseded"),
-            "got: {}",
-            first.failed[0].error
-        );
+        assert_eq!(first.restarted, vec!["remote"]);
+        assert!(first.failed.is_empty());
+        assert_eq!(second.removed, vec!["remote"]);
         assert!(manager.servers.read().await.is_empty());
+
+        // The removed fresh session was explicitly ended.
+        let requests = server.requests.lock().unwrap();
+        let last = requests.last().expect("requests recorded");
+        assert_eq!(last.http_method(), "DELETE");
+        assert_eq!(last.header("mcp-session-id"), Some("sess-2"));
+    }
+
+    #[tokio::test]
+    async fn http_session_expiry_during_first_tools_list_retries_handshake() {
+        // The server issues a session at initialize but loses it before the
+        // first tools/list: one fresh-connection retry must connect the
+        // server instead of skipping it (REQ-MCP-005).
+        let server = TestServer::start(vec![
+            json_response(
+                1,
+                &serde_json::json!({"protocolVersion": "2025-03-26", "capabilities": {}}),
+                &[("mcp-session-id", "sess-1")],
+            ),
+            accepted(),
+            status_response(404, &[]), // tools/list: session gone
+            delete_ack(),              // dead session's terminate
+        ])
+        .await;
+        server.push_responses(handshake_responses("sess-2"));
+
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("handshake must retry once and connect");
+        assert_eq!(mcp.tools.len(), 1);
+
+        let initializes = server
+            .recorded()
+            .iter()
+            .filter(|(_, rpc)| rpc == "initialize")
+            .count();
+        assert_eq!(initializes, 2, "exactly one fresh-connection retry");
     }
 
     #[tokio::test]

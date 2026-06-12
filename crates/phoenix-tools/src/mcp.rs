@@ -361,16 +361,13 @@ impl McpServer {
         self.transport.request(method, params, timeout, &sink).await
     }
 
-    fn error_message(&self, error: &TransportError) -> String {
-        format!("MCP server '{}': {error}", self.name)
-    }
-
     /// Send the JSON-RPC `initialize` handshake followed by the
     /// `notifications/initialized` notification.
     ///
     /// # Errors
-    /// Returns a display string when the handshake request or response fails.
-    pub async fn initialize(&mut self) -> Result<(), String> {
+    /// Returns a `McpRequestError` when the handshake request or response
+    /// fails, so callers can dispatch on the transport classification.
+    pub async fn initialize(&mut self) -> Result<(), McpRequestError> {
         let params = serde_json::json!({
             "protocolVersion": self.transport.requested_protocol_version(),
             "capabilities": {
@@ -385,7 +382,7 @@ impl McpServer {
         let _resp = self
             .request("initialize", params, CONNECT_TIMEOUT)
             .await
-            .map_err(|e| self.error_message(&e))?;
+            .map_err(McpRequestError::Transport)?;
 
         // Send the initialized notification (no id, no response expected).
         let notification = serde_json::json!({
@@ -395,7 +392,7 @@ impl McpServer {
         self.transport
             .notify(&notification)
             .await
-            .map_err(|e| self.error_message(&e))?;
+            .map_err(McpRequestError::Transport)?;
 
         Ok(())
     }
@@ -605,20 +602,48 @@ impl McpServer {
     /// transport without the session DELETE would leak it until expiry
     /// (REQ-MCP-005).
     async fn handshake(&mut self) -> Result<(), String> {
-        let result = match self.initialize().await {
-            Ok(()) => {
-                let name = self.name.clone();
-                self.list_tools()
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.into_message(&name))
-            }
-            Err(e) => Err(e),
+        let Err(error) = self.handshake_attempt().await else {
+            return Ok(());
         };
-        if result.is_err() {
-            self.terminate().await;
+        let recoverable = self.should_reestablish(&error);
+        let message = error.into_message(&self.name);
+        self.terminate().await;
+        if !recoverable {
+            return Err(message);
         }
-        result
+
+        // A recoverable transport failure mid-handshake -- e.g. the server
+        // dropped the just-created session before the first tools/list --
+        // gets one retry on a fresh connection rather than skipping an
+        // otherwise reachable server (REQ-MCP-005).
+        tracing::warn!(
+            server = %self.name,
+            error = %message,
+            "Handshake hit a recoverable transport failure; retrying once on a fresh connection"
+        );
+        self.transport = connect_transport(
+            &self.name,
+            &self.config,
+            Arc::clone(&self.pending_oauth_urls),
+        )
+        .await?;
+        self.generation = next_generation();
+
+        match self.handshake_attempt().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = error.into_message(&self.name);
+                self.terminate().await;
+                Err(message)
+            }
+        }
+    }
+
+    /// One handshake pass: `initialize` then the first `tools/list`.
+    async fn handshake_attempt(&mut self) -> Result<(), McpRequestError> {
+        self.initialize().await?;
+        self.list_tools().await?;
+        Ok(())
     }
 
     /// Rebuild the transport from the retained config and re-run the
@@ -677,6 +702,12 @@ pub struct McpClientManager {
     /// cannot resurrect a removed server or displace its replacement with
     /// stale config.
     connect_tickets: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Serializes reload reconciliations. Two interleaved reconciliations
+    /// can each classify a server against state the other is mutating
+    /// (e.g. both seeing the old config of a changed server, one revoking
+    /// the other's restart without replacing it); reconciliation is only
+    /// meaningful against a stable target, so reloads run one at a time.
+    reload_serial: tokio::sync::Mutex<()>,
     /// Servers currently blocked on an OAuth flow: name → auth URL.
     /// Written by the stderr drain; cleared when the server connects or fails.
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
@@ -698,6 +729,7 @@ impl McpClientManager {
             disabled_servers: RwLock::new(std::collections::HashSet::new()),
             recovering: std::sync::Mutex::new(HashMap::new()),
             connect_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reload_serial: tokio::sync::Mutex::new(()),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -1378,6 +1410,11 @@ impl McpClientManager {
         &self,
         configs: Vec<(String, McpServerConfig)>,
     ) -> McpReloadResult {
+        // One reconciliation at a time (see `reload_serial`). Recovery and
+        // refresh holds are not serialized by this -- they are settled via
+        // claims below -- only sibling reloads are.
+        let _serial = self.reload_serial.lock().await;
+
         let config_names: std::collections::HashSet<String> =
             configs.iter().map(|(n, _)| n.clone()).collect();
 
