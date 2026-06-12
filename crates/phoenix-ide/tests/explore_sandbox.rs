@@ -2,6 +2,7 @@ use std::process::Command;
 
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::too_many_lines)]
 fn explore_sandbox_enforces_read_only_policy() {
     if !phoenix_core::platform::PlatformCapability::detect().has_sandbox() {
         eprintln!("skipping: nono sandbox backend is unavailable");

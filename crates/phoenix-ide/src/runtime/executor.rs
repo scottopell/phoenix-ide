@@ -3495,7 +3495,7 @@ where
             // describe the same tool surface the model receives.
             let tools = tool_executor.definitions_for_language(llm_language).await;
             let explore_bash_available =
-                matches!(mode_context.as_ref(), Some(ModeContext::Explore))
+                matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. }))
                     && tools.iter().any(|t| t.name == "bash");
 
             // Build system prompt with AGENTS.md content + mode context

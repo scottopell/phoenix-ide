@@ -690,6 +690,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         fs::write(
@@ -709,6 +710,7 @@ mod tests {
             None,
             crate::llm_language::LlmLanguage::default(),
             None,
+            false,
         );
 
         assert_eq!(first_prompt, second_prompt);
