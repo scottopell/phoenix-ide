@@ -136,7 +136,10 @@ impl ExploreReadOnlyPolicy {
                     .map_err(|e| format!("{}: {e}", path.display()))?;
             }
         }
+        #[cfg(target_os = "macos")]
         add_sensitive_denies(&mut caps, &self.sensitive_dirs)?;
+        #[cfg(not(target_os = "macos"))]
+        add_sensitive_denies(&mut caps, &self.sensitive_dirs);
 
         Ok(caps.block_network())
     }
@@ -301,12 +304,7 @@ fn add_sensitive_denies(
 }
 
 #[cfg(not(target_os = "macos"))]
-fn add_sensitive_denies(
-    _caps: &mut CapabilitySet,
-    _sensitive_dirs: &[PathBuf],
-) -> Result<(), String> {
-    Ok(())
-}
+fn add_sensitive_denies(_caps: &mut CapabilitySet, _sensitive_dirs: &[PathBuf]) {}
 
 #[cfg(target_os = "macos")]
 fn seatbelt_escape_path(path: &Path) -> String {
