@@ -472,6 +472,11 @@ mod tests {
         status: u16,
         headers: Vec<(String, String)>,
         body: String,
+        /// Sleep before responding -- lets a test order concurrent exchanges.
+        delay_ms: u64,
+        /// When set, the body is built by echoing the request's JSON-RPC id,
+        /// for exchanges whose request id depends on scheduling order.
+        echo_result: Option<Value>,
     }
 
     fn json_response(id: u64, result: &Value, headers: &[(&str, &str)]) -> CannedResponse {
@@ -485,6 +490,18 @@ mod tests {
             status: 200,
             headers: all,
             body: serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+            delay_ms: 0,
+            echo_result: None,
+        }
+    }
+
+    fn echo_id_response(result: &Value) -> CannedResponse {
+        CannedResponse {
+            status: 200,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: String::new(),
+            delay_ms: 0,
+            echo_result: Some(result.clone()),
         }
     }
 
@@ -493,6 +510,8 @@ mod tests {
             status: 202,
             headers: Vec::new(),
             body: String::new(),
+            delay_ms: 0,
+            echo_result: None,
         }
     }
 
@@ -501,6 +520,8 @@ mod tests {
             status: 200,
             headers: vec![("content-type".to_string(), "text/event-stream".to_string())],
             body: body.to_string(),
+            delay_ms: 0,
+            echo_result: None,
         }
     }
 
@@ -512,7 +533,14 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
             body: String::new(),
+            delay_ms: 0,
+            echo_result: None,
         }
+    }
+
+    fn delayed(mut response: CannedResponse, delay_ms: u64) -> CannedResponse {
+        response.delay_ms = delay_ms;
+        response
     }
 
     struct TestServer {
@@ -620,6 +648,9 @@ mod tests {
                 String::from_utf8_lossy(&buf[body_start..body_start + content_length]).to_string();
             buf.drain(..body_start + content_length);
 
+            let request_id = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("id").cloned());
             requests.lock().unwrap().push(RecordedRequest {
                 request_line,
                 headers,
@@ -634,13 +665,27 @@ mod tests {
                     status: 500,
                     headers: Vec::new(),
                     body: String::new(),
+                    delay_ms: 0,
+                    echo_result: None,
                 });
+            if response.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(response.delay_ms)).await;
+            }
+            let response_body = match &response.echo_result {
+                Some(result) => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id.unwrap_or(Value::Null),
+                    "result": result,
+                })
+                .to_string(),
+                None => response.body.clone(),
+            };
             let mut out = format!("HTTP/1.1 {} Test\r\n", response.status);
             for (key, value) in &response.headers {
                 let _ = write!(out, "{key}: {value}\r\n");
             }
-            let _ = write!(out, "content-length: {}\r\n\r\n", response.body.len());
-            out.push_str(&response.body);
+            let _ = write!(out, "content-length: {}\r\n\r\n", response_body.len());
+            out.push_str(&response_body);
             if stream.write_all(out.as_bytes()).await.is_err() {
                 return;
             }
@@ -819,6 +864,98 @@ mod tests {
         let requests = server.requests.lock().unwrap();
         let last = requests.last().expect("requests recorded");
         assert_eq!(last.header("mcp-session-id"), Some("sess-2"));
+    }
+
+    #[tokio::test]
+    async fn http_session_expiry_during_tool_refresh_reestablishes() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = McpClientManager::new();
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        mcp.tools_changed
+            .store(true, std::sync::atomic::Ordering::Release);
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // The lazy list_changed refresh 404s (session expired); the refresh
+        // path must re-establish (fresh handshake) instead of leaving the
+        // server with a stale tool list.
+        server.push_responses(vec![status_response(404, &[])]);
+        server.push_responses(handshake_responses("sess-2"));
+
+        let defs = manager.tool_definitions().await;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].0, "remote");
+        assert_eq!(defs[0].1.name, "report");
+
+        let methods: Vec<String> = server.recorded().into_iter().map(|(_, rpc)| rpc).collect();
+        let methods: Vec<&str> = methods.iter().map(String::as_str).collect();
+        assert_eq!(
+            methods,
+            vec![
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+                "tools/list", // the refresh that 404s
+                "initialize",
+                "notifications/initialized",
+                "tools/list",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn http_concurrent_expired_calls_share_one_recovery() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // Two concurrent calls both 404. The delays order the race: the first
+        // failure claims the recovery immediately; the second failure lands
+        // (100ms) while the leader's re-initialize is still pending (300ms),
+        // so it must join the in-flight recovery rather than failing with
+        // "not connected". Retried call ids depend on scheduling order, so
+        // those responses echo the request id.
+        let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
+        server.push_responses(vec![
+            status_response(404, &[]),
+            delayed(status_response(404, &[]), 100),
+        ]);
+        let mut recovery = handshake_responses("sess-2");
+        recovery[0] = delayed(recovery[0].clone(), 300);
+        server.push_responses(recovery);
+        server.push_responses(vec![
+            echo_id_response(&call_result),
+            echo_id_response(&call_result),
+        ]);
+
+        let (first, second) = tokio::join!(
+            manager.call_tool("remote", "report", serde_json::json!({})),
+            manager.call_tool("remote", "report", serde_json::json!({})),
+        );
+
+        assert_eq!(first.expect("first call recovers"), "ok");
+        assert_eq!(second.expect("second call joins the recovery"), "ok");
+
+        // Exactly one recovery handshake ran for the two failing calls.
+        let initializes = server
+            .recorded()
+            .iter()
+            .filter(|(_, rpc)| rpc == "initialize")
+            .count();
+        assert_eq!(initializes, 2, "connect + one shared recovery");
+        assert!(manager.recovering.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

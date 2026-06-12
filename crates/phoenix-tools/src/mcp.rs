@@ -182,24 +182,24 @@ pub struct McpServerStatus {
 // McpServer
 // ---------------------------------------------------------------------------
 
-/// Failure from one `tools/call`, keeping the transport classification intact
-/// so the manager's recovery path dispatches on the variant rather than
-/// string-matching the message.
+/// Failure from one MCP request round trip (`tools/call`, `tools/list`),
+/// keeping the transport classification intact so recovery paths dispatch on
+/// the variant rather than string-matching the message.
 #[derive(Debug)]
-pub enum McpCallError {
+pub enum McpRequestError {
     /// Classified by the transport. The detail is unprefixed; format with the
     /// server name via `into_message`.
     Transport(TransportError),
     /// Tool-level failure (`isError` result) or malformed response; the
     /// string is the complete display message.
-    Call(String),
+    Other(String),
 }
 
-impl McpCallError {
+impl McpRequestError {
     fn into_message(self, server_name: &str) -> String {
         match self {
             Self::Transport(e) => format!("MCP server '{server_name}': {e}"),
-            Self::Call(message) => message,
+            Self::Other(message) => message,
         }
     }
 }
@@ -331,8 +331,11 @@ impl McpServer {
     /// Follows cursor-based pagination if the server returns `nextCursor`.
     ///
     /// # Errors
-    /// Returns a display string when a `tools/list` request or response fails.
-    pub async fn list_tools(&mut self) -> Result<Vec<McpToolDef>, String> {
+    /// Returns a `McpRequestError` when a `tools/list` request or response
+    /// fails, so callers can dispatch recovery on the transport
+    /// classification (the lazy `list_changed` refresh re-establishes an
+    /// expired HTTP session, REQ-MCP-005).
+    pub async fn list_tools(&mut self) -> Result<Vec<McpToolDef>, McpRequestError> {
         const MAX_PAGES: usize = 20;
 
         let mut all_defs = Vec::new();
@@ -347,16 +350,16 @@ impl McpServer {
             let resp = self
                 .request("tools/list", params, CONNECT_TIMEOUT)
                 .await
-                .map_err(|e| self.error_message(&e))?;
+                .map_err(McpRequestError::Transport)?;
 
             let tools_arr = resp
                 .get("tools")
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| {
-                    format!(
+                    McpRequestError::Other(format!(
                         "MCP server '{}': tools/list response missing 'tools' array",
                         self.name
-                    )
+                    ))
                 })?;
 
             for tool in tools_arr {
@@ -414,13 +417,13 @@ impl McpServer {
     /// Call a tool on this server via `tools/call`.
     ///
     /// # Errors
-    /// Returns a `McpCallError` when the `tools/call` request fails or the
+    /// Returns a `McpRequestError` when the `tools/call` request fails or the
     /// server reports a tool error.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         arguments: Value,
-    ) -> Result<String, McpCallError> {
+    ) -> Result<String, McpRequestError> {
         let params = serde_json::json!({
             "name": tool_name,
             "arguments": arguments,
@@ -429,7 +432,7 @@ impl McpServer {
         let resp = self
             .request("tools/call", params, REQUEST_TIMEOUT)
             .await
-            .map_err(McpCallError::Transport)?;
+            .map_err(McpRequestError::Transport)?;
 
         // MCP tools/call can signal failure via isError at the result level.
         let is_error = resp
@@ -442,7 +445,7 @@ impl McpServer {
             .get("content")
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
-                McpCallError::Call(format!(
+                McpRequestError::Other(format!(
                     "MCP server '{}': tools/call response missing 'content' array",
                     self.name
                 ))
@@ -471,7 +474,7 @@ impl McpServer {
         let output = text.join("\n");
 
         if is_error {
-            Err(McpCallError::Call(output))
+            Err(McpRequestError::Other(output))
         } else {
             Ok(output)
         }
@@ -504,8 +507,8 @@ impl McpServer {
     /// `Disconnected` -- a live-but-slow server is not respawned
     /// (REQ-MCP-003). HTTP additionally recovers from a timeout (REQ-MCP-007)
     /// and an expired session, which re-initializes (REQ-MCP-005).
-    fn should_reestablish(&self, error: &McpCallError) -> bool {
-        let McpCallError::Transport(transport_error) = error else {
+    fn should_reestablish(&self, error: &McpRequestError) -> bool {
+        let McpRequestError::Transport(transport_error) = error else {
             return false;
         };
         match &self.config {
@@ -535,7 +538,8 @@ impl McpServer {
         self.tools_changed.store(false, Ordering::Release);
 
         self.initialize().await?;
-        self.list_tools().await?;
+        let name = self.name.clone();
+        self.list_tools().await.map_err(|e| e.into_message(&name))?;
 
         tracing::info!(
             server = %self.name,
@@ -554,15 +558,21 @@ impl McpServer {
 
 /// Owns all MCP server connections.
 ///
-/// Lock ordering: always acquire `servers` before `disabled_servers`.
-/// Both are tokio `RwLock` and must not be held across heavy `.await`
+/// Lock ordering: always acquire `servers` before `disabled_servers` or
+/// `recovering`. The tokio `RwLock`s must not be held across heavy `.await`
 /// points (respawn, connect, etc.) -- extract data, drop the lock, then
-/// do async I/O.
+/// do async I/O. `recovering` is a sync mutex held only for map access.
 pub struct McpClientManager {
     servers: Arc<RwLock<HashMap<String, McpServer>>>,
     /// Server names whose tools should be excluded from conversations.
     /// The servers remain connected for instant re-enable.
     disabled_servers: RwLock<std::collections::HashSet<String>>,
+    /// Servers mid-recovery after a transport failure: the leading call
+    /// removes the server from `servers` and parks a watch sender here;
+    /// concurrent calls that find the server absent subscribe and wait for
+    /// the sender to drop (recovery finished) instead of failing with
+    /// "not connected".
+    recovering: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<()>>>,
     /// Servers currently blocked on an OAuth flow: name → auth URL.
     /// Written by the stderr drain; cleared when the server connects or fails.
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
@@ -582,8 +592,17 @@ impl McpClientManager {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
             disabled_servers: RwLock::new(std::collections::HashSet::new()),
+            recovering: std::sync::Mutex::new(HashMap::new()),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// The recovery-claim map. Held only for map access, never across an
+    /// await, so poisoning would require a panic that is already fatal.
+    fn recovering_map(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, tokio::sync::watch::Sender<()>>> {
+        self.recovering.lock().unwrap()
     }
 
     /// Replace the disabled server set (called at startup with persisted state).
@@ -748,10 +767,29 @@ impl McpClientManager {
                             "Refreshed tool list after list_changed notification"
                         );
                     }
+                    // A recoverable transport failure (e.g. the HTTP session
+                    // expired mid-refresh) re-establishes the connection,
+                    // which re-runs the handshake and tools/list, instead of
+                    // leaving the server with a stale tool list (REQ-MCP-005,
+                    // REQ-MCP-007).
+                    Err(e) if server.should_reestablish(&e) => {
+                        tracing::warn!(
+                            server = %name,
+                            error = %e.into_message(&name),
+                            "Tool refresh hit a transport failure, re-establishing connection"
+                        );
+                        if let Err(reestablish_err) = server.reestablish().await {
+                            tracing::warn!(
+                                server = %name,
+                                error = %reestablish_err,
+                                "Failed to re-establish connection after refresh failure"
+                            );
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
                             server = %name,
-                            error = %e,
+                            error = %e.into_message(&name),
                             "Failed to refresh tools after list_changed"
                         );
                     }
@@ -808,59 +846,99 @@ impl McpClientManager {
         match first_result {
             Ok(result) => return Ok(result),
             Err(e) => {
-                // Brief write lock: classify the failure and extract the
-                // broken server for out-of-lock recovery.
-                let (broken_server, action) = {
+                // One concurrent failing call leads the recovery; the others
+                // follow by waiting for it to finish, then retrying.
+                enum Recovery {
+                    Lead {
+                        server: Box<McpServer>,
+                        action: &'static str,
+                    },
+                    Follow(tokio::sync::watch::Receiver<()>),
+                }
+
+                // Brief write lock: classify the failure and either claim the
+                // recovery (extracting the server for out-of-lock work) or
+                // join one already in flight.
+                let recovery = {
                     let mut servers = self.servers.write().await;
-                    let server = servers
-                        .get_mut(server_name)
-                        .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
+                    if let Some(mut server) = servers.remove(server_name) {
+                        // If the transport is healthy and the failure is not
+                        // a recoverable transport error, it is a tool-level
+                        // failure. Also covers the case where another task
+                        // already recovered.
+                        if server.is_alive() && !server.should_reestablish(&e) {
+                            servers.insert(server_name.to_string(), server);
+                            return Err(e.into_message(server_name));
+                        }
 
-                    // If the transport is healthy and the failure is not a
-                    // recoverable transport error, it is a tool-level failure.
-                    // Also covers the case where another task already recovered.
-                    if server.is_alive() && !server.should_reestablish(&e) {
-                        return Err(e.into_message(server_name));
+                        let action = server.recovery_action();
+                        tracing::warn!(
+                            server = %server_name,
+                            error = %e.into_message(server_name),
+                            action = action,
+                            "MCP server connection lost, removing to re-establish"
+                        );
+
+                        // Claim the recovery while still holding the servers
+                        // lock, so a concurrent failing call cannot observe
+                        // the server absent without also seeing the claim.
+                        let (sender, _) = tokio::sync::watch::channel(());
+                        self.recovering_map()
+                            .insert(server_name.to_string(), sender);
+                        Recovery::Lead {
+                            server: Box::new(server),
+                            action,
+                        }
+                    } else {
+                        // Absent with a claim parked: a concurrent call is
+                        // already re-establishing this server -- wait for it
+                        // rather than failing with "not connected".
+                        let receiver = self
+                            .recovering_map()
+                            .get(server_name)
+                            .map(tokio::sync::watch::Sender::subscribe);
+                        let Some(receiver) = receiver else {
+                            return Err(format!("MCP server '{server_name}' is not connected"));
+                        };
+                        Recovery::Follow(receiver)
                     }
-
-                    let action = server.recovery_action();
-                    tracing::warn!(
-                        server = %server_name,
-                        error = %e.into_message(server_name),
-                        action = action,
-                        "MCP server connection lost, removing to re-establish"
-                    );
-
-                    // Remove the server so the write lock can be dropped.
-                    (servers.remove(server_name), action)
                 };
                 // Write lock is dropped here.
 
-                // Re-establish outside the lock so other servers aren't blocked.
-                if let Some(mut server) = broken_server {
-                    match server.reestablish().await {
-                        Ok(()) => {
-                            // Reinsert under a brief write lock, then retry
-                            // via the read-lock path.
+                match recovery {
+                    // Re-establish outside the lock so other servers aren't
+                    // blocked. The claim is released (waking followers) only
+                    // after the server is back in the map.
+                    Recovery::Lead { mut server, action } => {
+                        let result = server.reestablish().await;
+                        if result.is_ok() {
                             self.servers
                                 .write()
                                 .await
-                                .insert(server_name.to_string(), server);
+                                .insert(server_name.to_string(), *server);
                         }
-                        Err(reestablish_err) => {
+                        self.recovering_map().remove(server_name);
+                        if let Err(reestablish_err) = result {
                             return Err(format!(
                                 "MCP server '{server_name}' connection lost and {action} failed: {reestablish_err}"
                             ));
                         }
                     }
+                    // The leader's reestablish is bounded by the connect
+                    // timeouts; the wait here is bounded too in case the
+                    // leading task dies without releasing the claim.
+                    Recovery::Follow(mut receiver) => {
+                        let _ = tokio::time::timeout(CONNECT_TIMEOUT, receiver.changed()).await;
+                    }
                 }
             }
         }
 
-        // Retry once via the normal read-lock path after recovery.
+        // Retry once via the normal read-lock path after recovery. The server
+        // can be absent here when a followed recovery failed and dropped it.
         let servers = self.servers.read().await;
         let server = servers.get(server_name).ok_or_else(|| {
-            format!("MCP server '{server_name}' recovery succeeded but server not found")
+            format!("MCP server '{server_name}' is not connected after a failed recovery")
         })?;
         server
             .call_tool(tool_name, arguments)
@@ -876,7 +954,10 @@ impl McpClientManager {
     ) -> Result<McpServer, String> {
         let mut server = McpServer::connect(name, entry.clone(), pending_oauth_urls).await?;
         server.initialize().await?;
-        server.list_tools().await?;
+        server
+            .list_tools()
+            .await
+            .map_err(|e| e.into_message(name))?;
         Ok(server)
     }
 
@@ -1773,7 +1854,7 @@ mod tests {
             TransportError::SessionExpired,
         ] {
             assert!(
-                server.should_reestablish(&McpCallError::Transport(recoverable.clone())),
+                server.should_reestablish(&McpRequestError::Transport(recoverable.clone())),
                 "{recoverable:?} must reconnect an HTTP server"
             );
         }
@@ -1787,7 +1868,7 @@ mod tests {
             },
         ] {
             assert!(
-                !server.should_reestablish(&McpCallError::Transport(surfaced.clone())),
+                !server.should_reestablish(&McpRequestError::Transport(surfaced.clone())),
                 "{surfaced:?} must be surfaced, not retried"
             );
         }
