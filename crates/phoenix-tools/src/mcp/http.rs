@@ -1170,6 +1170,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_removes_a_held_server_that_left_the_config() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // The server is held out of the map (claim parked) when a reload
+        // arrives with it gone from config: the sweep must settle the hold
+        // and remove it, or the holder's reinsert would leave a zombie.
+        let (sender, _) = tokio::sync::watch::channel(());
+        manager
+            .recovering_map()
+            .insert("remote".to_string(), sender);
+        let held = manager
+            .servers
+            .write()
+            .await
+            .remove("remote")
+            .expect("server present");
+        let holder = Arc::clone(&manager);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            holder
+                .servers
+                .write()
+                .await
+                .insert("remote".to_string(), held);
+            holder.recovering_map().remove("remote");
+        });
+
+        server.push_responses(vec![delete_ack()]);
+        let result = manager.reload_from_configs(Vec::new()).await;
+
+        assert_eq!(result.removed, vec!["remote"]);
+        assert!(manager.servers.read().await.is_empty());
+        let requests = server.requests.lock().unwrap();
+        let last = requests.last().expect("requests recorded");
+        assert_eq!(last.http_method(), "DELETE");
+    }
+
+    #[tokio::test]
     async fn http_failed_refresh_recovery_drops_the_server() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = McpClientManager::new();
