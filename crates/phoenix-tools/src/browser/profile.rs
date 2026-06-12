@@ -1918,9 +1918,19 @@ async fn capture_heap_snapshot(
 
     let collector = tokio::spawn(async move {
         let mut buf = String::new();
-        // Chunks stop arriving once the snapshot is fully streamed; the
-        // takeHeapSnapshot command returns after the last chunk, so a short
-        // post-completion drain window is enough.
+        // First-chunk wait and inter-chunk drain are different waits and need
+        // different bounds. Streaming only begins after takeHeapSnapshot is
+        // dispatched (below) and Chrome starts walking the heap — under a
+        // loaded host that lead time can run to seconds, so the first chunk
+        // gets a generous bound. Once streaming starts, chunks arrive
+        // back-to-back, so a short idle gap reliably means "fully streamed"
+        // (takeHeapSnapshot returns after the last chunk). Collapsing both
+        // into one short timeout races the not-yet-streaming snapshot and
+        // yields an empty buffer under load.
+        match tokio::time::timeout(Duration::from_secs(30), chunks.next()).await {
+            Ok(Some(ev)) => buf.push_str(&ev.chunk),
+            _ => return buf,
+        }
         while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), chunks.next()).await {
             buf.push_str(&ev.chunk);
         }
