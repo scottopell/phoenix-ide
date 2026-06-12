@@ -1393,6 +1393,18 @@ impl McpClientManager {
         let mut removed_servers = Vec::new();
         {
             let mut servers = self.servers.write().await;
+            // Revoke connect tickets for names no longer configured while
+            // still holding the servers lock: publish_if_current checks the
+            // ticket under this same lock, so an in-flight connect either
+            // publishes before this sweep (and is removed by it, below) or
+            // observes the revocation -- there is no window in which a late
+            // publish can land after the sweep and resurrect a removed
+            // server.
+            self.connect_tickets
+                .lock()
+                .unwrap()
+                .retain(|name, _| config_names.contains(name));
+
             let existing_names: Vec<String> = servers.keys().cloned().collect();
             for name in existing_names {
                 if !config_names.contains(&name) {
@@ -1418,14 +1430,6 @@ impl McpClientManager {
             server.terminate().await;
             tracing::info!(server = %name, "MCP server removed during reload");
         }
-        // Revoke connect tickets for names no longer configured, superseding
-        // any still-in-flight connect attempt (e.g. one abandoned at a
-        // previous reload's deadline) so its late publish is discarded
-        // instead of resurrecting a removed server.
-        self.connect_tickets
-            .lock()
-            .unwrap()
-            .retain(|name, _| config_names.contains(name));
 
         for (name, entry) in configs {
             let existing_config = self.settled_config(&name).await;
