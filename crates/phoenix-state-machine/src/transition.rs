@@ -2574,6 +2574,20 @@ pub fn transition_sub_agent(
         }
 
         // ============================================================
+        // Sub-agent UserCancel while already CancellingTool -> absorb
+        // ============================================================
+        // A second UserCancel can arrive (the per-agent timeout and the parent
+        // cancel are independent senders) before the aborting tool settles. Stay
+        // in CancellingTool and do NOT notify the parent: notifying now would let
+        // the parent resume while the tool task is still aborting, recreating the
+        // write-after-cancel race this state exists to prevent. The eventual
+        // ToolAborted/ToolComplete settles the round (arm above).
+        (
+            cancelling @ SubAgentState::Core(CoreState::CancellingTool { .. }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _ }),
+        ) => Ok(SubAgentTransitionResult::new(cancelling.clone())),
+
+        // ============================================================
         // Sub-agent UserCancel -> Failed (from any other non-terminal core state)
         // ============================================================
         (SubAgentState::Core(_), SubAgentEvent::Core(CoreEvent::UserCancel { reason })) => {
@@ -3998,6 +4012,30 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::NotifyParent { .. })),
             "racing ToolComplete settle must also notify the parent"
+        );
+
+        // A SECOND UserCancel arriving before the tool settles must be absorbed:
+        // stay in CancellingTool, do NOT notify the parent (else the parent
+        // resumes while the tool is still aborting — the race this state prevents).
+        let result_recancel = transition(
+            &cancelling,
+            &sub_agent_context(),
+            Event::UserCancel {
+                reason: Some("second cancel".to_string()),
+            },
+        )
+        .expect("sub-agent CancellingTool + UserCancel must be absorbed");
+        assert!(
+            matches!(result_recancel.new_state, ConvState::CancellingTool { .. }),
+            "a repeated cancel must stay in CancellingTool, got {:?}",
+            result_recancel.new_state
+        );
+        assert!(
+            !result_recancel
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "a repeated cancel must NOT notify the parent before the tool settles"
         );
     }
 
