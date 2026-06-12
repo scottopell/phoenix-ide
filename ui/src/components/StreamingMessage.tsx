@@ -6,6 +6,7 @@ import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter
 import type { StreamingBuffer } from '../conversation/atom';
 import { useStreamingBuffer } from '../conversation/useConversationAtom';
 import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
+import { ConversationMarkdownAnchor } from './conversationMarkdown';
 
 // Stable markdown configuration — avoids creating new references on every render
 const REMARK_PLUGINS = [remarkGfm];
@@ -22,6 +23,7 @@ function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
 }
 
 const MARKDOWN_COMPONENTS = {
+  a: ConversationMarkdownAnchor,
   table: MarkdownTable,
 };
 

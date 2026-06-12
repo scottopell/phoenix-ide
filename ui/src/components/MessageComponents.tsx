@@ -15,6 +15,7 @@
 import React, { memo, useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
+import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import { api } from '../api';
@@ -35,6 +36,7 @@ import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './Browse
 import { PillStrip, type PillItem } from './PillStrip';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
+import { ConversationMarkdownAnchor, CONVERSATION_MARKDOWN_COMPONENTS } from './conversationMarkdown';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -803,8 +805,9 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, i
       };
       return <li>{processChildren(children)}</li>;
     },
+    a: ConversationMarkdownAnchor,
     table: MarkdownTable,
-  }), [onOpenFile, filePathCopyContext, syntaxStyle]);
+  } satisfies Components), [onOpenFile, filePathCopyContext, syntaxStyle]);
 
   // Check if there's any renderable content
   const hasRenderableContent = blocks.some(block => {
@@ -1878,7 +1881,7 @@ function ChildAgentActivity({ message, toolResults }: { message: Message; toolRe
           if (!text) return null;
           return (
             <div key={`${message.message_id}-text-${idx}`} className="subagent-activity-event agent-text">
-              <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={CONVERSATION_MARKDOWN_COMPONENTS}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</ReactMarkdown>
             </div>
           );
         }
@@ -1933,7 +1936,7 @@ export function SubAgentTranscript({ inline, running, full = false }: { inline: 
       ))}
       {atom.streamingBuffer?.text && (
         <div className="subagent-activity-event agent-text streaming">
-          <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{atom.streamingBuffer.text}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={CONVERSATION_MARKDOWN_COMPONENTS}>{atom.streamingBuffer.text}</ReactMarkdown>
         </div>
       )}
       {inline.type !== 'connecting' && inline.type !== 'error' && visibleAgentMessages.length === 0 && !atom.streamingBuffer?.text && (
@@ -1985,7 +1988,7 @@ function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; tas
       {expanded && resultText && (
         <div className={`subagent-final-result ${statusClass}`}>
           <div className="subagent-final-result-label">final outcome</div>
-          <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{resultText}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={CONVERSATION_MARKDOWN_COMPONENTS}>{resultText}</ReactMarkdown>
         </div>
       )}
     </div>

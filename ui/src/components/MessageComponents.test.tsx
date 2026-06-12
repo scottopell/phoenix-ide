@@ -264,6 +264,67 @@ describe('agent message file paths', () => {
 });
 
 
+describe('conversation markdown links', () => {
+  it('opens finalized agent Markdown links in a new tab with safe rel attributes', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-markdown-link', [{
+            type: 'text',
+            text: 'Review [PR 123](https://github.com/acme/repo/pull/123) before merging.',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    const link = screen.getByRole('link', { name: 'PR 123' });
+    expect(link).toHaveAttribute('href', 'https://github.com/acme/repo/pull/123');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+  });
+
+  it('keeps finalized agent plain URL auto-links opening in a new tab', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-auto-link', [{
+            type: 'text',
+            text: 'Plain URL: https://github.com/acme/repo/pull/456',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    const link = screen.getByRole('link', { name: 'https://github.com/acme/repo/pull/456' });
+    expect(link).toHaveAttribute('href', 'https://github.com/acme/repo/pull/456');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+  });
+
+  it('opens streaming agent Markdown links in a new tab with safe rel attributes', async () => {
+    render(
+      <MemoryRouter>
+        <StreamingMessageView buffer={{
+          text: 'Streaming [PR 789](https://github.com/acme/repo/pull/789) now.',
+          lastSequence: 1,
+          startedAt: Date.now(),
+          requestId: 'test-req-id',
+        }} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      const link = screen.getByRole('link', { name: 'PR 789' });
+      expect(link).toHaveAttribute('href', 'https://github.com/acme/repo/pull/789');
+      expect(link).toHaveAttribute('target', '_blank');
+      expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    });
+  });
+});
+
+
 describe('markdown table rendering', () => {
   const wideTableMarkdown = [
     '| Alpha | Beta | Gamma | Delta | Epsilon | Zeta |',
