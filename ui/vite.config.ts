@@ -17,7 +17,10 @@ function gitkeep(): Plugin {
 const apiPort = process.env.VITE_API_PORT || '8000';
 const apiScheme = process.env.VITE_API_SCHEME || 'http';
 const proxySecure = process.env.VITE_API_PROXY_SECURE !== 'false';
-const apiTarget = `${apiScheme}://localhost:${apiPort}`;
+// Literal IPv4 loopback, not `localhost`: the dev backend binds 127.0.0.1, and
+// on hosts where Node resolves `localhost` to `::1` first the proxy would get
+// connection-refused against an IPv4-only listener.
+const apiTarget = `${apiScheme}://127.0.0.1:${apiPort}`;
 
 // Dev HTTPS: when cert/key paths are provided (./dev.py wires these to Phoenix's
 // auto-managed local-CA leaf), serve over TLS. Vite 8's `resolveHttpServer` then

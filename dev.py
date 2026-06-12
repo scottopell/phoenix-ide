@@ -927,14 +927,19 @@ def _dev_bind_host() -> str:
 def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
     """Start the Vite dev server. Returns whether Vite serves over HTTPS (h2)."""
     scheme = "https" if phoenix_tls else "http"
-    desired_proxy = f"{scheme}://localhost:{phoenix_port}"
+    vite_host = _dev_bind_host()
+    # The restart key includes the bind host so a later auth / insecure-bind env
+    # change (which flips `_dev_bind_host` between 127.0.0.1 and 0.0.0.0) actually
+    # restarts Vite instead of being masked by "already running". The proxy target
+    # is 127.0.0.1 to match the backend's IPv4 loopback bind.
+    desired_proxy = f"{scheme}://127.0.0.1:{phoenix_port}|host={vite_host}"
     cert_paths = phoenix_tls_cert_paths() if phoenix_tls else None
     if get_pid(VITE_PID_FILE):
         current_proxy = VITE_PROXY_FILE.read_text().strip() if VITE_PROXY_FILE.exists() else ""
         if current_proxy == desired_proxy:
             print("Vite dev server already running")
             return bool(cert_paths and all(p.exists() for p in cert_paths))
-        print("Restarting Vite dev server for API proxy change")
+        print("Restarting Vite dev server for API proxy/host change")
         stop_process(VITE_PID_FILE, "Vite")
 
     ensure_ui_deps()
@@ -957,11 +962,11 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
         else:
             print(f"  ⚠ Vite HTTPS disabled: Phoenix TLS cert not found at {cert}")
 
-    # Start Vite in background. Host is loopback unless the API is password-
-    # protected or the insecure bind is opted into (see `_dev_bind_host`) — a
-    # `0.0.0.0` Vite proxies the unauthenticated backend to the network.
+    # Start Vite in background. `vite_host` (loopback unless the API is password-
+    # protected or the insecure bind is opted into, see `_dev_bind_host`) was
+    # resolved above and folded into the restart key — a `0.0.0.0` Vite proxies
+    # the unauthenticated backend to the network.
     # pnpm passes args after the script name directly — no `--` separator.
-    vite_host = _dev_bind_host()
     proc = subprocess.Popen(
         ["pnpm", "run", "dev", "--port", str(port), "--strictPort", "--host", vite_host],
         cwd=UI_DIR,
