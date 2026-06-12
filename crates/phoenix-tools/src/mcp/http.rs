@@ -1217,6 +1217,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_connect_superseded_by_newer_reload_is_discarded() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+
+        // A connect attempt holds this ticket while it is still handshaking...
+        let ticket = manager.issue_connect_ticket("remote");
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+
+        // ...when a newer reload (with the server gone from config) revokes
+        // the ticket.
+        let result = manager.reload_from_configs(Vec::new()).await;
+        assert!(result.removed.is_empty());
+
+        // The late publish must be discarded -- not resurrect the removed
+        // server -- and the session it created must be DELETEd.
+        server.push_responses(vec![delete_ack()]);
+        let published = super::super::publish_if_current(
+            &manager.servers,
+            &manager.connect_tickets,
+            "remote",
+            ticket,
+            mcp,
+        )
+        .await;
+
+        assert!(!published);
+        assert!(manager.servers.read().await.is_empty());
+        let requests = server.requests.lock().unwrap();
+        let last = requests.last().expect("requests recorded");
+        assert_eq!(last.http_method(), "DELETE");
+        assert_eq!(last.header("mcp-session-id"), Some("sess-1"));
+    }
+
+    #[tokio::test]
     async fn http_failed_refresh_recovery_drops_the_server() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = McpClientManager::new();

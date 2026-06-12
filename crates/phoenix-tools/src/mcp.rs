@@ -162,6 +162,46 @@ async fn insert_server(
     }
 }
 
+/// Publish a freshly connected server -- but only if `ticket` is still the
+/// current connect attempt for `name`. A connect that outlived its reload
+/// (e.g. abandoned at the reload deadline) must not resurrect a server a
+/// newer reload removed, or displace its replacement with stale config; a
+/// superseded server is terminated instead (ending any session it created).
+/// The check and the insert share the `servers` write lock so a concurrent
+/// reload's ticket revocation cannot interleave between them. Returns
+/// whether the server was published.
+async fn publish_if_current(
+    servers: &RwLock<HashMap<String, McpServer>>,
+    tickets: &std::sync::Mutex<HashMap<String, u64>>,
+    name: &str,
+    ticket: u64,
+    server: McpServer,
+) -> bool {
+    let (published, mut leftover) = {
+        let mut servers = servers.write().await;
+        if tickets.lock().unwrap().get(name).copied() == Some(ticket) {
+            (true, servers.insert(name.to_string(), server))
+        } else {
+            (false, Some(server))
+        }
+    };
+    if let Some(leftover) = leftover.as_mut() {
+        if published {
+            tracing::warn!(
+                server = %name,
+                "Publish displaced an existing MCP server instance; terminating it"
+            );
+        } else {
+            tracing::warn!(
+                server = %name,
+                "Discarding a late MCP connect superseded by a newer reload"
+            );
+        }
+        leftover.terminate().await;
+    }
+    published
+}
+
 /// Extract a string-to-string map from an optional JSON object, dropping
 /// non-string values.
 fn string_map(value: Option<&Value>) -> HashMap<String, String> {
@@ -614,10 +654,11 @@ impl McpServer {
 
 /// Owns all MCP server connections.
 ///
-/// Lock ordering: always acquire `servers` before `disabled_servers` or
-/// `recovering`. The tokio `RwLock`s must not be held across heavy `.await`
-/// points (respawn, connect, etc.) -- extract data, drop the lock, then
-/// do async I/O. `recovering` is a sync mutex held only for map access.
+/// Lock ordering: always acquire `servers` before `disabled_servers`,
+/// `recovering`, or `connect_tickets`. The tokio `RwLock`s must not be held
+/// across heavy `.await` points (respawn, connect, etc.) -- extract data,
+/// drop the lock, then do async I/O. The sync mutexes are held only for map
+/// access.
 pub struct McpClientManager {
     servers: Arc<RwLock<HashMap<String, McpServer>>>,
     /// Server names whose tools should be excluded from conversations.
@@ -629,6 +670,13 @@ pub struct McpClientManager {
     /// absent subscribe and wait for the sender to drop (work finished)
     /// instead of failing with "not connected".
     recovering: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<()>>>,
+    /// The current connect attempt per server name. Every spawned connect
+    /// (discovery, reload-added, reload-restart) records a ticket here and
+    /// publishes its result only while that ticket is still current
+    /// (`publish_if_current`), so an attempt outlived by a newer reload
+    /// cannot resurrect a removed server or displace its replacement with
+    /// stale config.
+    connect_tickets: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     /// Servers currently blocked on an OAuth flow: name → auth URL.
     /// Written by the stderr drain; cleared when the server connects or fails.
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
@@ -649,8 +697,20 @@ impl McpClientManager {
             servers: Arc::new(RwLock::new(HashMap::new())),
             disabled_servers: RwLock::new(std::collections::HashSet::new()),
             recovering: std::sync::Mutex::new(HashMap::new()),
+            connect_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Register a new connect attempt for `server_name`, superseding any
+    /// earlier attempt still in flight.
+    fn issue_connect_ticket(&self, server_name: &str) -> u64 {
+        let ticket = next_generation();
+        self.connect_tickets
+            .lock()
+            .unwrap()
+            .insert(server_name.to_string(), ticket);
+        ticket
     }
 
     /// The recovery-claim map. Held only for map access, never across an
@@ -733,13 +793,24 @@ impl McpClientManager {
                 .map(|(name, entry)| {
                     let mgr = Arc::clone(&manager);
                     let oauth = Arc::clone(&manager.pending_oauth_urls);
+                    let ticket = manager.issue_connect_ticket(&name);
                     tokio::spawn(async move {
                         let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
                         match result {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
                                 let tool_count = server.tools.len();
-                                insert_server(&mgr.servers, &name, server).await;
+                                if !publish_if_current(
+                                    &mgr.servers,
+                                    &mgr.connect_tickets,
+                                    &name,
+                                    ticket,
+                                    server,
+                                )
+                                .await
+                                {
+                                    return None;
+                                }
                                 tracing::info!(
                                     server = %name,
                                     tools = tool_count,
@@ -1347,6 +1418,14 @@ impl McpClientManager {
             server.terminate().await;
             tracing::info!(server = %name, "MCP server removed during reload");
         }
+        // Revoke connect tickets for names no longer configured, superseding
+        // any still-in-flight connect attempt (e.g. one abandoned at a
+        // previous reload's deadline) so its late publish is discarded
+        // instead of resurrecting a removed server.
+        self.connect_tickets
+            .lock()
+            .unwrap()
+            .retain(|name, _| config_names.contains(name));
 
         for (name, entry) in configs {
             let existing_config = self.settled_config(&name).await;
@@ -1358,18 +1437,23 @@ impl McpClientManager {
                     added.push(name.clone());
 
                     let servers = Arc::clone(&self.servers);
+                    let tickets = Arc::clone(&self.connect_tickets);
+                    let ticket = self.issue_connect_ticket(&name);
                     tokio::spawn(async move {
                         let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
                         match result {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
                                 let tool_count = server.tools.len();
-                                insert_server(&servers, &name, server).await;
-                                tracing::info!(
-                                    server = %name,
-                                    tools = tool_count,
-                                    "MCP server connected during reload"
-                                );
+                                if publish_if_current(&servers, &tickets, &name, ticket, server)
+                                    .await
+                                {
+                                    tracing::info!(
+                                        server = %name,
+                                        tools = tool_count,
+                                        "MCP server connected during reload"
+                                    );
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(server = %name, "Failed to connect during reload: {e}");
@@ -1399,14 +1483,16 @@ impl McpClientManager {
 
                     let oauth = Arc::clone(&self.pending_oauth_urls);
                     let servers = Arc::clone(&self.servers);
+                    let tickets = Arc::clone(&self.connect_tickets);
+                    let ticket = self.issue_connect_ticket(&name);
                     restart_pending.insert(name.clone());
                     // The connect runs as a detached task: when the reload
                     // deadline drops the awaiting future below, the task is
                     // abandoned, not cancelled, so a partially established
-                    // connection still finishes -- inserting (late) on
-                    // success, or terminating the transport on a handshake
-                    // failure so a created HTTP session is DELETEd rather
-                    // than leaked by a cancelled future.
+                    // connection still finishes -- publishing (late, ticket
+                    // permitting) on success, or terminating the transport on
+                    // a handshake failure so a created HTTP session is
+                    // DELETEd rather than leaked by a cancelled future.
                     let task_name = name.clone();
                     let task = tokio::spawn(async move {
                         let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
@@ -1414,7 +1500,7 @@ impl McpClientManager {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
                                 let tool_count = server.tools.len();
-                                insert_server(&servers, &name, server).await;
+                                publish_if_current(&servers, &tickets, &name, ticket, server).await;
                                 (name, Ok(tool_count))
                             }
                             Err(error) => (name, Err(error)),
