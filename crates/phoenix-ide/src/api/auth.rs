@@ -92,6 +92,15 @@ fn is_exempt_path(path: &str) -> bool {
         return true;
     }
 
+    // The MCP OAuth redirect arrives as a bare browser GET from the
+    // authorization server and cannot carry Phoenix credentials. It is safe
+    // unauthenticated: the only meaningful inputs are `code` + `state`, and
+    // the unguessable `state` nonce binds the request to a pending flow
+    // (REQ-MCP-011) — without it the callback is rejected.
+    if path == "/api/mcp/oauth/callback" {
+        return true;
+    }
+
     false
 }
 

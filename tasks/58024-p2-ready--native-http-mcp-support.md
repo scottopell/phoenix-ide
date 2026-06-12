@@ -16,16 +16,19 @@ review rounds (~51 findings), so treat it, not this file, as the source of truth
 for exact contracts (typed `TransportError`, the `ServerMessageSink`,
 authorization-server-keyed registrations, token↔resource binding, etc.).
 
-**M1 (tasks/58025) and M2 (tasks/58026) are done.** The `McpTransport` trait +
-`Stdio | Http` config enum landed with stdio behind `StdioTransport`
-(`mcp/stdio.rs`), and the Streamable HTTP substrate landed as `HttpTransport`
-(`mcp/http.rs`): `type: "http"` entries are no longer skipped, static
-bearer/header auth works, sessions + protocol-version headers + reconnect
-semantics are in. **Next actionable: M3 (OAuth 2.1)** — the headline and the
-first releasable unit (M2+M3). Spin it into its own task, implement against
-`specs/mcp/` (discovery → registration → PKCE → token store), and close task
-08639. Then M4 → M5 per the milestone list. `executive.md`'s status table
-tracks which REQs each milestone covers.
+**M1 (tasks/58025), M2 (tasks/58026), and M3 (tasks/58028) are done.** The
+`McpTransport` trait + `Stdio | Http` config enum landed with stdio behind
+`StdioTransport` (`mcp/stdio.rs`); the Streamable HTTP substrate landed as
+`HttpTransport` (`mcp/http.rs`): `type: "http"` entries are no longer skipped,
+static bearer/header auth works, sessions + protocol-version headers +
+reconnect semantics are in. M3 brought OAuth 2.1 native (`mcp/oauth.rs` + the
+lifecycle in `mcp.rs`): discovery (RFC 9728/8414/OIDC), AS-keyed client
+registration with RFC 7591 DCR fallback, auth-code + PKCE with the callback at
+`GET /api/mcp/oauth/callback`, and the SQLite token store with silent restore,
+refresh, and `insufficient_scope` step-up — closing task 08639. M2+M3 is the
+first releasable unit. **Next actionable: M4 (GET SSE stream + resumability)**,
+then M5, per the milestone list. `executive.md`'s status table tracks which
+REQs each milestone covers.
 
 ## Where we are today
 

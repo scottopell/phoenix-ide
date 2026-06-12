@@ -139,10 +139,15 @@ struct PreconfiguredClient {
 `read_all_configs` classifies each `mcpServers` entry into a variant
 (REQ-MCP-001). The JSON shape of an HTTP entry is `{"type": "http", "url":
 ..., "headers": {...}, "auth": ...}` where `auth` is absent (`HttpAuth::None`),
-`{"bearer": "<token>"}`, or `{"headers": {...}}` (the two `StaticCred` shapes).
-An entry whose `auth` has an unrecognized shape is skipped at `debug` rather
-than downgraded to no-auth -- silently dropping an intended credential would
-change which authorization path a 401 takes. Crucially, presence of the generic `headers` map alone does
+`{"bearer": "<token>"}` or `{"headers": {...}}` (the two `StaticCred` shapes),
+or `{"oauth": true}` / `{"oauth": {...}}` (`HttpAuth::OAuth`). The `oauth`
+object pre-configures a client for a DCR-less authorization server:
+`auth_server` + `client_id` are required together, `client_secret` and
+`token_endpoint_auth_method` (default `none`) optional -- a partial
+pre-configured client skips the server rather than falling back to the DCR the
+user said is unavailable. An entry whose `auth` has an unrecognized shape is
+skipped at `debug` rather than downgraded to no-auth -- silently dropping an
+intended credential would change which authorization path a 401 takes. Crucially, presence of the generic `headers` map alone does
 **not** make a server `Static`: only an explicit auth credential
 (`StaticCred`) does. So three cases are distinct: a header-authed internal
 server (`Static(Headers)`) whose rejected key yields `StaticAuthRejected`; an
@@ -209,7 +214,9 @@ OAuth (REQ-MCP-009..012) is a sub-lifecycle entered on a 401, modeled in
 3. **awaiting_user** -- an authorization URL (auth-code + PKCE, with the
    `resource` indicator) is surfaced via `/api/mcp/status`; the user opens it in
    a browser. Phoenix receives the redirect with the code on a local callback
-   route.
+   route, `GET /api/mcp/oauth/callback`, which is exempt from password auth: a
+   browser redirect carries no Phoenix credential, and the unguessable `state`
+   nonce already binds the request to its pending flow.
 4. **authorized** -- the code + PKCE verifier are exchanged for tokens at the
    token endpoint; tokens are persisted and the connection retries to `ready`.
 5. **refreshing** -- on expiry or a post-authorization 401, the refresh token is

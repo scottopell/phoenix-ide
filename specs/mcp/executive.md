@@ -24,11 +24,11 @@ natively, without the `mcp-remote` subprocess bridge.
 | REQ-MCP-006 | Server-Initiated Stream and Resumability | Not started | M4. GET SSE stream; `tools/list_changed`; `Last-Event-ID` replay. |
 | REQ-MCP-007 | HTTP Connection Recovery | Complete | `McpServer::should_reestablish`: HTTP recovers from `Disconnected`/`Timeout`/`SessionExpired` by rebuilding the client + handshake, distinct from the stdio respawn (which recovers only from `Disconnected`). |
 | REQ-MCP-008 | Static Token / Header Authentication | Complete | `HttpAuth::Static` (bearer or designated auth headers) attached to every request; generic `headers` ride every request without classifying the server. The 401-versus-OAuth routing distinction becomes observable when the OAuth flow exists (M3). |
-| REQ-MCP-009 | OAuth 2.1 Authorization Discovery | Not started | M3. 401 → PRM (RFC 9728) → AS metadata (RFC 8414). |
-| REQ-MCP-010 | Client Identity Acquisition | Not started | M3. Prefer pre-configured / cached registration / Client ID Metadata Document; RFC 7591 DCR as fallback. `OAuthRegistration` keyed by authorization server. |
-| REQ-MCP-011 | Authorization Code Flow with PKCE | Not started | M3. Native auth-code + PKCE; no `mcp-remote`. |
-| REQ-MCP-012 | Token Storage, Refresh, Invalidation, and Step-Up | Not started | M3. `mcp_oauth_tokens` (plaintext SQLite); refresh; discard-and-re-auth on refresh failure; 403 `insufficient_scope` step-up. |
-| REQ-MCP-013 | Authorization Status Surfaced to the UI | Partial | `GET /api/mcp/status` exists and carries a `pending_oauth_url`, but it is scraped from an `mcp-remote` child's stderr. M3 replaces it with the native flow's structured URL. |
+| REQ-MCP-009 | OAuth 2.1 Authorization Discovery | Complete | `mcp/oauth.rs`: 401 challenge parsing → PRM (`resource_metadata` or the path-aware/root well-knowns, RFC 9728) → AS metadata via both RFC 8414 and OIDC discovery forms, issuer-validated. |
+| REQ-MCP-010 | Client Identity Acquisition | Complete | Pre-configured client (config `auth.oauth`) seeds the registration row at discovery; cached registrations keyed by authorization server are reused; RFC 7591 DCR is the fallback. Phoenix hosts no Client ID Metadata Document, so that step resolves to nothing (logged at `debug`) and falls through to DCR. |
+| REQ-MCP-011 | Authorization Code Flow with PKCE | Complete | Native flow in `mcp.rs` (`begin_oauth_flow` / `complete_oauth_authorization`): S256 PKCE (refused when not advertised), unguessable `state` bound to the pending flow, `iss` validation, RFC 8707 `resource` on both requests, callback at `GET /api/mcp/oauth/callback`. |
+| REQ-MCP-012 | Token Storage, Refresh, Invalidation, and Step-Up | Complete | `mcp_oauth_registrations` + `mcp_oauth_tokens` (phoenix-db migration 22, plaintext); bearer on every request via the shared cell; silent restore (resource-matched, unexpired-or-refreshable); refresh with rotation persisted; refresh rejection discards and re-prompts; 403 `insufficient_scope` steps up with the scope union while the triggering call replays via the recovery claim. |
+| REQ-MCP-013 | Authorization Status Surfaced to the UI | Complete | `GET /api/mcp/status` carries the native flow's structured `pending_oauth_url` (the stdio `mcp-remote` path still feeds the same map from its stderr drain). |
 | REQ-MCP-014 | Tool Exposure and Live Resolution | Complete | `tool_definitions` / `create_mcp_tool_by_name`; live resolution via `ToolRegistryExecutor`. HTTP servers ride this unchanged. |
 | REQ-MCP-015 | Config Reload Reconciliation | Complete | `reload_from_configs` (add / remove / restart / unchanged / failed); the `PartialEq` comparison spans the `Stdio \| Http` config variants. |
 | REQ-MCP-016 | Per-Server Enable/Disable | Complete | `disable_server` / `enable_server`; persisted in `mcp_disabled_servers` (`crates/phoenix-db/src/lib.rs`). |
@@ -45,7 +45,7 @@ This spec set is M0 of the native HTTP MCP build-out. The milestones:
 - **M2** (done) -- Streamable HTTP transport substrate with static/no auth
   (REQ-MCP-001, -004, -005, -007, -008). Prerequisite for OAuth, not an
   independent release.
-- **M3** -- OAuth 2.1, the value driver. First releasable unit = M2 + M3
+- **M3** (done) -- OAuth 2.1, the value driver. First releasable unit = M2 + M3
   (REQ-MCP-009 .. -013).
 - **M4** -- Server-initiated SSE stream + resumability (REQ-MCP-006).
 - **M5** -- UI / config / ops polish, including connection-failure visibility

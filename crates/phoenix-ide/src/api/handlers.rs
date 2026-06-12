@@ -276,6 +276,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/mcp/reload", post(reload_mcp))
         .route("/api/mcp/servers/:name/disable", post(disable_mcp_server))
         .route("/api/mcp/servers/:name/enable", post(enable_mcp_server))
+        .route("/api/mcp/oauth/callback", get(mcp_oauth_callback))
         // Notification settings (REQ-NOTIF-006, REQ-NOTIF-009)
         .route(
             "/api/settings/notifications",
@@ -4714,6 +4715,95 @@ async fn disable_mcp_server(
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
+/// Query parameters of an OAuth authorization-code redirect (RFC 6749 §4.1.2
+/// plus the `iss` of RFC 9207). Either `code` (success) or `error` (denial)
+/// is present.
+#[derive(serde::Deserialize)]
+struct McpOAuthCallbackParams {
+    code: Option<String>,
+    state: Option<String>,
+    iss: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// Render the minimal page the operator's browser lands on after the
+/// authorization server redirects. No app chrome: the tab's only job is to
+/// report the outcome and be closed.
+fn mcp_oauth_callback_page(title: &str, detail: &str) -> Html<String> {
+    let title = html_escape(title);
+    let detail = html_escape(detail);
+    Html(format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head>\
+         <body style=\"font-family: system-ui, sans-serif; margin: 4rem auto; max-width: 32rem;\">\
+         <h1 style=\"font-size: 1.2rem;\">{title}</h1><p>{detail}</p>\
+         <p>You can close this tab and return to Phoenix.</p></body></html>"
+    ))
+}
+
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The local OAuth redirect endpoint for MCP servers (REQ-MCP-011): validates
+/// the callback against the pending flow (state nonce + iss), exchanges the
+/// code, and reconnects the server in the background.
+async fn mcp_oauth_callback(
+    State(state): State<AppState>,
+    Query(params): Query<McpOAuthCallbackParams>,
+) -> Response {
+    // An error redirect (operator denied, server rejected) fails the flow it
+    // belongs to.
+    if let Some(error) = &params.error {
+        let detail = params.error_description.as_deref().unwrap_or(error);
+        if let Some(state_nonce) = &params.state {
+            state
+                .mcp_manager
+                .fail_oauth_authorization(state_nonce, detail)
+                .await;
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            mcp_oauth_callback_page("Authorization failed", detail),
+        )
+            .into_response();
+    }
+
+    let (Some(code), Some(state_nonce)) = (&params.code, &params.state) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            mcp_oauth_callback_page(
+                "Invalid callback",
+                "The redirect is missing its 'code' or 'state' parameter.",
+            ),
+        )
+            .into_response();
+    };
+
+    match state
+        .mcp_manager
+        .complete_oauth_authorization(state_nonce, code, params.iss.as_deref())
+        .await
+    {
+        Ok(server_name) => mcp_oauth_callback_page(
+            "Authorization complete",
+            &format!("Phoenix is connecting to MCP server '{server_name}'."),
+        )
+        .into_response(),
+        Err(e) => {
+            tracing::warn!("MCP OAuth callback rejected: {e}");
+            (
+                StatusCode::BAD_REQUEST,
+                mcp_oauth_callback_page("Authorization failed", &e),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Re-enable a previously disabled MCP server.
 async fn enable_mcp_server(
     State(state): State<AppState>,
@@ -5118,6 +5208,55 @@ mod hard_delete_cascade_tests {
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_callback_rejects_unmatched_state_and_error_redirects() {
+        use axum::extract::Query;
+
+        let state = make_test_state().await;
+
+        // A callback matching no pending flow is rejected (REQ-MCP-011).
+        let response = super::mcp_oauth_callback(
+            State(state.clone()),
+            Query(super::McpOAuthCallbackParams {
+                code: Some("code-1".to_string()),
+                state: Some("nonexistent".to_string()),
+                iss: None,
+                error: None,
+                error_description: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // A missing code/state pair is rejected.
+        let response = super::mcp_oauth_callback(
+            State(state.clone()),
+            Query(super::McpOAuthCallbackParams {
+                code: None,
+                state: None,
+                iss: None,
+                error: None,
+                error_description: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // An error redirect reports the denial.
+        let response = super::mcp_oauth_callback(
+            State(state),
+            Query(super::McpOAuthCallbackParams {
+                code: None,
+                state: Some("nonexistent".to_string()),
+                iss: None,
+                error: Some("access_denied".to_string()),
+                error_description: Some("the user said no".to_string()),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
