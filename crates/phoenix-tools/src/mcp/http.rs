@@ -426,15 +426,12 @@ impl SseFramer {
         events
     }
 
-    /// Flush a final event not terminated by a blank line before EOF.
+    /// Flush a final event not terminated by a blank line before EOF. EOF
+    /// acts as the missing line terminator too: a server may close the
+    /// response immediately after the last `data:` line, without a trailing
+    /// newline, and that line must not be lost.
     fn finish(&mut self) -> Option<String> {
-        if self.data_lines.is_empty() {
-            None
-        } else {
-            let event = self.data_lines.join("\n");
-            self.data_lines.clear();
-            Some(event)
-        }
+        self.push(b"\n\n").into_iter().next()
     }
 }
 
@@ -1222,7 +1219,8 @@ mod tests {
         let manager = Arc::new(McpClientManager::new());
 
         // A connect attempt holds this ticket while it is still handshaking...
-        let ticket = manager.issue_connect_ticket("remote");
+        let ticket =
+            manager.issue_connect_ticket("remote", &http_config(&server.url, HttpAuth::None));
         let mcp = connect_http(&server, HttpAuth::None)
             .await
             .expect("connect");
@@ -1386,6 +1384,134 @@ mod tests {
             .filter(|(_, rpc)| rpc == "initialize")
             .count();
         assert_eq!(initializes, 2, "exactly one fresh-connection retry");
+    }
+
+    #[tokio::test]
+    async fn reload_leaves_a_same_config_pending_add_to_finish() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let config = http_config(&server.url, HttpAuth::None);
+
+        // An add for this exact config is still handshaking...
+        let ticket = manager.issue_connect_ticket("remote", &config);
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+
+        // ...when a reload arrives with the same config: it must not
+        // supersede the attempt and gamble on a fresh one.
+        let result = manager
+            .reload_from_configs(vec![("remote".to_string(), config)])
+            .await;
+        assert_eq!(result.added, vec!["remote"]);
+        let initializes = server
+            .recorded()
+            .iter()
+            .filter(|(_, rpc)| rpc == "initialize")
+            .count();
+        assert_eq!(initializes, 1, "no duplicate connect was spawned");
+
+        // The in-flight attempt finishes and publishes normally.
+        let published = super::super::publish_if_current(
+            &manager.servers,
+            &manager.connect_tickets,
+            "remote",
+            ticket,
+            mcp,
+        )
+        .await;
+        assert!(published);
+        assert_eq!(manager.servers.read().await.len(), 1);
+        assert!(manager.connect_tickets.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_connect_clears_its_ticket() {
+        let manager = Arc::new(McpClientManager::new());
+        // Port 1 refuses connections, so the spawned connect fails fast.
+        let unreachable = McpServerConfig::Http {
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            headers: HashMap::new(),
+            auth: HttpAuth::None,
+        };
+        let result = manager
+            .reload_from_configs(vec![("remote".to_string(), unreachable)])
+            .await;
+        assert_eq!(result.added, vec!["remote"]);
+
+        // The dead attempt must consume its ticket, or a later same-config
+        // reload would mistake it for an in-flight connect and never retry.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if manager.connect_tickets.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("failed connect left its ticket parked");
+    }
+
+    #[tokio::test]
+    async fn reload_applies_config_change_to_a_held_server() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // The old-config server is held out by a refresh/recovery claim when
+        // a reload with a NEW config arrives. The holder reinserts the OLD
+        // config; the reload must still apply the new one rather than
+        // reporting unchanged.
+        let (claim, _) = tokio::sync::watch::channel(());
+        manager.recovering_map().insert("remote".to_string(), claim);
+        let held = manager
+            .servers
+            .write()
+            .await
+            .remove("remote")
+            .expect("server present");
+        let holder = Arc::clone(&manager);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            holder
+                .servers
+                .write()
+                .await
+                .insert("remote".to_string(), held);
+            holder.recovering_map().remove("remote");
+        });
+
+        server.push_responses(vec![delete_ack()]); // old server's terminate
+        server.push_responses(handshake_responses("sess-2"));
+
+        let changed = http_config(
+            &server.url,
+            HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
+        );
+        let result = manager
+            .reload_from_configs(vec![("remote".to_string(), changed.clone())])
+            .await;
+
+        assert_eq!(result.restarted, vec!["remote"]);
+        assert!(result.unchanged.is_empty());
+        let servers = manager.servers.read().await;
+        let live = servers.get("remote").expect("server present");
+        assert_eq!(live.config(), changed, "the new config must be applied");
+        drop(servers);
+
+        // The restarted handshake carried the new static credential.
+        let requests = server.requests.lock().unwrap();
+        let last_init = requests
+            .iter()
+            .rfind(|r| r.rpc_method() == "initialize")
+            .expect("restart initialize");
+        assert_eq!(last_init.header("authorization"), Some("Bearer tok"));
     }
 
     #[tokio::test]
@@ -1640,6 +1766,16 @@ mod tests {
         let mut framer = SseFramer::default();
         assert!(framer.push(b"data: line1\ndata: line2\n").is_empty());
         assert_eq!(framer.finish(), Some("line1\nline2".to_string()));
+        assert_eq!(framer.finish(), None);
+    }
+
+    #[test]
+    fn sse_framer_flushes_an_unterminated_final_data_line() {
+        // A server may close the response right after the last data line,
+        // with no trailing newline; EOF must act as the terminator.
+        let mut framer = SseFramer::default();
+        assert!(framer.push(b"data: {\"a\":1}").is_empty());
+        assert_eq!(framer.finish(), Some("{\"a\":1}".to_string()));
         assert_eq!(framer.finish(), None);
     }
 

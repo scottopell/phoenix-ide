@@ -162,24 +162,36 @@ async fn insert_server(
     }
 }
 
+/// The in-flight connect attempts, keyed by server name: the ticket that
+/// identifies the current attempt plus the config it is connecting. An entry
+/// exists exactly while an attempt is in flight -- `publish_if_current`
+/// removes it on publication and `clear_ticket_if_current` on failure -- so
+/// reload can distinguish "a connect is already underway for this config"
+/// from "nothing is happening".
+type ConnectTickets = std::sync::Mutex<HashMap<String, (u64, McpServerConfig)>>;
+
 /// Publish a freshly connected server -- but only if `ticket` is still the
 /// current connect attempt for `name`. A connect that outlived its reload
 /// (e.g. abandoned at the reload deadline) must not resurrect a server a
 /// newer reload removed, or displace its replacement with stale config; a
 /// superseded server is terminated instead (ending any session it created).
 /// The check and the insert share the `servers` write lock so a concurrent
-/// reload's ticket revocation cannot interleave between them. Returns
-/// whether the server was published.
+/// reload's ticket revocation cannot interleave between them; a matching
+/// ticket entry is consumed (the attempt is finished). Returns whether the
+/// server was published.
 async fn publish_if_current(
     servers: &RwLock<HashMap<String, McpServer>>,
-    tickets: &std::sync::Mutex<HashMap<String, u64>>,
+    tickets: &ConnectTickets,
     name: &str,
     ticket: u64,
     server: McpServer,
 ) -> bool {
     let (published, mut leftover) = {
         let mut servers = servers.write().await;
-        if tickets.lock().unwrap().get(name).copied() == Some(ticket) {
+        let mut tickets = tickets.lock().unwrap();
+        if tickets.get(name).map(|(current, _)| *current) == Some(ticket) {
+            tickets.remove(name);
+            drop(tickets);
             (true, servers.insert(name.to_string(), server))
         } else {
             (false, Some(server))
@@ -200,6 +212,28 @@ async fn publish_if_current(
         leftover.terminate().await;
     }
     published
+}
+
+/// What a reload's changed-config branch found when (re)taking a server's
+/// map slot after settling any hold on it.
+enum Slot {
+    /// The old-config server, removed and owned for termination.
+    Old(Box<McpServer>),
+    /// The desired config is already running; nothing to restart.
+    Desired,
+    /// The slot is empty with no hold; the new connect fills the vacancy.
+    Vacant,
+}
+
+/// Consume `name`'s ticket entry if it still belongs to this attempt. Called
+/// on a failed connect: a dead attempt must not leave its ticket parked, or
+/// a later reload would mistake it for an in-flight connect and decline to
+/// start a replacement.
+fn clear_ticket_if_current(tickets: &ConnectTickets, name: &str, ticket: u64) {
+    let mut tickets = tickets.lock().unwrap();
+    if tickets.get(name).map(|(current, _)| *current) == Some(ticket) {
+        tickets.remove(name);
+    }
 }
 
 /// Extract a string-to-string map from an optional JSON object, dropping
@@ -701,7 +735,7 @@ pub struct McpClientManager {
     /// (`publish_if_current`), so an attempt outlived by a newer reload
     /// cannot resurrect a removed server or displace its replacement with
     /// stale config.
-    connect_tickets: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    connect_tickets: Arc<ConnectTickets>,
     /// Serializes reload reconciliations. Two interleaved reconciliations
     /// can each classify a server against state the other is mutating
     /// (e.g. both seeing the old config of a changed server, one revoking
@@ -734,14 +768,14 @@ impl McpClientManager {
         }
     }
 
-    /// Register a new connect attempt for `server_name`, superseding any
-    /// earlier attempt still in flight.
-    fn issue_connect_ticket(&self, server_name: &str) -> u64 {
+    /// Register a new connect attempt for `server_name` toward `config`,
+    /// superseding any earlier attempt still in flight.
+    fn issue_connect_ticket(&self, server_name: &str, config: &McpServerConfig) -> u64 {
         let ticket = next_generation();
         self.connect_tickets
             .lock()
             .unwrap()
-            .insert(server_name.to_string(), ticket);
+            .insert(server_name.to_string(), (ticket, config.clone()));
         ticket
     }
 
@@ -825,7 +859,7 @@ impl McpClientManager {
                 .map(|(name, entry)| {
                     let mgr = Arc::clone(&manager);
                     let oauth = Arc::clone(&manager.pending_oauth_urls);
-                    let ticket = manager.issue_connect_ticket(&name);
+                    let ticket = manager.issue_connect_ticket(&name, &entry);
                     tokio::spawn(async move {
                         let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
                         match result {
@@ -854,6 +888,7 @@ impl McpClientManager {
                                 // Leave any OAuth URL in pending_oauth_urls so the UI
                                 // keeps the panel visible with a reconnect affordance.
                                 tracing::warn!(server = %name, "Skipping MCP server: {e}");
+                                clear_ticket_if_current(&mgr.connect_tickets, &name, ticket);
                                 None
                             }
                         }
@@ -1432,7 +1467,7 @@ impl McpClientManager {
         // otherwise reinsert it later as a zombie -- so claimed names are
         // settled and swept alongside the map keys.
         let mut removed_servers = Vec::new();
-        {
+        let claimed: Vec<String> = {
             let mut servers = self.servers.write().await;
             // Revoke connect tickets for names no longer configured while
             // still holding the servers lock: publish_if_current checks the
@@ -1455,8 +1490,15 @@ impl McpClientManager {
                     removed.push(name);
                 }
             }
-        }
-        let claimed: Vec<String> = self.recovering_map().keys().cloned().collect();
+
+            // Snapshot active holds under the same lock as the sweep. A
+            // holder releases its claim only after reinserting through this
+            // lock, so every held server is either already back in the map
+            // (swept above) or still claimed (in this snapshot) -- none can
+            // slip between the sweep and the snapshot.
+            let claimed: Vec<String> = self.recovering_map().keys().cloned().collect();
+            claimed
+        };
         for name in claimed {
             if !config_names.contains(&name) && !removed.contains(&name) {
                 self.await_claim_release(&name).await;
@@ -1481,6 +1523,26 @@ impl McpClientManager {
                     oauth.write().await.remove(&name);
                     added.push(name.clone());
 
+                    // An earlier attempt may still be handshaking toward this
+                    // exact config (added servers park no claim to settle
+                    // on). Superseding it would gamble both attempts -- the
+                    // old one discarded as stale, the new one possibly
+                    // failing -- so a pending same-config attempt is left to
+                    // finish instead.
+                    let same_config_in_flight = self
+                        .connect_tickets
+                        .lock()
+                        .unwrap()
+                        .get(&name)
+                        .is_some_and(|(_, pending)| *pending == entry);
+                    if same_config_in_flight {
+                        tracing::debug!(
+                            server = %name,
+                            "Connect already in flight for this config; leaving it to finish"
+                        );
+                        continue;
+                    }
+
                     let servers = Arc::clone(&self.servers);
                     let tickets = Arc::clone(&self.connect_tickets);
                     // Supersede any in-flight connect for this name BEFORE
@@ -1490,7 +1552,7 @@ impl McpClientManager {
                     // between the absence observation and this issue -- is
                     // evicted below, so an old attempt's server can neither
                     // race the new connect nor outlive a failed one.
-                    let ticket = self.issue_connect_ticket(&name);
+                    let ticket = self.issue_connect_ticket(&name, &entry);
                     if let Some(mut stale) = self.servers.write().await.remove(&name) {
                         tracing::warn!(
                             server = %name,
@@ -1516,6 +1578,7 @@ impl McpClientManager {
                             }
                             Err(e) => {
                                 tracing::warn!(server = %name, "Failed to connect during reload: {e}");
+                                clear_ticket_if_current(&tickets, &name, ticket);
                             }
                         }
                     });
@@ -1529,22 +1592,53 @@ impl McpClientManager {
                     // no longer slip into the window between the removal and
                     // the new connect (the removal below sweeps anything that
                     // landed earlier).
-                    let ticket = self.issue_connect_ticket(&name);
-                    let old_server = {
-                        let mut servers = self.servers.write().await;
-                        match servers.get(&name) {
-                            Some(server) if server.config() != entry => servers.remove(&name),
-                            Some(_) | None => None,
+                    let ticket = self.issue_connect_ticket(&name, &entry);
+
+                    // Take the slot. The old-config server may be momentarily
+                    // held out by a refresh/recovery claim; settle the hold
+                    // and re-take rather than misreading it as nothing-to-
+                    // restart -- the holder would reinsert the OLD config and
+                    // this reload would silently fail to apply the new one.
+                    let slot = loop {
+                        {
+                            let mut servers = self.servers.write().await;
+                            match servers.get(&name) {
+                                Some(server) if server.config() == entry => break Slot::Desired,
+                                Some(_) => match servers.remove(&name) {
+                                    Some(server) => break Slot::Old(Box::new(server)),
+                                    None => break Slot::Vacant,
+                                },
+                                None => {}
+                            }
+                        }
+                        let receiver = self
+                            .recovering_map()
+                            .get(&name)
+                            .map(tokio::sync::watch::Sender::subscribe);
+                        match receiver {
+                            Some(mut receiver) => {
+                                let _ = receiver.changed().await;
+                            }
+                            // Absent with no hold: a recovery dropped the
+                            // server in the gap. The new connect below fills
+                            // the vacancy with the desired config.
+                            None => break Slot::Vacant,
                         }
                     };
 
-                    let Some(mut old_server) = old_server else {
-                        unchanged.push(name);
-                        continue;
-                    };
-
-                    self.pending_oauth_urls.write().await.remove(&name);
-                    old_server.terminate().await;
+                    match slot {
+                        Slot::Desired => {
+                            unchanged.push(name);
+                            continue;
+                        }
+                        Slot::Old(mut old_server) => {
+                            self.pending_oauth_urls.write().await.remove(&name);
+                            old_server.terminate().await;
+                        }
+                        Slot::Vacant => {
+                            self.pending_oauth_urls.write().await.remove(&name);
+                        }
+                    }
 
                     let oauth = Arc::clone(&self.pending_oauth_urls);
                     let servers = Arc::clone(&self.servers);
@@ -1575,7 +1669,10 @@ impl McpClientManager {
                                     (name, Err("superseded by a newer reload".to_string()))
                                 }
                             }
-                            Err(error) => (name, Err(error)),
+                            Err(error) => {
+                                clear_ticket_if_current(&tickets, &name, ticket);
+                                (name, Err(error))
+                            }
                         }
                     });
                     restart_futures.push(Box::pin(async move {
