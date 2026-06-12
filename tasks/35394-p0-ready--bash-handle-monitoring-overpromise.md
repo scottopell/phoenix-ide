@@ -8,6 +8,11 @@ it. The net effect put notification responsibility on the user without saying so
 This is a CAPTURE task. The fix strategy is an open decision the user (Scott) will make
 with wake-contracts in hand. Do not implement a fix yet.
 
+**Related spec:** `specs/wake-contracts/` — designs the `wait_until` notify primitive
+this feedback motivates (REQ-WAKE-001..016). See Root-cause below for what the spec does
+and does not cover. (Per spec authoring rules the spec cannot cite this task back; the
+link is one-directional.)
+
 ## Root-cause: two distinct problems, only one is spec'd
 
 1. MISSING PRIMITIVE (already designed, unimplemented). The agent had no way to say
