@@ -9,6 +9,7 @@
 //! as regular Phoenix tools through the Tool trait. Spec: `specs/mcp/`.
 
 pub mod http;
+pub mod oauth;
 pub mod stdio;
 
 pub use http::HttpTransport;
@@ -16,6 +17,7 @@ pub use stdio::StdioTransport;
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
+use oauth::{OAuthRegistrationRecord, OAuthStore, OAuthTokenRecord};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,6 +25,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+
+/// The OAuth bearer for one HTTP server, shared between the manager (which
+/// seeds it from the token store and rotates it on refresh) and the server's
+/// transports (which attach it to every request, REQ-MCP-012). `None` until a
+/// token exists.
+pub type SharedBearer = Arc<std::sync::RwLock<Option<String>>>;
 
 /// Timeout for a single JSON-RPC request-response round trip.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -124,6 +132,8 @@ pub trait McpTransport: Send + Sync {
 
 /// Build a transport for `config`: stdio spawns the child process, HTTP
 /// builds the client (the connection itself is exercised by `initialize`).
+/// `oauth_bearer` is the server's shared OAuth bearer cell, attached by the
+/// HTTP transport to every request unless a static credential supersedes it.
 ///
 /// # Errors
 /// Returns a display string when the transport cannot be established.
@@ -131,14 +141,19 @@ async fn connect_transport(
     name: &str,
     config: &McpServerConfig,
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
+    oauth_bearer: &SharedBearer,
 ) -> Result<Box<dyn McpTransport>, String> {
     match config {
         McpServerConfig::Stdio { command, args, env } => Ok(Box::new(
             StdioTransport::spawn(name, command, args, env, pending_oauth_urls).await?,
         )),
-        McpServerConfig::Http { url, headers, auth } => {
-            Ok(Box::new(HttpTransport::connect(name, url, headers, auth)?))
-        }
+        McpServerConfig::Http { url, headers, auth } => Ok(Box::new(HttpTransport::connect(
+            name,
+            url,
+            headers,
+            auth,
+            Arc::clone(oauth_bearer),
+        )?)),
     }
 }
 
@@ -298,6 +313,44 @@ impl McpRequestError {
     }
 }
 
+/// Failure establishing a connection (transport build or handshake). The 401
+/// classification survives to the connect path, which dispatches on it:
+/// `StaticAuthRejected` for config credentials, the OAuth entry point
+/// otherwise (REQ-MCP-008, REQ-MCP-009).
+#[derive(Debug)]
+enum HandshakeFailure {
+    /// The handshake was rejected with HTTP 401; carries the
+    /// `WWW-Authenticate` challenge when present.
+    Unauthorized {
+        www_authenticate: Option<String>,
+        message: String,
+    },
+    Other(String),
+}
+
+impl HandshakeFailure {
+    fn classify(error: McpRequestError, server_name: &str) -> Self {
+        match error {
+            McpRequestError::Transport(TransportError::Unauthorized { www_authenticate }) => {
+                Self::Unauthorized {
+                    www_authenticate,
+                    message: format!("MCP server '{server_name}': unauthorized (HTTP 401)"),
+                }
+            }
+            other => Self::Other(other.into_message(server_name)),
+        }
+    }
+}
+
+impl std::fmt::Display for HandshakeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized { message, .. } => write!(f, "{message}"),
+            Self::Other(message) => write!(f, "{message}"),
+        }
+    }
+}
+
 /// Protocol-layer handling of server-initiated messages forwarded by the
 /// transport: flags `tools/list_changed` for lazy refresh, logs and drops
 /// everything else.
@@ -349,6 +402,11 @@ pub struct McpServer {
     /// drain, read by `McpClientManager::status()`. Retained so a respawned
     /// transport keeps feeding the same map.
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
+    /// The OAuth bearer this server's transports attach to every request
+    /// (REQ-MCP-012). Seeded from the token store at connect, rotated in
+    /// place on refresh, and retained across re-establish so a rebuilt
+    /// transport keeps the credential.
+    oauth_bearer: SharedBearer,
 }
 
 /// Monotonic source for `McpServer::generation`.
@@ -367,8 +425,15 @@ impl McpServer {
         name: &str,
         config: McpServerConfig,
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
+        oauth_bearer: SharedBearer,
     ) -> Result<Self, String> {
-        let transport = connect_transport(name, &config, Arc::clone(&pending_oauth_urls)).await?;
+        let transport = connect_transport(
+            name,
+            &config,
+            Arc::clone(&pending_oauth_urls),
+            &oauth_bearer,
+        )
+        .await?;
         Ok(Self {
             name: name.to_string(),
             transport,
@@ -377,6 +442,7 @@ impl McpServer {
             generation: next_generation(),
             tools_changed: AtomicBool::new(false),
             pending_oauth_urls,
+            oauth_bearer,
         })
     }
 
@@ -628,6 +694,14 @@ impl McpServer {
         }
     }
 
+    /// Whether this server is operating under an OAuth bearer (REQ-MCP-012):
+    /// an OAuth-eligible HTTP config with a token attached. The re-auth
+    /// recovery paths (silent refresh, scope step-up) only apply here — a 401
+    /// on a static-credential or never-authorized server is not refreshable.
+    fn oauth_active(&self) -> bool {
+        oauth_resource_url(&self.config).is_some() && self.oauth_bearer.read().unwrap().is_some()
+    }
+
     /// Run the post-connect handshake: `initialize` then the first
     /// `tools/list`.
     ///
@@ -635,15 +709,15 @@ impl McpServer {
     /// may already have created a server-side HTTP session, and dropping the
     /// transport without the session DELETE would leak it until expiry
     /// (REQ-MCP-005).
-    async fn handshake(&mut self) -> Result<(), String> {
+    async fn handshake(&mut self) -> Result<(), HandshakeFailure> {
         let Err(error) = self.handshake_attempt().await else {
             return Ok(());
         };
         let recoverable = self.should_reestablish(&error);
-        let message = error.into_message(&self.name);
+        let failure = HandshakeFailure::classify(error, &self.name);
         self.terminate().await;
         if !recoverable {
-            return Err(message);
+            return Err(failure);
         }
 
         // A recoverable transport failure mid-handshake -- e.g. the server
@@ -652,23 +726,25 @@ impl McpServer {
         // otherwise reachable server (REQ-MCP-005).
         tracing::warn!(
             server = %self.name,
-            error = %message,
+            error = %failure,
             "Handshake hit a recoverable transport failure; retrying once on a fresh connection"
         );
         self.transport = connect_transport(
             &self.name,
             &self.config,
             Arc::clone(&self.pending_oauth_urls),
+            &self.oauth_bearer,
         )
-        .await?;
+        .await
+        .map_err(HandshakeFailure::Other)?;
         self.generation = next_generation();
 
         match self.handshake_attempt().await {
             Ok(()) => Ok(()),
             Err(error) => {
-                let message = error.into_message(&self.name);
+                let failure = HandshakeFailure::classify(error, &self.name);
                 self.terminate().await;
-                Err(message)
+                Err(failure)
             }
         }
     }
@@ -682,15 +758,17 @@ impl McpServer {
 
     /// Rebuild the transport from the retained config and re-run the
     /// handshake (stdio: respawn the process; HTTP: fresh client + session).
-    async fn reestablish(&mut self) -> Result<(), String> {
+    async fn reestablish(&mut self) -> Result<(), HandshakeFailure> {
         self.terminate().await;
 
         self.transport = connect_transport(
             &self.name,
             &self.config,
             Arc::clone(&self.pending_oauth_urls),
+            &self.oauth_bearer,
         )
-        .await?;
+        .await
+        .map_err(HandshakeFailure::Other)?;
         self.generation = next_generation();
         self.tools_changed.store(false, Ordering::Release);
 
@@ -705,6 +783,373 @@ impl McpServer {
 
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// OAuth lifecycle (REQ-MCP-009..013) -- the manager-side orchestration of the
+// protocol mechanics in `mcp/oauth.rs`.
+// ---------------------------------------------------------------------------
+
+/// The URL of an HTTP server whose 401s drive the OAuth flow: an explicit
+/// static credential opts out (StaticAuthRejected, REQ-MCP-008), stdio has no
+/// auth at all.
+fn oauth_resource_url(config: &McpServerConfig) -> Option<&str> {
+    match config {
+        McpServerConfig::Http {
+            url,
+            auth: HttpAuth::None | HttpAuth::OAuth(_),
+            ..
+        } => Some(url),
+        McpServerConfig::Http {
+            auth: HttpAuth::Static(_),
+            ..
+        }
+        | McpServerConfig::Stdio { .. } => None,
+    }
+}
+
+/// One in-flight authorization awaiting the operator's browser round trip
+/// (`oauth_phase = awaiting_user` in `specs/mcp/mcp.allium`). Keyed by server
+/// name in `OAuthRuntime::pending`; the `state_nonce` binds the callback to
+/// exactly this flow, and dropping the flow (resolution, cancellation, or
+/// displacement by a newer flow) releases any held recovery claim.
+struct PendingAuthFlow {
+    config: McpServerConfig,
+    state_nonce: String,
+    pkce_verifier: String,
+    redirect_uri: String,
+    token_endpoint: String,
+    issuer: String,
+    /// The authorization server advertises
+    /// `authorization_response_iss_parameter_supported`, so a callback
+    /// without a matching `iss` is rejected (REQ-MCP-011).
+    iss_required: bool,
+    registration: OAuthRegistrationRecord,
+    resource: String,
+    scopes: Vec<String>,
+    /// Held when a scope step-up removed a ready server from the map: keeps
+    /// callers parked on the claim until the re-authorized server is
+    /// republished, so the triggering call replays instead of failing
+    /// (deferred ReAuthCallRetry).
+    claim: Option<ServerClaim>,
+}
+
+/// The cloneable subset of a pending flow that the callback path reads before
+/// exchanging the code (the flow itself stays parked until the exchange
+/// succeeds, so a failed exchange leaves the URL retryable).
+#[derive(Clone)]
+struct FlowSnapshot {
+    pkce_verifier: String,
+    redirect_uri: String,
+    token_endpoint: String,
+    issuer: String,
+    iss_required: bool,
+    registration: OAuthRegistrationRecord,
+    resource: String,
+    scopes: Vec<String>,
+}
+
+impl PendingAuthFlow {
+    fn snapshot(&self) -> FlowSnapshot {
+        FlowSnapshot {
+            pkce_verifier: self.pkce_verifier.clone(),
+            redirect_uri: self.redirect_uri.clone(),
+            token_endpoint: self.token_endpoint.clone(),
+            issuer: self.issuer.clone(),
+            iss_required: self.iss_required,
+            registration: self.registration.clone(),
+            resource: self.resource.clone(),
+            scopes: self.scopes.clone(),
+        }
+    }
+}
+
+/// Manager-side OAuth state, shared (via `Arc`) with the connect tasks that
+/// outlive a `&self` borrow. Persistence is behind `OAuthStore`; the redirect
+/// base is the server's own externally reachable address, set once the
+/// listener is bound.
+struct OAuthRuntime {
+    store: std::sync::RwLock<Arc<dyn OAuthStore>>,
+    redirect_base: std::sync::Mutex<Option<String>>,
+    pending: std::sync::Mutex<HashMap<String, PendingAuthFlow>>,
+}
+
+impl Default for OAuthRuntime {
+    fn default() -> Self {
+        Self {
+            store: std::sync::RwLock::new(Arc::new(oauth::MemoryOAuthStore::default())),
+            redirect_base: std::sync::Mutex::new(None),
+            pending: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl OAuthRuntime {
+    fn store(&self) -> Arc<dyn OAuthStore> {
+        Arc::clone(&self.store.read().unwrap())
+    }
+
+    /// The local callback the authorization server redirects to; `None` until
+    /// the server address is known.
+    fn redirect_uri(&self) -> Option<String> {
+        self.redirect_base
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|base| format!("{}/api/mcp/oauth/callback", base.trim_end_matches('/')))
+    }
+}
+
+/// Failure from a token refresh. The split decides the stored token's fate
+/// (REQ-MCP-012): a definitive rejection discards it and re-prompts, while a
+/// transport failure is no evidence of staleness — the token is kept and the
+/// next 401 retries the refresh.
+enum RefreshFailure {
+    Rejected(String),
+    Transient(String),
+}
+
+/// Refresh a server's token: re-discover the authorization server from the
+/// challenge (endpoints are not persisted), then exchange the refresh token,
+/// persisting the rotated credentials (REQ-MCP-012). Returns the new access
+/// token.
+async fn oauth_refresh(
+    oauth_rt: &OAuthRuntime,
+    name: &str,
+    url: &str,
+    www_authenticate: Option<&str>,
+    token: &OAuthTokenRecord,
+) -> Result<String, RefreshFailure> {
+    let Some(refresh_token) = token.refresh_token.clone() else {
+        return Err(RefreshFailure::Rejected(
+            "stored token has no refresh token".to_string(),
+        ));
+    };
+    let client = oauth::oauth_http_client().map_err(RefreshFailure::Transient)?;
+    let challenge = www_authenticate
+        .map(oauth::parse_bearer_challenge)
+        .unwrap_or_default();
+    let prm = oauth::fetch_protected_resource_metadata(&client, url, &challenge)
+        .await
+        .map_err(RefreshFailure::Transient)?;
+    let issuer = prm.authorization_servers[0].clone();
+    let metadata = oauth::fetch_auth_server_metadata(&client, &issuer)
+        .await
+        .map_err(RefreshFailure::Transient)?;
+    let registration = oauth_rt
+        .store()
+        .registration(&metadata.issuer)
+        .await
+        .map_err(RefreshFailure::Transient)?
+        .ok_or_else(|| {
+            // Without a client identity the grant can never succeed; treat as
+            // a rejection so the dead token is discarded and a fresh flow
+            // (which registers a client) takes over.
+            RefreshFailure::Rejected(format!(
+                "no client registration for authorization server '{}'",
+                metadata.issuer
+            ))
+        })?;
+    let response = oauth::refresh_grant(
+        &client,
+        &metadata.token_endpoint,
+        &registration,
+        &refresh_token,
+        &token.resource,
+    )
+    .await
+    .map_err(|e| match e {
+        oauth::TokenGrantError::Rejected(detail) => RefreshFailure::Rejected(detail),
+        oauth::TokenGrantError::Transport(detail) => RefreshFailure::Transient(detail),
+    })?;
+
+    let record = OAuthTokenRecord {
+        server_name: name.to_string(),
+        resource: token.resource.clone(),
+        scopes: response
+            .scopes
+            .clone()
+            .unwrap_or_else(|| token.scopes.clone()),
+        access_token: response.access_token.clone(),
+        // A rotating server replaces the refresh token; one that does not
+        // rotate omits it, keeping the existing one (REQ-MCP-012).
+        refresh_token: response.refresh_token.clone().or(Some(refresh_token)),
+        expires_at: response.expires_at,
+    };
+    oauth_rt
+        .store()
+        .upsert_token(&record)
+        .await
+        .map_err(RefreshFailure::Transient)?;
+    tracing::info!(server = %name, "Refreshed MCP OAuth access token");
+    Ok(response.access_token)
+}
+
+/// Run discovery → client identity → PKCE for an HTTP server that needs the
+/// operator's authorization, park the pending flow, and surface its URL
+/// (REQ-MCP-009..011, REQ-MCP-013). `extra_scopes` carries prior grants for a
+/// step-up union; `claim` keeps callers parked until re-authorization
+/// completes (it is released on every failure path by drop).
+async fn begin_oauth_flow(
+    oauth_rt: &OAuthRuntime,
+    pending_oauth_urls: &Arc<RwLock<HashMap<String, String>>>,
+    name: &str,
+    entry: &McpServerConfig,
+    www_authenticate: Option<&str>,
+    extra_scopes: Vec<String>,
+    claim: Option<ServerClaim>,
+) -> Result<String, String> {
+    let Some(url) = oauth_resource_url(entry) else {
+        return Err("server is not OAuth-eligible".to_string());
+    };
+    let redirect_uri = oauth_rt
+        .redirect_uri()
+        .ok_or("OAuth redirect base not configured (server address unknown)")?;
+    let client = oauth::oauth_http_client()?;
+    let challenge = www_authenticate
+        .map(oauth::parse_bearer_challenge)
+        .unwrap_or_default();
+
+    let prm = oauth::fetch_protected_resource_metadata(&client, url, &challenge).await?;
+    let issuer = prm.authorization_servers[0].clone();
+    let metadata = oauth::fetch_auth_server_metadata(&client, &issuer).await?;
+
+    // Client identity preference (REQ-MCP-010): pre-configured/cached
+    // registration (keyed by authorization server) → Client ID Metadata
+    // Document → dynamic client registration. Phoenix hosts no client
+    // metadata document, so the CIMD step resolves to nothing; logged so the
+    // capability gap is visible.
+    let registration = match oauth_rt.store().registration(&metadata.issuer).await? {
+        Some(registration) => registration,
+        None => {
+            tracing::debug!(
+                server = %name,
+                auth_server = %metadata.issuer,
+                "no hosted Client ID Metadata Document available; falling back to dynamic client registration"
+            );
+            let Some(endpoint) = metadata.registration_endpoint.clone() else {
+                return Err(format!(
+                    "authorization server '{}' has no client registration for Phoenix and does \
+                     not advertise a registration endpoint (RFC 7591); configure a \
+                     pre-registered OAuth client for it",
+                    metadata.issuer
+                ));
+            };
+            let registration =
+                oauth::register_client(&client, &metadata, &endpoint, &redirect_uri).await?;
+            oauth_rt.store().upsert_registration(&registration).await?;
+            tracing::info!(
+                server = %name,
+                auth_server = %metadata.issuer,
+                client_id = %registration.client_id,
+                "Registered OAuth client via dynamic client registration"
+            );
+            registration
+        }
+    };
+
+    // Requested scopes: the challenge's `scope` when present, else the
+    // resource's advertised set; unioned with any prior grants (step-up,
+    // REQ-MCP-012).
+    let mut scopes: Vec<String> = challenge
+        .get("scope")
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .filter(|v: &Vec<String>| !v.is_empty())
+        .unwrap_or_else(|| prm.scopes_supported.clone());
+    for scope in extra_scopes {
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+
+    let pkce = oauth::generate_pkce();
+    let state_nonce = oauth::generate_state_nonce();
+    let resource = oauth::canonical_resource(url);
+    let auth_url = oauth::build_authorization_url(
+        &metadata,
+        &registration,
+        &redirect_uri,
+        &state_nonce,
+        &pkce.challenge,
+        &resource,
+        &scopes,
+    )?;
+
+    let flow = PendingAuthFlow {
+        config: entry.clone(),
+        state_nonce,
+        pkce_verifier: pkce.verifier,
+        redirect_uri,
+        token_endpoint: metadata.token_endpoint.clone(),
+        issuer: metadata.issuer.clone(),
+        iss_required: metadata.iss_parameter_supported,
+        registration,
+        resource,
+        scopes,
+        claim,
+    };
+    // Inserting rotates the nonce: a displaced older flow (and its claim)
+    // drops, so its callback no longer matches any pending flow.
+    oauth_rt
+        .pending
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), flow);
+    pending_oauth_urls
+        .write()
+        .await
+        .insert(name.to_string(), auth_url.clone());
+    tracing::info!(
+        server = %name,
+        url = %auth_url,
+        "MCP server requires OAuth authorization; waiting for the operator"
+    );
+    Ok(auth_url)
+}
+
+/// An OAuth re-authorization condition on an authorized server, classified
+/// from a failed call (REQ-MCP-012).
+enum OAuthRecoveryKind {
+    /// 401: the access token expired or was revoked (TokenRefreshNeeded).
+    Refresh { www_authenticate: Option<String> },
+    /// 403 with an explicit `error="insufficient_scope"` challenge
+    /// (InsufficientScopeStepUp). A plain 403 is not a step-up.
+    StepUp { www_authenticate: String },
+}
+
+fn oauth_recovery_kind(server: &McpServer, error: &McpRequestError) -> Option<OAuthRecoveryKind> {
+    let McpRequestError::Transport(transport_error) = error else {
+        return None;
+    };
+    if !server.oauth_active() {
+        return None;
+    }
+    match transport_error {
+        TransportError::Unauthorized { www_authenticate } => Some(OAuthRecoveryKind::Refresh {
+            www_authenticate: www_authenticate.clone(),
+        }),
+        TransportError::InsufficientScope {
+            www_authenticate: Some(challenge),
+        } if oauth::is_insufficient_scope_challenge(challenge) => {
+            Some(OAuthRecoveryKind::StepUp {
+                www_authenticate: challenge.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Outcome of refreshing an authorized server's token mid-recovery.
+enum RefreshServerOutcome {
+    /// The bearer was rotated in place; the server can rejoin the map.
+    Refreshed,
+    /// The refresh could not be attempted/completed for a reason that says
+    /// nothing about the token (network failure to the authorization
+    /// server); the token and server are kept.
+    Transient(String),
+    /// The grant was definitively rejected: the token was discarded and a
+    /// fresh authorization flow was surfaced (TokenRefreshFailed).
+    Reprompt(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -724,11 +1169,11 @@ pub struct McpClientManager {
     /// The servers remain connected for instant re-enable.
     disabled_servers: RwLock<std::collections::HashSet<String>>,
     /// Servers temporarily held out of `servers` (mid-recovery after a
-    /// transport failure, or mid tool-list refresh): the holder parks a
-    /// watch sender here via `ServerClaim`; calls that find the server
-    /// absent subscribe and wait for the sender to drop (work finished)
-    /// instead of failing with "not connected".
-    recovering: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<()>>>,
+    /// transport failure, mid tool-list refresh, or awaiting an OAuth
+    /// step-up): the holder parks a watch sender here via `ServerClaim`;
+    /// calls that find the server absent subscribe and wait for the sender
+    /// to drop (work finished) instead of failing with "not connected".
+    recovering: RecoveringMap,
     /// The current connect attempt per server name. Every spawned connect
     /// (discovery, reload-added, reload-restart) records a ticket here and
     /// publishes its result only while that ticket is still current
@@ -742,10 +1187,19 @@ pub struct McpClientManager {
     /// the other's restart without replacing it); reconciliation is only
     /// meaningful against a stable target, so reloads run one at a time.
     reload_serial: tokio::sync::Mutex<()>,
-    /// Servers currently blocked on an OAuth flow: name → auth URL.
-    /// Written by the stderr drain; cleared when the server connects or fails.
+    /// Servers currently blocked on an OAuth flow: name → auth URL. Written
+    /// by the native OAuth flow and by the stdio (`mcp-remote`) stderr drain;
+    /// cleared when the server connects or its flow is cancelled. This is the
+    /// structured `pending_auth_url` the status API serves (REQ-MCP-013).
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
+    /// OAuth lifecycle state: the token/registration store, the local
+    /// callback's base URL, and the pending authorization flows
+    /// (REQ-MCP-009..012).
+    oauth: Arc<OAuthRuntime>,
 }
+
+/// The claim map shared between the manager and parked `ServerClaim` guards.
+type RecoveringMap = Arc<std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<()>>>>;
 
 impl Default for McpClientManager {
     fn default() -> Self {
@@ -761,10 +1215,388 @@ impl McpClientManager {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
             disabled_servers: RwLock::new(std::collections::HashSet::new()),
-            recovering: std::sync::Mutex::new(HashMap::new()),
+            recovering: Arc::new(std::sync::Mutex::new(HashMap::new())),
             connect_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             reload_serial: tokio::sync::Mutex::new(()),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
+            oauth: Arc::new(OAuthRuntime::default()),
+        }
+    }
+
+    /// Swap in the persistent OAuth store (the default is in-memory). Called
+    /// once at startup, before discovery, so stored tokens restore silently
+    /// (REQ-MCP-012).
+    pub fn set_oauth_store(&self, store: Arc<dyn OAuthStore>) {
+        *self.oauth.store.write().unwrap() = store;
+    }
+
+    /// Set the externally reachable base URL (scheme://host:port) the OAuth
+    /// callback route is served under. Flows refuse to start until this is
+    /// known — an authorization URL with an unreachable redirect would strand
+    /// the operator in the browser.
+    pub fn set_oauth_redirect_base(&self, base: String) {
+        *self.oauth.redirect_base.lock().unwrap() = Some(base);
+    }
+
+    /// Drop a pending authorization flow, releasing any held claim and the
+    /// surfaced URL (PendingAuthorizationCancelled). Returns whether a flow
+    /// existed.
+    async fn cancel_pending_oauth_flow(&self, name: &str) -> bool {
+        let flow = self.oauth.pending.lock().unwrap().remove(name);
+        let existed = flow.is_some();
+        drop(flow);
+        if existed {
+            self.pending_oauth_urls.write().await.remove(name);
+            tracing::info!(server = %name, "Cancelled pending MCP OAuth authorization");
+        }
+        existed
+    }
+
+    /// Discard a stored token the reloaded config can no longer use: the
+    /// resource was repointed, or auth moved away from OAuth
+    /// (ReloadInvalidatesOAuth, REQ-MCP-012).
+    async fn invalidate_oauth_on_config_change(&self, name: &str, new_config: &McpServerConfig) {
+        let token = match self.oauth.store().token(name).await {
+            Ok(Some(token)) => token,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(server = %name, "OAuth token lookup failed during reload: {e}");
+                return;
+            }
+        };
+        let still_usable = oauth_resource_url(new_config)
+            .is_some_and(|url| oauth::canonical_resource(url) == token.resource);
+        if !still_usable {
+            tracing::info!(
+                server = %name,
+                "Reload repointed or de-OAuthed this server; discarding its stored token"
+            );
+            if let Err(e) = self.oauth.store().delete_token(name).await {
+                tracing::warn!(server = %name, "Failed to delete invalidated OAuth token: {e}");
+            }
+        }
+    }
+
+    /// Handle the OAuth redirect: validate `state` against the pending flow
+    /// and `iss` against the discovered authorization server, exchange the
+    /// code (with the PKCE verifier and resource indicator), persist the
+    /// token, and reconnect the server in the background (REQ-MCP-011,
+    /// REQ-MCP-012). Returns the server name on success.
+    ///
+    /// # Errors
+    /// Returns a display string when the callback matches no pending flow,
+    /// fails the `iss` check, or the code exchange is rejected. The flow
+    /// stays pending on exchange failure so the operator can retry from the
+    /// same authorization URL.
+    pub async fn complete_oauth_authorization(
+        self: &Arc<Self>,
+        state_nonce: &str,
+        code: &str,
+        iss: Option<&str>,
+    ) -> Result<String, String> {
+        // The state nonce binds the callback to exactly one pending flow
+        // (callback_state_matches): a code injected by another tab, server,
+        // or a cancelled flow matches nothing and is rejected before any
+        // exchange (REQ-MCP-011).
+        let (name, flow) = {
+            let pending = self.oauth.pending.lock().unwrap();
+            let Some((name, flow)) = pending
+                .iter()
+                .find(|(_, flow)| flow.state_nonce == state_nonce)
+            else {
+                return Err(
+                    "no pending MCP authorization matches this callback (state mismatch or \
+                     cancelled flow)"
+                        .to_string(),
+                );
+            };
+            (name.clone(), flow.snapshot())
+        };
+
+        // The iss check defends against authorization-server mix-up
+        // (redirect_issuer_valid): a state-valid callback delivered from a
+        // different authorization server is rejected before the code reaches
+        // the token endpoint (REQ-MCP-011).
+        match iss {
+            Some(iss) if iss.trim_end_matches('/') != flow.issuer.trim_end_matches('/') => {
+                return Err(format!(
+                    "callback 'iss' ({iss}) does not match the authorization server ({})",
+                    flow.issuer
+                ));
+            }
+            None if flow.iss_required => {
+                return Err(format!(
+                    "callback omitted the 'iss' parameter that authorization server '{}' \
+                     advertises support for",
+                    flow.issuer
+                ));
+            }
+            _ => {}
+        }
+
+        let client = oauth::oauth_http_client()?;
+        let response = oauth::exchange_code(
+            &client,
+            &flow.token_endpoint,
+            &flow.registration,
+            &flow.redirect_uri,
+            code,
+            &flow.pkce_verifier,
+            &flow.resource,
+        )
+        .await
+        .map_err(|e| format!("MCP server '{name}': authorization code exchange failed: {e}"))?;
+
+        let record = OAuthTokenRecord {
+            server_name: name.clone(),
+            resource: flow.resource.clone(),
+            scopes: response.scopes.clone().unwrap_or_else(|| flow.scopes.clone()),
+            access_token: response.access_token,
+            refresh_token: response.refresh_token,
+            expires_at: response.expires_at,
+        };
+        self.oauth
+            .store()
+            .upsert_token(&record)
+            .await
+            .map_err(|e| format!("MCP server '{name}': failed to persist OAuth token: {e}"))?;
+
+        // Resolve the flow -- but only if it is still the one this callback
+        // authorized. A reload may have cancelled/replaced it during the
+        // exchange; its token must not survive under the new config.
+        let resolved = {
+            let mut pending = self.oauth.pending.lock().unwrap();
+            match pending.get(&name) {
+                Some(current) if current.state_nonce == state_nonce => pending.remove(&name),
+                _ => None,
+            }
+        };
+        let Some(resolved) = resolved else {
+            let _ = self.oauth.store().delete_token(&name).await;
+            return Err(format!(
+                "MCP server '{name}': the authorization flow was superseded during the exchange"
+            ));
+        };
+        self.pending_oauth_urls.write().await.remove(&name);
+        let claim = resolved.claim;
+        let config = resolved.config;
+
+        // Reconnect in the background: the stored token restores onto the
+        // first initialize. Any step-up claim is released only after the
+        // publish attempt, so calls parked on it replay against the
+        // re-authorized server (deferred ReAuthCallRetry).
+        let manager = Arc::clone(self);
+        let reconnect_name = name.clone();
+        tokio::spawn(async move {
+            let ticket = manager.issue_connect_ticket(&reconnect_name, &config);
+            let result = Self::connect_one(
+                &reconnect_name,
+                &config,
+                Arc::clone(&manager.pending_oauth_urls),
+                Arc::clone(&manager.oauth),
+            )
+            .await;
+            match result {
+                Ok(server) => {
+                    let tool_count = server.tools.len();
+                    if publish_if_current(
+                        &manager.servers,
+                        &manager.connect_tickets,
+                        &reconnect_name,
+                        ticket,
+                        server,
+                    )
+                    .await
+                    {
+                        tracing::info!(
+                            server = %reconnect_name,
+                            tools = tool_count,
+                            "MCP server connected after OAuth authorization"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        server = %reconnect_name,
+                        "MCP server failed to connect after OAuth authorization: {e}"
+                    );
+                    clear_ticket_if_current(&manager.connect_tickets, &reconnect_name, ticket);
+                }
+            }
+            drop(claim);
+        });
+
+        Ok(name)
+    }
+
+    /// Handle an error redirect from the authorization server (the operator
+    /// denied, or the server rejected the request): cancel the flow it
+    /// belongs to (OAuthFlowFailed). Returns the server name when a flow
+    /// matched.
+    pub async fn fail_oauth_authorization(
+        &self,
+        state_nonce: &str,
+        error: &str,
+    ) -> Option<String> {
+        let name = {
+            let pending = self.oauth.pending.lock().unwrap();
+            pending
+                .iter()
+                .find(|(_, flow)| flow.state_nonce == state_nonce)
+                .map(|(name, _)| name.clone())
+        }?;
+        self.cancel_pending_oauth_flow(&name).await;
+        tracing::warn!(
+            server = %name,
+            error = %error,
+            "MCP OAuth authorization failed at the authorization server"
+        );
+        Some(name)
+    }
+
+    /// Refresh the token of an authorized server whose call just 401'd
+    /// (TokenRefreshNeeded → TokenRefreshed / TokenRefreshFailed). On a
+    /// definitive rejection the token is discarded and a fresh authorization
+    /// flow is surfaced before returning `Reprompt`.
+    async fn refresh_authorized_server(
+        &self,
+        server: &mut McpServer,
+        www_authenticate: Option<&str>,
+    ) -> RefreshServerOutcome {
+        let name = server.name.clone();
+        let config = server.config();
+        let Some(url) = oauth_resource_url(&config).map(str::to_string) else {
+            return RefreshServerOutcome::Transient(format!(
+                "MCP server '{name}': not OAuth-eligible"
+            ));
+        };
+        let token = match self.oauth.store().token(&name).await {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                // The bearer cell is set but no row backs it (e.g. deleted by
+                // a concurrent reload): nothing to refresh, re-prompt.
+                return self
+                    .reprompt_after_refresh_failure(
+                        server,
+                        &config,
+                        www_authenticate,
+                        "no stored token",
+                    )
+                    .await;
+            }
+            Err(e) => {
+                return RefreshServerOutcome::Transient(format!(
+                    "MCP server '{name}': OAuth token lookup failed: {e}"
+                ));
+            }
+        };
+        match oauth_refresh(&self.oauth, &name, &url, www_authenticate, &token).await {
+            Ok(access_token) => {
+                *server.oauth_bearer.write().unwrap() = Some(access_token);
+                RefreshServerOutcome::Refreshed
+            }
+            Err(RefreshFailure::Transient(e)) => RefreshServerOutcome::Transient(format!(
+                "MCP server '{name}': OAuth token refresh failed: {e}"
+            )),
+            Err(RefreshFailure::Rejected(e)) => {
+                self.reprompt_after_refresh_failure(server, &config, www_authenticate, &e)
+                    .await
+            }
+        }
+    }
+
+    /// TokenRefreshFailed: discard the dead token and surface a fresh
+    /// authorization flow so the operator re-authorizes (REQ-MCP-012).
+    async fn reprompt_after_refresh_failure(
+        &self,
+        server: &mut McpServer,
+        config: &McpServerConfig,
+        www_authenticate: Option<&str>,
+        reason: &str,
+    ) -> RefreshServerOutcome {
+        let name = server.name.clone();
+        tracing::warn!(
+            server = %name,
+            "OAuth refresh rejected ({reason}); discarding token and re-prompting"
+        );
+        if let Err(e) = self.oauth.store().delete_token(&name).await {
+            tracing::warn!(server = %name, "Failed to delete rejected OAuth token: {e}");
+        }
+        *server.oauth_bearer.write().unwrap() = None;
+        match begin_oauth_flow(
+            &self.oauth,
+            &self.pending_oauth_urls,
+            &name,
+            config,
+            www_authenticate,
+            Vec::new(),
+            None,
+        )
+        .await
+        {
+            Ok(auth_url) => RefreshServerOutcome::Reprompt(format!(
+                "MCP server '{name}': authorization expired; re-authorize at {auth_url}"
+            )),
+            Err(flow_error) => RefreshServerOutcome::Reprompt(format!(
+                "MCP server '{name}': OAuth refresh rejected ({reason}) and re-authorization \
+                 could not start: {flow_error}"
+            )),
+        }
+    }
+
+    /// InsufficientScopeStepUp: read the prior grants, discard the narrow
+    /// token, and surface a re-authorization requesting the union of prior
+    /// and challenged scopes. The claim moves into the pending flow so the
+    /// triggering call stays parked until the re-authorized server is
+    /// republished (REQ-MCP-012, deferred ReAuthCallRetry).
+    async fn step_up_authorization(
+        &self,
+        mut server: Box<McpServer>,
+        www_authenticate: &str,
+        claim: ServerClaim,
+    ) -> Result<(), String> {
+        let name = server.name.clone();
+        let config = server.config();
+        // Prior grants are read BEFORE the token is discarded; persisting
+        // scopes on the token makes them available even across a restart.
+        let prior_scopes = match self.oauth.store().token(&name).await {
+            Ok(Some(token)) => token.scopes,
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                tracing::warn!(server = %name, "OAuth token lookup failed during step-up: {e}");
+                Vec::new()
+            }
+        };
+        if let Err(e) = self.oauth.store().delete_token(&name).await {
+            tracing::warn!(server = %name, "Failed to delete narrow OAuth token: {e}");
+        }
+        // Best-effort session teardown while the old bearer is still
+        // attached; the replacement connection starts fresh.
+        server.terminate().await;
+
+        match begin_oauth_flow(
+            &self.oauth,
+            &self.pending_oauth_urls,
+            &name,
+            &config,
+            Some(www_authenticate),
+            prior_scopes,
+            Some(claim),
+        )
+        .await
+        {
+            Ok(auth_url) => {
+                tracing::info!(
+                    server = %name,
+                    url = %auth_url,
+                    "Tool call needs additional scopes; awaiting re-authorization"
+                );
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "MCP server '{name}': insufficient scope and re-authorization could not \
+                 start: {e}"
+            )),
         }
     }
 
@@ -790,12 +1622,12 @@ impl McpClientManager {
     /// Park a claim for `server_name`. Must be called while holding the
     /// `servers` write lock that removes the entry, so a concurrent caller
     /// can never observe the server absent without also seeing the claim.
-    fn claim_server(&self, server_name: &str) -> ServerClaim<'_> {
+    fn claim_server(&self, server_name: &str) -> ServerClaim {
         let (sender, _) = tokio::sync::watch::channel(());
         self.recovering_map()
             .insert(server_name.to_string(), sender);
         ServerClaim {
-            manager: self,
+            recovering: Arc::clone(&self.recovering),
             name: server_name.to_string(),
         }
     }
@@ -859,9 +1691,11 @@ impl McpClientManager {
                 .map(|(name, entry)| {
                     let mgr = Arc::clone(&manager);
                     let oauth = Arc::clone(&manager.pending_oauth_urls);
+                    let oauth_rt = Arc::clone(&manager.oauth);
                     let ticket = manager.issue_connect_ticket(&name, &entry);
                     tokio::spawn(async move {
-                        let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
+                        let result =
+                            Self::connect_one(&name, &entry, Arc::clone(&oauth), oauth_rt).await;
                         match result {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
@@ -1114,11 +1948,27 @@ impl McpClientManager {
             Err(e) => {
                 // One concurrent failing call leads the recovery; the others
                 // follow by waiting for it to finish, then retrying.
-                enum Recovery<'a> {
+                enum Recovery {
                     Lead {
                         server: Box<McpServer>,
                         action: &'static str,
-                        claim: ServerClaim<'a>,
+                        claim: ServerClaim,
+                    },
+                    /// A 401 on an OAuth-authorized server: silently refresh
+                    /// the token, then retry (TokenRefreshNeeded).
+                    OAuthRefresh {
+                        server: Box<McpServer>,
+                        claim: ServerClaim,
+                        www_authenticate: Option<String>,
+                    },
+                    /// A 403 insufficient_scope on an OAuth-authorized
+                    /// server: re-authorize with the scope union, holding the
+                    /// claim so this call replays once the operator acts
+                    /// (InsufficientScopeStepUp).
+                    OAuthStepUp {
+                        server: Box<McpServer>,
+                        claim: ServerClaim,
+                        www_authenticate: String,
                     },
                     Follow(tokio::sync::watch::Receiver<()>),
                     /// The failing transport was already replaced; go
@@ -1136,23 +1986,36 @@ impl McpClientManager {
                         // its own judgement applies. A healthy transport with
                         // a non-recoverable failure is a tool-level error --
                         // surface it; retrying could re-execute a
-                        // side-effecting call.
+                        // side-effecting call -- unless it is an OAuth
+                        // re-auth condition, which claims the slot like a
+                        // transport recovery (REQ-MCP-012).
                         if server.generation == attempt.generation
                             && server.is_alive()
                             && !attempt.recoverable
                         {
-                            servers.insert(server_name.to_string(), server);
-                            return Err(e.into_message(server_name));
-                        }
-
-                        // A failure from a transport that has already been
-                        // replaced (another task finished a recovery, or
-                        // reload swapped the server) is stale: the fresh
-                        // instance's policy must not re-judge it. Surface it
-                        // if the serving instance deemed it non-recoverable;
-                        // otherwise retry on the fresh instance instead of
-                        // tearing it down.
-                        if server.generation == attempt.generation {
+                            match oauth_recovery_kind(&server, &e) {
+                                Some(OAuthRecoveryKind::Refresh { www_authenticate }) => {
+                                    Recovery::OAuthRefresh {
+                                        server: Box::new(server),
+                                        claim: self.claim_server(server_name),
+                                        www_authenticate,
+                                    }
+                                }
+                                Some(OAuthRecoveryKind::StepUp { www_authenticate }) => {
+                                    Recovery::OAuthStepUp {
+                                        server: Box::new(server),
+                                        claim: self.claim_server(server_name),
+                                        www_authenticate,
+                                    }
+                                }
+                                None => {
+                                    servers.insert(server_name.to_string(), server);
+                                    return Err(e.into_message(server_name));
+                                }
+                            }
+                        } else if server.generation == attempt.generation {
+                            // A recoverable transport failure from the
+                            // serving instance: lead the recovery.
                             let action = server.recovery_action();
                             tracing::warn!(
                                 server = %server_name,
@@ -1171,6 +2034,13 @@ impl McpClientManager {
                                 claim: self.claim_server(server_name),
                             }
                         } else {
+                            // A failure from a transport that has already
+                            // been replaced (another task finished a
+                            // recovery, or reload swapped the server) is
+                            // stale: the fresh instance's policy must not
+                            // re-judge it. Surface it if the serving instance
+                            // deemed it non-recoverable; otherwise retry on
+                            // the fresh instance instead of tearing it down.
                             servers.insert(server_name.to_string(), server);
                             if !attempt.recoverable {
                                 return Err(e.into_message(server_name));
@@ -1214,6 +2084,54 @@ impl McpClientManager {
                             ));
                         }
                     }
+                    // Silent token refresh (REQ-MCP-012): on success the
+                    // server rejoins the map with the rotated bearer and the
+                    // call retries below, so a routine expiry never surfaces
+                    // as a tool failure.
+                    Recovery::OAuthRefresh {
+                        mut server,
+                        claim,
+                        www_authenticate,
+                    } => {
+                        match self
+                            .refresh_authorized_server(&mut server, www_authenticate.as_deref())
+                            .await
+                        {
+                            RefreshServerOutcome::Refreshed => {
+                                insert_server(&self.servers, server_name, *server).await;
+                                drop(claim);
+                            }
+                            // Not evidence of a stale token (network blip to
+                            // the authorization server): keep the server and
+                            // its token; the next 401 retries the refresh.
+                            RefreshServerOutcome::Transient(message) => {
+                                insert_server(&self.servers, server_name, *server).await;
+                                drop(claim);
+                                return Err(message);
+                            }
+                            // TokenRefreshFailed: the token was discarded and
+                            // a fresh authorization flow surfaced its URL;
+                            // the server leaves the map until the operator
+                            // completes it.
+                            RefreshServerOutcome::Reprompt(message) => {
+                                server.terminate().await;
+                                drop(claim);
+                                return Err(message);
+                            }
+                        }
+                    }
+                    // Scope step-up (REQ-MCP-012): the claim moves into the
+                    // pending flow, so the retry below parks until the
+                    // operator re-authorizes and the server is republished --
+                    // then the call replays with the upgraded token.
+                    Recovery::OAuthStepUp {
+                        server,
+                        claim,
+                        www_authenticate,
+                    } => {
+                        self.step_up_authorization(server, &www_authenticate, claim)
+                            .await?;
+                    }
                     // Wait for the leader's claim guard to drop. Unbounded by
                     // design: the guard releases on every leader exit path
                     // (including unwind), and each re-establish stage is
@@ -1239,14 +2157,157 @@ impl McpClientManager {
     /// Connect and initialize a single MCP server. A failed handshake shuts
     /// the transport down (ending any session `initialize` created) before
     /// the error is returned.
+    ///
+    /// For OAuth-eligible HTTP servers this is also where the token
+    /// lifecycle's connect-side rules live: a stored, resource-matched token
+    /// is restored onto the very first `initialize` (REQ-MCP-012,
+    /// ServerDiscoveredWithStoredToken); a 401 against a refreshable token
+    /// takes the silent refresh path; and a 401 with no usable token starts
+    /// the authorization flow, failing the connect with the surfaced URL
+    /// (OAuthRequired). A 401 against static config credentials stays a hard
+    /// failure (StaticAuthRejected, REQ-MCP-008).
     async fn connect_one(
         name: &str,
         entry: &McpServerConfig,
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
+        oauth_rt: Arc<OAuthRuntime>,
     ) -> Result<McpServer, String> {
-        let mut server = McpServer::connect(name, entry.clone(), pending_oauth_urls).await?;
-        server.handshake().await?;
-        Ok(server)
+        // A pre-configured client (for a DCR-less authorization server) seeds
+        // the registration row at discovery, so the later 401 reuses it
+        // instead of attempting registration (REQ-MCP-010,
+        // PreconfiguredClientSeeded). Idempotent per authorization server.
+        if let McpServerConfig::Http {
+            auth: HttpAuth::OAuth(Some(preconfigured)),
+            ..
+        } = entry
+        {
+            oauth_rt
+                .store()
+                .upsert_registration(&OAuthRegistrationRecord {
+                    auth_server: preconfigured.auth_server.clone(),
+                    client_id: preconfigured.client_id.clone(),
+                    client_secret: preconfigured.client_secret.clone(),
+                    token_endpoint_auth_method: preconfigured.token_endpoint_auth_method.clone(),
+                })
+                .await
+                .map_err(|e| {
+                    format!("MCP server '{name}': failed to seed pre-configured OAuth client: {e}")
+                })?;
+        }
+
+        let bearer: SharedBearer = Arc::default();
+        if let Some(url) = oauth_resource_url(entry) {
+            match oauth_rt.store().token(name).await {
+                Ok(Some(token)) => {
+                    let resource = oauth::canonical_resource(url);
+                    if token.resource != resource {
+                        // The config was repointed; the token's audience is
+                        // the old endpoint and must not be sent to the new
+                        // one (REQ-MCP-012).
+                        tracing::info!(
+                            server = %name,
+                            "Stored OAuth token is bound to a different resource; discarding"
+                        );
+                        let _ = oauth_rt.store().delete_token(name).await;
+                    } else if token.is_expired() && token.refresh_token.is_none() {
+                        tracing::info!(
+                            server = %name,
+                            "Stored OAuth token is expired with no refresh token; discarding"
+                        );
+                        let _ = oauth_rt.store().delete_token(name).await;
+                    } else {
+                        // Silent restore: the bearer rides the first
+                        // initialize. An expired-but-refreshable token rides
+                        // the 401 → refresh path below, still with no
+                        // re-prompt (REQ-MCP-012).
+                        *bearer.write().unwrap() = Some(token.access_token.clone());
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(server = %name, "OAuth token lookup failed: {e}"),
+            }
+        }
+
+        let mut server = McpServer::connect(
+            name,
+            entry.clone(),
+            Arc::clone(&pending_oauth_urls),
+            Arc::clone(&bearer),
+        )
+        .await?;
+        let Err(failure) = server.handshake().await else {
+            return Ok(server);
+        };
+        let HandshakeFailure::Unauthorized {
+            www_authenticate,
+            message,
+        } = failure
+        else {
+            return Err(failure.to_string());
+        };
+        // StaticAuthRejected: there is no interactive flow to recover a
+        // rejected config credential into (REQ-MCP-008). Stdio cannot 401.
+        let Some(url) = oauth_resource_url(entry) else {
+            return Err(message);
+        };
+
+        // Silent refresh before any re-prompt: a restored token whose access
+        // half expired offline refreshes on this first 401 (REQ-MCP-012).
+        let stored = oauth_rt.store().token(name).await.unwrap_or_default();
+        if let Some(token) = stored {
+            if token.refresh_token.is_some() {
+                match oauth_refresh(&oauth_rt, name, url, www_authenticate.as_deref(), &token)
+                    .await
+                {
+                    Ok(access_token) => {
+                        *bearer.write().unwrap() = Some(access_token);
+                        match server.reestablish().await {
+                            Ok(()) => return Ok(server),
+                            Err(HandshakeFailure::Unauthorized { .. }) => {
+                                // The freshly refreshed token was still
+                                // rejected; the grant chain is dead.
+                                let _ = oauth_rt.store().delete_token(name).await;
+                            }
+                            Err(other) => return Err(other.to_string()),
+                        }
+                    }
+                    Err(RefreshFailure::Transient(e)) => {
+                        return Err(format!(
+                            "MCP server '{name}': OAuth token refresh failed: {e}"
+                        ));
+                    }
+                    Err(RefreshFailure::Rejected(e)) => {
+                        tracing::warn!(
+                            server = %name,
+                            "OAuth refresh rejected ({e}); discarding token and re-prompting"
+                        );
+                        let _ = oauth_rt.store().delete_token(name).await;
+                    }
+                }
+            } else {
+                // An unexpired stored token was rejected and cannot be
+                // refreshed: discard it before re-prompting so a stale
+                // credential never coexists with the fresh one.
+                let _ = oauth_rt.store().delete_token(name).await;
+            }
+        }
+
+        // Fresh authorization: surface the URL and fail the connect — the
+        // callback completing the flow reconnects (REQ-MCP-009..011).
+        let auth_url = begin_oauth_flow(
+            &oauth_rt,
+            &pending_oauth_urls,
+            name,
+            entry,
+            www_authenticate.as_deref(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .map_err(|e| format!("MCP server '{name}': OAuth authorization failed: {e}"))?;
+        Err(format!(
+            "MCP server '{name}' requires OAuth authorization; open {auth_url}"
+        ))
     }
 
     /// Read all MCP config files in priority order, merging by server name
@@ -1366,13 +2427,18 @@ impl McpClientManager {
     }
 
     /// Classify an HTTP entry's `auth` object: `{"bearer": "<token>"}` or
-    /// `{"headers": {...}}` is an explicit static credential (REQ-MCP-008).
-    /// An unrecognized or malformed shape skips the server -- silently
-    /// downgrading an intended credential to no-auth (or dropping part of
-    /// it) would change which authorization path a 401 takes.
+    /// `{"headers": {...}}` is an explicit static credential (REQ-MCP-008);
+    /// `{"oauth": {...}}` declares OAuth, optionally carrying a
+    /// pre-configured client for a DCR-less authorization server
+    /// (REQ-MCP-010). An unrecognized or malformed shape skips the server --
+    /// silently downgrading an intended credential to no-auth (or dropping
+    /// part of it) would change which authorization path a 401 takes.
     fn classify_http_auth(name: &str, auth: &Value) -> Option<HttpAuth> {
         if let Some(token) = auth.get("bearer").and_then(|v| v.as_str()) {
             return Some(HttpAuth::Static(StaticCred::Bearer(token.to_string())));
+        }
+        if let Some(oauth_value) = auth.get("oauth") {
+            return Self::classify_oauth_auth(name, oauth_value);
         }
         if let Some(headers_value) = auth.get("headers") {
             let Some(object) = headers_value.as_object() else {
@@ -1399,6 +2465,47 @@ impl McpClientManager {
         }
         tracing::debug!(server = %name, "HTTP MCP server with unrecognized 'auth' shape");
         None
+    }
+
+    /// Classify the `auth.oauth` value: `true` or `{}` selects OAuth with a
+    /// dynamically acquired client; an object carrying `auth_server` +
+    /// `client_id` pre-configures the client identity. A partial
+    /// pre-configured client skips the server -- half a client identity
+    /// would attempt DCR against an authorization server the user said
+    /// disables it.
+    fn classify_oauth_auth(name: &str, oauth_value: &Value) -> Option<HttpAuth> {
+        match oauth_value {
+            Value::Bool(true) => Some(HttpAuth::OAuth(None)),
+            Value::Object(fields) if fields.is_empty() => Some(HttpAuth::OAuth(None)),
+            Value::Object(fields) => {
+                let auth_server = fields.get("auth_server").and_then(Value::as_str);
+                let client_id = fields.get("client_id").and_then(Value::as_str);
+                let (Some(auth_server), Some(client_id)) = (auth_server, client_id) else {
+                    tracing::debug!(
+                        server = %name,
+                        "'auth.oauth' pre-configured client needs both 'auth_server' and 'client_id'"
+                    );
+                    return None;
+                };
+                Some(HttpAuth::OAuth(Some(PreconfiguredClient {
+                    auth_server: auth_server.to_string(),
+                    client_id: client_id.to_string(),
+                    client_secret: fields
+                        .get("client_secret")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    token_endpoint_auth_method: fields
+                        .get("token_endpoint_auth_method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("none")
+                        .to_string(),
+                })))
+            }
+            _ => {
+                tracing::debug!(server = %name, "'auth.oauth' must be true or an object");
+                None
+            }
+        }
     }
 
     /// Re-scan config files and reconcile servers: connect new ones,
@@ -1499,6 +2606,21 @@ impl McpClientManager {
             let claimed: Vec<String> = self.recovering_map().keys().cloned().collect();
             claimed
         };
+        // Sweep pending OAuth flows whose server left the config -- BEFORE
+        // settling claims, because a step-up flow holds its server's claim
+        // until the operator acts, and waiting on it here would block the
+        // reload on a browser round trip. Cancelling drops the flow (and its
+        // claim), so the stale callback is rejected (ReloadCancelsPendingAuth).
+        let pending_flow_names: Vec<String> =
+            self.oauth.pending.lock().unwrap().keys().cloned().collect();
+        for name in pending_flow_names {
+            if !config_names.contains(&name) {
+                self.cancel_pending_oauth_flow(&name).await;
+                if !removed.contains(&name) {
+                    removed.push(name);
+                }
+            }
+        }
         for name in claimed {
             if !config_names.contains(&name) && !removed.contains(&name) {
                 self.await_claim_release(&name).await;
@@ -1506,6 +2628,14 @@ impl McpClientManager {
                     removed_servers.push((name.clone(), server));
                     removed.push(name);
                 }
+            }
+        }
+        // A removed server's stored token would orphan with no owning server
+        // (ReloadRemovesServer / TokenImpliesOAuthServer); the shared
+        // per-authorization-server registration is deliberately retained.
+        for name in &removed {
+            if let Err(e) = self.oauth.store().delete_token(name).await {
+                tracing::warn!(server = %name, "Failed to delete OAuth token for removed server: {e}");
             }
         }
         for (name, mut server) in removed_servers {
@@ -1519,6 +2649,26 @@ impl McpClientManager {
 
             match existing_config {
                 None => {
+                    // A pending native OAuth flow for this exact config keeps
+                    // waiting on the operator: superseding it would rotate
+                    // the nonce and invalidate the URL they may already have
+                    // open in a browser. Only a *changed* config cancels a
+                    // pending flow (ReloadCancelsPendingAuth).
+                    let pending_same_config = self
+                        .oauth
+                        .pending
+                        .lock()
+                        .unwrap()
+                        .get(&name)
+                        .is_some_and(|flow| flow.config == entry);
+                    if pending_same_config {
+                        unchanged.push(name);
+                        continue;
+                    }
+                    if self.cancel_pending_oauth_flow(&name).await {
+                        self.invalidate_oauth_on_config_change(&name, &entry).await;
+                    }
+
                     let oauth = Arc::clone(&self.pending_oauth_urls);
                     oauth.write().await.remove(&name);
                     added.push(name.clone());
@@ -1545,6 +2695,7 @@ impl McpClientManager {
 
                     let servers = Arc::clone(&self.servers);
                     let tickets = Arc::clone(&self.connect_tickets);
+                    let oauth_rt = Arc::clone(&self.oauth);
                     // Supersede any in-flight connect for this name BEFORE
                     // acting on the observed absence: with the new ticket
                     // issued, a stale publish landing from here on is
@@ -1561,7 +2712,8 @@ impl McpClientManager {
                         stale.terminate().await;
                     }
                     tokio::spawn(async move {
-                        let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
+                        let result =
+                            Self::connect_one(&name, &entry, Arc::clone(&oauth), oauth_rt).await;
                         match result {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
@@ -1587,6 +2739,15 @@ impl McpClientManager {
                     unchanged.push(name);
                 }
                 Some(_) => {
+                    // A changed config cancels any pending authorization
+                    // (ReloadCancelsPendingAuth) -- BEFORE the slot loop
+                    // below, which would otherwise wait on a claim the
+                    // pending flow holds until the operator acts -- and
+                    // discards a stored token the new config can no longer
+                    // use (ReloadInvalidatesOAuth).
+                    self.cancel_pending_oauth_flow(&name).await;
+                    self.invalidate_oauth_on_config_change(&name, &entry).await;
+
                     // Supersede any in-flight connect BEFORE removing the old
                     // server: with the new ticket issued, a stale publish can
                     // no longer slip into the window between the removal and
@@ -1643,6 +2804,7 @@ impl McpClientManager {
                     let oauth = Arc::clone(&self.pending_oauth_urls);
                     let servers = Arc::clone(&self.servers);
                     let tickets = Arc::clone(&self.connect_tickets);
+                    let oauth_rt = Arc::clone(&self.oauth);
                     restart_pending.insert(name.clone());
                     // The connect runs as a detached task: when the reload
                     // deadline drops the awaiting future below, the task is
@@ -1653,7 +2815,8 @@ impl McpClientManager {
                     // DELETEd rather than leaked by a cancelled future.
                     let task_name = name.clone();
                     let task = tokio::spawn(async move {
-                        let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
+                        let result =
+                            Self::connect_one(&name, &entry, Arc::clone(&oauth), oauth_rt).await;
                         match result {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
@@ -1761,18 +2924,20 @@ impl McpClientManager {
 }
 
 /// An exclusive hold on a server temporarily out of the `servers` map
-/// (re-establishing after a transport failure, or refreshing its tool list).
-/// Dropping it releases the claim and wakes waiters on every exit path --
-/// success, error, panic unwind, or a dropped future -- so a dead holder can
-/// never strand the callers waiting on it.
-struct ServerClaim<'a> {
-    manager: &'a McpClientManager,
+/// (re-establishing after a transport failure, refreshing its tool list, or
+/// awaiting an OAuth step-up re-authorization). Dropping it releases the
+/// claim and wakes waiters on every exit path -- success, error, panic
+/// unwind, or a dropped future -- so a dead holder can never strand the
+/// callers waiting on it. Owns its handle on the claim map (rather than
+/// borrowing the manager) so a pending OAuth flow can hold it.
+struct ServerClaim {
+    recovering: RecoveringMap,
     name: String,
 }
 
-impl Drop for ServerClaim<'_> {
+impl Drop for ServerClaim {
     fn drop(&mut self) {
-        self.manager.recovering_map().remove(&self.name);
+        self.recovering.lock().unwrap().remove(&self.name);
     }
 }
 
@@ -2219,6 +3384,7 @@ mod tests {
             generation: next_generation(),
             tools_changed: AtomicBool::new(false),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
+            oauth_bearer: Arc::default(),
         };
         (server, requests, notifications)
     }
@@ -2574,6 +3740,7 @@ for line in sys.stdin:
             "fixture",
             config,
             Arc::clone(&manager.pending_oauth_urls),
+            Arc::clone(&manager.oauth),
         )
         .await
         .expect("connect fixture");

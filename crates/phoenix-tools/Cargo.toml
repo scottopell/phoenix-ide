@@ -74,8 +74,9 @@ which = "8"
 # Process-group / signal management for bash.
 libc = "0.2"
 
-# HTTP client for the MCP Streamable HTTP transport (specs/mcp/).
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+# HTTP client for the MCP Streamable HTTP transport (specs/mcp/); `form`
+# carries the OAuth token-endpoint grants (application/x-www-form-urlencoded).
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls"] }
 
 # Typed errors.
 thiserror = "2"

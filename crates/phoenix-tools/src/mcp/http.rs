@@ -8,7 +8,7 @@
 //! them. Unlike stdio, requests are not serialized: each POST is an
 //! independent HTTP exchange correlated by the JSON-RPC id.
 
-use super::{HttpAuth, McpTransport, ServerMessageSink, StaticCred, TransportError};
+use super::{HttpAuth, McpTransport, ServerMessageSink, SharedBearer, StaticCred, TransportError};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
@@ -37,6 +37,11 @@ pub struct HttpTransport {
     /// Negotiated protocol version from the `initialize` result, sent as the
     /// `MCP-Protocol-Version` header on every later request (REQ-MCP-004).
     protocol_version: std::sync::Mutex<Option<String>>,
+    /// The server's shared OAuth bearer, attached as `Authorization: Bearer`
+    /// on every request — initialize, tools/*, and the session DELETE
+    /// (REQ-MCP-012). `None` for static-credential servers, whose config
+    /// authorization is already in `base_headers` and must not be shadowed.
+    oauth_bearer: Option<SharedBearer>,
     next_id: AtomicU64,
 }
 
@@ -52,6 +57,7 @@ impl HttpTransport {
         url: &str,
         headers: &HashMap<String, String>,
         auth: &HttpAuth,
+        oauth_bearer: SharedBearer,
     ) -> Result<Self, String> {
         let mut base_headers = HeaderMap::new();
         for (key, value) in headers {
@@ -86,8 +92,20 @@ impl HttpTransport {
             base_headers,
             session_id: std::sync::Mutex::new(None),
             protocol_version: std::sync::Mutex::new(None),
+            // A static credential owns the Authorization header; the OAuth
+            // bearer applies only when no config credential does.
+            oauth_bearer: match auth {
+                HttpAuth::None | HttpAuth::OAuth(_) => Some(oauth_bearer),
+                HttpAuth::Static(_) => None,
+            },
             next_id: AtomicU64::new(1),
         })
+    }
+
+    /// The current OAuth bearer header value, when one applies.
+    fn bearer_header(&self) -> Option<HeaderValue> {
+        let token = self.oauth_bearer.as_ref()?.read().unwrap().clone()?;
+        HeaderValue::from_str(&format!("Bearer {token}")).ok()
     }
 
     /// A POST to the MCP endpoint carrying the base headers, the Accept pair,
@@ -103,6 +121,9 @@ impl HttpTransport {
             .timeout(timeout)
             .headers(self.base_headers.clone())
             .header(ACCEPT, ACCEPT_BOTH);
+        if let Some(bearer) = self.bearer_header() {
+            builder = builder.header(AUTHORIZATION, bearer);
+        }
         if let Some(session_id) = &session_id {
             builder = builder.header(MCP_SESSION_ID, session_id.as_str());
         }
@@ -360,6 +381,10 @@ impl McpTransport for HttpTransport {
                 .timeout(Duration::from_secs(5))
                 .headers(self.base_headers.clone())
                 .header(MCP_SESSION_ID, session_id);
+            // The bearer rides the session DELETE too (REQ-MCP-012).
+            if let Some(bearer) = self.bearer_header() {
+                builder = builder.header(AUTHORIZATION, bearer);
+            }
             // The negotiated protocol version rides every post-initialize
             // request, the session DELETE included (REQ-MCP-004).
             if let Some(version) = self.protocol_version.lock().unwrap().clone() {
@@ -743,6 +768,7 @@ mod tests {
             "remote",
             &http_config(&server.url, auth),
             Arc::new(RwLock::new(HashMap::new())),
+            Arc::default(),
         )
         .await
     }
@@ -1000,6 +1026,7 @@ mod tests {
             "http://127.0.0.1:1/mcp",
             &HashMap::from([("Mcp-Session-Id".to_string(), "boo".to_string())]),
             &HttpAuth::None,
+            Arc::default(),
         );
         let err = generic.err().expect("generic header must be rejected");
         assert!(err.contains("transport-managed"), "got: {err}");
@@ -1012,6 +1039,7 @@ mod tests {
                 "MCP-Protocol-Version".to_string(),
                 "boo".to_string(),
             )]))),
+            Arc::default(),
         );
         let err = auth.err().expect("auth header must be rejected");
         assert!(err.contains("transport-managed"), "got: {err}");
@@ -1037,7 +1065,13 @@ mod tests {
         ))])
         .await;
         let transport =
-            HttpTransport::connect("remote", &server.url, &HashMap::new(), &HttpAuth::None)
+            HttpTransport::connect(
+            "remote",
+            &server.url,
+            &HashMap::new(),
+            &HttpAuth::None,
+            Arc::default(),
+        )
                 .expect("connect");
 
         let sink = RecordingSink::default();
@@ -1707,7 +1741,13 @@ mod tests {
         let server =
             TestServer::start(vec![status_response(404, &[]), status_response(404, &[])]).await;
         let transport =
-            HttpTransport::connect("remote", &server.url, &HashMap::new(), &HttpAuth::None)
+            HttpTransport::connect(
+            "remote",
+            &server.url,
+            &HashMap::new(),
+            &HttpAuth::None,
+            Arc::default(),
+        )
                 .expect("connect");
         *transport.session_id.lock().unwrap() = Some("sess-1".to_string());
 
