@@ -2,7 +2,7 @@
 //!
 //! Pure protocol mechanics: `WWW-Authenticate` challenge parsing, Protected
 //! Resource Metadata discovery (RFC 9728), Authorization Server Metadata
-//! discovery (RFC 8414 + OpenID Connect Discovery), Dynamic Client
+//! discovery (RFC 8414 + `OpenID` Connect Discovery), Dynamic Client
 //! Registration (RFC 7591), PKCE, and the token-endpoint grants (code
 //! exchange + refresh) with RFC 8707 resource indicators. The connection
 //! lifecycle that drives these — when to discover, when to refresh, when to
@@ -225,10 +225,7 @@ pub fn canonical_resource(url: &str) -> String {
         (Some(p), _) => format!(":{p}"),
     };
     let path = parsed.path().trim_end_matches('/');
-    let query = parsed
-        .query()
-        .map(|q| format!("?{q}"))
-        .unwrap_or_default();
+    let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
     format!("{scheme}://{host}{port}{path}{query}")
 }
 
@@ -311,7 +308,9 @@ fn prm_well_known_candidates(mcp_url: &str) -> Vec<String> {
     let path = parsed.path().trim_end_matches('/');
     let mut candidates = Vec::new();
     if !path.is_empty() && path != "/" {
-        candidates.push(format!("{origin}/.well-known/oauth-protected-resource{path}"));
+        candidates.push(format!(
+            "{origin}/.well-known/oauth-protected-resource{path}"
+        ));
     }
     candidates.push(format!("{origin}/.well-known/oauth-protected-resource"));
     candidates
@@ -324,6 +323,7 @@ fn prm_well_known_candidates(mcp_url: &str) -> Vec<String> {
 /// # Errors
 /// Returns a display string when no candidate yields a metadata document
 /// naming at least one authorization server.
+#[allow(clippy::implicit_hasher)] // challenge maps come straight from parse_bearer_challenge
 pub async fn fetch_protected_resource_metadata(
     client: &reqwest::Client,
     mcp_url: &str,
@@ -655,9 +655,7 @@ async fn token_grant(
         .map_err(|e| TokenGrantError::Transport(format!("token request failed: {e}")))?;
     let status = response.status();
     let doc: Value = response.json().await.map_err(|e| {
-        TokenGrantError::Transport(format!(
-            "token response unreadable (HTTP {status}): {e}"
-        ))
+        TokenGrantError::Transport(format!("token response unreadable (HTTP {status}): {e}"))
     })?;
     if !status.is_success() {
         return Err(TokenGrantError::Rejected(format!(

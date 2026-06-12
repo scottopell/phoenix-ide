@@ -489,6 +489,11 @@ mod tests {
             self.request_line.split(' ').next().unwrap_or("")
         }
 
+        fn path(&self) -> &str {
+            let target = self.request_line.split(' ').nth(1).unwrap_or("");
+            target.split('?').next().unwrap_or("")
+        }
+
         fn rpc_method(&self) -> String {
             serde_json::from_str::<Value>(&self.body)
                 .ok()
@@ -583,10 +588,17 @@ mod tests {
         response
     }
 
+    /// Path-routed responses: a queue per path, consumed in order with the
+    /// final entry replayed indefinitely. Lets one scripted server carry the
+    /// OAuth endpoints (metadata, registration, token) alongside the
+    /// in-order /mcp queue, which keeps serving any unrouted path.
+    type RouteMap = Arc<Mutex<HashMap<String, VecDeque<CannedResponse>>>>;
+
     struct TestServer {
         url: String,
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
         responses: Arc<Mutex<VecDeque<CannedResponse>>>,
+        routes: RouteMap,
         accept_task: tokio::task::JoinHandle<()>,
     }
 
@@ -603,9 +615,11 @@ mod tests {
             let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
             let responses: Arc<Mutex<VecDeque<CannedResponse>>> =
                 Arc::new(Mutex::new(responses.into()));
+            let routes: RouteMap = Arc::default();
 
             let req_log = Arc::clone(&requests);
             let resp_queue = Arc::clone(&responses);
+            let route_map = Arc::clone(&routes);
             let accept_task = tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -615,6 +629,7 @@ mod tests {
                         stream,
                         Arc::clone(&req_log),
                         Arc::clone(&resp_queue),
+                        Arc::clone(&route_map),
                     ));
                 }
             });
@@ -623,12 +638,33 @@ mod tests {
                 url,
                 requests,
                 responses,
+                routes,
                 accept_task,
             }
         }
 
+        /// The server's base URL (scheme://host:port), which doubles as the
+        /// authorization-server issuer in the OAuth tests.
+        fn base(&self) -> String {
+            self.url.trim_end_matches("/mcp").to_string()
+        }
+
         fn push_responses(&self, responses: Vec<CannedResponse>) {
             self.responses.lock().unwrap().extend(responses);
+        }
+
+        /// Serve `response` for every request to `path`.
+        fn route(&self, path: &str, response: CannedResponse) {
+            self.route_seq(path, vec![response]);
+        }
+
+        /// Serve `responses` in order for requests to `path`, replaying the
+        /// last one indefinitely.
+        fn route_seq(&self, path: &str, responses: Vec<CannedResponse>) {
+            self.routes
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), responses.into());
         }
 
         fn recorded(&self) -> Vec<(String, String)> {
@@ -637,6 +673,17 @@ mod tests {
                 .unwrap()
                 .iter()
                 .map(|r| (r.http_method().to_string(), r.rpc_method()))
+                .collect()
+        }
+
+        /// Recorded requests whose path matches, as (method, body) pairs.
+        fn recorded_for_path(&self, path: &str) -> Vec<(String, String)> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.path() == path)
+                .map(|r| (r.http_method().to_string(), r.body.clone()))
                 .collect()
         }
     }
@@ -649,6 +696,7 @@ mod tests {
         mut stream: TcpStream,
         requests: Arc<Mutex<Vec<RecordedRequest>>>,
         responses: Arc<Mutex<VecDeque<CannedResponse>>>,
+        routes: RouteMap,
     ) {
         let mut buf: Vec<u8> = Vec::new();
         loop {
@@ -691,23 +739,41 @@ mod tests {
             let request_id = serde_json::from_str::<Value>(&body)
                 .ok()
                 .and_then(|v| v.get("id").cloned());
+            let path = request_line
+                .split(' ')
+                .nth(1)
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_string();
             requests.lock().unwrap().push(RecordedRequest {
                 request_line,
                 headers,
                 body,
             });
 
-            let response = responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(CannedResponse {
-                    status: 500,
-                    headers: Vec::new(),
-                    body: String::new(),
-                    delay_ms: 0,
-                    echo_result: None,
-                });
+            let path_response = {
+                let mut routes = routes.lock().unwrap();
+                match routes.get_mut(&path) {
+                    Some(queue) if queue.len() > 1 => queue.pop_front(),
+                    Some(queue) => queue.front().cloned(),
+                    None => None,
+                }
+            };
+            let response = path_response.unwrap_or_else(|| {
+                responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(CannedResponse {
+                        status: 500,
+                        headers: Vec::new(),
+                        body: String::new(),
+                        delay_ms: 0,
+                        echo_result: None,
+                    })
+            });
             if response.delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(response.delay_ms)).await;
             }
@@ -1064,15 +1130,14 @@ mod tests {
             "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
         ))])
         .await;
-        let transport =
-            HttpTransport::connect(
+        let transport = HttpTransport::connect(
             "remote",
             &server.url,
             &HashMap::new(),
             &HttpAuth::None,
             Arc::default(),
         )
-                .expect("connect");
+        .expect("connect");
 
         let sink = RecordingSink::default();
         let result = transport
@@ -1740,15 +1805,14 @@ mod tests {
     async fn http_concurrent_404s_both_classify_as_session_expired() {
         let server =
             TestServer::start(vec![status_response(404, &[]), status_response(404, &[])]).await;
-        let transport =
-            HttpTransport::connect(
+        let transport = HttpTransport::connect(
             "remote",
             &server.url,
             &HashMap::new(),
             &HttpAuth::None,
             Arc::default(),
         )
-                .expect("connect");
+        .expect("connect");
         *transport.session_id.lock().unwrap() = Some("sess-1".to_string());
 
         // Both in-flight requests carried the expired session id; the first
@@ -1824,5 +1888,1045 @@ mod tests {
         let mut framer = SseFramer::default();
         let events = framer.push(b": keepalive\nid: 7\nretry: 100\ndata: x\n\n");
         assert_eq!(events, vec!["x"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // OAuth 2.1 lifecycle (REQ-MCP-009..013) against the scripted server.
+    // The TestServer doubles as the protected resource (/mcp), its RFC 9728
+    // metadata, the authorization server's RFC 8414 metadata, and the
+    // registration + token endpoints, via path routing.
+    // -----------------------------------------------------------------------
+
+    use super::super::oauth::{self, OAuthRegistrationRecord, OAuthTokenRecord};
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
+    const REDIRECT_BASE: &str = "http://localhost:7777";
+    const CALLBACK: &str = "http://localhost:7777/api/mcp/oauth/callback";
+
+    fn json_doc(value: &Value) -> CannedResponse {
+        CannedResponse {
+            status: 200,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: value.to_string(),
+            delay_ms: 0,
+            echo_result: None,
+        }
+    }
+
+    fn unauthorized(server: &TestServer) -> CannedResponse {
+        status_response(
+            401,
+            &[(
+                "www-authenticate",
+                &format!(
+                    "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\"",
+                    server.base()
+                ),
+            )],
+        )
+    }
+
+    /// Wire up the discovery documents: PRM naming the server itself as the
+    /// authorization server, and AS metadata with PKCE + iss support.
+    fn install_oauth_discovery(server: &TestServer, with_registration_endpoint: bool) {
+        let base = server.base();
+        server.route(
+            "/.well-known/oauth-protected-resource/mcp",
+            json_doc(&serde_json::json!({
+                "resource": server.url,
+                "authorization_servers": [base],
+                "scopes_supported": ["mcp.read"],
+            })),
+        );
+        let mut metadata = serde_json::json!({
+            "issuer": base,
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+            "code_challenge_methods_supported": ["S256"],
+            "authorization_response_iss_parameter_supported": true,
+        });
+        if with_registration_endpoint {
+            metadata["registration_endpoint"] = Value::String(format!("{base}/register"));
+        }
+        server.route(
+            "/.well-known/oauth-authorization-server",
+            json_doc(&metadata),
+        );
+    }
+
+    fn token_response(access: &str, refresh: Option<&str>, scope: Option<&str>) -> CannedResponse {
+        let mut body = serde_json::json!({
+            "access_token": access,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        });
+        if let Some(refresh) = refresh {
+            body["refresh_token"] = Value::String(refresh.to_string());
+        }
+        if let Some(scope) = scope {
+            body["scope"] = Value::String(scope.to_string());
+        }
+        json_doc(&body)
+    }
+
+    fn stored_token(
+        server: &TestServer,
+        access: &str,
+        refresh: Option<&str>,
+        scopes: &[&str],
+        expires_at: i64,
+    ) -> OAuthTokenRecord {
+        OAuthTokenRecord {
+            server_name: "remote".to_string(),
+            resource: oauth::canonical_resource(&server.url),
+            scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            access_token: access.to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at,
+        }
+    }
+
+    fn far_future() -> i64 {
+        chrono::Utc::now().timestamp() + 3600
+    }
+
+    fn in_the_past() -> i64 {
+        chrono::Utc::now().timestamp() - 3600
+    }
+
+    async fn connect_http_managed(
+        manager: &McpClientManager,
+        server: &TestServer,
+        auth: HttpAuth,
+    ) -> Result<super::super::McpServer, String> {
+        McpClientManager::connect_one(
+            "remote",
+            &http_config(&server.url, auth),
+            Arc::clone(&manager.pending_oauth_urls),
+            Arc::clone(&manager.oauth),
+        )
+        .await
+    }
+
+    /// Poll `f` until it yields Some, panicking after a deadline. The OAuth
+    /// completion path reconnects in a background task, so tests observe it
+    /// through the manager's published state.
+    async fn poll_until<T, F, Fut>(what: &str, mut f: F) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(value) = f().await {
+                return value;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn pending_auth_url(manager: &McpClientManager) -> Option<String> {
+        manager
+            .status()
+            .await
+            .into_iter()
+            .find_map(|s| s.pending_oauth_url)
+    }
+
+    fn query_params(url: &str) -> HashMap<String, String> {
+        reqwest::Url::parse(url)
+            .expect("valid url")
+            .query_pairs()
+            .into_owned()
+            .collect()
+    }
+
+    /// Minimal x-www-form-urlencoded decoder for asserting token requests.
+    fn parse_form(body: &str) -> HashMap<String, String> {
+        fn decode(s: &str) -> String {
+            let bytes = s.as_bytes();
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'+' => out.push(b' '),
+                    b'%' if i + 2 < bytes.len() => {
+                        let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                        if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                            out.push(byte);
+                            i += 2;
+                        } else {
+                            out.push(bytes[i]);
+                        }
+                    }
+                    other => out.push(other),
+                }
+                i += 1;
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        }
+        body.split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(k, v)| (decode(k), decode(v)))
+            .collect()
+    }
+
+    #[tokio::test]
+    // reason: end-to-end assertion of one ordered flow (discovery → DCR →
+    // PKCE URL → exchange → authenticated reconnect); splitting would
+    // duplicate the scripted-server setup at every stage.
+    #[allow(clippy::too_many_lines)]
+    async fn oauth_full_flow_discovers_registers_authorizes_and_connects() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        install_oauth_discovery(&server, true);
+        server.route(
+            "/register",
+            json_doc(&serde_json::json!({
+                "client_id": "cid-1",
+                "token_endpoint_auth_method": "none",
+            })),
+        );
+        server.route(
+            "/token",
+            token_response("at-1", Some("rt-1"), Some("mcp.read")),
+        );
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+
+        // The 401 starts discovery; the connect fails with the surfaced URL.
+        let err = connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("unauthorized connect must not publish");
+        assert!(err.contains("requires OAuth authorization"), "got: {err}");
+
+        // The authorization URL is structured state (REQ-MCP-013), carrying
+        // PKCE, state, the resource indicator, and the registered client.
+        let auth_url = pending_auth_url(&manager).await.expect("pending url");
+        let params = query_params(&auth_url);
+        assert_eq!(
+            params.get("response_type").map(String::as_str),
+            Some("code")
+        );
+        assert_eq!(params.get("client_id").map(String::as_str), Some("cid-1"));
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some(CALLBACK)
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(
+            params.get("resource").map(String::as_str),
+            Some(oauth::canonical_resource(&server.url).as_str())
+        );
+        assert_eq!(params.get("scope").map(String::as_str), Some("mcp.read"));
+        let state = params.get("state").expect("state nonce").clone();
+        let challenge = params
+            .get("code_challenge")
+            .expect("pkce challenge")
+            .clone();
+
+        // The registration request carried our redirect and a public client.
+        let registrations = server.recorded_for_path("/register");
+        assert_eq!(registrations.len(), 1);
+        let reg_body: Value = serde_json::from_str(&registrations[0].1).expect("json");
+        assert_eq!(
+            reg_body.get("redirect_uris"),
+            Some(&serde_json::json!([CALLBACK]))
+        );
+
+        // Operator completes the browser round trip; the callback exchanges
+        // the code and reconnects with the token on every request.
+        server.push_responses(handshake_responses("sess-1"));
+        let name = manager
+            .complete_oauth_authorization(&state, "code-1", Some(&server.base()))
+            .await
+            .expect("authorization completes");
+        assert_eq!(name, "remote");
+
+        poll_until("server to connect", || async {
+            manager
+                .status()
+                .await
+                .into_iter()
+                .find(|s| s.tool_count == 1)
+        })
+        .await;
+
+        // The token request was a PKCE code exchange bound to the resource.
+        let token_requests = server.recorded_for_path("/token");
+        assert_eq!(token_requests.len(), 1);
+        let form = parse_form(&token_requests[0].1);
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("authorization_code")
+        );
+        assert_eq!(form.get("code").map(String::as_str), Some("code-1"));
+        assert_eq!(form.get("client_id").map(String::as_str), Some("cid-1"));
+        assert_eq!(form.get("redirect_uri").map(String::as_str), Some(CALLBACK));
+        assert_eq!(
+            form.get("resource").map(String::as_str),
+            Some(oauth::canonical_resource(&server.url).as_str())
+        );
+        let verifier = form.get("code_verifier").expect("pkce verifier");
+        let digest = sha2::Sha256::digest(verifier.as_bytes());
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+        assert_eq!(challenge, expected, "challenge must be S256(verifier)");
+
+        // The bearer rides EVERY request, the reconnect initialize included
+        // (REQ-MCP-012), and the URL is no longer pending.
+        {
+            let requests = server.requests.lock().unwrap();
+            let last_init = requests
+                .iter()
+                .rfind(|r| r.rpc_method() == "initialize")
+                .expect("reconnect initialize");
+            assert_eq!(last_init.header("authorization"), Some("Bearer at-1"));
+        }
+        assert!(pending_auth_url(&manager).await.is_none());
+
+        // The token and the AS-keyed registration persisted.
+        let token = manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .expect("token persisted");
+        assert_eq!(token.access_token, "at-1");
+        assert_eq!(token.refresh_token.as_deref(), Some("rt-1"));
+        assert_eq!(token.scopes, vec!["mcp.read"]);
+        assert_eq!(token.resource, oauth::canonical_resource(&server.url));
+        let registration = manager
+            .oauth
+            .store()
+            .registration(&server.base())
+            .await
+            .unwrap()
+            .expect("registration persisted");
+        assert_eq!(registration.client_id, "cid-1");
+    }
+
+    #[tokio::test]
+    async fn static_auth_401_is_hard_failure_without_oauth_discovery() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        install_oauth_discovery(&server, true);
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+
+        let err = connect_http_managed(
+            &manager,
+            &server,
+            HttpAuth::Static(StaticCred::Bearer("bad".to_string())),
+        )
+        .await
+        .err()
+        .expect("rejected static auth must fail");
+        assert!(err.contains("unauthorized (HTTP 401)"), "got: {err}");
+
+        // StaticAuthRejected: no discovery, no pending flow (REQ-MCP-008).
+        assert!(server
+            .recorded_for_path("/.well-known/oauth-protected-resource/mcp")
+            .is_empty());
+        assert!(pending_auth_url(&manager).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stored_unexpired_token_restores_onto_first_initialize() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-9",
+                Some("rt-9"),
+                &["mcp.read"],
+                far_future(),
+            ))
+            .await
+            .unwrap();
+
+        let mcp = connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .expect("silent restore connects with no 401 round trip");
+        assert_eq!(mcp.tools.len(), 1);
+
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert_eq!(request.header("authorization"), Some("Bearer at-9"));
+        }
+    }
+
+    #[tokio::test]
+    async fn repointed_url_discards_stored_token_instead_of_sending_it() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mut token = stored_token(&server, "at-9", None, &[], far_future());
+        token.resource = "https://elsewhere.example/mcp".to_string();
+        manager.oauth.store().upsert_token(&token).await.unwrap();
+
+        connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .expect("connect (unauthenticated)");
+
+        // The token bound to the old resource was neither sent nor kept.
+        {
+            let requests = server.requests.lock().unwrap();
+            for request in requests.iter() {
+                assert_eq!(request.header("authorization"), None);
+            }
+        }
+        assert!(manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_stored_token_refreshes_silently_on_first_401() {
+        // The restored-but-expired bearer rides the first initialize, the
+        // server 401s, and the refresh path reconnects -- no re-prompt
+        // (REQ-MCP-012).
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        install_oauth_discovery(&server, true);
+        server.route("/token", token_response("at-2", Some("rt-2"), None));
+        server.push_responses(handshake_responses("sess-2"));
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        manager
+            .oauth
+            .store()
+            .upsert_registration(&OAuthRegistrationRecord {
+                auth_server: server.base(),
+                client_id: "cid-1".to_string(),
+                client_secret: None,
+                token_endpoint_auth_method: "none".to_string(),
+            })
+            .await
+            .unwrap();
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-old",
+                Some("rt-1"),
+                &["mcp.read"],
+                in_the_past(),
+            ))
+            .await
+            .unwrap();
+
+        let mcp = connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .expect("silent refresh must connect without a prompt");
+        assert_eq!(mcp.tools.len(), 1);
+        assert!(pending_auth_url(&manager).await.is_none());
+
+        // The refresh grant carried the resource indicator and rotated both
+        // halves, persisted (REQ-MCP-012).
+        let form = parse_form(&server.recorded_for_path("/token")[0].1);
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(form.get("refresh_token").map(String::as_str), Some("rt-1"));
+        assert_eq!(
+            form.get("resource").map(String::as_str),
+            Some(oauth::canonical_resource(&server.url).as_str())
+        );
+        let token = manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.access_token, "at-2");
+        assert_eq!(token.refresh_token.as_deref(), Some("rt-2"));
+
+        // The post-refresh initialize carried the new bearer.
+        let requests = server.requests.lock().unwrap();
+        let last_init = requests
+            .iter()
+            .rfind(|r| r.rpc_method() == "initialize")
+            .expect("post-refresh initialize");
+        assert_eq!(last_init.header("authorization"), Some("Bearer at-2"));
+    }
+
+    #[tokio::test]
+    async fn tool_call_401_refreshes_and_replays_the_call() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        manager
+            .oauth
+            .store()
+            .upsert_registration(&OAuthRegistrationRecord {
+                auth_server: server.base(),
+                client_id: "cid-1".to_string(),
+                client_secret: None,
+                token_endpoint_auth_method: "none".to_string(),
+            })
+            .await
+            .unwrap();
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-1",
+                Some("rt-1"),
+                &["mcp.read"],
+                far_future(),
+            ))
+            .await
+            .unwrap();
+        let mcp = connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // The call 401s (revoked/expired server-side); the silent refresh
+        // rotates the bearer and the executor replays the call
+        // (TokenRefreshNeeded -> TokenRefreshed -> retry).
+        install_oauth_discovery(&server, true);
+        server.route("/token", token_response("at-2", None, None));
+        let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
+        server.push_responses(vec![unauthorized(&server), echo_id_response(&call_result)]);
+
+        let output = manager
+            .call_tool("remote", "report", serde_json::json!({}))
+            .await
+            .expect("call replays after silent refresh");
+        assert_eq!(output, "ok");
+
+        // Exactly two tools/call attempts; the replay carries the rotated
+        // bearer on the still-live session.
+        {
+            let requests = server.requests.lock().unwrap();
+            let calls: Vec<_> = requests
+                .iter()
+                .filter(|r| r.rpc_method() == "tools/call")
+                .collect();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].header("authorization"), Some("Bearer at-1"));
+            assert_eq!(calls[1].header("authorization"), Some("Bearer at-2"));
+            assert_eq!(calls[1].header("mcp-session-id"), Some("sess-1"));
+        }
+        let token = manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.access_token, "at-2");
+        assert_eq!(
+            token.refresh_token.as_deref(),
+            Some("rt-1"),
+            "a non-rotating server keeps the existing refresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejection_discards_token_and_reprompts() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        manager
+            .oauth
+            .store()
+            .upsert_registration(&OAuthRegistrationRecord {
+                auth_server: server.base(),
+                client_id: "cid-1".to_string(),
+                client_secret: None,
+                token_endpoint_auth_method: "none".to_string(),
+            })
+            .await
+            .unwrap();
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-1",
+                Some("rt-dead"),
+                &["mcp.read"],
+                far_future(),
+            ))
+            .await
+            .unwrap();
+        let mcp = connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        install_oauth_discovery(&server, true);
+        server.route(
+            "/token",
+            CannedResponse {
+                status: 400,
+                headers: vec![("content-type".to_string(), "application/json".to_string())],
+                body: serde_json::json!({"error": "invalid_grant"}).to_string(),
+                delay_ms: 0,
+                echo_result: None,
+            },
+        );
+        server.push_responses(vec![unauthorized(&server), delete_ack()]);
+
+        let err = manager
+            .call_tool("remote", "report", serde_json::json!({}))
+            .await
+            .expect_err("dead grant chain must surface");
+        assert!(err.contains("re-authorize at"), "got: {err}");
+
+        // TokenRefreshFailed: row discarded, server unauthorized with a fresh
+        // flow surfaced (REQ-MCP-012), and the server left the map.
+        assert!(manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(pending_auth_url(&manager).await.is_some());
+        assert!(manager.servers.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn insufficient_scope_steps_up_with_union_and_replays_the_call() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        manager
+            .oauth
+            .store()
+            .upsert_registration(&OAuthRegistrationRecord {
+                auth_server: server.base(),
+                client_id: "cid-1".to_string(),
+                client_secret: None,
+                token_endpoint_auth_method: "none".to_string(),
+            })
+            .await
+            .unwrap();
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-1",
+                Some("rt-1"),
+                &["read"],
+                far_future(),
+            ))
+            .await
+            .unwrap();
+        let mcp = connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        install_oauth_discovery(&server, true);
+        // The 403 step-up challenge names the missing scope; the old session
+        // is DELETEd during the step-up teardown.
+        server.push_responses(vec![
+            status_response(
+                403,
+                &[(
+                    "www-authenticate",
+                    "Bearer error=\"insufficient_scope\", scope=\"write\"",
+                )],
+            ),
+            delete_ack(),
+        ]);
+
+        // The triggering call parks on the step-up claim and replays once the
+        // operator re-authorizes (deferred ReAuthCallRetry).
+        let caller = Arc::clone(&manager);
+        let held_call = tokio::spawn(async move {
+            caller
+                .call_tool("remote", "report", serde_json::json!({}))
+                .await
+        });
+
+        let auth_url = poll_until("step-up auth url", || async {
+            pending_auth_url(&manager).await
+        })
+        .await;
+        let params = query_params(&auth_url);
+        let scopes: Vec<&str> = params
+            .get("scope")
+            .map(|s| s.split(' ').collect())
+            .unwrap_or_default();
+        assert!(
+            scopes.contains(&"read") && scopes.contains(&"write"),
+            "step-up must request the union of prior and challenged scopes, got: {scopes:?}"
+        );
+        // The narrow token is gone before re-authorization (OneTokenPerServer).
+        assert!(manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Operator re-authorizes; the call replays with the upgraded token.
+        server.route(
+            "/token",
+            token_response("at-up", Some("rt-up"), Some("read write")),
+        );
+        let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
+        server.push_responses(handshake_responses("sess-2"));
+        server.push_responses(vec![echo_id_response(&call_result)]);
+
+        let state = params.get("state").expect("state").clone();
+        manager
+            .complete_oauth_authorization(&state, "code-up", Some(&server.base()))
+            .await
+            .expect("step-up authorization completes");
+
+        let output = held_call
+            .await
+            .expect("join")
+            .expect("held call must replay after step-up");
+        assert_eq!(output, "ok");
+
+        let token = manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.access_token, "at-up");
+        assert_eq!(token.scopes, vec!["read", "write"]);
+    }
+
+    #[tokio::test]
+    async fn callback_rejects_state_mismatch_and_iss_mismatch() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        install_oauth_discovery(&server, true);
+        server.route(
+            "/register",
+            json_doc(&serde_json::json!({"client_id": "cid-1"})),
+        );
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("connect blocks on authorization");
+        let auth_url = pending_auth_url(&manager).await.expect("pending url");
+        let state = query_params(&auth_url).get("state").unwrap().clone();
+
+        // A callback whose state matches no pending flow is rejected before
+        // any exchange (REQ-MCP-011)...
+        let err = manager
+            .complete_oauth_authorization("wrong-state", "code-1", Some(&server.base()))
+            .await
+            .expect_err("state mismatch must be rejected");
+        assert!(err.contains("state mismatch"), "got: {err}");
+
+        // ...as is a state-valid callback from the wrong issuer...
+        let err = manager
+            .complete_oauth_authorization(&state, "code-1", Some("https://evil.example"))
+            .await
+            .expect_err("iss mismatch must be rejected");
+        assert!(
+            err.contains("does not match the authorization server"),
+            "got: {err}"
+        );
+
+        // ...and one omitting iss when the server advertises it.
+        let err = manager
+            .complete_oauth_authorization(&state, "code-1", None)
+            .await
+            .expect_err("missing iss must be rejected");
+        assert!(err.contains("omitted the 'iss'"), "got: {err}");
+
+        // No code ever reached the token endpoint, and the flow is intact for
+        // a correct callback.
+        assert!(server.recorded_for_path("/token").is_empty());
+        assert!(pending_auth_url(&manager).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn authorization_server_without_pkce_support_is_refused() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        let base = server.base();
+        server.route(
+            "/.well-known/oauth-protected-resource/mcp",
+            json_doc(&serde_json::json!({
+                "authorization_servers": [base],
+            })),
+        );
+        // Metadata WITHOUT code_challenge_methods_supported.
+        server.route(
+            "/.well-known/oauth-authorization-server",
+            json_doc(&serde_json::json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "registration_endpoint": format!("{base}/register"),
+            })),
+        );
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        let err = connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("PKCE-less authorization server must be refused");
+        assert!(
+            err.contains("code_challenge_methods_supported"),
+            "got: {err}"
+        );
+
+        // Refused before the browser round trip: no flow, no registration.
+        assert!(pending_auth_url(&manager).await.is_none());
+        assert!(server.recorded_for_path("/register").is_empty());
+    }
+
+    #[tokio::test]
+    async fn preconfigured_client_seeds_registration_and_skips_dcr() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        // No registration endpoint advertised, and no /register route: DCR
+        // would fail loudly if attempted.
+        install_oauth_discovery(&server, false);
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        let auth = HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
+            auth_server: server.base(),
+            client_id: "pre-1".to_string(),
+            client_secret: None,
+            token_endpoint_auth_method: "none".to_string(),
+        }));
+        connect_http_managed(&manager, &server, auth)
+            .await
+            .err()
+            .expect("connect blocks on authorization");
+
+        let auth_url = pending_auth_url(&manager).await.expect("pending url");
+        let params = query_params(&auth_url);
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some("pre-1"),
+            "the pre-configured client must be reused (OAuthClientReused)"
+        );
+        assert!(server.recorded_for_path("/register").is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_url_change_discards_the_stored_token() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(
+                &server,
+                "at-1",
+                Some("rt-1"),
+                &["read"],
+                far_future(),
+            ))
+            .await
+            .unwrap();
+        let mcp = connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // Repoint the URL (same host, different path = different resource).
+        // The restart handshake runs unauthenticated -- and crucially the old
+        // token must not survive to be sent to the new endpoint
+        // (ReloadInvalidatesOAuth).
+        server.push_responses(vec![delete_ack()]);
+        server.push_responses(handshake_responses("sess-2"));
+        let repointed = McpServerConfig::Http {
+            url: format!("{}/v2", server.url),
+            headers: HashMap::from([("x-org".to_string(), "acme".to_string())]),
+            auth: HttpAuth::None,
+        };
+        let result = manager
+            .reload_from_configs(vec![("remote".to_string(), repointed)])
+            .await;
+
+        assert_eq!(result.restarted, vec!["remote"]);
+        assert!(
+            manager
+                .oauth
+                .store()
+                .token("remote")
+                .await
+                .unwrap()
+                .is_none(),
+            "the repointed server's token must be discarded"
+        );
+        let requests = server.requests.lock().unwrap();
+        let last_init = requests
+            .iter()
+            .rfind(|r| r.rpc_method() == "initialize")
+            .expect("restart initialize");
+        assert_eq!(
+            last_init.header("authorization"),
+            None,
+            "the old token must not reach the new endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_removed_server_deletes_its_token() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        manager
+            .oauth
+            .store()
+            .upsert_token(&stored_token(&server, "at-1", None, &[], far_future()))
+            .await
+            .unwrap();
+        let mcp = connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        server.push_responses(vec![delete_ack()]);
+        let result = manager.reload_from_configs(Vec::new()).await;
+
+        assert_eq!(result.removed, vec!["remote"]);
+        assert!(
+            manager
+                .oauth
+                .store()
+                .token("remote")
+                .await
+                .unwrap()
+                .is_none(),
+            "a removed server must not orphan its token (TokenImpliesOAuthServer)"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_with_changed_config_cancels_pending_auth_and_rotates_nonce() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        install_oauth_discovery(&server, true);
+        server.route(
+            "/register",
+            json_doc(&serde_json::json!({"client_id": "cid-1"})),
+        );
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("connect blocks on authorization");
+        let old_url = pending_auth_url(&manager).await.expect("pending url");
+        let old_state = query_params(&old_url).get("state").unwrap().clone();
+
+        // Reload with a changed config (extra header): the pending flow is
+        // cancelled; the restarted connect 401s again and surfaces a NEW flow
+        // (ReloadCancelsPendingAuth).
+        server.push_responses(vec![unauthorized(&server)]);
+        let changed = McpServerConfig::Http {
+            url: server.url.clone(),
+            headers: HashMap::from([("x-org".to_string(), "other".to_string())]),
+            auth: HttpAuth::None,
+        };
+        manager
+            .reload_from_configs(vec![("remote".to_string(), changed)])
+            .await;
+
+        let new_url = poll_until("re-surfaced auth url", || async {
+            pending_auth_url(&manager).await
+        })
+        .await;
+        let new_state = query_params(&new_url).get("state").unwrap().clone();
+        assert_ne!(old_state, new_state, "the nonce must rotate");
+
+        // A delayed callback from the pre-reload flow is rejected.
+        let err = manager
+            .complete_oauth_authorization(&old_state, "stale-code", Some(&server.base()))
+            .await
+            .expect_err("stale callback must be rejected");
+        assert!(err.contains("state mismatch"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn reload_with_unchanged_config_keeps_the_pending_flow() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        install_oauth_discovery(&server, true);
+        server.route(
+            "/register",
+            json_doc(&serde_json::json!({"client_id": "cid-1"})),
+        );
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        let config = http_config(&server.url, HttpAuth::None);
+        connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("connect blocks on authorization");
+        let old_url = pending_auth_url(&manager).await.expect("pending url");
+
+        // An unchanged reload must NOT rotate the nonce -- the operator may
+        // already have the URL open in a browser.
+        let result = manager
+            .reload_from_configs(vec![("remote".to_string(), config)])
+            .await;
+        assert_eq!(result.unchanged, vec!["remote"]);
+        assert_eq!(
+            pending_auth_url(&manager).await.as_deref(),
+            Some(old_url.as_str())
+        );
     }
 }

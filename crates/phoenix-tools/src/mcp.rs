@@ -337,7 +337,9 @@ impl HandshakeFailure {
                     message: format!("MCP server '{server_name}': unauthorized (HTTP 401)"),
                 }
             }
-            other => Self::Other(other.into_message(server_name)),
+            other @ (McpRequestError::Transport(_) | McpRequestError::Other(_)) => {
+                Self::Other(other.into_message(server_name))
+            }
         }
     }
 }
@@ -345,8 +347,7 @@ impl HandshakeFailure {
 impl std::fmt::Display for HandshakeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unauthorized { message, .. } => write!(f, "{message}"),
-            Self::Other(message) => write!(f, "{message}"),
+            Self::Unauthorized { message, .. } | Self::Other(message) => write!(f, "{message}"),
         }
     }
 }
@@ -791,7 +792,7 @@ impl McpServer {
 // ---------------------------------------------------------------------------
 
 /// The URL of an HTTP server whose 401s drive the OAuth flow: an explicit
-/// static credential opts out (StaticAuthRejected, REQ-MCP-008), stdio has no
+/// static credential opts out (`StaticAuthRejected`, REQ-MCP-008), stdio has no
 /// auth at all.
 fn oauth_resource_url(config: &McpServerConfig) -> Option<&str> {
     match config {
@@ -830,7 +831,7 @@ struct PendingAuthFlow {
     /// Held when a scope step-up removed a ready server from the map: keeps
     /// callers parked on the claim until the re-authorized server is
     /// republished, so the triggering call replays instead of failing
-    /// (deferred ReAuthCallRetry).
+    /// (deferred `ReAuthCallRetry`).
     claim: Option<ServerClaim>,
 }
 
@@ -1019,9 +1020,12 @@ async fn begin_oauth_flow(
     // Document → dynamic client registration. Phoenix hosts no client
     // metadata document, so the CIMD step resolves to nothing; logged so the
     // capability gap is visible.
-    let registration = match oauth_rt.store().registration(&metadata.issuer).await? {
-        Some(registration) => registration,
-        None => {
+    let registration = if let Some(registration) =
+        oauth_rt.store().registration(&metadata.issuer).await?
+    {
+        registration
+    } else {
+        {
             tracing::debug!(
                 server = %name,
                 auth_server = %metadata.issuer,
@@ -1110,10 +1114,10 @@ async fn begin_oauth_flow(
 /// An OAuth re-authorization condition on an authorized server, classified
 /// from a failed call (REQ-MCP-012).
 enum OAuthRecoveryKind {
-    /// 401: the access token expired or was revoked (TokenRefreshNeeded).
+    /// 401: the access token expired or was revoked (`TokenRefreshNeeded`).
     Refresh { www_authenticate: Option<String> },
     /// 403 with an explicit `error="insufficient_scope"` challenge
-    /// (InsufficientScopeStepUp). A plain 403 is not a step-up.
+    /// (`InsufficientScopeStepUp`). A plain 403 is not a step-up.
     StepUp { www_authenticate: String },
 }
 
@@ -1130,12 +1134,15 @@ fn oauth_recovery_kind(server: &McpServer, error: &McpRequestError) -> Option<OA
         }),
         TransportError::InsufficientScope {
             www_authenticate: Some(challenge),
-        } if oauth::is_insufficient_scope_challenge(challenge) => {
-            Some(OAuthRecoveryKind::StepUp {
-                www_authenticate: challenge.clone(),
-            })
-        }
-        _ => None,
+        } if oauth::is_insufficient_scope_challenge(challenge) => Some(OAuthRecoveryKind::StepUp {
+            www_authenticate: challenge.clone(),
+        }),
+        TransportError::InsufficientScope { .. }
+        | TransportError::SessionExpired
+        | TransportError::Disconnected(_)
+        | TransportError::Timeout(_)
+        | TransportError::Rpc { .. }
+        | TransportError::Protocol(_) => None,
     }
 }
 
@@ -1148,7 +1155,7 @@ enum RefreshServerOutcome {
     /// server); the token and server are kept.
     Transient(String),
     /// The grant was definitively rejected: the token was discarded and a
-    /// fresh authorization flow was surfaced (TokenRefreshFailed).
+    /// fresh authorization flow was surfaced (`TokenRefreshFailed`).
     Reprompt(String),
 }
 
@@ -1226,6 +1233,9 @@ impl McpClientManager {
     /// Swap in the persistent OAuth store (the default is in-memory). Called
     /// once at startup, before discovery, so stored tokens restore silently
     /// (REQ-MCP-012).
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic is already fatal).
     pub fn set_oauth_store(&self, store: Arc<dyn OAuthStore>) {
         *self.oauth.store.write().unwrap() = store;
     }
@@ -1234,12 +1244,15 @@ impl McpClientManager {
     /// callback route is served under. Flows refuse to start until this is
     /// known — an authorization URL with an unreachable redirect would strand
     /// the operator in the browser.
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic is already fatal).
     pub fn set_oauth_redirect_base(&self, base: String) {
         *self.oauth.redirect_base.lock().unwrap() = Some(base);
     }
 
     /// Drop a pending authorization flow, releasing any held claim and the
-    /// surfaced URL (PendingAuthorizationCancelled). Returns whether a flow
+    /// surfaced URL (`PendingAuthorizationCancelled`). Returns whether a flow
     /// existed.
     async fn cancel_pending_oauth_flow(&self, name: &str) -> bool {
         let flow = self.oauth.pending.lock().unwrap().remove(name);
@@ -1254,7 +1267,7 @@ impl McpClientManager {
 
     /// Discard a stored token the reloaded config can no longer use: the
     /// resource was repointed, or auth moved away from OAuth
-    /// (ReloadInvalidatesOAuth, REQ-MCP-012).
+    /// (`ReloadInvalidatesOAuth`, REQ-MCP-012).
     async fn invalidate_oauth_on_config_change(&self, name: &str, new_config: &McpServerConfig) {
         let token = match self.oauth.store().token(name).await {
             Ok(Some(token)) => token,
@@ -1288,6 +1301,10 @@ impl McpClientManager {
     /// fails the `iss` check, or the code exchange is rejected. The flow
     /// stays pending on exchange failure so the operator can retry from the
     /// same authorization URL.
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic is already fatal).
+    #[allow(clippy::too_many_lines)] // One ordered sequence: validate, exchange, persist, resolve, reconnect.
     pub async fn complete_oauth_authorization(
         self: &Arc<Self>,
         state_nonce: &str,
@@ -1350,7 +1367,10 @@ impl McpClientManager {
         let record = OAuthTokenRecord {
             server_name: name.clone(),
             resource: flow.resource.clone(),
-            scopes: response.scopes.clone().unwrap_or_else(|| flow.scopes.clone()),
+            scopes: response
+                .scopes
+                .clone()
+                .unwrap_or_else(|| flow.scopes.clone()),
             access_token: response.access_token,
             refresh_token: response.refresh_token,
             expires_at: response.expires_at,
@@ -1431,13 +1451,12 @@ impl McpClientManager {
 
     /// Handle an error redirect from the authorization server (the operator
     /// denied, or the server rejected the request): cancel the flow it
-    /// belongs to (OAuthFlowFailed). Returns the server name when a flow
+    /// belongs to (`OAuthFlowFailed`). Returns the server name when a flow
     /// matched.
-    pub async fn fail_oauth_authorization(
-        &self,
-        state_nonce: &str,
-        error: &str,
-    ) -> Option<String> {
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic is already fatal).
+    pub async fn fail_oauth_authorization(&self, state_nonce: &str, error: &str) -> Option<String> {
         let name = {
             let pending = self.oauth.pending.lock().unwrap();
             pending
@@ -1455,7 +1474,7 @@ impl McpClientManager {
     }
 
     /// Refresh the token of an authorized server whose call just 401'd
-    /// (TokenRefreshNeeded → TokenRefreshed / TokenRefreshFailed). On a
+    /// (`TokenRefreshNeeded` → `TokenRefreshed` / `TokenRefreshFailed`). On a
     /// definitive rejection the token is discarded and a fresh authorization
     /// flow is surfaced before returning `Reprompt`.
     async fn refresh_authorized_server(
@@ -1505,7 +1524,7 @@ impl McpClientManager {
         }
     }
 
-    /// TokenRefreshFailed: discard the dead token and surface a fresh
+    /// `TokenRefreshFailed`: discard the dead token and surface a fresh
     /// authorization flow so the operator re-authorizes (REQ-MCP-012).
     async fn reprompt_after_refresh_failure(
         &self,
@@ -1544,11 +1563,11 @@ impl McpClientManager {
         }
     }
 
-    /// InsufficientScopeStepUp: read the prior grants, discard the narrow
+    /// `InsufficientScopeStepUp`: read the prior grants, discard the narrow
     /// token, and surface a re-authorization requesting the union of prior
     /// and challenged scopes. The claim moves into the pending flow so the
     /// triggering call stays parked until the re-authorized server is
-    /// republished (REQ-MCP-012, deferred ReAuthCallRetry).
+    /// republished (REQ-MCP-012, deferred `ReAuthCallRetry`).
     async fn step_up_authorization(
         &self,
         mut server: Box<McpServer>,
@@ -1928,6 +1947,7 @@ impl McpClientManager {
     /// # Errors
     /// Returns a display string when the named server is unknown or the
     /// underlying `tools/call` fails.
+    #[allow(clippy::too_many_lines)] // One failure-classification lifecycle: attempt, classify, recover (transport or OAuth), retry.
     pub async fn call_tool(
         &self,
         server_name: &str,
@@ -1955,16 +1975,16 @@ impl McpClientManager {
                         claim: ServerClaim,
                     },
                     /// A 401 on an OAuth-authorized server: silently refresh
-                    /// the token, then retry (TokenRefreshNeeded).
+                    /// the token, then retry (`TokenRefreshNeeded`).
                     OAuthRefresh {
                         server: Box<McpServer>,
                         claim: ServerClaim,
                         www_authenticate: Option<String>,
                     },
-                    /// A 403 insufficient_scope on an OAuth-authorized
+                    /// A 403 `insufficient_scope` on an OAuth-authorized
                     /// server: re-authorize with the scope union, holding the
                     /// claim so this call replays once the operator acts
-                    /// (InsufficientScopeStepUp).
+                    /// (`InsufficientScopeStepUp`).
                     OAuthStepUp {
                         server: Box<McpServer>,
                         claim: ServerClaim,
@@ -2161,11 +2181,12 @@ impl McpClientManager {
     /// For OAuth-eligible HTTP servers this is also where the token
     /// lifecycle's connect-side rules live: a stored, resource-matched token
     /// is restored onto the very first `initialize` (REQ-MCP-012,
-    /// ServerDiscoveredWithStoredToken); a 401 against a refreshable token
+    /// `ServerDiscoveredWithStoredToken`); a 401 against a refreshable token
     /// takes the silent refresh path; and a 401 with no usable token starts
     /// the authorization flow, failing the connect with the surfaced URL
-    /// (OAuthRequired). A 401 against static config credentials stays a hard
-    /// failure (StaticAuthRejected, REQ-MCP-008).
+    /// (`OAuthRequired`). A 401 against static config credentials stays a hard
+    /// failure (`StaticAuthRejected`, REQ-MCP-008).
+    #[allow(clippy::too_many_lines)] // One ordered connect sequence: seed, restore, handshake, refresh-or-prompt.
     async fn connect_one(
         name: &str,
         entry: &McpServerConfig,
@@ -2256,8 +2277,7 @@ impl McpClientManager {
         let stored = oauth_rt.store().token(name).await.unwrap_or_default();
         if let Some(token) = stored {
             if token.refresh_token.is_some() {
-                match oauth_refresh(&oauth_rt, name, url, www_authenticate.as_deref(), &token)
-                    .await
+                match oauth_refresh(&oauth_rt, name, url, www_authenticate.as_deref(), &token).await
                 {
                     Ok(access_token) => {
                         *bearer.write().unwrap() = Some(access_token);
@@ -2501,7 +2521,11 @@ impl McpClientManager {
                         .to_string(),
                 })))
             }
-            _ => {
+            Value::Null
+            | Value::Bool(false)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Array(_) => {
                 tracing::debug!(server = %name, "'auth.oauth' must be true or an object");
                 None
             }
@@ -3239,6 +3263,61 @@ mod tests {
                 )]))),
             })
         );
+    }
+
+    #[test]
+    fn classify_entry_parses_oauth_shapes() {
+        // Bare OAuth: client identity acquired dynamically.
+        for oauth_value in [serde_json::json!(true), serde_json::json!({})] {
+            let cfg = serde_json::json!({
+                "type": "http",
+                "url": "https://example.com/mcp",
+                "auth": {"oauth": oauth_value},
+            });
+            assert_eq!(
+                McpClientManager::classify_config_entry("s", &cfg),
+                Some(McpServerConfig::Http {
+                    url: "https://example.com/mcp".to_string(),
+                    headers: HashMap::new(),
+                    auth: HttpAuth::OAuth(None),
+                }),
+                "auth.oauth = {oauth_value} must select OAuth"
+            );
+        }
+
+        // Pre-configured client for a DCR-less authorization server.
+        let preconfigured = serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "auth": {"oauth": {
+                "auth_server": "https://as.example.com",
+                "client_id": "cid-1",
+                "client_secret": "sec",
+                "token_endpoint_auth_method": "client_secret_post",
+            }},
+        });
+        assert_eq!(
+            McpClientManager::classify_config_entry("s", &preconfigured),
+            Some(McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: HashMap::new(),
+                auth: HttpAuth::OAuth(Some(PreconfiguredClient {
+                    auth_server: "https://as.example.com".to_string(),
+                    client_id: "cid-1".to_string(),
+                    client_secret: Some("sec".to_string()),
+                    token_endpoint_auth_method: "client_secret_post".to_string(),
+                })),
+            })
+        );
+
+        // Half a pre-configured client must skip the server, not silently
+        // fall back to DCR against a server the user said disables it.
+        let partial = serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "auth": {"oauth": {"client_id": "cid-1"}},
+        });
+        assert_eq!(McpClientManager::classify_config_entry("s", &partial), None);
     }
 
     #[test]
