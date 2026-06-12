@@ -204,6 +204,18 @@ impl HttpTransport {
 }
 
 fn insert_header(map: &mut HeaderMap, server: &str, key: &str, value: &str) -> Result<(), String> {
+    // The session and protocol-version headers are transport state; a
+    // config-supplied copy would ride alongside the real value (reqwest's
+    // `.header()` appends rather than replaces) and could bind a request to
+    // the wrong session. Reject loudly rather than silently dropping what
+    // the user wrote.
+    if key.eq_ignore_ascii_case("mcp-session-id")
+        || key.eq_ignore_ascii_case("mcp-protocol-version")
+    {
+        return Err(format!(
+            "MCP server '{server}': header '{key}' is transport-managed and cannot be set in config"
+        ));
+    }
     let header_name = HeaderName::from_bytes(key.as_bytes())
         .map_err(|_| format!("MCP server '{server}': invalid header name '{key}'"))?;
     let header_value = HeaderValue::from_str(value)
@@ -906,6 +918,96 @@ mod tests {
                 "tools/list",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn http_aborted_connect_deletes_the_created_session() {
+        // initialize succeeds and creates a session, but the first
+        // tools/list fails: the connect must end the session with a DELETE
+        // instead of leaking it server-side until expiry.
+        let server = TestServer::start(vec![
+            json_response(
+                1,
+                &serde_json::json!({"protocolVersion": "2025-03-26", "capabilities": {}}),
+                &[("mcp-session-id", "sess-1")],
+            ),
+            accepted(),
+            status_response(500, &[]),
+            status_response(200, &[]), // DELETE ack
+        ])
+        .await;
+
+        let err = connect_http(&server, HttpAuth::None)
+            .await
+            .err()
+            .expect("handshake must fail");
+        assert!(err.contains("HTTP 500"), "got: {err}");
+
+        let requests = server.requests.lock().unwrap();
+        let last = requests.last().expect("requests recorded");
+        assert_eq!(last.http_method(), "DELETE");
+        assert_eq!(last.header("mcp-session-id"), Some("sess-1"));
+    }
+
+    #[tokio::test]
+    async fn http_call_during_refresh_recovery_joins_the_claim() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        mcp.tools_changed
+            .store(true, std::sync::atomic::Ordering::Release);
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // The list_changed refresh 404s and escalates into a recovery whose
+        // re-initialize is held open for 300ms. A tool call STARTING at
+        // 100ms -- while the refresh holds the server out of the map -- must
+        // wait on the parked claim and succeed, not fail "not connected".
+        let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
+        server.push_responses(vec![status_response(404, &[])]);
+        let mut recovery = handshake_responses("sess-2");
+        recovery[0] = delayed(recovery[0].clone(), 300);
+        server.push_responses(recovery);
+        server.push_responses(vec![echo_id_response(&call_result)]);
+
+        let (defs, call) = tokio::join!(manager.tool_definitions(), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            manager
+                .call_tool("remote", "report", serde_json::json!({}))
+                .await
+        });
+
+        assert_eq!(defs.len(), 1, "refresh recovery must serve fresh defs");
+        assert_eq!(call.expect("call joins the refresh hold"), "ok");
+    }
+
+    #[test]
+    fn transport_managed_config_headers_are_rejected() {
+        let generic = HttpTransport::connect(
+            "s",
+            "http://127.0.0.1:1/mcp",
+            &HashMap::from([("Mcp-Session-Id".to_string(), "boo".to_string())]),
+            &HttpAuth::None,
+        );
+        let err = generic.err().expect("generic header must be rejected");
+        assert!(err.contains("transport-managed"), "got: {err}");
+
+        let auth = HttpTransport::connect(
+            "s",
+            "http://127.0.0.1:1/mcp",
+            &HashMap::new(),
+            &HttpAuth::Static(StaticCred::Headers(HashMap::from([(
+                "MCP-Protocol-Version".to_string(),
+                "boo".to_string(),
+            )]))),
+        );
+        let err = auth.err().expect("auth header must be rejected");
+        assert!(err.contains("transport-managed"), "got: {err}");
     }
 
     #[tokio::test]

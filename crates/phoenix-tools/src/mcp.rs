@@ -524,6 +524,30 @@ impl McpServer {
         }
     }
 
+    /// Run the post-connect handshake: `initialize` then the first
+    /// `tools/list`.
+    ///
+    /// On failure the transport is shut down before returning: `initialize`
+    /// may already have created a server-side HTTP session, and dropping the
+    /// transport without the session DELETE would leak it until expiry
+    /// (REQ-MCP-005).
+    async fn handshake(&mut self) -> Result<(), String> {
+        let result = match self.initialize().await {
+            Ok(()) => {
+                let name = self.name.clone();
+                self.list_tools()
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.into_message(&name))
+            }
+            Err(e) => Err(e),
+        };
+        if result.is_err() {
+            self.terminate().await;
+        }
+        result
+    }
+
     /// Rebuild the transport from the retained config and re-run the
     /// handshake (stdio: respawn the process; HTTP: fresh client + session).
     async fn reestablish(&mut self) -> Result<(), String> {
@@ -537,9 +561,7 @@ impl McpServer {
         .await?;
         self.tools_changed.store(false, Ordering::Release);
 
-        self.initialize().await?;
-        let name = self.name.clone();
-        self.list_tools().await.map_err(|e| e.into_message(&name))?;
+        self.handshake().await?;
 
         tracing::info!(
             server = %self.name,
@@ -567,11 +589,11 @@ pub struct McpClientManager {
     /// Server names whose tools should be excluded from conversations.
     /// The servers remain connected for instant re-enable.
     disabled_servers: RwLock<std::collections::HashSet<String>>,
-    /// Servers mid-recovery after a transport failure: the leading call
-    /// removes the server from `servers` and parks a watch sender here;
-    /// concurrent calls that find the server absent subscribe and wait for
-    /// the sender to drop (recovery finished) instead of failing with
-    /// "not connected".
+    /// Servers temporarily held out of `servers` (mid-recovery after a
+    /// transport failure, or mid tool-list refresh): the holder parks a
+    /// watch sender here via `ServerClaim`; calls that find the server
+    /// absent subscribe and wait for the sender to drop (work finished)
+    /// instead of failing with "not connected".
     recovering: std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<()>>>,
     /// Servers currently blocked on an OAuth flow: name → auth URL.
     /// Written by the stderr drain; cleared when the server connects or fails.
@@ -605,17 +627,31 @@ impl McpClientManager {
         self.recovering.lock().unwrap()
     }
 
-    /// If a recovery claim is parked for `server_name`, wait (bounded) for it
-    /// to be released. The claim drops only after the recovered server is
-    /// back in the map, so a follow-up lookup observes the outcome. The bound
-    /// covers a leading task dying without releasing its claim.
-    async fn await_recovery(&self, server_name: &str) {
+    /// Park a claim for `server_name`. Must be called while holding the
+    /// `servers` write lock that removes the entry, so a concurrent caller
+    /// can never observe the server absent without also seeing the claim.
+    fn claim_server(&self, server_name: &str) -> ServerClaim<'_> {
+        let (sender, _) = tokio::sync::watch::channel(());
+        self.recovering_map()
+            .insert(server_name.to_string(), sender);
+        ServerClaim {
+            manager: self,
+            name: server_name.to_string(),
+        }
+    }
+
+    /// If a claim is parked for `server_name`, wait for it to be released.
+    /// The claim is a drop guard released on every holder exit path and
+    /// every stage of re-establish is itself deadline-bounded, so this wait
+    /// cannot be stranded; a follow-up map lookup observes the outcome.
+    async fn await_claim_release(&self, server_name: &str) {
         let receiver = self
             .recovering_map()
             .get(server_name)
             .map(tokio::sync::watch::Sender::subscribe);
         if let Some(mut receiver) = receiver {
-            let _ = tokio::time::timeout(CONNECT_TIMEOUT, receiver.changed()).await;
+            // changed() resolves (with Err) when the sender drops.
+            let _ = receiver.changed().await;
         }
     }
 
@@ -762,17 +798,22 @@ impl McpClientManager {
         // operations during list_tools() I/O (up to 30s timeout per server).
         // Same extract-refresh-reinsert pattern as call_tool() respawn.
         for name in needs_refresh {
-            let server = {
+            let extracted = {
                 let mut servers = self.servers.write().await;
                 match servers.get_mut(&name) {
                     Some(s) if s.tools_changed.swap(false, Ordering::AcqRel) => {
-                        servers.remove(&name)
+                        // Claim the hold under the same lock that removes the
+                        // entry, so a tool call landing mid-refresh (or
+                        // mid-refresh-recovery) waits for the outcome instead
+                        // of failing with "not connected".
+                        let claim = self.claim_server(&name);
+                        servers.remove(&name).map(|server| (server, claim))
                     }
                     _ => None,
                 }
             };
             // Lock dropped -- list_tools() runs with no lock held.
-            if let Some(mut server) = server {
+            if let Some((mut server, claim)) = extracted {
                 let keep = match server.list_tools().await {
                     Ok(tools) => {
                         tracing::info!(
@@ -817,10 +858,12 @@ impl McpClientManager {
                 // Reinsert under brief write lock -- unless re-establish
                 // failed, in which case the transport is torn down and stale
                 // definitions must not be advertised from it; a reload
-                // reconnects it (REQ-MCP-015).
+                // reconnects it (REQ-MCP-015). The claim is released after,
+                // so waiters observe the outcome.
                 if keep {
                     self.servers.write().await.insert(name, server);
                 }
+                drop(claim);
             }
         }
 
@@ -871,7 +914,7 @@ impl McpClientManager {
                 // server is genuinely gone (or recovery just finished -- the
                 // re-lookup settles which).
                 drop(servers);
-                self.await_recovery(server_name).await;
+                self.await_claim_release(server_name).await;
                 let servers = self.servers.read().await;
                 let server = servers
                     .get(server_name)
@@ -885,10 +928,11 @@ impl McpClientManager {
             Err(e) => {
                 // One concurrent failing call leads the recovery; the others
                 // follow by waiting for it to finish, then retrying.
-                enum Recovery {
+                enum Recovery<'a> {
                     Lead {
                         server: Box<McpServer>,
                         action: &'static str,
+                        claim: ServerClaim<'a>,
                     },
                     Follow(tokio::sync::watch::Receiver<()>),
                 }
@@ -919,12 +963,10 @@ impl McpClientManager {
                         // Claim the recovery while still holding the servers
                         // lock, so a concurrent failing call cannot observe
                         // the server absent without also seeing the claim.
-                        let (sender, _) = tokio::sync::watch::channel(());
-                        self.recovering_map()
-                            .insert(server_name.to_string(), sender);
                         Recovery::Lead {
                             server: Box::new(server),
                             action,
+                            claim: self.claim_server(server_name),
                         }
                     } else {
                         // Absent with a claim parked: a concurrent call is
@@ -944,9 +986,14 @@ impl McpClientManager {
 
                 match recovery {
                     // Re-establish outside the lock so other servers aren't
-                    // blocked. The claim is released (waking followers) only
-                    // after the server is back in the map.
-                    Recovery::Lead { mut server, action } => {
+                    // blocked. The claim guard is dropped (waking followers)
+                    // only after the server is back in the map -- and on the
+                    // error path, only after the drop decision is final.
+                    Recovery::Lead {
+                        mut server,
+                        action,
+                        claim,
+                    } => {
                         let result = server.reestablish().await;
                         if result.is_ok() {
                             self.servers
@@ -954,18 +1001,20 @@ impl McpClientManager {
                                 .await
                                 .insert(server_name.to_string(), *server);
                         }
-                        self.recovering_map().remove(server_name);
+                        drop(claim);
                         if let Err(reestablish_err) = result {
                             return Err(format!(
                                 "MCP server '{server_name}' connection lost and {action} failed: {reestablish_err}"
                             ));
                         }
                     }
-                    // The leader's reestablish is bounded by the connect
-                    // timeouts; the wait here is bounded too in case the
-                    // leading task dies without releasing the claim.
+                    // Wait for the leader's claim guard to drop. Unbounded by
+                    // design: the guard releases on every leader exit path
+                    // (including unwind), and each re-establish stage is
+                    // itself deadline-bounded, so a slow-but-successful
+                    // recovery is never misreported as a failure here.
                     Recovery::Follow(mut receiver) => {
-                        let _ = tokio::time::timeout(CONNECT_TIMEOUT, receiver.changed()).await;
+                        let _ = receiver.changed().await;
                     }
                 }
             }
@@ -983,18 +1032,16 @@ impl McpClientManager {
             .map_err(|e| e.into_message(server_name))
     }
 
-    /// Connect and initialize a single MCP server.
+    /// Connect and initialize a single MCP server. A failed handshake shuts
+    /// the transport down (ending any session `initialize` created) before
+    /// the error is returned.
     async fn connect_one(
         name: &str,
         entry: &McpServerConfig,
         pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<McpServer, String> {
         let mut server = McpServer::connect(name, entry.clone(), pending_oauth_urls).await?;
-        server.initialize().await?;
-        server
-            .list_tools()
-            .await
-            .map_err(|e| e.into_message(name))?;
+        server.handshake().await?;
         Ok(server)
     }
 
@@ -1342,6 +1389,22 @@ impl McpClientManager {
             tracing::debug!(server = %name, "MCP server stopped");
         }
         servers.clear();
+    }
+}
+
+/// An exclusive hold on a server temporarily out of the `servers` map
+/// (re-establishing after a transport failure, or refreshing its tool list).
+/// Dropping it releases the claim and wakes waiters on every exit path --
+/// success, error, panic unwind, or a dropped future -- so a dead holder can
+/// never strand the callers waiting on it.
+struct ServerClaim<'a> {
+    manager: &'a McpClientManager,
+    name: String,
+}
+
+impl Drop for ServerClaim<'_> {
+    fn drop(&mut self) {
+        self.manager.recovering_map().remove(&self.name);
     }
 }
 
