@@ -3951,9 +3951,11 @@ async fn read_root_allowlist(state: &AppState, cwd: Option<&str>) -> Vec<PathBuf
     if let Some(cwd) = cwd {
         let cwd = PathBuf::from(cwd);
         // The canonical cwd anchors containment. A widened subtree is honored
-        // only if it resolves to a path INSIDE the canonical cwd — otherwise a
-        // project whose task/skill dir is a symlink to `/` or `/etc` would
-        // canonicalize to that target and re-open arbitrary host-file read.
+        // only if it resolves to a STRICT descendant of the canonical cwd —
+        // otherwise a project whose task/skill dir is a symlink to `/` or `/etc`
+        // would re-open arbitrary host-file read, and a symlink to the cwd itself
+        // (`tasks -> .`) would collapse the allowed root to the whole project
+        // (admitting e.g. `<cwd>/.env`), which this widening must never do.
         let Ok(canonical_cwd) = fs::canonicalize(&cwd) else {
             return roots;
         };
@@ -3966,7 +3968,7 @@ async fn read_root_allowlist(state: &AppState, cwd: Option<&str>) -> Vec<PathBuf
             cwd.join(".agents").join("skills"),
         ] {
             if let Ok(dir) = fs::canonicalize(subtree) {
-                if dir.starts_with(&canonical_cwd) {
+                if dir != canonical_cwd && dir.starts_with(&canonical_cwd) {
                     roots.push(dir);
                 }
             }
@@ -8021,6 +8023,33 @@ mod file_read_tests {
             ReadFileResponse::Text { content, .. } => assert_eq!(content, "task body\n"),
             other @ ReadFileResponse::Image { .. } => panic!("expected text, got {other:?}"),
         }
+    }
+
+    /// Regression: a task/skill subtree that is a symlink to the cwd ITSELF
+    /// (`tasks -> .`) must NOT collapse the allowed root to the whole project —
+    /// otherwise `read_file?cwd=<project>&path=<project>/.env` would be admitted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_cwd_subtree_symlinked_to_cwd_itself() {
+        let conv_root = tempfile::tempdir().expect("conv root");
+        let project = tempfile::tempdir().expect("project");
+        // `tasks` resolves to the project root itself.
+        std::os::unix::fs::symlink(project.path(), project.path().join("tasks"))
+            .expect("symlink tasks -> .");
+        let secret = project.path().join(".env");
+        std::fs::write(&secret, "SECRET=1\n").expect("write .env");
+
+        let state = state_with_root(conv_root.path()).await;
+        let err = read_file(
+            State(state),
+            Query(PathQuery {
+                path: secret.to_string_lossy().to_string(),
+                cwd: Some(project.path().to_string_lossy().to_string()),
+            }),
+        )
+        .await
+        .expect_err("a subtree symlinked to the cwd itself must not widen to the whole project");
+        assert!(matches!(err, AppError::NotFound(_)));
     }
 
     /// Providing a `cwd` must NOT turn `read_file` into an arbitrary host-file
