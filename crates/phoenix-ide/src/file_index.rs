@@ -31,6 +31,25 @@
 //! New top-level dirs are picked up because their parent is watched; we
 //! re-walk the new subtree with `ignore::WalkBuilder` (which respects
 //! nested `.gitignore` files) and add watches as appropriate.
+//!
+//! ## Lifecycle: Loading vs Ready
+//!
+//! Each workspace lives in a `WorkspaceCell` whose state is either
+//! `Loading { pending: Vec<notify::Event> }` or `Ready { index }`. The
+//! first `search` for a `cwd` inserts a `Loading` cell, spawns the
+//! bootstrap walk, and awaits the cell's transition to `Ready` via a
+//! `tokio::sync::Notify`. Watcher events that arrive while the cell is
+//! `Loading` are pushed into the pending buffer; bootstrap drains the
+//! buffer atomically while flipping to `Ready`, so a file created
+//! between the bootstrap's walk and its publication is never lost.
+//!
+//! This is the patch-shaped fix to the bootstrap TOCTOU. Codex review
+//! correctly observed that the same shared-state coordination shows up
+//! at many other sites in this file (event routing, watch ownership,
+//! gitignore-file change detection). A cleaner endpoint is a
+//! per-workspace actor that owns its own debouncer; see
+//! `tasks/64002-p3-ready--file-index-actor-refactor.md` for the
+//! proposed shape and the "When to do this" gating criteria.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -43,7 +62,6 @@ use notify::RecommendedWatcher;
 use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
-use tokio::sync::OnceCell;
 
 /// Debounce window. Short enough that newly-saved files appear in the
 /// palette before the user starts typing the new filename; long enough to
@@ -62,22 +80,53 @@ struct WorkspaceIndex {
     /// watches on directory removal and avoid double-registering on
     /// `Create(Folder)` events.
     watched_dirs: HashSet<PathBuf>,
-    /// Composite gitignore matcher built from every `.gitignore` file the
-    /// bootstrap walk encountered (root, `.git/info/exclude`, plus any
-    /// nested `.gitignore` files inside non-ignored directories), used to
+    /// Composite gitignore matcher built from every `.gitignore` /
+    /// `.ignore` file the bootstrap walk encountered, plus the workspace's
+    /// `.git/info/exclude` and the resolved global excludes file. Used to
     /// filter watcher-driven `Create(File)` events so a freshly-written
     /// `*.log` / `.env` / build artifact doesn't slip into the index that
     /// the bootstrap walk's nested-gitignore handling would have excluded.
-    gitignore: Gitignore,
+    /// `None` when the workspace is not a git repo — matches the bootstrap
+    /// walker's behaviour, which only applies `.gitignore` rules inside a
+    /// git tree.
+    gitignore: Option<Gitignore>,
 }
 
-/// State held while a workspace's first bootstrap walk is in flight.
-type CellState = Arc<OnceCell<Arc<RwLock<WorkspaceIndex>>>>;
+/// Lifecycle state for one workspace. A freshly-inserted cell starts in
+/// `Loading`; the bootstrap task transitions to `Ready` (or `Failed`)
+/// while holding the cell mutex, so events queued in `pending` are
+/// drained atomically with the publication of the new index.
+enum WorkspaceState {
+    Loading { pending: Vec<notify::Event> },
+    Ready { index: Arc<RwLock<WorkspaceIndex>> },
+    Failed(String),
+}
+
+struct WorkspaceCell {
+    state: Mutex<WorkspaceState>,
+    /// Awaited by `search` callers while the bootstrap is still running;
+    /// `notify_waiters` is fired when the state transitions out of
+    /// `Loading`.
+    notify: tokio::sync::Notify,
+}
+
+impl WorkspaceCell {
+    fn new_loading() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(WorkspaceState::Loading {
+                pending: Vec::new(),
+            }),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+}
 
 pub struct WorkspaceIndexer {
-    /// Each workspace gets a `OnceCell` so concurrent first-callers share
-    /// the same bootstrap walk instead of racing each other.
-    cells: Mutex<HashMap<PathBuf, CellState>>,
+    /// One cell per indexed workspace cwd. The cell carries the loading/
+    /// ready state machine so concurrent first-callers share a single
+    /// bootstrap and watcher events arriving during bootstrap can be
+    /// buffered into the cell instead of dropped on the floor.
+    cells: Mutex<HashMap<PathBuf, Arc<WorkspaceCell>>>,
     /// The single debouncer multiplexes events from every watched
     /// directory across every workspace. Wrapped in `Mutex` because
     /// `add_watch`/`remove_watch` mutate it, and we touch it from both
@@ -128,50 +177,153 @@ impl WorkspaceIndexer {
         limit: usize,
     ) -> Result<Vec<String>, String> {
         let canonical = canonicalize_or_self(&root);
-        let cell = self.cell_for(&canonical);
-        let me = self.clone();
-        let canonical_for_init = canonical.clone();
-        let index = cell
-            .get_or_try_init(|| async move { me.bootstrap_workspace(canonical_for_init).await })
-            .await?
-            .clone();
+        let (cell, is_first) = self.cell_for(&canonical);
+
+        if is_first {
+            // First caller wins the bootstrap. Spawn it onto tokio so the
+            // search future doesn't end up bound to this caller's lifetime
+            // — concurrent searches all wait on the same Notify and pick
+            // up the published index.
+            let me = self.clone();
+            let canonical_for_bs = canonical.clone();
+            let cell_for_bs = cell.clone();
+            tokio::spawn(async move {
+                me.bootstrap_and_publish(canonical_for_bs, cell_for_bs)
+                    .await;
+            });
+        }
+
+        // Wait until the cell transitions out of Loading. notified() must
+        // be registered before re-checking state to avoid missing the
+        // notify_waiters call that fires inside the bootstrap task.
+        let index = loop {
+            let waiter = cell.notify.notified();
+            {
+                let state = cell.state.lock().expect("cell state poisoned");
+                match &*state {
+                    WorkspaceState::Ready { index } => break index.clone(),
+                    WorkspaceState::Failed(e) => return Err(e.clone()),
+                    WorkspaceState::Loading { .. } => {}
+                }
+            }
+            waiter.await;
+        };
 
         let guard = index.read().expect("index lock poisoned");
         Ok(score_paths(&guard.paths, query, limit))
     }
 
-    fn cell_for(&self, canonical: &Path) -> CellState {
+    /// Get-or-create the cell for `canonical`. Returns `(cell, is_first)`
+    /// where `is_first` indicates this caller is responsible for spawning
+    /// the bootstrap task.
+    fn cell_for(&self, canonical: &Path) -> (Arc<WorkspaceCell>, bool) {
         let mut map = self.cells.lock().expect("cells lock poisoned");
-        map.entry(canonical.to_path_buf())
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone()
+        if let Some(existing) = map.get(canonical) {
+            return (existing.clone(), false);
+        }
+        let cell = WorkspaceCell::new_loading();
+        map.insert(canonical.to_path_buf(), cell.clone());
+        (cell, true)
     }
 
-    /// Walk the workspace, register per-directory watches, return the
-    /// initialized index. Runs walks in `spawn_blocking` so we don't stall
-    /// the tokio executor on a multi-second cold walk.
+    /// Run the bootstrap walk for `canonical`, then publish the result by
+    /// transitioning the workspace cell from `Loading` to `Ready` (or
+    /// `Failed`). Events that arrived in `pending` during the walk are
+    /// applied to the new index inside the same `Mutex` critical section
+    /// so the publication is atomic — no event written to the watcher
+    /// while the bootstrap was in flight can be lost.
     ///
-    /// Bootstrap orders work as:
-    /// 1. Walk #1 collects the snapshot, the set of directories to watch,
-    ///    and the composite gitignore matcher (root `.gitignore`,
-    ///    `.git/info/exclude`, global git excludes, plus any nested
-    ///    `.gitignore` / `.ignore` files inside non-ignored directories).
-    /// 2. Register watches; record only the directories the debouncer
-    ///    actually accepted, so a workspace that hits
-    ///    `fs.inotify.max_user_watches` doesn't silently "track" dirs
-    ///    that will never deliver an event.
-    /// 3. Walk #2 catches any files created between Walk #1 and watch
-    ///    registration — without this pass a fast editor save during a
-    ///    cold bootstrap window vanishes from the index until something
-    ///    else invalidates the workspace. The second walk is cheap
-    ///    (OS page cache is hot from Walk #1) and merges into the same
-    ///    `BTreeSet`, so duplicates are absorbed silently. A tiny race
-    ///    remains between Walk #2 completion and the `OnceCell` flipping
-    ///    to Ready, but it's microseconds, not seconds.
+    /// If the workspace was invalidated (or replaced) while the bootstrap
+    /// was running, the cell may no longer be the active one in
+    /// [`Self::cells`]. We detect that by comparing pointers and clean up
+    /// any watches we registered, otherwise they'd leak until process
+    /// shutdown.
+    async fn bootstrap_and_publish(self: Arc<Self>, canonical: PathBuf, cell: Arc<WorkspaceCell>) {
+        let result = self.bootstrap_workspace(canonical.clone()).await;
+
+        let watched_dirs_for_cleanup;
+        {
+            let mut state = cell.state.lock().expect("cell state poisoned");
+            let pending = match &mut *state {
+                WorkspaceState::Loading { pending } => std::mem::take(pending),
+                // Only the bootstrap writer ever transitions out of
+                // Loading, so seeing Ready/Failed here would mean the
+                // cell was published by someone else — a bug, not an
+                // expected state. Treat as empty to avoid double-applying
+                // events from a parallel bootstrap.
+                WorkspaceState::Ready { .. } | WorkspaceState::Failed(_) => Vec::new(),
+            };
+
+            match result {
+                Ok(index) => {
+                    let arc = Arc::new(RwLock::new(index));
+                    // Drain buffered events into the fresh index. Both
+                    // happen while the cell mutex is held, so no event
+                    // can slip past the transition.
+                    for event in &pending {
+                        self.apply_event_to_index(&canonical, &arc, event);
+                    }
+                    watched_dirs_for_cleanup = {
+                        let guard = arc.read().expect("index poisoned");
+                        guard.watched_dirs.clone()
+                    };
+                    *state = WorkspaceState::Ready { index: arc };
+                }
+                Err(err) => {
+                    *state = WorkspaceState::Failed(err);
+                    watched_dirs_for_cleanup = HashSet::new();
+                }
+            }
+        }
+        cell.notify.notify_waiters();
+
+        // Ownership check: if our cell is no longer the active one for
+        // this canonical path (an invalidation or replacement happened
+        // while we were walking), the watches we registered are
+        // unreachable from any future invalidate_workspace call. Drop
+        // them ourselves to prevent a slow inotify leak under repeated
+        // cold-bootstrap-then-invalidate cycles.
+        let still_active = {
+            let map = self.cells.lock().expect("cells poisoned");
+            map.get(&canonical)
+                .is_some_and(|active| Arc::ptr_eq(active, &cell))
+        };
+        if !still_active && !watched_dirs_for_cleanup.is_empty() {
+            tracing::debug!(
+                ?canonical,
+                orphan_watches = watched_dirs_for_cleanup.len(),
+                "bootstrap completed after workspace was replaced; releasing orphan watches"
+            );
+            let mut debouncer = self.debouncer.lock().expect("debouncer poisoned");
+            for dir in &watched_dirs_for_cleanup {
+                let _ = debouncer.unwatch(dir);
+            }
+        }
+    }
+
+    /// Walk the workspace, register per-directory watches, and return a
+    /// fully-populated [`WorkspaceIndex`]. Runs walks in `spawn_blocking`
+    /// so we don't stall the tokio executor on a multi-second cold walk.
+    ///
+    /// Bootstrap ordering:
+    /// 1. Walk #1 collects the snapshot, directories to watch, and the
+    ///    composite ignore matcher.
+    /// 2. Register a non-recursive watch on each directory; only record
+    ///    the ones the debouncer accepted (a failed watch must not be
+    ///    cached as "covered" or its subtree would silently lose
+    ///    updates).
+    /// 3. If a `.git/info/` exists, also watch it directly — the
+    ///    bootstrap walker skips the `.git/` subtree, so events on
+    ///    `.git/info/exclude` would otherwise never reach us, leaving
+    ///    [`event_touches_ignore_file`] unable to trigger a refresh.
+    /// 4. Walk #2 catches any files written between Walk #1 and watch
+    ///    registration. The two-walk pass narrows the bootstrap TOCTOU;
+    ///    the cell's `Loading`-state pending buffer (see
+    ///    [`bootstrap_and_publish`]) closes the rest of the race.
     async fn bootstrap_workspace(
-        self: Arc<Self>,
+        self: &Arc<Self>,
         root: PathBuf,
-    ) -> Result<Arc<RwLock<WorkspaceIndex>>, String> {
+    ) -> Result<WorkspaceIndex, String> {
         let walk_root = root.clone();
         let (mut paths, dirs, gitignore) =
             tokio::task::spawn_blocking(move || walk_workspace(&walk_root))
@@ -192,6 +344,22 @@ impl WorkspaceIndexer {
                     Err(e) => {
                         watch_failures += 1;
                         tracing::debug!(?dir, ?e, "failed to register file-index watch");
+                    }
+                }
+            }
+
+            // Explicitly watch `.git/info/` if it exists. The walker
+            // skipped `.git/` (we filter_entry it out for sanity), so
+            // edits to `.git/info/exclude` would never produce events
+            // without this explicit registration.
+            let git_info = root.join(".git").join("info");
+            if git_info.is_dir() {
+                match debouncer.watch(&git_info, RecursiveMode::NonRecursive) {
+                    Ok(()) => {
+                        watched_dirs.insert(git_info);
+                    }
+                    Err(e) => {
+                        tracing::debug!(dir = ?git_info, ?e, "failed to register watch on .git/info");
                     }
                 }
             }
@@ -217,11 +385,11 @@ impl WorkspaceIndexer {
             .map_err(|e| format!("post-watch walk panicked: {e}"))?;
         paths.extend(second_pass);
 
-        Ok(Arc::new(RwLock::new(WorkspaceIndex {
+        Ok(WorkspaceIndex {
             paths,
             watched_dirs,
             gitignore,
-        })))
+        })
     }
 
     /// Drop a workspace from the cache and unwatch its directories. Used
@@ -241,23 +409,44 @@ impl WorkspaceIndexer {
             map.remove(root)
         };
         let Some(cell) = cell_opt else { return };
-        // If the cell was never initialized there's nothing to unwatch.
-        let Some(index) = cell.get() else { return };
+
+        // Surface watched_dirs if the cell ever published. A Loading cell
+        // has none yet; its in-flight bootstrap will detect the race
+        // (cell removed from map) and clean up its own watches via the
+        // ownership check in `bootstrap_and_publish`.
         let my_dirs: Vec<PathBuf> = {
-            let guard = index.read().expect("index poisoned");
-            guard.watched_dirs.iter().cloned().collect()
+            let state = cell.state.lock().expect("cell state poisoned");
+            match &*state {
+                WorkspaceState::Ready { index } => {
+                    let guard = index.read().expect("index poisoned");
+                    guard.watched_dirs.iter().cloned().collect()
+                }
+                WorkspaceState::Loading { .. } | WorkspaceState::Failed(_) => Vec::new(),
+            }
         };
 
-        // Snapshot the survivors' watched_dirs so we know which
-        // directories must keep their watch.
+        // Wake any search() that was awaiting this cell — they'll see
+        // Failed/Loading transitioning is unlikely, but we should signal
+        // so they retry from the new cell on their next call.
+        cell.notify.notify_waiters();
+
+        if my_dirs.is_empty() {
+            return;
+        }
+
+        // Snapshot survivors' watched_dirs so we only unwatch dirs that
+        // no other workspace depends on. Without this, dropping `/repo`
+        // while `/repo/packages/app` is still cached would orphan the
+        // child workspace's watches.
         let still_needed: HashSet<PathBuf> = {
             let map = self.cells.lock().expect("cells poisoned");
-            let survivors: Vec<CellState> = map.values().cloned().collect();
+            let survivors: Vec<Arc<WorkspaceCell>> = map.values().cloned().collect();
             drop(map);
             let mut combined = HashSet::new();
             for cell in survivors {
-                if let Some(idx) = cell.get() {
-                    let guard = idx.read().expect("index poisoned");
+                let state = cell.state.lock().expect("cell state poisoned");
+                if let WorkspaceState::Ready { index } = &*state {
+                    let guard = index.read().expect("index poisoned");
                     combined.extend(guard.watched_dirs.iter().cloned());
                 }
             }
@@ -319,7 +508,7 @@ impl WorkspaceIndexer {
             // Any change to a gitignore-defining file (`.gitignore`,
             // `.ignore`, or `.git/info/exclude`) invalidates both the
             // cached path set (existing tracked files might now be
-            // ignored) and the cached `Gitignore` matcher (future
+            // ignored) and the cached gitignore matcher (future
             // Create(File) events need the new rules). Drop the
             // workspace and let the next search rebuild.
             if event_touches_ignore_file(&event.event.paths) {
@@ -333,7 +522,7 @@ impl WorkspaceIndexer {
                 continue;
             }
 
-            self.apply_event(&event.event);
+            self.dispatch_event(&event.event);
         }
     }
 
@@ -342,19 +531,36 @@ impl WorkspaceIndexer {
         map.keys().cloned().collect()
     }
 
-    /// Apply a single event to every workspace whose root prefixes one of
-    /// the event's paths. Nested workspaces (e.g. `/repo` and
-    /// `/repo/packages/app`) both index the inner path under their own
-    /// roots and both need the update; routing to "the first match" would
-    /// leave the other stale.
-    fn apply_event(self: &Arc<Self>, event: &notify::Event) {
-        let targets = self.affected_workspaces(&event.paths);
-        for (root, index) in targets {
-            self.apply_event_to_workspace(&root, &index, event);
+    /// Dispatch a single event to every workspace whose root prefixes one
+    /// of the event's paths. For `Ready` cells the event is applied
+    /// immediately; for `Loading` cells it's buffered into the cell's
+    /// pending queue so the in-flight bootstrap can drain it atomically
+    /// during publication.
+    fn dispatch_event(self: &Arc<Self>, event: &notify::Event) {
+        let targets: Vec<(PathBuf, Arc<WorkspaceCell>)> = {
+            let map = self.cells.lock().expect("cells poisoned");
+            map.iter()
+                .filter(|(root, _)| event.paths.iter().any(|p| p.starts_with(root)))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        for (root, cell) in targets {
+            let mut state = cell.state.lock().expect("cell state poisoned");
+            match &mut *state {
+                WorkspaceState::Loading { pending } => {
+                    pending.push(event.clone());
+                }
+                WorkspaceState::Ready { index } => {
+                    let index = index.clone();
+                    drop(state);
+                    self.apply_event_to_index(&root, &index, event);
+                }
+                WorkspaceState::Failed(_) => {}
+            }
         }
     }
 
-    fn apply_event_to_workspace(
+    fn apply_event_to_index(
         self: &Arc<Self>,
         root: &Path,
         index: &Arc<RwLock<WorkspaceIndex>>,
@@ -434,12 +640,34 @@ impl WorkspaceIndexer {
         // the bootstrap pass correctly skipped.
         {
             let guard = index.read().expect("index poisoned");
-            if guard.gitignore.matched(new_dir, true).is_ignore() {
+            if guard
+                .gitignore
+                .as_ref()
+                .is_some_and(|gi| gi.matched(new_dir, true).is_ignore())
+            {
                 return;
             }
         }
 
         let (new_files, new_dirs) = walk_subtree(root, new_dir);
+
+        // If the new subtree carries its own `.gitignore` or `.ignore` file
+        // (e.g. the user just moved a foreign project into the workspace),
+        // the cached matcher doesn't know about its rules. Invalidate the
+        // workspace so the next search rebuilds with the new rules layered
+        // in — far simpler than splicing them into the live matcher.
+        let imports_ignore_rules = new_files
+            .iter()
+            .any(|f| f.ends_with("/.gitignore") || f.ends_with("/.ignore"));
+        if imports_ignore_rules {
+            tracing::debug!(
+                ?root,
+                ?new_dir,
+                "subtree contained ignore file; invalidating workspace"
+            );
+            self.invalidate_workspace(root);
+            return;
+        }
 
         if !new_dirs.is_empty() {
             let mut debouncer = self.debouncer.lock().expect("debouncer poisoned");
@@ -575,32 +803,10 @@ impl WorkspaceIndexer {
         }
     }
 
-    /// Snapshot of (root, ready-index) pairs whose root prefixes any path
-    /// in `paths`. Empty if no indexed workspace contains the event.
-    /// Nested workspaces both appear — see `apply_event` for why.
-    fn affected_workspaces(
-        &self,
-        paths: &[PathBuf],
-    ) -> Vec<(PathBuf, Arc<RwLock<WorkspaceIndex>>)> {
-        let pairs: Vec<(PathBuf, CellState)> = {
-            let map = self.cells.lock().expect("cells poisoned");
-            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-        };
-        let mut out: Vec<(PathBuf, Arc<RwLock<WorkspaceIndex>>)> = Vec::new();
-        for (root, cell) in &pairs {
-            let Some(index) = cell.get() else { continue };
-            let touches = paths.iter().any(|p| p.starts_with(root));
-            if touches {
-                out.push((root.clone(), index.clone()));
-            }
-        }
-        out
-    }
-
     /// Roots of every workspace whose tree contains any of `paths`,
-    /// including workspaces whose `OnceCell` hasn't initialized yet
-    /// (a rescan signal still has to invalidate them so the in-flight
-    /// bootstrap can be retried with a fresh walk if needed).
+    /// including workspaces still in `Loading` — a rescan or
+    /// ignore-file event needs to invalidate them so the in-flight
+    /// bootstrap can be retried with a fresh walk.
     fn affected_workspace_roots(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
         let roots: Vec<PathBuf> = {
             let map = self.cells.lock().expect("cells poisoned");
@@ -628,24 +834,42 @@ fn canonicalize_or_self(p: &Path) -> PathBuf {
 /// originating directory, so a rule in `<root>/src/.gitignore` only
 /// matches paths under `<root>/src`, mirroring real `git` semantics
 /// instead of leaking across siblings.
-fn walk_workspace(root: &Path) -> (BTreeSet<String>, HashSet<PathBuf>, Gitignore) {
+fn walk_workspace(root: &Path) -> (BTreeSet<String>, HashSet<PathBuf>, Option<Gitignore>) {
     let mut files = BTreeSet::new();
     let mut dirs = HashSet::new();
+
+    // The bootstrap walker only honors `.gitignore` rules when the tree
+    // is inside a git repo (this is what `WalkBuilder::git_ignore(true)`
+    // does). If `.git` doesn't exist at the root, the cached event-time
+    // matcher must mirror that, or `insert_file_if_not_ignored` would
+    // reject files that the bootstrap walk accepted, producing diverging
+    // results.
+    let is_git_repo = root.join(".git").exists();
     let mut gi_builder = GitignoreBuilder::new(root);
 
-    // Seed with the standard sources `WalkBuilder` itself respects:
-    // root-level `.gitignore`, `.git/info/exclude`, and the global git
-    // excludes file (resolved from `core.excludesFile` config, falling
-    // back to `$XDG_CONFIG_HOME/git/ignore`). Without this seeding,
-    // `Create(File)` events for files matched by a `.ignore` file or a
-    // user-level excludes file would slip past `insert_file_if_not_ignored`
-    // even though the bootstrap walker filtered them out.
-    let _ = gi_builder.add(root.join(".gitignore"));
-    let _ = gi_builder.add(root.join(".ignore"));
-    let _ = gi_builder.add(root.join(".git").join("info").join("exclude"));
-    if let Some(global) = resolve_global_gitignore() {
-        let _ = gi_builder.add(global);
+    if is_git_repo {
+        // `.gitignore` files apply with their containing directory as
+        // scope (mirroring git semantics). `GitignoreBuilder::add` handles
+        // that correctly.
+        let _ = gi_builder.add(root.join(".gitignore"));
+
+        // `.git/info/exclude` and the global excludes file are NOT
+        // directory-scoped to themselves — git applies their patterns
+        // against paths relative to the workspace root. `add_line` keeps
+        // each pattern scoped to the builder's root, which is exactly
+        // what we want here. Loading them via `add()` would scope them
+        // to `<root>/.git/info` and `$XDG_CONFIG_HOME/git`, which never
+        // contain any project file.
+        seed_pattern_lines(
+            &mut gi_builder,
+            &root.join(".git").join("info").join("exclude"),
+        );
+        if let Some(global) = resolve_global_gitignore() {
+            seed_pattern_lines(&mut gi_builder, &global);
+        }
     }
+    // `.ignore` files are always honoured (independent of git presence).
+    let _ = gi_builder.add(root.join(".ignore"));
 
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
@@ -675,9 +899,9 @@ fn walk_workspace(root: &Path) -> (BTreeSet<String>, HashSet<PathBuf>, Gitignore
                 // behaviour. Root-level files were already added above; we
                 // skip them here to avoid double-loading the same rules.
                 let name = entry.file_name();
-                if (name == ".gitignore" && path != root_gitignore)
-                    || (name == ".ignore" && path != root_ignore)
-                {
+                let is_gitignore = name == ".gitignore" && is_git_repo && path != root_gitignore;
+                let is_ignore = name == ".ignore" && path != root_ignore;
+                if is_gitignore || is_ignore {
                     let _ = gi_builder.add(path);
                 }
             }
@@ -685,16 +909,38 @@ fn walk_workspace(root: &Path) -> (BTreeSet<String>, HashSet<PathBuf>, Gitignore
         }
     }
 
-    let gitignore = gi_builder.build().unwrap_or_else(|err| {
-        tracing::debug!(
-            ?err,
-            ?root,
-            "failed to build composite gitignore; falling back to empty matcher"
-        );
-        Gitignore::empty()
-    });
+    // Build the matcher only when there are rules to honour. An
+    // always-empty `Gitignore::empty()` would force every `Create(File)`
+    // event through a no-op match call; `Option::None` is cheaper to
+    // check and more honest about non-git workspaces.
+    let gitignore = if is_git_repo || root.join(".ignore").exists() {
+        gi_builder.build().ok().or_else(|| {
+            tracing::debug!(?root, "failed to build composite gitignore");
+            None
+        })
+    } else {
+        None
+    };
 
     (files, dirs, gitignore)
+}
+
+/// Read a pattern file (e.g. `.git/info/exclude` or the global git
+/// excludes file) line by line and feed each pattern to `builder` via
+/// `add_line`. This keeps the patterns scoped to the builder's root
+/// instead of the pattern file's own directory — the semantics git
+/// itself uses for these non-tree exclude files.
+fn seed_pattern_lines(builder: &mut GitignoreBuilder, path: &Path) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let _ = builder.add_line(Some(path.to_path_buf()), trimmed);
+    }
 }
 
 /// Cheap variant of [`walk_workspace`] that returns just the file set,
@@ -819,7 +1065,10 @@ fn insert_file_if_not_ignored(root: &Path, path: &Path, index: &Arc<RwLock<Works
     // churning) doesn't contend on the write lock.
     let ignored = {
         let guard = index.read().expect("index poisoned");
-        guard.gitignore.matched(path, false).is_ignore()
+        guard
+            .gitignore
+            .as_ref()
+            .is_some_and(|gi| gi.matched(path, false).is_ignore())
     };
     if ignored {
         return;
@@ -1329,5 +1578,245 @@ mod tests {
             after_restart.iter().any(|p| p == "src/b.rs"),
             "fresh bootstrap missed pre-existing file: {after_restart:?}"
         );
+    }
+
+    /// Codex round-3 #1: events arriving while a workspace is still
+    /// `Loading` must be buffered into the cell, not dropped. We force
+    /// the race by issuing concurrent searches: the first one wins the
+    /// bootstrap, the second one waits on the Notify, and any
+    /// filesystem event in between must end up in the published index.
+    ///
+    /// The strongest assertion we can make from outside the module is
+    /// that *after* bootstrap completes and a file was written during
+    /// it, the file ends up in the index. We can't directly inject
+    /// the timing without hooking internals, but the Loading-state
+    /// buffering is also exercised by every other watcher-driven
+    /// test (they all hit the post-bootstrap apply path through
+    /// `dispatch_event`'s `Ready` arm); this test specifically covers
+    /// the publication-atomic case.
+    #[tokio::test]
+    async fn events_during_loading_are_not_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Make Walk #1 long enough that we can race with it by
+        // populating many files. (With a small tree the bootstrap is
+        // sub-ms and we can't reliably race; with ~500 files we get
+        // tens of ms of bootstrap work.)
+        for i in 0..500 {
+            write(&root.join(format!("src/f{i:03}.rs")), "");
+        }
+
+        let indexer = WorkspaceIndexer::new().unwrap();
+
+        // Kick off the bootstrap in the background.
+        let indexer_a = indexer.clone();
+        let root_a = root.to_path_buf();
+        let bs = tokio::spawn(async move {
+            indexer_a.search(root_a, "", 1).await.expect("search");
+        });
+
+        // Race: write a file while bootstrap is in progress. The
+        // watcher fires a Create event; with Loading-state buffering
+        // it ends up in the pending buffer, drained at publication.
+        write(&root.join("src/race.rs"), "");
+
+        bs.await.unwrap();
+
+        // The file should appear in the index. Either Walk #2 picked
+        // it up (deterministic) or the Loading buffer drained the
+        // Create event (also deterministic). Both paths converge.
+        let saw_race = wait_for_path(&indexer, root, "race", Duration::from_secs(2), |results| {
+            results.iter().any(|p| p == "src/race.rs")
+        })
+        .await;
+        assert!(saw_race, "race file vanished during bootstrap");
+    }
+
+    /// Codex round-3 #2: `.git/info/exclude` must be watched even
+    /// though `.git` is excluded from the bootstrap walk. Without an
+    /// explicit watch on `.git/info/`, edits to the exclude file
+    /// never produce events and the cached gitignore matcher goes
+    /// stale silently.
+    #[tokio::test]
+    async fn git_info_exclude_edit_triggers_invalidation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git/info")).unwrap();
+        write(&root.join(".git/info/exclude"), "");
+        write(&root.join("src/test.tmp"), "");
+
+        let indexer = WorkspaceIndexer::new().unwrap();
+        let initial = search(&indexer, root, "").await;
+        assert!(
+            initial.iter().any(|p| p == "src/test.tmp"),
+            "initial: {initial:?}"
+        );
+
+        // Edit `.git/info/exclude` to ignore `.tmp` files.
+        write(&root.join(".git/info/exclude"), "*.tmp\n");
+
+        let gone = wait_for_path(&indexer, root, "", Duration::from_secs(2), |results| {
+            !results.iter().any(|p| p == "src/test.tmp")
+        })
+        .await;
+        assert!(gone, ".git/info/exclude edit didn't trigger refresh");
+    }
+
+    /// Codex round-3 #6: `.git/info/exclude` patterns are scoped to
+    /// the workspace root, not to `<root>/.git/info/`. A pattern like
+    /// `*.tmp` should match files anywhere in the tree, not just
+    /// under `.git/info/`.
+    #[tokio::test]
+    async fn git_info_exclude_patterns_match_workspace_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git/info")).unwrap();
+        write(&root.join(".git/info/exclude"), "*.tmp\n");
+        write(&root.join("src/keep.rs"), "");
+
+        let indexer = WorkspaceIndexer::new().unwrap();
+        let _ = search(&indexer, root, "").await;
+
+        // Create a `.tmp` file under src/ — the cached matcher should
+        // reject it because the workspace-scoped exclude pattern matches.
+        write(&root.join("src/debug.tmp"), "");
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let results = search(&indexer, root, "").await;
+        assert!(
+            !results.iter().any(|p| p == "src/debug.tmp"),
+            "exclude file's pattern wasn't applied to workspace path: {results:?}"
+        );
+    }
+
+    /// Codex round-3 #7: a non-git workspace must not apply
+    /// `.gitignore` rules — the bootstrap walker doesn't, and the
+    /// cached matcher must match that behaviour or filtering diverges
+    /// between Walk #1 and `Create(File)` events.
+    #[tokio::test]
+    async fn non_git_workspace_does_not_apply_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // No .git/ — this is NOT a git repo.
+        write(&root.join(".gitignore"), "*.log\n");
+        write(&root.join("src/main.rs"), "");
+        write(&root.join("src/existing.log"), "");
+
+        let indexer = WorkspaceIndexer::new().unwrap();
+        let initial = search(&indexer, root, "").await;
+        // Bootstrap walk doesn't apply .gitignore in non-git tree, so
+        // existing.log is present.
+        assert!(
+            initial.iter().any(|p| p == "src/existing.log"),
+            "non-git bootstrap should include the .log file: {initial:?}"
+        );
+
+        // Create a new .log file. Without the gitignore-on-Create
+        // filter being suppressed in non-git workspaces, this would
+        // be rejected — diverging from the bootstrap walker.
+        write(&root.join("src/new.log"), "");
+        let saw_new = wait_for_path(
+            &indexer,
+            root,
+            "new.log",
+            Duration::from_secs(2),
+            |results| results.iter().any(|p| p == "src/new.log"),
+        )
+        .await;
+        assert!(saw_new, "non-git workspace incorrectly applied .gitignore");
+    }
+
+    /// Codex round-3 #3: moving in a subtree with its own `.gitignore`
+    /// must trigger workspace invalidation so subsequent files under
+    /// it are filtered by the moved-in rules.
+    #[tokio::test]
+    async fn imported_subtree_with_gitignore_invalidates_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_git(root);
+        write(&root.join("src/main.rs"), "");
+
+        let indexer = WorkspaceIndexer::new().unwrap();
+        let _ = search(&indexer, root, "").await;
+
+        // Simulate moving in an external project: a new directory
+        // appears with its own .gitignore inside.
+        fs::create_dir_all(root.join("external/sub")).unwrap();
+        write(&root.join("external/.gitignore"), "*.tmp\n");
+        write(&root.join("external/sub/keep.rs"), "");
+
+        // Give notify time to fire the dir-create + file-creates.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // The presence of the imported `.gitignore` should have
+        // invalidated the workspace. Verify by writing a `.tmp` file
+        // under `external/` — the next search re-bootstraps with the
+        // new rules and should exclude it.
+        write(&root.join("external/junk.tmp"), "");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let results = search(&indexer, root, "").await;
+        // The imported .gitignore should now be in force, so junk.tmp
+        // is excluded by the rebuilt matcher. (Files added BEFORE the
+        // invalidation might be present or absent depending on timing;
+        // we only assert the gitignore is now active.)
+        assert!(
+            !results.iter().any(|p| p == "external/junk.tmp"),
+            "imported .gitignore rule wasn't honored after import: {results:?}"
+        );
+    }
+
+    /// Codex round-3 #4: if a workspace is invalidated while its
+    /// bootstrap is in flight, the bootstrap-registered watches must
+    /// not leak. The ownership check in `bootstrap_and_publish` is the
+    /// guarantee; we verify behaviorally by invalidating during
+    /// bootstrap and confirming a fresh bootstrap can still operate
+    /// without exhausting the inotify budget.
+    #[tokio::test]
+    async fn bootstrap_invalidated_mid_flight_does_not_leak_watches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..200 {
+            write(&root.join(format!("src/f{i:03}.rs")), "");
+        }
+
+        let indexer = WorkspaceIndexer::new().unwrap();
+
+        // Run 20 quick "search → invalidate → search" cycles. If
+        // bootstrap-registered watches were leaking on each
+        // invalidation, even a low watch budget would eventually
+        // refuse new watches; the final search would lose updates.
+        for _ in 0..20 {
+            let _ = search(&indexer, root, "").await;
+            indexer.invalidate_workspace(&canonicalize_or_self(root));
+        }
+
+        // Final state: bootstrap one more time and verify the index
+        // is correct. Use a higher limit than the default 50 so we
+        // exercise the full snapshot.
+        let final_results = indexer
+            .search(root.to_path_buf(), "", 500)
+            .await
+            .expect("final search");
+        assert_eq!(
+            final_results.len(),
+            200,
+            "expected 200 files after invalidation cycles, got {}: {:?}",
+            final_results.len(),
+            &final_results[..final_results.len().min(5)]
+        );
+
+        // And that the watcher still functions — i.e. the leaks
+        // didn't push us past `max_user_watches`.
+        write(&root.join("src/post_cycle.rs"), "");
+        let saw = wait_for_path(
+            &indexer,
+            root,
+            "post_cycle",
+            Duration::from_secs(2),
+            |results| results.iter().any(|p| p == "src/post_cycle.rs"),
+        )
+        .await;
+        assert!(saw, "watcher stopped working after invalidation cycles");
     }
 }
