@@ -74,6 +74,9 @@ which = "8"
 # Process-group / signal management for bash.
 libc = "0.2"
 
+# HTTP client for the MCP Streamable HTTP transport (specs/mcp/).
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+
 # Typed errors.
 thiserror = "2"
 

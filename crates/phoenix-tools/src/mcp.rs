@@ -4,21 +4,25 @@
 //! `tools/call`, notification handling) lives on `McpServer` and is
 //! transport-agnostic; how a request's bytes leave and a response's bytes
 //! arrive is behind the `McpTransport` trait. `StdioTransport` reaches a
-//! server spawned as a child subprocess; HTTP configs (`type: "http"`) are
-//! skipped at discovery. Discovered tools are exposed as regular Phoenix
-//! tools through the Tool trait. Spec: `specs/mcp/`.
+//! server spawned as a child subprocess; `HttpTransport` reaches a remote
+//! server over the Streamable HTTP transport. Discovered tools are exposed
+//! as regular Phoenix tools through the Tool trait. Spec: `specs/mcp/`.
+
+pub mod http;
+pub mod stdio;
+
+pub use http::HttpTransport;
+pub use stdio::StdioTransport;
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 /// Timeout for a single JSON-RPC request-response round trip.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,6 +33,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Upper bound for an HTTP reload request applying changed existing configs.
 const RELOAD_RESTART_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Timeout for a fire-and-forget JSON-RPC notification; notifications never
+/// legitimately take as long as a tool call.
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Transport boundary
@@ -109,9 +117,8 @@ pub trait McpTransport: Send + Sync {
     async fn shutdown(&mut self);
 }
 
-/// Build a transport for `config`. Stdio spawns the child process; HTTP is
-/// not implemented (`read_all_configs` skips `type: "http"` entries, so an
-/// `Http` config never reaches a connection attempt).
+/// Build a transport for `config`: stdio spawns the child process, HTTP
+/// builds the client (the connection itself is exercised by `initialize`).
 ///
 /// # Errors
 /// Returns a display string when the transport cannot be established.
@@ -124,10 +131,23 @@ async fn connect_transport(
         McpServerConfig::Stdio { command, args, env } => Ok(Box::new(
             StdioTransport::spawn(name, command, args, env, pending_oauth_urls).await?,
         )),
-        McpServerConfig::Http { .. } => Err(format!(
-            "MCP server '{name}': HTTP transport not implemented"
-        )),
+        McpServerConfig::Http { url, headers, auth } => {
+            Ok(Box::new(HttpTransport::connect(name, url, headers, auth)?))
+        }
     }
+}
+
+/// Extract a string-to-string map from an optional JSON object, dropping
+/// non-string values.
+fn string_map(value: Option<&Value>) -> HashMap<String, String> {
+    value
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|val| (k.clone(), val.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -154,266 +174,6 @@ pub struct McpServerStatus {
 }
 
 // ---------------------------------------------------------------------------
-// StdioTransport
-// ---------------------------------------------------------------------------
-
-/// Stdio transport: a child process exchanging JSON-RPC 2.0 over its
-/// stdin/stdout (REQ-MCP-003).
-pub struct StdioTransport {
-    name: String,
-    child: Child,
-    /// Locked together with `stdout` for request-response serialization.
-    stdin: Mutex<BufWriter<ChildStdin>>,
-    stdout: Mutex<BufReader<ChildStdout>>,
-    next_id: AtomicU64,
-    /// Handle to the stderr drain task -- aborted on shutdown.
-    stderr_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl StdioTransport {
-    /// Spawn the child process with stdin/stdout piped.
-    ///
-    /// # Errors
-    /// Returns a display string when the child process cannot be spawned.
-    #[allow(clippy::unused_async)] // async block inside spawns a task; keeping async for API consistency
-    pub async fn spawn(
-        name: &str,
-        command: &str,
-        args: &[String],
-        env: &HashMap<String, String>,
-        pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
-    ) -> Result<Self, String> {
-        let mut cmd = Command::new(command);
-        cmd.args(args)
-            .envs(env)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn MCP server '{name}': {e}"))?;
-
-        let child_stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("MCP server '{name}': stdin not captured"))?;
-        let child_stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("MCP server '{name}': stdout not captured"))?;
-
-        // Drain stderr to debug logs so the child doesn't block on a full pipe.
-        // Lines containing URLs are surfaced at warn and stored as pending OAuth
-        // URLs so the UI can display a clickable auth link.
-        let stderr_task = child.stderr.take().map(|stderr| {
-            let server_name = name.to_string();
-            let oauth_sink = Arc::clone(&pending_oauth_urls);
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            let trimmed = line.trim_end();
-                            if trimmed.contains("https://") {
-                                tracing::warn!(
-                                    server = %server_name,
-                                    "MCP stderr: {trimmed}"
-                                );
-                                oauth_sink
-                                    .write()
-                                    .await
-                                    .insert(server_name.clone(), trimmed.to_string());
-                            } else {
-                                tracing::debug!(
-                                    server = %server_name,
-                                    "MCP stderr: {trimmed}"
-                                );
-                            }
-                        }
-                    }
-                }
-            })
-        });
-
-        Ok(Self {
-            name: name.to_string(),
-            child,
-            stdin: Mutex::new(BufWriter::new(child_stdin)),
-            stdout: Mutex::new(BufReader::new(child_stdout)),
-            next_id: AtomicU64::new(1),
-            stderr_task,
-        })
-    }
-}
-
-#[async_trait]
-impl McpTransport for StdioTransport {
-    /// Send a JSON-RPC request and read the response with a timeout.
-    ///
-    /// Both stdin and stdout locks are held for the duration to serialize
-    /// concurrent calls on the same server. This is intentional and
-    /// stdio-specific: a proper multiplexing dispatcher (lock stdin briefly
-    /// to write, then match responses by ID from a reader task) would be
-    /// complex and provide little real benefit -- the MCP server is a single
-    /// process that serializes work internally anyway, so parallel requests
-    /// would just queue on the server side.
-    async fn request(
-        &self,
-        method: &str,
-        params: Value,
-        timeout: Duration,
-        sink: &dyn ServerMessageSink,
-    ) -> Result<Value, TransportError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-
-        let request_line = format!(
-            "{}\n",
-            serde_json::to_string(&request).map_err(|e| TransportError::Protocol(format!(
-                "failed to serialize request: {e}"
-            )))?
-        );
-
-        // Detect contention: if the lock is already held, another call is
-        // in-flight and this one will queue behind it.
-        if self.stdin.try_lock().is_err() {
-            tracing::debug!(
-                server = %self.name,
-                method = %method,
-                id = id,
-                "MCP request queued behind in-flight call"
-            );
-        }
-
-        // Lock both to serialize the request-response pair. See doc comment
-        // above for why we don't multiplex.
-        let mut stdin = self.stdin.lock().await;
-        let mut stdout = self.stdout.lock().await;
-
-        // Write request.
-        let write_fut = async {
-            stdin
-                .write_all(request_line.as_bytes())
-                .await
-                .map_err(|e| TransportError::Disconnected(format!("stdin write failed: {e}")))?;
-            stdin
-                .flush()
-                .await
-                .map_err(|e| TransportError::Disconnected(format!("stdin flush failed: {e}")))
-        };
-
-        tokio::time::timeout(timeout, write_fut)
-            .await
-            .map_err(|_| {
-                TransportError::Timeout(format!("timed out writing request for '{method}'"))
-            })??;
-
-        // Read response -- loop to forward server-initiated messages to the sink.
-        let read_fut = async {
-            loop {
-                let mut line = String::new();
-                let bytes_read = stdout.read_line(&mut line).await.map_err(|e| {
-                    // An io error on read is not crash-like; only EOF (below)
-                    // and stdin write failures evidence a dead process.
-                    TransportError::Protocol(format!("stdout read failed: {e}"))
-                })?;
-
-                if bytes_read == 0 {
-                    return Err(TransportError::Disconnected(format!(
-                        "stdout closed (process exited) while waiting for response to '{method}'"
-                    )));
-                }
-
-                let parsed: Value = serde_json::from_str(line.trim()).map_err(|e| {
-                    TransportError::Protocol(format!("invalid JSON from stdout: {e}"))
-                })?;
-
-                // Server-initiated messages (no "id" field) are the protocol
-                // layer's concern -- forward and keep waiting for the response.
-                if parsed.get("id").is_none() {
-                    sink.on_message(parsed);
-                    continue;
-                }
-
-                // Verify the response id matches our request.
-                if parsed.get("id").and_then(Value::as_u64) != Some(id) {
-                    tracing::warn!(
-                        server = %self.name,
-                        expected_id = id,
-                        got = ?parsed.get("id"),
-                        "Mismatched response id, skipping"
-                    );
-                    continue;
-                }
-
-                // Check for JSON-RPC error.
-                if let Some(error) = parsed.get("error") {
-                    let message = error
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error")
-                        .to_string();
-                    let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-                    return Err(TransportError::Rpc { code, message });
-                }
-
-                return parsed.get("result").cloned().ok_or_else(|| {
-                    TransportError::Protocol(
-                        "response missing both 'result' and 'error'".to_string(),
-                    )
-                });
-            }
-        };
-
-        tokio::time::timeout(timeout, read_fut).await.map_err(|_| {
-            TransportError::Timeout(format!("timed out reading response for '{method}'"))
-        })?
-    }
-
-    async fn notify(&self, notification: &Value) -> Result<(), TransportError> {
-        let line = format!(
-            "{}\n",
-            serde_json::to_string(notification).map_err(|e| TransportError::Protocol(format!(
-                "failed to serialize notification: {e}"
-            )))?
-        );
-
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| TransportError::Disconnected(format!("notification write failed: {e}")))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| TransportError::Disconnected(format!("notification flush failed: {e}")))
-    }
-
-    fn is_alive(&mut self) -> bool {
-        // try_wait returns Ok(Some(status)) if exited, Ok(None) if still running.
-        matches!(self.child.try_wait(), Ok(None))
-    }
-
-    async fn shutdown(&mut self) {
-        if let Some(handle) = self.stderr_task.take() {
-            handle.abort();
-        }
-        let _ = self.child.kill().await;
-    }
-}
-
-// ---------------------------------------------------------------------------
 // McpServer
 // ---------------------------------------------------------------------------
 
@@ -431,11 +191,6 @@ pub enum McpCallError {
 }
 
 impl McpCallError {
-    /// Crash-like failures trigger the stdio respawn path (REQ-MCP-003).
-    fn is_crash_like(&self) -> bool {
-        matches!(self, Self::Transport(TransportError::Disconnected(_)))
-    }
-
     fn into_message(self, server_name: &str) -> String {
         match self {
             Self::Transport(e) => format!("MCP server '{server_name}': {e}"),
@@ -730,11 +485,42 @@ impl McpServer {
         self.transport.is_alive()
     }
 
-    /// Attempt to rebuild the transport and reinitialize after a crash.
-    async fn respawn(&mut self) -> Result<(), String> {
+    /// The recovery verb for this server's transport: stdio respawns a
+    /// process, HTTP reconnects a client.
+    fn recovery_action(&self) -> &'static str {
+        match &self.config {
+            McpServerConfig::Stdio { .. } => "respawn",
+            McpServerConfig::Http { .. } => "reconnect",
+        }
+    }
+
+    /// Whether `error` warrants tearing down and re-establishing the
+    /// transport before one retry. Stdio recovers only from a crash-like
+    /// `Disconnected` -- a live-but-slow server is not respawned
+    /// (REQ-MCP-003). HTTP additionally recovers from a timeout (REQ-MCP-007)
+    /// and an expired session, which re-initializes (REQ-MCP-005).
+    fn should_reestablish(&self, error: &McpCallError) -> bool {
+        let McpCallError::Transport(transport_error) = error else {
+            return false;
+        };
+        match &self.config {
+            McpServerConfig::Stdio { .. } => {
+                matches!(transport_error, TransportError::Disconnected(_))
+            }
+            McpServerConfig::Http { .. } => matches!(
+                transport_error,
+                TransportError::Disconnected(_)
+                    | TransportError::Timeout(_)
+                    | TransportError::SessionExpired
+            ),
+        }
+    }
+
+    /// Rebuild the transport from the retained config and re-run the
+    /// handshake (stdio: respawn the process; HTTP: fresh client + session).
+    async fn reestablish(&mut self) -> Result<(), String> {
         self.terminate().await;
 
-        // Rebuild the transport from the same config.
         self.transport = connect_transport(
             &self.name,
             &self.config,
@@ -749,7 +535,8 @@ impl McpServer {
         tracing::info!(
             server = %self.name,
             tools = self.tools.len(),
-            "MCP server respawned"
+            action = self.recovery_action(),
+            "MCP server connection re-established"
         );
 
         Ok(())
@@ -1016,37 +803,37 @@ impl McpClientManager {
         match first_result {
             Ok(result) => return Ok(result),
             Err(e) => {
-                let crash_like = e.is_crash_like();
-                let message = e.into_message(server_name);
-
-                // Brief write lock: check liveness and extract the crashed
-                // server for out-of-lock respawn.
-                let crashed_server = {
+                // Brief write lock: classify the failure and extract the
+                // broken server for out-of-lock recovery.
+                let (broken_server, action) = {
                     let mut servers = self.servers.write().await;
                     let server = servers
                         .get_mut(server_name)
                         .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
 
-                    // If alive, the error is a tool-level failure (not a crash).
-                    // Also covers the case where another task already respawned.
-                    if server.is_alive() && !crash_like {
-                        return Err(message);
+                    // If the transport is healthy and the failure is not a
+                    // recoverable transport error, it is a tool-level failure.
+                    // Also covers the case where another task already recovered.
+                    if server.is_alive() && !server.should_reestablish(&e) {
+                        return Err(e.into_message(server_name));
                     }
 
+                    let action = server.recovery_action();
                     tracing::warn!(
                         server = %server_name,
-                        error = %message,
-                        "MCP server crashed, removing for respawn"
+                        error = %e.into_message(server_name),
+                        action = action,
+                        "MCP server connection lost, removing to re-establish"
                     );
 
                     // Remove the server so the write lock can be dropped.
-                    servers.remove(server_name)
+                    (servers.remove(server_name), action)
                 };
                 // Write lock is dropped here.
 
-                // Respawn outside the lock so other servers aren't blocked.
-                if let Some(mut server) = crashed_server {
-                    match server.respawn().await {
+                // Re-establish outside the lock so other servers aren't blocked.
+                if let Some(mut server) = broken_server {
+                    match server.reestablish().await {
                         Ok(()) => {
                             // Reinsert under a brief write lock, then retry
                             // via the read-lock path.
@@ -1055,9 +842,9 @@ impl McpClientManager {
                                 .await
                                 .insert(server_name.to_string(), server);
                         }
-                        Err(respawn_err) => {
+                        Err(reestablish_err) => {
                             return Err(format!(
-                                "MCP server '{server_name}' crashed and respawn failed: {respawn_err}"
+                                "MCP server '{server_name}' connection lost and {action} failed: {reestablish_err}"
                             ));
                         }
                     }
@@ -1065,10 +852,10 @@ impl McpClientManager {
             }
         }
 
-        // Retry once via the normal read-lock path after respawn.
+        // Retry once via the normal read-lock path after recovery.
         let servers = self.servers.read().await;
         let server = servers.get(server_name).ok_or_else(|| {
-            format!("MCP server '{server_name}' respawn succeeded but server not found")
+            format!("MCP server '{server_name}' recovery succeeded but server not found")
         })?;
         server
             .call_tool(tool_name, arguments)
@@ -1140,59 +927,86 @@ impl McpClientManager {
                     continue; // first-seen wins
                 }
 
-                // Skip HTTP transport entries.
-                if cfg.get("type").and_then(|v| v.as_str()) == Some("http") {
+                if let Some(config) = Self::classify_config_entry(name, cfg) {
                     tracing::debug!(
                         server = %name,
                         path = %path.display(),
-                        "Skipping HTTP transport MCP server"
+                        "Found MCP server config"
                     );
-                    continue;
+                    seen.insert(name.clone(), config);
+                } else {
+                    tracing::debug!(
+                        server = %name,
+                        path = %path.display(),
+                        "Skipping unusable MCP server config"
+                    );
                 }
-
-                // Must have a command field (stdio transport).
-                let Some(command) = cfg.get("command").and_then(|v| v.as_str()) else {
-                    tracing::debug!(
-                        server = %name,
-                        path = %path.display(),
-                        "Skipping MCP server without 'command' field"
-                    );
-                    continue;
-                };
-                let command = command.to_string();
-
-                let args: Vec<String> = cfg
-                    .get("args")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let env: HashMap<String, String> = cfg
-                    .get("env")
-                    .and_then(|v| v.as_object())
-                    .map(|obj| {
-                        obj.iter()
-                            .filter_map(|(k, v)| v.as_str().map(|val| (k.clone(), val.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                tracing::debug!(
-                    server = %name,
-                    command = %command,
-                    path = %path.display(),
-                    "Found MCP server config"
-                );
-
-                seen.insert(name.clone(), McpServerConfig::Stdio { command, args, env });
             }
         }
 
         seen.into_iter().collect()
+    }
+
+    /// Classify one `mcpServers` entry into a transport-tagged config
+    /// (REQ-MCP-001): `"type": "http"` + `url` selects HTTP, a `command`
+    /// field selects stdio. Returns `None` (the entry is skipped) when
+    /// neither is usable, with the reason at `debug` level.
+    fn classify_config_entry(name: &str, cfg: &Value) -> Option<McpServerConfig> {
+        if cfg.get("type").and_then(|v| v.as_str()) == Some("http") {
+            let Some(url) = cfg.get("url").and_then(|v| v.as_str()) else {
+                tracing::debug!(server = %name, "HTTP MCP server without 'url' field");
+                return None;
+            };
+            let auth = match cfg.get("auth") {
+                None => HttpAuth::None,
+                Some(auth) => Self::classify_http_auth(name, auth)?,
+            };
+            return Some(McpServerConfig::Http {
+                url: url.to_string(),
+                headers: string_map(cfg.get("headers")),
+                auth,
+            });
+        }
+
+        // Must have a command field (stdio transport).
+        let Some(command) = cfg.get("command").and_then(|v| v.as_str()) else {
+            tracing::debug!(server = %name, "MCP server without 'command' field");
+            return None;
+        };
+
+        let args: Vec<String> = cfg
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Some(McpServerConfig::Stdio {
+            command: command.to_string(),
+            args,
+            env: string_map(cfg.get("env")),
+        })
+    }
+
+    /// Classify an HTTP entry's `auth` object: `{"bearer": "<token>"}` or
+    /// `{"headers": {...}}` is an explicit static credential (REQ-MCP-008).
+    /// An unrecognized shape skips the server -- silently downgrading an
+    /// intended credential to no-auth would change which authorization path
+    /// a 401 takes.
+    fn classify_http_auth(name: &str, auth: &Value) -> Option<HttpAuth> {
+        if let Some(token) = auth.get("bearer").and_then(|v| v.as_str()) {
+            return Some(HttpAuth::Static(StaticCred::Bearer(token.to_string())));
+        }
+        if auth.get("headers").is_some() {
+            return Some(HttpAuth::Static(StaticCred::Headers(string_map(
+                auth.get("headers"),
+            ))));
+        }
+        tracing::debug!(server = %name, "HTTP MCP server with unrecognized 'auth' shape");
+        None
     }
 
     /// Re-scan config files and reconcile servers: connect new ones,
@@ -1414,9 +1228,6 @@ pub struct McpReloadFailure {
 /// Parsed MCP server configuration from a config file, tagged by transport
 /// (REQ-MCP-001). `PartialEq` is the reload reconciler's unchanged-vs-restart
 /// comparison (REQ-MCP-015), so every field of both variants participates.
-///
-/// Only the `Stdio` variant is produced today: `read_all_configs` skips
-/// `type: "http"` entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpServerConfig {
     Stdio {
@@ -1588,13 +1399,105 @@ mod tests {
     }
 
     #[test]
-    fn test_config_parsing_skips_http() {
+    fn test_read_all_configs_does_not_panic() {
         // Verify that read_all_configs works with no config files present
         // (it should return empty, not error).
         let configs = McpClientManager::read_all_configs();
         // We can't assert anything about count since the dev machine may have configs,
         // but the call should not panic.
         let _ = configs;
+    }
+
+    #[test]
+    fn classify_entry_selects_stdio_for_command() {
+        let cfg = serde_json::json!({
+            "command": "uvx",
+            "args": ["server"],
+            "env": {"KEY": "v"},
+        });
+        let config = McpClientManager::classify_config_entry("s", &cfg).expect("stdio config");
+        assert_eq!(
+            config,
+            McpServerConfig::Stdio {
+                command: "uvx".to_string(),
+                args: vec!["server".to_string()],
+                env: HashMap::from([("KEY".to_string(), "v".to_string())]),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_entry_selects_http_with_headers_and_no_auth() {
+        let cfg = serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "headers": {"X-Org": "acme"},
+        });
+        let config = McpClientManager::classify_config_entry("s", &cfg).expect("http config");
+        assert_eq!(
+            config,
+            McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: HashMap::from([("X-Org".to_string(), "acme".to_string())]),
+                auth: HttpAuth::None,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_entry_parses_static_credentials() {
+        let bearer = serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "auth": {"bearer": "tok"},
+        });
+        assert_eq!(
+            McpClientManager::classify_config_entry("s", &bearer),
+            Some(McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: HashMap::new(),
+                auth: HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
+            })
+        );
+
+        let auth_headers = serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "auth": {"headers": {"X-Api-Key": "k"}},
+        });
+        assert_eq!(
+            McpClientManager::classify_config_entry("s", &auth_headers),
+            Some(McpServerConfig::Http {
+                url: "https://example.com/mcp".to_string(),
+                headers: HashMap::new(),
+                auth: HttpAuth::Static(StaticCred::Headers(HashMap::from([(
+                    "X-Api-Key".to_string(),
+                    "k".to_string()
+                )]))),
+            })
+        );
+    }
+
+    #[test]
+    fn classify_entry_skips_unusable_entries() {
+        // No command and not HTTP.
+        let neither = serde_json::json!({"args": ["x"]});
+        assert_eq!(McpClientManager::classify_config_entry("s", &neither), None);
+
+        // HTTP without a url.
+        let no_url = serde_json::json!({"type": "http"});
+        assert_eq!(McpClientManager::classify_config_entry("s", &no_url), None);
+
+        // Unrecognized auth shape must not silently downgrade to no-auth.
+        let bad_auth = serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "auth": {"oauth2": true},
+        });
+        assert_eq!(
+            McpClientManager::classify_config_entry("s", &bad_auth),
+            None
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1663,7 +1566,10 @@ mod tests {
     type RequestLog = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
     type NotificationLog = Arc<std::sync::Mutex<Vec<Value>>>;
 
-    fn fake_server(script: Vec<ScriptedExchange>) -> (McpServer, RequestLog, NotificationLog) {
+    fn fake_server_with_config(
+        script: Vec<ScriptedExchange>,
+        config: McpServerConfig,
+    ) -> (McpServer, RequestLog, NotificationLog) {
         let requests: RequestLog = Arc::default();
         let notifications: NotificationLog = Arc::default();
         let transport = FakeTransport {
@@ -1675,15 +1581,22 @@ mod tests {
             name: "fake".to_string(),
             transport: Box::new(transport),
             tools: Vec::new(),
-            config: McpServerConfig::Stdio {
-                command: "unused".to_string(),
-                args: Vec::new(),
-                env: HashMap::new(),
-            },
+            config,
             tools_changed: AtomicBool::new(false),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
         };
         (server, requests, notifications)
+    }
+
+    fn fake_server(script: Vec<ScriptedExchange>) -> (McpServer, RequestLog, NotificationLog) {
+        fake_server_with_config(
+            script,
+            McpServerConfig::Stdio {
+                command: "unused".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+            },
+        )
     }
 
     #[tokio::test]
@@ -1741,7 +1654,7 @@ mod tests {
             .await
             .expect_err("isError result must be an error");
 
-        assert!(!err.is_crash_like());
+        assert!(!server.should_reestablish(&err));
         assert_eq!(err.into_message("fake"), "boom");
     }
 
@@ -1779,20 +1692,55 @@ mod tests {
             .call_tool("report", serde_json::json!({}))
             .await
             .expect_err("disconnected must fail");
-        assert!(crash.is_crash_like());
+        assert!(server.should_reestablish(&crash));
 
         let timeout = server
             .call_tool("report", serde_json::json!({}))
             .await
             .expect_err("timeout must fail");
         assert!(
-            !timeout.is_crash_like(),
+            !server.should_reestablish(&timeout),
             "a live-but-slow server must not be classified as crashed"
         );
         assert_eq!(
             timeout.into_message("fake"),
             "MCP server 'fake': timed out reading response for 'tools/call'"
         );
+    }
+
+    #[tokio::test]
+    async fn http_recovery_policy_covers_timeout_and_session_expiry() {
+        let http_config = McpServerConfig::Http {
+            url: "https://example.com/mcp".to_string(),
+            headers: HashMap::new(),
+            auth: HttpAuth::None,
+        };
+        let (server, _, _) = fake_server_with_config(Vec::new(), http_config);
+
+        for recoverable in [
+            TransportError::Disconnected("reset".to_string()),
+            TransportError::Timeout("timed out".to_string()),
+            TransportError::SessionExpired,
+        ] {
+            assert!(
+                server.should_reestablish(&McpCallError::Transport(recoverable.clone())),
+                "{recoverable:?} must reconnect an HTTP server"
+            );
+        }
+        for surfaced in [
+            TransportError::Unauthorized {
+                www_authenticate: None,
+            },
+            TransportError::Rpc {
+                code: -1,
+                message: "x".to_string(),
+            },
+        ] {
+            assert!(
+                !server.should_reestablish(&McpCallError::Transport(surfaced.clone())),
+                "{surfaced:?} must be surfaced, not retried"
+            );
+        }
     }
 
     fn write_fixture_server(dir: &tempfile::TempDir) -> std::path::PathBuf {
@@ -1969,8 +1917,9 @@ for line in sys.stdin:
         let initial = fixture_config(&script, &marker, "v1", "env1");
         connect_fixture(&manager, &initial).await;
 
+        // Port 1 refuses connections, so the HTTP handshake fails fast.
         let changed = McpServerConfig::Http {
-            url: "https://example.com/mcp".to_string(),
+            url: "http://127.0.0.1:1/mcp".to_string(),
             headers: HashMap::new(),
             auth: HttpAuth::None,
         };
@@ -1978,14 +1927,14 @@ for line in sys.stdin:
             .reload_from_configs(vec![("fixture".to_string(), changed)])
             .await;
 
-        // The variant switch is a config change; the restart then fails
-        // because the HTTP transport is not implemented.
+        // The variant switch is a config change: the stdio server is torn
+        // down and the (unreachable) HTTP replacement is a restart failure,
+        // never "unchanged".
         assert!(result.unchanged.is_empty());
         assert!(result.restarted.is_empty());
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].server, "fixture");
         assert_eq!(result.failed[0].action, "restart");
-        assert!(result.failed[0].error.contains("HTTP transport"));
     }
 
     #[tokio::test]
