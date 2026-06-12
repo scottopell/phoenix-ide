@@ -196,15 +196,20 @@ pub fn mode_explore(lang: LlmLanguage, tasks_dir_name: &str) -> String {
                 reject. On approval, an isolated worktree is created and \
                 you gain full write access.\n\n\
              The `patch` tool is restricted to `{tasks_dir_name}/` in this \
-             mode. `bash` is unavailable. If the user asks you to change \
-             code directly, explain that you must propose a task first."
+             mode. `bash` is available for read-only local investigation under \
+             an OS sandbox: it can read broadly, but source/Git metadata writes \
+             and network access are blocked, and only task proposals, scratch, \
+             synthetic home, and platform temp are writable. If the user asks \
+             you to change code directly, explain that you must propose a task \
+             first."
         ),
         LlmLanguage::Caveman => format!(
             "\n\nYou in look-only cave. Look at code. No change code. \
              To do work: write plan in `{tasks_dir_name}/` (file like \
              `12345-p2-ready--slug.md`), then call propose_task with that file. \
              Big caveman say yes? You get new cave with write power. \
-             No bash here. patch only in `{tasks_dir_name}/`."
+             Bash can look wide but no write code and no network. patch only \
+             in `{tasks_dir_name}/`."
         ),
     }
 }
