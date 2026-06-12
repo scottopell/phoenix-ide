@@ -194,9 +194,13 @@ impl McpTransport for StdioTransport {
                     TransportError::Protocol(format!("invalid JSON from stdout: {e}"))
                 })?;
 
-                // Server-initiated messages (no "id" field) are the protocol
-                // layer's concern -- forward and keep waiting for the response.
-                if parsed.get("id").is_none() {
+                // A message carrying a `method` is server-initiated (a
+                // request or a notification); responses never carry one. Its
+                // id space (if any) is independent of ours -- a server `ping`
+                // whose id collides with our request id is not our reply --
+                // so this check must come before id correlation. Forward to
+                // the protocol layer and keep waiting for the response.
+                if parsed.get("method").is_some() {
                     sink.on_message(parsed);
                     continue;
                 }

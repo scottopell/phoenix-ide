@@ -116,7 +116,6 @@ impl HttpTransport {
     /// status through. `Ok` carries the response back for body handling.
     /// `sent_session_id` is the session id this particular request carried.
     fn classify_status(
-        &self,
         response: reqwest::Response,
         sent_session_id: Option<&str>,
     ) -> Result<reqwest::Response, TransportError> {
@@ -133,14 +132,13 @@ impl HttpTransport {
             401 => Err(TransportError::Unauthorized { www_authenticate }),
             403 => Err(TransportError::InsufficientScope { www_authenticate }),
             404 if sent_session_id.is_some() => {
-                // The server-side session is gone; the next initialize must
-                // not echo the dead id (REQ-MCP-005). Clear only if the
-                // stored id is still the one this request sent -- a
-                // concurrent recovery may already hold a fresh session.
-                let mut stored = self.session_id.lock().unwrap();
-                if stored.as_deref() == sent_session_id {
-                    *stored = None;
-                }
+                // The server-side session is gone (REQ-MCP-005). The stored
+                // id is deliberately NOT cleared: recovery replaces this
+                // whole transport (the fresh one re-initializes with no
+                // session), and clearing here would let a concurrent call
+                // race in session-less -- failing as a generic protocol
+                // error instead of classifying as expired and joining the
+                // recovery.
                 Err(TransportError::SessionExpired)
             }
             _ => Err(TransportError::Protocol(format!(
@@ -158,6 +156,16 @@ impl HttpTransport {
         id: u64,
         sink: &dyn ServerMessageSink,
     ) -> Option<Result<Value, TransportError>> {
+        // A message carrying a `method` is server-initiated (a request or a
+        // notification); responses never carry one. Its id space is
+        // independent of ours -- a server `ping` whose id collides with our
+        // request id is not our reply -- so this check must come before id
+        // correlation.
+        if message.get("method").is_some() {
+            sink.on_message(message);
+            return None;
+        }
+
         if message.get("id").and_then(Value::as_u64) == Some(id) {
             if let Some(error) = message.get("error") {
                 let text = error
@@ -174,13 +182,6 @@ impl HttpTransport {
             return Some(message.get("result").cloned().ok_or_else(|| {
                 TransportError::Protocol("response missing both 'result' and 'error'".to_string())
             }));
-        }
-
-        // Server-initiated requests and notifications carry their own id (or
-        // none); both are the protocol layer's concern.
-        if message.get("method").is_some() {
-            sink.on_message(message);
-            return None;
         }
 
         tracing::warn!(
@@ -262,7 +263,7 @@ impl McpTransport for HttpTransport {
             }
         }
 
-        let response = self.classify_status(response, sent_session_id.as_deref())?;
+        let response = Self::classify_status(response, sent_session_id.as_deref())?;
 
         let content_type = response
             .headers()
@@ -332,8 +333,7 @@ impl McpTransport for HttpTransport {
         // A conforming server acknowledges an accepted notification with
         // 202 Accepted and no body (REQ-MCP-004); any 2xx is success and the
         // body, if present, is ignored.
-        self.classify_status(response, sent_session_id.as_deref())
-            .map(|_| ())
+        Self::classify_status(response, sent_session_id.as_deref()).map(|_| ())
     }
 
     fn requested_protocol_version(&self) -> &'static str {
@@ -548,6 +548,12 @@ mod tests {
             delay_ms: 0,
             echo_result: None,
         }
+    }
+
+    /// Ack for the session DELETE that re-establish sends while tearing
+    /// down a session-bearing transport.
+    fn delete_ack() -> CannedResponse {
+        status_response(200, &[])
     }
 
     fn delayed(mut response: CannedResponse, delay_ms: u64) -> CannedResponse {
@@ -842,7 +848,7 @@ mod tests {
 
         // The call 404s (session expired), recovery re-runs the handshake
         // with a fresh session, then the retried call succeeds.
-        server.push_responses(vec![status_response(404, &[])]);
+        server.push_responses(vec![status_response(404, &[]), delete_ack()]);
         server.push_responses(handshake_responses("sess-2"));
         server.push_responses(vec![json_response(
             3,
@@ -856,8 +862,8 @@ mod tests {
             .expect("retried call");
         assert_eq!(output, "ok");
 
-        let methods: Vec<String> = server.recorded().into_iter().map(|(_, rpc)| rpc).collect();
-        let methods: Vec<&str> = methods.iter().map(String::as_str).collect();
+        let recorded = server.recorded();
+        let methods: Vec<&str> = recorded.iter().map(|(_, rpc)| rpc.as_str()).collect();
         assert_eq!(
             methods,
             vec![
@@ -865,12 +871,14 @@ mod tests {
                 "notifications/initialized",
                 "tools/list",
                 "tools/call",
+                "", // DELETE ending the expired session
                 "initialize",
                 "notifications/initialized",
                 "tools/list",
                 "tools/call",
             ]
         );
+        assert_eq!(recorded[4].0, "DELETE");
 
         // The retried call rides the fresh session, not the expired one.
         let requests = server.requests.lock().unwrap();
@@ -896,7 +904,7 @@ mod tests {
         // The lazy list_changed refresh 404s (session expired); the refresh
         // path must re-establish (fresh handshake) instead of leaving the
         // server with a stale tool list.
-        server.push_responses(vec![status_response(404, &[])]);
+        server.push_responses(vec![status_response(404, &[]), delete_ack()]);
         server.push_responses(handshake_responses("sess-2"));
 
         let defs = manager.tool_definitions().await;
@@ -904,8 +912,8 @@ mod tests {
         assert_eq!(defs[0].0, "remote");
         assert_eq!(defs[0].1.name, "report");
 
-        let methods: Vec<String> = server.recorded().into_iter().map(|(_, rpc)| rpc).collect();
-        let methods: Vec<&str> = methods.iter().map(String::as_str).collect();
+        let recorded = server.recorded();
+        let methods: Vec<&str> = recorded.iter().map(|(_, rpc)| rpc.as_str()).collect();
         assert_eq!(
             methods,
             vec![
@@ -913,11 +921,13 @@ mod tests {
                 "notifications/initialized",
                 "tools/list",
                 "tools/list", // the refresh that 404s
+                "",           // DELETE ending the expired session
                 "initialize",
                 "notifications/initialized",
                 "tools/list",
             ]
         );
+        assert_eq!(recorded[4].0, "DELETE");
     }
 
     #[tokio::test]
@@ -969,7 +979,7 @@ mod tests {
         // 100ms -- while the refresh holds the server out of the map -- must
         // wait on the parked claim and succeed, not fail "not connected".
         let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
-        server.push_responses(vec![status_response(404, &[])]);
+        server.push_responses(vec![status_response(404, &[]), delete_ack()]);
         let mut recovery = handshake_responses("sess-2");
         recovery[0] = delayed(recovery[0].clone(), 300);
         server.push_responses(recovery);
@@ -1010,6 +1020,155 @@ mod tests {
         assert!(err.contains("transport-managed"), "got: {err}");
     }
 
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<Value>>);
+
+    impl ServerMessageSink for RecordingSink {
+        fn on_message(&self, message: Value) {
+            self.0.lock().unwrap().push(message);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_server_request_with_colliding_id_goes_to_the_sink() {
+        // The server-initiated `ping` reuses id 1 -- the same id as our
+        // first request. It must reach the sink, not be parsed as a
+        // result-less reply that aborts the call.
+        let server = TestServer::start(vec![sse_response(concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
+        ))])
+        .await;
+        let transport =
+            HttpTransport::connect("remote", &server.url, &HashMap::new(), &HttpAuth::None)
+                .expect("connect");
+
+        let sink = RecordingSink::default();
+        let result = transport
+            .request(
+                "tools/call",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+                &sink,
+            )
+            .await
+            .expect("the real reply must still be correlated");
+
+        assert_eq!(result, serde_json::json!({"ok": true}));
+        let messages = sink.0.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].get("method").and_then(Value::as_str),
+            Some("ping")
+        );
+    }
+
+    #[tokio::test]
+    async fn http_stale_error_does_not_tear_down_a_fresh_connection() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // Two concurrent calls 404. One failure is held open for 400ms; the
+        // other fails instantly and completes its recovery (~ms) long before
+        // the held one lands. The stale failure must observe the fresh
+        // generation and just retry -- exactly one recovery handshake total,
+        // and no teardown of the newly established session.
+        let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
+        server.push_responses(vec![
+            delayed(status_response(404, &[]), 400),
+            status_response(404, &[]),
+            delete_ack(),
+        ]);
+        server.push_responses(handshake_responses("sess-2"));
+        server.push_responses(vec![
+            echo_id_response(&call_result),
+            echo_id_response(&call_result),
+        ]);
+
+        let (first, second) = tokio::join!(
+            manager.call_tool("remote", "report", serde_json::json!({})),
+            manager.call_tool("remote", "report", serde_json::json!({})),
+        );
+
+        assert_eq!(first.expect("call must succeed"), "ok");
+        assert_eq!(second.expect("call must succeed"), "ok");
+
+        let initializes = server
+            .recorded()
+            .iter()
+            .filter(|(_, rpc)| rpc == "initialize")
+            .count();
+        assert_eq!(
+            initializes, 2,
+            "connect + one recovery; the stale error must not re-reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_waits_for_held_servers_instead_of_duplicating() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        let manager = Arc::new(McpClientManager::new());
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("remote".to_string(), mcp);
+
+        // Simulate an in-flight hold (refresh/recovery): the server is out
+        // of the map with a claim parked, released 100ms later.
+        let (sender, _) = tokio::sync::watch::channel(());
+        manager
+            .recovering_map()
+            .insert("remote".to_string(), sender);
+        let held = manager
+            .servers
+            .write()
+            .await
+            .remove("remote")
+            .expect("server present");
+        let holder = Arc::clone(&manager);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            holder
+                .servers
+                .write()
+                .await
+                .insert("remote".to_string(), held);
+            holder.recovering_map().remove("remote");
+        });
+
+        // Reload with the identical config must settle the hold and report
+        // unchanged -- not misread the held server as newly added and start
+        // a duplicate connection.
+        let result = manager
+            .reload_from_configs(vec![(
+                "remote".to_string(),
+                http_config(&server.url, HttpAuth::None),
+            )])
+            .await;
+
+        assert_eq!(result.unchanged, vec!["remote"]);
+        assert!(result.added.is_empty());
+        assert!(result.failed.is_empty());
+        let initializes = server
+            .recorded()
+            .iter()
+            .filter(|(_, rpc)| rpc == "initialize")
+            .count();
+        assert_eq!(initializes, 1, "no duplicate connection during reload");
+    }
+
     #[tokio::test]
     async fn http_failed_refresh_recovery_drops_the_server() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
@@ -1028,7 +1187,11 @@ mod tests {
         // The refresh 404s (recoverable), but the recovery handshake fails:
         // the server must be dropped, not reinserted with stale definitions
         // over a torn-down transport.
-        server.push_responses(vec![status_response(404, &[]), status_response(500, &[])]);
+        server.push_responses(vec![
+            status_response(404, &[]),
+            delete_ack(),
+            status_response(500, &[]),
+        ]);
 
         let defs = manager.tool_definitions().await;
         assert!(defs.is_empty(), "stale definitions must not be advertised");
@@ -1053,7 +1216,7 @@ mod tests {
         // server is out of the map -- and must join the in-flight recovery
         // at the initial lookup instead of failing with "not connected".
         let call_result = serde_json::json!({"content": [{"type": "text", "text": "ok"}]});
-        server.push_responses(vec![status_response(404, &[])]);
+        server.push_responses(vec![status_response(404, &[]), delete_ack()]);
         let mut recovery = handshake_responses("sess-2");
         recovery[0] = delayed(recovery[0].clone(), 300);
         server.push_responses(recovery);
@@ -1106,6 +1269,7 @@ mod tests {
         server.push_responses(vec![
             status_response(404, &[]),
             delayed(status_response(404, &[]), 100),
+            delete_ack(),
         ]);
         let mut recovery = handshake_responses("sess-2");
         recovery[0] = delayed(recovery[0].clone(), 300);
@@ -1228,7 +1392,13 @@ mod tests {
             second.expect_err("404 must fail"),
             TransportError::SessionExpired
         );
-        assert!(transport.session_id.lock().unwrap().is_none());
+        // The expired id stays visible on the doomed transport so calls
+        // racing in before recovery still classify as SessionExpired;
+        // recovery replaces the transport wholesale.
+        assert_eq!(
+            *transport.session_id.lock().unwrap(),
+            Some("sess-1".to_string())
+        );
     }
 
     #[test]

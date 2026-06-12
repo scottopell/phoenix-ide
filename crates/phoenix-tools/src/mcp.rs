@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -142,6 +142,26 @@ async fn connect_transport(
     }
 }
 
+/// Insert a server into the map, terminating any instance it displaces so an
+/// evicted connection is shut down (ending its HTTP session with the DELETE)
+/// rather than silently dropped. Displacement is rare -- it takes an insert
+/// racing a hold/reload window -- but a leaked remote session is invisible,
+/// so every insert routes through here.
+async fn insert_server(
+    servers: &RwLock<HashMap<String, McpServer>>,
+    name: &str,
+    server: McpServer,
+) {
+    let displaced = servers.write().await.insert(name.to_string(), server);
+    if let Some(mut displaced) = displaced {
+        tracing::warn!(
+            server = %name,
+            "Insert displaced an existing MCP server instance; terminating it"
+        );
+        displaced.terminate().await;
+    }
+}
+
 /// Extract a string-to-string map from an optional JSON object, dropping
 /// non-string values.
 fn string_map(value: Option<&Value>) -> HashMap<String, String> {
@@ -243,6 +263,11 @@ pub struct McpServer {
     /// Config retained for reload comparison and for rebuilding the
     /// transport on respawn.
     config: McpServerConfig,
+    /// Identifies the current transport instance; reassigned whenever the
+    /// transport is (re)built. A failure observed against one generation
+    /// must not tear down a later one (a stale error racing a completed
+    /// recovery).
+    generation: u64,
     /// Set when the server sends `notifications/tools/list_changed`.
     /// Cleared after the next `list_tools()` refresh.
     tools_changed: AtomicBool,
@@ -250,6 +275,13 @@ pub struct McpServer {
     /// drain, read by `McpClientManager::status()`. Retained so a respawned
     /// transport keeps feeding the same map.
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
+}
+
+/// Monotonic source for `McpServer::generation`.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 impl McpServer {
@@ -268,6 +300,7 @@ impl McpServer {
             transport,
             tools: Vec::new(),
             config,
+            generation: next_generation(),
             tools_changed: AtomicBool::new(false),
             pending_oauth_urls,
         })
@@ -559,6 +592,7 @@ impl McpServer {
             Arc::clone(&self.pending_oauth_urls),
         )
         .await?;
+        self.generation = next_generation();
         self.tools_changed.store(false, Ordering::Release);
 
         self.handshake().await?;
@@ -705,7 +739,7 @@ impl McpClientManager {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
                                 let tool_count = server.tools.len();
-                                mgr.servers.write().await.insert(name.clone(), server);
+                                insert_server(&mgr.servers, &name, server).await;
                                 tracing::info!(
                                     server = %name,
                                     tools = tool_count,
@@ -861,7 +895,7 @@ impl McpClientManager {
                 // reconnects it (REQ-MCP-015). The claim is released after,
                 // so waiters observe the outcome.
                 if keep {
-                    self.servers.write().await.insert(name, server);
+                    insert_server(&self.servers, &name, server).await;
                 }
                 drop(claim);
             }
@@ -879,6 +913,38 @@ impl McpClientManager {
             }
         }
         out
+    }
+
+    /// One `tools/call` attempt via the read-lock path, returning the result
+    /// together with the generation of the instance that served it (so a
+    /// failure is attributed to that transport and not a successor). A call
+    /// arriving while the server is held out of the map for recovery joins
+    /// the parked claim instead of failing with "not connected"; with no
+    /// claim parked, the re-lookup settles whether the server is genuinely
+    /// gone or a recovery just finished.
+    async fn attempt_call(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> Result<(Result<String, McpRequestError>, u64), String> {
+        let servers = self.servers.read().await;
+        if let Some(server) = servers.get(server_name) {
+            return Ok((
+                server.call_tool(tool_name, arguments.clone()).await,
+                server.generation,
+            ));
+        }
+        drop(servers);
+        self.await_claim_release(server_name).await;
+        let servers = self.servers.read().await;
+        let server = servers
+            .get(server_name)
+            .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
+        Ok((
+            server.call_tool(tool_name, arguments.clone()).await,
+            server.generation,
+        ))
     }
 
     /// Route a tool call to the correct server.
@@ -902,26 +968,9 @@ impl McpClientManager {
             return Err(format!("MCP server '{server_name}' is disabled"));
         }
 
-        // Happy path: read lock -- McpServer.call_tool takes &self.
-        let first_result = {
-            let servers = self.servers.read().await;
-            if let Some(server) = servers.get(server_name) {
-                server.call_tool(tool_name, arguments.clone()).await
-            } else {
-                // Absent: a call arriving while another task holds the server
-                // out of the map for recovery joins that recovery instead of
-                // failing with "not connected". When no claim is parked the
-                // server is genuinely gone (or recovery just finished -- the
-                // re-lookup settles which).
-                drop(servers);
-                self.await_claim_release(server_name).await;
-                let servers = self.servers.read().await;
-                let server = servers
-                    .get(server_name)
-                    .ok_or_else(|| format!("MCP server '{server_name}' is not connected"))?;
-                server.call_tool(tool_name, arguments.clone()).await
-            }
-        };
+        let (first_result, failed_generation) = self
+            .attempt_call(server_name, tool_name, &arguments)
+            .await?;
 
         match first_result {
             Ok(result) => return Ok(result),
@@ -935,6 +984,9 @@ impl McpClientManager {
                         claim: ServerClaim<'a>,
                     },
                     Follow(tokio::sync::watch::Receiver<()>),
+                    /// The failing transport was already replaced; go
+                    /// straight to the retry.
+                    Retry,
                 }
 
                 // Brief write lock: classify the failure and either claim the
@@ -945,28 +997,39 @@ impl McpClientManager {
                     if let Some(mut server) = servers.remove(server_name) {
                         // If the transport is healthy and the failure is not
                         // a recoverable transport error, it is a tool-level
-                        // failure. Also covers the case where another task
-                        // already recovered.
+                        // failure -- surface it; retrying could re-execute a
+                        // side-effecting call.
                         if server.is_alive() && !server.should_reestablish(&e) {
                             servers.insert(server_name.to_string(), server);
                             return Err(e.into_message(server_name));
                         }
 
-                        let action = server.recovery_action();
-                        tracing::warn!(
-                            server = %server_name,
-                            error = %e.into_message(server_name),
-                            action = action,
-                            "MCP server connection lost, removing to re-establish"
-                        );
+                        // A recoverable failure from a transport that has
+                        // already been replaced (another task finished a
+                        // recovery, or reload swapped the server) is stale:
+                        // retry on the fresh instance instead of tearing it
+                        // down.
+                        if server.generation == failed_generation {
+                            let action = server.recovery_action();
+                            tracing::warn!(
+                                server = %server_name,
+                                error = %e.into_message(server_name),
+                                action = action,
+                                "MCP server connection lost, removing to re-establish"
+                            );
 
-                        // Claim the recovery while still holding the servers
-                        // lock, so a concurrent failing call cannot observe
-                        // the server absent without also seeing the claim.
-                        Recovery::Lead {
-                            server: Box::new(server),
-                            action,
-                            claim: self.claim_server(server_name),
+                            // Claim the recovery while still holding the
+                            // servers lock, so a concurrent failing call
+                            // cannot observe the server absent without also
+                            // seeing the claim.
+                            Recovery::Lead {
+                                server: Box::new(server),
+                                action,
+                                claim: self.claim_server(server_name),
+                            }
+                        } else {
+                            servers.insert(server_name.to_string(), server);
+                            Recovery::Retry
                         }
                     } else {
                         // Absent with a claim parked: a concurrent call is
@@ -996,10 +1059,7 @@ impl McpClientManager {
                     } => {
                         let result = server.reestablish().await;
                         if result.is_ok() {
-                            self.servers
-                                .write()
-                                .await
-                                .insert(server_name.to_string(), *server);
+                            insert_server(&self.servers, server_name, *server).await;
                         }
                         drop(claim);
                         if let Err(reestablish_err) = result {
@@ -1016,6 +1076,7 @@ impl McpClientManager {
                     Recovery::Follow(mut receiver) => {
                         let _ = receiver.changed().await;
                     }
+                    Recovery::Retry => {}
                 }
             }
         }
@@ -1214,6 +1275,15 @@ impl McpClientManager {
         &self,
         configs: Vec<(String, McpServerConfig)>,
     ) -> McpReloadResult {
+        // Settle in-flight holds before reconciling: a server held out of
+        // the map for a refresh or recovery would otherwise be misread as
+        // newly added (starting a duplicate connection that races the
+        // holder's reinsert) or missed by the removal sweep.
+        let parked: Vec<String> = self.recovering_map().keys().cloned().collect();
+        for name in parked {
+            self.await_claim_release(&name).await;
+        }
+
         let config_names: std::collections::HashSet<String> =
             configs.iter().map(|(n, _)| n.clone()).collect();
 
@@ -1264,7 +1334,7 @@ impl McpClientManager {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
                                 let tool_count = server.tools.len();
-                                servers.write().await.insert(name.clone(), server);
+                                insert_server(&servers, &name, server).await;
                                 tracing::info!(
                                     server = %name,
                                     tools = tool_count,
@@ -1306,7 +1376,7 @@ impl McpClientManager {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
                                 let tool_count = server.tools.len();
-                                servers.write().await.insert(name.clone(), server);
+                                insert_server(&servers, &name, server).await;
                                 (name, Ok(tool_count))
                             }
                             Err(error) => (name, Err(error)),
@@ -1808,6 +1878,7 @@ mod tests {
             transport: Box::new(transport),
             tools: Vec::new(),
             config,
+            generation: next_generation(),
             tools_changed: AtomicBool::new(false),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
         };
@@ -2011,6 +2082,10 @@ for line in sys.stdin:
         if crash_file and os.path.exists(crash_file):
             os.remove(crash_file)
             os._exit(2)
+        if os.environ.get("MCP_EMIT_PING"):
+            # A server-initiated request whose id collides with the client's.
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "method": "ping"}) + "\n")
+            sys.stdout.flush()
         send(req_id, {"content": [{"type": "text", "text": f"label={label};env={os.environ.get('MCP_TEST_VALUE', '')}"}]})
     elif req_id is not None:
         send(req_id, {})
@@ -2269,6 +2344,30 @@ for line in sys.stdin:
 
         assert_eq!(output, "label=v2;env=env2");
         assert_eq!(marker_lines(&marker).len(), 3);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stdio_server_request_with_colliding_id_is_not_mistaken_for_reply() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let manager = McpClientManager::new();
+        let mut config = fixture_config(&script, &marker, "v1", "env1");
+        as_stdio_mut(&mut config)
+            .2
+            .insert("MCP_EMIT_PING".to_string(), "1".to_string());
+        connect_fixture(&manager, &config).await;
+
+        // The fixture emits a server-initiated `ping` request reusing the
+        // call's own id before answering; it must be forwarded to the sink,
+        // not parsed as a result-less reply that fails the call.
+        let output = manager
+            .call_tool("fixture", "report", serde_json::json!({}))
+            .await
+            .expect("ping must not be mistaken for the reply");
+
+        assert_eq!(output, "label=v1;env=env1");
         manager.shutdown().await;
     }
 }
