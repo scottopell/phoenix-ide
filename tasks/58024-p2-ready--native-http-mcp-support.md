@@ -16,12 +16,16 @@ review rounds (~51 findings), so treat it, not this file, as the source of truth
 for exact contracts (typed `TransportError`, the `ServerMessageSink`,
 authorization-server-keyed registrations, token↔resource binding, etc.).
 
-**Next actionable: M1** — extract the `McpTransport` trait and turn
-`McpServerConfig` into a `Stdio | Http` enum, *zero behavior change*. Spin it
-into its own task (`taskmd new --slug mcp-transport-trait`), implement against
-`specs/mcp/`, and keep the existing stdio tests green. Then M2 → M3 → M4 → M5
-per the milestone list. `executive.md`'s status table tracks which REQs each
-milestone covers.
+**M1 (tasks/58025) and M2 (tasks/58026) are done.** The `McpTransport` trait +
+`Stdio | Http` config enum landed with stdio behind `StdioTransport`
+(`mcp/stdio.rs`), and the Streamable HTTP substrate landed as `HttpTransport`
+(`mcp/http.rs`): `type: "http"` entries are no longer skipped, static
+bearer/header auth works, sessions + protocol-version headers + reconnect
+semantics are in. **Next actionable: M3 (OAuth 2.1)** — the headline and the
+first releasable unit (M2+M3). Spin it into its own task, implement against
+`specs/mcp/` (discovery → registration → PKCE → token store), and close task
+08639. Then M4 → M5 per the milestone list. `executive.md`'s status table
+tracks which REQs each milestone covers.
 
 ## Where we are today
 
