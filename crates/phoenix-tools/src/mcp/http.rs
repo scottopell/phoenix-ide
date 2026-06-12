@@ -61,6 +61,18 @@ impl HttpTransport {
     ) -> Result<Self, String> {
         let mut base_headers = HeaderMap::new();
         for (key, value) in headers {
+            // An Authorization header is a credential, and credentials are
+            // classified through `auth` (REQ-MCP-008). Smuggled in as a
+            // generic header it would both dodge the StaticAuthRejected
+            // semantics and ride alongside an OAuth bearer as a second
+            // Authorization value once a flow completes. Reject loudly
+            // rather than silently misclassify.
+            if key.eq_ignore_ascii_case("authorization") {
+                return Err(format!(
+                    "MCP server '{name}': 'Authorization' is a credential and cannot be a \
+                     generic header; configure it as auth.bearer or auth.headers"
+                ));
+            }
             insert_header(&mut base_headers, name, key, value)?;
         }
         match auth {
@@ -1116,6 +1128,34 @@ mod tests {
         );
         let err = auth.err().expect("auth header must be rejected");
         assert!(err.contains("transport-managed"), "got: {err}");
+
+        // Authorization is a credential: as a generic header it would dodge
+        // the auth classification and collide with an OAuth bearer. The SAME
+        // key under auth.headers is the explicit static-credential form and
+        // stays accepted.
+        let smuggled = HttpTransport::connect(
+            "s",
+            "http://127.0.0.1:1/mcp",
+            &HashMap::from([("Authorization".to_string(), "Bearer tok".to_string())]),
+            &HttpAuth::None,
+            Arc::default(),
+        );
+        let err = smuggled
+            .err()
+            .expect("generic Authorization must be rejected");
+        assert!(err.contains("auth.bearer or auth.headers"), "got: {err}");
+
+        let explicit = HttpTransport::connect(
+            "s",
+            "http://127.0.0.1:1/mcp",
+            &HashMap::new(),
+            &HttpAuth::Static(StaticCred::Headers(HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer tok".to_string(),
+            )]))),
+            Arc::default(),
+        );
+        assert!(explicit.is_ok(), "auth.headers Authorization stays valid");
     }
 
     #[derive(Default)]
@@ -2772,6 +2812,171 @@ mod tests {
             "the pre-configured client must be reused (OAuthClientReused)"
         );
         assert!(server.recorded_for_path("/register").is_empty());
+    }
+
+    #[tokio::test]
+    async fn authorization_flow_skips_an_unusable_advertised_server() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        let base = server.base();
+        // The PRM advertises a dead issuer first; its metadata candidates all
+        // 404. The flow must fall through to the live sibling instead of
+        // failing (REQ-MCP-009).
+        server.route(
+            "/.well-known/oauth-protected-resource/mcp",
+            json_doc(&serde_json::json!({
+                "authorization_servers": [format!("{base}/down"), base],
+            })),
+        );
+        let not_found = CannedResponse {
+            status: 404,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: "{}".to_string(),
+            delay_ms: 0,
+            echo_result: None,
+        };
+        server.route(
+            "/.well-known/oauth-authorization-server/down",
+            not_found.clone(),
+        );
+        server.route("/.well-known/openid-configuration/down", not_found.clone());
+        server.route("/down/.well-known/openid-configuration", not_found);
+        server.route(
+            "/.well-known/oauth-authorization-server",
+            json_doc(&serde_json::json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "registration_endpoint": format!("{base}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            })),
+        );
+        server.route(
+            "/register",
+            json_doc(&serde_json::json!({"client_id": "cid-live"})),
+        );
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("connect blocks on authorization");
+
+        let auth_url = pending_auth_url(&manager).await.expect("pending url");
+        assert_eq!(
+            query_params(&auth_url).get("client_id").map(String::as_str),
+            Some("cid-live"),
+            "the live advertised issuer must be used"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_flow_prefers_the_issuer_with_a_registration() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        let base = server.base();
+        // Two usable issuers; only the SECOND has a client registration. It
+        // must be chosen — picking the first would force DCR even though the
+        // user pre-registered a client with its sibling (REQ-MCP-010).
+        server.route(
+            "/.well-known/oauth-protected-resource/mcp",
+            json_doc(&serde_json::json!({
+                "authorization_servers": [base, format!("{base}/tenant")],
+            })),
+        );
+        server.route(
+            "/.well-known/oauth-authorization-server",
+            json_doc(&serde_json::json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "registration_endpoint": format!("{base}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            })),
+        );
+        server.route(
+            "/.well-known/oauth-authorization-server/tenant",
+            json_doc(&serde_json::json!({
+                "issuer": format!("{base}/tenant"),
+                "authorization_endpoint": format!("{base}/tenant/authorize"),
+                "token_endpoint": format!("{base}/tenant/token"),
+                "code_challenge_methods_supported": ["S256"],
+            })),
+        );
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        manager
+            .oauth
+            .store()
+            .upsert_registration(&OAuthRegistrationRecord {
+                auth_server: format!("{base}/tenant"),
+                client_id: "ten-1".to_string(),
+                client_secret: None,
+                token_endpoint_auth_method: "none".to_string(),
+            })
+            .await
+            .unwrap();
+        connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("connect blocks on authorization");
+
+        let auth_url = pending_auth_url(&manager).await.expect("pending url");
+        let params = query_params(&auth_url);
+        assert_eq!(params.get("client_id").map(String::as_str), Some("ten-1"));
+        assert!(
+            auth_url.starts_with(&format!("{base}/tenant/authorize")),
+            "the registered issuer's endpoints must be used, got: {auth_url}"
+        );
+        assert!(
+            server.recorded_for_path("/register").is_empty(),
+            "no DCR when a sibling issuer already has a registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_bearer_token_type_fails_the_flow() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        install_oauth_discovery(&server, true);
+        server.route(
+            "/register",
+            json_doc(&serde_json::json!({"client_id": "cid-1"})),
+        );
+        server.route(
+            "/token",
+            json_doc(&serde_json::json!({
+                "access_token": "dpop-tok",
+                "token_type": "DPoP",
+            })),
+        );
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("connect blocks on authorization");
+        let auth_url = pending_auth_url(&manager).await.expect("pending url");
+        let state = query_params(&auth_url).get("state").unwrap().clone();
+
+        let err = manager
+            .complete_oauth_authorization(&state, "code-1", Some(&server.base()))
+            .await
+            .expect_err("a non-Bearer token must fail the flow");
+        assert!(err.contains("unsupported token_type"), "got: {err}");
+
+        // Nothing was persisted, and the flow stays retryable.
+        assert!(manager
+            .oauth
+            .store()
+            .token("remote")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(pending_auth_url(&manager).await.is_some());
     }
 
     #[tokio::test]

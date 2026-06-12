@@ -247,10 +247,14 @@ fn starts_with_bearer(value: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The canonical resource URI a token is audience-bound to: the MCP server's
-/// URL with scheme and host lowercased, the default port and any fragment
-/// dropped. Both the `resource` parameter on authorization/token requests and
-/// the stored-token match at restore time use this form, so the comparison is
-/// stable against cosmetic config edits while a real repoint still mismatches.
+/// URL with scheme and host lowercased and the default port and any fragment
+/// dropped. Path bytes are preserved — `/mcp/` and `/mcp` are distinct
+/// resources, and rewriting one to the other would request a token for an
+/// audience the server does not accept; only the bare root path normalizes to
+/// no path at all. Both the `resource` parameter on authorization/token
+/// requests and the stored-token match at restore time use this form, so the
+/// comparison is stable against cosmetic config edits while a real repoint
+/// still mismatches.
 #[must_use]
 pub fn canonical_resource(url: &str) -> String {
     let Ok(mut parsed) = reqwest::Url::parse(url) else {
@@ -265,7 +269,10 @@ pub fn canonical_resource(url: &str) -> String {
         (Some(443), "https") | (Some(80), "http") | (None, _) => String::new(),
         (Some(p), _) => format!(":{p}"),
     };
-    let path = parsed.path().trim_end_matches('/');
+    let path = match parsed.path() {
+        "/" => "",
+        path => path,
+    };
     let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
     format!("{scheme}://{host}{port}{path}{query}")
 }
@@ -735,6 +742,19 @@ async fn token_grant(
         .ok_or_else(|| {
             TokenGrantError::Rejected("token response missing access_token".to_string())
         })?;
+    // The token rides as `Authorization: Bearer …`; a non-Bearer grant (e.g.
+    // DPoP) would be silently misused and surface as opaque 401/refresh
+    // loops, so it fails the flow here instead. An omitted token_type is
+    // noncompliant (RFC 6749 §5.1) but always means Bearer in practice.
+    match doc.get("token_type").and_then(Value::as_str) {
+        Some(token_type) if !token_type.eq_ignore_ascii_case("bearer") => {
+            return Err(TokenGrantError::Rejected(format!(
+                "unsupported token_type '{token_type}'; only Bearer tokens can be attached"
+            )));
+        }
+        Some(_) => {}
+        None => tracing::debug!("token response omitted token_type; assuming Bearer"),
+    }
     let expires_at = doc
         .get("expires_in")
         .and_then(Value::as_i64)
@@ -881,8 +901,15 @@ mod tests {
     fn canonical_resource_normalizes_case_port_and_fragment() {
         assert_eq!(
             canonical_resource("HTTPS://Example.COM:443/MCP/#frag"),
-            "https://example.com/MCP"
+            "https://example.com/MCP/"
         );
+        // Path bytes are preserved: a trailing slash names a different
+        // resource, and only the bare root path normalizes away.
+        assert_ne!(
+            canonical_resource("https://host/mcp/"),
+            canonical_resource("https://host/mcp")
+        );
+        assert_eq!(canonical_resource("https://host/"), "https://host");
         assert_eq!(
             canonical_resource("http://host:8080/mcp"),
             "http://host:8080/mcp"

@@ -923,6 +923,45 @@ enum RefreshFailure {
     Transient(String),
 }
 
+/// Resolve a usable authorization server from the resource's advertised list
+/// (REQ-MCP-009, REQ-MCP-010): the first issuer with both valid metadata and
+/// an existing client registration wins; otherwise the first with valid
+/// metadata (the DCR fallback). An advertised server that fails discovery
+/// (unreachable, no PKCE, malformed metadata) is skipped rather than failing
+/// the flow while a usable sibling remains.
+async fn resolve_authorization_server(
+    oauth_rt: &OAuthRuntime,
+    client: &reqwest::Client,
+    prm: &oauth::ProtectedResourceMetadata,
+) -> Result<(oauth::AuthServerMetadata, Option<OAuthRegistrationRecord>), String> {
+    let mut fallback: Option<oauth::AuthServerMetadata> = None;
+    let mut errors: Vec<String> = Vec::new();
+    for issuer in &prm.authorization_servers {
+        let metadata = match oauth::fetch_auth_server_metadata(client, issuer).await {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        match oauth_rt.store().registration(&metadata.issuer).await? {
+            Some(registration) => return Ok((metadata, Some(registration))),
+            None => {
+                if fallback.is_none() {
+                    fallback = Some(metadata);
+                }
+            }
+        }
+    }
+    match fallback {
+        Some(metadata) => Ok((metadata, None)),
+        None => Err(format!(
+            "no usable authorization server among those advertised: {}",
+            errors.join("; ")
+        )),
+    }
+}
+
 /// Refresh a server's token: re-discover the authorization server from the
 /// challenge (endpoints are not persisted), then exchange the refresh token,
 /// persisting the rotated credentials (REQ-MCP-012). Returns the new access
@@ -946,24 +985,18 @@ async fn oauth_refresh(
     let prm = oauth::fetch_protected_resource_metadata(&client, url, &challenge)
         .await
         .map_err(RefreshFailure::Transient)?;
-    let issuer = prm.authorization_servers[0].clone();
-    let metadata = oauth::fetch_auth_server_metadata(&client, &issuer)
+    let (metadata, registration) = resolve_authorization_server(oauth_rt, &client, &prm)
         .await
         .map_err(RefreshFailure::Transient)?;
-    let registration = oauth_rt
-        .store()
-        .registration(&metadata.issuer)
-        .await
-        .map_err(RefreshFailure::Transient)?
-        .ok_or_else(|| {
-            // Without a client identity the grant can never succeed; treat as
-            // a rejection so the dead token is discarded and a fresh flow
-            // (which registers a client) takes over.
-            RefreshFailure::Rejected(format!(
-                "no client registration for authorization server '{}'",
-                metadata.issuer
-            ))
-        })?;
+    let registration = registration.ok_or_else(|| {
+        // Without a client identity the grant can never succeed; treat as
+        // a rejection so the dead token is discarded and a fresh flow
+        // (which registers a client) takes over.
+        RefreshFailure::Rejected(format!(
+            "no client registration for authorization server '{}'",
+            metadata.issuer
+        ))
+    })?;
     let response = oauth::refresh_grant(
         &client,
         &metadata.token_endpoint,
@@ -1025,17 +1058,15 @@ async fn begin_oauth_flow(
         .unwrap_or_default();
 
     let prm = oauth::fetch_protected_resource_metadata(&client, url, &challenge).await?;
-    let issuer = prm.authorization_servers[0].clone();
-    let metadata = oauth::fetch_auth_server_metadata(&client, &issuer).await?;
+    let (metadata, cached_registration) =
+        resolve_authorization_server(oauth_rt, &client, &prm).await?;
 
     // Client identity preference (REQ-MCP-010): pre-configured/cached
     // registration (keyed by authorization server) → Client ID Metadata
     // Document → dynamic client registration. Phoenix hosts no client
     // metadata document, so the CIMD step resolves to nothing; logged so the
     // capability gap is visible.
-    let registration = if let Some(registration) =
-        oauth_rt.store().registration(&metadata.issuer).await?
-    {
+    let registration = if let Some(registration) = cached_registration {
         registration
     } else {
         {
@@ -1392,6 +1423,25 @@ impl McpClientManager {
         .await
         .map_err(|e| format!("MCP server '{name}': authorization code exchange failed: {e}"))?;
 
+        // Resolve the flow BEFORE persisting -- and only if it is still the
+        // one this callback authorized. A reload may have cancelled/replaced
+        // it during the exchange (a stale flow's token must not survive under
+        // the new config), or a newer flow may already have persisted its own
+        // token (which a stale exchange must not overwrite or delete). A dead
+        // flow's exchange result is simply discarded.
+        let resolved = {
+            let mut pending = self.oauth.pending.lock().unwrap();
+            match pending.get(&name) {
+                Some(current) if current.state_nonce == state_nonce => pending.remove(&name),
+                _ => None,
+            }
+        };
+        let Some(resolved) = resolved else {
+            return Err(format!(
+                "MCP server '{name}': the authorization flow was superseded during the exchange"
+            ));
+        };
+
         let record = OAuthTokenRecord {
             server_name: name.clone(),
             resource: flow.resource.clone(),
@@ -1409,22 +1459,6 @@ impl McpClientManager {
             .await
             .map_err(|e| format!("MCP server '{name}': failed to persist OAuth token: {e}"))?;
 
-        // Resolve the flow -- but only if it is still the one this callback
-        // authorized. A reload may have cancelled/replaced it during the
-        // exchange; its token must not survive under the new config.
-        let resolved = {
-            let mut pending = self.oauth.pending.lock().unwrap();
-            match pending.get(&name) {
-                Some(current) if current.state_nonce == state_nonce => pending.remove(&name),
-                _ => None,
-            }
-        };
-        let Some(resolved) = resolved else {
-            let _ = self.oauth.store().delete_token(&name).await;
-            return Err(format!(
-                "MCP server '{name}': the authorization flow was superseded during the exchange"
-            ));
-        };
         self.pending_oauth_urls.write().await.remove(&name);
         let claim = resolved.claim;
         let config = resolved.config;

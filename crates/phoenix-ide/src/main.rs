@@ -489,6 +489,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ip = bind_address.ip();
             let host = if ip.is_unspecified() || ip.is_loopback() {
                 "localhost".to_string()
+            } else if let std::net::IpAddr::V6(v6) = ip {
+                // An IPv6 literal needs brackets to form a valid authority
+                // next to the port.
+                format!("[{v6}]")
             } else {
                 ip.to_string()
             };
