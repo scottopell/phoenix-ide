@@ -96,6 +96,14 @@ impl std::fmt::Display for TransportError {
 /// transport boundary.
 pub trait ServerMessageSink: Send + Sync {
     fn on_message(&self, message: Value);
+
+    /// The transport observed its session reset out-of-band -- a session-bearing
+    /// GET-stream 404 (REQ-MCP-005, REQ-MCP-006). The stream cannot rebuild the
+    /// transport itself; marking the tool list stale routes the next
+    /// `tool_definitions` read through the lazy-refresh path, whose
+    /// `SessionExpired` re-establishes the connection (new session + fresh GET
+    /// stream). Default no-op for sinks with no such state.
+    fn on_session_reset(&self) {}
 }
 
 /// How a request's bytes leave and a response's bytes arrive. The JSON-RPC
@@ -387,6 +395,16 @@ impl ServerMessageSink for NotificationSink {
                 "Skipping server notification"
             );
         }
+    }
+
+    fn on_session_reset(&self) {
+        // The session is gone; force the next definitions read to re-verify,
+        // which re-establishes the connection on the expired-session tools/list.
+        tracing::info!(
+            server = %self.server,
+            "GET stream observed a session reset -- will re-establish on next definitions() call"
+        );
+        self.tools_changed.store(true, Ordering::Release);
     }
 }
 

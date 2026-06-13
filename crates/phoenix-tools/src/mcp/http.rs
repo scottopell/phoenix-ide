@@ -686,7 +686,20 @@ impl ServerStream {
     /// proceed reading the stream body.
     fn classify_stream_status(&self, status: reqwest::StatusCode) -> Option<StreamOutcome> {
         match status.as_u16() {
-            405 => Some(StreamOutcome::Unsupported),
+            // A session-bearing 404 means the session is gone: signal the
+            // protocol layer so the next definitions read re-establishes (new
+            // session + fresh GET stream) rather than leaving the server
+            // `ready` on a dead session (REQ-MCP-005); a re-GET on the dead
+            // session would only 404 again.
+            404 if self.session_id.is_some() => {
+                self.sink.on_session_reset();
+                Some(StreamOutcome::Fatal(
+                    "GET stream session expired (HTTP 404)".to_string(),
+                ))
+            }
+            // No stream offered here: 405 (method not allowed) or a 404 on a
+            // stateless server. Stop without reconnecting.
+            404 | 405 => Some(StreamOutcome::Unsupported),
             // With OAuth, a concurrent refresh may rotate the shared bearer;
             // reconnect and re-read it. Without OAuth there is nothing to
             // recover, so stop rather than loop on a permanent rejection.
@@ -698,12 +711,6 @@ impl ServerStream {
             401 | 403 => Some(StreamOutcome::Fatal(format!(
                 "GET stream rejected with HTTP {status}"
             ))),
-            // The session is gone. A request-path 404 rebuilds the whole
-            // transport (re-initialize), which spawns a fresh stream; a re-GET
-            // on the dead session would only 404 again.
-            404 => Some(StreamOutcome::Fatal(
-                "GET stream session expired (HTTP 404)".to_string(),
-            )),
             _ if !status.is_success() => Some(StreamOutcome::Disconnected {
                 productive: false,
                 reason: format!("GET stream returned HTTP {status}"),
@@ -1575,6 +1582,19 @@ mod tests {
         let err = auth.err().expect("auth header must be rejected");
         assert!(err.contains("transport-managed"), "got: {err}");
 
+        // Last-Event-ID is the GET stream's runtime resume cursor; a config
+        // copy would ride the initial open and duplicate on reconnect.
+        let resume = HttpTransport::connect(
+            "s",
+            "http://127.0.0.1:1/mcp",
+            &HashMap::from([("Last-Event-ID".to_string(), "42".to_string())]),
+            &HttpAuth::None,
+            Arc::default(),
+            discard_sink(),
+        );
+        let err = resume.err().expect("Last-Event-ID must be rejected");
+        assert!(err.contains("transport-managed"), "got: {err}");
+
         // Authorization is a credential: as a generic header it would dodge
         // the auth classification and collide with an OAuth bearer. The SAME
         // key under auth.headers is the explicit static-credential form and
@@ -1747,6 +1767,30 @@ mod tests {
             1,
             "a non-SSE 2xx response must stop the stream, not poll"
         );
+    }
+
+    #[tokio::test]
+    async fn server_initiated_stream_404_flags_session_reset() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        // The session-bearing GET stream observes the session expired (404). It
+        // must flag the server so the next definitions read re-establishes
+        // (REQ-MCP-005), not leave it ready on a dead session.
+        server.set_get_responses(vec![status_response(404, &[])]);
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+
+        wait_for("session-reset flag set from a GET-stream 404", || {
+            mcp.tools_changed.load(Ordering::Acquire)
+        })
+        .await;
+
+        // The GET carried the negotiated session, and the stream stopped rather
+        // than re-GETting a dead session in a loop.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let gets = server.get_recorded();
+        assert_eq!(gets.len(), 1, "a dead session must not be re-GETted");
+        assert_eq!(gets[0].header("mcp-session-id"), Some("sess-1"));
     }
 
     #[tokio::test]
