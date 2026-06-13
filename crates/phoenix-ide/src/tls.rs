@@ -76,7 +76,32 @@ pub(crate) struct LoadedConfig {
     pub mode: &'static str,
 }
 
+/// Whether a configured TLS host is a loopback name/address rather than an
+/// externally reachable domain.
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 impl ConfigSource {
+    /// The operator's chosen externally reachable host (the first non-loopback
+    /// `PHOENIX_TLS_HOSTS` entry), if any. This is the single domain that drives
+    /// both the TLS certificate and the OAuth redirect origin, so a remote
+    /// deployment needs no separate redirect knob (REQ-MCP-020). `None` for
+    /// manual TLS (the domain lives in the externally provided cert) -- those
+    /// rely on `PHOENIX_EXTERNAL_URL`.
+    pub(crate) fn external_host(&self) -> Option<String> {
+        match self {
+            Self::Auto { hosts, .. } => hosts.iter().find(|h| !is_loopback_host(h)).cloned(),
+            Self::Manual(_) => None,
+        }
+    }
+
     pub(crate) fn from_env(db_path: &str) -> Result<Option<Self>, Box<dyn Error>> {
         let cert_path = env::var_os("PHOENIX_TLS_CERT_PATH");
         let key_path = env::var_os("PHOENIX_TLS_KEY_PATH");

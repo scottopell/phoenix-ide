@@ -112,6 +112,154 @@ fn build_deployment_config(
     }
 }
 
+/// The canonical externally-reachable origin used as the OAuth redirect base
+/// (REQ-MCP-020): `PHOENIX_EXTERNAL_URL` if set, else derived from the scheme
+/// (TLS presence), the operator's TLS host (the reachable domain set for the
+/// certificate), and the bind address. Reading the env var here keeps
+/// `resolve_external_origin` pure and unit-testable.
+fn canonical_external_origin(
+    bind_address: SocketAddr,
+    tls_loaded: bool,
+    external_host: Option<String>,
+) -> String {
+    let explicit = std::env::var("PHOENIX_EXTERNAL_URL")
+        .ok()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty());
+    resolve_external_origin(explicit, tls_loaded, external_host, bind_address)
+}
+
+/// Pure core of [`canonical_external_origin`]. `explicit` is an operator
+/// override; `external_host` is the reachable domain from the TLS config.
+fn resolve_external_origin(
+    explicit: Option<String>,
+    tls_loaded: bool,
+    external_host: Option<String>,
+    bind_address: SocketAddr,
+) -> String {
+    if let Some(external) = explicit {
+        return external;
+    }
+    let scheme = if tls_loaded { "https" } else { "http" };
+    let host = external_host.unwrap_or_else(|| {
+        let ip = bind_address.ip();
+        if ip.is_unspecified() || ip.is_loopback() {
+            "localhost".to_string()
+        } else if let std::net::IpAddr::V6(v6) = ip {
+            // An IPv6 literal needs brackets to form a valid authority.
+            format!("[{v6}]")
+        } else {
+            ip.to_string()
+        }
+    });
+    let port = bind_address.port();
+    let default_port = if tls_loaded { 443 } else { 80 };
+    if port == default_port {
+        format!("{scheme}://{host}")
+    } else {
+        format!("{scheme}://{host}:{port}")
+    }
+}
+
+/// Whether a redirect base's host is a loopback name/address -- the signal that
+/// an all-interfaces deployment has no reachable name configured.
+fn redirect_is_loopback(redirect_base: &str) -> bool {
+    let authority = redirect_base
+        .split_once("://")
+        .map_or(redirect_base, |(_, rest)| rest)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    // Strip the port; an IPv6 literal is bracketed, so split a port only after
+    // the closing bracket.
+    let host = match authority.rsplit_once(']') {
+        Some((bracketed, _)) => bracketed.trim_start_matches('['),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod external_origin_tests {
+    use super::{redirect_is_loopback, resolve_external_origin};
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("addr")
+    }
+
+    #[test]
+    fn local_bind_derives_localhost() {
+        // No TLS, loopback or all-interfaces bind, no domain -> localhost.
+        assert_eq!(
+            resolve_external_origin(None, false, None, addr("127.0.0.1:8042")),
+            "http://localhost:8042"
+        );
+        assert_eq!(
+            resolve_external_origin(None, false, None, addr("0.0.0.0:8031")),
+            "http://localhost:8031"
+        );
+    }
+
+    #[test]
+    fn tls_domain_drives_the_origin() {
+        // The reachable TLS domain is the canonical host; the default https
+        // port is dropped, a non-default port kept (REQ-MCP-020).
+        assert_eq!(
+            resolve_external_origin(
+                None,
+                true,
+                Some("phoenix.example.com".into()),
+                addr("0.0.0.0:443")
+            ),
+            "https://phoenix.example.com"
+        );
+        assert_eq!(
+            resolve_external_origin(
+                None,
+                true,
+                Some("phoenix.example.com".into()),
+                addr("0.0.0.0:8443")
+            ),
+            "https://phoenix.example.com:8443"
+        );
+    }
+
+    #[test]
+    fn explicit_override_wins_over_the_derived_host() {
+        assert_eq!(
+            resolve_external_origin(
+                Some("https://proxy.example".into()),
+                false,
+                Some("ignored.example".into()),
+                addr("0.0.0.0:8031")
+            ),
+            "https://proxy.example"
+        );
+    }
+
+    #[test]
+    fn non_loopback_ip_bind_uses_the_ip() {
+        assert_eq!(
+            resolve_external_origin(None, false, None, addr("192.168.1.5:8042")),
+            "http://192.168.1.5:8042"
+        );
+    }
+
+    #[test]
+    fn loopback_detection_covers_names_and_literals() {
+        assert!(redirect_is_loopback("http://localhost:8042"));
+        assert!(redirect_is_loopback("http://127.0.0.1:8042"));
+        assert!(redirect_is_loopback("https://[::1]:8443"));
+        assert!(!redirect_is_loopback("https://phoenix.example.com"));
+        assert!(!redirect_is_loopback("http://192.168.1.5:8042"));
+    }
+}
+
 /// Build the on-disk location rows reported by `GET /api/deployment`, each with
 /// its sizing policy. Every path is normalized to absolute.
 fn build_disk_locations(
@@ -466,46 +614,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The MCP OAuth callback redirect must point at an address the
-    // *operator's browser* can reach. PHOENIX_EXTERNAL_URL pins it for
-    // remote deployments — an all-interfaces bind says nothing about the
-    // name remote browsers reach the host by, so the derived fallback
-    // (localhost for unspecified/loopback binds, the bare IP otherwise) only
-    // serves same-machine access. With the redirect base known, background
-    // MCP discovery (which may immediately hit a 401 and start an OAuth
-    // flow) can start.
+    // *operator's browser* can reach. It is the canonical external origin,
+    // derived from the TLS host config (the reachable domain the operator
+    // already sets for the certificate) so a remote deployment needs no
+    // separate redirect knob (REQ-MCP-020); PHOENIX_EXTERNAL_URL overrides it
+    // for proxy-terminated TLS / manual certs. With the redirect base known,
+    // background MCP discovery (which may immediately hit a 401 and start an
+    // OAuth flow) can start.
     {
-        let configured = std::env::var("PHOENIX_EXTERNAL_URL")
-            .ok()
-            .map(|url| url.trim().trim_end_matches('/').to_string())
-            .filter(|url| !url.is_empty());
-        let redirect_base = if let Some(external) = configured {
-            external
-        } else {
-            let scheme = if loaded_tls.is_some() {
-                "https"
-            } else {
-                "http"
-            };
-            let ip = bind_address.ip();
-            let host = if ip.is_unspecified() || ip.is_loopback() {
-                "localhost".to_string()
-            } else if let std::net::IpAddr::V6(v6) = ip {
-                // An IPv6 literal needs brackets to form a valid authority
-                // next to the port.
-                format!("[{v6}]")
-            } else {
-                ip.to_string()
-            };
-            if ip.is_unspecified() {
-                tracing::info!(
-                    "MCP OAuth redirect base defaulting to {scheme}://localhost:{}; set \
-                     PHOENIX_EXTERNAL_URL to the browser-reachable URL when operating \
-                     Phoenix from another machine",
-                    bind_address.port()
-                );
-            }
-            format!("{scheme}://{host}:{}", bind_address.port())
-        };
+        let redirect_base = canonical_external_origin(
+            bind_address,
+            loaded_tls.is_some(),
+            tls_source
+                .as_ref()
+                .and_then(tls::ConfigSource::external_host),
+        );
+        // An all-interfaces bind that still resolves to loopback has no
+        // reachable name configured: the callback would point a remote browser
+        // at localhost and fail. Surface the fix rather than failing silently.
+        if bind_address.ip().is_unspecified() && redirect_is_loopback(&redirect_base) {
+            tracing::warn!(
+                redirect_base = %redirect_base,
+                "MCP OAuth redirect resolves to loopback on an all-interfaces bind; set \
+                 PHOENIX_TLS_HOSTS to your reachable domain (or PHOENIX_EXTERNAL_URL) so a \
+                 remote browser can complete the authorization round trip"
+            );
+        }
         mcp_manager.set_oauth_redirect_base(redirect_base);
     }
     mcp_manager.start_background_discovery();
