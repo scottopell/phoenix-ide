@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { useLastSseEventAtRef } from '../conversation/useConversationAtom';
 import { FolderTree } from 'lucide-react';
@@ -8,7 +8,7 @@ import type { ConnectionState } from '../hooks';
 import { useIsMobile } from '../hooks';
 import { getStateDescription, isAgentWorking } from '../utils';
 import { ContextIndicator } from './ContextIndicator';
-import { prBadgeClass, prBadgeLabel, prRefreshStaleText, prTooltip, unavailablePrHint } from './prBadge';
+import { prBadgeClass, prBadgeLabel, prTooltip, unavailablePrHint } from './prBadge';
 
 const CheckIcon = () => (
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -145,48 +145,29 @@ function getProjectName(conversation: Conversation): string | null {
   return parts[parts.length - 1] || null;
 }
 
-function prCheckStatusText(pr: PrStatusResponse): string {
-  switch (pr.check_state) {
-    case 'passing': return 'Passed';
-    case 'pending': return 'Pending';
-    case 'failing': return 'Failed';
-    default: return 'Unknown';
-  }
-}
-
-function prSummaryText(pr: PrStatusResponse): string {
-  const s = pr.check_summary;
-  if (!s) return 'No check details available';
-  return `${s.passing} pass · ${s.pending} pending · ${s.failing} fail · ${s.skipped} skip · ${s.unknown} unknown`;
-}
-
-function PrStatusPopover({ pr }: { pr: PrStatusResponse }) {
-  const attentionNames = [
-    ...(pr.check_summary?.failing_names ?? []),
-    ...(pr.check_summary?.pending_names ?? []),
-  ].slice(0, 5);
+function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
+  if (!pr.url) return null;
+  const stopPropagation = (event: ReactMouseEvent<HTMLAnchorElement>) => {
+    event.stopPropagation();
+  };
   return (
-    <div className="pr-popover" role="dialog" aria-label="PR CI monitoring">
-      {pr.refresh.stale && (
-        <div className="pr-popover-muted">Stale PR data; {prRefreshStaleText(pr)}.</div>
-      )}
-      <div className="pr-popover-row">
-        <span>CI</span>
-        <strong>{prCheckStatusText(pr)}</strong>
-      </div>
-      <div className="pr-popover-muted">{prSummaryText(pr)}</div>
-      {attentionNames.length > 0 && (
-        <div className="pr-popover-list" title={attentionNames.join('\n')}>
-          {attentionNames.join(' · ')}
-        </div>
-      )}
-      {pr.feedback_summary && (
-        <div className="pr-popover-muted">
-          PR feedback: {pr.feedback_summary.unresolved} unresolved / {pr.feedback_summary.total} found
-        </div>
-      )}
-      {pr.url && <a href={pr.url} target="_blank" rel="noreferrer">Open PR/checks ↗</a>}
-    </div>
+    <span className="pr-control">
+      <a
+        href={pr.url}
+        target="_blank"
+        rel="noreferrer"
+        className={prBadgeClass(pr)}
+        title={prTooltip(pr)}
+        onClick={stopPropagation}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.stopPropagation();
+          }
+        }}
+      >
+        {prBadgeLabel(pr)}
+      </a>
+    </span>
   );
 }
 
@@ -235,7 +216,6 @@ export function StateBar({
   void _deprecatedToolStartedAt;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
-  const [prPopoverOpen, setPrPopoverOpen] = useState(false);
   // Mobile breakpoint mirrors the @media (max-width: 768px) block in index.css.
   const isMobile = useIsMobile();
   const [mobileExpanded, setMobileExpanded] = useState(false);
@@ -246,7 +226,6 @@ export function StateBar({
     if (!isMobile) setMobileExpanded(false);
   }, [isMobile]);
   const pickerRef = useRef<HTMLSpanElement>(null);
-  const prRef = useRef<HTMLSpanElement>(null);
 
   // Live elapsed-time counter, generalized for every working phase
   // (REQ-WPV-001 / REQ-WPV-003). The source of truth is the server-
@@ -381,26 +360,6 @@ export function StateBar({
     document.addEventListener('keydown', handleKey);
     return () => document.removeEventListener('keydown', handleKey);
   }, [pickerOpen]);
-
-  useEffect(() => {
-    if (!prPopoverOpen) return;
-    const handleClick = (e: MouseEvent) => {
-      if (!prRef.current || !prRef.current.contains(e.target as Node)) {
-        setPrPopoverOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [prPopoverOpen]);
-
-  useEffect(() => {
-    if (!prPopoverOpen) return;
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setPrPopoverOpen(false);
-    };
-    document.addEventListener('keydown', handleKey);
-    return () => document.removeEventListener('keydown', handleKey);
-  }, [prPopoverOpen]);
 
   let dotClass = 'dot';
   let stateText = '';
@@ -758,23 +717,7 @@ export function StateBar({
                       <span className="git-base">{baseBranch}</span>
                       <span className="git-arrow">&larr;</span>
                       <span className="git-branch">{branchName}</span>
-                      {prStatus?.found && prStatus.url && (
-                        <span className="pr-control" ref={prRef}>
-                          <button
-                            type="button"
-                            className={prBadgeClass(prStatus)}
-                            title={prTooltip(prStatus)}
-                            aria-haspopup="dialog"
-                            aria-expanded={prPopoverOpen}
-                            onClick={() => setPrPopoverOpen(v => !v)}
-                          >
-                            {prBadgeLabel(prStatus)}
-                          </button>
-                          {prPopoverOpen && conversation && (
-                            <PrStatusPopover pr={prStatus} />
-                          )}
-                        </span>
-                      )}
+                      {prStatus?.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
                       {prHint && !prLoading && (
                         <span className="pr-hint" title="Install and authenticate GitHub CLI to enable PR tracking">
                           {prHint}
@@ -785,23 +728,7 @@ export function StateBar({
                   {branchName && !baseBranch && (
                     <span className="git-branch-solo" title={`Branch: ${branchName}`}>
                       {branchName}
-                      {prStatus?.found && prStatus.url && (
-                        <span className="pr-control" ref={prRef}>
-                          <button
-                            type="button"
-                            className={prBadgeClass(prStatus)}
-                            title={prTooltip(prStatus)}
-                            aria-haspopup="dialog"
-                            aria-expanded={prPopoverOpen}
-                            onClick={() => setPrPopoverOpen(v => !v)}
-                          >
-                            {prBadgeLabel(prStatus)}
-                          </button>
-                          {prPopoverOpen && conversation && (
-                            <PrStatusPopover pr={prStatus} />
-                          )}
-                        </span>
-                      )}
+                      {prStatus?.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
                       {prHint && !prLoading && (
                         <span className="pr-hint" title="Install and authenticate GitHub CLI to enable PR tracking">
                           {prHint}

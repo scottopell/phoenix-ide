@@ -307,6 +307,7 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     );
     const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
     expect(mark.textContent).toMatch(/Clean up merged PR/i);
+    expect(mark).toHaveClass('work-actions-complete--merged');
     expect(mark.disabled).toBe(false);
   });
 

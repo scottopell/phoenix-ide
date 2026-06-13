@@ -74,6 +74,7 @@ function deriveWorkLifecycleControls({
     visible,
     hasContinuation,
     prStatus,
+    prMerged,
     prClosedUnmerged,
     prUnavailable,
     prBlocksCleanup,
@@ -189,7 +190,7 @@ export function WorkControlBar({ conversationId, convModeLabel, phaseType, conti
         />
       )}
       <button
-        className="work-actions-btn work-actions-complete"
+        className={`work-actions-btn work-actions-complete${lifecycle.prMerged ? ' work-actions-complete--merged' : ''}`}
         disabled={lifecycle.completeDisabled}
         title={lifecycle.completeTitle}
         data-testid="mark-merged-button"

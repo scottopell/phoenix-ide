@@ -3083,59 +3083,6 @@ pre:hover .copy-btn {
   display: inline-flex;
 }
 
-.pr-popover {
-  position: absolute;
-  z-index: 50;
-  left: 0;
-  top: calc(100% + 6px);
-  width: 280px;
-  padding: 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  background: var(--bg-elevated);
-  box-shadow: 0 10px 30px rgb(0 0 0 / 35%);
-  color: var(--text-primary);
-  font-size: 12px;
-  line-height: 1.4;
-}
-
-.pr-popover-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 4px;
-}
-
-.pr-popover-muted,
-.pr-popover-list {
-  color: var(--text-muted);
-  font-size: 11px;
-  margin-bottom: 6px;
-}
-
-.pr-popover-list {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.pr-autofix-btn {
-  width: 100%;
-  margin-top: 8px;
-  padding: 5px 8px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: var(--bg-secondary);
-  color: var(--text-primary);
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.pr-autofix-btn:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
 .pr-hint {
   font-size: 10px;
   color: var(--text-muted);
@@ -8509,6 +8456,16 @@ html * {
 .work-actions-complete:hover:not(:disabled) {
   background: color-mix(in srgb, var(--accent-green, #22c55e) 10%, transparent);
   border-color: var(--accent-green, #22c55e);
+}
+
+.work-actions-complete--merged {
+  color: #c084fc;
+  border-color: color-mix(in srgb, #a855f7 45%, transparent);
+}
+
+.work-actions-complete--merged:hover:not(:disabled) {
+  background: color-mix(in srgb, #a855f7 14%, transparent);
+  border-color: #a855f7;
 }
 
 .work-actions-pr-remediate {

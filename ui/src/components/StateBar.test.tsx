@@ -171,8 +171,11 @@ describe('StateBar PR badge', () => {
       check_state: state.check_state,
     }) });
 
-    const badge = await screen.findByRole('button', { name: label });
+    const badge = await screen.findByRole('link', { name: label });
     expect(badge).toHaveClass('pr-badge', className);
+    expect(badge).toHaveAttribute('href', 'https://github.com/scottopell/phoenix-ide/pull/12');
+    expect(badge).toHaveAttribute('target', '_blank');
+    expect(badge).toHaveAttribute('rel', 'noreferrer');
     expect(badge.getAttribute('title')).toContain('Add PR tracking');
   });
 
@@ -186,7 +189,7 @@ describe('StateBar PR badge', () => {
     renderStateBar({ prStatus: mockPrStatus({ found: false, unavailable_reason: 'not_authenticated' }) });
 
     expect(screen.getByText('gh auth')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /^#\d+/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /^#\d+/ })).not.toBeInTheDocument();
   });
 
   it('does not fetch PR status itself for conversations without a branch', async () => {
@@ -196,7 +199,7 @@ describe('StateBar PR badge', () => {
     expect(api.getPrStatus).not.toHaveBeenCalled();
   });
 
-  it('opens read-only CI popover without remediation action', async () => {
+  it('renders PR status as a direct PR link instead of an inline popover trigger', async () => {
     renderStateBar({ prStatus: mockPrStatus({
       found: true,
       number: 12,
@@ -220,8 +223,13 @@ describe('StateBar PR badge', () => {
       feedback_summary: { total: 2, unresolved: 2, items: [], coverage: [] },
     }) });
 
-    fireEvent.click(await screen.findByRole('button', { name: /#12 checks ✗/i }));
-    expect(await screen.findByRole('dialog', { name: /PR CI monitoring/i })).toBeInTheDocument();
+    const badge = await screen.findByRole('link', { name: /#12 checks ✗/i });
+    expect(badge).toHaveClass('pr-badge', 'pr-badge--failing');
+    expect(badge).toHaveAttribute('href', 'https://github.com/scottopell/phoenix-ide/pull/12');
+    expect(badge).toHaveAttribute('target', '_blank');
+    expect(badge).toHaveAttribute('rel', 'noreferrer');
+    expect(badge.getAttribute('title')).toContain('Fix CI');
+    expect(screen.queryByRole('dialog', { name: /PR CI monitoring/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Auto-fix CI & address comments/i })).not.toBeInTheDocument();
     expect(api.createPrAutoFixContext).not.toHaveBeenCalled();
   });
