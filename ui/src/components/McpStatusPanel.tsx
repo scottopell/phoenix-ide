@@ -145,13 +145,15 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     });
   }, []);
 
-  const enabledServers = servers.filter(s => s.enabled);
-  const totalTools = enabledServers.reduce((sum, s) => sum + s.tool_count, 0);
-  const disabledCount = servers.length - enabledServers.length;
+  const readyServers = servers.filter(s => s.state === 'ready');
+  const enabledReady = readyServers.filter(s => s.enabled);
+  const totalTools = enabledReady.reduce((sum, s) => sum + s.tool_count, 0);
+  const disabledCount = readyServers.filter(s => !s.enabled).length;
 
-  const pendingOAuth = servers.filter(s => s.pending_oauth_url);
+  const pendingOAuth = servers.filter(s => s.state === 'unauthorized');
+  const failedServers = servers.filter(s => s.state === 'failed');
 
-  if (servers.length === 0 && pendingOAuth.length === 0 && !expanded && !reloading) {
+  if (servers.length === 0 && !expanded && !reloading) {
     return null;
   }
 
@@ -170,19 +172,35 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
           </a>
         </div>
       ))}
+      {!reloading && failedServers.map(s => (
+        <div key={s.name} className="mcp-error-banner">
+          <span className="mcp-error-label">Failed:</span>
+          <span className="mcp-error-text" title={s.last_error}>
+            {s.name} &mdash; {s.last_error ?? 'connection failed'}
+          </span>
+        </div>
+      ))}
       <button className="mcp-panel-header" onClick={() => setExpanded(!expanded)}>
         <span className={`mcp-panel-chevron ${expanded ? 'expanded' : ''}`}>&#9654;</span>
         <span className="mcp-panel-summary">
-          {pendingOAuth.length > 0 && enabledServers.length === 0
-            ? <span className="mcp-auth-needed">MCP &middot; auth needed</span>
-            : servers.length === 0
-              ? 'No MCP servers'
-              : <>
-                  MCP &middot; {enabledServers.length} server{enabledServers.length !== 1 ? 's' : ''} &middot; {totalTools} tool{totalTools !== 1 ? 's' : ''} &middot; ~{Math.round(totalTools * 250 / 1000)}k tokens
-                  {disabledCount > 0 && (
-                    <span className="mcp-disabled-count"> ({disabledCount} off)</span>
-                  )}
-                </>
+          {servers.length === 0
+            ? 'No MCP servers'
+            : enabledReady.length === 0 && pendingOAuth.length > 0
+              ? <span className="mcp-auth-needed">MCP &middot; auth needed</span>
+              : enabledReady.length === 0 && failedServers.length > 0
+                ? <span className="mcp-failed-count">MCP &middot; {failedServers.length} failed</span>
+                : <>
+                    MCP &middot; {enabledReady.length} server{enabledReady.length !== 1 ? 's' : ''} &middot; {totalTools} tool{totalTools !== 1 ? 's' : ''} &middot; ~{Math.round(totalTools * 250 / 1000)}k tokens
+                    {disabledCount > 0 && (
+                      <span className="mcp-disabled-count"> ({disabledCount} off)</span>
+                    )}
+                    {failedServers.length > 0 && (
+                      <span className="mcp-failed-count"> &middot; {failedServers.length} failed</span>
+                    )}
+                    {pendingOAuth.length > 0 && (
+                      <span className="mcp-auth-needed"> &middot; auth needed</span>
+                    )}
+                  </>
           }
         </span>
         {(servers.length > 0 || pendingOAuth.length > 0) && (
@@ -215,8 +233,15 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
                   <span className={`mcp-server-name ${!server.enabled ? 'mcp-name-disabled' : ''}`}>
                     {server.name}
                   </span>
+                  <span className="mcp-server-meta">
+                    {server.transport}{server.auth !== 'none' ? ` · ${server.auth}` : ''}
+                  </span>
                   <span className="mcp-server-count">
-                    {server.tool_count} tool{server.tool_count !== 1 ? 's' : ''}
+                    {server.state === 'failed'
+                      ? <span className="mcp-state-failed">failed</span>
+                      : server.state === 'unauthorized'
+                        ? <span className="mcp-auth-needed">auth needed</span>
+                        : `${server.tool_count} tool${server.tool_count !== 1 ? 's' : ''}`}
                   </span>
                   <span
                     className={`mcp-server-toggle ${server.enabled ? 'on' : 'off'} ${togglingServers.has(server.name) ? 'toggling' : ''}`}
@@ -240,11 +265,15 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
                   </span>
                 </button>
                 {expandedServers.has(server.name) && (
-                  <div className="mcp-tool-list">
-                    {server.tools.map(tool => (
-                      <span key={tool} className={`mcp-tool-name ${!server.enabled ? 'mcp-tool-disabled' : ''}`}>{tool}</span>
-                    ))}
-                  </div>
+                  server.state === 'failed' ? (
+                    <div className="mcp-server-error">{server.last_error ?? 'connection failed'}</div>
+                  ) : (
+                    <div className="mcp-tool-list">
+                      {server.tools.map(tool => (
+                        <span key={tool} className={`mcp-tool-name ${!server.enabled ? 'mcp-tool-disabled' : ''}`}>{tool}</span>
+                      ))}
+                    </div>
+                  )
                 )}
               </div>
             ))

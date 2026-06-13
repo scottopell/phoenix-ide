@@ -247,3 +247,48 @@
 .mcp-oauth-link:hover {
   text-decoration: underline;
 }
+
+/* Failed-connection banner: red, vs the yellow auth banner (REQ-MCP-018). */
+.mcp-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  background: var(--color-error-bg, rgb(244 67 54 / 12%));
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+}
+
+.mcp-error-label {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.mcp-error-text {
+  color: var(--color-error, #f44336);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-failed-count {
+  color: var(--color-error, #f44336);
+}
+
+.mcp-state-failed {
+  color: var(--color-error, #f44336);
+}
+
+/* Transport · auth, inline per the density philosophy. */
+.mcp-server-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-left: 6px;
+}
+
+.mcp-server-error {
+  padding: 4px 12px 8px 28px;
+  color: var(--color-error, #f44336);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}

@@ -590,12 +590,23 @@ export interface ForkProposalSummary {
   refinement_conversation_id?: string;
 }
 
+export type McpConnState = 'ready' | 'unauthorized' | 'failed';
+export type McpTransportKind = 'stdio' | 'http';
+export type McpAuthKind = 'none' | 'static' | 'oauth';
+
 export interface McpServerStatus {
   name: string;
+  /** Lifecycle state surfaced for the panel (REQ-MCP-013, REQ-MCP-018). */
+  state: McpConnState;
+  transport: McpTransportKind;
+  auth: McpAuthKind;
   tool_count: number;
   tools: string[];
   enabled: boolean;
+  /** Set while awaiting the user to complete an OAuth flow (state = unauthorized). */
   pending_oauth_url?: string;
+  /** Failure cause when state = failed; cleared on a successful reconnect. */
+  last_error?: string;
 }
 
 export interface McpReloadFailure {
