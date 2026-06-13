@@ -8977,24 +8977,39 @@ html * {
 }
 
 .skill-command-chip {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 1px;
-  padding: 1px 9px 2px 6px;
-  border: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 22%, var(--border-color));
-  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 7%, var(--bg-primary));
-  border-radius: 6px;
+  padding: 1px 12px 2px 6px;
+  border-left: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 22%, var(--border-color));
+  border-top: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 22%, var(--border-color));
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 22%, var(--border-color));
+  border-radius: 6px 0 0 6px;
+  background: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--accent-blue, #3b82f6) 7%, var(--bg-primary)) 0,
+    color-mix(in srgb, var(--accent-blue, #3b82f6) 7%, var(--bg-primary)) calc(100% - 14px),
+    transparent 100%
+  );
   color: var(--accent-blue, #2563eb);
   font-weight: 500;
   line-height: 1.25;
   white-space: nowrap;
-  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 12px), transparent 100%);
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 14px), transparent 100%);
   cursor: help;
 }
 
 .skill-command-chip:hover {
-  border-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 35%, var(--border-color));
-  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, var(--bg-primary));
+  border-left-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 35%, var(--border-color));
+  border-top-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 35%, var(--border-color));
+  border-bottom-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 35%, var(--border-color));
+  background: linear-gradient(
+    to right,
+    color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, var(--bg-primary)) 0,
+    color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, var(--bg-primary)) calc(100% - 14px),
+    transparent 100%
+  );
 }
 
 .skill-command-slash {
