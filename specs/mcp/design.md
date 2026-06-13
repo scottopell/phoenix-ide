@@ -228,6 +228,32 @@ The native flow produces the authorization URL as structured state
 child's stderr for a line containing `https://` -- the structured URL is what
 the status API and UI consume.
 
+### Redirect origin (REQ-MCP-020)
+
+The `redirect_uri` baked into the authorization request, the DCR registration,
+and the token exchange must name an origin the operator's browser can reach and
+that routes back to this instance's `GET /api/mcp/oauth/callback`. That origin
+is the **canonical external origin**, resolved once at startup
+(`resolve_external_origin`) and held on the `OAuthRuntime`:
+
+- an explicit `PHOENIX_EXTERNAL_URL` override, otherwise
+- `{scheme}://{host}:{port}` where the scheme follows TLS presence, the host is
+  the reachable domain the operator already configures for the certificate
+  (`ConfigSource::external_host` -- the first non-loopback TLS host), falling
+  back to the bind-derived host (loopback for an unspecified/loopback bind, the
+  bare IP otherwise), and the default port for the scheme is dropped.
+
+Binding the redirect origin to the TLS host configuration means a self-hosted
+remote deployment sets its reachable domain once. The origin is taken from
+trusted configuration, never from request-controlled `Host`/`Forwarded`
+headers: a forged header would otherwise redirect an authorization code to an
+attacker-chosen destination, a target the `state` nonce and `iss` check do not
+defend. Consequently there is no trusted-proxy flag or origin allowlist -- the
+attack surface those would guard does not exist. An all-interfaces bind that
+still resolves to loopback has no reachable name configured; this is surfaced at
+startup so the operator supplies one before a remote authorization round trip
+fails.
+
 ### Token store
 
 Two tables back the OAuth flow, alongside the existing `mcp_disabled_servers`
@@ -277,12 +303,21 @@ agnostic and operate on the unified `ConnState` (REQ-MCP-015, REQ-MCP-016).
 
 ## Status API and UI
 
-`GET /api/mcp/status` returns one entry per server carrying its state, tool
-list, enabled flag, and -- for OAuth servers mid-flow -- the authorization URL,
-or -- for failed servers -- the error (REQ-MCP-013, REQ-MCP-018). The
-`McpStatusPanel` (`ui/src/components/McpStatusPanel.tsx`) renders connected,
-authorization-pending (with a clickable authorize affordance), and failed
-states distinctly. The reload control retries failed and pending servers.
+`GET /api/mcp/status` returns one entry per server carrying its `state`
+(`ready`/`unauthorized`/`failed`), `transport`, `auth`, tool list, enabled flag,
+and -- for OAuth servers mid-flow -- the authorization URL, or -- for failed
+servers -- the `last_error` (REQ-MCP-013, REQ-MCP-018). The status unions three
+sources: connected servers (`ready`), `pending_oauth_urls` (`unauthorized`), and
+`failed_servers` (`failed`), deduped by name with precedence
+`ready > unauthorized > failed` so a server that has since reconnected or is
+awaiting auth is never also reported failed. `failed_servers` is the retention
+map -- a give-up at any connect/handshake/reestablish site records the cause
+through `record_connect_failure` (which leaves an awaiting-auth server out, as
+its pending URL makes it `unauthorized`), and the entry clears on the next
+successful (re)connect and on config removal. The `McpStatusPanel`
+(`ui/src/components/McpStatusPanel.tsx`) renders ready, authorization-pending
+(yellow, with a clickable authorize affordance), and failed (red, with the
+error) distinctly. The reload control retries failed and pending servers.
 
 ---
 

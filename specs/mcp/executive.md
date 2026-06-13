@@ -28,13 +28,14 @@ natively, without the `mcp-remote` subprocess bridge.
 | REQ-MCP-010 | Client Identity Acquisition | Complete | Pre-configured client (config `auth.oauth`) seeds the registration row at discovery; cached registrations keyed by authorization server are reused; RFC 7591 DCR is the fallback. Phoenix hosts no Client ID Metadata Document, so that step resolves to nothing (logged at `debug`) and falls through to DCR. |
 | REQ-MCP-011 | Authorization Code Flow with PKCE | Complete | Native flow in `mcp.rs` (`begin_oauth_flow` / `complete_oauth_authorization`): S256 PKCE (refused when not advertised), unguessable `state` bound to the pending flow, `iss` validation, RFC 8707 `resource` on both requests, callback at `GET /api/mcp/oauth/callback`. |
 | REQ-MCP-012 | Token Storage, Refresh, Invalidation, and Step-Up | Complete | `mcp_oauth_registrations` + `mcp_oauth_tokens` (phoenix-db migration 22, plaintext); bearer on every request via the shared cell; silent restore (resource-matched, unexpired-or-refreshable); refresh with rotation persisted; refresh rejection discards and re-prompts; 403 `insufficient_scope` steps up with the scope union while the triggering call replays via the recovery claim. |
-| REQ-MCP-013 | Authorization Status Surfaced to the UI | Complete | `GET /api/mcp/status` carries the native flow's structured `pending_oauth_url` (the stdio `mcp-remote` path still feeds the same map from its stderr drain). |
+| REQ-MCP-013 | Authorization Status Surfaced to the UI | Complete | `GET /api/mcp/status` carries each server's `state` (`ready`/`unauthorized`/`failed`), `transport`, `auth`, and the native flow's structured `pending_oauth_url` (the stdio `mcp-remote` path still feeds the same map from its stderr drain). |
 | REQ-MCP-014 | Tool Exposure and Live Resolution | Complete | `tool_definitions` / `create_mcp_tool_by_name`; live resolution via `ToolRegistryExecutor`. HTTP servers ride this unchanged. |
 | REQ-MCP-015 | Config Reload Reconciliation | Complete | `reload_from_configs` (add / remove / restart / unchanged / failed); the `PartialEq` comparison spans the `Stdio \| Http` config variants. |
 | REQ-MCP-016 | Per-Server Enable/Disable | Complete | `disable_server` / `enable_server`; persisted in `mcp_disabled_servers` (`crates/phoenix-db/src/lib.rs`). |
 | REQ-MCP-017 | Tool Call Cancellation and Error Surfacing | Complete | `McpTool::run` spawns a detached task + selects on the cancel token; `tools/call` honors `isError`. |
-| REQ-MCP-018 | Connection Failure Visibility | Not started | M5. Failed servers retained in the status response with their error, cleared on reconnect. |
+| REQ-MCP-018 | Connection Failure Visibility | Complete | A give-up at any connect/handshake/reestablish site records the cause in `failed_servers` (parallel to `pending_oauth_urls`) via the shared `record_connect_failure`; `status()` retains it as `state = failed` with `last_error`, cleared on the next successful (re)connect and on config removal. A server still awaiting auth is `unauthorized`, not failed. `McpStatusPanel` renders the three states distinctly. |
 | REQ-MCP-019 | Legacy HTTP+SSE Not Natively Supported | Complete | By decision; `legacy_sse_native = false`. Such servers use the `mcp-remote` stdio bridge. |
+| REQ-MCP-020 | OAuth Redirect Origin Resolution | Complete | The redirect base is the canonical external origin: `PHOENIX_EXTERNAL_URL` override, else derived from the TLS host config (`ConfigSource::external_host`) + scheme + bind port (`resolve_external_origin`). An all-interfaces bind that still resolves to loopback warns at startup. Derived from trusted config, not request headers. |
 
 ## Milestones
 
@@ -48,8 +49,8 @@ This spec set is M0 of the native HTTP MCP build-out. The milestones:
 - **M3** (done) -- OAuth 2.1, the value driver. First releasable unit = M2 + M3
   (REQ-MCP-009 .. -013).
 - **M4** (done) -- Server-initiated SSE stream + resumability (REQ-MCP-006).
-- **M5** -- UI / config / ops polish, including connection-failure visibility
-  (REQ-MCP-018).
+- **M5** (done) -- UI / config / ops polish: connection-failure visibility
+  (REQ-MCP-018) and the consolidated OAuth redirect origin (REQ-MCP-020).
 
 ## Design Decisions
 
@@ -63,6 +64,13 @@ This spec set is M0 of the native HTTP MCP build-out. The milestones:
   `npx mcp-remote <url>`.
 - **Static auth is not an independent milestone.** It costs nothing on top of
   the M2 transport, but OAuth (M3) is the deliverable users feel.
+- **The OAuth redirect origin is derived from the TLS host config, not request
+  headers** (REQ-MCP-020). The reachable domain an operator already sets for the
+  certificate is the single source of truth for the callback origin, so a
+  self-hosted remote deployment needs no separate knob. Deriving from trusted
+  config rather than the `Host`/`Forwarded` headers removes the redirect-target
+  injection surface, so no trusted-proxy or origin-allowlist machinery exists.
+  `PHOENIX_EXTERNAL_URL` overrides for proxy-terminated TLS or manual certs.
 
 ## Allium Spec
 

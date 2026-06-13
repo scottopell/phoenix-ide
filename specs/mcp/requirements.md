@@ -400,4 +400,31 @@ configuring the `mcp-remote` bridge as a stdio server.
 **Rationale:** The Streamable HTTP transport supersedes HTTP+SSE. Native support
 for both doubles the HTTP surface for a shrinking set of legacy servers; the
 stdio bridge already covers them during their decline.
+
+---
+
+### REQ-MCP-020: OAuth Redirect Origin Resolution
+
+THE SYSTEM SHALL resolve the OAuth callback redirect URI from a single canonical
+external origin: an explicit operator override when configured, otherwise the
+origin composed from the connection scheme (TLS presence), the reachable host the
+operator configures for the TLS certificate, and the bound port.
+
+WHERE no reachable host is configured and the server is bound to all interfaces,
+THE SYSTEM SHALL resolve the origin to loopback AND record that the callback is
+unreachable from another machine, so the operator can supply the reachable name
+rather than discovering a broken authorization round trip only after opening the
+authorization URL.
+
+THE SYSTEM SHALL NOT derive the redirect origin from request-controlled headers
+(`Host`, `Forwarded`), so a forged header cannot redirect an authorization code
+to an attacker-chosen destination.
+
+**Rationale:** The redirect URI must name an origin the operator's browser can
+reach and that routes back to this instance; the reachable domain already chosen
+for the certificate is exactly that origin, so binding the two removes a
+redundant, divergence-prone knob. A redirect target taken from a request header
+is attacker-influenceable in a way the `state` nonce and `iss` check do not
+defend -- they bind the callback to its flow and its authorization server, not
+its destination -- so the origin is taken from trusted configuration instead.
 </content>

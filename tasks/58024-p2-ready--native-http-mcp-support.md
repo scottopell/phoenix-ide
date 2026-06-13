@@ -29,9 +29,15 @@ refresh, and `insufficient_scope` step-up — closing task 08639. M2+M3 is the
 first releasable unit. **M4 (tasks/58029) is done**: `ServerStream` in
 `mcp/http.rs` opens the server-initiated GET SSE stream after `initialize`,
 feeds `tools/list_changed` to the shared `NotificationSink`, and reconnects
-with `Last-Event-ID` (REQ-MCP-006). **Next actionable: M5 (UI / config / ops
-polish, including connection-failure visibility, REQ-MCP-018 / task 02685).**
-`executive.md`'s status table tracks which REQs each milestone covers.
+with `Last-Event-ID` (REQ-MCP-006). **M5 (tasks/58030) is done**: failed
+servers are retained in `/api/mcp/status` with their cause (REQ-MCP-018,
+closing task 02685), the panel renders ready/unauthorized/failed distinctly,
+and the OAuth redirect origin is the canonical external origin derived from the
+TLS host config (REQ-MCP-020). Two follow-ups remain: re-register DCR on a
+redirect-base change (tasks/58031) and surface the loopback-on-remote redirect
+diagnostic in the status panel (tasks/58032). **The milestone roadmap (M1-M5)
+is complete.** `executive.md`'s status table tracks which REQs each milestone
+covers.
 
 ## Where we are today
 
