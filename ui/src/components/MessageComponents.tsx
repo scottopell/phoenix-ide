@@ -405,32 +405,64 @@ function skillCommandFromInput(input: Record<string, unknown>): string {
   return args ? `/${skillName} ${args}` : `/${skillName}`;
 }
 
-function SkillToolInput({ input, resultText }: { input: Record<string, unknown>; resultText: string }) {
+function SkillToolBlock({
+  input,
+  resultText,
+  result,
+  isError,
+  durationMs,
+  toolStartedAtMs,
+  inflightElapsedSeconds,
+  onOpenFile,
+  toolId,
+}: {
+  input: Record<string, unknown>;
+  resultText: string;
+  result: Message | undefined;
+  isError: boolean;
+  durationMs: number | undefined;
+  toolStartedAtMs: number | null | undefined;
+  inflightElapsedSeconds: number;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  toolId: string;
+}) {
   const details = extractSkillResultDetails(resultText);
-  return (
-    <div className="skill-tool-input">
-      <SkillCommandText
-        text={skillCommandFromInput(input)}
-        source={details.source ? `${details.source}/SKILL.md` : undefined}
-        snippet={details.snippet}
-      />
-    </div>
-  );
-}
+  const sourcePath = details.source ? `${details.source}/SKILL.md` : undefined;
+  const status = result == null ? 'loading' : isError ? 'failed' : 'loaded';
+  const statusClass = result == null ? 'pending' : isError ? 'error' : 'success';
 
-function SkillToolOutput({ resultText }: { resultText: string }) {
-  const details = extractSkillResultDetails(resultText);
-  if (!details.source && !details.snippet) return null;
   return (
-    <div className="skill-tool-output">
-      {details.source && (
-        <div className="skill-tool-source">
-          <span className="skill-tool-source-label">source</span>
-          <code className="skill-tool-source-path">{details.source}/SKILL.md</code>
+    <div className={`tool-block skill-tool-block ${statusClass}`} data-tool-id={toolId}>
+      <div className="skill-tool-status-row">
+        <SkillCommandText
+          text={skillCommandFromInput(input)}
+          source={sourcePath}
+          snippet={details.snippet}
+        />
+        <span className={`skill-tool-status ${statusClass}`}>
+          {status}
+          {durationMs !== undefined && <span className="tool-block-duration">&bull; {formatToolDuration(durationMs)}</span>}
+          {result == null && toolStartedAtMs != null && <span className="tool-block-duration">&bull; {inflightElapsedSeconds}s</span>}
+        </span>
+      </div>
+      {(sourcePath || details.snippet) && (
+        <div className="skill-tool-detail-row">
+          {sourcePath && (
+            onOpenFile ? (
+              <button
+                type="button"
+                className="skill-source-link"
+                onClick={() => onOpenFile(sourcePath, new Set(), 0)}
+                title={`Open ${sourcePath}`}
+              >
+                SKILL.md
+              </button>
+            ) : (
+              <span className="skill-source-link static" title={sourcePath}>SKILL.md</span>
+            )
+          )}
+          {details.snippet && <span className="skill-tool-snippet">{details.snippet}</span>}
         </div>
-      )}
-      {details.snippet && (
-        <div className="skill-tool-snippet">{details.snippet}</div>
       )}
     </div>
   );
@@ -1713,8 +1745,23 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
   })();
 
   // Get the raw input for copying (not the formatted display)
+  if (name === 'skill') {
+    return (
+      <SkillToolBlock
+        input={input as Record<string, unknown>}
+        resultText={resultText}
+        result={result}
+        isError={isError}
+        durationMs={durationMs}
+        toolStartedAtMs={toolStartedAtMs}
+        inflightElapsedSeconds={inflightElapsedSeconds}
+        onOpenFile={onOpenFile}
+        toolId={toolId}
+      />
+    );
+  }
+
   const rawInput = name === 'bash' ? bashInputCopyText(input as Record<string, unknown>) :
-                   name === 'skill' ? skillCommandFromInput(input as Record<string, unknown>) :
                    name === 'think' ? String(input['thoughts'] || '') :
                    name === 'read_file' ? String(input['path'] || '') :
                    name === 'ask_user_question' ? String(((input['questions'] as Array<{ question?: string }> | undefined)?.[0]?.question) || '') :
@@ -1731,10 +1778,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
     : 'Copy command';
 
   return (
-    <div className={`tool-block${name === 'skill' ? ' skill-tool-block' : ''}`} data-tool-id={toolId}>
+    <div className="tool-block" data-tool-id={toolId}>
       {/* Tool header with name */}
       <div className="tool-block-header">
-        <span className="tool-block-name">{name === 'skill' ? 'skill invocation' : name}</span>
+        <span className="tool-block-name">{name}</span>
         {hasOutput && (
           <span className={`tool-block-status ${isError ? 'error' : 'success'}`}>
             {isError ? <XIcon /> : <CheckIcon />}
@@ -1759,11 +1806,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
 
       {/* Tool input - always visible */}
       <div className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}>
-        {name === 'skill' ? (
-          <SkillToolInput input={input as Record<string, unknown>} resultText={resultText} />
-        ) : (
-          inputDisplay
-        )}
+        {inputDisplay}
         <CopyButton text={rawInput} title={bashCopyTitle} />
       </div>
 
@@ -1783,8 +1826,6 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
             <BashResponseView response={bashResponse} />
           ) : tmuxResponse ? (
             <TmuxResponseView response={tmuxResponse} />
-          ) : name === 'skill' && !isError ? (
-            <SkillToolOutput resultText={resultText} />
           ) : name === 'browser_profile' &&
               STRUCTURED_PROFILE_ACTIONS.has(
                 String((input as Record<string, unknown>)?.['action'] ?? ''),

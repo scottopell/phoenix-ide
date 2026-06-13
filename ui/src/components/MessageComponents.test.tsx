@@ -135,6 +135,7 @@ describe('skill command rendering', () => {
   });
 
   it('renders skill tool calls with matching chip, source, and snippet', () => {
+    const onOpenFile = vi.fn();
     render(
       <MemoryRouter>
         <AgentMessage
@@ -150,14 +151,19 @@ describe('skill command rendering', () => {
               'Base directory for this skill: /Users/test/.claude/skills/agent-browser\n# Browser Automation with agent-browser\nMore content',
             )],
           ])}
+          onOpenFile={onOpenFile}
         />
       </MemoryRouter>,
     );
 
-    expect(screen.getByText('skill invocation')).toBeInTheDocument();
+    expect(screen.queryByText('skill invocation')).not.toBeInTheDocument();
     expect(screen.getByText('agent-browser')).toHaveClass('skill-command-name');
     expect(screen.getByText('http://localhost:8042')).toHaveClass('skill-command-args');
-    expect(screen.getByText('/Users/test/.claude/skills/agent-browser/SKILL.md')).toBeInTheDocument();
+    expect(screen.getByText('loaded')).toHaveClass('skill-tool-status');
+    const sourceButton = screen.getByRole('button', { name: 'SKILL.md' });
+    expect(sourceButton).toHaveClass('skill-source-link');
+    fireEvent.click(sourceButton);
+    expect(onOpenFile).toHaveBeenCalledWith('/Users/test/.claude/skills/agent-browser/SKILL.md', new Set(), 0);
     expect(screen.getByText('Browser Automation with agent-browser')).toHaveClass('skill-tool-snippet');
   });
 });

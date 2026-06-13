@@ -1129,15 +1129,87 @@ body {
 }
 
 .skill-tool-block {
-  border-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 24%, var(--border-color));
+  margin: 6px 0;
+  border: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 22%, var(--border-color));
+  border-radius: 6px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 4%, var(--bg-secondary));
 }
 
-.skill-tool-block .tool-block-header {
-  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 7%, var(--bg-tertiary));
+.skill-tool-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  min-width: 0;
 }
 
-.skill-tool-block .tool-block-name {
-  color: var(--accent-blue, #2563eb);
+.skill-tool-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.skill-tool-status.success {
+  background: color-mix(in srgb, var(--accent-green) 16%, var(--bg-primary));
+  color: var(--accent-green);
+}
+
+.skill-tool-status.error {
+  background: color-mix(in srgb, var(--accent-red) 14%, var(--bg-primary));
+  color: var(--accent-red);
+}
+
+.skill-tool-status.pending {
+  background: color-mix(in srgb, var(--accent-yellow) 16%, var(--bg-primary));
+  color: var(--accent-yellow);
+}
+
+.skill-tool-detail-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.skill-source-link {
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--bg-primary);
+  padding: 1px 6px;
+  color: var(--accent-blue);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.skill-source-link:hover:not(.static) {
+  border-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 35%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 8%, var(--bg-primary));
+}
+
+.skill-source-link.static {
+  color: var(--text-muted);
+  cursor: help;
+}
+
+.skill-tool-snippet {
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tool-block-status {
@@ -1179,49 +1251,6 @@ body {
 .tool-block-input.multiline {
   max-height: 150px;
   overflow-y: auto;
-}
-
-.skill-tool-input {
-  display: inline-flex;
-  align-items: center;
-  font-family: var(--font-sans);
-  white-space: normal;
-}
-
-.skill-tool-output {
-  padding: 8px 10px;
-  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 5%, var(--bg-primary));
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.skill-tool-source {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  color: var(--text-secondary);
-}
-
-.skill-tool-source-label {
-  color: var(--text-muted);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.skill-tool-source-path {
-  color: var(--text-secondary);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  overflow-wrap: anywhere;
-}
-
-.skill-tool-snippet {
-  margin-top: 3px;
-  color: var(--text-primary);
-  font-weight: 500;
 }
 
 /* Tool output section */
@@ -8951,30 +8980,30 @@ html * {
   display: inline-flex;
   align-items: center;
   gap: 1px;
-  padding: 1px 6px 2px;
-  border: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 28%, var(--border-color));
-  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 9%, var(--bg-primary));
+  padding: 1px 9px 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent-blue, #3b82f6) 22%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 7%, var(--bg-primary));
   border-radius: 6px;
   color: var(--accent-blue, #2563eb);
-  font-weight: 650;
+  font-weight: 500;
   line-height: 1.25;
   white-space: nowrap;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 45%);
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 12px), transparent 100%);
   cursor: help;
 }
 
 .skill-command-chip:hover {
-  border-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 45%, var(--border-color));
-  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 13%, var(--bg-primary));
+  border-color: color-mix(in srgb, var(--accent-blue, #3b82f6) 35%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 10%, var(--bg-primary));
 }
 
 .skill-command-slash {
-  opacity: 0.72;
-  font-weight: 800;
+  opacity: 0.66;
+  font-weight: 650;
 }
 
 .skill-command-name {
-  font-weight: 700;
+  font-weight: 500;
 }
 
 .skill-command-args {
