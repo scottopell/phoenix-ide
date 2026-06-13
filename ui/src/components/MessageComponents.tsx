@@ -2023,7 +2023,13 @@ function ChildToolActivity({ block, result }: { block: ContentBlock; result: Mes
   );
 }
 
-function ChildAgentActivity({ message, toolResults }: { message: Message; toolResults: Map<string, Message> }) {
+// Memoized so completed sub-agent steps are not re-parsed through ReactMarkdown
+// on every streaming token of the *active* step. The transcript re-renders per
+// token (the buffer grows), but a finished step's `message` object and its
+// `toolResults` map are referentially stable across token-only atom updates, so
+// a shallow prop compare bails. Mirrors the AgentTextBlock / StreamingBlock
+// memoization for the same re-parse-on-unchanged-content problem.
+const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResults }: { message: Message; toolResults: Map<string, Message> }) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   return (
     <>
@@ -2050,7 +2056,7 @@ function ChildAgentActivity({ message, toolResults }: { message: Message; toolRe
       })}
     </>
   );
-}
+});
 
 /**
  * Presentational read-only sub-agent transcript. Stream ownership lives with
@@ -2065,11 +2071,22 @@ function ChildAgentActivity({ message, toolResults }: { message: Message; toolRe
  */
 export function SubAgentTranscript({ inline, running, full = false }: { inline: InlineStreamState; running: boolean; full?: boolean }) {
   const { atom } = inline;
-  const toolResults = buildToolResults(atom.messages);
-  const agentMessages = atom.messages.filter((m) => m.message_type === 'agent' || m.type === 'agent');
-  const visibleAgentMessages = full ? agentMessages : agentMessages.slice(-12);
+  const messages = atom.messages;
+  // Derived once per messages change, not per streaming token. `sse_token`
+  // preserves `atom.messages` identity (only `streamingBuffer` grows), so a
+  // stable `toolResults` map lets the memoized ChildAgentActivity rows bail
+  // while the active step's buffer streams.
+  const toolResults = useMemo(() => buildToolResults(messages), [messages]);
+  const agentMessages = useMemo(
+    () => messages.filter((m) => m.message_type === 'agent' || m.type === 'agent'),
+    [messages],
+  );
+  const visibleAgentMessages = useMemo(
+    () => (full ? agentMessages : agentMessages.slice(-12)),
+    [full, agentMessages],
+  );
   const hiddenCount = Math.max(0, agentMessages.length - visibleAgentMessages.length);
-  const toolCount = countToolUses(atom.messages);
+  const toolCount = useMemo(() => countToolUses(messages), [messages]);
 
   return (
     <div className="subagent-activity-panel">

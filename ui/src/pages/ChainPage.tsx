@@ -30,7 +30,7 @@
 // unfilled), which structurally communicates that the next question creates a
 // new pair rather than continuing a thread.
 
-import { useEffect, useMemo, useRef, useCallback, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useCallback, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
@@ -317,12 +317,16 @@ export function ChainPage() {
   /** Re-ask: populate the active textarea with the original question and
    *  focus it. Do NOT auto-submit — REQ-CHN-007's editing pattern preserves
    *  user agency, and consistency with that precedent matters here. */
-  const handleReask = (question: string) => {
-    dispatch({ type: 'DRAFT_SET', value: appendDraftText(draft, question) });
+  // Read the latest draft via the existing `draftRef` so `handleReask` stays
+  // referentially stable. A stable `onReask` lets the memoized PersistedPairCard
+  // rows bail while an in-flight answer streams token-by-token — otherwise every
+  // persisted answer re-parses markdown per token.
+  const handleReask = useCallback((question: string) => {
+    dispatch({ type: 'DRAFT_SET', value: appendDraftText(draftRef.current, question) });
     queueMicrotask(() => {
       activeTextareaRef.current?.focus();
     });
-  };
+  }, [dispatch]);
 
   const setDraft = useCallback(
     (value: string) => dispatch({ type: 'DRAFT_CHANGED', value }),
@@ -986,7 +990,7 @@ function InflightPairCard({ inflightEntry, onReask }: ChainQaPairCardProps) {
   );
 }
 
-function PersistedPairCard({ row, chain, onReask }: ChainQaPairCardProps) {
+const PersistedPairCard = memo(function PersistedPairCard({ row, chain, onReask }: ChainQaPairCardProps) {
   if (!row || !chain) return null;
   const stale = stalenessLabel(row, chain);
   return (
@@ -1009,7 +1013,7 @@ function PersistedPairCard({ row, chain, onReask }: ChainQaPairCardProps) {
       </div>
     </article>
   );
-}
+});
 
 function renderPersistedAnswer(
   row: ChainQaRow,
