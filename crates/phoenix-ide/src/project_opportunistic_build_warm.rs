@@ -30,9 +30,15 @@ impl BuildWarmCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WarmCopyOutcome {
+    #[cfg(any(target_os = "macos", test))]
     Cloned,
-    SkippedUnsupported { reason: String },
-    Failed { reason: String },
+    SkippedUnsupported {
+        reason: String,
+    },
+    #[cfg(any(target_os = "macos", test))]
+    Failed {
+        reason: String,
+    },
 }
 
 pub(crate) trait WarmCopier {
@@ -94,6 +100,7 @@ pub(crate) fn prewarm_project_build_caches_with_copier(
         }
 
         match copier.clone_dir_best_effort(&src, &dst) {
+            #[cfg(any(target_os = "macos", test))]
             WarmCopyOutcome::Cloned => tracing::info!(
                 source = %src.display(),
                 destination = %dst.display(),
@@ -107,6 +114,7 @@ pub(crate) fn prewarm_project_build_caches_with_copier(
                 relative = %relative.display(),
                 "build cache prewarm skipped: clone operation unsupported"
             ),
+            #[cfg(any(target_os = "macos", test))]
             WarmCopyOutcome::Failed { reason } => tracing::info!(
                 reason,
                 source = %src.display(),
