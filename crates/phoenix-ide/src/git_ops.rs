@@ -600,6 +600,8 @@ pub(crate) fn create_worktree(
         })?;
     }
 
+    prewarm_new_worktree(cwd, &worktree_path);
+
     // 3. Stage `.phoenix/` into the tracked `.gitignore` for StageGitignore.
     //    LocalExclude already wrote its exclude entry BEFORE the add (above), so
     //    `.phoenix/` is ignored even if the add failed; nothing to do here.
@@ -610,6 +612,39 @@ pub(crate) fn create_worktree(
     }
 
     Ok(worktree_path_str)
+}
+
+fn prewarm_new_worktree(source_root: &Path, worktree_path: &Path) {
+    crate::project_opportunistic_build_warm::prewarm_project_build_caches(
+        source_root,
+        worktree_path,
+    );
+
+    #[cfg(test)]
+    TEST_PREWARM_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(source_root, worktree_path);
+        }
+    });
+}
+
+#[cfg(test)]
+type PrewarmHook = dyn Fn(&Path, &Path);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PREWARM_HOOK: std::cell::RefCell<Option<Box<PrewarmHook>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn with_test_prewarm_hook<R>(hook: impl Fn(&Path, &Path) + 'static, f: impl FnOnce() -> R) -> R {
+    TEST_PREWARM_HOOK.with(|slot| {
+        let previous = slot.replace(Some(Box::new(hook)));
+        let result = f();
+        slot.replace(previous);
+        result
+    })
 }
 
 /// Best-effort rollback of a partially-created worktree after `git worktree add`
@@ -1119,6 +1154,64 @@ mod tests {
             ],
         )
         .is_ok()
+    }
+
+    #[test]
+    fn create_worktree_invokes_prewarm_after_successful_add() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
+
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let calls_for_hook = std::rc::Rc::clone(&calls);
+        let conv_id = "feedface-2222-2222-2222-222222222222";
+
+        let result = with_test_prewarm_hook(
+            move |source_root, worktree_path| {
+                calls_for_hook
+                    .borrow_mut()
+                    .push((source_root.to_path_buf(), worktree_path.to_path_buf()));
+            },
+            || {
+                create_worktree(
+                    tmp.path(),
+                    conv_id,
+                    "task-pending-feedface",
+                    Some("main"),
+                    PhoenixIgnoreStrategy::StageGitignore,
+                )
+            },
+        )
+        .unwrap();
+
+        let expected_worktree = tmp.path().join(".phoenix/worktrees").join(conv_id);
+        assert_eq!(Path::new(&result), expected_worktree.as_path());
+        assert!(expected_worktree.join("tracked.txt").exists());
+        assert_eq!(
+            calls.borrow().as_slice(),
+            &[(tmp.path().to_path_buf(), expected_worktree)]
+        );
+    }
+
+    #[test]
+    fn create_worktree_still_succeeds_when_prewarm_source_cache_exists() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
+        std::fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
+        std::fs::write(tmp.path().join("target/debug/cache.txt"), "warm\n").unwrap();
+
+        let conv_id = "feedface-3333-3333-3333-333333333333";
+        let result = create_worktree(
+            tmp.path(),
+            conv_id,
+            "task-pending-warm",
+            Some("main"),
+            PhoenixIgnoreStrategy::StageGitignore,
+        )
+        .unwrap();
+
+        assert!(Path::new(&result).join("tracked.txt").exists());
     }
 
     #[test]

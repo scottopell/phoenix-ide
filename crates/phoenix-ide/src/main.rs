@@ -10,6 +10,7 @@ pub(crate) mod git_ops;
 mod llm;
 mod mcp_oauth_store;
 mod message_expander;
+mod project_opportunistic_build_warm;
 mod resolution_root;
 mod runtime;
 mod system_prompt;

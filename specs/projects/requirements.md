@@ -201,7 +201,27 @@ because their code changes never share a directory.
 
 ---
 
-### REQ-PROJ-006: Task Files as Versioned Living Contracts
+### REQ-PROJ-005A: Worktree Build Cache Pre-Warm Is Best-Effort
+
+WHEN Phoenix creates a new conversation worktree under `.phoenix/worktrees/{conversation-id}/`
+THE SYSTEM MAY pre-warm allowlisted project-local build cache directories from the repository root
+AND SHALL keep the destination paths inside the new worktree
+AND SHALL skip missing sources and existing destination paths
+AND SHALL use copy-on-write clone semantics only when supported by the platform/filesystem
+AND SHALL NOT fall back to a large physical copy
+AND SHALL NOT fail worktree creation when pre-warm cloning is unsupported or fails
+
+The allowlist is intentionally narrow: `target/`, `node_modules/.cache/`, `.next/cache/`,
+`.turbo/`, and project-local `.vite/`. Phoenix does not pre-warm `.git/`, `.phoenix*`,
+lock files, sockets, PID files, arbitrary ignored directories, or full dependency trees such
+as `node_modules/`.
+
+**Rationale:** Pre-warming improves time-to-first-build for isolated Phoenix worktrees on
+filesystems with cheap block cloning, while preserving the isolation guarantee. The cloned
+files occupy independent worktree paths and diverge normally when rebuilt; failure to clone
+only loses an optimization, never correctness.
+
+
 
 WHEN the agent drafts a task file in Explore mode (REQ-PROJ-003)
 THE SYSTEM SHALL place it in the project's tasks directory (typically `tasks/`,
