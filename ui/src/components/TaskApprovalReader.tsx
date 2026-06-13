@@ -199,6 +199,8 @@ export function TaskApprovalReader({
   const [showNotesPanel, setShowNotesPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
+  const hasUnsentNotes = notes.length > 0;
+  const noteCountLabel = `${notes.length} note${notes.length !== 1 ? 's' : ''}`;
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
@@ -428,6 +430,13 @@ export function TaskApprovalReader({
         <div className="viewer-markdown">{renderPlanMarkdown}</div>
       </div>
 
+      {hasUnsentNotes && (
+        <div className="task-approval-feedback-cue" role="status">
+          You have {noteCountLabel} of unsent feedback. Send feedback, or approve
+          without sending those notes.
+        </div>
+      )}
+
       {/* Action toolbar */}
       <div className="task-approval-actions">
         <button
@@ -438,20 +447,32 @@ export function TaskApprovalReader({
           Discard
         </button>
         <button
-          className="task-approval-btn task-approval-btn--feedback"
+          className={[
+            'task-approval-btn',
+            'task-approval-btn--feedback',
+            hasUnsentNotes && 'task-approval-btn--recommended',
+          ]
+            .filter(Boolean)
+            .join(' ')}
           onClick={handleSendFeedback}
-          disabled={notes.length === 0}
+          disabled={!hasUnsentNotes}
           title={
-            notes.length === 0
+            !hasUnsentNotes
               ? 'Add annotations to the plan before sending feedback'
-              : `Send ${notes.length} note${notes.length !== 1 ? 's' : ''} as feedback`
+              : `Send ${noteCountLabel} as feedback`
           }
         >
           <Send size={18} />
           Send Feedback ({notes.length})
         </button>
         <button
-          className="task-approval-btn task-approval-btn--approve"
+          className={[
+            'task-approval-btn',
+            'task-approval-btn--approve',
+            hasUnsentNotes && 'task-approval-btn--subdued',
+          ]
+            .filter(Boolean)
+            .join(' ')}
           disabled={approving}
           onClick={() => {
             setApproving(true);
@@ -466,7 +487,7 @@ export function TaskApprovalReader({
           ) : (
             <>
               <Check size={18} />
-              Approve
+              {hasUnsentNotes ? 'Approve without sending feedback' : 'Approve'}
             </>
           )}
         </button>

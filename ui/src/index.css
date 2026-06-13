@@ -8367,6 +8367,14 @@ html * {
   -webkit-overflow-scrolling: touch;
 }
 
+.task-approval-feedback-cue {
+  padding: 8px 16px;
+  border-top: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--accent-blue) 10%, var(--bg-secondary));
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
 .task-approval-actions {
   display: flex;
   align-items: center;
@@ -8421,6 +8429,22 @@ html * {
 
 .task-approval-btn--feedback:hover:not(:disabled) {
   opacity: 0.9;
+}
+
+.task-approval-btn--recommended {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-blue) 30%, transparent);
+  font-weight: 700;
+}
+
+.task-approval-btn--approve.task-approval-btn--subdued {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+}
+
+.task-approval-btn--approve.task-approval-btn--subdued:hover {
+  background: var(--bg-tertiary);
+  opacity: 1;
 }
 
 /* --- First Task Welcome modal --- */
