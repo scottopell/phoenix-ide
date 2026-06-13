@@ -125,6 +125,11 @@ function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
 const REMARK_PLUGINS = [remarkGfm];
 const NO_REMARK_PLUGINS: typeof REMARK_PLUGINS = [];
 
+// Inline-code / prose file-path links open the file with no modified-line
+// selection. Share one empty Set rather than allocating a new one per markdown
+// node on every render. Never mutated.
+const EMPTY_LINE_SET = new Set<number>();
+
 function usesGfmSyntax(text: string): boolean {
   return /(^|\n)\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]\s/.test(text)
     || /(^|\n)\s*\|.*\|/.test(text)
@@ -694,6 +699,33 @@ function firstLineSummary(text: string, maxLen = 140): string {
 }
 
 /**
+ * A fully-rendered assistant prose block. Memoized so a turn's completed
+ * prose is not re-parsed through ReactMarkdown every time the parent
+ * AgentMessage re-renders — which happens repeatedly during an active turn
+ * as each tool result lands (the `toolResults` Map gets a new identity).
+ * `remarkPlugins` is one of two module-level constants and `components` is
+ * a memoized map, so a shallow prop compare bails for unchanged text.
+ * Mirrors the per-block memoization StreamingMessage uses for the same reason.
+ */
+const AgentTextBlock = memo(function AgentTextBlock({
+  text,
+  remarkPlugins,
+  components,
+}: {
+  text: string;
+  remarkPlugins: typeof REMARK_PLUGINS;
+  components: React.ComponentProps<typeof ReactMarkdown>['components'];
+}) {
+  return (
+    <div className="agent-text-block">
+      <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+});
+
+/**
  * An assistant text block that, in compact mode, is below the significance
  * threshold. Renders as a faded clickable one-liner that expands to the full
  * markdown on click — never destructive, the full text is always one click
@@ -859,72 +891,58 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, i
 
   // Stable markdown component map — only recreated when onOpenFile identity changes.
   // Keeps ReactMarkdown from remounting SyntaxHighlighter on every parent re-render.
-  const markdownComponents = useMemo(() => ({
-    // Custom code block rendering with syntax highlighting
-    // Inline code with file paths becomes clickable
-    code: ({ inline, className, children, node, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode; node?: unknown }) => {
-      void node;
-      const match = /language-(\w+)/.exec(className || '');
-      if (!inline && match?.[1]) {
+  const markdownComponents = useMemo(() => {
+    // One handler shared by every code/paragraph/list node, instead of a fresh
+    // closure (and Set) allocated per node on every render.
+    const fileClickHandler = onOpenFile
+      ? (filePath: string) => onOpenFile(filePath, EMPTY_LINE_SET, 0)
+      : undefined;
+    const processChildren = (nodes: React.ReactNode): React.ReactNode[] => {
+      return React.Children.toArray(nodes).flatMap((child) => {
+        if (typeof child === 'string') {
+          return linkifyText(child, fileClickHandler, filePathCopyContext);
+        }
+        return child;
+      });
+    };
+    return {
+      // Custom code block rendering with syntax highlighting
+      // Inline code with file paths becomes clickable
+      code: ({ inline, className, children, node, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode; node?: unknown }) => {
+        void node;
+        const match = /language-(\w+)/.exec(className || '');
+        if (!inline && match?.[1]) {
+          return (
+            <DeferredSyntaxHighlighter
+              syntaxStyle={syntaxStyle}
+              language={match[1]}
+              {...props}
+            >
+              {children}
+            </DeferredSyntaxHighlighter>
+          );
+        }
+        // For inline code, check if it looks like a file path and make it clickable
+        const text = String(children);
+        const linkified = linkifyText(text, fileClickHandler, filePathCopyContext);
+        // If linkifyText returned something other than plain text, it found a file path
+        if (linkified !== text && fileClickHandler) {
+          return <>{linkified}</>;
+        }
         return (
-          <DeferredSyntaxHighlighter
-            syntaxStyle={syntaxStyle}
-            language={match[1]}
-            {...props}
-          >
+          <code className={className} {...props}>
             {children}
-          </DeferredSyntaxHighlighter>
+          </code>
         );
-      }
-      // For inline code, check if it looks like a file path and make it clickable
-      const text = String(children);
-      const fileClickHandler = onOpenFile
-        ? (filePath: string) => onOpenFile(filePath, new Set(), 0)
-        : undefined;
-      const linkified = linkifyText(text, fileClickHandler, filePathCopyContext);
-      // If linkifyText returned something other than plain text, it found a file path
-      if (linkified !== text && fileClickHandler) {
-        return <>{linkified}</>;
-      }
-      return (
-        <code className={className} {...props}>
-          {children}
-        </code>
-      );
-    },
-    // Custom paragraph rendering with clickable file paths
-    p: ({ children }: { children?: React.ReactNode }) => {
-      const fileClickHandler = onOpenFile
-        ? (filePath: string) => onOpenFile(filePath, new Set(), 0)
-        : undefined;
-      const processChildren = (nodes: React.ReactNode): React.ReactNode[] => {
-        return React.Children.toArray(nodes).flatMap((child) => {
-          if (typeof child === 'string') {
-            return linkifyText(child, fileClickHandler, filePathCopyContext);
-          }
-          return child;
-        });
-      };
-      return <p>{processChildren(children)}</p>;
-    },
-    // Custom list item rendering with clickable file paths
-    li: ({ children }: { children?: React.ReactNode }) => {
-      const fileClickHandler = onOpenFile
-        ? (filePath: string) => onOpenFile(filePath, new Set(), 0)
-        : undefined;
-      const processChildren = (nodes: React.ReactNode): React.ReactNode[] => {
-        return React.Children.toArray(nodes).flatMap((child) => {
-          if (typeof child === 'string') {
-            return linkifyText(child, fileClickHandler, filePathCopyContext);
-          }
-          return child;
-        });
-      };
-      return <li>{processChildren(children)}</li>;
-    },
-    a: ConversationMarkdownAnchor,
-    table: MarkdownTable,
-  } satisfies Components), [onOpenFile, filePathCopyContext, syntaxStyle]);
+      },
+      // Custom paragraph rendering with clickable file paths
+      p: ({ children }: { children?: React.ReactNode }) => <p>{processChildren(children)}</p>,
+      // Custom list item rendering with clickable file paths
+      li: ({ children }: { children?: React.ReactNode }) => <li>{processChildren(children)}</li>,
+      a: ConversationMarkdownAnchor,
+      table: MarkdownTable,
+    } satisfies Components;
+  }, [onOpenFile, filePathCopyContext, syntaxStyle]);
 
   // Check if there's any renderable content
   const hasRenderableContent = blocks.some(block => {
@@ -1005,11 +1023,12 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, i
                 );
               }
               return (
-                <div key={i} className="agent-text-block">
-                  <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
-                    {block.text}
-                  </ReactMarkdown>
-                </div>
+                <AgentTextBlock
+                  key={i}
+                  text={block.text}
+                  remarkPlugins={remarkPlugins}
+                  components={markdownComponents}
+                />
               );
             } else if (block.type === 'tool_use') {
               // `think` renders as a subtle inline aside, not the full tool-block
