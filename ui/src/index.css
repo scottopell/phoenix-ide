@@ -4877,8 +4877,14 @@ html * {
 
 .viewer-content {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+.viewer-content--image {
+  display: flex;
+  overflow: hidden;
 }
 
 .viewer-loading,
@@ -4903,25 +4909,98 @@ html * {
   cursor: pointer;
 }
 
-.image-preview {
-  min-height: 100%;
-  padding: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.image-preview-frame {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
   background: var(--bg-primary);
 }
 
+.image-preview {
+  position: absolute;
+  inset: 0;
+  padding: 0;
+  overflow: auto;
+  background: var(--bg-primary);
+  overscroll-behavior: contain;
+  touch-action: none;
+  user-select: none;
+  cursor: default;
+  scrollbar-width: none;
+}
+
+.image-preview::-webkit-scrollbar {
+  display: none;
+}
+
+.image-preview--click-zoom-in {
+  cursor: zoom-in;
+}
+
+.image-preview--zoomed {
+  cursor: zoom-out;
+}
+
+.image-preview--zoomed:active {
+  cursor: grab;
+}
+
+.image-preview--dragging {
+  cursor: grabbing;
+}
+
+.image-preview-toolbar {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-secondary) 88%, transparent);
+  color: var(--text-secondary);
+  font-size: 12px;
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(8px);
+}
+
+.image-preview-reset {
+  border: none;
+  border-left: 1px solid var(--border-color);
+  padding: 0 0 0 8px;
+  background: transparent;
+  color: var(--accent-blue);
+  font: inherit;
+  cursor: pointer;
+}
+
+.image-preview-canvas {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 100%;
+  min-height: 100%;
+  padding: 24px;
+  box-sizing: border-box;
+}
+
 .image-preview-img {
-  max-width: 100%;
-  max-height: calc(100vh - 160px);
+  flex: 0 0 auto;
   object-fit: contain;
   border-radius: 8px;
   box-shadow: var(--shadow-lg);
 }
 
-.viewer-shell--inline .image-preview-img {
-  max-height: calc(100vh - 96px);
+.viewer-shell-icon-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 /* Text/Code display */
@@ -11013,7 +11092,7 @@ html * {
 }
 
 .viewer-shell-body--scroll-shell {
-  overflow: auto;
+  overflow: hidden;
 }
 
 .viewer-shell-body--scroll-children {

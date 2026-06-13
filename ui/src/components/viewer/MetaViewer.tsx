@@ -13,6 +13,8 @@
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+import { Maximize2, Minimize2 } from 'lucide-react';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { ViewerShell } from './ViewerShell';
 import { NotesPanel } from './NotesPanel';
@@ -49,6 +51,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const fileCodeRef = useRef<PhoenixFileCodeViewHandle>(null);
 
   const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
+  const [imageTakeover, setImageTakeover] = useState(false);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
   const scrollRestoredRef = useRef(false);
@@ -231,7 +234,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // rather than being stranded on the raw <pre>.
   const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
   const largeFallback = textLike && payload.renderMode === 'plainLargeText' && !htmlPreview;
-  const body = usePierreCode ? null : renderBody(payload, bodyProps, htmlViewMode);
+  const body = usePierreCode ? null : renderBody(payload, bodyProps, htmlViewMode, imageTakeover ? 'takeover' : 'pane');
 
   const headerExtras: ReactNode = textLike ? (
     <>
@@ -258,6 +261,28 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
         </>
       )}
     </>
+  ) : payload.kind === 'image' ? (
+    <>
+      <a
+        className="viewer-shell-toggle"
+        href={payload.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        title="Open image in a browser tab"
+      >
+        Open in new tab
+      </a>
+      <button
+        type="button"
+        className="viewer-shell-toggle viewer-shell-icon-toggle"
+        onClick={() => setImageTakeover((value) => !value)}
+        aria-label={imageTakeover ? 'Exit fullscreen image viewer' : 'Open fullscreen image viewer'}
+        title={imageTakeover ? 'Exit fullscreen' : 'Open fullscreen'}
+      >
+        {imageTakeover ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+        <span>{imageTakeover ? 'Exit fullscreen' : 'Fullscreen'}</span>
+      </button>
+    </>
   ) : null;
 
   const patchChangeCount = patchContext?.modifiedLines.size ?? 0;
@@ -275,9 +300,10 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     </span>
   ) : null;
 
-  return (
+  const viewerMode = payload.kind === 'image' && imageTakeover ? 'takeover' : inline ? 'inline' : 'overlay';
+  const shell = (
     <ViewerShell
-      mode={inline ? 'inline' : 'overlay'}
+      mode={viewerMode}
       ariaLabel={`File viewer: ${title}`}
       title={title}
       titleTooltip={absolutePath}
@@ -324,12 +350,14 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           onAnnotateLine={notes.startAnnotate}
         />
       ) : (
-        <div className="viewer-content" ref={contentRef}>
+        <div className={`viewer-content ${payload.kind === 'image' ? 'viewer-content--image' : ''}`} ref={contentRef}>
           {body}
         </div>
       )}
     </ViewerShell>
   );
+
+  return payload.kind === 'image' && imageTakeover ? createPortal(shell, document.body) : shell;
 }
 
 const EMPTY_SET: Set<number> = new Set();
@@ -338,6 +366,7 @@ function renderBody(
   payload: MetaViewerPayload,
   bodyProps: ViewerBodyProps,
   htmlViewMode: HtmlViewMode,
+  imageViewKey: string,
 ): ReactNode {
   // HTML preview renders an iframe with no per-line cost, so the large-file
   // fallback must not pre-empt it; only source-like rendering falls back.
@@ -365,6 +394,6 @@ function renderBody(
     case 'text':
       return <TextViewerBody {...bodyProps} />;
     case 'image':
-      return <ImageViewerBody fileName={payload.fileName} url={payload.url} />;
+      return <ImageViewerBody fileName={payload.fileName} url={payload.url} viewKey={imageViewKey} />;
   }
 }
