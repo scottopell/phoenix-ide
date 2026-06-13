@@ -152,7 +152,6 @@ impl HttpTransport {
             url: self.url.clone(),
             base_headers: self.base_headers.clone(),
             oauth_bearer: self.oauth_bearer.clone(),
-            has_oauth: self.oauth_bearer.is_some(),
             session_id: self.session_id.lock().unwrap().clone(),
             protocol_version: self.protocol_version.lock().unwrap().clone(),
             name: self.name.clone(),
@@ -396,16 +395,16 @@ impl McpTransport for HttpTransport {
             let mut outcome = None;
             'read: while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| Self::classify_request_error(&e, method))?;
-                for event in framer.push(&chunk) {
-                    if let Some(found) = self.dispatch_sse_data(&event.data, id, method, sink) {
+                for data in framer.push(&chunk) {
+                    if let Some(found) = self.dispatch_sse_data(&data, id, method, sink) {
                         outcome = Some(found);
                         break 'read;
                     }
                 }
             }
             if outcome.is_none() {
-                if let Some(event) = framer.finish() {
-                    outcome = self.dispatch_sse_data(&event.data, id, method, sink);
+                if let Some(data) = framer.finish() {
+                    outcome = self.dispatch_sse_data(&data, id, method, sink);
                 }
             }
             outcome.unwrap_or_else(|| {
@@ -551,10 +550,6 @@ struct ServerStream {
     url: String,
     base_headers: HeaderMap,
     oauth_bearer: Option<SharedBearer>,
-    /// Whether an OAuth bearer applies. A 401/403 on the GET is then a transient
-    /// token condition a reconnect may resolve (a concurrent refresh rotates the
-    /// shared cell); without OAuth it is unrecoverable and stops the task.
-    has_oauth: bool,
     session_id: Option<String>,
     protocol_version: Option<String>,
     name: String,
@@ -577,6 +572,10 @@ impl ServerStream {
     async fn run(self) {
         let mut last_event_id: Option<String> = None;
         let mut backoff = Self::BACKOFF_BASE;
+        // A server-sent `retry:` sets the reconnection time until the server
+        // updates it (SSE processing model), so it persists across reconnects
+        // rather than applying only to the stream that carried it.
+        let mut retry_hint: Option<Duration> = None;
         loop {
             match self.connect_once(&mut last_event_id).await {
                 StreamOutcome::Unsupported => {
@@ -602,13 +601,12 @@ impl ServerStream {
                     if productive {
                         backoff = Self::BACKOFF_BASE;
                     }
-                    // A server-sent `retry:` chooses the reconnect delay
-                    // (clamped to sane bounds); otherwise local backoff applies
-                    // and ramps when the connection was not productive.
-                    let delay = match retry_after {
-                        Some(hint) => hint.clamp(Self::RETRY_MIN, Self::BACKOFF_MAX),
-                        None => backoff,
-                    };
+                    if let Some(hint) = retry_after {
+                        retry_hint = Some(hint.clamp(Self::RETRY_MIN, Self::BACKOFF_MAX));
+                    }
+                    // A remembered server `retry:` governs the delay; otherwise
+                    // local backoff applies and ramps when unproductive.
+                    let delay = retry_hint.unwrap_or(backoff);
                     tracing::debug!(
                         server = %self.name,
                         reason,
@@ -617,7 +615,7 @@ impl ServerStream {
                         "MCP server-initiated stream dropped; reconnecting"
                     );
                     tokio::time::sleep(delay).await;
-                    if !productive && retry_after.is_none() {
+                    if !productive && retry_hint.is_none() {
                         backoff = (backoff * 2).min(Self::BACKOFF_MAX);
                     }
                 }
@@ -700,10 +698,13 @@ impl ServerStream {
             // No stream offered here: 405 (method not allowed) or a 404 on a
             // stateless server. Stop without reconnecting.
             404 | 405 => Some(StreamOutcome::Unsupported),
-            // With OAuth, a concurrent refresh may rotate the shared bearer;
-            // reconnect and re-read it. Without OAuth there is nothing to
-            // recover, so stop rather than loop on a permanent rejection.
-            401 | 403 if self.has_oauth => Some(StreamOutcome::Disconnected {
+            // A current token may be rotated by a concurrent refresh, so
+            // reconnect and re-read the shared cell. With no token in hand
+            // (a no-auth server, or one that never authorized) there is nothing
+            // to recover, so stop rather than loop on a permanent rejection --
+            // the presence of the shared cell alone (`HttpAuth::None` carries
+            // one) is not authorization.
+            401 | 403 if self.has_bearer() => Some(StreamOutcome::Disconnected {
                 productive: false,
                 reason: format!("GET stream rejected with HTTP {status}"),
                 retry_after: None,
@@ -720,8 +721,10 @@ impl ServerStream {
         }
     }
 
-    /// Read the open stream's SSE body, forwarding each message to the sink and
-    /// advancing `last_event_id`, until the body ends or errors.
+    /// Read the open stream's SSE body, forwarding each message to the sink,
+    /// until the body ends or errors. The resume cursor is taken from the
+    /// framer's last-event-id buffer at the drop, so an empty/bare `id` reset
+    /// clears it rather than leaving a stale cursor (REQ-MCP-006).
     async fn pump(
         &self,
         response: reqwest::Response,
@@ -731,54 +734,64 @@ impl ServerStream {
         let mut delivered = false;
         let mut framer = SseFramer::default();
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(e) => {
-                    return StreamOutcome::Disconnected {
-                        productive: delivered || started.elapsed() >= Self::HEALTHY_AFTER,
-                        reason: format!("GET stream read error: {e}"),
-                        retry_after: framer.retry,
+        let reason = loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    for data in framer.push(&chunk) {
+                        self.dispatch(&data);
+                        delivered = true;
                     }
                 }
-            };
-            for event in framer.push(&chunk) {
-                self.deliver(event, &mut delivered, last_event_id);
+                Some(Err(e)) => break format!("GET stream read error: {e}"),
+                None => {
+                    if let Some(data) = framer.finish() {
+                        self.dispatch(&data);
+                        delivered = true;
+                    }
+                    break "GET stream closed by server".to_string();
+                }
             }
-        }
-        if let Some(event) = framer.finish() {
-            self.deliver(event, &mut delivered, last_event_id);
-        }
+        };
+        last_event_id.clone_from(&framer.last_id);
         StreamOutcome::Disconnected {
             productive: delivered || started.elapsed() >= Self::HEALTHY_AFTER,
-            reason: "GET stream closed by server".to_string(),
+            reason,
             retry_after: framer.retry,
         }
     }
 
-    /// Advance the resume cursor and forward one framed event to the sink.
-    fn deliver(&self, event: SseEvent, delivered: &mut bool, last_event_id: &mut Option<String>) {
-        if let Some(id) = event.id {
-            *last_event_id = Some(id);
-        }
-        self.dispatch(&event.data);
-        *delivered = true;
+    /// Whether a usable OAuth bearer token is currently held. Distinct from the
+    /// shared cell merely existing: a `HttpAuth::None` server carries the cell
+    /// but holds no token, and a GET-stream 401/403 there is unrecoverable.
+    fn has_bearer(&self) -> bool {
+        bearer_header(self.oauth_bearer.as_ref()).is_some()
     }
 
-    /// Forward a server-initiated message to the protocol layer. Only messages
-    /// carrying a `method` (notifications, or server-initiated requests) belong
-    /// on this stream; a stray response has no request of ours to answer.
+    /// Forward server-initiated messages in one SSE event to the protocol
+    /// layer. The MCP Streamable HTTP transport allows a JSON-RPC batch (an
+    /// array) here, so an array is unpacked and each member dispatched; a bare
+    /// object is dispatched directly. Only messages carrying a `method`
+    /// (notifications, or server-initiated requests) belong on this stream; a
+    /// stray response has no request of ours to answer.
     fn dispatch(&self, data: &str) {
         match serde_json::from_str::<Value>(data) {
-            Ok(message) if message.get("method").is_some() => self.sink.on_message(message),
-            Ok(_) => tracing::debug!(
-                server = %self.name,
-                "Ignoring non-method message on server-initiated stream"
-            ),
+            Ok(Value::Array(batch)) => batch.into_iter().for_each(|m| self.dispatch_message(m)),
+            Ok(message) => self.dispatch_message(message),
             Err(e) => tracing::debug!(
                 server = %self.name,
                 "Invalid JSON on server-initiated stream: {e}"
             ),
+        }
+    }
+
+    fn dispatch_message(&self, message: Value) {
+        if message.get("method").is_some() {
+            self.sink.on_message(message);
+        } else {
+            tracing::debug!(
+                server = %self.name,
+                "Ignoring non-method message on server-initiated stream"
+            );
         }
     }
 }
@@ -787,21 +800,13 @@ impl ServerStream {
 // SSE framing
 // ---------------------------------------------------------------------------
 
-/// One framed SSE event: its joined `data:` payload and the `id:` in effect
-/// when it dispatched. The POST reply path consumes only `data` (its events
-/// are not resumed); the server-initiated GET stream also tracks `id` to send
-/// `Last-Event-ID` on reconnect (REQ-MCP-006).
-struct SseEvent {
-    id: Option<String>,
-    data: String,
-}
-
 /// Incremental SSE event framer over a byte stream: yields the joined `data:`
 /// payload of each event. `event:` fields and comments are ignored. Per the
-/// SSE spec the `id:` field sets a "last event id" that persists across
-/// subsequent events until changed, so each dispatched event carries the id
-/// then in effect; the `retry:` field sets the reconnection time the
-/// server-initiated stream honors on its next reconnect (REQ-MCP-006).
+/// SSE processing model the `id:` field sets a "last event id" buffer that
+/// persists across events (an empty or bare `id` resets it) and the `retry:`
+/// field sets the reconnection time; the server-initiated GET stream reads both
+/// off the framer to resume and pace reconnects (REQ-MCP-006). The POST reply
+/// path consumes only the data payloads.
 #[derive(Default)]
 struct SseFramer {
     buf: Vec<u8>,
@@ -811,8 +816,8 @@ struct SseFramer {
 }
 
 impl SseFramer {
-    /// Feed a chunk; returns the events completed by it.
-    fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+    /// Feed a chunk; returns the data payloads of the events completed by it.
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
         let mut events = Vec::new();
         self.buf.extend_from_slice(chunk);
         while let Some(newline) = self.buf.iter().position(|&b| b == b'\n') {
@@ -821,21 +826,21 @@ impl SseFramer {
             let line = line.trim_end_matches(['\n', '\r']);
             if line.is_empty() {
                 if !self.data_lines.is_empty() {
-                    events.push(SseEvent {
-                        id: self.last_id.clone(),
-                        data: self.data_lines.join("\n"),
-                    });
+                    events.push(self.data_lines.join("\n"));
                     self.data_lines.clear();
                 }
             } else if let Some(rest) = line.strip_prefix("data:") {
                 self.data_lines
                     .push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
-            } else if let Some(rest) = line.strip_prefix("id:") {
-                // A NUL in an id is invalid per the SSE spec; such a field is
-                // ignored. Otherwise it replaces the persistent last event id.
-                let id = rest.strip_prefix(' ').unwrap_or(rest);
-                if !id.contains('\0') {
-                    self.last_id = Some(id.to_string());
+            } else if line == "id" || line.starts_with("id:") {
+                // The `id` field sets the persistent last event id. An empty
+                // value (a bare `id` or `id:`) resets it so the next reconnect
+                // omits Last-Event-ID; a NUL value is ignored per the SSE spec.
+                let value = line
+                    .strip_prefix("id:")
+                    .map_or("", |rest| rest.strip_prefix(' ').unwrap_or(rest));
+                if !value.contains('\0') {
+                    self.last_id = (!value.is_empty()).then(|| value.to_string());
                 }
             } else if let Some(rest) = line.strip_prefix("retry:") {
                 // Per the SSE spec a `retry:` value is the reconnection time in
@@ -855,7 +860,7 @@ impl SseFramer {
     /// acts as the missing line terminator too: a server may close the
     /// response immediately after the last `data:` line, without a trailing
     /// newline, and that line must not be lost.
-    fn finish(&mut self) -> Option<SseEvent> {
+    fn finish(&mut self) -> Option<String> {
         self.push(b"\n\n").into_iter().next()
     }
 }
@@ -1794,6 +1799,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_initiated_stream_handles_batched_notifications() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        // A JSON-RPC batch (array) on the stream carrying list_changed must
+        // flip tools_changed, not be dropped as a non-object payload.
+        server.set_get_responses(vec![
+            sse_response(concat!(
+                "data: [{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}]\n\n",
+            )),
+            status_response(405, &[]),
+        ]);
+        let mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+
+        wait_for(
+            "tools_changed set from a batched GET-stream notification",
+            || mcp.tools_changed.load(Ordering::Acquire),
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn server_initiated_stream_carries_the_oauth_bearer() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         server.set_get_responses(vec![status_response(405, &[])]);
@@ -2516,15 +2543,11 @@ mod tests {
         );
     }
 
-    fn event_data(events: &[SseEvent]) -> Vec<&str> {
-        events.iter().map(|e| e.data.as_str()).collect()
-    }
-
     #[test]
     fn sse_framer_yields_event_per_blank_line() {
         let mut framer = SseFramer::default();
         let events = framer.push(b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n");
-        assert_eq!(event_data(&events), vec!["{\"a\":1}", "{\"b\":2}"]);
+        assert_eq!(events, vec!["{\"a\":1}", "{\"b\":2}"]);
     }
 
     #[test]
@@ -2532,17 +2555,14 @@ mod tests {
         let mut framer = SseFramer::default();
         assert!(framer.push(b"event: message\r\ndata: {\"a\"").is_empty());
         let events = framer.push(b":1}\r\n\r\n");
-        assert_eq!(event_data(&events), vec!["{\"a\":1}"]);
+        assert_eq!(events, vec!["{\"a\":1}"]);
     }
 
     #[test]
     fn sse_framer_joins_multiline_data_and_flushes_on_finish() {
         let mut framer = SseFramer::default();
         assert!(framer.push(b"data: line1\ndata: line2\n").is_empty());
-        assert_eq!(
-            framer.finish().map(|e| e.data),
-            Some("line1\nline2".to_string())
-        );
+        assert_eq!(framer.finish(), Some("line1\nline2".to_string()));
         assert!(framer.finish().is_none());
     }
 
@@ -2552,26 +2572,37 @@ mod tests {
         // with no trailing newline; EOF must act as the terminator.
         let mut framer = SseFramer::default();
         assert!(framer.push(b"data: {\"a\":1}").is_empty());
-        assert_eq!(
-            framer.finish().map(|e| e.data),
-            Some("{\"a\":1}".to_string())
-        );
+        assert_eq!(framer.finish(), Some("{\"a\":1}".to_string()));
         assert!(framer.finish().is_none());
     }
 
     #[test]
     fn sse_framer_tracks_id_and_retry_and_ignores_comments() {
-        // `id:` sets the persistent last event id carried by the event it
-        // dispatches with, and `retry:` is captured as the reconnect hint
-        // (REQ-MCP-006); comments are ignored.
+        // `id:` sets the persistent last event id buffer and `retry:` the
+        // reconnect hint (REQ-MCP-006); comments are ignored.
         let mut framer = SseFramer::default();
         let events = framer.push(b": keepalive\nid: 7\nretry: 100\ndata: x\n\n");
-        assert_eq!(event_data(&events), vec!["x"]);
-        assert_eq!(events[0].id.as_deref(), Some("7"));
+        assert_eq!(events, vec!["x"]);
+        assert_eq!(framer.last_id.as_deref(), Some("7"));
         assert_eq!(framer.retry, Some(Duration::from_millis(100)));
-        // The id persists onto a later event with no id field of its own.
-        let more = framer.push(b"data: y\n\n");
-        assert_eq!(more[0].id.as_deref(), Some("7"));
+        // The id persists across later events until the server changes it.
+        framer.push(b"data: y\n\n");
+        assert_eq!(framer.last_id.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn sse_framer_empty_or_bare_id_resets_the_cursor() {
+        // An empty or bare `id` resets the last-event-id buffer (SSE spec), so
+        // the next reconnect omits Last-Event-ID rather than resuming stale.
+        let mut framer = SseFramer::default();
+        framer.push(b"id: 7\ndata: x\n\n");
+        assert_eq!(framer.last_id.as_deref(), Some("7"));
+        framer.push(b"id:\ndata: y\n\n");
+        assert_eq!(framer.last_id, None, "empty id: resets");
+        framer.push(b"id: 9\ndata: z\n\n");
+        assert_eq!(framer.last_id.as_deref(), Some("9"));
+        framer.push(b"id\ndata: w\n\n");
+        assert_eq!(framer.last_id, None, "bare id resets");
     }
 
     #[test]
