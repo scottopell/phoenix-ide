@@ -4329,10 +4329,12 @@ def native_prod_deploy(version: str | None = None):
         sys.exit(1)
 
     # Refuse before building if the deploy would expose an unauthenticated server.
-    # systemd reads its environment ONLY from .phoenix-ide.env (EnvironmentFile=),
-    # so the effective env is the file alone.
+    # The effective service env is .phoenix-ide.env (EnvironmentFile=) PLUS any
+    # systemd drop-in overrides written by `./dev.py prod set` — both reach the
+    # running service, so the preflight must consider both.
     systemd_env: dict[str, str] = {}
     _load_env_file(systemd_env)
+    systemd_env.update(_systemd_override_env())
     _preflight_prod_bind_auth(systemd_env, socket_activated=True)
 
     # Build
@@ -4570,15 +4572,49 @@ def _bind_is_loopback(effective_env: dict[str, str]) -> bool:
         return False  # binary falls back to 0.0.0.0 on an invalid value
 
 
+def _systemd_override_env() -> dict[str, str]:
+    """Environment values systemd applies from drop-in `*.conf` overrides
+    (written by `./dev.py prod set`), layered on top of the unit's
+    EnvironmentFile. These reach the running service, so the deploy preflight
+    must honour them when deciding whether auth is configured — otherwise an
+    operator who set PHOENIX_PASSWORD via `prod set` is wrongly refused."""
+    env: dict[str, str] = {}
+    for _name, content in list_systemd_overrides():
+        for raw in content.splitlines():
+            line = raw.strip()
+            if line.startswith("Environment="):
+                kv = line[len("Environment=") :].strip().strip('"')
+                key, sep, value = kv.partition("=")
+                if key and sep:
+                    env[key.strip()] = value
+    return env
+
+
+def _launchd_override_env() -> dict[str, str]:
+    """Environment values baked into the launchd plist's EnvironmentVariables
+    (written by `./dev.py prod set`), which the running service uses. The deploy
+    preflight must honour them for the same reason as the systemd drop-ins."""
+    if not LAUNCHD_PLIST_PATH.exists():
+        return {}
+    try:
+        import plistlib
+
+        with open(LAUNCHD_PLIST_PATH, "rb") as f:
+            plist = plistlib.load(f)
+        return dict(plist.get("EnvironmentVariables", {}))
+    except Exception:
+        return {}
+
+
 def _preflight_prod_bind_auth(effective_env: dict[str, str], socket_activated: bool) -> None:
     """Refuse to deploy an unauthenticated, network-reachable prod server.
 
     `effective_env` is the environment the deployed service will actually run
     with, assembled the same way the calling deploy path assembles it:
-      - systemd reads its environment ONLY from .phoenix-ide.env
-        (EnvironmentFile=), and launchd bakes only the file's values into the
-        plist's EnvironmentVariables — so for those paths effective_env is the
-        file alone.
+      - systemd: .phoenix-ide.env (EnvironmentFile=) plus any drop-in `*.conf`
+        overrides (`./dev.py prod set`), which systemd layers on top.
+      - launchd: .phoenix-ide.env plus the plist's existing EnvironmentVariables
+        (also written by `./dev.py prod set`).
       - the non-systemd daemon inherits the deploying shell's os.environ and
         then layers .phoenix-ide.env on top — so effective_env is that merge.
 
@@ -5284,11 +5320,12 @@ def _launchd_stop_if_loaded():
 def launchd_prod_deploy(version: str | None = None):
     """Build and deploy to production via launchd (native macOS)."""
     # Refuse before building if the deploy would expose an unauthenticated server.
-    # The launchd service runs with only the plist's EnvironmentVariables, which
-    # are baked from .phoenix-ide.env (not the deploying shell), so the effective
-    # env is the file alone.
+    # The launchd service runs with the plist's EnvironmentVariables: those baked
+    # from .phoenix-ide.env at deploy time PLUS any set later via `./dev.py prod
+    # set`. The preflight must honour the existing plist overrides too.
     launchd_env: dict[str, str] = {}
     _load_env_file(launchd_env)
+    launchd_env.update(_launchd_override_env())
     _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
     # Build native macOS binary
