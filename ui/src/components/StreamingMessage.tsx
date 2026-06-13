@@ -62,14 +62,31 @@ interface StreamingMessageViewProps {
  *   dimensions so the swap to SyntaxHighlighter causes no layout shift.
  */
 export function StreamingMessageView({ buffer }: StreamingMessageViewProps) {
+  if (!buffer) return null;
+  return (
+    <div className="streaming-message agent-message">
+      <div className="streaming-message-content">
+        <StreamingBlocks text={buffer.text ?? ''} />
+      </div>
+      <span className="streaming-cursor" aria-hidden="true" />
+    </div>
+  );
+}
+
+/**
+ * rAF-gated, block-memoized renderer for a live streaming text buffer. Owns the
+ * coalescing + parse-once machinery so any surface that displays a growing token
+ * buffer (the main agent stream, a sub-agent transcript) re-highlights only the
+ * growing tail rather than re-parsing the whole buffer every token (REQ-MLRU-010).
+ * Caller supplies the wrapping chrome (cursor, container classes).
+ */
+export function StreamingBlocks({ text }: { text: string }) {
   const { theme } = useTheme();
   const syntaxStyle = theme === 'light' ? oneLight : oneDark;
   // rAF-gated display buffer: accumulates incoming text and flushes once per frame.
   const pendingText = useRef<string>('');
   const rafHandle = useRef<number | null>(null);
   const [displayText, setDisplayText] = useState<string>('');
-
-  const incomingText = buffer?.text ?? '';
 
   // Update the pending text and schedule a single rAF flush per frame.
   // The previous cleanup-on-every-dep-change pattern cancelled in-flight
@@ -79,14 +96,14 @@ export function StreamingMessageView({ buffer }: StreamingMessageViewProps) {
   // only update pendingText and skip re-scheduling because rafHandle
   // is non-null.
   useEffect(() => {
-    pendingText.current = incomingText;
+    pendingText.current = text;
     if (rafHandle.current === null) {
       rafHandle.current = requestAnimationFrame(() => {
         setDisplayText(pendingText.current);
         rafHandle.current = null;
       });
     }
-  }, [incomingText]);
+  }, [text]);
 
   // Cancel any pending frame on unmount only — not on every token.
   useEffect(() => {
@@ -101,17 +118,12 @@ export function StreamingMessageView({ buffer }: StreamingMessageViewProps) {
   // Parse once per text change, not on theme-only re-renders.
   const blocks = useMemo(() => parseStreamingBlocks(displayText), [displayText]);
 
-  if (!buffer) return null;
-
   return (
-    <div className="streaming-message agent-message">
-      <div className="streaming-message-content">
-        {blocks.map((block, i) => (
-          <StreamingBlock key={`${block.type}-${i}`} block={block} syntaxStyle={syntaxStyle} />
-        ))}
-      </div>
-      <span className="streaming-cursor" aria-hidden="true" />
-    </div>
+    <>
+      {blocks.map((block, i) => (
+        <StreamingBlock key={`${block.type}-${i}`} block={block} syntaxStyle={syntaxStyle} />
+      ))}
+    </>
   );
 }
 

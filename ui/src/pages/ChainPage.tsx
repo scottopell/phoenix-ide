@@ -923,7 +923,11 @@ function ActivePairCard({
   );
 }
 
-function InflightPairCard({ inflightEntry, onReask }: ChainQaPairCardProps) {
+// Memoized so a token landing on one in-flight Q&A re-renders only that card.
+// `TOKEN_APPENDED` replaces just the streaming entry's object identity; sibling
+// in-flight entries keep theirs, so a shallow prop compare bails. Mirrors
+// PersistedPairCard's memoization for the same per-token re-parse problem.
+const InflightPairCard = memo(function InflightPairCard({ inflightEntry, onReask }: ChainQaPairCardProps) {
   if (!inflightEntry) return null;
   const isFailed = inflightEntry.error !== null;
   const className = isFailed
@@ -988,7 +992,7 @@ function InflightPairCard({ inflightEntry, onReask }: ChainQaPairCardProps) {
       </div>
     </article>
   );
-}
+});
 
 const PersistedPairCard = memo(function PersistedPairCard({ row, chain, onReask }: ChainQaPairCardProps) {
   if (!row || !chain) return null;

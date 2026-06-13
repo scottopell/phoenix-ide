@@ -37,6 +37,7 @@ import { PillStrip, type PillItem } from './PillStrip';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, CONVERSATION_MARKDOWN_COMPONENTS } from './conversationMarkdown';
+import { StreamingBlocks } from './StreamingMessage';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -1688,8 +1689,8 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
   // For bash/tmux, the tool result is a structured JSON envelope (REQ-BASH-002 /
   // REQ-TMUX-012). Decode it once so the renderer below can branch on
   // status / running state / label rather than show the raw JSON.
-  const bashResponse = name === 'bash' ? tryParseJson(rawResultText) : null;
-  const tmuxResponse = name === 'tmux' ? tryParseJson(rawResultText) : null;
+  const bashResponse = useMemo(() => (name === 'bash' ? tryParseJson(rawResultText) : null), [name, rawResultText]);
+  const tmuxResponse = useMemo(() => (name === 'tmux' ? tryParseJson(rawResultText) : null), [name, rawResultText]);
 
   // For patch tool, use the diff from display_data instead of the generic success message
   const patchDiff = name === 'patch' ? (result?.display_data as { diff?: string })?.diff : undefined;
@@ -1741,14 +1742,17 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
   const [outputExpanded, setOutputExpanded] = useState(shouldAutoExpand);
 
   // For display, truncate very long outputs even when expanded
-  const maxDisplayLen = 5000;
-  const displayResult = resultText.length > maxDisplayLen 
-    ? resultText.slice(0, maxDisplayLen) + `\n... (${resultText.length - maxDisplayLen} more chars)`
-    : resultText;
+  const displayResult = useMemo(() => {
+    const maxDisplayLen = 5000;
+    return resultText.length > maxDisplayLen
+      ? resultText.slice(0, maxDisplayLen) + `\n... (${resultText.length - maxDisplayLen} more chars)`
+      : resultText;
+  }, [resultText]);
 
-  // Preview for collapsed state: show first 3 lines faded
-  const previewLines = resultText.split('\n').slice(0, 3);
-  const lineCount = resultText.split('\n').length;
+  // Preview for collapsed state: show first 3 lines faded. Split once, derive both.
+  const lines = useMemo(() => resultText.split('\n'), [resultText]);
+  const previewLines = lines.slice(0, 3);
+  const lineCount = lines.length;
   const hasMoreLines = lineCount > 3;
 
   const hasOutput = resultContent !== null;
@@ -2105,7 +2109,7 @@ export function SubAgentTranscript({ inline, running, full = false }: { inline: 
       ))}
       {atom.streamingBuffer?.text && (
         <div className="subagent-activity-event agent-text streaming">
-          <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={CONVERSATION_MARKDOWN_COMPONENTS}>{atom.streamingBuffer.text}</ReactMarkdown>
+          <StreamingBlocks text={atom.streamingBuffer.text} />
         </div>
       )}
       {inline.type !== 'connecting' && inline.type !== 'error' && visibleAgentMessages.length === 0 && !atom.streamingBuffer?.text && (
