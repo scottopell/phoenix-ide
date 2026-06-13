@@ -21,7 +21,7 @@ natively, without the `mcp-remote` subprocess bridge.
 | REQ-MCP-003 | Stdio Transport | Complete | `StdioTransport::spawn` / `McpServer::initialize` / `list_tools`; crash detection (`is_alive`, `TransportError::Disconnected` classification) + `respawn` in `mcp.rs`. |
 | REQ-MCP-004 | Streamable HTTP Transport | Complete | `HttpTransport` (`mcp/http.rs`): POST with the dual `Accept` pair, unary-JSON and SSE-stream response handling (`SseFramer`), `MCP-Protocol-Version` echoed after `initialize`, 202-with-empty-body accepted for notifications. |
 | REQ-MCP-005 | HTTP Session Lifecycle | Complete | `Mcp-Session-Id` captured at `initialize` and echoed on every request; DELETE on shutdown (`HttpTransport::shutdown`); 404 → `TransportError::SessionExpired` → re-initialize before one retry. |
-| REQ-MCP-006 | Server-Initiated Stream and Resumability | Not started | M4. GET SSE stream; `tools/list_changed`; `Last-Event-ID` replay. |
+| REQ-MCP-006 | Server-Initiated Stream and Resumability | Complete | `ServerStream` (`mcp/http.rs`): a detached GET (`Accept: text/event-stream`, bearer + session + protocol-version) opened once `initialize` negotiates, feeding server-initiated messages to the shared `NotificationSink`; reconnect resumes via `Last-Event-ID` with capped backoff; aborted on `shutdown`/`Drop`. |
 | REQ-MCP-007 | HTTP Connection Recovery | Complete | `McpServer::should_reestablish`: HTTP recovers from `Disconnected`/`Timeout`/`SessionExpired` by rebuilding the client + handshake, distinct from the stdio respawn (which recovers only from `Disconnected`). |
 | REQ-MCP-008 | Static Token / Header Authentication | Complete | `HttpAuth::Static` (bearer or designated auth headers) attached to every request; generic `headers` ride every request without classifying the server. The 401-versus-OAuth routing distinction becomes observable when the OAuth flow exists (M3). |
 | REQ-MCP-009 | OAuth 2.1 Authorization Discovery | Complete | `mcp/oauth.rs`: 401 challenge parsing → PRM (`resource_metadata` or the path-aware/root well-knowns, RFC 9728) → AS metadata via both RFC 8414 and OIDC discovery forms, issuer-validated. |
@@ -47,7 +47,7 @@ This spec set is M0 of the native HTTP MCP build-out. The milestones:
   independent release.
 - **M3** (done) -- OAuth 2.1, the value driver. First releasable unit = M2 + M3
   (REQ-MCP-009 .. -013).
-- **M4** -- Server-initiated SSE stream + resumability (REQ-MCP-006).
+- **M4** (done) -- Server-initiated SSE stream + resumability (REQ-MCP-006).
 - **M5** -- UI / config / ops polish, including connection-failure visibility
   (REQ-MCP-018).
 

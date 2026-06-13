@@ -26,9 +26,12 @@ lifecycle in `mcp.rs`): discovery (RFC 9728/8414/OIDC), AS-keyed client
 registration with RFC 7591 DCR fallback, auth-code + PKCE with the callback at
 `GET /api/mcp/oauth/callback`, and the SQLite token store with silent restore,
 refresh, and `insufficient_scope` step-up — closing task 08639. M2+M3 is the
-first releasable unit. **Next actionable: M4 (GET SSE stream + resumability)**,
-then M5, per the milestone list. `executive.md`'s status table tracks which
-REQs each milestone covers.
+first releasable unit. **M4 (tasks/58029) is done**: `ServerStream` in
+`mcp/http.rs` opens the server-initiated GET SSE stream after `initialize`,
+feeds `tools/list_changed` to the shared `NotificationSink`, and reconnects
+with `Last-Event-ID` (REQ-MCP-006). **Next actionable: M5 (UI / config / ops
+polish, including connection-failure visibility, REQ-MCP-018 / task 02685).**
+`executive.md`'s status table tracks which REQs each milestone covers.
 
 ## Where we are today
 
