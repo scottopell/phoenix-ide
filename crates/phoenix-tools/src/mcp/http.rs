@@ -1804,9 +1804,9 @@ mod tests {
         // A JSON-RPC batch (array) on the stream carrying list_changed must
         // flip tools_changed, not be dropped as a non-object payload.
         server.set_get_responses(vec![
-            sse_response(concat!(
+            sse_response(
                 "data: [{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}]\n\n",
-            )),
+            ),
             status_response(405, &[]),
         ]);
         let mcp = connect_http(&server, HttpAuth::None)
