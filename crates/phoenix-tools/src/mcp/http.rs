@@ -306,14 +306,28 @@ fn bearer_header(oauth_bearer: Option<&SharedBearer>) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!("Bearer {token}")).ok()
 }
 
+/// Whether a response is framed as a server-sent-event stream.
+fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
+}
+
 fn insert_header(map: &mut HeaderMap, server: &str, key: &str, value: &str) -> Result<(), String> {
-    // The session and protocol-version headers are transport state; a
+    // The session, protocol-version, and resume headers are transport state; a
     // config-supplied copy would ride alongside the real value (reqwest's
     // `.header()` appends rather than replaces) and could bind a request to
-    // the wrong session. Reject loudly rather than silently dropping what
-    // the user wrote.
+    // the wrong session or replay from a stale event id. Reject loudly rather
+    // than silently dropping what the user wrote.
     if key.eq_ignore_ascii_case("mcp-session-id")
         || key.eq_ignore_ascii_case("mcp-protocol-version")
+        || key.eq_ignore_ascii_case("last-event-id")
     {
         return Err(format!(
             "MCP server '{server}': header '{key}' is transport-managed and cannot be set in config"
@@ -518,8 +532,14 @@ enum StreamOutcome {
     Fatal(String),
     /// The stream connected and then dropped, or failed to connect. `productive`
     /// is true when it delivered at least one event or stayed open long enough
-    /// to count as healthy, which resets the reconnect backoff.
-    Disconnected { productive: bool, reason: String },
+    /// to count as healthy, which resets the reconnect backoff. `retry_after`
+    /// carries a server-sent SSE `retry:` hint, when one arrived, to time the
+    /// reconnect in place of local backoff.
+    Disconnected {
+        productive: bool,
+        reason: String,
+        retry_after: Option<Duration>,
+    },
 }
 
 /// The owned slice of an `HttpTransport` a detached GET-stream task needs. It
@@ -547,6 +567,9 @@ impl ServerStream {
     /// reconnect per `BACKOFF_MAX` rather than a hot loop.
     const BACKOFF_BASE: Duration = Duration::from_secs(1);
     const BACKOFF_MAX: Duration = Duration::from_secs(30);
+    /// Floor for a server-sent `retry:` hint, so a `retry: 0` cannot turn the
+    /// reconnect into a hot loop while still honoring sub-second requests.
+    const RETRY_MIN: Duration = Duration::from_millis(250);
     /// A connection open at least this long counts as healthy even if it
     /// delivered no events (an idle but live stream).
     const HEALTHY_AFTER: Duration = Duration::from_secs(5);
@@ -571,19 +594,30 @@ impl ServerStream {
                     );
                     return;
                 }
-                StreamOutcome::Disconnected { productive, reason } => {
+                StreamOutcome::Disconnected {
+                    productive,
+                    reason,
+                    retry_after,
+                } => {
                     if productive {
                         backoff = Self::BACKOFF_BASE;
                     }
+                    // A server-sent `retry:` chooses the reconnect delay
+                    // (clamped to sane bounds); otherwise local backoff applies
+                    // and ramps when the connection was not productive.
+                    let delay = match retry_after {
+                        Some(hint) => hint.clamp(Self::RETRY_MIN, Self::BACKOFF_MAX),
+                        None => backoff,
+                    };
                     tracing::debug!(
                         server = %self.name,
                         reason,
                         resume_from = ?last_event_id,
-                        backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         "MCP server-initiated stream dropped; reconnecting"
                     );
-                    tokio::time::sleep(backoff).await;
-                    if !productive {
+                    tokio::time::sleep(delay).await;
+                    if !productive && retry_after.is_none() {
                         backoff = (backoff * 2).min(Self::BACKOFF_MAX);
                     }
                 }
@@ -601,13 +635,21 @@ impl ServerStream {
                 return StreamOutcome::Disconnected {
                     productive: false,
                     reason,
+                    retry_after: None,
                 }
             }
         };
-        match self.classify_stream_status(response.status()) {
-            Some(outcome) => outcome,
-            None => self.pump(response, last_event_id).await,
+        if let Some(outcome) = self.classify_stream_status(response.status()) {
+            return outcome;
         }
+        // A 2xx that is not `text/event-stream` (a JSON/HTML health page, a
+        // 204) carries no stream: framing it yields no events and `pump` would
+        // return at once, spinning a reconnect loop. The endpoint offers no
+        // server-initiated stream, so stop like a 405 (REQ-MCP-006).
+        if !is_event_stream(&response) {
+            return StreamOutcome::Unsupported;
+        }
+        self.pump(response, last_event_id).await
     }
 
     /// Build and send the GET, attaching auth, session, protocol-version, and
@@ -651,6 +693,7 @@ impl ServerStream {
             401 | 403 if self.has_oauth => Some(StreamOutcome::Disconnected {
                 productive: false,
                 reason: format!("GET stream rejected with HTTP {status}"),
+                retry_after: None,
             }),
             401 | 403 => Some(StreamOutcome::Fatal(format!(
                 "GET stream rejected with HTTP {status}"
@@ -664,6 +707,7 @@ impl ServerStream {
             _ if !status.is_success() => Some(StreamOutcome::Disconnected {
                 productive: false,
                 reason: format!("GET stream returned HTTP {status}"),
+                retry_after: None,
             }),
             _ => None,
         }
@@ -687,6 +731,7 @@ impl ServerStream {
                     return StreamOutcome::Disconnected {
                         productive: delivered || started.elapsed() >= Self::HEALTHY_AFTER,
                         reason: format!("GET stream read error: {e}"),
+                        retry_after: framer.retry,
                     }
                 }
             };
@@ -700,6 +745,7 @@ impl ServerStream {
         StreamOutcome::Disconnected {
             productive: delivered || started.elapsed() >= Self::HEALTHY_AFTER,
             reason: "GET stream closed by server".to_string(),
+            retry_after: framer.retry,
         }
     }
 
@@ -744,15 +790,17 @@ struct SseEvent {
 }
 
 /// Incremental SSE event framer over a byte stream: yields the joined `data:`
-/// payload of each event. `event:`/`retry:` fields and comments are ignored.
-/// Per the SSE spec the `id:` field sets a "last event id" that persists
-/// across subsequent events until changed, so each dispatched event carries
-/// the id then in effect.
+/// payload of each event. `event:` fields and comments are ignored. Per the
+/// SSE spec the `id:` field sets a "last event id" that persists across
+/// subsequent events until changed, so each dispatched event carries the id
+/// then in effect; the `retry:` field sets the reconnection time the
+/// server-initiated stream honors on its next reconnect (REQ-MCP-006).
 #[derive(Default)]
 struct SseFramer {
     buf: Vec<u8>,
     data_lines: Vec<String>,
     last_id: Option<String>,
+    retry: Option<Duration>,
 }
 
 impl SseFramer {
@@ -781,6 +829,15 @@ impl SseFramer {
                 let id = rest.strip_prefix(' ').unwrap_or(rest);
                 if !id.contains('\0') {
                     self.last_id = Some(id.to_string());
+                }
+            } else if let Some(rest) = line.strip_prefix("retry:") {
+                // Per the SSE spec a `retry:` value is the reconnection time in
+                // integer milliseconds; a non-integer value is ignored.
+                let value = rest.strip_prefix(' ').unwrap_or(rest);
+                if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(ms) = value.parse::<u64>() {
+                        self.retry = Some(Duration::from_millis(ms));
+                    }
                 }
             }
         }
@@ -1665,6 +1722,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_initiated_stream_stops_on_non_sse_response() {
+        let server = TestServer::start(handshake_responses("sess-1")).await;
+        // A 200 application/json health page is not a stream. The task must
+        // stop rather than frame it as empty and reconnect forever.
+        server.set_get_responses(vec![json_response(
+            0,
+            &serde_json::json!({"status": "ok"}),
+            &[],
+        )]);
+        let _mcp = connect_http(&server, HttpAuth::None)
+            .await
+            .expect("connect");
+
+        wait_for("a GET stream request", || {
+            !server.get_requests.lock().unwrap().is_empty()
+        })
+        .await;
+        // Past one local backoff interval a buggy poll loop would have issued a
+        // second GET; a stopped stream stays at one.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            server.get_requests.lock().unwrap().len(),
+            1,
+            "a non-SSE 2xx response must stop the stream, not poll"
+        );
+    }
+
+    #[tokio::test]
     async fn server_initiated_stream_carries_the_oauth_bearer() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         server.set_get_responses(vec![status_response(405, &[])]);
@@ -2431,16 +2516,25 @@ mod tests {
     }
 
     #[test]
-    fn sse_framer_tracks_id_and_ignores_comments() {
+    fn sse_framer_tracks_id_and_retry_and_ignores_comments() {
         // `id:` sets the persistent last event id carried by the event it
-        // dispatches with (REQ-MCP-006); comments and retry are ignored.
+        // dispatches with, and `retry:` is captured as the reconnect hint
+        // (REQ-MCP-006); comments are ignored.
         let mut framer = SseFramer::default();
         let events = framer.push(b": keepalive\nid: 7\nretry: 100\ndata: x\n\n");
         assert_eq!(event_data(&events), vec!["x"]);
         assert_eq!(events[0].id.as_deref(), Some("7"));
+        assert_eq!(framer.retry, Some(Duration::from_millis(100)));
         // The id persists onto a later event with no id field of its own.
         let more = framer.push(b"data: y\n\n");
         assert_eq!(more[0].id.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn sse_framer_ignores_non_integer_retry() {
+        let mut framer = SseFramer::default();
+        framer.push(b"retry: soon\ndata: x\n\n");
+        assert_eq!(framer.retry, None);
     }
 
     // -----------------------------------------------------------------------
