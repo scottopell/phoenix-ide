@@ -867,7 +867,7 @@ impl SseFramer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{McpClientManager, McpServerConfig};
+    use super::super::{McpClientManager, McpConnState, McpServerConfig};
     use super::*;
     use std::collections::VecDeque;
     use std::fmt::Write as _;
@@ -2331,7 +2331,12 @@ mod tests {
 
         let defs = manager.tool_definitions().await;
         assert!(defs.is_empty(), "stale definitions must not be advertised");
-        assert!(manager.status().await.is_empty());
+        // Dropped from the connected map, but retained in status as failed with
+        // its cause rather than vanishing (REQ-MCP-018).
+        let status = manager.status().await;
+        assert_eq!(status.len(), 1);
+        assert!(matches!(status[0].state, McpConnState::Failed));
+        assert!(status[0].last_error.is_some());
     }
 
     #[tokio::test]
