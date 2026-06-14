@@ -466,19 +466,24 @@ async fn attach_pr_feedback_freshness(
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
-        response.feedback_freshness = match feedback {
-            Ok(feedback) => crate::api::pr_monitoring::feedback_freshness_from_baseline(
-                &baseline,
-                Some(&feedback),
-            ),
-            Err(err) => {
-                // Couldn't fetch feedback to compare — surface no content
-                // freshness rather than guessing. A distinct "feedback
-                // incomplete" signal is tracked separately.
-                tracing::debug!(pr = pr_number, error = %err, "could not fetch PR feedback to classify freshness");
-                None
+        match feedback {
+            Ok(feedback) => {
+                // Content change and coverage health are independent signals
+                // derived from the same fetch: the count reflects only the
+                // surfaces that were read, and coverage flags any that weren't.
+                response.feedback_freshness =
+                    crate::api::pr_monitoring::feedback_freshness_from_baseline(
+                        &baseline,
+                        Some(&feedback),
+                    );
+                response.feedback_coverage = crate::api::pr_monitoring::coverage_health(&feedback);
             }
-        };
+            Err(err) => {
+                // Couldn't fetch feedback at all (e.g. not a git repo) — leave
+                // both signals absent rather than guessing.
+                tracing::debug!(pr = pr_number, error = %err, "could not fetch PR feedback to classify freshness");
+            }
+        }
     }
 
     Ok(response)

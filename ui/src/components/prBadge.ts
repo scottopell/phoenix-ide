@@ -52,14 +52,56 @@ Checks: ${checks}${freshness}`;
 }
 
 /** Short feedback-freshness tag (`"3 new"`, `"1 comment updated"`), or null
- *  when there is no freshness signal to show. */
+ *  when there is no freshness signal to show. When the fetch was degraded
+ *  (`feedback_coverage` present) the count is a lower bound, so it's prefixed
+ *  with "at least". */
 export function prFeedbackFreshnessLabel(pr: PrStatusResponse): string | null {
   const freshness = pr.feedback_freshness;
   if (!freshness) return null;
+  const floor = pr.feedback_coverage ? 'at least ' : '';
   if (freshness.state === 'new') {
-    return `${freshness.count} new`;
+    return `${floor}${freshness.count} new`;
   }
-  return freshness.count === 1 ? '1 comment updated' : `${freshness.count} comments updated`;
+  const noun =
+    freshness.count === 1 ? '1 comment updated' : `${freshness.count} comments updated`;
+  return `${floor}${noun}`;
+}
+
+export interface PrFeedbackCoverageMarker {
+  /** True for an actionable auth failure (the user can run `gh auth login`). */
+  actionable: boolean;
+  /** Short visible text; empty for the low-key transient case (icon only). */
+  label: string;
+  tooltip: string;
+}
+
+const SURFACE_LABELS: Record<string, string> = {
+  issue_comments: 'issue comments',
+  review_comments: 'review comments',
+  review_summaries: 'review summaries',
+  review_threads: 'review threads',
+};
+
+/** Warning marker for a degraded feedback fetch, or null when coverage is
+ *  complete. Distinct from the freshness label so an incomplete fetch is never
+ *  rendered as a content change. Auth failures are actionable and labelled;
+ *  transient gaps are icon-only with the reason in the tooltip. */
+export function prFeedbackCoverageMarker(pr: PrStatusResponse): PrFeedbackCoverageMarker | null {
+  const coverage = pr.feedback_coverage;
+  if (!coverage) return null;
+  const surfaces = coverage.surfaces.map((s) => SURFACE_LABELS[s] ?? s).join(', ');
+  if (coverage.kind === 'auth_required') {
+    return {
+      actionable: true,
+      label: 'GitHub sign-in needed',
+      tooltip: `Couldn't read ${surfaces} — the GitHub CLI isn't authenticated. Run \`gh auth login\`, then refresh.`,
+    };
+  }
+  return {
+    actionable: false,
+    label: '',
+    tooltip: `Feedback may be incomplete — couldn't fetch ${surfaces}.`,
+  };
 }
 
 /** Short hint for why PR status is unavailable (the pipeline couldn't check),

@@ -220,10 +220,19 @@ export interface PrRefreshMetadata {
 
 // Mirrors the Rust `PrFeedbackFreshness` (api/types.rs): an internally-tagged
 // union where each variant carries its own count. Coverage gaps / fetch errors
-// are not represented here — they are a separate error condition.
+// are not represented here — they are a separate error condition
+// (`PrFeedbackCoverageHealth`).
 export type PrFeedbackFreshness =
   | { state: 'new'; count: number }
   | { state: 'edited'; count: number };
+
+// Mirrors the Rust `PrFeedbackCoverageHealth` (api/types.rs). Orthogonal to
+// freshness: when a surface can't be read, any freshness count is a lower
+// bound. `auth_required` is user-actionable (gh auth login); `incomplete` is
+// transient.
+export type PrFeedbackCoverageHealth =
+  | { kind: 'auth_required'; surfaces: PrFeedbackCoverageSurface[] }
+  | { kind: 'incomplete'; surfaces: PrFeedbackCoverageSurface[] };
 
 export interface PrStatusResponse {
   found: boolean;
@@ -243,6 +252,7 @@ export interface PrStatusResponse {
   updated_at?: string;
   display_state?: PrDisplayState;
   feedback_freshness?: PrFeedbackFreshness;
+  feedback_coverage?: PrFeedbackCoverageHealth;
 }
 
 export interface Project {

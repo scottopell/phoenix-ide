@@ -1,9 +1,9 @@
 use super::types::{
     PrAutoFixContextResponse, PrCheckDetail, PrCheckLogSnippet, PrCheckLogSource, PrCheckState,
-    PrCheckSummary, PrDisplayState, PrFeedbackCoverage, PrFeedbackCoverageStatus,
-    PrFeedbackCoverageSurface, PrFeedbackFreshness, PrFeedbackItem, PrFeedbackSource,
-    PrFeedbackSummary, PrIdentity, PrRefreshMetadata, PrRefreshState, PrStatusResponse,
-    PrUnavailableReason,
+    PrCheckSummary, PrDisplayState, PrFeedbackCoverage, PrFeedbackCoverageHealth,
+    PrFeedbackCoverageStatus, PrFeedbackCoverageSurface, PrFeedbackFreshness, PrFeedbackItem,
+    PrFeedbackSource, PrFeedbackSummary, PrIdentity, PrRefreshMetadata, PrRefreshState,
+    PrStatusResponse, PrUnavailableReason,
 };
 use crate::db::{
     WorkScopePrAssociation, WorkScopePrFeedbackBaseline, WorkScopePrFeedbackBaselineInput,
@@ -751,6 +751,7 @@ fn fresh_response(
         updated_at: pr.updated_at.clone().or_else(|| Some(refreshed_at.clone())),
         display_state: Some(pr.display_state.clone()),
         feedback_freshness: None,
+        feedback_coverage: None,
         pr: Some(pr),
         refresh: PrRefreshMetadata {
             state: PrRefreshState::Fresh,
@@ -827,6 +828,7 @@ pub(crate) fn stale_response_with_refresh_state(
         updated_at: identity.updated_at.clone(),
         display_state: Some(identity.display_state.clone()),
         feedback_freshness: None,
+        feedback_coverage: None,
         pr: Some(identity),
         refresh: PrRefreshMetadata {
             state: refresh_state,
@@ -883,6 +885,7 @@ pub(crate) fn persisted_primary_response(
         updated_at: identity.updated_at.clone(),
         display_state: Some(identity.display_state.clone()),
         feedback_freshness: None,
+        feedback_coverage: None,
         pr: Some(identity),
         refresh,
     }
@@ -1378,6 +1381,33 @@ pub(crate) fn feedback_freshness_from_baseline(
         });
     }
 
+    None
+}
+
+/// Coverage health of a feedback fetch, derived from its per-surface coverage.
+/// Auth failures take precedence over transient unavailability because only
+/// they are user-actionable. Returns `None` when every surface was fetched.
+pub(crate) fn coverage_health(feedback: &PrFeedbackSummary) -> Option<PrFeedbackCoverageHealth> {
+    let surfaces_with = |target: PrFeedbackCoverageStatus| -> Vec<PrFeedbackCoverageSurface> {
+        feedback
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.status == target)
+            .map(|coverage| coverage.surface)
+            .collect()
+    };
+    let auth_failed = surfaces_with(PrFeedbackCoverageStatus::AuthFailed);
+    if !auth_failed.is_empty() {
+        return Some(PrFeedbackCoverageHealth::AuthRequired {
+            surfaces: auth_failed,
+        });
+    }
+    let unavailable = surfaces_with(PrFeedbackCoverageStatus::Unavailable);
+    if !unavailable.is_empty() {
+        return Some(PrFeedbackCoverageHealth::Incomplete {
+            surfaces: unavailable,
+        });
+    }
     None
 }
 
@@ -2094,6 +2124,75 @@ mod tests {
             feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
         };
         assert_eq!(feedback_freshness_from_baseline(&baseline, None), None);
+    }
+
+    fn coverage_summary(coverage: Vec<PrFeedbackCoverage>) -> PrFeedbackSummary {
+        PrFeedbackSummary {
+            total: 0,
+            unresolved: 0,
+            items: vec![],
+            coverage,
+        }
+    }
+
+    fn coverage(
+        surface: PrFeedbackCoverageSurface,
+        status: PrFeedbackCoverageStatus,
+    ) -> PrFeedbackCoverage {
+        PrFeedbackCoverage {
+            surface,
+            status,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn coverage_health_flags_auth_over_transient() {
+        let feedback = coverage_summary(vec![
+            coverage(
+                PrFeedbackCoverageSurface::IssueComments,
+                PrFeedbackCoverageStatus::Unavailable,
+            ),
+            coverage(
+                PrFeedbackCoverageSurface::ReviewThreads,
+                PrFeedbackCoverageStatus::AuthFailed,
+            ),
+        ]);
+        assert_eq!(
+            coverage_health(&feedback),
+            Some(PrFeedbackCoverageHealth::AuthRequired {
+                surfaces: vec![PrFeedbackCoverageSurface::ReviewThreads],
+            })
+        );
+    }
+
+    #[test]
+    fn coverage_health_reports_incomplete_for_transient_only() {
+        let feedback = coverage_summary(vec![
+            coverage(
+                PrFeedbackCoverageSurface::IssueComments,
+                PrFeedbackCoverageStatus::Fetched,
+            ),
+            coverage(
+                PrFeedbackCoverageSurface::ReviewThreads,
+                PrFeedbackCoverageStatus::Unavailable,
+            ),
+        ]);
+        assert_eq!(
+            coverage_health(&feedback),
+            Some(PrFeedbackCoverageHealth::Incomplete {
+                surfaces: vec![PrFeedbackCoverageSurface::ReviewThreads],
+            })
+        );
+    }
+
+    #[test]
+    fn coverage_health_none_when_all_fetched() {
+        let feedback = coverage_summary(vec![coverage(
+            PrFeedbackCoverageSurface::IssueComments,
+            PrFeedbackCoverageStatus::Fetched,
+        )]);
+        assert_eq!(coverage_health(&feedback), None);
     }
 
     #[test]

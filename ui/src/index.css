@@ -8713,6 +8713,20 @@ html * {
   font-weight: 600;
 }
 
+/* Degraded-feedback marker. Low-key amber for a transient gap (icon + tooltip);
+   prominent red for an actionable auth failure. */
+.work-actions-pr-coverage {
+  color: var(--accent-yellow, #eab308);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: help;
+}
+
+.work-actions-pr-coverage--auth {
+  color: var(--accent-red, #ef4444);
+  cursor: default;
+}
+
 .work-actions-pr-note {
   color: var(--text-muted);
   font-size: 11px;

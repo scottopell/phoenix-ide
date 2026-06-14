@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { api, type PrStatusResponse } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
-import { prFeedbackFreshnessLabel } from './prBadge';
+import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
 
 interface WorkControlBarProps {
   conversationId: string;
@@ -128,6 +128,7 @@ function PrRemediationActions({
   const [loading, setLoading] = useState(false);
   const refreshUnavailable = prStatus?.refresh.state === 'unavailable';
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
+  const coverageMarker = prStatus ? prFeedbackCoverageMarker(prStatus) : null;
   const canAddress = !!prStatus?.found && prStatus.display_state === 'open' && !refreshUnavailable && !!onSendMessage;
   if (!prStatus?.found || prStatus.display_state !== 'open') return null;
   return (
@@ -152,6 +153,15 @@ function PrRemediationActions({
     >
       {loading ? 'Capturing...' : 'Address CI & comments'}
       {freshnessLabel && <span className="work-actions-pr-freshness">{freshnessLabel}</span>}
+      {coverageMarker && (
+        <span
+          className={`work-actions-pr-coverage${coverageMarker.actionable ? ' work-actions-pr-coverage--auth' : ''}`}
+          title={coverageMarker.tooltip}
+        >
+          {'⚠'}
+          {coverageMarker.label ? ` ${coverageMarker.label}` : ''}
+        </span>
+      )}
     </button>
   );
 }
