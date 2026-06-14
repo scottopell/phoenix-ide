@@ -990,11 +990,11 @@ async fn reconcile_worktrees(db: &Database) {
 /// `develop` keeps cutting forks from `develop` even after the remote default
 /// shifts to `main`. For a row stored as `"main"`:
 ///
-/// - a remote default that differs (`schema::resolve_remote_default_branch`, the
+/// - a remote default that differs (`git::resolve_remote_default_branch`, the
 ///   cached `refs/remotes/origin/HEAD`) is the authoritative fork base — backfill;
 /// - else, with no local `main` branch, the literal is broken and would fail fork
 ///   approval, so repair to the current checked-out branch
-///   (`schema::resolve_default_branch`);
+///   (`git::resolve_default_branch`);
 /// - else a real `main` branch exists with no remote signal — leave it.
 ///
 /// Best-effort and idempotent: a project whose repo is missing or has a detached
@@ -1048,14 +1048,14 @@ async fn reconcile_project_main_refs(db: &Database) {
         //   later fail fork approval), so repair to the current checked-out branch;
         // - else a real `main` branch exists with no remote signal — leave it.
         let new_main_ref = if let Some(remote_default) =
-            db::resolve_remote_default_branch(repo_path)
+            phoenix_core::git::resolve_remote_default_branch(repo_path)
         {
             remote_default
         } else {
             if local_branch_exists(repo_path, "main") {
                 continue;
             }
-            let Some(current) = phoenix_core::domain::db_schema::resolve_default_branch(repo_path)
+            let Some(current) = phoenix_core::git::resolve_default_branch(repo_path)
             else {
                 tracing::warn!(
                     project_id = %project.id,

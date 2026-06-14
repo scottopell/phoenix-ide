@@ -3958,7 +3958,7 @@ fn normalize_task_file_repo_relative(
     task_file: &str,
     proposal_id: &str,
 ) -> String {
-    let Some(repo_root) = crate::db::detect_git_repo_root(working_dir) else {
+    let Some(repo_root) = phoenix_core::git::detect_git_repo_root(working_dir) else {
         tracing::warn!(
             proposal_id = %proposal_id,
             working_dir = %working_dir.display(),

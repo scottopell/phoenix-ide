@@ -2041,7 +2041,7 @@ impl RuntimeManager {
                     // inside a git repo — a fork cuts from the repository's
                     // default branch (REQ-PROJ-036).
                     let registry = ToolRegistry::direct(agent_catalog.to_vec());
-                    if crate::db::detect_git_repo_root(&context.working_dir).is_some() {
+                    if phoenix_core::git::detect_git_repo_root(&context.working_dir).is_some() {
                         registry.with_propose_task()
                     } else {
                         registry

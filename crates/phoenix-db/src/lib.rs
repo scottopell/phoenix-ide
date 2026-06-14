@@ -2,6 +2,7 @@
 //!
 //! Provides persistence for conversations and messages.
 
+mod ddl;
 mod migrations;
 pub mod retrieval;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
@@ -589,8 +590,8 @@ impl Database {
     }
 
     async fn run_migrations(&self) -> DbResult<()> {
-        sqlx::raw_sql(SCHEMA).execute(&self.pool).await?;
-        sqlx::raw_sql(MIGRATION_TYPED_STATE)
+        sqlx::raw_sql(ddl::SCHEMA).execute(&self.pool).await?;
+        sqlx::raw_sql(ddl::MIGRATION_TYPED_STATE)
             .execute(&self.pool)
             .await?;
 
@@ -624,17 +625,17 @@ impl Database {
             .await;
 
         // Rename id -> message_id for searchability (ignore error if already done)
-        let _ = sqlx::raw_sql(MIGRATION_RENAME_MESSAGE_ID)
+        let _ = sqlx::raw_sql(ddl::MIGRATION_RENAME_MESSAGE_ID)
             .execute(&self.pool)
             .await;
 
         // Replace "unknown" error_kind with "server_error" in stored conversation state
-        let _ = sqlx::raw_sql(MIGRATION_REMOVE_UNKNOWN_ERROR_KIND)
+        let _ = sqlx::raw_sql(ddl::MIGRATION_REMOVE_UNKNOWN_ERROR_KIND)
             .execute(&self.pool)
             .await;
 
         // Create projects table (idempotent via IF NOT EXISTS)
-        let _ = sqlx::raw_sql(MIGRATION_CREATE_PROJECTS)
+        let _ = sqlx::raw_sql(ddl::MIGRATION_CREATE_PROJECTS)
             .execute(&self.pool)
             .await;
 
@@ -662,12 +663,12 @@ impl Database {
             .await;
 
         // Create mcp_disabled_servers table (idempotent via IF NOT EXISTS)
-        let _ = sqlx::raw_sql(MIGRATION_CREATE_MCP_DISABLED_SERVERS)
+        let _ = sqlx::raw_sql(ddl::MIGRATION_CREATE_MCP_DISABLED_SERVERS)
             .execute(&self.pool)
             .await;
 
         // Create share_tokens table (REQ-AUTH-008, idempotent via IF NOT EXISTS)
-        let _ = sqlx::raw_sql(MIGRATION_CREATE_SHARE_TOKENS)
+        let _ = sqlx::raw_sql(ddl::MIGRATION_CREATE_SHARE_TOKENS)
             .execute(&self.pool)
             .await;
 
@@ -1127,7 +1128,7 @@ impl Database {
         // later if the repo becomes resolvable.
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
-        let main_ref = schema::resolve_default_branch(std::path::Path::new(canonical_path))
+        let main_ref = phoenix_core::git::resolve_default_branch(std::path::Path::new(canonical_path))
             .unwrap_or_else(|| "main".to_string());
 
         sqlx::query(

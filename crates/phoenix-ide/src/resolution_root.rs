@@ -75,7 +75,7 @@ impl ResolutionRoot {
         if matches!(mode, "branch" | "managed") {
             if let (Some(branch), Some(repo_root)) = (
                 base_branch.filter(|b| !b.is_empty()),
-                crate::db::detect_git_repo_root(&cwd_path),
+                phoenix_core::git::detect_git_repo_root(&cwd_path),
             ) {
                 let repo_root = PathBuf::from(repo_root);
                 if let Some(reference) = resolve_tree_ref(&repo_root, branch) {

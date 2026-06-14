@@ -1306,7 +1306,7 @@ async fn create_conversation_with_id(
     };
 
     // Detect project from git repo root (REQ-PROJ-001)
-    let project_id = if let Some(repo_root) = crate::db::detect_git_repo_root(&path) {
+    let project_id = if let Some(repo_root) = phoenix_core::git::detect_git_repo_root(&path) {
         match state.db.find_or_create_project(&repo_root).await {
             Ok(project) => {
                 tracing::info!(project_id = %project.id, path = %repo_root, "Associated conversation with project");
@@ -1359,7 +1359,7 @@ async fn create_conversation_with_id(
                 "Branch mode requires a git repository".to_string(),
             ));
         }
-        let repo_root = crate::db::detect_git_repo_root(&path).ok_or_else(|| {
+        let repo_root = phoenix_core::git::detect_git_repo_root(&path).ok_or_else(|| {
             AppError::BadRequest("Could not determine git repository root".to_string())
         })?;
 
@@ -1424,7 +1424,7 @@ async fn create_conversation_with_id(
         // Infer the current branch from the cwd. For an explicit `mode=managed`
         // (the form path), require an explicit base_branch — the form picks one
         // deliberately and the caller deserves a 400 if it's missing.
-        let repo_root = crate::db::detect_git_repo_root(&path).ok_or_else(|| {
+        let repo_root = phoenix_core::git::detect_git_repo_root(&path).ok_or_else(|| {
             AppError::BadRequest("Could not determine git repository root".to_string())
         })?;
         let inferred_base = if req.mode.as_deref() == Some("auto") && req.base_branch.is_none() {
