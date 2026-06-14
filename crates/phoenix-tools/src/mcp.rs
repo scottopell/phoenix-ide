@@ -368,6 +368,10 @@ pub struct McpServerStatus {
     /// The failure cause when `state = failed`, cleared on a successful
     /// reconnect (REQ-MCP-018).
     pub last_error: Option<String>,
+    /// On an `unauthorized` entry, a diagnostic when the OAuth redirect base is
+    /// unreachable from another machine, so the authorize link will fail
+    /// (REQ-MCP-020).
+    pub auth_redirect_warning: Option<String>,
 }
 
 /// A connect/handshake/authorization failure retained for the status API
@@ -1016,6 +1020,11 @@ impl PendingAuthFlow {
 struct OAuthRuntime {
     store: std::sync::RwLock<Arc<dyn OAuthStore>>,
     redirect_base: std::sync::Mutex<Option<String>>,
+    /// A diagnostic surfaced on `unauthorized` status entries when the resolved
+    /// redirect base is unreachable from another machine (a loopback redirect
+    /// on a remote-reachable bind, REQ-MCP-020), so the operator sees why the
+    /// authorize link will fail before opening it.
+    redirect_warning: std::sync::Mutex<Option<String>>,
     pending: std::sync::Mutex<HashMap<String, PendingAuthFlow>>,
 }
 
@@ -1024,6 +1033,7 @@ impl Default for OAuthRuntime {
         Self {
             store: std::sync::RwLock::new(Arc::new(oauth::MemoryOAuthStore::default())),
             redirect_base: std::sync::Mutex::new(None),
+            redirect_warning: std::sync::Mutex::new(None),
             pending: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -1032,6 +1042,11 @@ impl Default for OAuthRuntime {
 impl OAuthRuntime {
     fn store(&self) -> Arc<dyn OAuthStore> {
         Arc::clone(&self.store.read().unwrap())
+    }
+
+    /// The redirect-unreachable diagnostic, when one applies (REQ-MCP-020).
+    fn redirect_warning(&self) -> Option<String> {
+        self.redirect_warning.lock().unwrap().clone()
     }
 
     /// The local callback the authorization server redirects to; `None` until
@@ -1472,6 +1487,15 @@ impl McpClientManager {
     /// Panics if the internal lock is poisoned (a prior panic is already fatal).
     pub fn set_oauth_redirect_base(&self, base: String) {
         *self.oauth.redirect_base.lock().unwrap() = Some(base);
+    }
+
+    /// Set (or clear) the redirect-unreachable diagnostic surfaced on
+    /// `unauthorized` status entries (REQ-MCP-020).
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned (a prior panic is already fatal).
+    pub fn set_oauth_redirect_warning(&self, warning: Option<String>) {
+        *self.oauth.redirect_warning.lock().unwrap() = warning;
     }
 
     /// Drop a pending authorization flow, releasing any held claim and the
@@ -2054,6 +2078,9 @@ impl McpClientManager {
         let disabled = self.disabled_servers.read().await;
         let pending = self.pending_oauth_urls.read().await;
         let failed = self.failed_servers.read().await;
+        // Surfaced only on `unauthorized` entries: the authorize link those
+        // carry is the one a loopback-on-remote redirect breaks (REQ-MCP-020).
+        let redirect_warning = self.oauth.redirect_warning();
 
         // Connected servers are ready.
         let mut result: Vec<McpServerStatus> = servers
@@ -2068,6 +2095,7 @@ impl McpClientManager {
                 enabled: !disabled.contains(name),
                 pending_oauth_url: None,
                 last_error: None,
+                auth_redirect_warning: None,
             })
             .collect();
 
@@ -2087,6 +2115,7 @@ impl McpClientManager {
                     enabled: !disabled.contains(name),
                     pending_oauth_url: Some(url.clone()),
                     last_error: None,
+                    auth_redirect_warning: redirect_warning.clone(),
                 });
             }
         }
@@ -2106,6 +2135,7 @@ impl McpClientManager {
                     enabled: !disabled.contains(name),
                     pending_oauth_url: None,
                     last_error: Some(failure.error.clone()),
+                    auth_redirect_warning: None,
                 });
             }
         }
@@ -4094,6 +4124,25 @@ mod tests {
         assert!(
             !status[0].enabled,
             "a disabled failed server reports disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_entry_carries_the_redirect_warning() {
+        let manager = McpClientManager::new();
+        manager.set_oauth_redirect_warning(Some("callback unreachable".to_string()));
+        manager.pending_oauth_urls.write().await.insert(
+            "remote".to_string(),
+            "https://auth.example/authorize".to_string(),
+        );
+
+        let status = manager.status().await;
+        assert_eq!(status.len(), 1);
+        assert!(matches!(status[0].state, McpConnState::Unauthorized));
+        assert_eq!(
+            status[0].auth_redirect_warning.as_deref(),
+            Some("callback unreachable"),
+            "the redirect diagnostic rides the unauthorized entry (REQ-MCP-020)"
         );
     }
 

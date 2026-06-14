@@ -248,6 +248,16 @@
   text-decoration: underline;
 }
 
+/* The OAuth redirect-unreachable diagnostic, shown next to the doomed
+   authorize link (REQ-MCP-020). */
+.mcp-oauth-warning {
+  color: var(--color-warning, #f5a623);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Failed-connection banner: red, vs the yellow auth banner (REQ-MCP-018). */
 .mcp-error-banner {
   display: flex;

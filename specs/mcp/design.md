@@ -251,8 +251,17 @@ attacker-chosen destination, a target the `state` nonce and `iss` check do not
 defend. Consequently there is no trusted-proxy flag or origin allowlist -- the
 attack surface those would guard does not exist. An all-interfaces bind that
 still resolves to loopback has no reachable name configured; this is surfaced at
-startup so the operator supplies one before a remote authorization round trip
-fails.
+startup *and* on every `unauthorized` status entry (`auth_redirect_warning`), so
+the operator sees why the authorize link will fail before opening it.
+
+The canonical redirect base can change across deployments (a new domain,
+default-port elision). A dynamic client registration is keyed only by
+authorization server, so a cached client carries the `redirect_uri` it was
+registered with; when that no longer matches the resolved base,
+`acquire_client_registration` re-registers via DCR (RFC 7591) rather than
+reusing a client an authorization server that binds clients to their redirect
+would reject. A pre-configured client's redirect is operator-managed and left
+untouched.
 
 ### Token store
 

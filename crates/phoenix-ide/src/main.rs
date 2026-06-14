@@ -692,14 +692,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         // An all-interfaces bind that still resolves to loopback has no
         // reachable name configured: the callback would point a remote browser
-        // at localhost and fail. Surface the fix rather than failing silently.
+        // at localhost and fail. Surface the fix at startup and on every
+        // `unauthorized` status entry, rather than failing silently.
         if bind_address.ip().is_unspecified() && redirect_is_loopback(&redirect_base) {
-            tracing::warn!(
-                redirect_base = %redirect_base,
-                "MCP OAuth redirect resolves to loopback on an all-interfaces bind; set \
-                 PHOENIX_TLS_HOSTS to your reachable domain (or PHOENIX_EXTERNAL_URL) so a \
-                 remote browser can complete the authorization round trip"
+            let warning = format!(
+                "OAuth callback redirects to {redirect_base}, which is unreachable from another \
+                 machine. Set PHOENIX_TLS_HOSTS to your reachable domain (or PHOENIX_EXTERNAL_URL) \
+                 so a remote browser can complete authorization."
             );
+            tracing::warn!(redirect_base = %redirect_base, "{warning}");
+            mcp_manager.set_oauth_redirect_warning(Some(warning));
         }
         mcp_manager.set_oauth_redirect_base(redirect_base);
     }

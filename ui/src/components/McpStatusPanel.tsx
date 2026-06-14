@@ -213,6 +213,11 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
           >
             {s.name} &rarr; sign in
           </a>
+          {s.auth_redirect_warning && (
+            <span className="mcp-oauth-warning" title={s.auth_redirect_warning}>
+              &#9888; {s.auth_redirect_warning}
+            </span>
+          )}
         </div>
       ))}
       {!reloading && failedServers.map(s => (

@@ -607,6 +607,9 @@ export interface McpServerStatus {
   pending_oauth_url?: string;
   /** Failure cause when state = failed; cleared on a successful reconnect. */
   last_error?: string;
+  /** On an unauthorized entry, a diagnostic when the OAuth redirect base is
+   *  unreachable from another machine, so the authorize link will fail. */
+  auth_redirect_warning?: string;
 }
 
 export interface McpReloadFailure {
