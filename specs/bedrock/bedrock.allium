@@ -1015,7 +1015,7 @@ rule TaskResolved {
     --     core_status; the turn could not complete and there is no edge out
     --     of context_exhausted back into a running state.
     -- This must stay consistent with the MarkAsMerged / ConfirmAbandon
-    -- gates in specs/projects/ (which permit core_status = idle or error
+    -- gates in specs/work-lifecycle/ (which permit core_status = idle or error
     -- plus parent_status = absent or context_exhausted) and with the
     -- UserDismissesError resume policy: a stuck conversation that is not
     -- running is always disposable.

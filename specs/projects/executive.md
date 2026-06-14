@@ -58,12 +58,12 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete | Task 08602 (M2). propose_task tool; task 13009 — `task_file` may be any `.md` file, taskmd naming is one accepted form (`crate::task_source::TaskSource`) |
 | **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ✅ Complete | Approval is a permission upgrade in the existing worktree (REQ-PROJ-028): rename temp branch, promote+commit the agent's task file on it |
 | **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Task 08603 (M3). Derived from conversation UUID |
-| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | taskmd 1.0 (filename is metadata, no frontmatter) is the default; agent drafts the file via `patch` in Explore; committed on the task branch, not main (REQ-PROJ-027). Task 13009 — a plain `.md` file (no taskmd metadata, no on-approve status rename, branch `task-{stem}-{conv-id8}`) works too, behind the `TaskSource` seam |
+| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | taskmd 1.0 (filename is metadata, no frontmatter) is the default; agent drafts the file via `patch` in Explore; committed on the task branch, not main (work-lifecycle REQ-WL-002). A plain `.md` file (no taskmd metadata, no on-approve status rename, branch `task-{stem}-{conv-id8}`) works too, behind the `TaskSource` seam |
 | **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete | Task 08603 (M3). upgrade_to_work_mode() |
 | **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | ✅ Complete | Mode parameter, model override, max_turns, one-writer constraint, MCP access, cwd-scoping guard all implemented; spec normative in `specs/subagents/subagents.allium`. Explore-search-restricted MCP subset stays deferred (see subagents executive.md). |
 | **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted. Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
-| **REQ-PROJ-010:** Abandon a Conversation | ✅ Complete | Worktree removed; Managed deletes the task branch, Branch keeps it; diff snapshot captured as a system message first; no task-file edit |
-| **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | ✅ Complete | PR badge replaces ahead/behind StateBar noise |
+| **REQ-PROJ-010:** Abandon a Conversation | Moved | Relocated to work-lifecycle REQ-WL-001 |
+| **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | Moved | Relocated to work-lifecycle REQ-WL-003 |
 | **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Explore gateway shipped; the writing-mode fork registry/interception path (REQ-PROJ-033/036) is spec-only |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
@@ -78,13 +78,13 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-023:** Reserved | Removed | Commits-behind polling removed; PR status is the branch health signal |
 | **REQ-PROJ-024:** Work Directly on an Existing Branch (Branch Mode) | ✅ Complete | Worktree on existing branch, no task file, no Explore phase |
 | **REQ-PROJ-025:** One Active Work Conversation Per Branch | ✅ Complete | Conflict detection with redirect/delete/fresh-start options |
-| **REQ-PROJ-026:** Branch Mode Lifecycle (Push, Mark Merged, Abandon) | ✅ Complete | Push via bash; PR-aware cleanup guidance via gh; Abandon as terminal action |
-| **REQ-PROJ-027:** Simplified Managed Completion (Push Branch) | ✅ Complete | Push branch, user merges via PR; gh observes merge state for cleanup; task file on branch, not main |
+| **REQ-PROJ-026:** Branch Mode Lifecycle (Push, Mark Merged, Abandon) | Moved | Relocated to work-lifecycle REQ-WL-001 (abandon) and REQ-WL-002 (mark-merged) |
+| **REQ-PROJ-027:** Simplified Managed Completion (Push Branch) | Moved | Relocated to work-lifecycle REQ-WL-002 |
 | **REQ-PROJ-028:** Managed Mode Worktree from First Message | ✅ Complete | Worktree created on first message with temp branch |
 | **REQ-PROJ-029:** Branch Mode in the Mode Picker | ✅ Complete | Mode picker offers Direct, Managed, and Branch |
-| **REQ-PROJ-030:** PR Feedback Freshness Indicator | ✅ Complete | Work Actions shows advisory `new`/`updated` marker beside `Address CI & comments`; StateBar remains branch health only |
-| **REQ-PROJ-031:** Agent-Facing PR Context Baseline | ✅ Complete | Successful PR auto-fix context capture records work-scope/PR baseline with timestamp, PR updated_at, and feedback identities |
-| **REQ-PROJ-032:** Bounded PR Feedback Refresh | ✅ Complete | Routine PR status uses PR updated_at as the gate before fetching feedback surfaces; failures degrade to coarse advisory |
+| **REQ-PROJ-030:** PR Feedback Freshness Indicator | Moved | Relocated to pr-association REQ-PRA-001 |
+| **REQ-PROJ-031:** Agent-Facing PR Context Baseline | Moved | Relocated to pr-association REQ-PRA-002 |
+| **REQ-PROJ-032:** Bounded PR Feedback Refresh | Moved | Relocated to pr-association REQ-PRA-003 |
 | **REQ-PROJ-033:** Propose a Decoupled Task Fork from a Writing Mode | 📐 Spec only | Non-blocking `propose_task` in Work/Branch/Direct-in-git; snapshots the task and continues |
 | **REQ-PROJ-034:** Approve a Fork Proposal — Spawn an Independent Conversation | 📐 Spec only | Async approval spawns a fresh top-level Work conversation cut from the repository default branch (`main_ref`), never the origin's `base_branch`/HEAD |
 | **REQ-PROJ-035:** Fork Provenance and Decoupling Guarantees | 📐 Spec only | `spawned_from_conversation_id` breadcrumb; no lifecycle notifications; proposal bound to origin |

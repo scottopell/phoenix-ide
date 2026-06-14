@@ -27,7 +27,7 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-013:** Image Handling | ✅ Complete | Base64 images passed to LLM |
 | **REQ-BED-014:** Conversation Mode | ⏭️ Deprecated | Replaced by REQ-BED-027. Restricted/Unrestricted model superseded by Explore/Work with git worktrees |
 | **REQ-BED-015:** Mode Upgrade Request | ⏭️ Deprecated | Replaced by REQ-PROJ-003/004 + REQ-BED-028. `request_mode_upgrade` tool replaced by `propose_task` flow |
-| **REQ-BED-016:** Mode Downgrade | ⏭️ Deprecated | Replaced by REQ-PROJ-009/010. Mode return now tied to task merge or abandon |
+| **REQ-BED-016:** Mode Downgrade | ⏭️ Deprecated | Replaced by work-lifecycle REQ-WL-002/REQ-WL-001. Mode return now tied to task merge or abandon |
 | **REQ-BED-017:** Mode Communication | ✅ Complete | Mode-aware tool errors in `crates/phoenix-ide/src/tools.rs:479`; system prompt directs Explore agents to `propose_task` (`system_prompt.rs:578`) |
 | **REQ-BED-018:** Sub-Agent Mode Enforcement | ✅ Complete | Sub-agent tool sets restricted by mode in `crates/phoenix-ide/src/tools.rs:647-677` (tested); sub-agents inherit parent worktree |
 | **REQ-BED-019:** Context Continuation Threshold | ✅ Complete | Check at 90%, reject tools, trigger continuation |

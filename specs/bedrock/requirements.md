@@ -292,7 +292,7 @@ The mode transition is now inseparable from task creation.
 
 ### REQ-BED-016: Mode Downgrade
 
-**DEPRECATED:** Replaced by REQ-PROJ-009 (merge) and REQ-PROJ-010 (abandon).
+**DEPRECATED:** Replaced by work-lifecycle REQ-WL-002 (mark merged) and REQ-WL-001 (abandon).
 
 WHEN user requests mode downgrade (Unrestricted → Restricted)
 THE SYSTEM SHALL transition immediately to Restricted mode
@@ -303,7 +303,7 @@ THE SYSTEM SHALL persist the new mode as part of conversation state
 
 **Deprecation Reason:** The downgrade concept (Unrestricted -> Restricted) is replaced
 by task completion flows. A Work conversation transitions to Terminal state on task
-completion (REQ-PROJ-009) or abandonment (REQ-PROJ-010). There is no standalone mode
+completion (work-lifecycle REQ-WL-002) or abandonment (work-lifecycle REQ-WL-001). There is no standalone mode
 downgrade; mode is always tied to worktree lifecycle.
 
 ---
@@ -616,12 +616,12 @@ happen on the task branch.
 
 ### REQ-BED-029: Conversation Terminal State on Task Resolution
 
-WHEN a Work or Branch conversation is marked as merged (REQ-PROJ-026/027 — worktree
+WHEN a Work or Branch conversation is marked as merged (work-lifecycle REQ-WL-002 — worktree
   removed; the task branch deleted for Managed mode, kept for Branch mode)
 THE SYSTEM SHALL transition the conversation to Terminal state
 AND the conversation SHALL NOT accept new user messages
 
-WHEN a Work or Branch conversation is abandoned (REQ-PROJ-010)
+WHEN a Work or Branch conversation is abandoned (work-lifecycle REQ-WL-001)
 THE SYSTEM SHALL transition the conversation to Terminal state
 AND the conversation SHALL NOT accept new user messages
 
@@ -672,7 +672,7 @@ structurally, without a separate auto-stash mechanism. Single-continuation
 policy keeps worktree ownership unambiguous: at any moment, exactly one
 conversation in the parent→continuation chain owns the worktree.
 
-**Dependencies:** REQ-BED-021, REQ-PROJ-025, REQ-PROJ-026, REQ-PROJ-028
+**Dependencies:** REQ-BED-021, REQ-PROJ-025, work-lifecycle REQ-WL-001/REQ-WL-002, REQ-PROJ-028
 
 ---
 
@@ -686,9 +686,9 @@ AND preserve its branch in git
 WHEN a context-exhausted conversation has no continuation
 THE SYSTEM SHALL permit user-initiated terminal actions (abandon or mark-as-merged)
 AND on abandon, apply the same worktree/branch disposition as abandon from a non-terminal state
-  (worktree removed; branch removed for Work mode, preserved for Branch mode, per REQ-PROJ-026)
+  (worktree removed; branch removed for Work mode, preserved for Branch mode, per work-lifecycle REQ-WL-001)
 AND on mark-as-merged, apply the same worktree/branch disposition as mark-as-merged from a non-terminal state
-  (worktree removed; branch removed for Work mode, preserved for Branch mode, per REQ-PROJ-026/027)
+  (worktree removed; branch removed for Work mode, preserved for Branch mode, per work-lifecycle REQ-WL-002)
 
 WHEN a context-exhausted conversation has an existing continuation
 THE SYSTEM SHALL NOT permit abandon or mark-as-merged on the parent
@@ -709,7 +709,7 @@ stranded continuation record. When a continuation exists, the live
 conversation is the continuation; operating on the parent would be
 ambiguous about which conversation the action affects.
 
-**Dependencies:** REQ-BED-021, REQ-BED-030, REQ-PROJ-015, REQ-PROJ-026
+**Dependencies:** REQ-BED-021, REQ-BED-030, REQ-PROJ-015, work-lifecycle REQ-WL-001/REQ-WL-002
 
 ---
 
@@ -833,7 +833,7 @@ adding a startup orphan-walker would carry complexity without
 materially improving reliability. Operators who do encounter orphans
 have the WARN-level structured logs to act on.
 
-The not-busy precondition mirrors REQ-PROJ-010 / `ConfirmAbandon` in
+The not-busy precondition mirrors work-lifecycle REQ-WL-001 / `ConfirmAbandon` in
 `specs/projects/`. Hard-delete during a live tool execution would race
 the tool's own cleanup code; canceling first is the deterministic order.
 The permissive choice between (a) reject and (b) cancel-first leaves

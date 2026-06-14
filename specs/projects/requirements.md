@@ -176,7 +176,7 @@ left it under the tasks directory — nothing to commit, nothing to clean up)
 existing worktree (REQ-PROJ-028). The task file already exists on disk (the agent
 wrote it with `patch` in Explore mode); approval renames the temp branch, promotes the
 file's status to `in-progress` if needed, and commits it on the task branch (never
-main -- REQ-PROJ-027). Discarding is cheap: the worktree and temp branch already
+main -- work-lifecycle REQ-WL-002). Discarding is cheap: the worktree and temp branch already
 exist, and an uncommitted task file on the temp branch is harmless. The prose reader
 renders the file's body — surfaced via the display copy in the state, re-read from disk
 on approval.
@@ -301,94 +301,34 @@ one-Work-sub-agent constraint maintains a single writer per worktree at all time
 
 ### REQ-PROJ-009: Complete a Task (Squash Merge)
 
-**DEPRECATED:** Superseded by REQ-PROJ-027 (push branch, user merges via PR).
+**DEPRECATED:** Superseded by work-lifecycle REQ-WL-002 (push branch, user merges via PR).
 Squash-merge bypasses code review and branch protection rules. The push-branch
-model aligns with how teams actually ship code. Retained for historical context.
+model aligns with how teams actually ship code. Retained for historical context;
+the no-squash-merge constraint lives in work-lifecycle REQ-WL-002.
 
 ---
 
-### REQ-PROJ-010: Abandon a Conversation
+### REQ-PROJ-010: Abandon a Conversation (Moved)
 
-WHEN the user initiates the Abandon action on an idle Work conversation
-THE SYSTEM SHALL present a confirmation dialog warning that the worktree will be deleted
-
-WHEN the user confirms abandonment of a Managed mode conversation
-THE SYSTEM SHALL delete the worktree AND delete the task branch
-AND transition the conversation to Terminal state
-
-WHEN the user confirms abandonment of a Branch mode conversation
-THE SYSTEM SHALL delete the worktree AND keep the branch
-AND transition the conversation to Terminal state
-
-WHEN the user cancels the confirmation dialog
-THE SYSTEM SHALL take no action
-AND the conversation SHALL remain in Work mode
-
-**Rationale:** Abandon deletes the worktree to free disk space. For Managed mode,
-the task branch is also deleted because Phoenix created it -- it's a Phoenix artifact.
-For Branch mode, the branch is kept because it belongs to the user's PR, not to
-Phoenix. The confirmation dialog prevents accidental worktree deletion.
+**Moved** to work-lifecycle REQ-WL-001.
 
 ---
 
-### REQ-PROJ-011: PR Status Is the Branch Health Indicator
+### REQ-PROJ-011: PR Status Is the Branch Health Indicator (Moved)
 
-WHEN a Work or Branch conversation has an associated pull request
-THE SYSTEM SHALL display the PR status in the StateBar
+**Moved** to work-lifecycle REQ-WL-003.
 
-THE SYSTEM SHALL NOT display local commits-ahead or commits-behind badges in the StateBar
+### REQ-PROJ-030: PR Feedback Freshness Indicator (Moved)
 
-**Rationale:** PR state is the actionable signal in the normal review workflow. Local
-commit divergence badges draw attention without telling the user whether the PR is
-ready, merged, blocked, or stale. Users and agents can still inspect git history via
-normal git commands when they need that detail.
+**Moved** to pr-association REQ-PRA-001.
 
-### REQ-PROJ-030: PR Feedback Freshness Indicator
+### REQ-PROJ-031: Agent-Facing PR Context Baseline (Moved)
 
-WHEN a Work or Branch conversation has an open associated pull request
-AND PR feedback changed since Phoenix last captured agent-facing PR remediation context
-THE SYSTEM SHALL show a compact advisory marker near the `Address CI & comments` Work Action
-SUCH AS `new comments`, `{N} new`, or `updated`
+**Moved** to pr-association REQ-PRA-002.
 
-THE SYSTEM SHALL NOT use PR feedback freshness as the StateBar branch-health signal
+### REQ-PROJ-032: Bounded PR Feedback Refresh (Moved)
 
-THE SYSTEM SHALL NOT block cleanup, abandon, or ordinary conversation use based on PR feedback freshness
-
-**Rationale:** Fresh review activity is useful exactly where the user asks the agent to
-address review feedback. It is not branch health, and it is not lifecycle authority.
-
-### REQ-PROJ-031: Agent-Facing PR Context Baseline
-
-WHEN Phoenix successfully captures PR remediation context for an associated pull request
-THE SYSTEM SHALL record that successful capture as the baseline for agent-facing PR feedback freshness
-
-THE SYSTEM SHALL store compact baseline data for the work scope and PR number:
-- capture timestamp
-- pull request `updated_at` timestamp when available
-- stable feedback identities or fingerprints when available
-
-WHEN classifying freshness
-THE SYSTEM SHALL treat feedback as new when current feedback contains stable identities absent from the latest successful baseline
-
-WHEN no successful baseline exists
-THE SYSTEM SHALL NOT show `new comments`
-
-**Rationale:** The baseline is what Phoenix has actually handed to the agent, not what
-GitHub happened to contain at some unrelated time.
-
-### REQ-PROJ-032: Bounded PR Feedback Refresh
-
-WHEN refreshing routine PR status
-THE SYSTEM SHALL keep the poll lightweight and SHALL NOT fetch all PR feedback surfaces unless gated by evidence that feedback may have changed
-
-Evidence includes the pull request `updated_at` timestamp being newer than the latest successful baseline, or an explicit remediation context capture
-
-WHEN full feedback surfaces are unavailable during freshness classification
-THE SYSTEM SHALL degrade to no count or a coarse `updated` advisory
-AND SHALL log the failure
-
-**Rationale:** PR status is polled routinely. Full review surfaces are slower and more
-rate-limit sensitive, so Phoenix fetches them only when they can change the advisory.
+**Moved** to pr-association REQ-PRA-003.
 
 ---
 
@@ -604,10 +544,10 @@ approval; `None` for an Explore sub-agent, which shares the parent's working dir
 
 THE Direct mode SHALL carry no git metadata
 
-WHEN the "Mark as merged" action runs (REQ-PROJ-026/027)
+WHEN the "Mark as merged" action runs (work-lifecycle REQ-WL-002)
 THE SYSTEM SHALL delete the worktree (and delete the branch for Managed mode)
 
-WHEN the Abandon action runs (REQ-PROJ-010)
+WHEN the Abandon action runs (work-lifecycle REQ-WL-001)
 THE SYSTEM SHALL delete the worktree (and delete the branch for Managed mode)
 
 **Rationale:** Not all projects use `main` as their integration branch. A user may be
@@ -834,63 +774,15 @@ iterative work on the same branch.
 
 ---
 
-### REQ-PROJ-026: Branch Mode Lifecycle -- Mark Merged, Abandon
+### REQ-PROJ-026: Branch Mode Lifecycle -- Mark Merged, Abandon (Moved)
 
-WHEN the user initiates "Mark as merged" on a Branch mode conversation
-THE SYSTEM SHALL delete the worktree (keep the branch -- it is not ours to delete)
-AND transition the conversation to terminal state
-
-WHEN the user initiates "Abandon" on a Branch mode conversation
-THE SYSTEM SHALL delete the worktree (keep the branch)
-AND transition the conversation to terminal state
-
-THE SYSTEM SHALL NOT offer "Complete (squash-merge)" for Branch mode conversations
-THE SYSTEM SHALL NOT push to origin on the user's behalf (push is the agent's
-responsibility, run through the bash tool when the user requests it)
-THE SYSTEM SHALL use the GitHub CLI, when available, to observe PR state for the
-branch and guide the cleanup action
-THE SYSTEM SHALL treat a user-asserted manual "Mark as merged" action as a
-fallback when PR state is unavailable, not as the preferred happy path
-
-**Rationale:** Branch mode conversations track the PR lifecycle, not the task
-lifecycle. The agent commits and pushes from bash on the user's instruction;
-Phoenix observes no push event and gates no lifecycle on it. "Mark as merged"
-is the user-initiated terminal action when the PR is merged through their
-normal workflow. Abandon means "I'm done with this conversation" but doesn't
-touch the branch. In both cases the branch survives because it belongs to the
-user's PR, not to Phoenix.
+**Moved** to work-lifecycle REQ-WL-001 (abandon) and REQ-WL-002 (mark-merged).
 
 ---
 
-### REQ-PROJ-027: Simplified Managed Mode Completion -- User Merges via PR
+### REQ-PROJ-027: Simplified Managed Mode Completion -- User Merges via PR (Moved)
 
-WHEN the user initiates "Mark as merged" on a Managed mode conversation
-THE SYSTEM SHALL delete the worktree AND delete the task branch
-AND transition the conversation to terminal state
-
-WHEN the user initiates "Abandon" on a Managed mode conversation
-THE SYSTEM SHALL delete the worktree AND delete the task branch
-AND transition the conversation to terminal state
-
-THE SYSTEM SHALL NOT squash-merge to the base branch
-THE SYSTEM SHALL NOT push to origin (push is the agent's responsibility, run
-through the bash tool when the user requests it)
-THE SYSTEM SHALL commit the task file on the task branch (never on main/base)
-
-**Rationale:** Many repositories protect their main branch and require PR-based
-merges. Squash-merging in Phoenix bypasses code review and branch protection
-rules. Letting the user merge through their normal PR workflow is simpler,
-works with protected branches, and aligns with how teams actually ship code.
-The task file lives on the task branch alongside the code changes, keeping the
-task branch self-contained. Phoenix never pushes on the user's behalf — the
-agent runs `git push` from bash if and when instructed; Phoenix observes no
-push event and gates no lifecycle on it. When `gh` can observe a PR for the
-branch, Phoenix uses that state to make merged PR cleanup the happy path and to
-discourage local cleanup while the PR is still open, draft, failing, pending, or
-closed-unmerged. On "Mark as merged" / merged-PR cleanup, Phoenix cleans
-up both the worktree and the task branch (since Phoenix created it). On
-abandon, same cleanup -- the task branch was a Phoenix artifact that the user
-is discarding.
+**Moved** to work-lifecycle REQ-WL-002.
 
 ---
 

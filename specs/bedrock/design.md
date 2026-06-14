@@ -542,7 +542,7 @@ here, and the resolution is never fed back into this conversation's LLM context.
 absence is the decoupling — contrast the Explore fresh-handoff approval, which moves the
 predecessor to `HandedOff`. A fork's origin is untouched and uninformed by construction.
 
-## Task Resolution: Mark as Merged and Abandon (REQ-BED-029, REQ-PROJ-010/026/027)
+## Task Resolution: Mark as Merged and Abandon (REQ-BED-029, work-lifecycle REQ-WL-001/REQ-WL-002)
 
 There is no `AwaitingMergeApproval` state and no in-Phoenix squash-merge. Mark-as-merged
 and abandon are user-initiated HTTP actions on a Work or Branch conversation that is
@@ -553,7 +553,7 @@ transition to `Terminal` through `handle_outcome()`.
 
 **Mark as merged:** remove the worktree; for Managed mode delete the task branch (it's a
 Phoenix artifact), for Branch mode keep it (it's the user's PR branch). The UI makes the
-action PR-aware via `gh` (REQ-PROJ-011/026/027) but Phoenix never pushes or merges.
+action PR-aware via `gh` (work-lifecycle REQ-WL-003/REQ-WL-002) but Phoenix never pushes or merges.
 
 **Abandon:** capture a best-effort diff snapshot from the worktree first (persisted as a
 system message so work isn't silently lost), then remove the worktree and — for Managed
@@ -1537,9 +1537,9 @@ Both terminal user actions follow the same gate:
 | Context-exhausted, `continued_in_conv_id = null` | Yes; normal flow applies |
 | Context-exhausted, `continued_in_conv_id != null` | No; user acts on the continuation instead |
 
-The abandon semantics match REQ-PROJ-026's flow. Work abandon removes
+The abandon semantics match work-lifecycle REQ-WL-001's flow. Work abandon removes
 the worktree and the branch; Branch abandon removes the worktree and
-preserves the branch. Mark-as-merged follows REQ-PROJ-026/027 — same
+preserves the branch. Mark-as-merged follows work-lifecycle REQ-WL-002 — same
 worktree/branch disposition, different system message.
 
 The same gate applies to both because a continuation is the "live
@@ -1574,7 +1574,7 @@ on-disk-missing `worktree_path`:
   invocations against the old worktree path, etc.) is not resolved by
   this spec and is left as an open concern.
 - `ConfirmAbandon` / `MarkAsMerged` from a continuation's tail destroy
-  the worktree per REQ-PROJ-026.
+  the worktree per work-lifecycle REQ-WL-001.
 - Sub-agents of the parent are unaffected. Sub-agents are bounded
   primarily by the turn-limit / grace-turn flow (REQ-BED-026), which
   typically fires well before context exhaustion could. In the edge

@@ -109,8 +109,8 @@ REQ-PROJ-025 — so no per-member fan-out):
   metadata.
 - **PR health** — `display_state` (open / draft / merged / closed),
   checks, and feedback-freshness — from the existing **PR-status /
-  feedback pipeline** that drives the StateBar (`specs/projects/`
-  REQ-PROJ-011/030/031). `work_scope_pr_associations` carries PR identity
+  feedback pipeline** that drives the StateBar (work-lifecycle
+  REQ-WL-003, pr-association REQ-PRA-001/REQ-PRA-002). `work_scope_pr_associations` carries PR identity
   and state only; checks come from the live PR-status path (e.g.
   `gh pr checks`) and freshness from `work_scope_pr_feedback_baselines`
   compared against current feedback. Reading the association row alone
@@ -441,7 +441,7 @@ addition to the user-visible non-requirements listed in
 - `specs/projects/` — owns `project_id` scoping, the one-non-terminal-
   conversation-per-scope invariant (REQ-PROJ-025) the single-scope-key
   query relies on, and the PR-status/feedback pipeline
-  (REQ-PROJ-011/030/031) the work-identity facet reads (REQ-CHN-008);
+  (work-lifecycle REQ-WL-003, pr-association REQ-PRA-001/REQ-PRA-002) the work-identity facet reads (REQ-CHN-008);
   chain membership extends projects' conversation grouping with
   continuation-aware collapsibility
 - `specs/sse_wire/` — owns the SSE streaming infrastructure used for

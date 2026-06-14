@@ -132,7 +132,7 @@ found, so existing repos behave as before (task 13008).
 The task file is authored by the agent in Explore mode with the `patch` tool (whose
 allowlist in Explore mode is scoped to `{tasks_dir}/`) and referenced by path in the
 `propose_task` call. On approval it is committed on the task branch — never on `main`
-or the base branch (REQ-PROJ-027).
+or the base branch (work-lifecycle REQ-WL-002).
 
 There are two "task source" kinds, behind the `TaskSource` seam
 (`crate::task_source::TaskSource`); taskmd is the default but not a hard dependency
@@ -218,48 +218,12 @@ the UI to open the prose reader on the task file's body (see `specs/prose-feedba
 On server restart: reconstruct from DB (`task_file` + display fields are serialized in
 the `ConvState` column). The UI re-opens the prose reader on reconnect.
 
-### REQ-PROJ-010, REQ-PROJ-026, REQ-PROJ-027 — Terminal Actions (Mark as Merged, Abandon)
+### Terminal Actions (Mark as Merged, Abandon) — Moved
 
-There is no `AwaitingMergeApproval` state and no in-Phoenix squash-merge (REQ-PROJ-009
-was removed — see `requirements.md`). The two terminal actions are user-initiated HTTP
-calls (`POST /api/conversations/:id/mark-merged`, `POST /api/conversations/:id/abandon-task`)
-on a Work or Branch conversation that is `Idle`, `ContextExhausted`, or `Error`. An
-`Error`-state conversation is stuck but not running, so disposing of it is safe — and
-that is exactly when cleanup is wanted, since the user should not have to coax out a
-successful turn just to clean up work that is already done or abandoned. Both reject with
-409 if the conversation has been continued (`continued_in_conv_id` set — REQ-BED-031);
-the live conversation is the continuation, so terminal actions belong there. The handler
-performs the git cleanup in a `spawn_blocking` task, then routes through the state
-machine via `Effect::ResolveTask`/`TaskResolved`, which moves the conversation to
-`Terminal`.
-
-**Mark as merged:**
-
-1. Validate mode (Work or Branch), state (`Idle`/`ContextExhausted`/`Error`), not continued,
-   project-scoped.
-2. `git worktree remove {worktree_path} --force` (filesystem-rm + `worktree prune`
-   fallback on failure).
-3. Work (Managed) mode: `git branch -D {branch_name}` — the task branch is a Phoenix
-   artifact. Branch mode: keep the branch — it is the user's PR branch.
-4. Emit a system message ("Marked as merged. Worktree removed[, task branch deleted].")
-   and transition to `Terminal`.
-
-The UI (`WorkActions`) makes this action PR-aware via `GET /api/conversations/:id/pr-status`
-(REQ-PROJ-011/026/027): a `gh`-confirmed merged PR gets the "Clean up merged PR" happy
-path; an open/draft/failing/closed-unmerged PR disables the button with an explanatory
-note; when `gh` is unavailable the user can opt into an explicit manual fallback. Phoenix
-never pushes or merges — `git push` is the agent's job via the bash tool.
-
-**Abandon:**
-
-1. Same validation as mark-merged.
-2. Capture a best-effort diff snapshot (committed + uncommitted, capped at 100 KiB) from
-   the worktree *before* deleting it, and persist it as a system message so the work
-   isn't silently lost.
-3. `git worktree remove {worktree_path} --force` (same fallback as above).
-4. Work mode: `git branch -D {branch_name}`. Branch mode: keep the branch.
-5. No task-file edit — for Work mode the branch (and the task file on it) is deleted;
-   for Branch mode there is no task file. Transition to `Terminal`.
+The mark-merged and abandon terminal-action design (HTTP handlers, git-cleanup
+sequence, mode-dependent branch disposition, diff snapshot, PR-aware gating) lives in
+work-lifecycle/design.md. See work-lifecycle REQ-WL-001 (abandon), REQ-WL-002
+(mark-merged), and REQ-WL-003 (PR status gating).
 
 ## Tool Implementation
 
@@ -319,8 +283,8 @@ process-global approval mutex):**
 6. Resume the agent with "Task approved. You are on branch task-{task_id}-{slug}."
 
 The task file is committed on the task branch — never on `main`/the base branch
-(REQ-PROJ-027). `Effect::ResolveTask`/`TaskResolved` is the symmetric terminal effect
-used by mark-merged and abandon (see above).
+(work-lifecycle REQ-WL-002). `Effect::ResolveTask`/`TaskResolved` is the symmetric terminal effect
+used by mark-merged and abandon (see work-lifecycle/design.md).
 
 **On Rejected / FeedbackProvided:** no git operations. The task file stays on disk; the
 conversation returns to Explore/Idle (FeedbackProvided also delivers the annotations and
@@ -330,7 +294,7 @@ lets the agent re-propose).
 
 During Work mode the agent updates the task file with `patch`, like any other file in
 the worktree — no dedicated tool. Those commits live on the task branch and reach `main`
-when the user merges the PR (REQ-PROJ-027). The agent renames the file to `...-done--...`
+when the user merges the PR (work-lifecycle REQ-WL-002). The agent renames the file to `...-done--...`
 (or `...-wont-do--...`) itself when the work closes; Phoenix does not.
 
 ## Task Forks (Decoupled Spawn)
@@ -756,39 +720,13 @@ On startup `reconcile_worktrees` scans conversations whose `conv_mode` is `Work`
 
 ## Branch Health Indicator
 
-### REQ-PROJ-011 — PR status, not local commit divergence
+### PR Status and Feedback Freshness — Moved
 
-The StateBar uses PR status as the branch health signal for Work and Branch
-conversations. It shows the PR number plus merge/check state when `gh` can resolve
-a pull request for the branch. It does not render local commits-ahead,
-commits-behind, or PR-feedback-freshness badges; those counts are easy to inspect
-with git commands when needed, and feedback freshness belongs beside the remediation
-action that consumes it.
-
-`GET /api/conversations/:id/pr-status` is the data source. It runs `gh pr list --head
-{branch} --state all --json ...` (and `gh pr checks` where needed) from the
-conversation's worktree, in a `spawn_blocking` task, and normalises the result to
-`{ found, display_state: open|draft|merged|closed, check_state: passing|pending|failing|unknown,
-number/title/url/... }` or `{ found: false, unavailable_reason: gh_missing|not_authenticated|not_git_repo|command_failed }`.
-`gh` failures are logged at `debug` and surfaced to the UI as a compact non-blocking
-hint, never as a hard error — the conversation page stays usable without `gh`.
-
-### REQ-PROJ-030 through REQ-PROJ-032 — Work Action remediation freshness
-
-The `Address CI & comments` Work Action owns PR feedback freshness. A successful
-`POST /api/conversations/:id/pr-auto-fix-context` capture writes the artifact passed
-to the agent and records a compact baseline keyed by work scope and PR number:
-capture time, PR `updated_at` when GitHub provides it, and stable feedback identities
-(provider id, URL, or a structural fingerprint fallback). With no baseline, the UI
-shows no freshness marker.
-
-Routine `pr-status` polling remains the main path but stays bounded. The status
-refresh first reads only PR identity/check data. If the current PR `updated_at` is
-newer than the stored baseline, Phoenix fetches full feedback surfaces once to
-compare identities. If that comparison finds unseen feedback it returns a counted
-`new` marker; if surfaces are unavailable it logs at `debug` and returns only a
-coarse `updated` advisory. The marker is advisory and does not affect cleanup,
-abandon, or conversation availability.
+The StateBar PR-status branch-health signal and the `Address CI & comments` Work
+Action feedback-freshness design (the `pr-status` data source, baseline capture, and
+bounded refresh) live in their owning specs. See work-lifecycle REQ-WL-003 (PR status
+as cleanup gate, in work-lifecycle/design.md) and pr-association REQ-PRA-001 through
+REQ-PRA-003 (freshness indicator, baseline, bounded refresh, in pr-association/design.md).
 
 `.gitignore` management: the system checks for `.phoenix/worktrees/` in `.gitignore`
 at project creation and appends it if missing.

@@ -251,7 +251,7 @@ REQ-PROJ-025), so one scope key is complete
 THE work identity SHALL be sourced from the members' `ConvMode` git
 metadata, and the PR `display_state` / checks / feedback-freshness SHALL
 be sourced from the existing **PR-status / feedback pipeline** that drives
-the StateBar (`specs/projects/` REQ-PROJ-011/030/031) — not from the PR
+the StateBar (work-lifecycle REQ-WL-003, pr-association REQ-PRA-001/REQ-PRA-002) — not from the PR
 association record alone (which carries PR identity and state but not live
 checks or freshness). This facet SHALL NOT be folded into
 `WorkScopeInventory`, whose contract is a full-snapshot read-projection
