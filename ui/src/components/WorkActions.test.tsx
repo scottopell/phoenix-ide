@@ -1,9 +1,20 @@
-// Tests for WorkControlBar continuation gate (REQ-BED-031, task 24696 Phase 5).
+// Tests for the redesigned WorkControlBar.
 //
-// When the parent conversation has a continuation, abandon and mark-as-merged
-// must be disabled on the parent — the action belongs on the continuation.
-// Server enforces with 409 `error_type = "continuation_exists"`; the UI
-// disables the controls so the user never sees that error path.
+// The bar renders from `deriveWorkDisposition` (see workDisposition.ts), which
+// is the source of truth for which disposition row yields which testid /
+// primary / note. These tests drive the real component through a render
+// harness, asserting the rendered affordances per disposition case.
+//
+// Affordances (NEW design):
+//   - view-diff-button ("View Diff") — always in the REVIEW zone on Work/Branch.
+//   - address-feedback-button ("Address feedback" / "Capturing...") — carries
+//     the #288 freshness (.work-actions-pr-freshness) + coverage
+//     (.work-actions-pr-coverage[--auth] ⚠) spans.
+//   - merge-pr-link / open-pr-link — honest <a> links to the PR url.
+//   - clean-up-button ("Clean up" / "Cleaning...") — single click → api.markMerged.
+//   - abandon-button ("Abandon" / "Abandoning...") — window.confirm → api.abandonTask.
+//   - Exactly one element carries work-actions-btn--primary.
+//   - Notes are muted spans, never buttons.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
@@ -14,8 +25,8 @@ import { WorkControlBar } from './WorkActions';
 import { api, type PrStatusResponse } from '../api';
 import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
 
-// WorkViewerActions reads the unified viewer slot; MemoryRouter backs the
-// slot's URL contract.
+// WorkControlBar reads the unified viewer slot; MemoryRouter backs the slot's
+// URL contract.
 const renderWithProviders = (ui: ReactElement) =>
   render(
     <MemoryRouter>
@@ -36,11 +47,13 @@ vi.mock('../api', () => ({
     abandonTask: vi.fn().mockResolvedValue({ success: true }),
     markMerged: vi.fn().mockResolvedValue({ success: true }),
     getConversationDiff: vi.fn(),
-    createPrAutoFixContext: vi.fn().mockResolvedValue({ message: 'Address `.phoenix/pr-context/pr-12.json`' }),
+    createPrAutoFixContext: vi
+      .fn()
+      .mockResolvedValue({ message: 'Address `.phoenix/pr-context/pr-12.json`' }),
   },
 }));
 
-function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, manualFallbackEnabled = false) {
+function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }) {
   const status: PrStatusResponse = {
     found: false,
     refresh: {
@@ -53,7 +66,7 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, 
   };
   return {
     state: { status: 'ready' as const, prStatus: status },
-    manualFallbackEnabled,
+    manualFallbackEnabled: false,
     enableManualFallback: vi.fn(),
     refresh: vi.fn().mockResolvedValue(undefined),
   };
@@ -66,12 +79,64 @@ const loadingPrStatusHandle = {
   refresh: vi.fn().mockResolvedValue(undefined),
 };
 
-describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+/** Count of glowing primaries across the whole bar — must always be exactly 1
+ *  when the bar is in a dispositive (non-continued) state. */
+function primaryCount() {
+  return document.querySelectorAll('.work-actions-btn--primary').length;
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe('WorkControlBar — visibility (REQ-WAB-001)', () => {
+  it('is hidden in a non-Work/Branch mode (Direct)', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Direct"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
+      />,
+    );
+    expect(screen.queryByTestId('view-diff-button')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
   });
 
-  it('disables Abandon and Mark-as-Merged when continuedInConvId is set', async () => {
+  it('is hidden when the phase is running (not a disposable phase)', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="running"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
+      />,
+    );
+    expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
+  });
+
+  it.each(['idle', 'error', 'context_exhausted'] as const)(
+    'is visible for a %s phase on Work',
+    (phaseType) => {
+      renderWithProviders(
+        <WorkControlBar
+          conversationId="conv-1"
+          convModeLabel="Work"
+          phaseType={phaseType}
+          continuedInConvId={null}
+          prStatusHandle={prStatusHandle()}
+        />,
+      );
+      expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
+      expect(screen.getByTestId('view-diff-button')).toBeInTheDocument();
+    },
+  );
+});
+
+describe('WorkControlBar — continuation gate (REQ-WAB-009)', () => {
+  it('disables Abandon, shows the continuation note, and glows nothing', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-1"
@@ -79,95 +144,56 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
         phaseType="idle"
         continuedInConvId="continuation-id"
         prStatusHandle={prStatusHandle()}
-      />
+      />,
     );
 
     const abandon = screen.getByTestId('abandon-button') as HTMLButtonElement;
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-
     expect(abandon.disabled).toBe(true);
-    expect(mark.disabled).toBe(true);
-    expect(abandon.title).toMatch(/continued/i);
-    expect(mark.title).toMatch(/continued/i);
 
-    // Visible inline note reinforces the reason
-    expect(screen.getByText(/Continued — actions belong on the continuation/i)).toBeInTheDocument();
+    expect(
+      document.querySelector('.work-actions-continuation-note'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Continued — actions belong on the continuation/i),
+    ).toBeInTheDocument();
+
+    // No primary glow in the continued case.
+    expect(primaryCount()).toBe(0);
+    // Terminal verbs suppressed.
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
   });
+});
 
-  it('enables Abandon and Mark-as-Merged when continuedInConvId is null', async () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle()}
-      />
-    );
+describe('WorkControlBar — stuck phases suppress RESOLVE (REQ-WAB-005)', () => {
+  it.each(['error', 'context_exhausted'] as const)(
+    'exposes Clean up + Abandon but NO address-feedback even with an open PR (%s)',
+    (phaseType) => {
+      renderWithProviders(
+        <WorkControlBar
+          conversationId="conv-1"
+          convModeLabel="Work"
+          phaseType={phaseType}
+          continuedInConvId={null}
+          onSendMessage={vi.fn()}
+          prStatusHandle={prStatusHandle({
+            found: true,
+            number: 12,
+            url: 'https://gh/pr/12',
+            display_state: 'open',
+            check_state: 'failing',
+          })}
+        />,
+      );
 
-    const abandon = screen.getByTestId('abandon-button') as HTMLButtonElement;
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+      // Stuck + open PR → primary collapses to Abandon (an open PR can't be
+      // cleaned up), RESOLVE is suppressed.
+      expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
+      expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('merge-pr-link')).not.toBeInTheDocument();
+    },
+  );
 
-    // Shared PR status is ready and no PR was found, so cleanup is allowed.
-    await waitFor(() => {
-      expect(abandon.disabled).toBe(false);
-      expect(mark.disabled).toBe(false);
-    });
-
-    // Mark-as-merged is safe to click (no confirm dialog); assert it
-    // actually wires through. Abandon triggers window.confirm which
-    // happy-dom stubs to true by default but we avoid relying on that.
-    fireEvent.click(mark);
-    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
-  });
-  it('exposes cleanup actions while the conversation is errored', async () => {
-    // A Work conversation stuck in error (e.g. a usage-limit window the user
-    // merged around) must still reach Mark-as-Merged / Abandon — the backend
-    // permits terminal cleanup from Error.
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="error"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle()}
-      />
-    );
-
-    const abandon = screen.getByTestId('abandon-button') as HTMLButtonElement;
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-    await waitFor(() => {
-      expect(abandon.disabled).toBe(false);
-      expect(mark.disabled).toBe(false);
-    });
-    fireEvent.click(mark);
-    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
-  });
-
-  it('exposes cleanup actions while context-exhausted', async () => {
-    // TaskResolved is permitted from ContextExhausted, so a Work conversation
-    // that filled context after its PR merged externally must reach cleanup.
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="context_exhausted"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: true, number: 12, display_state: 'merged' })}
-      />
-    );
-
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-    await waitFor(() => expect(mark.disabled).toBe(false));
-    expect(mark.textContent).toMatch(/clean up merged pr/i);
-    fireEvent.click(mark);
-    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
-  });
-
-  it('suppresses PR remediation while errored, even with an open PR', async () => {
-    // "Address CI & comments" posts a normal UserMessage, which Error accepts;
-    // surfacing it on an errored bar would reopen the error through a side
-    // action. While errored the bar exposes only terminal cleanup.
+  it('stuck with no PR → Clean up + Abandon both present, no RESOLVE', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-1"
@@ -175,127 +201,17 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
         phaseType="error"
         continuedInConvId={null}
         onSendMessage={vi.fn()}
-        prStatusHandle={prStatusHandle({ found: true, number: 12, display_state: 'open' })}
-      />
-    );
-
-    expect(screen.queryByRole('button', { name: /Address CI & comments/i })).not.toBeInTheDocument();
-    // Terminal cleanup is still reachable.
-    expect(screen.getByTestId('mark-merged-button')).toBeInTheDocument();
-  });
-
-  it('requires an explicit manual fallback click when gh is unavailable', async () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: false, unavailable_reason: 'not_authenticated' })}
-      />
-    );
-
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-    expect(mark.textContent).toMatch(/manual fallback/i);
-    fireEvent.click(mark);
-    expect(api.markMerged).not.toHaveBeenCalled();
-  });
-
-  it('keeps manual cleanup fallback reachable for stale PR data when gh is unavailable', async () => {
-    const handle = prStatusHandle({
-      found: true,
-      number: 134,
-      display_state: 'open',
-      unavailable_reason: 'not_authenticated',
-      refresh: {
-        state: 'unavailable',
-        reason: 'not_authenticated',
-        last_attempted_at: '2026-01-01T00:00:00Z',
-        last_refreshed_at: '2025-12-31T00:00:00Z',
-        stale: true,
-      },
-    });
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-stale-unavailable"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={handle}
+        prStatusHandle={prStatusHandle({ found: false })}
       />,
     );
-
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-    expect(mark.disabled).toBe(false);
-    expect(mark.textContent).toMatch(/manual fallback/i);
-    fireEvent.click(mark);
-    expect(api.markMerged).not.toHaveBeenCalled();
-    expect(handle.enableManualFallback).toHaveBeenCalled();
+    expect(screen.getByTestId('clean-up-button')).toBeInTheDocument();
+    expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
+    expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
   });
+});
 
-  it('keeps stale unavailable closed PRs directed to Abandon', async () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-stale-closed"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({
-          found: true,
-          number: 135,
-          display_state: 'closed',
-          unavailable_reason: 'not_authenticated',
-          refresh: {
-            state: 'unavailable',
-            reason: 'not_authenticated',
-            last_attempted_at: '2026-01-01T00:00:00Z',
-            last_refreshed_at: '2025-12-31T00:00:00Z',
-            stale: true,
-          },
-        })}
-      />,
-    );
-
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-    expect(mark.disabled).toBe(true);
-    expect(mark.textContent).toMatch(/closed without merge/i);
-    expect(mark.title).toMatch(/Use Abandon/i);
-  });
-
-  it('marks merged after explicit manual fallback is enabled', async () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: false, unavailable_reason: 'not_authenticated' }, true)}
-      />
-    );
-
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-    expect(mark.textContent).toMatch(/mark as merged/i);
-    fireEvent.click(mark);
-    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
-  });
-
-
-  it('shows Checking PR while shared PR status is loading', () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={loadingPrStatusHandle}
-      />,
-    );
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-    expect(mark.textContent).toMatch(/Checking PR/i);
-    expect(mark.disabled).toBe(true);
-  });
-
-  it('shows Clean up merged PR when GitHub reports merged', () => {
+describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
+  it('merged PR → Clean up is present and is the primary; Abandon present', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-merged"
@@ -305,17 +221,344 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
         prStatusHandle={prStatusHandle({ found: true, number: 136, display_state: 'merged' })}
       />,
     );
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-    expect(mark.textContent).toMatch(/Clean up merged PR/i);
-    expect(mark).toHaveClass('work-actions-complete--merged');
-    expect(mark.disabled).toBe(false);
+
+    const clean = screen.getByTestId('clean-up-button');
+    expect(clean).toBeInTheDocument();
+    expect(clean).toHaveClass('work-actions-btn--primary');
+    expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
+    expect(primaryCount()).toBe(1);
   });
 
-  beforeEach(() => {
-    vi.clearAllMocks();
+  it('closed-unmerged PR → Abandon is primary, note says closed/use Abandon, NO Clean up', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-closed"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: true, number: 133, display_state: 'closed' })}
+      />,
+    );
+
+    const abandon = screen.getByTestId('abandon-button');
+    expect(abandon).toHaveClass('work-actions-btn--primary');
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+
+    const note = document.querySelector('.work-actions-pr-note');
+    expect(note).toBeInTheDocument();
+    expect(note?.textContent).toMatch(/PR #133 is closed without merge\. Use Abandon/i);
   });
 
-  it('shows PR feedback freshness next to the remediation action', () => {
+  it('open PR, failing checks + onSendMessage → address-feedback present + primary', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-fail"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 12,
+          url: 'https://gh/pr/12',
+          display_state: 'open',
+          check_state: 'failing',
+        })}
+      />,
+    );
+
+    const resolve = screen.getByTestId('address-feedback-button');
+    expect(resolve).toBeInTheDocument();
+    expect(resolve).toHaveClass('work-actions-btn--primary');
+    expect(resolve.textContent).toMatch(/Address feedback/i);
+    expect(primaryCount()).toBe(1);
+  });
+
+  it('open PR, fresh feedback + onSendMessage → address-feedback present + primary', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-fresh"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 12,
+          url: 'https://gh/pr/12',
+          display_state: 'open',
+          check_state: 'passing',
+          feedback_freshness: { state: 'new', count: 2 },
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId('address-feedback-button')).toHaveClass(
+      'work-actions-btn--primary',
+    );
+  });
+
+  it('open PR, passing checks, no fresh feedback → merge-pr-link present + primary, honest href', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-green"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 77,
+          url: 'https://github.com/o/r/pull/77',
+          display_state: 'open',
+          check_state: 'passing',
+        })}
+      />,
+    );
+
+    const link = screen.getByTestId('merge-pr-link') as HTMLAnchorElement;
+    expect(link).toBeInTheDocument();
+    expect(link.textContent).toMatch(/Merge PR #77 ↗/);
+    expect(link.getAttribute('href')).toBe('https://github.com/o/r/pull/77');
+    expect(link).toHaveClass('work-actions-btn--primary');
+    expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
+  });
+
+  it('open PR, pending checks → open-pr-link ("Open PR #N ↗")', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-pending"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 88,
+          url: 'https://github.com/o/r/pull/88',
+          display_state: 'open',
+          check_state: 'pending',
+        })}
+      />,
+    );
+
+    const link = screen.getByTestId('open-pr-link') as HTMLAnchorElement;
+    expect(link).toBeInTheDocument();
+    expect(link.textContent).toMatch(/Open PR #88 ↗/);
+    expect(link.getAttribute('href')).toBe('https://github.com/o/r/pull/88');
+    expect(screen.queryByTestId('merge-pr-link')).not.toBeInTheDocument();
+  });
+
+  it('draft PR → open-pr-link ("Open PR #N ↗")', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-draft"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 89,
+          url: 'https://github.com/o/r/pull/89',
+          display_state: 'draft',
+        })}
+      />,
+    );
+
+    const link = screen.getByTestId('open-pr-link') as HTMLAnchorElement;
+    expect(link).toBeInTheDocument();
+    expect(link.textContent).toMatch(/Open PR #89 ↗/);
+  });
+
+  it('no PR found (refresh ok) → Clean up present and primary', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-none"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false })}
+      />,
+    );
+
+    const clean = screen.getByTestId('clean-up-button');
+    expect(clean).toBeInTheDocument();
+    expect(clean).toHaveClass('work-actions-btn--primary');
+    expect(primaryCount()).toBe(1);
+  });
+});
+
+describe('WorkControlBar — gh unavailable (single-click manual fallback)', () => {
+  it('no PR + refresh unavailable → Clean up present; a SINGLE click calls api.markMerged; warning note shown', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, unavailable_reason: 'not_authenticated' })}
+      />,
+    );
+
+    const clean = screen.getByTestId('clean-up-button');
+    expect(clean).toBeInTheDocument();
+    expect(
+      document.querySelector('.work-actions-pr-note--warning'),
+    ).toBeInTheDocument();
+
+    // Single click marks merged — no two-step enable-then-mark fallback.
+    fireEvent.click(clean);
+    expect(api.markMerged).toHaveBeenCalledTimes(1);
+    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
+  });
+});
+
+describe('WorkControlBar — checking / loading', () => {
+  it('PR status loading → checking note shown, Abandon present, NO Clean up', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={loadingPrStatusHandle}
+      />,
+    );
+
+    expect(document.querySelector('.work-actions-checking-note')).toBeInTheDocument();
+    expect(screen.getByText(/Checking PR/i)).toBeInTheDocument();
+    expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+  });
+});
+
+describe('WorkControlBar — terminal cleanup actions', () => {
+  it('Clean up is a single click that calls api.markMerged (no two-step)', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('clean-up-button'));
+    expect(api.markMerged).toHaveBeenCalledTimes(1);
+    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
+  });
+
+  it('Abandon confirms then calls api.abandonTask', () => {
+    const confirmSpy = vi.fn().mockReturnValue(true);
+    const prevConfirm = window.confirm;
+    window.confirm = confirmSpy;
+    try {
+      renderWithProviders(
+        <WorkControlBar
+          conversationId="conv-1"
+          convModeLabel="Work"
+          phaseType="idle"
+          continuedInConvId={null}
+          prStatusHandle={prStatusHandle({ found: false })}
+        />,
+      );
+      fireEvent.click(screen.getByTestId('abandon-button'));
+      expect(confirmSpy).toHaveBeenCalled();
+      expect(api.abandonTask).toHaveBeenCalledWith('conv-1');
+    } finally {
+      window.confirm = prevConfirm;
+    }
+  });
+
+  it('Abandon does NOT call api.abandonTask when the confirm is declined', () => {
+    const confirmSpy = vi.fn().mockReturnValue(false);
+    const prevConfirm = window.confirm;
+    window.confirm = confirmSpy;
+    try {
+      renderWithProviders(
+        <WorkControlBar
+          conversationId="conv-1"
+          convModeLabel="Work"
+          phaseType="idle"
+          continuedInConvId={null}
+          prStatusHandle={prStatusHandle({ found: false })}
+        />,
+      );
+      fireEvent.click(screen.getByTestId('abandon-button'));
+      expect(confirmSpy).toHaveBeenCalled();
+      expect(api.abandonTask).not.toHaveBeenCalled();
+    } finally {
+      window.confirm = prevConfirm;
+    }
+  });
+});
+
+describe('WorkControlBar — View Diff (View Browser gone)', () => {
+  it('View Browser is gone; View Diff opens the fullscreen diff slot', () => {
+    let slot: ReturnType<typeof useViewerSlot>['slot'] = { kind: 'none' };
+    renderWithProviders(
+      <>
+        <WorkControlBar
+          conversationId="conv-1"
+          convModeLabel="Branch"
+          phaseType="idle"
+          continuedInConvId={null}
+          prStatusHandle={prStatusHandle()}
+        />
+        <CaptureSlot onSlot={(s) => { slot = s; }} />
+      </>,
+    );
+
+    expect(screen.queryByTestId('view-browser-button')).toBeNull();
+
+    expect(slot).toEqual({ kind: 'none' });
+    fireEvent.click(screen.getByTestId('view-diff-button'));
+    expect(slot).toEqual({ kind: 'diff', presentation: 'fullscreen' });
+    expect(api.getConversationDiff).not.toHaveBeenCalled();
+  });
+});
+
+describe('WorkControlBar — invariants', () => {
+  it('exactly one element glows in a representative case (merged PR)', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: true, number: 90, display_state: 'merged' })}
+      />,
+    );
+    expect(primaryCount()).toBe(1);
+  });
+
+  it('no disabled-as-status: old morphed labels are absent', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 91,
+          url: 'https://gh/pr/91',
+          display_state: 'open',
+          check_state: 'pending',
+        })}
+      />,
+    );
+
+    expect(
+      screen.queryByText(/Waiting for PR merge|Clean up merged PR|Use manual fallback|Checking PR…/i),
+    ).toBeNull();
+  });
+});
+
+describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
+  it('shows a "N new" freshness marker inside the address-feedback button', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-freshness"
@@ -326,13 +569,17 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
         prStatusHandle={prStatusHandle({
           found: true,
           number: 137,
+          url: 'https://gh/pr/137',
           display_state: 'open',
           feedback_freshness: { state: 'new', count: 3 },
         })}
       />,
     );
 
-    expect(screen.getByRole('button', { name: /Address CI & comments 3 new/i })).toBeInTheDocument();
+    const button = screen.getByTestId('address-feedback-button');
+    const freshness = button.querySelector('.work-actions-pr-freshness');
+    expect(freshness).toBeInTheDocument();
+    expect(freshness?.textContent).toBe('3 new');
   });
 
   it('shows an edited-comment marker when existing feedback changed', () => {
@@ -346,18 +593,20 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
         prStatusHandle={prStatusHandle({
           found: true,
           number: 138,
+          url: 'https://gh/pr/138',
           display_state: 'open',
           feedback_freshness: { state: 'edited', count: 1 },
         })}
       />,
     );
 
-    expect(
-      screen.getByRole('button', { name: /Address CI & comments 1 comment updated/i }),
-    ).toBeInTheDocument();
+    const button = screen.getByTestId('address-feedback-button');
+    expect(button.querySelector('.work-actions-pr-freshness')?.textContent).toBe(
+      '1 comment updated',
+    );
   });
 
-  it('renders the count as a lower bound and a warning when feedback coverage is degraded', () => {
+  it('renders the count as a lower bound and a ⚠ warning when feedback coverage is degraded', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-incomplete"
@@ -368,6 +617,7 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
         prStatusHandle={prStatusHandle({
           found: true,
           number: 140,
+          url: 'https://gh/pr/140',
           display_state: 'open',
           feedback_freshness: { state: 'new', count: 2 },
           feedback_coverage: { kind: 'incomplete', surfaces: ['review_threads'] },
@@ -375,16 +625,20 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
       />,
     );
 
-    expect(
-      screen.getByRole('button', { name: /Address CI & comments at least 2 new ⚠/i }),
-    ).toBeInTheDocument();
-    expect(screen.getByText('⚠')).toHaveAttribute(
-      'title',
-      expect.stringContaining('review threads'),
+    const button = screen.getByTestId('address-feedback-button');
+    // Lower-bound prefix from the degraded coverage.
+    expect(button.querySelector('.work-actions-pr-freshness')?.textContent).toBe(
+      'at least 2 new',
     );
+    // Transient (non-actionable) coverage gap → icon-only ⚠, no --auth class.
+    const coverage = button.querySelector('.work-actions-pr-coverage');
+    expect(coverage).toBeInTheDocument();
+    expect(coverage).not.toHaveClass('work-actions-pr-coverage--auth');
+    expect(coverage?.textContent).toContain('⚠');
+    expect(coverage).toHaveAttribute('title', expect.stringContaining('review threads'));
   });
 
-  it('shows an actionable sign-in marker when feedback auth failed', () => {
+  it('shows an actionable "GitHub sign-in needed" auth marker when feedback auth failed', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-auth"
@@ -395,15 +649,19 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
         prStatusHandle={prStatusHandle({
           found: true,
           number: 141,
+          url: 'https://gh/pr/141',
           display_state: 'open',
+          check_state: 'failing',
           feedback_coverage: { kind: 'auth_required', surfaces: ['review_threads'] },
         })}
       />,
     );
 
-    expect(
-      screen.getByRole('button', { name: /Address CI & comments ⚠ GitHub sign-in needed/i }),
-    ).toBeInTheDocument();
+    const button = screen.getByTestId('address-feedback-button');
+    const coverage = button.querySelector('.work-actions-pr-coverage');
+    expect(coverage).toBeInTheDocument();
+    expect(coverage).toHaveClass('work-actions-pr-coverage--auth');
+    expect(coverage?.textContent).toContain('⚠ GitHub sign-in needed');
   });
 
   it('keeps remediation loading until send completes and then refreshes PR status', async () => {
@@ -413,6 +671,7 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     const handle = prStatusHandle({
       found: true,
       number: 139,
+      url: 'https://gh/pr/139',
       display_state: 'open',
       feedback_freshness: { state: 'new', count: 2 },
     });
@@ -428,115 +687,29 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /Address CI & comments 2 new/i }));
+    const button = screen.getByTestId('address-feedback-button');
+    fireEvent.click(button);
 
+    // createPrAutoFixContext → onSendMessage with the captured message.
     await waitFor(() => {
+      expect(api.createPrAutoFixContext).toHaveBeenCalledWith('conv-remediate');
       expect(onSendMessage).toHaveBeenCalledWith('Address `.phoenix/pr-context/pr-12.json`');
     });
-    expect(screen.getByRole('button', { name: /Capturing/i })).toBeDisabled();
+
+    // Loading state holds while send is in flight; refresh not yet called.
+    expect(button.textContent).toMatch(/Capturing/i);
     expect(handle.refresh).not.toHaveBeenCalled();
 
     resolveSend();
 
+    // Once send completes, PR status refreshes and the label settles back.
     await waitFor(() => {
       expect(handle.refresh).toHaveBeenCalledTimes(1);
     });
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /Address CI & comments 2 new/i })).not.toBeDisabled();
+      expect(screen.getByTestId('address-feedback-button').textContent).toMatch(
+        /Address feedback/i,
+      );
     });
-  });
-
-  it('guides closed-unmerged PRs toward Abandon instead of waiting for merge cleanup', async () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-closed"
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: true, number: 133, display_state: 'closed' })}
-      />,
-    );
-
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-    const abandon = screen.getByTestId('abandon-button') as HTMLButtonElement;
-
-    await waitFor(() => {
-      expect(screen.getByText(/PR #133 is closed without merge\. Use Abandon/i)).toBeInTheDocument();
-    });
-    expect(screen.queryByText(/cleanup unlocks after GitHub reports merged/i)).not.toBeInTheDocument();
-    expect(mark.disabled).toBe(true);
-    expect(mark.textContent).toMatch(/closed without merge/i);
-    expect(mark.title).toMatch(/Use Abandon/i);
-    expect(abandon.disabled).toBe(false);
-  });
-
-  it.each([
-    ['open', 134],
-    ['draft', 135],
-  ] as const)('keeps %s PRs blocked until GitHub reports merged', async (displayState, number) => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId={`conv-${displayState}`}
-        convModeLabel="Work"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle({ found: true, number, display_state: displayState })}
-      />,
-    );
-
-    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-
-    await waitFor(() => {
-      expect(
-        screen.getByText(
-          `PR #${number} is ${displayState}; cleanup unlocks after GitHub reports merged.`,
-        ),
-      ).toBeInTheDocument();
-    });
-    expect(mark.disabled).toBe(true);
-    expect(mark.textContent).toMatch(/waiting for PR merge/i);
-    expect(mark.title).toMatch(/merge it before cleanup/i);
-  });
-});
-
-describe('WorkControlBar — View Diff (task 08641 + 08654 follow-on)', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it('opens the fullscreen diff presentation when View Diff is clicked (payload fetched on mount by the viewer)', () => {
-    let slot: ReturnType<typeof useViewerSlot>['slot'] = { kind: 'none' };
-    renderWithProviders(
-      <>
-        <WorkControlBar
-          conversationId="conv-1"
-          convModeLabel="Branch"
-          phaseType="idle"
-          continuedInConvId={null}
-          prStatusHandle={prStatusHandle()}
-        />
-        <CaptureSlot onSlot={(s) => { slot = s; }} />
-      </>,
-    );
-
-    expect(slot).toEqual({ kind: 'none' });
-    fireEvent.click(screen.getByTestId('view-diff-button'));
-    expect(slot).toEqual({ kind: 'diff', presentation: 'fullscreen' });
-    // WorkActions no longer fetches; the diff viewer fetches on mount.
-    expect(api.getConversationDiff).not.toHaveBeenCalled();
-  });
-
-  it('does not render the View Diff button in Direct mode', async () => {
-    renderWithProviders(
-      <WorkControlBar
-        conversationId="conv-1"
-        convModeLabel="Direct"
-        phaseType="idle"
-        continuedInConvId={null}
-        prStatusHandle={prStatusHandle()}
-      />
-    );
-
-    expect(screen.queryByTestId('view-diff-button')).not.toBeInTheDocument();
   });
 });

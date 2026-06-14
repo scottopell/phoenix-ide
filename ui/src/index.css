@@ -8607,13 +8607,37 @@ html * {
 .work-actions-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   padding: 6px 12px;
   font-size: 12px;
   color: var(--text-secondary);
   flex-wrap: wrap;
   border-top: 1px solid var(--border-color);
   background: color-mix(in srgb, var(--bg-tertiary) 50%, transparent);
+}
+
+/* Zone grouping: review / resolve / finish. Resolve and finish zones get a
+ * left border to visually separate them from the preceding group. */
+.work-actions-zone {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.work-actions-zone--review {
+  /* no separator — leftmost zone */
+}
+
+.work-actions-zone--resolve {
+  padding-left: 8px;
+  border-left: 1px solid var(--border-color);
+  margin-left: 4px;
+}
+
+.work-actions-zone--finish {
+  padding-left: 8px;
+  border-left: 1px solid var(--border-color);
+  margin-left: 4px;
 }
 
 .work-actions-label {
@@ -8638,30 +8662,79 @@ html * {
   cursor: not-allowed;
 }
 
-.work-actions-complete {
-  color: var(--accent-green, #22c55e);
-  border-color: color-mix(in srgb, var(--accent-green, #22c55e) 40%, transparent);
+/* Primary call-to-action — professional emphasis using the blue accent token.
+ * Slightly elevated background + brighter border; no glow animation. */
+.work-actions-btn--primary {
+  color: var(--accent-blue, #58a6ff);
+  border-color: color-mix(in srgb, var(--accent-blue, #58a6ff) 55%, transparent);
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 10%, transparent);
+  font-weight: 600;
 }
 
-.work-actions-complete:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent-green, #22c55e) 10%, transparent);
-  border-color: var(--accent-green, #22c55e);
+.work-actions-btn--primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 18%, transparent);
+  border-color: var(--accent-blue, #58a6ff);
+  color: var(--accent-blue, #58a6ff);
 }
 
-.work-actions-complete--merged {
-  color: #c084fc;
-  border-color: color-mix(in srgb, #a855f7 45%, transparent);
-}
-
-.work-actions-complete--merged:hover:not(:disabled) {
-  background: color-mix(in srgb, #a855f7 14%, transparent);
-  border-color: #a855f7;
-}
-
-.work-actions-pr-remediate {
+/* Address feedback button — inline-flex so the freshness/coverage spans stay
+ * on the same line without wrapping unexpectedly. */
+.work-actions-address {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+/* Clean up button — neutral green (same weight as the old "complete" action). */
+.work-actions-clean-up {
+  color: var(--accent-green, #3fb950);
+  border-color: color-mix(in srgb, var(--accent-green, #3fb950) 40%, transparent);
+}
+
+.work-actions-clean-up:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-green, #3fb950) 10%, transparent);
+  border-color: var(--accent-green, #3fb950);
+}
+
+/* External link buttons (Merge PR ↗, Open PR ↗) — styled identically to
+ * .work-actions-btn: no underline, same sizing and chrome. */
+.work-actions-merge-link,
+.work-actions-open-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  text-decoration: none;
+}
+
+.work-actions-merge-link:hover:not([aria-disabled]),
+.work-actions-open-link:hover:not([aria-disabled]) {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+  background: var(--bg-secondary);
+  text-decoration: none;
+}
+
+/* ⓘ info hint — muted glyph; native title tooltip handles the text. */
+.work-actions-info-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: help;
+  opacity: 0.7;
+  transition: opacity 150ms;
+  user-select: none;
+}
+
+.work-actions-info-hint:hover,
+.work-actions-info-hint:focus-visible {
+  opacity: 1;
+  outline: none;
+}
+
+/* "Checking PR…" muted status text — same treatment as continuation-note. */
+.work-actions-checking-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-style: italic;
 }
 
 .work-actions-pr-freshness {
@@ -9014,33 +9087,6 @@ html * {
   font-style: italic;
 }
 
-.work-actions-dirty-details {
-  margin-top: 6px;
-}
-
-.work-actions-dirty-files {
-  font-family: var(--font-mono, monospace);
-  font-size: 11px;
-  max-height: 100px;
-  overflow-y: auto;
-  margin-bottom: 6px;
-}
-
-.work-actions-dirty-file {
-  padding: 1px 0;
-  color: var(--text-secondary);
-}
-
-.work-actions-stash {
-  font-size: 11px;
-  color: var(--accent-blue, #58a6ff);
-  border-color: color-mix(in srgb, var(--accent-blue, #58a6ff) 40%, transparent);
-}
-
-.work-actions-stash:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 10%, transparent);
-  border-color: var(--accent-blue, #58a6ff);
-}
 
 /* --- SSE Error Toast --- */
 
