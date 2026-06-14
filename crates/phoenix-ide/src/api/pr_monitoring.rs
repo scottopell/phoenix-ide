@@ -336,6 +336,11 @@ impl GhClient for ShellGhClient<'_> {
         // so one slow log download cannot starve the others.
         let job_deadline =
             earliest_deadline(self.deadline, Instant::now() + LOG_FETCH_PER_JOB_TIMEOUT);
+        // A single check's log fetch failing (timeout, empty, non-zero exit)
+        // must not fail the whole capture — fall back to the URL. But always
+        // record *why* at debug, so a logless bundle is diagnosable (bad job id,
+        // permissions, expired logs) rather than silently indistinguishable from
+        // an intentional URL-only provider.
         match run_gh_raw_with_deadline(
             self.cwd,
             &["run", "view", &run_id, "--job", &job_id, "--log-failed"],
@@ -344,21 +349,24 @@ impl GhClient for ShellGhClient<'_> {
             Ok(out) if out.status.success() && !out.stdout.trim().is_empty() => {
                 Ok(Some(tail_log_snippet(check_name, url, &out.stdout)))
             }
-            // A single check's log fetch failing (timeout, empty, non-zero exit)
-            // must not fail the whole capture — fall back to the URL.
-            other => {
-                if let Err(e) = &other {
-                    tracing::debug!(check = %check_name, error = %e.message, "gh run view --log-failed failed");
-                }
-                Ok(Some(url_only_snippet(
-                    check_name,
-                    url,
-                    "Phoenix could not extract logs for this failing check (gh returned no failed-step output). Open the URL for full logs.",
-                )))
+            Ok(out) => {
+                tracing::debug!(
+                    check = %check_name,
+                    code = out.status.code(),
+                    stderr = %out.stderr,
+                    "gh run view --log-failed produced no usable output"
+                );
+                Ok(Some(url_only_snippet(check_name, url, GH_LOG_FALLBACK_MSG)))
+            }
+            Err(e) => {
+                tracing::debug!(check = %check_name, error = %e.message, "gh run view --log-failed failed");
+                Ok(Some(url_only_snippet(check_name, url, GH_LOG_FALLBACK_MSG)))
             }
         }
     }
 }
+
+const GH_LOG_FALLBACK_MSG: &str = "Phoenix could not extract logs for this failing check (gh returned no failed-step output). Open the URL for full logs.";
 
 /// Per-failing-check budget for `gh run view --log-failed`. Backstopped by the
 /// hard per-command cap in [`run_gh_raw_with_deadline`].
@@ -376,15 +384,19 @@ fn earliest_deadline(client: Option<Instant>, job: Instant) -> Instant {
     }
 }
 
-/// Parse a GitHub Actions job URL of the form
-/// `https://github.com/<owner>/<repo>/actions/runs/<run_id>/job/<job_id>` into
-/// `(run_id, job_id)`. Returns `None` for any other URL shape (a non-Actions
+/// Parse a GitHub Actions job URL into `(run_id, job_id)`. Accepts the shapes
+/// GitHub uses for job links — `.../actions/runs/<run>/job/<job>` and the
+/// documented `.../runs/<run>/jobs/<job>` (both `job`/`jobs`, with or without
+/// the `/actions` prefix). Returns `None` for any other URL (a non-Actions
 /// check provider).
 fn parse_actions_job_url(url: &str) -> Option<(String, String)> {
-    let after_runs = url.split("/actions/runs/").nth(1)?;
+    let after_runs = url
+        .split_once("/actions/runs/")
+        .or_else(|| url.split_once("/runs/"))
+        .map(|(_, rest)| rest)?;
     let mut segments = after_runs.split('/');
     let run_id = segments.next()?;
-    if segments.next()? != "job" {
+    if !matches!(segments.next()?, "job" | "jobs") {
         return None;
     }
     let job_id = segments
@@ -2325,6 +2337,16 @@ mod tests {
                 "https://github.com/o/r/actions/runs/1/job/2?check_suite_focus=true"
             ),
             Some(("1".to_string(), "2".to_string()))
+        );
+        // GitHub also documents the plural `jobs` segment.
+        assert_eq!(
+            parse_actions_job_url("https://github.com/o/r/actions/runs/3/jobs/4"),
+            Some(("3".to_string(), "4".to_string()))
+        );
+        // ...and a job URL without the `/actions` prefix.
+        assert_eq!(
+            parse_actions_job_url("https://github.com/o/r/runs/5/jobs/6"),
+            Some(("5".to_string(), "6".to_string()))
         );
     }
 
