@@ -280,10 +280,17 @@ enum Slot {
 /// on a failed connect: a dead attempt must not leave its ticket parked, or
 /// a later reload would mistake it for an in-flight connect and decline to
 /// start a replacement.
-fn clear_ticket_if_current(tickets: &ConnectTickets, name: &str, ticket: u64) {
+/// Clear `name`'s ticket entry if it still belongs to this attempt. Returns
+/// whether it was current -- a `false` means a later reload/removal revoked
+/// this attempt, so its outcome (including a failure record) must be discarded
+/// rather than applied over the newer state.
+fn clear_ticket_if_current(tickets: &ConnectTickets, name: &str, ticket: u64) -> bool {
     let mut tickets = tickets.lock().unwrap();
     if tickets.get(name).map(|(current, _)| *current) == Some(ticket) {
         tickets.remove(name);
+        true
+    } else {
+        false
     }
 }
 
@@ -1629,17 +1636,19 @@ impl McpClientManager {
                     }
                 }
                 Err(e) => {
-                    clear_ticket_if_current(&manager.connect_tickets, &reconnect_name, ticket);
-                    // A post-authorization reconnect failure must be retained
-                    // as a failure, not vanish (REQ-MCP-018).
-                    record_connect_failure(
-                        &manager.failed_servers,
-                        &manager.pending_oauth_urls,
-                        &reconnect_name,
-                        &config,
-                        format!("connect after authorization failed: {e}"),
-                    )
-                    .await;
+                    // Record the failure only if this attempt still owns the
+                    // ticket; a superseded one must not write stale state over
+                    // a newer attempt or a removal (REQ-MCP-018).
+                    if clear_ticket_if_current(&manager.connect_tickets, &reconnect_name, ticket) {
+                        record_connect_failure(
+                            &manager.failed_servers,
+                            &manager.pending_oauth_urls,
+                            &reconnect_name,
+                            &config,
+                            format!("connect after authorization failed: {e}"),
+                        )
+                        .await;
+                    }
                 }
             }
             drop(claim);
@@ -1955,15 +1964,20 @@ impl McpClientManager {
                                 Some((name, tool_count))
                             }
                             Err(e) => {
-                                clear_ticket_if_current(&mgr.connect_tickets, &name, ticket);
-                                record_connect_failure(
-                                    &mgr.failed_servers,
-                                    &mgr.pending_oauth_urls,
-                                    &name,
-                                    &entry,
-                                    e,
-                                )
-                                .await;
+                                // Only record if this attempt still owns the
+                                // ticket; a superseded/removed connect failing
+                                // late must not resurrect a `failed` entry for a
+                                // server no longer configured (REQ-MCP-018).
+                                if clear_ticket_if_current(&mgr.connect_tickets, &name, ticket) {
+                                    record_connect_failure(
+                                        &mgr.failed_servers,
+                                        &mgr.pending_oauth_urls,
+                                        &name,
+                                        &entry,
+                                        e,
+                                    )
+                                    .await;
+                                }
                                 None
                             }
                         }
@@ -2891,6 +2905,10 @@ impl McpClientManager {
         let mut unchanged = Vec::new();
         let mut failed = Vec::new();
         let mut restart_pending = std::collections::HashSet::new();
+        // The target config per in-flight restart, so a restart that times out
+        // before its background connect returns is still retained as a failure
+        // with the right transport/auth (REQ-MCP-018).
+        let mut restart_configs: HashMap<String, McpServerConfig> = HashMap::new();
         let mut restart_futures: futures::stream::FuturesUnordered<McpRestartFuture> =
             futures::stream::FuturesUnordered::new();
 
@@ -2955,6 +2973,20 @@ impl McpClientManager {
                 }
             }
         }
+        // A server whose only remaining state is a failure record (it never
+        // connected, so it is absent from the connected/claimed/pending sets
+        // above) is folded into `removed` when dropped from config, so its
+        // orphaned OAuth token is deleted and the removal is reported -- not
+        // merely swept from status (REQ-MCP-018).
+        let failed_only_removed: Vec<String> = {
+            let failed = self.failed_servers.read().await;
+            failed
+                .keys()
+                .filter(|name| !config_names.contains(*name) && !removed.contains(*name))
+                .cloned()
+                .collect()
+        };
+        removed.extend(failed_only_removed);
         // A removed server's stored token would orphan with no owning server
         // (ReloadRemovesServer / TokenImpliesOAuthServer); the shared
         // per-authorization-server registration is deliberately retained.
@@ -2964,9 +2996,6 @@ impl McpClientManager {
             }
         }
         // Drop failure records for any server no longer configured (REQ-MCP-018).
-        // A failed-only server (one that never connected) is absent from
-        // `removed`, which is built from connected/claimed/pending servers, so
-        // sweeping the whole map against the config is what clears it.
         self.failed_servers
             .write()
             .await
@@ -3068,8 +3097,9 @@ impl McpClientManager {
                                 }
                             }
                             Err(e) => {
-                                clear_ticket_if_current(&tickets, &name, ticket);
-                                record_connect_failure(&failed, &oauth, &name, &entry, e).await;
+                                if clear_ticket_if_current(&tickets, &name, ticket) {
+                                    record_connect_failure(&failed, &oauth, &name, &entry, e).await;
+                                }
                             }
                         }
                     });
@@ -3147,6 +3177,7 @@ impl McpClientManager {
                     let oauth_rt = Arc::clone(&self.oauth);
                     let failed = Arc::clone(&self.failed_servers);
                     restart_pending.insert(name.clone());
+                    restart_configs.insert(name.clone(), entry.clone());
                     // The connect runs as a detached task: when the reload
                     // deadline drops the awaiting future below, the task is
                     // abandoned, not cancelled, so a partially established
@@ -3178,15 +3209,16 @@ impl McpClientManager {
                                 }
                             }
                             Err(error) => {
-                                clear_ticket_if_current(&tickets, &name, ticket);
-                                record_connect_failure(
-                                    &failed,
-                                    &oauth,
-                                    &name,
-                                    &entry,
-                                    error.clone(),
-                                )
-                                .await;
+                                if clear_ticket_if_current(&tickets, &name, ticket) {
+                                    record_connect_failure(
+                                        &failed,
+                                        &oauth,
+                                        &name,
+                                        &entry,
+                                        error.clone(),
+                                    )
+                                    .await;
+                                }
                                 (name, Err(error))
                             }
                         }
@@ -3213,13 +3245,29 @@ impl McpClientManager {
                             timeout_seconds = RELOAD_RESTART_TIMEOUT.as_secs(),
                             "Timed out restarting MCP server during reload after config change; the connect continues in the background"
                         );
+                        let error = format!(
+                            "timed out after {}s restarting changed MCP server",
+                            RELOAD_RESTART_TIMEOUT.as_secs()
+                        );
+                        // Retain the timed-out restart as failed so status shows
+                        // it instead of an empty gap while the background connect
+                        // runs on (REQ-MCP-018). The still-current background task
+                        // reconciles this: it clears on a late publish, or
+                        // overwrites with the real error on a late failure.
+                        if let Some(config) = restart_configs.get(&name) {
+                            record_connect_failure(
+                                &self.failed_servers,
+                                &self.pending_oauth_urls,
+                                &name,
+                                config,
+                                error.clone(),
+                            )
+                            .await;
+                        }
                         failed.push(McpReloadFailure {
                             server: name,
                             action: "restart".to_string(),
-                            error: format!(
-                                "timed out after {}s restarting changed MCP server",
-                                RELOAD_RESTART_TIMEOUT.as_secs()
-                            ),
+                            error,
                         });
                     }
                     break;

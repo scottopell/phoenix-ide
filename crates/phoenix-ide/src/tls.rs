@@ -7,7 +7,6 @@ use hyper_util::{
 use rustls::ServerConfig;
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::{
-    collections::BTreeSet,
     env,
     error::Error,
     fs,
@@ -280,23 +279,31 @@ fn tls_dir_from_env(db_path: &str) -> PathBuf {
 }
 
 fn hosts_from_env() -> Vec<String> {
-    let mut hosts = BTreeSet::from([
+    // Insertion order is preserved (deduped): the cert's SAN order is
+    // immaterial, but `external_host` takes the first non-loopback entry as the
+    // canonical OAuth redirect host (REQ-MCP-020), so the operator's first
+    // `PHOENIX_TLS_HOSTS` entry -- their intended primary name -- must win over
+    // a later one. A `BTreeSet` would reorder `phoenix.example.com,10.0.0.5`
+    // into `10.0.0.5` first.
+    let mut hosts: Vec<String> = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
         "::1".to_string(),
-    ]);
+    ];
 
     if let Ok(extra) = env::var("PHOENIX_TLS_HOSTS") {
-        hosts.extend(
-            extra
-                .split(',')
-                .map(str::trim)
-                .filter(|host| !host.is_empty())
-                .map(ToOwned::to_owned),
-        );
+        for host in extra
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+        {
+            if !hosts.iter().any(|existing| existing == host) {
+                hosts.push(host.to_string());
+            }
+        }
     }
 
-    hosts.into_iter().collect()
+    hosts
 }
 
 fn ensure_managed_cert(dir: &Path, hosts: &[String]) -> Result<Paths, Box<dyn Error>> {
@@ -307,6 +314,38 @@ fn ensure_managed_cert(dir: &Path, hosts: &[String]) -> Result<Paths, Box<dyn Er
         cert_path: issued.cert_path,
         key_path: issued.key_path,
     })
+}
+
+#[cfg(test)]
+mod external_host_tests {
+    use super::ConfigSource;
+    use std::path::PathBuf;
+
+    #[test]
+    fn external_host_takes_the_first_non_loopback_in_order() {
+        // The operator's first PHOENIX_TLS_HOSTS entry (their intended primary
+        // name) must win over a later one; loopback defaults are skipped.
+        let cfg = ConfigSource::Auto {
+            dir: PathBuf::from("/tmp"),
+            hosts: vec![
+                "localhost".into(),
+                "127.0.0.1".into(),
+                "::1".into(),
+                "phoenix.example.com".into(),
+                "10.0.0.5".into(),
+            ],
+        };
+        assert_eq!(cfg.external_host().as_deref(), Some("phoenix.example.com"));
+    }
+
+    #[test]
+    fn external_host_is_none_without_a_configured_domain() {
+        let cfg = ConfigSource::Auto {
+            dir: PathBuf::from("/tmp"),
+            hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
+        };
+        assert_eq!(cfg.external_host(), None);
+    }
 }
 
 #[cfg(test)]

@@ -20,10 +20,14 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
   const [reloading, setReloading] = useState(false);
   const [togglingServers, setTogglingServers] = useState<Set<string>>(new Set());
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // While a reload retry is in flight, keep polling until this deadline even if
-  // no server is awaiting OAuth, so a failed server that the retry reconnects
-  // updates from `failed` to `ready` without a manual refresh.
+  // Reload-retry polling: the backend reconnects retried servers in the
+  // background (up to the connect timeout), so after a reload we keep polling
+  // until every awaited server is `ready` or this deadline passes — long enough
+  // for a slow reconnect to flip failed/pending → ready without a manual
+  // refresh. `awaitingRef` is null while the reload request itself is in flight
+  // (the awaited set isn't known yet), then the names being (re)connected.
   const reloadUntilRef = useRef<number>(0);
+  const awaitingRef = useRef<Set<string> | null>(null);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -35,14 +39,23 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     }
   }, []);
 
+  // Whether a reload's retried servers have settled (all `ready`) or its window
+  // has elapsed, so polling may stop. Outside a reload (deadline in the past)
+  // this is vacuously true, preserving the connect-once polling behavior.
+  const reloadSettled = useCallback((s: McpServerStatus[]) => {
+    if (Date.now() > reloadUntilRef.current) return true;
+    const awaiting = awaitingRef.current;
+    if (awaiting === null) return false; // reload request still in flight
+    const ready = new Set(s.filter(srv => srv.state === 'ready').map(srv => srv.name));
+    return [...awaiting].every(name => ready.has(name));
+  }, []);
+
   // Poll every 3s until servers are connected. Keep polling while any server
   // has a pending OAuth URL so the UI can update when auth completes.
   useEffect(() => {
     let cancelled = false;
     const shouldStopPolling = (s: McpServerStatus[]) =>
-      s.length > 0 &&
-      s.every(srv => !srv.pending_oauth_url) &&
-      Date.now() > reloadUntilRef.current;
+      s.length > 0 && s.every(srv => !srv.pending_oauth_url) && reloadSettled(s);
 
     fetchStatus().then(count => {
       if (cancelled) return;
@@ -58,27 +71,28 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     };
   }, [fetchStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Stop polling once all OAuth flows have resolved and any reload retry window
-  // has elapsed.
+  // Stop polling once all OAuth flows have resolved and any reload retry has
+  // settled.
   useEffect(() => {
     if (
       servers.length > 0 &&
       servers.every(s => !s.pending_oauth_url) &&
-      Date.now() > reloadUntilRef.current &&
+      reloadSettled(servers) &&
       pollRef.current
     ) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
-  }, [servers]);
+  }, [servers, reloadSettled]);
 
   const handleReload = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (reloading) return;
     setReloading(true);
-    // Keep polling through the retry window so a reconnected server updates from
-    // failed/pending to ready without a manual refresh.
-    reloadUntilRef.current = Date.now() + 8000;
+    // Open the retry-polling window (bounded by the backend connect timeout)
+    // and mark the awaited set unknown until the reload request returns it.
+    reloadUntilRef.current = Date.now() + 300_000;
+    awaitingRef.current = null;
     // Synchronously drop stale pending-OAuth and failed entries from local
     // state: the reload retries them as background connects, so their new
     // outcome should repopulate from polling rather than the panel showing a
@@ -91,6 +105,9 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     }
     try {
       const result = await api.reloadMcp();
+      // The (re)connecting servers to await before polling settles: a slow one
+      // flips to `ready` later, within the window above.
+      awaitingRef.current = new Set([...result.added, ...result.restarted]);
       await fetchStatus();
       const parts: string[] = [];
       if (result.added.length > 0) parts.push(`+${result.added.length} added`);
@@ -113,6 +130,10 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     } catch {
       showError('MCP reload failed', 3000);
       setReloading(false);
+      // The reload never landed; close the retry window so polling settles
+      // normally instead of running for the full timeout.
+      reloadUntilRef.current = 0;
+      awaitingRef.current = null;
     }
   }, [reloading, fetchStatus, showToast, showError]);
 
