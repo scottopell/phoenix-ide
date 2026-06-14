@@ -1,0 +1,294 @@
+-- allium: 3
+-- work-lifecycle.allium
+--
+-- Phoenix Work Lifecycle: Behavioural Specification
+--
+-- Scope: Terminal actions on Work and Branch conversations and their git
+--        side effects.
+-- Includes: Abandon (confirmation gate, diff snapshot, worktree + branch
+--             cleanup with mode-dependent disposition),
+--           Mark as merged (worktree + branch cleanup, mode-dependent
+--             disposition, no squash, no push),
+--           PR merge state as the advisory cleanup-affordance gate.
+-- Excludes: the canonical scope boundary is stated in requirements.md and
+--           executive.md (transition legality is bedrock's TaskResolved rule
+--           and TerminalActionRequiresNoContinuation invariant; PR freshness/
+--           auto-fix is the pr-association spec; UI surface composition is the
+--           work-actions-bar spec). Not re-duplicated here.
+--
+-- Requirement traceability: REQ-WL-001 through REQ-WL-003
+
+use "../bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The git worktree managed by Phoenix for a Work or Branch conversation.
+-- One worktree per conversation; path is deterministic from conversation id.
+-- A worktree exists only for mode in { work, branch } (Direct and Explore
+-- conversations are not subjects of the terminal actions here).
+external entity Worktree {
+    conversation: bedrock/Conversation
+    path: String
+    branch_name: String            -- task-{ID}-{slug} (managed) or existing branch (branch mode)
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- bedrock's TaskResolved(conversation, outcome) carries an untyped outcome
+-- identifier. The two user-initiated terminal actions in this spec resolve a
+-- Work/Branch conversation with one of exactly two outcomes: `merged` (Mark
+-- as merged) or `abandoned` (Abandon), passed as bare identifiers below.
+
+enum PrDisplayState  { open | draft | merged | closed }
+enum PrCheckState    { passing | pending | failing | unknown }
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; the rules below call
+-- these by bare identifier. This block is the single source of truth for
+-- their signatures and semantics.
+--
+--   is_managed_mode(conversation: Conversation) -> Boolean
+--       True when conversation.mode = work (Managed mode). Phoenix created
+--       the task branch (task-{ID}-{slug}), so Phoenix must also delete it.
+--       False for branch mode (user-owned PR branch; kept on cleanup).
+--
+--   has_live_worktree_co_owner(conversation: Conversation) -> Boolean
+--       True when at least one live conversation (non-terminal AND not
+--       archived), other than this one, resolves to the same work scope:
+--       a context continuation that inherited the worktree (REQ-BED-030),
+--       or a Work-mode sub-agent sharing the parent's worktree_path
+--       (REQ-PROJ-008). Liveness is derived from persisted conversation
+--       rows, not runtime handle presence. Prevents destroying a worktree
+--       still in use by another live conversation. This is the same
+--       any-live-owner signal that gates the bedrock terminal cascade
+--       (cascade_projects_on_delete, REQ-BED-032).
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Best-effort capture of "what this branch has done relative to its base",
+-- taken before worktree removal so the abandoned work survives in the
+-- conversation record after the worktree is gone. Captured relative to the
+-- effective base ref (origin/{base} when it resolves, else the bare base).
+-- Each diff section is bounded by a per-section byte cap; `truncated` is
+-- set when any section saturated that cap.
+value DiffSnapshot {
+    commit_log: String       -- subjects of commits on the branch not in base
+    committed_diff: String   -- base...HEAD, bounded per-section
+    uncommitted_diff: String -- working-tree changes (incl. untracked), bounded per-section
+    truncated: Boolean       -- a section hit its byte cap; content was dropped
+}
+
+value PrStatusResult {
+    found: Boolean
+    display_state: PrDisplayState?  -- present when found
+    check_state: PrCheckState?      -- present when found
+    number: Integer?                -- present when found
+    unavailable_reason: String?     -- present when not found
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ===========================================================
+-- 1. ABANDON (REQ-WL-001)
+-- ===========================================================
+--
+-- Abandon is a two-step user action: initiate (shows a confirmation
+-- dialog), then confirm (captures the diff snapshot and runs the git
+-- sequence) or cancel (no-op). Legality preconditions (mode, core_status,
+-- parent_status, continued_in_conv_id) are enforced by bedrock's
+-- TaskResolved rule and the TerminalActionRequiresNoContinuation invariant
+-- in projects; this spec models the confirmation gate and git side effects.
+
+rule InitiateAbandon {
+    when: UserInitiatesAbandon(conversation)
+    requires: exists Worktree{conversation: conversation}
+    ensures: AbandonConfirmationPending(conversation)
+
+    @guidance
+        -- Show a confirmation dialog warning that the worktree will be
+        -- deleted and uncommitted work lost (a diff snapshot is saved to
+        -- conversation history first). The dialog offers Confirm and Cancel.
+}
+
+rule ConfirmAbandon {
+    when: UserConfirmsAbandon(conversation)
+
+    let worktree = Worktree{conversation: conversation}
+
+    requires: AbandonConfirmationPending(conversation)
+    requires: exists worktree
+    requires: not has_live_worktree_co_owner(conversation)
+
+    let snapshot = DiffSnapshot{
+        commit_log: String,
+        committed_diff: String,
+        uncommitted_diff: String,
+        truncated: Boolean
+    }
+
+    ensures: not AbandonConfirmationPending(conversation)
+    ensures: DiffSnapshotPersisted(conversation, snapshot)
+    ensures: not exists worktree
+
+    ensures:
+        if is_managed_mode(conversation):
+            BranchDeleted(worktree.branch_name)
+        -- Branch mode: branch kept (user's PR branch, not ours to delete)
+
+    ensures: bedrock/TaskResolved(conversation, abandoned)
+    ensures: SystemMessageEmitted(
+        conversation,
+        if is_managed_mode(conversation):
+            "Task abandoned. Worktree and branch deleted."
+        else:
+            "Conversation abandoned. Worktree deleted, branch kept."
+    )
+
+    @guidance
+        -- Sequence:
+        --   1. Validate legality (same gate as MarkAsMerged) — HTTP 409
+        --      on failure.
+        --   2. Capture the DiffSnapshot from the worktree (committed +
+        --      uncommitted, relative to the effective base ref) and persist
+        --      it to conversation history. Best-effort: a failure here is
+        --      logged at debug and does not block step 3. Each section is
+        --      bounded by a per-section byte cap; saturation sets `truncated`.
+        --   3. Check has_live_worktree_co_owner — skip worktree/branch
+        --      removal if a live co-owner exists.
+        --   4. `git worktree remove {path} --force`
+        --      On failure: remove the directory directly + `git worktree prune`.
+        --   5. If managed: `git branch -D {branch_name}` (non-fatal; log at
+        --      debug and continue). If branch mode: skip branch deletion.
+        --   6. Send TaskResolved(conversation, abandoned) (bedrock transitions
+        --      parent_status -> terminal) and emit the system message.
+        --
+        -- All uncommitted work is permanently lost after step 4. The diff
+        -- snapshot from step 2 is the recovery artifact.
+}
+
+rule CancelAbandon {
+    when: UserCancelsAbandon(conversation)
+    requires: AbandonConfirmationPending(conversation)
+    ensures: not AbandonConfirmationPending(conversation)
+    -- No git operations. The conversation remains in its current state.
+}
+
+-- ===========================================================
+-- 2. MARK AS MERGED (REQ-WL-002)
+-- ===========================================================
+--
+-- User initiates "Mark as merged" on a Work or Branch conversation: a
+-- single-step assertion that the work shipped via the user's own PR
+-- workflow. Phoenix performs worktree cleanup only — it never squash-merges
+-- and never pushes. Same legality gate as abandon (bedrock's TaskResolved).
+
+rule MarkAsMerged {
+    when: UserMarksAsMerged(conversation)
+
+    let worktree = Worktree{conversation: conversation}
+
+    -- Existence implies mode in { work, branch } — Direct and Explore
+    -- conversations have no worktree.
+    requires: exists worktree
+    requires: not has_live_worktree_co_owner(conversation)
+
+    ensures: not exists worktree
+
+    ensures:
+        if is_managed_mode(conversation):
+            BranchDeleted(worktree.branch_name)
+        -- Branch mode: branch kept (user's PR branch, not ours to delete)
+
+    ensures: bedrock/TaskResolved(conversation, merged)
+    ensures: SystemMessageEmitted(conversation, "Marked as merged. Worktree deleted.")
+
+    @guidance
+        -- Sequence:
+        --   1. Validate legality (mode, core_status, parent_status,
+        --      continued_in_conv_id) — HTTP 409 on failure.
+        --   2. Check has_live_worktree_co_owner — skip worktree/branch
+        --      removal if a live co-owner exists.
+        --   3. `git worktree remove {path} --force`
+        --      On failure: remove the directory directly + `git worktree prune`.
+        --   4. If managed: `git branch -D {branch_name}` (non-fatal; log at
+        --      debug and continue). If branch mode: skip branch deletion.
+        --   5. Send TaskResolved(conversation, merged) (bedrock transitions
+        --      parent_status -> terminal) and emit the system message.
+        --
+        -- Never squash-merge to base; never push to origin. Push is the
+        -- agent's responsibility via the bash tool when the user requests it.
+}
+
+-- ===========================================================
+-- 3. PR MERGE STATE AS CLEANUP GATE (REQ-WL-003)
+-- ===========================================================
+--
+-- Phoenix queries `gh` for the branch's PR state. The result is advisory:
+-- it labels the cleanup affordance but does not by itself trigger a
+-- lifecycle transition. Cleanup occurs only when the user initiates
+-- UserMarksAsMerged or UserInitiatesAbandon.
+
+rule PrStatusObserved {
+    when: PrStatusQueried(conversation)
+
+    let worktree = Worktree{conversation: conversation}
+
+    requires: exists worktree
+    ensures: PrStatusResultDelivered(conversation, result: PrStatusResult)
+
+    @guidance
+        -- Implementation: query `gh` for the PR on the worktree's branch,
+        -- off the request thread, from the conversation's worktree. gh
+        -- failures (unavailable, unauthenticated, non-git directory,
+        -- command failure) yield found: false with an unavailable_reason,
+        -- are logged at debug, and surface as compact non-blocking UI hints;
+        -- the conversation page stays fully usable.
+        --
+        -- The work-actions-bar spec maps PrStatusResult to UI:
+        --   display_state = merged  -> "Clean up merged PR" enabled
+        --   display_state in { open, draft, closed }, or
+        --     check_state in { pending, failing }
+        --                          -> cleanup discouraged + note;
+        --                             manual fallback available
+        --   found = false           -> "Mark as merged" available, no note
+        --
+        -- No auto-transition: observing a merged PR does NOT call
+        -- UserMarksAsMerged automatically. The user initiates.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A terminal Work/Branch conversation with no surviving live co-owner has
+-- no worktree on disk: the terminal cascade removes the worktree before the
+-- conversation settles into terminal state, unless a live co-owner (a
+-- continuation that inherited the worktree, or a sub-agent sharing it) still
+-- needs it. When a co-owner exists the worktree may persist on disk.
+invariant TerminalConversationHasNoWorktree {
+    for w in Worktree:
+        w.conversation.parent_status = terminal
+        and not has_live_worktree_co_owner(w.conversation) implies
+            not exists Worktree{conversation: w.conversation}
+}
+
+-- A terminal Managed (Work) conversation with no live co-owner has no task
+-- branch: Phoenix created the branch, so cleanup deletes it.
+invariant TerminalManagedConversationHasNoBranch {
+    for w in Worktree:
+        w.conversation.parent_status = terminal
+        and is_managed_mode(w.conversation)
+        and not has_live_worktree_co_owner(w.conversation) implies
+            BranchDeleted(w.branch_name)
+}
