@@ -1,0 +1,286 @@
+-- allium: 3
+-- permissions.allium
+--
+-- Permission seam: behavioural specification.
+--
+-- Scope: the single enforced gate every tool call passes before execution.
+--   Includes: the correct-by-construction proof token (clear vs deny), the
+--   deterministic deny layer (Layer 0), deny-and-continue, and the
+--   per-conversation denial-counting + escalation lifecycle.
+-- Excludes:
+--   - The on-device dangerous-action encoder (intent-agnostic risk layer that
+--     stacks behind Layer 0); it reuses this seam's clear/deny shape.
+--   - Intent-aware enforcement / overeagerness (needs the transcript).
+--   - The bash tool's own lifecycle (specs/bash/); its command-safety patterns
+--     are the seed entries of Layer 0's registry.
+--   - Worktree / Landlock containment (specs/bash/, specs/projects/).
+--
+-- Requirement traceability: REQ-PERM-001 through REQ-PERM-007.
+-- Dependencies: specs/bedrock/bedrock.allium
+
+use "../bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The agent whose tool calls pass through the seam. Each call is evaluated in
+-- the context of a conversation, whose id keys the denial tracker.
+actor LlmAgent {
+    identified_by: bedrock/Conversation
+    conversation_id: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The proof that DenyGate cleared a call. Carries the validated payload so a
+-- proof minted for one tool cannot be replayed to run another. In code its
+-- fields are private and its sole non-test constructor is DenyGate::check
+-- (REQ-PERM-001, REQ-PERM-002).
+value CheckedToolCall {
+    name:  String
+    input: String
+}
+
+-- A structured rejection delivered to the model as a tool result. The reason
+-- is both human- and model-readable; the stable error id lets the model and
+-- the UI branch on it (REQ-PERM-004, REQ-PERM-005).
+value Denial {
+    error:  String
+    reason: String
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Lifecycle of a conversation's denial tracker. active is initial; escalated
+-- is terminal — once the seam hands control to the human the model is no
+-- longer driven for that conversation until the human resumes it.
+enum TrackerStatus {
+    active
+    | escalated
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- Per-conversation denial bookkeeping. consecutive_count resets to zero on any
+-- allowed-and-executed tool call; total_count only grows. When either count
+-- crosses its configured limit the tracker escalates (REQ-PERM-006).
+entity DenialTracker {
+    conversation_id: String
+
+    consecutive_count: Integer
+    total_count:       Integer
+
+    status: TrackerStatus
+
+    transitions status {
+        active -> escalated
+        terminal: escalated
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    consecutive_denial_limit: Integer = 3
+    -- Consecutive denials with no intervening allowed call that trip
+    -- escalation. Catches a model stuck retrying variants of a blocked action.
+
+    total_denial_limit: Integer = 20
+    -- Total denials across the conversation that trip escalation. Catches slow
+    -- accumulation across a long session even when the model keeps finding new
+    -- permitted actions between denials.
+}
+
+------------------------------------------------------------
+-- Helpers (pure functions referenced by the rules below)
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; the rules below call these
+-- by bare identifier. This block is the single source of truth for their
+-- signatures and semantics.
+--
+--   deny_layer_allows(name: String, input: String) -> Boolean
+--       True iff the deterministic deny layer (Layer 0) permits the call.
+--       Reads only the tool name and serialized input (and environment trust);
+--       never the transcript. For the bash tool this is the brush_parser AST
+--       check seeded from the prior bash-internal patterns (blind git add,
+--       force push, dangerous rm). A tool with no registered rule is allowed.
+--
+--   denial_reason(name: String, input: String) -> String
+--       The human/model-readable reason a denied call matched, e.g. the
+--       command_safety_rejected reason string for a matched bash pattern.
+--
+--   tracker_of(conversation_id: String) -> DenialTracker
+--       The conversation's tracker. A conversation with no prior denial has an
+--       implicit active tracker with both counts zero; the first denial
+--       materialises it.
+
+------------------------------------------------------------
+-- Rules — gate decision
+------------------------------------------------------------
+
+-- REQ-PERM-001, REQ-PERM-002, REQ-PERM-003: a call the deny layer permits is
+-- cleared. The proof carries the validated payload and is the only value tool
+-- execution accepts; registry and live-MCP tools alike are unreachable without
+-- it.
+rule ToolCallCleared {
+    when: AgentEmitsToolCall(conversation_id, name, input)
+
+    requires: deny_layer_allows(name, input)
+
+    ensures: ToolExecutionAuthorized(
+        conversation_id: conversation_id,
+        call: CheckedToolCall{ name: name, input: input }
+    )
+
+    @guidance
+        -- Decision runs synchronously in dispatch_tool_execution
+        -- (runtime/executor.rs), before the tool task is spawned and upstream
+        -- of the registry-vs-MCP split inside ToolExecutor::execute
+        -- (runtime/traits.rs). On clear, the minted CheckedToolCall threads
+        -- into the spawned task; execute consumes it. There is no path to
+        -- tool.run / mcp_tool.run that does not consume a CheckedToolCall.
+}
+
+-- REQ-PERM-004, REQ-PERM-005: a call a Layer 0 rule rejects is denied. No tool
+-- task is spawned. The denial returns through the same tool-result channel a
+-- normal output uses, so the model may try an alternative (deny-and-continue).
+rule ToolCallDenied {
+    when: AgentEmitsToolCall(conversation_id, name, input)
+
+    requires: not deny_layer_allows(name, input)
+
+    let tracker = tracker_of(conversation_id)
+
+    ensures: AgentReceivesDenial(
+        conversation_id: conversation_id,
+        denial: Denial{
+            error:  "command_safety_rejected",
+            reason: denial_reason(name, input)
+        }
+    )
+    ensures: tracker.consecutive_count = tracker.consecutive_count + 1
+    ensures: tracker.total_count = tracker.total_count + 1
+}
+
+-- REQ-PERM-006: any allowed call that executes resets the consecutive counter.
+-- The total counter is untouched — it only grows.
+rule ConsecutiveDenialsResetOnExecution {
+    when: ToolExecutionSucceeded(conversation_id, name)
+
+    let tracker = tracker_of(conversation_id)
+
+    requires: tracker.status = active
+
+    ensures: tracker.consecutive_count = 0
+}
+
+-- REQ-PERM-006: either limit crossing trips escalation. The seam stops driving
+-- the model and surfaces the condition to the human; the tracker is terminal
+-- until the human resumes.
+rule EscalationTriggered {
+    when: AgentEmitsToolCall(conversation_id, name, input)
+
+    requires: not deny_layer_allows(name, input)
+
+    let tracker = tracker_of(conversation_id)
+
+    requires: tracker.status = active
+    requires: tracker.consecutive_count + 1 >= config.consecutive_denial_limit
+              or tracker.total_count + 1 >= config.total_denial_limit
+
+    ensures: tracker.status = escalated
+    ensures: ConversationEscalatedToHuman(conversation_id)
+    ensures: ModelDrivingStopped(conversation_id)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-PERM-006: counters are non-negative.
+invariant DenialCountsNonNegative {
+    for t in DenialTracker:
+        t.consecutive_count >= 0 and t.total_count >= 0
+}
+
+-- REQ-PERM-006: the consecutive count never exceeds the total count — every
+-- consecutive denial is also a denial.
+invariant ConsecutiveBoundedByTotal {
+    for t in DenialTracker:
+        t.consecutive_count <= t.total_count
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface AgentToolGate {
+    facing agent: LlmAgent
+
+    context conversation: bedrock/Conversation
+
+    exposes:
+        DenialTracker.status
+
+    provides:
+        AgentEmitsToolCall(conversation_id, name, input)
+
+    @guarantee NoUngatedExecution
+        -- Every tool call the agent emits is evaluated by DenyGate before any
+        -- tool executes. Tool execution accepts only a CheckedToolCall, whose
+        -- sole non-test constructor is DenyGate::check, so a call that has not
+        -- passed the gate cannot run — the guarantee is structural, not a
+        -- convention. Coverage includes live-resolved MCP tools, because the
+        -- gate sits upstream of the registry-vs-MCP split.
+
+    @guarantee DenyAndContinue
+        -- A denial is delivered as an ordinary tool result with a reason, not a
+        -- fatal error. The model may attempt an alternative. Repeated denial is
+        -- bounded: consecutive_denial_limit consecutive or total_denial_limit
+        -- total denials escalate to the human rather than letting the model
+        -- loop indefinitely.
+}
+
+------------------------------------------------------------
+-- Deferred
+------------------------------------------------------------
+
+deferred IntentAgnosticRiskEncoder
+    -- An on-device dangerous-action classifier stacks behind Layer 0 as a
+    -- second DenyGate stage: it runs only on calls Layer 0 allowed, and may
+    -- add a denial (SAFE passes; RISKY/BLOCKED deny) but never removes a
+    -- Layer 0 denial. It reads only the action, never the transcript, so it
+    -- reuses this seam's clear/deny shape with no new context plumbing.
+    -- Location: would extend DenyGate::check in crates/phoenix-ide/src/.
+
+deferred IntentAwareEnforcement
+    -- Judging an action against what the user authorized (overeagerness /
+    -- consent-scoping) requires the conversation transcript and a reasoning
+    -- step. It is a distinct layer from this intent-agnostic seam and is where
+    -- the decision to thread a reasoning-blind transcript slice becomes
+    -- load-bearing. Out of scope here by construction.
+    -- Location: would live alongside DenyGate in the conversation runtime.
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+-- No open questions remain. Decisions fixed for this layer:
+--   - Layer 0 rules are a typed Rust registry keyed by tool name, not
+--     declarative config: single-user self-hosted Phoenix does not face the
+--     shared-repo self-granting threat that motivates config scoping.
+--   - The decision runs executor-side (loop-local counters) while the proof is
+--     required at the executor trait boundary (universal coverage); the two
+--     properties hold together rather than trading off.
+--   - Escalation thresholds: 3 consecutive or 20 total denials.
+--   - Subagent delegation is excluded from Layer 0 as intent-relative.
