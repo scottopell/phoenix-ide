@@ -35,3 +35,4 @@ function call. No loose `connect()` function, no lint suppression needed, cleanu
 handles the old connection automatically.
 
 See `CredentialHelperPanel.tsx` for the canonical implementation.
+
