@@ -469,16 +469,14 @@ async fn attach_pr_feedback_freshness(
         response.feedback_freshness = match feedback {
             Ok(feedback) => crate::api::pr_monitoring::feedback_freshness_from_baseline(
                 &baseline,
-                Some(updated_at),
                 Some(&feedback),
             ),
             Err(err) => {
-                tracing::debug!(pr = pr_number, error = %err, "failed to classify PR feedback freshness");
-                crate::api::pr_monitoring::feedback_freshness_from_baseline(
-                    &baseline,
-                    Some(updated_at),
-                    None,
-                )
+                // Couldn't fetch feedback to compare — surface no content
+                // freshness rather than guessing. A distinct "feedback
+                // incomplete" signal is tracked separately.
+                tracing::debug!(pr = pr_number, error = %err, "could not fetch PR feedback to classify freshness");
+                None
             }
         };
     }

@@ -79,7 +79,7 @@ describe('ChainWorkIdentityBlock', () => {
       number: 248,
       display_state: 'open',
       check_state: 'passing',
-      feedback_freshness: { state: 'new', new_count: 3 },
+      feedback_freshness: { state: 'new', count: 3 },
       refresh: { state: 'fresh', stale: false, last_attempted_at: '2026-04-29T12:00:00Z' },
     };
     setPrState({ status: 'ready', prStatus });

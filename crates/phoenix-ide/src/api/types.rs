@@ -844,18 +844,21 @@ pub struct PrIdentity {
     pub updated_at: Option<String>,
 }
 
+/// How the PR's feedback has moved since the last captured baseline. Each
+/// variant carries its own count, so a count is never absent and "new" can
+/// never be confused with "edited". Serializes with an internal `state` tag:
+/// `{ "state": "new", "count": 3 }` / `{ "state": "edited", "count": 1 }`.
+///
+/// Coverage gaps and fetch failures are deliberately *not* represented here —
+/// they are an error condition, not a content change, and surface separately.
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PrFeedbackFreshnessState {
-    New,
-    Updated,
-}
-
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
-pub struct PrFeedbackFreshness {
-    pub state: PrFeedbackFreshnessState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_count: Option<u32>,
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PrFeedbackFreshness {
+    /// `count` feedback items are present that were not in the baseline.
+    New { count: u32 },
+    /// `count` baseline feedback items changed content (e.g. a reviewer edited
+    /// an existing comment) with no net-new items.
+    Edited { count: u32 },
 }
 
 #[derive(Debug, Serialize)]

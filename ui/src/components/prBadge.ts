@@ -51,17 +51,15 @@ State: ${state}
 Checks: ${checks}${freshness}`;
 }
 
-/** Short feedback-freshness tag (`"3 new"`, `"new comments"`, `"updated"`), or
- *  null when there is no freshness signal to show. */
+/** Short feedback-freshness tag (`"3 new"`, `"1 comment updated"`), or null
+ *  when there is no freshness signal to show. */
 export function prFeedbackFreshnessLabel(pr: PrStatusResponse): string | null {
   const freshness = pr.feedback_freshness;
   if (!freshness) return null;
   if (freshness.state === 'new') {
-    return typeof freshness.new_count === 'number' && freshness.new_count > 0
-      ? `${freshness.new_count} new`
-      : 'new comments';
+    return `${freshness.count} new`;
   }
-  return 'updated';
+  return freshness.count === 1 ? '1 comment updated' : `${freshness.count} comments updated`;
 }
 
 /** Short hint for why PR status is unavailable (the pipeline couldn't check),

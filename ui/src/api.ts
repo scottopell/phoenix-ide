@@ -218,10 +218,12 @@ export interface PrRefreshMetadata {
   stale: boolean;
 }
 
-export interface PrFeedbackFreshness {
-  state: 'new' | 'updated';
-  new_count?: number;
-}
+// Mirrors the Rust `PrFeedbackFreshness` (api/types.rs): an internally-tagged
+// union where each variant carries its own count. Coverage gaps / fetch errors
+// are not represented here — they are a separate error condition.
+export type PrFeedbackFreshness =
+  | { state: 'new'; count: number }
+  | { state: 'edited'; count: number };
 
 export interface PrStatusResponse {
   found: boolean;

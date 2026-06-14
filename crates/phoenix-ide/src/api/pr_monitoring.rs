@@ -1,9 +1,9 @@
 use super::types::{
     PrAutoFixContextResponse, PrCheckDetail, PrCheckLogSnippet, PrCheckLogSource, PrCheckState,
     PrCheckSummary, PrDisplayState, PrFeedbackCoverage, PrFeedbackCoverageStatus,
-    PrFeedbackCoverageSurface, PrFeedbackFreshness, PrFeedbackFreshnessState, PrFeedbackItem,
-    PrFeedbackSource, PrFeedbackSummary, PrIdentity, PrRefreshMetadata, PrRefreshState,
-    PrStatusResponse, PrUnavailableReason,
+    PrFeedbackCoverageSurface, PrFeedbackFreshness, PrFeedbackItem, PrFeedbackSource,
+    PrFeedbackSummary, PrIdentity, PrRefreshMetadata, PrRefreshState, PrStatusResponse,
+    PrUnavailableReason,
 };
 use crate::db::{
     WorkScopePrAssociation, WorkScopePrFeedbackBaseline, WorkScopePrFeedbackBaselineInput,
@@ -1335,57 +1335,46 @@ pub(crate) fn pr_updated_after_baseline(
 
 pub(crate) fn feedback_freshness_from_baseline(
     baseline: &WorkScopePrFeedbackBaseline,
-    current_pr_updated_at: Option<&str>,
     current_feedback: Option<&PrFeedbackSummary>,
 ) -> Option<PrFeedbackFreshness> {
-    if let Some(feedback) = current_feedback {
-        let baseline_ids: HashSet<&str> = baseline
-            .feedback_identities
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let new_count = feedback
-            .items
-            .iter()
-            .map(feedback_identity)
-            .filter(|identity| !baseline_ids.contains(identity.as_str()))
-            .count();
-        if new_count > 0 {
-            return Some(PrFeedbackFreshness {
-                state: PrFeedbackFreshnessState::New,
-                new_count: Some(u32::try_from(new_count).unwrap_or(u32::MAX)),
-            });
-        }
-        let baseline_fingerprints: HashSet<&str> = baseline
-            .feedback_fingerprints
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let content_changed = feedback
-            .items
-            .iter()
-            .map(feedback_fingerprint)
-            .any(|fingerprint| !baseline_fingerprints.contains(fingerprint.as_str()));
-        if content_changed
-            || feedback
-                .coverage
-                .iter()
-                .any(|coverage| coverage.status != PrFeedbackCoverageStatus::Fetched)
-                && current_pr_updated_at.is_some()
-        {
-            return Some(PrFeedbackFreshness {
-                state: PrFeedbackFreshnessState::Updated,
-                new_count: None,
-            });
-        }
-        return None;
+    // No feedback to compare (the fetch failed) is an error condition, not a
+    // content change — report no freshness rather than a misleading signal.
+    let feedback = current_feedback?;
+
+    let baseline_ids: HashSet<&str> = baseline
+        .feedback_identities
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let new_count = feedback
+        .items
+        .iter()
+        .map(feedback_identity)
+        .filter(|identity| !baseline_ids.contains(identity.as_str()))
+        .count();
+    if new_count > 0 {
+        return Some(PrFeedbackFreshness::New {
+            count: u32::try_from(new_count).unwrap_or(u32::MAX),
+        });
     }
 
-    let updated_at = current_pr_updated_at?;
-    if pr_updated_after_baseline(baseline, updated_at) {
-        return Some(PrFeedbackFreshness {
-            state: PrFeedbackFreshnessState::Updated,
-            new_count: None,
+    // No net-new items, so every current identity is already in the baseline.
+    // Any item whose fingerprint is absent from the baseline is an edit of
+    // existing content.
+    let baseline_fingerprints: HashSet<&str> = baseline
+        .feedback_fingerprints
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let edited_count = feedback
+        .items
+        .iter()
+        .map(feedback_fingerprint)
+        .filter(|fingerprint| !baseline_fingerprints.contains(fingerprint.as_str()))
+        .count();
+    if edited_count > 0 {
+        return Some(PrFeedbackFreshness::Edited {
+            count: u32::try_from(edited_count).unwrap_or(u32::MAX),
         });
     }
 
@@ -2017,25 +2006,21 @@ mod tests {
             ],
         };
 
-        let freshness = feedback_freshness_from_baseline(
-            &baseline,
-            Some("2026-01-02T00:00:00Z"),
-            Some(&feedback),
-        )
-        .unwrap();
-        assert_eq!(freshness.state, PrFeedbackFreshnessState::New);
-        assert_eq!(freshness.new_count, Some(1));
+        let freshness = feedback_freshness_from_baseline(&baseline, Some(&feedback)).unwrap();
+        assert_eq!(freshness, PrFeedbackFreshness::New { count: 1 });
     }
 
     #[test]
-    fn feedback_freshness_degrades_to_updated_when_surface_unavailable() {
+    fn coverage_degradation_alone_yields_no_content_freshness() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
             feedback_identities: vec!["IssueComment:1".to_string()],
-            feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
+            // Matches the item below exactly (see feedback_fingerprint format),
+            // so the only signal that could fire is the degraded coverage.
+            feedback_fingerprints: vec!["IssueComment:1::u:::|old".to_string()],
         };
         let feedback = PrFeedbackSummary {
             total: 1,
@@ -2057,18 +2042,15 @@ mod tests {
             }],
         };
 
-        let freshness = feedback_freshness_from_baseline(
-            &baseline,
-            Some("2026-01-02T00:00:00Z"),
-            Some(&feedback),
-        )
-        .unwrap();
-        assert_eq!(freshness.state, PrFeedbackFreshnessState::Updated);
-        assert_eq!(freshness.new_count, None);
+        // An unfetchable surface is an error condition, not a content change:
+        // the only item is unchanged, so there is no freshness signal. (The
+        // "feedback incomplete" error state is tracked separately.)
+        let freshness = feedback_freshness_from_baseline(&baseline, Some(&feedback));
+        assert_eq!(freshness, None);
     }
 
     #[test]
-    fn feedback_freshness_marks_existing_feedback_edits_as_updated() {
+    fn feedback_freshness_marks_existing_feedback_edits_as_edited() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
             pr_number: 7,
@@ -2097,14 +2079,21 @@ mod tests {
             }],
         };
 
-        let freshness = feedback_freshness_from_baseline(
-            &baseline,
-            Some("2026-01-02T00:00:00Z"),
-            Some(&feedback),
-        )
-        .unwrap();
-        assert_eq!(freshness.state, PrFeedbackFreshnessState::Updated);
-        assert_eq!(freshness.new_count, None);
+        let freshness = feedback_freshness_from_baseline(&baseline, Some(&feedback)).unwrap();
+        assert_eq!(freshness, PrFeedbackFreshness::Edited { count: 1 });
+    }
+
+    #[test]
+    fn no_feedback_to_compare_yields_no_freshness() {
+        let baseline = WorkScopePrFeedbackBaseline {
+            work_scope_id: 1,
+            pr_number: 7,
+            captured_at: "2026-01-01T00:00:00Z".to_string(),
+            github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            feedback_identities: vec!["IssueComment:1".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
+        };
+        assert_eq!(feedback_freshness_from_baseline(&baseline, None), None);
     }
 
     #[test]
