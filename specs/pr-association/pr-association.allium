@@ -1,17 +1,21 @@
 -- allium: 3
--- workscope-pr-association.allium
+-- pr-association.allium
 --
 -- Phoenix WorkScope-owned PR Association: Behavioural Specification
 --
 -- Scope: Durable association between a WorkScope and observed GitHub pull
---        requests; primary PR derivation; freshness-aware PR status; PR
---        auto-fix target selection; and abandon-time best-effort refresh.
+--        requests; primary PR derivation; freshness-aware PR status; the
+--        Address-CI auto-fix affordance target selection; and abandon-time
+--        best-effort refresh.
 --
 -- Includes:
 --   - WorkScope-keyed PR observation history.
 --   - Read-only versus write observation behaviour.
 --   - Primary PR ranking and stale/fresh response semantics.
---   - Alignment between StateBar PR identity and auto-fix target.
+--   - Alignment between the StateBar PR identity (the PR badge surface) and the
+--     auto-fix target rendered by the work actions bar: the StateBar shows the
+--     PR identity, the work actions bar shows the Address-CI auto-fix
+--     affordance, and they must target the same PR.
 --   - Bounded, non-fatal abandon refresh before worktree cleanup.
 --
 -- Excludes:
@@ -19,11 +23,19 @@
 --   - Check-run and review-thread parsing details.
 --   - Manual PR attach/switch UI.
 --   - Background scanners, webhooks, or scheduled refresh.
+--   - The work-actions-bar UI surface composition (button labels, zones); the
+--     work-actions-bar spec consumes this spec's affordance result.
 --
 -- Design basis:
 --   WorkScope-owned PR association is a standing runtime invariant: PR
 --   identity is learned from provider observations, persisted by WorkScope,
 --   and reused by status/action surfaces until fresher provider facts replace it.
+--
+-- Requirement traceability: REQ-PRA-001 through REQ-PRA-003 (PR feedback
+--   freshness advisory, agent-facing context baseline, bounded refresh) are
+--   modelled as deferred behavioural extensions at the foot of this file; the
+--   association, primary-derivation, status, and auto-fix rules below carry the
+--   freshness-aware PR identity those requirements build on.
 --
 -- Dependencies: specs/bedrock/bedrock.allium
 
@@ -63,9 +75,26 @@ value PrRefreshMetadata {
     stale: Boolean
 }
 
+-- The freshness advisory derived per REQ-PRA-001: present only when a
+-- successful remediation-context baseline exists and current PR feedback
+-- carries identities absent from it. `new_count` is a best-effort count of
+-- newly-seen feedback items; absent when only a coarse `updated` advisory
+-- could be classified (REQ-PRA-003 degradation).
+value PrFeedbackFreshness {
+    state: PrFeedbackFreshnessState
+    new_count: Integer?
+}
+
 value PrStatusView {
     pr: PrIdentity?
     refresh: PrRefreshMetadata
+    -- Present when a PR is found. `check_state` is the CI rollup for the PR
+    -- head; `feedback_freshness` is the REQ-PRA-001 advisory. Consumers that
+    -- choose a disposition (the work-actions-bar) read these to distinguish a
+    -- PR that needs attention (failing checks or fresh feedback) from a clean,
+    -- mergeable one. Absent when no PR is found.
+    check_state: PrCheckState?
+    feedback_freshness: PrFeedbackFreshness?
 }
 
 
@@ -107,7 +136,7 @@ contract WorkScopePrAutoFixContract {
         -- PR status surface.
 }
 
-contract StateBarPrAffordanceContract {
+contract WorkActionsPrAffordanceContract {
     derive_affordance: (status: PrStatusView) -> PrAutoFixAffordance
 
     @invariant NotFoundStalePrimaryIsActionable
@@ -127,6 +156,23 @@ contract StateBarPrAffordanceContract {
 enum WorkScopeKind {
     worktree
     | conversation
+}
+
+-- CI rollup for the PR head, as observed via the provider. `unknown` covers
+-- both "no checks configured" and "checks not yet observed".
+enum PrCheckState {
+    passing
+    | pending
+    | failing
+    | unknown
+}
+
+-- The REQ-PRA-001 freshness advisory state. `new` means previously-unseen
+-- feedback identities are present; `updated` is the coarse degradation when
+-- per-identity classification is unavailable (REQ-PRA-003).
+enum PrFeedbackFreshnessState {
+    new
+    | updated
 }
 
 enum PullRequestState {
@@ -207,7 +253,9 @@ entity PrAutoFixContextResult {
     target: PrIdentity
 }
 
--- Observable StateBar auto-fix affordance derived from a PR status result.
+-- Observable work-actions-bar auto-fix affordance derived from a PR status
+-- result. The StateBar renders PR identity; this affordance is the Address-CI
+-- control rendered by the work actions bar.
 entity PrAutoFixAffordanceResult {
     status: PrStatusResult
     affordance: PrAutoFixAffordance
@@ -276,11 +324,11 @@ config {
 --       Produces unavailable metadata when no persisted PR identity can be shown.
 --
 --   enabled_auto_fix(target: PrIdentity) -> PrAutoFixAffordance
---       Returns an enabled StateBar affordance targeting the supplied PR.
+--       Returns an enabled work-actions-bar affordance targeting the supplied PR.
 --
 --   disabled_auto_fix(reason: String) -> PrAutoFixAffordance
---       Returns a disabled StateBar affordance with no target and a user-facing
---       disabled reason.
+--       Returns a disabled work-actions-bar affordance with no target and a
+--       user-facing disabled reason.
 --
 --   non_open_reason(pr: PrIdentity) -> String
 --       Returns the auto-fix rejection message for a PR whose latest display
@@ -497,8 +545,8 @@ rule BranchAutoFixFallbackWithoutAssociation {
 }
 
 
-rule StateBarEnablesAutoFixForFreshOpenPrimary {
-    when: StateBarRendersStatus(status)
+rule WorkActionsEnablesAutoFixForFreshOpenPrimary {
+    when: WorkActionsRendersPrStatus(status)
 
     requires: status.pr != null
     requires: status.pr.display_state = open
@@ -510,8 +558,8 @@ rule StateBarEnablesAutoFixForFreshOpenPrimary {
     )
 }
 
-rule StateBarEnablesAutoFixForStaleNotFoundOpenPrimary {
-    when: StateBarRendersStatus(status)
+rule WorkActionsEnablesAutoFixForStaleNotFoundOpenPrimary {
+    when: WorkActionsRendersPrStatus(status)
 
     requires: status.pr != null
     requires: status.pr.display_state = open
@@ -529,8 +577,8 @@ rule StateBarEnablesAutoFixForStaleNotFoundOpenPrimary {
         -- action is number-based auto-fix against the persisted primary.
 }
 
-rule StateBarDisablesAutoFixWhenRefreshUnavailable {
-    when: StateBarRendersStatus(status)
+rule WorkActionsDisablesAutoFixWhenRefreshUnavailable {
+    when: WorkActionsRendersPrStatus(status)
 
     requires: status.pr != null
     requires: status.pr.display_state = open
@@ -542,8 +590,8 @@ rule StateBarDisablesAutoFixWhenRefreshUnavailable {
     )
 }
 
-rule StateBarDisablesAutoFixForNonOpenPrimary {
-    when: StateBarRendersStatus(status)
+rule WorkActionsDisablesAutoFixForNonOpenPrimary {
+    when: WorkActionsRendersPrStatus(status)
 
     requires: status.pr = null or status.pr.display_state != open
 
@@ -639,7 +687,7 @@ surface PrAutoFixApi {
         fulfils WorkScopePrAutoFixContract
 }
 
-surface StateBarPrAffordance {
+surface WorkActionsPrAffordance {
     facing user: ConversationUser
 
     context status: PrStatusResult
@@ -648,10 +696,10 @@ surface StateBarPrAffordance {
         PrAutoFixAffordance
 
     provides:
-        StateBarRendersStatus(status)
+        WorkActionsRendersPrStatus(status)
 
     contracts:
-        fulfils StateBarPrAffordanceContract
+        fulfils WorkActionsPrAffordanceContract
 }
 
 surface AbandonCleanup {
@@ -667,3 +715,51 @@ surface AbandonCleanup {
         -- Abandon may attempt to enrich PR association history before cleanup,
         -- but cleanup completion does not depend on PR provider success.
 }
+
+------------------------------------------------------------
+-- Deferred Behavioural Extensions
+------------------------------------------------------------
+--
+-- The rules above model PR identity, primary derivation, freshness-aware PR
+-- status, the Address-CI auto-fix affordance, and abandon refresh. The
+-- agent-facing PR feedback freshness layer (REQ-PRA-001..003) builds on that
+-- foundation: it compares what Phoenix last handed the agent against current
+-- review activity and renders a compact advisory near the Address-CI Work
+-- Action. It is named here so the traceability is explicit rather than
+-- silently absent.
+
+deferred PrFeedbackFreshnessAdvisory
+    -- REQ-PRA-001. WHEN a Work or Branch conversation has an open associated PR
+    -- AND PR feedback changed since Phoenix last captured agent-facing PR
+    -- remediation context, a compact advisory marker (`new comments`, `{N} new`,
+    -- `updated`) is shown near the Address-CI Work Action. PR feedback freshness
+    -- is NOT the StateBar branch-health signal (that is PR merge state, owned by
+    -- the work-lifecycle spec) and it never blocks cleanup, abandon, or ordinary
+    -- conversation use. The advisory composes the PrStatusResult freshness
+    -- metadata modelled above with a feedback-identity comparison against the
+    -- baseline captured by PrRemediationContextBaseline below.
+    -- Location: ui/src/components/WorkActions.tsx (PrRemediationActions)
+
+deferred PrRemediationContextBaseline
+    -- REQ-PRA-002. WHEN Phoenix successfully captures PR remediation context for
+    -- an associated PR, that successful capture is recorded as the baseline for
+    -- agent-facing PR feedback freshness, keyed by WorkScope and PR number:
+    -- capture timestamp; PR `github_updated_at` (the PrIdentity field above) when
+    -- available; stable feedback identities/fingerprints when available. Feedback
+    -- is classified as new when current feedback carries stable identities absent
+    -- from the latest successful baseline. WHEN no successful baseline exists, the
+    -- `new comments` advisory is not shown. The baseline reflects what Phoenix
+    -- actually handed the agent, not what GitHub contained at an unrelated time.
+    -- Location: crates/phoenix-ide/src/api/pr_monitoring.rs (WorkScope-keyed PR baseline persistence)
+
+deferred BoundedPrFeedbackRefresh
+    -- REQ-PRA-003. WHEN refreshing routine PR status, the poll stays lightweight
+    -- and does NOT fetch all PR feedback surfaces unless gated by evidence that
+    -- feedback may have changed — PR `github_updated_at` newer than the latest
+    -- successful baseline, or an explicit remediation context capture. WHEN full
+    -- feedback surfaces are unavailable during freshness classification, the
+    -- advisory degrades to no count or a coarse `updated` marker AND the failure
+    -- is logged. Full review surfaces are slower and rate-limit sensitive, so
+    -- they are fetched only when they can change the advisory; this extends the
+    -- bounded refresh_branch_prs poll modelled in the status rules above.
+    -- Location: crates/phoenix-ide/src/api/pr_monitoring.rs (pr-status handler, gated full fetch)
