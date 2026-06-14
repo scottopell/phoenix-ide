@@ -54,7 +54,8 @@ ever blocking ordinary work or treating feedback freshness as branch health.
 |----|---------|
 | REQ-PRA-001 | PR feedback freshness indicator — compact advisory near Address-CI; never branch health; never a lifecycle gate |
 | REQ-PRA-002 | Agent-facing PR context baseline — record each successful remediation capture as the freshness baseline; new = identities absent from baseline; no baseline → no count |
-| REQ-PRA-003 | Bounded PR feedback refresh — keep routine polls light; fetch full surfaces only when evidence says they changed; degrade and log when unavailable |
+| REQ-PRA-003 | Bounded PR feedback refresh — keep routine polls light; fetch full surfaces only when evidence says they changed; report a coverage gap (REQ-PRA-004) rather than coarsening freshness when a surface can't be read, and log |
+| REQ-PRA-004 | PR feedback coverage health — a signal distinct from freshness when a surface can't be read; `auth_required` (user-fixable) vs `incomplete` (transient); any concurrent freshness count is a lower bound; no lifecycle authority |
 
 ## Implementation Status
 
@@ -63,9 +64,10 @@ ever blocking ordinary work or treating feedback freshness as branch health.
 | REQ-PRA-001 | Implemented | `ui/src/components/WorkActions.tsx` (`PrRemediationActions`); freshness advisory marker |
 | REQ-PRA-002 | Implemented | `crates/phoenix-ide/src/api/pr_monitoring.rs` (WorkScope-keyed baseline persistence) |
 | REQ-PRA-003 | Implemented | `crates/phoenix-ide/src/api/pr_monitoring.rs` (gated full-feedback fetch) |
+| REQ-PRA-004 | Implemented | `crates/phoenix-ide/src/api/pr_monitoring.rs` (coverage-health classification); `PrFeedbackCoverageHealth` in `api/types.rs` |
 
 The broader association, primary-derivation, status, and auto-fix behaviour on which these
-requirements build is modelled normatively in `pr-association.allium`; REQ-PRA-001..003 are
+requirements build is modelled normatively in `pr-association.allium`; REQ-PRA-001..004 are
 the agent-facing feedback-freshness layer over it.
 
 ## Provenance

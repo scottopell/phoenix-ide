@@ -69,13 +69,13 @@ independently of branch discovery, so branch/HEAD drift does not strand a user w
 associated primary. Branch-based discovery is a fallback only when no associated primary
 exists.
 
-## PR Feedback Freshness and Baseline (REQ-PRA-001..003)
+## PR Feedback Freshness and Baseline (REQ-PRA-001..004)
 
 The agent-facing feedback freshness layer builds on the status/identity model above. It is
-modelled in `pr-association.allium` as three `deferred` behavioural extensions
-(`PrFeedbackFreshnessAdvisory`, `PrRemediationContextBaseline`, `BoundedPrFeedbackRefresh`)
-because it composes the existing freshness-aware PR identity rather than introducing new
-association state-machine transitions.
+modelled in `pr-association.allium` as four `deferred` behavioural extensions
+(`PrFeedbackFreshnessAdvisory`, `PrRemediationContextBaseline`, `BoundedPrFeedbackRefresh`,
+`PrFeedbackCoverageHealthAdvisory`) because it composes the existing freshness-aware PR identity
+rather than introducing new association state-machine transitions.
 
 **Baseline (REQ-PRA-002).** Each *successful* capture of agent-facing PR remediation context
 records a baseline keyed by WorkScope and PR number: the capture timestamp, the PR
@@ -85,17 +85,26 @@ agent — not what GitHub contained at an unrelated time. Feedback is classified
 current feedback carries stable identities absent from the latest successful baseline. With no
 baseline, nothing is "new", so no count is shown.
 
-**Advisory (REQ-PRA-001).** When an open associated PR's feedback is new relative to the
-baseline, a compact marker (`new comments`, `{N} new`, `updated`) renders next to the
-Address-CI Work Action. It is *not* the StateBar branch-health signal (PR merge state owns
-that, in `work-lifecycle`) and it never gates cleanup, abandon, or ordinary conversation use.
+**Advisory (REQ-PRA-001).** When an open associated PR's feedback differs from the baseline, a
+compact count marker (`{N} new` for net-new items, `{N} edited` for changed baseline items)
+renders next to the Address-CI Work Action. It is *not* the StateBar branch-health signal (PR
+merge state owns that, in `work-lifecycle`) and it never gates cleanup, abandon, or ordinary
+conversation use.
 
 **Bounded refresh (REQ-PRA-003).** Routine PR-status polling stays lightweight. Full feedback
 surfaces are fetched only when gated by evidence they may have changed — PR `updated_at` newer
-than the latest successful baseline, or an explicit remediation-context capture. When full
-surfaces are unavailable during classification, the advisory degrades to no count or a coarse
-`updated`, and the failure is logged. This is the capability-gap-is-logged-not-silenced
-principle applied to rate-limit-sensitive review surfaces.
+than the latest successful baseline, or an explicit remediation-context capture. When a surface
+cannot be read during classification, the gap is reported as coverage health (REQ-PRA-004), not
+folded into a coarse freshness marker, and the failure is logged — the
+capability-gap-is-logged-not-silenced principle applied to rate-limit-sensitive review surfaces.
+
+**Coverage health (REQ-PRA-004).** Coverage health is orthogonal to freshness: freshness answers
+"did feedback change?", coverage answers "could we read all of it?". When a surface is unreadable
+it is surfaced as a distinct signal — `auth_required` (the GitHub CLI is not authenticated;
+user-fixable via `gh auth login`) or `incomplete` (a transient gap) — and any freshness count
+shown alongside it is a lower bound. Folding the two together would make an incomplete fetch
+indistinguishable from genuinely-fresh feedback; keeping them separate lets the UI show an honest
+count and offer a concrete fix for the auth case. Neither signal carries lifecycle authority.
 
 ## Abandon Refresh
 

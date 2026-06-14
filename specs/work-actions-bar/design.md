@@ -114,7 +114,7 @@ state.
 
 The feedback freshness label (`prFeedbackFreshnessLabel` from `ui/src/components/prBadge.ts`)
 renders inline inside the Address feedback button when `PrStatusView.feedback_freshness` is
-present (`"3 new"`, `"new comments"`, `"updated"`). The label is decorative — it tells the
+present (`"3 new"`, `"2 edited"`). The label is decorative — it tells the
 user there is something new to address; it does not gate the button. The gate is the
 addressability predicate of REQ-WAB-004 (failing checks or fresh feedback, affordance enabled).
 

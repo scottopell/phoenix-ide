@@ -21,9 +21,9 @@ This spec **owns**:
   does not strand the user.
 - **The Address-CI auto-fix affordance derivation** — whether the "Address CI & comments"
   control is enabled or disabled, and which PR it targets, derived from the PR status view.
-- **PR feedback freshness and baseline** — the agent-facing advisory marker (`new comments`,
-  `{N} new`, `updated`) near the Address-CI action, the baseline of what Phoenix last handed
-  the agent, and the bounded poll that gates full feedback fetches.
+- **PR feedback freshness and baseline** — the agent-facing advisory count marker (`{N} new`,
+  `{N} edited`) near the Address-CI action, the baseline of what Phoenix last handed the agent,
+  the bounded poll that gates full feedback fetches, and the orthogonal coverage-health signal.
 
 This spec does **not** own:
 
@@ -60,7 +60,8 @@ next to the Address-CI action on the work actions bar, not on the StateBar PR ba
 WHEN a Work or Branch conversation has an open associated pull request
 AND PR feedback changed since Phoenix last captured agent-facing PR remediation context
 THE SYSTEM SHALL show a compact advisory marker near the `Address CI & comments` Work Action
-  SUCH AS `new comments`, `{N} new`, or `updated`
+  carrying a count, SUCH AS `{N} new` (net-new feedback items) or `{N} edited` (baseline items
+  whose content changed with no net-new items)
 
 THE SYSTEM SHALL NOT use PR feedback freshness as the StateBar branch-health signal
 
@@ -89,7 +90,7 @@ THE SYSTEM SHALL treat feedback as new when current feedback contains stable ide
   from the latest successful baseline
 
 WHEN no successful baseline exists
-THE SYSTEM SHALL NOT show `new comments`
+THE SYSTEM SHALL NOT show a freshness count
 
 **Design:** The baseline is what Phoenix actually handed the agent, not what GitHub contained
 at some unrelated time. Freshness is the difference between current feedback and that last
@@ -106,15 +107,40 @@ AND SHALL NOT fetch all PR feedback surfaces unless gated by evidence that feedb
   changed (evidence includes pull request `updated_at` newer than the latest successful
   baseline, or an explicit remediation context capture)
 
-WHEN full feedback surfaces are unavailable during freshness classification
-THE SYSTEM SHALL degrade to no count or a coarse `updated` advisory
+WHEN a feedback surface cannot be read during freshness classification
+THE SYSTEM SHALL report the gap as coverage health (REQ-PRA-004), not as a coarsened freshness
+  advisory, so an incomplete fetch is never mistaken for fresh feedback
 AND SHALL log the failure
 
-**Design:** PR status is polled routinely; full review surfaces (review threads, check runs,
-comment bodies) are slower and rate-limit sensitive. Fetch them only when they can actually
+**Design:** PR status is polled routinely; full review surfaces (review threads, review and
+issue comments) are slower and rate-limit sensitive. Fetch them only when they can actually
 change the advisory — gated by a cheap `updated_at` comparison against the baseline, or by an
-explicit remediation capture. When the full surfaces cannot be fetched, the advisory degrades
-gracefully (coarse `updated`, or nothing) and the failure is logged rather than silenced.
+explicit remediation capture. When a surface cannot be fetched, the freshness count is left
+unclassified and the gap is surfaced separately as coverage health rather than folded into a
+vague freshness state — keeping "feedback changed" and "we could not read all feedback" as
+distinct, unambiguous signals.
+
+---
+
+### REQ-PRA-004: PR Feedback Coverage Health
+
+WHEN classifying PR feedback freshness AND at least one feedback surface cannot be read
+THE SYSTEM SHALL surface a coverage-health signal distinct from the freshness advisory,
+  identifying the unreadable surfaces
+
+THE SYSTEM SHALL distinguish a user-actionable auth gap (`auth_required` — the GitHub CLI is
+  not authenticated, resolvable via `gh auth login`) from a transient gap (`incomplete`)
+
+THE SYSTEM SHALL treat any freshness count shown alongside a coverage gap as a lower bound
+
+THE SYSTEM SHALL NOT block cleanup, abandon, or ordinary conversation use based on coverage
+  health
+
+**Design:** Coverage health is orthogonal to freshness: freshness answers "did feedback
+change?", coverage answers "could we read all of it?". Folding the two together makes an
+incomplete fetch indistinguishable from genuinely-fresh feedback. Separating them lets the UI
+both show an honest (lower-bound) count and offer the user a concrete fix when the gap is an
+auth problem, while neither signal carries lifecycle authority.
 
 ---
 
@@ -122,6 +148,7 @@ gracefully (coarse `updated`, or nothing) and the failure is logged rather than 
 
 | ID | The system must… |
 |----|------------------|
-| REQ-PRA-001 | Show a compact freshness advisory near Address-CI when an open PR's feedback changed since the last agent-facing capture; never use it as branch health or as a lifecycle gate. |
-| REQ-PRA-002 | Record each successful remediation-context capture as the freshness baseline (timestamp, PR `updated_at`, stable feedback identities); classify feedback new when identities are absent from the latest baseline; show nothing when no baseline exists. |
-| REQ-PRA-003 | Keep routine PR polling lightweight; fetch full feedback surfaces only when `updated_at` or an explicit capture says they may have changed; degrade and log when unavailable. |
+| REQ-PRA-001 | Show a compact freshness advisory (a `{N} new` or `{N} edited` count) near Address-CI when an open PR's feedback changed since the last agent-facing capture; never use it as branch health or as a lifecycle gate. |
+| REQ-PRA-002 | Record each successful remediation-context capture as the freshness baseline (timestamp, PR `updated_at`, stable feedback identities); classify feedback new when identities are absent from the latest baseline; show no count when no baseline exists. |
+| REQ-PRA-003 | Keep routine PR polling lightweight; fetch full feedback surfaces only when `updated_at` or an explicit capture says they may have changed; on an unreadable surface, report a coverage gap (REQ-PRA-004) rather than coarsening freshness, and log. |
+| REQ-PRA-004 | Surface coverage health distinct from freshness when a feedback surface can't be read; distinguish user-actionable `auth_required` from transient `incomplete`; treat any concurrent freshness count as a lower bound; carry no lifecycle authority. |

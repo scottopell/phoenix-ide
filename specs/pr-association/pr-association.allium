@@ -31,7 +31,7 @@
 --   identity is learned from provider observations, persisted by WorkScope,
 --   and reused by status/action surfaces until fresher provider facts replace it.
 --
--- Requirement traceability: REQ-PRA-001 through REQ-PRA-003 (PR feedback
+-- Requirement traceability: REQ-PRA-001 through REQ-PRA-004 (PR feedback
 --   freshness advisory, agent-facing context baseline, bounded refresh) are
 --   modelled as deferred behavioural extensions at the foot of this file; the
 --   association, primary-derivation, status, and auto-fix rules below carry the
@@ -77,24 +77,36 @@ value PrRefreshMetadata {
 
 -- The freshness advisory derived per REQ-PRA-001: present only when a
 -- successful remediation-context baseline exists and current PR feedback
--- carries identities absent from it. `new_count` is a best-effort count of
--- newly-seen feedback items; absent when only a coarse `updated` advisory
--- could be classified (REQ-PRA-003 degradation).
+-- differs from it. The two variants are mutually exclusive — `new` carries a
+-- count of net-new feedback items absent from the baseline; `edited` carries a
+-- count of baseline items whose content changed with no net-new items. `count`
+-- is always present for the classified variant.
 value PrFeedbackFreshness {
     state: PrFeedbackFreshnessState
-    new_count: Integer?
+    count: Integer
+}
+
+-- Coverage health is orthogonal to freshness (REQ-PRA-004): it reports that a
+-- feedback surface could not be read, so any freshness count is a lower bound.
+-- Kept separate from `feedback_freshness` so an incomplete fetch is never
+-- mistaken for fresh feedback.
+value PrFeedbackCoverageHealth {
+    kind: PrFeedbackCoverageKind
+    surfaces: [PrFeedbackCoverageSurface]
 }
 
 value PrStatusView {
     pr: PrIdentity?
     refresh: PrRefreshMetadata
     -- Present when a PR is found. `check_state` is the CI rollup for the PR
-    -- head; `feedback_freshness` is the REQ-PRA-001 advisory. Consumers that
-    -- choose a disposition (the work-actions-bar) read these to distinguish a
-    -- PR that needs attention (failing checks or fresh feedback) from a clean,
-    -- mergeable one. Absent when no PR is found.
+    -- head; `feedback_freshness` is the REQ-PRA-001 advisory; `feedback_coverage`
+    -- is the orthogonal REQ-PRA-004 coverage-health signal. Consumers that choose
+    -- a disposition (the work-actions-bar) read check_state and freshness to
+    -- distinguish a PR that needs attention (failing checks or fresh feedback)
+    -- from a clean, mergeable one. All three are absent when no PR is found.
     check_state: PrCheckState?
     feedback_freshness: PrFeedbackFreshness?
+    feedback_coverage: PrFeedbackCoverageHealth?
 }
 
 
@@ -168,11 +180,29 @@ enum PrCheckState {
 }
 
 -- The REQ-PRA-001 freshness advisory state. `new` means previously-unseen
--- feedback identities are present; `updated` is the coarse degradation when
--- per-identity classification is unavailable (REQ-PRA-003).
+-- feedback items are present; `edited` means baseline items changed content
+-- with no net-new items. A coverage gap is NOT a freshness state — it is
+-- reported separately as PrFeedbackCoverageHealth (REQ-PRA-004).
 enum PrFeedbackFreshnessState {
     new
-    | updated
+    | edited
+}
+
+-- The REQ-PRA-004 coverage-health kind. `auth_required` means a surface was
+-- unreadable because the GitHub CLI is not authenticated (user-fixable via
+-- `gh auth login`); `incomplete` means a surface was transiently unavailable.
+enum PrFeedbackCoverageKind {
+    auth_required
+    | incomplete
+}
+
+-- A PR feedback surface whose read can fail independently. Named so coverage
+-- health can report which surfaces were missed.
+enum PrFeedbackCoverageSurface {
+    issue_comments
+    | review_comments
+    | review_summaries
+    | review_threads
 }
 
 enum PullRequestState {
@@ -722,7 +752,7 @@ surface AbandonCleanup {
 --
 -- The rules above model PR identity, primary derivation, freshness-aware PR
 -- status, the Address-CI auto-fix affordance, and abandon refresh. The
--- agent-facing PR feedback freshness layer (REQ-PRA-001..003) builds on that
+-- agent-facing PR feedback freshness layer (REQ-PRA-001..004) builds on that
 -- foundation: it compares what Phoenix last handed the agent against current
 -- review activity and renders a compact advisory near the Address-CI Work
 -- Action. It is named here so the traceability is explicit rather than
@@ -731,8 +761,8 @@ surface AbandonCleanup {
 deferred PrFeedbackFreshnessAdvisory
     -- REQ-PRA-001. WHEN a Work or Branch conversation has an open associated PR
     -- AND PR feedback changed since Phoenix last captured agent-facing PR
-    -- remediation context, a compact advisory marker (`new comments`, `{N} new`,
-    -- `updated`) is shown near the Address-CI Work Action. PR feedback freshness
+    -- remediation context, a compact advisory count marker (`{N} new` or
+    -- `{N} edited`) is shown near the Address-CI Work Action. PR feedback freshness
     -- is NOT the StateBar branch-health signal (that is PR merge state, owned by
     -- the work-lifecycle spec) and it never blocks cleanup, abandon, or ordinary
     -- conversation use. The advisory composes the PrStatusResult freshness
@@ -747,8 +777,8 @@ deferred PrRemediationContextBaseline
     -- capture timestamp; PR `github_updated_at` (the PrIdentity field above) when
     -- available; stable feedback identities/fingerprints when available. Feedback
     -- is classified as new when current feedback carries stable identities absent
-    -- from the latest successful baseline. WHEN no successful baseline exists, the
-    -- `new comments` advisory is not shown. The baseline reflects what Phoenix
+    -- from the latest successful baseline. WHEN no successful baseline exists, no
+    -- freshness count is shown. The baseline reflects what Phoenix
     -- actually handed the agent, not what GitHub contained at an unrelated time.
     -- Location: crates/phoenix-ide/src/api/pr_monitoring.rs (WorkScope-keyed PR baseline persistence)
 
@@ -757,9 +787,20 @@ deferred BoundedPrFeedbackRefresh
     -- and does NOT fetch all PR feedback surfaces unless gated by evidence that
     -- feedback may have changed — PR `github_updated_at` newer than the latest
     -- successful baseline, or an explicit remediation context capture. WHEN full
-    -- feedback surfaces are unavailable during freshness classification, the
-    -- advisory degrades to no count or a coarse `updated` marker AND the failure
-    -- is logged. Full review surfaces are slower and rate-limit sensitive, so
-    -- they are fetched only when they can change the advisory; this extends the
-    -- bounded refresh_branch_prs poll modelled in the status rules above.
+    -- feedback surfaces cannot be read during freshness classification, the
+    -- gap is reported as coverage health (REQ-PRA-004), NOT folded into a coarse
+    -- freshness marker, AND the failure is logged. Full review surfaces are
+    -- slower and rate-limit sensitive, so they are fetched only when they can
+    -- change the advisory; this extends the bounded refresh_branch_prs poll
+    -- modelled in the status rules above.
     -- Location: crates/phoenix-ide/src/api/pr_monitoring.rs (pr-status handler, gated full fetch)
+
+deferred PrFeedbackCoverageHealthAdvisory
+    -- REQ-PRA-004. WHEN classifying PR feedback freshness AND at least one
+    -- feedback surface cannot be read, a coverage-health signal distinct from
+    -- the freshness advisory identifies the unreadable surfaces, distinguishing
+    -- a user-actionable auth gap (auth_required — gh not authenticated) from a
+    -- transient one (incomplete). Any freshness count shown alongside a gap is a
+    -- lower bound. Coverage health carries no lifecycle authority. Orthogonal to
+    -- freshness so an incomplete fetch is never mistaken for fresh feedback.
+    -- Location: crates/phoenix-ide/src/api/pr_monitoring.rs (coverage-health classification)
