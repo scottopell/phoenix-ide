@@ -737,7 +737,11 @@ pub enum PrFeedbackSource {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrCheckLogSource {
+    /// No extractable logs; `snippet` explains why and `url` points at the
+    /// provider's web UI for the full logs.
     CheckUrl,
+    /// Failed-step logs extracted from a GitHub Actions job via `gh run view`.
+    GhActionsLog,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
