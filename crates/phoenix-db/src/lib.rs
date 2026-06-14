@@ -2167,6 +2167,45 @@ impl Database {
         Ok(rows)
     }
 
+    /// Forward chain members as fully-hydrated [`Conversation`] rows, ordered
+    /// root-first by continuation depth.
+    ///
+    /// Equivalent to [`Self::chain_members_forward`] followed by a
+    /// [`Self::get_conversation`] per id, but in a single query: the recursive
+    /// chain walk is joined back to `conversations` so the whole chain is
+    /// hydrated in one round-trip instead of N. Callers that need the member
+    /// rows (not just their ids) should prefer this.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn chain_members_forward_full(&self, root_id: &str) -> DbResult<Vec<Conversation>> {
+        let rows = sqlx::query(
+            "WITH RECURSIVE chain(id, next_id, depth) AS (
+                SELECT id, continued_in_conv_id, 0
+                FROM conversations
+                WHERE id = ?1
+                UNION ALL
+                SELECT c.id, c.continued_in_conv_id, chain.depth + 1
+                FROM conversations c
+                JOIN chain ON c.id = chain.next_id
+            )
+            SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+                   c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                   c.project_id, c.conv_mode, c.desired_base_branch,
+                   c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
+                   (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+            FROM conversations c
+            JOIN chain ON c.id = chain.id
+            ORDER BY chain.depth",
+        )
+        .bind(root_id)
+        .try_map(parse_conversation_row)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Walk the continuation chain backward from `conv_id` to its root and
     /// return the root's id. REQ-CHN-002.
     ///
@@ -6410,6 +6449,52 @@ mod tests {
             members,
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    /// `chain_members_forward_full` returns the same membership and order as the
+    /// id-only walk, fully hydrated, with an accurate `message_count` per member.
+    /// This is the single-query equivalent of looping `get_conversation` over
+    /// `chain_members_forward`, so the two must not diverge.
+    #[tokio::test]
+    async fn test_chain_members_forward_full_matches_per_member_fetch() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["a", "b", "c"]).await;
+
+        // Give members distinct message counts so the COUNT subquery is exercised.
+        db.add_message_with_seq("a-1", "a", 1, &MessageContent::user("a1"), None, None)
+            .await
+            .unwrap();
+        db.add_message_with_seq("c-1", "c", 1, &MessageContent::user("c1"), None, None)
+            .await
+            .unwrap();
+        db.add_message_with_seq("c-2", "c", 2, &MessageContent::user("c2"), None, None)
+            .await
+            .unwrap();
+
+        let full = db.chain_members_forward_full("a").await.unwrap();
+
+        // Same ids, same root-first order as the id-only walk.
+        let ids: Vec<&str> = full.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+
+        // Per-member parity with the loop it replaces.
+        for member in &full {
+            let direct = db.get_conversation(&member.id).await.unwrap();
+            assert_eq!(member.id, direct.id);
+            assert_eq!(member.message_count, direct.message_count);
+        }
+
+        let counts: Vec<i64> = full.iter().map(|c| c.message_count).collect();
+        assert_eq!(counts, vec![1, 0, 2]);
+    }
+
+    /// A non-existent root yields an empty vec, mirroring `chain_members_forward`.
+    #[tokio::test]
+    async fn test_chain_members_forward_full_nonexistent_root() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let members = db.chain_members_forward_full("ghost").await.unwrap();
+        assert!(members.is_empty());
     }
 
     /// REQ-CHN-002: a single conversation with no continuation returns just itself.

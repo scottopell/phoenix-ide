@@ -438,15 +438,11 @@ async fn validate_chain_root(state: &AppState, root_id: &str) -> Result<(), AppE
 async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, AppError> {
     validate_chain_root(state, root_id).await?;
 
-    let member_ids = state
+    let members: Vec<Conversation> = state
         .db
-        .chain_members_forward(root_id)
+        .chain_members_forward_full(root_id)
         .await
         .map_err(db_to_app)?;
-    let mut members: Vec<Conversation> = Vec::with_capacity(member_ids.len());
-    for id in &member_ids {
-        members.push(state.db.get_conversation(id).await.map_err(db_to_app)?);
-    }
 
     let root_conv = members
         .first()
