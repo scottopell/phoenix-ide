@@ -3000,6 +3000,15 @@ impl McpClientManager {
             .write()
             .await
             .retain(|name, _| config_names.contains(name));
+        // Sweep pending-auth URLs the same way: a removed server may carry one
+        // without an active flow (a failed-only server, or the stdio
+        // `mcp-remote` stderr drain writing a URL), which `cancel_pending_oauth_flow`
+        // and the connected-server cleanup below would both miss, leaving an
+        // `unauthorized` entry for a server no longer configured.
+        self.pending_oauth_urls
+            .write()
+            .await
+            .retain(|name, _| config_names.contains(name));
         for (name, mut server) in removed_servers {
             self.pending_oauth_urls.write().await.remove(&name);
             server.terminate().await;

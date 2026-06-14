@@ -106,8 +106,14 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     try {
       const result = await api.reloadMcp();
       // The (re)connecting servers to await before polling settles: a slow one
-      // flips to `ready` later, within the window above.
-      awaitingRef.current = new Set([...result.added, ...result.restarted]);
+      // flips to `ready` later, within the window above. `failed` is included
+      // because a timed-out restart still has a background connect running that
+      // may publish successfully and clear the failure.
+      awaitingRef.current = new Set([
+        ...result.added,
+        ...result.restarted,
+        ...result.failed.map(f => f.server),
+      ]);
       await fetchStatus();
       const parts: string[] = [];
       if (result.added.length > 0) parts.push(`+${result.added.length} added`);
