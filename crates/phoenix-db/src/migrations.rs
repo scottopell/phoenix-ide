@@ -124,6 +124,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_mcp_oauth_tables",
         sql: MIGRATION_022,
     },
+    Migration {
+        version: 23,
+        name: "add_mcp_oauth_registration_redirect_uri",
+        sql: MIGRATION_023,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -539,6 +544,15 @@ CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
 );
 ";
 
+/// Track the `redirect_uri` a dynamic client registration was made with, so a
+/// changed canonical redirect base (REQ-MCP-020) re-registers instead of
+/// reusing a client the authorization server will reject on a redirect-URI
+/// mismatch (REQ-MCP-011). NULL for pre-configured clients (operator-managed
+/// redirect) and rows written before this column existed.
+const MIGRATION_023: &str = r"
+ALTER TABLE mcp_oauth_registrations ADD COLUMN redirect_uri TEXT;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -666,7 +680,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 22);
+        assert_eq!(first, 23);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

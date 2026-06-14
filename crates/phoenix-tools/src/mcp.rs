@@ -1163,6 +1163,73 @@ async fn oauth_refresh(
     Ok(response.access_token)
 }
 
+/// Resolve the OAuth client identity for an authorization server (REQ-MCP-010):
+/// reuse a cached client whose registered `redirect_uri` still matches the
+/// resolved redirect base (or is unknown), otherwise dynamically register
+/// (RFC 7591). A cached client registered with a *different* `redirect_uri` is
+/// re-registered so an authorization server that binds clients to their
+/// redirect accepts the new callback after the canonical base changed
+/// (REQ-MCP-020); when the server advertises no registration endpoint it is
+/// reused best-effort with a warning. Phoenix hosts no Client ID Metadata
+/// Document, so that step resolves to nothing.
+async fn acquire_client_registration(
+    oauth_rt: &OAuthRuntime,
+    client: &reqwest::Client,
+    name: &str,
+    metadata: &oauth::AuthServerMetadata,
+    cached: Option<OAuthRegistrationRecord>,
+    redirect_uri: &str,
+) -> Result<OAuthRegistrationRecord, String> {
+    if let Some(cached) = &cached {
+        if cached
+            .redirect_uri
+            .as_deref()
+            .is_none_or(|registered| registered == redirect_uri)
+        {
+            return Ok(cached.clone());
+        }
+    }
+
+    let Some(endpoint) = metadata.registration_endpoint.clone() else {
+        return match cached {
+            Some(cached) => {
+                tracing::warn!(
+                    server = %name,
+                    auth_server = %metadata.issuer,
+                    "OAuth redirect base changed but the authorization server advertises no \
+                     registration endpoint; reusing the existing client (its registered \
+                     redirect_uri may no longer match)"
+                );
+                Ok(cached)
+            }
+            None => Err(format!(
+                "authorization server '{}' has no client registration for Phoenix and does not \
+                 advertise a registration endpoint (RFC 7591); configure a pre-registered OAuth \
+                 client for it",
+                metadata.issuer
+            )),
+        };
+    };
+
+    let registration = oauth::register_client(client, metadata, &endpoint, redirect_uri).await?;
+    oauth_rt.store().upsert_registration(&registration).await?;
+    if cached.is_some() {
+        tracing::info!(
+            server = %name,
+            auth_server = %metadata.issuer,
+            "Re-registered OAuth client after a redirect base change"
+        );
+    } else {
+        tracing::info!(
+            server = %name,
+            auth_server = %metadata.issuer,
+            client_id = %registration.client_id,
+            "Registered OAuth client via dynamic client registration"
+        );
+    }
+    Ok(registration)
+}
+
 /// Run discovery → client identity → PKCE for an HTTP server that needs the
 /// operator's authorization, park the pending flow, and surface its URL
 /// (REQ-MCP-009..011, REQ-MCP-013). `extra_scopes` carries prior grants for a
@@ -1192,40 +1259,15 @@ async fn begin_oauth_flow(
     let (metadata, cached_registration) =
         resolve_authorization_server(oauth_rt, &client, &prm).await?;
 
-    // Client identity preference (REQ-MCP-010): pre-configured/cached
-    // registration (keyed by authorization server) → Client ID Metadata
-    // Document → dynamic client registration. Phoenix hosts no client
-    // metadata document, so the CIMD step resolves to nothing; logged so the
-    // capability gap is visible.
-    let registration = if let Some(registration) = cached_registration {
-        registration
-    } else {
-        {
-            tracing::debug!(
-                server = %name,
-                auth_server = %metadata.issuer,
-                "no hosted Client ID Metadata Document available; falling back to dynamic client registration"
-            );
-            let Some(endpoint) = metadata.registration_endpoint.clone() else {
-                return Err(format!(
-                    "authorization server '{}' has no client registration for Phoenix and does \
-                     not advertise a registration endpoint (RFC 7591); configure a \
-                     pre-registered OAuth client for it",
-                    metadata.issuer
-                ));
-            };
-            let registration =
-                oauth::register_client(&client, &metadata, &endpoint, &redirect_uri).await?;
-            oauth_rt.store().upsert_registration(&registration).await?;
-            tracing::info!(
-                server = %name,
-                auth_server = %metadata.issuer,
-                client_id = %registration.client_id,
-                "Registered OAuth client via dynamic client registration"
-            );
-            registration
-        }
-    };
+    let registration = acquire_client_registration(
+        oauth_rt,
+        &client,
+        name,
+        &metadata,
+        cached_registration,
+        &redirect_uri,
+    )
+    .await?;
 
     // Requested scopes: the challenge's `scope` when present, else the
     // resource's advertised set; unioned with any prior grants (step-up,
@@ -2503,6 +2545,10 @@ impl McpClientManager {
                     client_id: preconfigured.client_id.clone(),
                     client_secret: preconfigured.client_secret.clone(),
                     token_endpoint_auth_method: preconfigured.token_endpoint_auth_method.clone(),
+                    // A pre-configured client's redirect is registered out of
+                    // band by the operator; Phoenix does not manage or compare
+                    // it, so it is left unknown (REQ-MCP-020).
+                    redirect_uri: None,
                 })
                 .await
                 .map_err(|e| {

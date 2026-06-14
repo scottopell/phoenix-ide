@@ -41,6 +41,12 @@ pub struct OAuthRegistrationRecord {
     pub client_id: String,
     pub client_secret: Option<String>,
     pub token_endpoint_auth_method: String,
+    /// The `redirect_uri` this client was registered with, when known
+    /// (REQ-MCP-020). `None` for a pre-configured client (the operator manages
+    /// its redirect out of band) or a registration persisted before redirect
+    /// tracking existed. A cached registration whose `redirect_uri` no longer
+    /// matches the resolved redirect base is re-registered (REQ-MCP-011).
+    pub redirect_uri: Option<String>,
 }
 
 /// A persisted OAuth token for one MCP server, audience-bound to `resource`
@@ -580,6 +586,7 @@ pub async fn register_client(
             .and_then(Value::as_str)
             .unwrap_or("none")
             .to_string(),
+        redirect_uri: Some(redirect_uri.to_string()),
     })
 }
 
@@ -991,6 +998,7 @@ mod tests {
             client_id: "cid".to_string(),
             client_secret: None,
             token_endpoint_auth_method: "none".to_string(),
+            redirect_uri: None,
         };
         let url = build_authorization_url(
             &metadata,

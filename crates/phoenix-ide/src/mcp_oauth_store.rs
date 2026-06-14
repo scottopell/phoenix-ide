@@ -34,6 +34,7 @@ impl OAuthStore for DbOAuthStore {
             client_id: row.client_id,
             client_secret: row.client_secret,
             token_endpoint_auth_method: row.token_endpoint_auth_method,
+            redirect_uri: row.redirect_uri,
         }))
     }
 
@@ -44,6 +45,7 @@ impl OAuthStore for DbOAuthStore {
                 client_id: record.client_id.clone(),
                 client_secret: record.client_secret.clone(),
                 token_endpoint_auth_method: record.token_endpoint_auth_method.clone(),
+                redirect_uri: record.redirect_uri.clone(),
             })
             .await
             .map_err(|e| e.to_string())

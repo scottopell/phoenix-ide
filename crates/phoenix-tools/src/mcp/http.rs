@@ -2704,6 +2704,18 @@ mod tests {
         json_doc(&body)
     }
 
+    /// A throwaway public-client registration (`cid-1`, no recorded
+    /// `redirect_uri`) for seeding the OAuth store in tests.
+    fn none_registration(auth_server: &str) -> OAuthRegistrationRecord {
+        OAuthRegistrationRecord {
+            auth_server: auth_server.to_string(),
+            client_id: "cid-1".to_string(),
+            client_secret: None,
+            token_endpoint_auth_method: "none".to_string(),
+            redirect_uri: None,
+        }
+    }
+
     fn stored_token(
         server: &TestServer,
         access: &str,
@@ -2951,6 +2963,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_registration_with_stale_redirect_is_reregistered() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        install_oauth_discovery(&server, true);
+        server.route(
+            "/register",
+            json_doc(&serde_json::json!({
+                "client_id": "cid-fresh",
+                "token_endpoint_auth_method": "none",
+            })),
+        );
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+
+        // A cached DCR registration whose recorded redirect_uri predates the
+        // current canonical redirect base (REQ-MCP-020): the flow must
+        // re-register rather than reuse a client the AS would reject on a
+        // redirect mismatch (REQ-MCP-011).
+        manager
+            .oauth
+            .store()
+            .upsert_registration(&OAuthRegistrationRecord {
+                auth_server: server.base(),
+                client_id: "cid-stale".to_string(),
+                client_secret: None,
+                token_endpoint_auth_method: "none".to_string(),
+                redirect_uri: Some("http://stale.example/api/mcp/oauth/callback".to_string()),
+            })
+            .await
+            .unwrap();
+
+        connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("unauthorized connect must not publish");
+
+        // Re-registration happened with the current redirect, and the flow
+        // uses the freshly registered client.
+        let registrations = server.recorded_for_path("/register");
+        assert_eq!(
+            registrations.len(),
+            1,
+            "stale redirect forces a re-register"
+        );
+        let reg_body: Value = serde_json::from_str(&registrations[0].1).expect("json");
+        assert_eq!(
+            reg_body.get("redirect_uris"),
+            Some(&serde_json::json!([CALLBACK]))
+        );
+        let auth_url = pending_auth_url(&manager).await.expect("pending url");
+        assert_eq!(
+            query_params(&auth_url).get("client_id").map(String::as_str),
+            Some("cid-fresh")
+        );
+
+        // The persisted registration now records the current redirect.
+        let stored = manager
+            .oauth
+            .store()
+            .registration(&server.base())
+            .await
+            .unwrap()
+            .expect("registration");
+        assert_eq!(stored.client_id, "cid-fresh");
+        assert_eq!(stored.redirect_uri.as_deref(), Some(CALLBACK));
+    }
+
+    #[tokio::test]
+    async fn cached_registration_with_matching_redirect_is_reused() {
+        let server = TestServer::start(vec![]).await;
+        server.push_responses(vec![unauthorized(&server)]);
+        // The AS advertises DCR, but no /register route exists: a re-register
+        // attempt would fail loudly, proving reuse.
+        install_oauth_discovery(&server, true);
+
+        let manager = Arc::new(McpClientManager::new());
+        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
+        manager
+            .oauth
+            .store()
+            .upsert_registration(&OAuthRegistrationRecord {
+                auth_server: server.base(),
+                client_id: "cid-cached".to_string(),
+                client_secret: None,
+                token_endpoint_auth_method: "none".to_string(),
+                redirect_uri: Some(CALLBACK.to_string()),
+            })
+            .await
+            .unwrap();
+
+        connect_http_managed(&manager, &server, HttpAuth::None)
+            .await
+            .err()
+            .expect("unauthorized connect must not publish");
+
+        assert!(
+            server.recorded_for_path("/register").is_empty(),
+            "a matching redirect reuses the cached client"
+        );
+        let auth_url = pending_auth_url(&manager).await.expect("pending url");
+        assert_eq!(
+            query_params(&auth_url).get("client_id").map(String::as_str),
+            Some("cid-cached")
+        );
+    }
+
+    #[tokio::test]
     async fn static_auth_401_is_hard_failure_without_oauth_discovery() {
         let server = TestServer::start(vec![]).await;
         server.push_responses(vec![unauthorized(&server)]);
@@ -3049,12 +3169,7 @@ mod tests {
         manager
             .oauth
             .store()
-            .upsert_registration(&OAuthRegistrationRecord {
-                auth_server: server.base(),
-                client_id: "cid-1".to_string(),
-                client_secret: None,
-                token_endpoint_auth_method: "none".to_string(),
-            })
+            .upsert_registration(&none_registration(&server.base()))
             .await
             .unwrap();
         manager
@@ -3115,12 +3230,7 @@ mod tests {
         manager
             .oauth
             .store()
-            .upsert_registration(&OAuthRegistrationRecord {
-                auth_server: server.base(),
-                client_id: "cid-1".to_string(),
-                client_secret: None,
-                token_endpoint_auth_method: "none".to_string(),
-            })
+            .upsert_registration(&none_registration(&server.base()))
             .await
             .unwrap();
         manager
@@ -3194,12 +3304,7 @@ mod tests {
         manager
             .oauth
             .store()
-            .upsert_registration(&OAuthRegistrationRecord {
-                auth_server: server.base(),
-                client_id: "cid-1".to_string(),
-                client_secret: None,
-                token_endpoint_auth_method: "none".to_string(),
-            })
+            .upsert_registration(&none_registration(&server.base()))
             .await
             .unwrap();
         manager
@@ -3263,12 +3368,7 @@ mod tests {
         manager
             .oauth
             .store()
-            .upsert_registration(&OAuthRegistrationRecord {
-                auth_server: server.base(),
-                client_id: "cid-1".to_string(),
-                client_secret: None,
-                token_endpoint_auth_method: "none".to_string(),
-            })
+            .upsert_registration(&none_registration(&server.base()))
             .await
             .unwrap();
         manager
@@ -3595,6 +3695,7 @@ mod tests {
                 client_id: "ten-1".to_string(),
                 client_secret: None,
                 token_endpoint_auth_method: "none".to_string(),
+                redirect_uri: None,
             })
             .await
             .unwrap();

@@ -137,6 +137,9 @@ pub struct McpOAuthRegistrationRow {
     pub client_id: String,
     pub client_secret: Option<String>,
     pub token_endpoint_auth_method: String,
+    /// The `redirect_uri` the client was registered with, when known; `None`
+    /// for a pre-configured client or a pre-redirect-tracking row.
+    pub redirect_uri: Option<String>,
 }
 
 /// One `mcp_oauth_tokens` row: the OAuth token for an MCP server,
@@ -895,23 +898,24 @@ impl Database {
         &self,
         auth_server: &str,
     ) -> DbResult<Option<McpOAuthRegistrationRow>> {
-        let row: Option<(String, Option<String>, String)> = sqlx::query_as(
-            "SELECT client_id, client_secret, token_endpoint_auth_method \
+        let row: Option<(String, Option<String>, String, Option<String>)> = sqlx::query_as(
+            "SELECT client_id, client_secret, token_endpoint_auth_method, redirect_uri \
              FROM mcp_oauth_registrations WHERE auth_server = ?1",
         )
         .bind(auth_server)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(
-            row.map(|(client_id, client_secret, token_endpoint_auth_method)| {
+        Ok(row.map(
+            |(client_id, client_secret, token_endpoint_auth_method, redirect_uri)| {
                 McpOAuthRegistrationRow {
                     auth_server: auth_server.to_string(),
                     client_id,
                     client_secret,
                     token_endpoint_auth_method,
+                    redirect_uri,
                 }
-            }),
-        )
+            },
+        ))
     }
 
     /// Insert or replace the OAuth client registration for an authorization
@@ -926,13 +930,14 @@ impl Database {
     ) -> DbResult<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO mcp_oauth_registrations \
-             (auth_server, client_id, client_secret, token_endpoint_auth_method) \
-             VALUES (?1, ?2, ?3, ?4)",
+             (auth_server, client_id, client_secret, token_endpoint_auth_method, redirect_uri) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .bind(&registration.auth_server)
         .bind(&registration.client_id)
         .bind(&registration.client_secret)
         .bind(&registration.token_endpoint_auth_method)
+        .bind(&registration.redirect_uri)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -4463,6 +4468,7 @@ mod tests {
             client_id: "cid-1".to_string(),
             client_secret: None,
             token_endpoint_auth_method: "none".to_string(),
+            redirect_uri: Some("https://phoenix.example/api/mcp/oauth/callback".to_string()),
         };
         db.upsert_mcp_oauth_registration(&registration)
             .await
