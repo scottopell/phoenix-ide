@@ -1,0 +1,4 @@
+# Regenerable model artifact — `uv run model_logreg.py --retrain` reproduces it
+# deterministically from data/train_synth.jsonl (random_state pinned).
+*.pkl
+__pycache__/
