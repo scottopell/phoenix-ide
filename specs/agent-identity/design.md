@@ -92,7 +92,7 @@ Co-authored-by: phoenix-ide <phoenix-ide@noreply.local>
 
 - Survives `git rebase -i` (trailers are preserved as commit message content)
 - Visible in `git log`, `git show`, and all major git hosts
-- Compatible with user re-signing — the squash commit on main (REQ-PROJ-009) is authored by the user and can be signed normally; the agent commits with their trailers are squashed away
+- Attribution persists onto main — agent commits and their trailers reach main through the user's PR merge (work-lifecycle REQ-WL-002), so `Co-authored-by` stays visible in main's history; signing of those commits is the user's repository policy applied at merge time
 
 ---
 

@@ -12,7 +12,7 @@ Work conversations run git commands via the bash tool in a dedicated worktree on
 
 2. **No attribution without action.** Without any marker, `git log` on the task branch shows all commits as coming from the user's own identity, making it impossible to distinguish agent work from manual edits during the task.
 
-Agent commits on the task branch are ephemeral — on task completion they are squash-merged (REQ-PROJ-009). The squash commit on main can be signed by the user through their normal workflow. Phoenix does not manage push authentication, remote credentials, or commit signing on behalf of the user.
+Agent commits live on the task branch and reach main when the user merges the branch's pull request through their normal workflow (work-lifecycle REQ-WL-002); Phoenix never squash-merges or pushes on the user's behalf. The `Co-authored-by` trailer carries agent attribution into main's history, and whether those commits are signed is the user's repository policy, applied at merge time. Phoenix does not manage push authentication, remote credentials, or commit signing on behalf of the user.
 
 ---
 
@@ -27,7 +27,7 @@ SO THAT `git commit` operations complete without prompting for signing credentia
 WHEN the bash tool executes commands in an Explore conversation or Explore sub-agent
 THE SYSTEM SHALL NOT inject signing bypass variables
 
-**Rationale:** Users should not need to reconfigure their global git signing setup to use Phoenix. Agent commits on the task branch are squashed on completion — signing them individually provides no value and actively blocks the workflow. The bypass operates via process environment only; no config files are modified.
+**Rationale:** Users should not need to reconfigure their global git signing setup to use Phoenix. The bypass exists so signing prompts (1Password SSH, GPG) cannot hang an automated agent commit — not because the commits are throwaway; they persist and reach main through the user's PR merge. Whether they are signed is the user's repository policy, applied at merge time, not Phoenix's concern. The bypass operates via process environment only; no config files are modified.
 
 ---
 
