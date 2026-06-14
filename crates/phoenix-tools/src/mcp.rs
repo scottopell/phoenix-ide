@@ -1620,6 +1620,7 @@ impl McpClientManager {
                     )
                     .await
                     {
+                        manager.failed_servers.write().await.remove(&reconnect_name);
                         tracing::info!(
                             server = %reconnect_name,
                             tools = tool_count,
@@ -1628,11 +1629,17 @@ impl McpClientManager {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        server = %reconnect_name,
-                        "MCP server failed to connect after OAuth authorization: {e}"
-                    );
                     clear_ticket_if_current(&manager.connect_tickets, &reconnect_name, ticket);
+                    // A post-authorization reconnect failure must be retained
+                    // as a failure, not vanish (REQ-MCP-018).
+                    record_connect_failure(
+                        &manager.failed_servers,
+                        &manager.pending_oauth_urls,
+                        &reconnect_name,
+                        &config,
+                        format!("connect after authorization failed: {e}"),
+                    )
+                    .await;
                 }
             }
             drop(claim);
@@ -1656,12 +1663,25 @@ impl McpClientManager {
                 .find(|(_, flow)| flow.state_nonce == state_nonce)
                 .map(|(name, _)| name.clone())
         }?;
-        self.cancel_pending_oauth_flow(&name).await;
+        let config = self.cancel_pending_oauth_flow(&name).await;
         tracing::warn!(
             server = %name,
             error = %error,
             "MCP OAuth authorization failed at the authorization server"
         );
+        // Retain the denial as a failure rather than letting the server vanish
+        // from status (REQ-MCP-018). The pending URL is already cleared, so
+        // this records `failed`, not `unauthorized`.
+        if let Some(config) = config {
+            record_connect_failure(
+                &self.failed_servers,
+                &self.pending_oauth_urls,
+                &name,
+                &config,
+                format!("authorization failed: {error}"),
+            )
+            .await;
+        }
         Some(name)
     }
 
@@ -1910,7 +1930,6 @@ impl McpClientManager {
                         match result {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
-                                mgr.failed_servers.write().await.remove(&name);
                                 let tool_count = server.tools.len();
                                 if !publish_if_current(
                                     &mgr.servers,
@@ -1923,6 +1942,11 @@ impl McpClientManager {
                                 {
                                     return None;
                                 }
+                                // Clear the failure only once this attempt is
+                                // the published one; a superseded success must
+                                // not erase a failure the winning attempt
+                                // recorded (REQ-MCP-018).
+                                mgr.failed_servers.write().await.remove(&name);
                                 tracing::info!(
                                     server = %name,
                                     tools = tool_count,
@@ -2004,7 +2028,7 @@ impl McpClientManager {
                     auth: McpAuthKind::Oauth,
                     tool_count: 0,
                     tools: vec![],
-                    enabled: true,
+                    enabled: !disabled.contains(name),
                     pending_oauth_url: Some(url.clone()),
                     last_error: None,
                 });
@@ -2023,7 +2047,7 @@ impl McpClientManager {
                     auth: failure.auth,
                     tool_count: 0,
                     tools: vec![],
-                    enabled: true,
+                    enabled: !disabled.contains(name),
                     pending_oauth_url: None,
                     last_error: Some(failure.error.clone()),
                 });
@@ -2938,10 +2962,15 @@ impl McpClientManager {
             if let Err(e) = self.oauth.store().delete_token(name).await {
                 tracing::warn!(server = %name, "Failed to delete OAuth token for removed server: {e}");
             }
-            // A server dropped from config must not linger in the status as a
-            // failure (REQ-MCP-018).
-            self.failed_servers.write().await.remove(name);
         }
+        // Drop failure records for any server no longer configured (REQ-MCP-018).
+        // A failed-only server (one that never connected) is absent from
+        // `removed`, which is built from connected/claimed/pending servers, so
+        // sweeping the whole map against the config is what clears it.
+        self.failed_servers
+            .write()
+            .await
+            .retain(|name, _| config_names.contains(name));
         for (name, mut server) in removed_servers {
             self.pending_oauth_urls.write().await.remove(&name);
             server.terminate().await;
@@ -3023,11 +3052,14 @@ impl McpClientManager {
                         match result {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
-                                failed.write().await.remove(&name);
                                 let tool_count = server.tools.len();
                                 if publish_if_current(&servers, &tickets, &name, ticket, server)
                                     .await
                                 {
+                                    // Clear only once published, so a superseded
+                                    // success cannot erase the winning attempt's
+                                    // failure (REQ-MCP-018).
+                                    failed.write().await.remove(&name);
                                     tracing::info!(
                                         server = %name,
                                         tools = tool_count,
@@ -3129,11 +3161,14 @@ impl McpClientManager {
                         match result {
                             Ok(server) => {
                                 oauth.write().await.remove(&name);
-                                failed.write().await.remove(&name);
                                 let tool_count = server.tools.len();
                                 if publish_if_current(&servers, &tickets, &name, ticket, server)
                                     .await
                                 {
+                                    // Clear only once published, so a superseded
+                                    // success cannot erase the winning attempt's
+                                    // failure (REQ-MCP-018).
+                                    failed.write().await.remove(&name);
                                     (name, Ok(tool_count))
                                 } else {
                                     // Nothing was published; reporting this
@@ -3918,6 +3953,45 @@ mod tests {
         // Ok arms); the server then vanishes from the failed set.
         manager.failed_servers.write().await.remove("remote");
         assert!(manager.status().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_sweeps_failed_only_servers_dropped_from_config() {
+        let manager = McpClientManager::new();
+        manager.failed_servers.write().await.insert(
+            "gone".to_string(),
+            FailureRecord::from_config(
+                &http_none_config("https://gone.example/mcp"),
+                "boom".into(),
+            ),
+        );
+        // A failed-only server (never connected, so absent from the connected
+        // map) dropped from config must be swept, not linger in status.
+        manager.reload_from_configs(vec![]).await;
+        assert!(manager.failed_servers.read().await.is_empty());
+        assert!(manager.status().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_entry_reflects_disabled_state() {
+        let manager = McpClientManager::new();
+        manager.failed_servers.write().await.insert(
+            "remote".to_string(),
+            FailureRecord::from_config(&http_none_config("https://remote.example/mcp"), "x".into()),
+        );
+        manager
+            .disabled_servers
+            .write()
+            .await
+            .insert("remote".to_string());
+
+        let status = manager.status().await;
+        assert_eq!(status.len(), 1);
+        assert!(matches!(status[0].state, McpConnState::Failed));
+        assert!(
+            !status[0].enabled,
+            "a disabled failed server reports disabled"
+        );
     }
 
     #[tokio::test]

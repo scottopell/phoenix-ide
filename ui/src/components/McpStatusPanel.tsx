@@ -20,6 +20,10 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
   const [reloading, setReloading] = useState(false);
   const [togglingServers, setTogglingServers] = useState<Set<string>>(new Set());
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // While a reload retry is in flight, keep polling until this deadline even if
+  // no server is awaiting OAuth, so a failed server that the retry reconnects
+  // updates from `failed` to `ready` without a manual refresh.
+  const reloadUntilRef = useRef<number>(0);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -36,7 +40,9 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
   useEffect(() => {
     let cancelled = false;
     const shouldStopPolling = (s: McpServerStatus[]) =>
-      s.length > 0 && s.every(srv => !srv.pending_oauth_url);
+      s.length > 0 &&
+      s.every(srv => !srv.pending_oauth_url) &&
+      Date.now() > reloadUntilRef.current;
 
     fetchStatus().then(count => {
       if (cancelled) return;
@@ -52,9 +58,15 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     };
   }, [fetchStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Stop polling once all OAuth flows have resolved.
+  // Stop polling once all OAuth flows have resolved and any reload retry window
+  // has elapsed.
   useEffect(() => {
-    if (servers.length > 0 && servers.every(s => !s.pending_oauth_url) && pollRef.current) {
+    if (
+      servers.length > 0 &&
+      servers.every(s => !s.pending_oauth_url) &&
+      Date.now() > reloadUntilRef.current &&
+      pollRef.current
+    ) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
@@ -64,10 +76,14 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     e.stopPropagation();
     if (reloading) return;
     setReloading(true);
-    // Synchronously drop stale pending-OAuth entries from local state so the
-    // settling effect below doesn't treat them as "fresh content arrived" and
-    // clear `reloading` prematurely. Connected servers are kept untouched.
-    setServers(prev => prev.filter(s => !s.pending_oauth_url));
+    // Keep polling through the retry window so a reconnected server updates from
+    // failed/pending to ready without a manual refresh.
+    reloadUntilRef.current = Date.now() + 8000;
+    // Synchronously drop stale pending-OAuth and failed entries from local
+    // state: the reload retries them as background connects, so their new
+    // outcome should repopulate from polling rather than the panel showing a
+    // stale state. Connected servers are kept untouched.
+    setServers(prev => prev.filter(s => s.state === 'ready'));
     // Ensure polling is active — connection happens as a background task on the
     // server, so the new OAuth URL won't be in the status we fetch immediately.
     if (!pollRef.current) {

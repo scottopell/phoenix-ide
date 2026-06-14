@@ -141,23 +141,38 @@ fn resolve_external_origin(
         return external;
     }
     let scheme = if tls_loaded { "https" } else { "http" };
-    let host = external_host.unwrap_or_else(|| {
-        let ip = bind_address.ip();
-        if ip.is_unspecified() || ip.is_loopback() {
-            "localhost".to_string()
-        } else if let std::net::IpAddr::V6(v6) = ip {
-            // An IPv6 literal needs brackets to form a valid authority.
-            format!("[{v6}]")
-        } else {
-            ip.to_string()
-        }
-    });
+    // An IPv6 literal needs brackets to form a valid authority next to the
+    // port, whether it comes from the TLS host config or the bind fallback.
+    let host = external_host.map_or_else(
+        || {
+            let ip = bind_address.ip();
+            if ip.is_unspecified() || ip.is_loopback() {
+                "localhost".to_string()
+            } else if let std::net::IpAddr::V6(v6) = ip {
+                format!("[{v6}]")
+            } else {
+                ip.to_string()
+            }
+        },
+        bracket_if_ipv6,
+    );
     let port = bind_address.port();
     let default_port = if tls_loaded { 443 } else { 80 };
     if port == default_port {
         format!("{scheme}://{host}")
     } else {
         format!("{scheme}://{host}:{port}")
+    }
+}
+
+/// Bracket a bare IPv6 literal so it forms a valid URL authority; pass any
+/// other host (a domain or IPv4 literal, or an already-bracketed address)
+/// through unchanged.
+fn bracket_if_ipv6(host: String) -> String {
+    if !host.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host
     }
 }
 
@@ -247,6 +262,25 @@ mod external_origin_tests {
         assert_eq!(
             resolve_external_origin(None, false, None, addr("192.168.1.5:8042")),
             "http://192.168.1.5:8042"
+        );
+    }
+
+    #[test]
+    fn tls_ipv6_host_is_bracketed() {
+        // A bare IPv6 TLS host must be bracketed to form a valid authority.
+        assert_eq!(
+            resolve_external_origin(None, true, Some("2001:db8::1".into()), addr("0.0.0.0:8443")),
+            "https://[2001:db8::1]:8443"
+        );
+        // An already-bracketed literal passes through unchanged.
+        assert_eq!(
+            resolve_external_origin(
+                None,
+                true,
+                Some("[2001:db8::1]".into()),
+                addr("0.0.0.0:8443")
+            ),
+            "https://[2001:db8::1]:8443"
         );
     }
 
