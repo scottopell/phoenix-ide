@@ -566,11 +566,10 @@ async fn fork_origin_repo_root(
     let project_id = conv.project_id.as_deref()?;
     let project = db.get_project(project_id).await.ok()?;
     Some(
-        phoenix_core::git::detect_git_repo_root(Path::new(&project.canonical_path))
-            .map_or_else(
-                || std::path::PathBuf::from(&project.canonical_path),
-                std::path::PathBuf::from,
-            ),
+        phoenix_core::git::detect_git_repo_root(Path::new(&project.canonical_path)).map_or_else(
+            || std::path::PathBuf::from(&project.canonical_path),
+            std::path::PathBuf::from,
+        ),
     )
 }
 
@@ -1183,13 +1182,11 @@ impl RuntimeManager {
             .await
             .map_err(|e| ForkResolveError::Internal(e.to_string()))?;
 
-        let repo_root = phoenix_core::git::detect_git_repo_root(Path::new(
-            &project.canonical_path,
-        ))
-        .map_or_else(
-            || std::path::PathBuf::from(&project.canonical_path),
-            std::path::PathBuf::from,
-        );
+        let repo_root = phoenix_core::git::detect_git_repo_root(Path::new(&project.canonical_path))
+            .map_or_else(
+                || std::path::PathBuf::from(&project.canonical_path),
+                std::path::PathBuf::from,
+            );
 
         Ok(ResolveContext {
             proposal,

@@ -1055,8 +1055,7 @@ async fn reconcile_project_main_refs(db: &Database) {
             if local_branch_exists(repo_path, "main") {
                 continue;
             }
-            let Some(current) = phoenix_core::git::resolve_default_branch(repo_path)
-            else {
+            let Some(current) = phoenix_core::git::resolve_default_branch(repo_path) else {
                 tracing::warn!(
                     project_id = %project.id,
                     canonical_path = %project.canonical_path,

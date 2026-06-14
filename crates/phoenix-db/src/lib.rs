@@ -1128,8 +1128,9 @@ impl Database {
         // later if the repo becomes resolvable.
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
-        let main_ref = phoenix_core::git::resolve_default_branch(std::path::Path::new(canonical_path))
-            .unwrap_or_else(|| "main".to_string());
+        let main_ref =
+            phoenix_core::git::resolve_default_branch(std::path::Path::new(canonical_path))
+                .unwrap_or_else(|| "main".to_string());
 
         sqlx::query(
             "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES (?1, ?2, ?3, ?4)",
