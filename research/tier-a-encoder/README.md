@@ -87,3 +87,51 @@ uv run eval.py --data data/eval_seed.jsonl
 
 No dependencies — pure stdlib. Adding a model means adding a classifier callable
 and re-running; the harness and frozen set do not change.
+
+```bash
+uv run model_logreg.py --retrain     # rung 2: train logreg + score on eval set
+cd runtime-spike && cargo run --release   # W3: candle forward-pass latency
+```
+
+## Findings so far
+
+Numbers on the 61-command stratified seed set (SAFE=23, RISKY=20, BLOCKED=18).
+
+| Rung | BLOCKED recall | RISKY recall | danger FNR | danger FPR |
+|------|---------------|--------------|-----------|-----------|
+| 0 majority | 0.00 | 0.00 | 1.00 | 0.00 |
+| 1 bash_check rules | 0.56 | 0.00 | 0.74 | 0.00 |
+| 2 logreg (word+char ngram TF-IDF) | 1.00 | 1.00 | **0.00** | 0.04 |
+
+**Rung 2 beats rung 1 in-distribution, but the result is template-bound.** The
+synthetic corpus (W2) shares templates with the eval set, so logreg's 0.00 FNR
+reflects learned *template vocabulary*, not shell semantics. An out-of-template
+probe of novel dangerous verbs — `terraform destroy -auto-approve`,
+`kubectl delete ns prod`, `find / -delete`, `history -c` — is waved through as
+`SAFE`. This is the quantified case for rung 3: a BERT-mini pretrained on real
+shell corpora learns semantics that generalize past the templates. Do not ship
+rung 2 as the encoder; it is the bar rung 3 must clear on a *real* held-out set.
+
+### Decisions resolved (task 29001 decision-points)
+
+- **#1 inference runtime / ANE — RESOLVED: pure-Rust candle on CPU.** The W3
+  spike measures a random-weight BERT-mini forward pass (batch=1) at p99 **2.07ms
+  (seq 32) / 2.69ms (seq 64)** on Apple Silicon CPU with the Accelerate BLAS
+  backend, single-threaded. This clears a low-single-digit-ms budget, so the
+  ONNX→CoreML/ANE path is unnecessary complexity — inference stays a single Rust
+  dependency with no model-conversion toolchain.
+- **#5 latency budget — RESOLVED: ~3ms p99 is the floor, well within budget.**
+  Sub-ms (the original hypothesis) is *not* achievable — eager per-op overhead
+  for a 4-layer stack floors at ~2ms — but 3ms p99 on a synchronous pre-dispatch
+  gate is fine.
+- Two runtime gotchas the spike surfaced, load-bearing for the inference impl:
+  the **gemm backend** (BLAS-backed vs candle's pure-Rust gemm) dominates latency
+  far more than ANE-vs-CPU would; and **batch=1 must pin rayon to one thread** —
+  the multi-thread default is contention-bound and blows p99 to ~100ms.
+
+### Still open (need W2-real before rung 3)
+
+Decision-points #2 (tokenizer), #3 (real training corpus + per-class metrics on a
+*real* held-out set), #4 (threshold calibration on a held-out split), #6 (model
+shipping/versioning) remain. The synthetic corpus is a scaffold, not the training
+set — rung 3 needs the real corpora named under W2.
