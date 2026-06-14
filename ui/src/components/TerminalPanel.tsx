@@ -159,6 +159,13 @@ interface CommandExecution {
 /** REQ-TERM-015. Frontend mirrors `config.shell_integration_detection_window`. */
 const DETECTION_WINDOW_MS = 5000;
 
+/**
+ * How long a mouseup-armed clipboard write waits for tmux's OSC 52 to arrive
+ * before giving up. The PTY round-trip is sub-frame; this only guards against a
+ * mouseup that produced no tmux copy (plain click, empty selection).
+ */
+const OSC52_ARM_TIMEOUT_MS = 500;
+
 /** Build the WebSocket URL for a terminal scope. */
 function terminalWsUrl(scope: TerminalScope): string {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -402,12 +409,14 @@ export function TerminalPanel({
       fontSize: 13,
       scrollback: 1000,
       // When the PTY child is `tmux attach` with `mouse on`, tmux requests
-      // SGR mouse tracking, so xterm forwards drags to tmux instead of making
-      // a local DOM selection — which is what term.getSelection() (send-to-LLM)
-      // and highlight-to-copy both rely on. xterm honors Shift+drag to force a
-      // local selection on every platform; this opt extends that to Option+drag
-      // on macOS so the usual "hold Shift or Alt to escape the app's mouse
-      // grab" muscle memory works here too.
+      // SGR mouse tracking, so xterm forwards drags to tmux instead of making a
+      // local DOM selection — which is what term.getSelection() (send-to-LLM)
+      // relies on. xterm's force-local-selection modifier is platform-split
+      // (SelectionService.shouldForceSelection): Shift+drag on non-mac, and on
+      // macOS *only* Option+drag, gated behind this opt. Shift does nothing on
+      // macOS. Plain-drag copy still works via tmux's OSC 52 (see Drag-to-copy
+      // below); this is only for the modifier-drag path that yields an
+      // xterm-side selection.
       macOptionClickForcesSelection: true,
     });
     const fitAddon = new FitAddon();
@@ -430,9 +439,9 @@ export function TerminalPanel({
     // default (some browsers focus the URL bar on Cmd+L). The shortcut
     // works regardless of OSC 133 status or whether a command is running.
     // It reads xterm's own selection: under a direct shell any drag selects;
-    // under `tmux attach` with mouse tracking on, the drag must hold Shift
-    // (any platform) or Alt (macOptionClickForcesSelection) to escape tmux's
-    // mouse grab and land an xterm-side selection.
+    // under `tmux attach` with mouse tracking on, the drag must escape tmux's
+    // mouse grab to land an xterm-side selection — Shift+drag off macOS,
+    // Option+drag on macOS (see macOptionClickForcesSelection above).
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
       const isSendSelection =
@@ -560,17 +569,27 @@ export function TerminalPanel({
       return true;
     });
 
-    // --- OSC 52 clipboard write ---
-    // tmux runs with `set-clipboard on`, so when text is copied inside a tmux
-    // copy-mode selection (the plain mouse-drag path under `mouse on`) tmux
-    // emits `OSC 52 ; <targets> ; <base64>` to its client — us. Route it to the
-    // system clipboard so a plain drag-select copies, mirroring how a native
-    // terminal forwards OSC 52 to the OS. A `?` payload is a clipboard *read*
-    // query; we never answer it (answering would leak clipboard contents to
-    // whatever is running in the PTY).
+    // --- Drag-to-copy ---
+    // Two mutually-exclusive paths per drag, both finishing on mouseup:
+    //
+    //   xterm owns the selection (Shift/Alt+drag escapes tmux's mouse grab, or a
+    //   direct-shell child with no mouse tracking) — copied synchronously inside
+    //   the mouseup gesture.
+    //
+    //   tmux owns the selection (plain drag under `mouse on`) — xterm has no DOM
+    //   selection; tmux is configured `set-clipboard on` and emits OSC 52 with
+    //   the copied text over the PTY *after* mouseup. WebKit only permits a
+    //   clipboard write that *begins* inside a user gesture, so the async OSC 52
+    //   text cannot call writeText directly (Chromium's standing clipboard-write
+    //   permission lets it, WebKit's does not). Instead mouseup arms a
+    //   ClipboardItem whose payload Promise the OSC 52 handler resolves.
+    let pendingTmuxClipboard: { resolve: (blob: Blob) => void; reject: () => void } | null = null;
+
     const handleOsc52 = (data: string): void => {
       const semi = data.indexOf(';');
       const payload = semi === -1 ? data : data.slice(semi + 1);
+      // A `?` payload is a clipboard *read* query; we never answer it (answering
+      // would leak clipboard contents to whatever is running in the PTY).
       if (payload === '?' || payload === '') return;
       // The payload is attacker-influenceable PTY output. Bound it before
       // decoding so a pathological sequence can't force a multi-hundred-MB
@@ -588,6 +607,15 @@ export function TerminalPanel({
         console.debug('OSC 52 base64 decode failed');
         return;
       }
+      if (pendingTmuxClipboard) {
+        // Fulfill the gesture-armed write from the preceding mouseup.
+        pendingTmuxClipboard.resolve(new Blob([text], { type: 'text/plain' }));
+        pendingTmuxClipboard = null;
+        return;
+      }
+      // No armed write (browser lacks async ClipboardItem, or OSC 52 arrived
+      // outside a drag) — direct write. Succeeds where the page holds standing
+      // clipboard-write permission (Chromium); a silent no-op on WebKit.
       void copyToClipboard(text);
     };
     const osc52Dispose = term.parser.registerOscHandler(52, (data: string) => {
@@ -595,22 +623,40 @@ export function TerminalPanel({
       return true;
     });
 
-    // Highlight-to-copy: when xterm owns the selection (Shift/Alt+drag escapes
-    // tmux's mouse grab, or a direct-shell child with no mouse tracking), mirror
-    // the finished selection to the system clipboard. The clipboard write must
-    // run inside a user gesture — navigator.clipboard.writeText (and the
-    // execCommand fallback) fail without transient activation — so onSelectionChange
-    // only tracks the latest selection text and the actual copy fires on mouseup.
-    // The same selection also feeds Cmd/Ctrl+Shift+L send-to-LLM above.
-    let latestSelection = '';
-    const disposeSelectionCopy = term.onSelectionChange(() => {
-      latestSelection = term.hasSelection() ? term.getSelection() : '';
-    });
-    const copyLatestSelection = (): void => {
-      if (latestSelection.length > 0) void copyToClipboard(latestSelection);
+    const canArmAsyncClipboard =
+      typeof ClipboardItem !== 'undefined' && typeof navigator.clipboard?.write === 'function';
+
+    const handleMouseUp = (): void => {
+      if (term.hasSelection()) {
+        const selection = term.getSelection();
+        if (selection.length > 0) void copyToClipboard(selection);
+        return;
+      }
+      // No xterm selection: a plain tmux drag whose OSC 52 is in flight. Arm a
+      // clipboard write now, inside the gesture; handleOsc52 resolves it. If no
+      // OSC 52 lands (plain click, or the drag selected nothing) the payload
+      // Promise is rejected on timeout, leaving the clipboard untouched.
+      if (!canArmAsyncClipboard) return;
+      if (pendingTmuxClipboard) pendingTmuxClipboard.reject();
+      let settle!: { resolve: (blob: Blob) => void; reject: () => void };
+      const blobPromise = new Promise<Blob>((resolve, reject) => {
+        settle = { resolve, reject };
+      });
+      pendingTmuxClipboard = settle;
+      window.setTimeout(() => {
+        if (pendingTmuxClipboard === settle) {
+          pendingTmuxClipboard = null;
+          settle.reject();
+        }
+      }, OSC52_ARM_TIMEOUT_MS);
+      void navigator.clipboard
+        .write([new ClipboardItem({ 'text/plain': blobPromise })])
+        .catch(() => {
+          // Rejected payload (timeout) or denied permission — clipboard intact.
+        });
     };
     const termEl = containerRef.current;
-    termEl.addEventListener('mouseup', copyLatestSelection);
+    termEl.addEventListener('mouseup', handleMouseUp);
 
     // --- Detection timeout (REQ-TERM-015) ---
     detectionTimeoutRef.current = window.setTimeout(() => {
@@ -717,8 +763,11 @@ export function TerminalPanel({
         osc133Dispose.dispose();
         osc7Dispose.dispose();
         osc52Dispose.dispose();
-        disposeSelectionCopy.dispose();
-        termEl.removeEventListener('mouseup', copyLatestSelection);
+        if (pendingTmuxClipboard) {
+          pendingTmuxClipboard.reject();
+          pendingTmuxClipboard = null;
+        }
+        termEl.removeEventListener('mouseup', handleMouseUp);
         window.removeEventListener('resize', handleResize);
         if (activityTimeoutRef.current !== null) {
           window.clearTimeout(activityTimeoutRef.current);
