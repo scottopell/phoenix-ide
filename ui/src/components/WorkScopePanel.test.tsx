@@ -7,11 +7,20 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
+import { useEffect } from 'react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import type { WorkScopeInventory, BashHandleInventory } from '../api';
 import { api } from '../api';
-import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
+import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { hasRunningBash, hasLiveResource } from './workScopeHelpers';
+
+/** Observe the viewer slot so a test can assert that an affordance (e.g. the
+ *  browser "open →" button) drove the slot transition. */
+function CaptureSlot({ onSlot }: { onSlot: (slot: ReturnType<typeof useViewerSlot>['slot']) => void }) {
+  const { slot } = useViewerSlot();
+  useEffect(() => { onSlot(slot); }, [slot, onSlot]);
+  return null;
+}
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
@@ -550,6 +559,98 @@ describe('inspect affordance + provider dependency', () => {
     openBashDetail();
     expect(screen.getByTitle('Open the process inspector for this handle')).toBeTruthy();
     expect(screen.getByText('inspect →')).toBeTruthy();
+  });
+});
+
+describe('browser open affordance (Phase 3)', () => {
+  /** A WorkScopeSection (inspectable rows) over a fixed inventory, with a
+   *  CaptureSlot sibling inside the same provider so the test can observe the
+   *  slot transition the "open →" button drives. */
+  function browserSectionTree(props: {
+    inventory: WorkScopeInventory;
+    onSlot: (slot: ReturnType<typeof useViewerSlot>['slot']) => void;
+  }) {
+    return (
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes>
+          <Route
+            path="/c/:slug"
+            element={
+              <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={true}>
+                <WorkScopeSection
+                  scopeKey="ws-1"
+                  liveInventory={props.inventory}
+                  expanded={true}
+                  onToggleExpanded={() => {}}
+                />
+                <CaptureSlot onSlot={props.onSlot} />
+              </ViewerSlotProvider>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+  }
+
+  it('a LIVE browser + inspectable rows renders open →; clicking it opens the browser slot', async () => {
+    const liveBrowser = inv([], { browser: { state: 'live', idle_ms: 0 } });
+    getInv.mockResolvedValue(liveBrowser);
+
+    let slot: ReturnType<typeof useViewerSlot>['slot'] = { kind: 'none' };
+    await act(async () => {
+      render(browserSectionTree({ inventory: liveBrowser, onSlot: (s) => { slot = s; } }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const open = screen.getByTestId('browser-open-button');
+    expect(open).toBeTruthy();
+    expect(screen.getByText('open →')).toBeTruthy();
+
+    expect(slot).toEqual({ kind: 'none' });
+    fireEvent.click(open);
+    expect(slot).toEqual({ kind: 'browser' });
+  });
+
+  it('a torn_down browser does NOT render open → (even though rows are inspectable)', async () => {
+    const deadBrowser = inv([], { browser: { state: 'torn_down', idle_ms: 0 } });
+    getInv.mockResolvedValue(deadBrowser);
+
+    await act(async () => {
+      render(browserSectionTree({ inventory: deadBrowser, onSlot: () => {} }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The browser row is present (torn down), but no open affordance.
+    expect(document.querySelector('.ws-row--dead .ws-row-label')?.textContent).toBe('browser');
+    expect(screen.queryByTestId('browser-open-button')).toBeNull();
+  });
+
+  it('a LIVE browser in a non-inspectable dock does NOT render open →', async () => {
+    // WorkScopePanel's standalone dock renders BrowserRow with inspectable=false.
+    const liveBrowser = inv([], { browser: { state: 'live', idle_ms: 0 } });
+    getInv.mockResolvedValue(liveBrowser);
+
+    await act(async () => {
+      render(
+        <WorkScopePanel
+          scopeKey="ws-1"
+          liveInventory={liveBrowser}
+          collapsed={false}
+          onToggle={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const labels = Array.from(document.querySelectorAll('.ws-row-label')).map((n) => n.textContent);
+    expect(labels).toContain('browser');
+    expect(screen.queryByTestId('browser-open-button')).toBeNull();
   });
 });
 

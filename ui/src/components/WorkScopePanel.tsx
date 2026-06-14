@@ -138,6 +138,24 @@ function BashInspectButton({ scopeKey, handleId }: { scopeKey: string; handleId:
   );
 }
 
+/** The "open →" affordance for a live browser session. Isolated so
+ *  `useViewerSlot()` (which throws outside a `ViewerSlotProvider`) is only
+ *  called when a live browser row is actually inspectable. */
+function BrowserOpenButton() {
+  const { openBrowser } = useViewerSlot();
+  return (
+    <button
+      type="button"
+      className="ws-row-open"
+      data-testid="browser-open-button"
+      onClick={() => openBrowser()}
+      title="Open the live browser view"
+    >
+      open →
+    </button>
+  );
+}
+
 function BashRow({
   handle,
   now,
@@ -219,7 +237,15 @@ function TmuxRow({ status }: { status: 'not_probed' | 'live' | 'gone' }) {
   );
 }
 
-function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: number }) {
+function BrowserRow({
+  state,
+  idleMs,
+  inspectable,
+}: {
+  state: 'live' | 'torn_down';
+  idleMs: number;
+  inspectable: boolean;
+}) {
   // "idle" is a client-side display over idle_ms; the wire state stays live.
   const idle = state === 'live' && idleMs >= BROWSER_IDLE_THRESHOLD_MS;
   const display =
@@ -236,6 +262,7 @@ function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: nu
         </span>
         <span className="ws-row-label">browser</span>
         <span className="ws-row-meta">{display.text}</span>
+        {state === 'live' && inspectable && <BrowserOpenButton />}
       </div>
     </div>
   );
@@ -442,7 +469,7 @@ function WorkScopeBody({
           <section className="ws-section">
             <div className="ws-section-head">browser</div>
             {inventory.browser ? (
-              <BrowserRow state={inventory.browser.state} idleMs={inventory.browser.idle_ms} />
+              <BrowserRow state={inventory.browser.state} idleMs={inventory.browser.idle_ms} inspectable={inspectable} />
             ) : (
               <div className="ws-empty">no session</div>
             )}
