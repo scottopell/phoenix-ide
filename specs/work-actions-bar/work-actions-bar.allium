@@ -1,0 +1,566 @@
+-- allium: 3
+-- work-actions-bar.allium
+--
+-- Phoenix Work Actions Bar: Behavioural Specification
+--
+-- Scope: The `.work-actions-bar` row rendered on Work and Branch conversations
+--        while the conversation is idle, errored, or context-exhausted.
+--        Governs visibility, three-zone layout, the single-primary rule, the
+--        WorkDisposition derivation, verb labels, tooltip copy, and the
+--        no-disabled-as-status / no-two-step-toggle principles.
+--
+-- This is a COMPOSITION spec. It re-derives nothing: PR status and the
+-- auto-fix affordance come from pr-association; terminal-action git semantics
+-- come from work-lifecycle; legality comes from bedrock; the diff and browser
+-- viewers come from viewer_slot. This spec selects which verb is primary and
+-- which verbs are present, given those inputs.
+--
+-- Includes:
+--   - Bar visibility (mode + phase gate).
+--   - WorkDisposition: the single derived state selecting the primary verb,
+--     total over every open-PR and stuck-with-PR case.
+--   - Three-zone layout: REVIEW (View Diff), RESOLVE (push-forward), FINISH
+--     (terminal verbs Clean up and Abandon).
+--   - RESOLVE suppression in stuck phases (error, context_exhausted).
+--   - Single primary across the whole bar, encoded structurally.
+--   - View Browser exclusion from this bar.
+--   - Tooltip semantics for terminal verbs.
+--
+-- Excludes:
+--   - PR status derivation, primary PR selection, the check-state and
+--     feedback-freshness signals, auto-fix affordance logic (pr-association:
+--     PrStatusView, PrCheckState, PrFeedbackFreshness, PrAutoFixAffordance,
+--     WorkScopePrStatusContract, WorkActionsPrAffordanceContract).
+--   - Terminal action git semantics: worktree deletion, diff snapshot,
+--     mode-dependent branch disposition, confirmation gate (work-lifecycle:
+--     REQ-WL-001/002/003).
+--   - Action legality gate: when a terminal action may fire (bedrock
+--     TaskResolved: REQ-BED-029 for terminal-on-resolution, REQ-BED-031 for
+--     context_exhausted disposability).
+--   - Diff viewer (viewer_slot REQ-VS-003) and browser viewer (REQ-VS-008)
+--     mechanics; the browser launcher's home (work-scope-ui REQ-WSUI-004).
+--
+-- Dependencies:
+--   specs/bedrock/bedrock.allium
+--   specs/pr-association/pr-association.allium
+
+use "../bedrock/bedrock.allium" as bedrock
+use "../pr-association/pr-association.allium" as pra
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Inputs to WorkDisposition derivation, gathered from the conversation and its
+-- PR status handle. This is a snapshot at render time; the bar re-derives on
+-- every render. pr_status carries pra/PrCheckState and pra/PrFeedbackFreshness
+-- inside pra/PrStatusView; the address-vs-merge split reads those, not the raw
+-- provider wire.
+value BarInputs {
+    phase: BarPhase
+    mode: ConvMode
+    continued_in_conv_id: String?
+    pr_status: pra/PrStatusView?
+    auto_fix_affordance: pra/PrAutoFixAffordance
+}
+
+-- The primary selection and button-set for the bar, derived from BarInputs.
+-- No button state is stored; the bar re-derives this value on every render.
+--
+-- The single-primary rule (REQ-WAB-003) is encoded structurally: `primary`
+-- names exactly one slot in the whole bar (or none). It is not possible to
+-- represent two glowing buttons, because `primary` holds one variant. Whether
+-- a zone *renders* its verb (review_zone.show_view_diff, resolve_zone.visible,
+-- finish_zone.show_*) is independent of which single slot glows.
+value BarPresentation {
+    disposition: WorkDisposition
+    review_zone: ReviewZone
+    resolve_zone: ResolveZone
+    finish_zone: FinishZone
+    primary: BarPrimary
+    inline_note: InlineNote?
+}
+
+-- The REVIEW zone is always the same: View Diff only. View Browser is NOT a
+-- field here (REQ-WAB-006); its absence is structural.
+value ReviewZone {
+    show_view_diff: Boolean
+}
+
+value ResolveZone {
+    visible: Boolean
+    verb: ResolveVerb?        -- null exactly when visible = false
+}
+
+value FinishZone {
+    show_clean_up: Boolean
+    show_abandon: Boolean
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Phases that make the bar eligible for display (REQ-WAB-001). Running and
+-- awaiting phases are absent from this enum: the bar is hidden entirely during
+-- those phases, so no eligible value can name them. The three members mirror
+-- bedrock's TaskResolved disposability (REQ-BED-029 for idle/error,
+-- REQ-BED-031 for context_exhausted).
+enum BarPhase {
+    idle
+    | error
+    | context_exhausted
+}
+
+enum ConvMode {
+    work
+    | branch
+}
+
+-- The single derived state that selects the primary verb and which verbs are
+-- present (REQ-WAB-004). Total: every reachable combination of phase,
+-- continuation, and PR state maps to exactly one variant via derive_disposition.
+enum WorkDisposition {
+    continued           -- continued_in_conv_id set; no primary; RESOLVE + FINISH suppressed
+    | stuck             -- phase in {error, context_exhausted}; RESOLVE suppressed; FINISH primary
+    | address_feedback  -- idle, PR open/draft, addressable: failing checks or fresh feedback, affordance enabled
+    | merge_ready       -- idle, PR open, checks passing
+    | pr_open_other     -- idle, PR open/draft, not addressable and not green (pending, draft, or affordance-disabled)
+    | clean_up_merged   -- idle, PR merged
+    | pr_closed         -- idle, PR closed unmerged
+    | no_pr             -- idle, no PR found, refresh not unavailable
+    | gh_unavailable    -- idle, no PR identity, refresh unavailable
+}
+
+-- The push-forward verb in the RESOLVE zone. External navigation (GitHub link)
+-- vs. in-Phoenix action is part of the verb identity. A merge-ready or
+-- pr_open_other PR both surface an honest external link verb; only
+-- address_feedback posts a UserMessage in-Phoenix.
+enum ResolveVerb {
+    address_feedback    -- "Address feedback": posts a UserMessage via PrAutoFixAffordance
+    | merge_link        -- "Merge PR #N ↗": opens PrIdentity.url in a new tab (Phoenix has no merge API)
+    | open_pr_link      -- "Open PR #N ↗": opens PrIdentity.url; honest when checks are not passing
+}
+
+-- The single glowing slot across the whole bar (REQ-WAB-003). Exactly one of
+-- these is the bar's primary; `none` is the continued case (no primary at all).
+-- Because BarPresentation.primary holds one BarPrimary, two simultaneous
+-- primaries are unrepresentable.
+enum BarPrimary {
+    none                -- continued: no glowing verb anywhere
+    | resolve           -- the RESOLVE verb glows (idle, push-forward available)
+    | clean_up          -- the FINISH Clean up verb glows
+    | abandon           -- the FINISH Abandon verb glows
+}
+
+-- At most one inline note is shown per render.
+enum InlineNote {
+    continued_note          -- "Continued — actions belong on the continuation."
+    | pr_open_stuck_note     -- "PR #N still open — merge on GitHub, or abandon."
+    | pr_closed_note        -- "PR closed — abandon to clean up."
+    | gh_unavailable_note   -- "gh unavailable — manual cleanup."
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The rendered bar for one conversation. One per conversation; present only
+-- when the conversation is in an eligible phase and mode (phase_is_eligible).
+-- Non-eligible conversations have no bar entity at all.
+entity WorkActionsBar {
+    conversation: bedrock/Conversation
+
+    inputs: BarInputs
+    presentation: BarPresentation
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+--
+-- Pure functions referenced by the rules below. Documented here as the single
+-- source of truth for their signatures and semantics.
+--
+--   phase_is_eligible(conv: bedrock/Conversation) -> Boolean
+--       True when conv.mode in { work, branch } AND the conversation is in a
+--       disposable, non-running condition: conv.core_status in { idle, error }
+--       or conv.parent_status = context_exhausted. Mirrors bedrock's
+--       TaskResolved disposability (REQ-BED-029, REQ-BED-031).
+--
+--   conv_mode(conv: bedrock/Conversation) -> ConvMode
+--       Maps conv.mode: work -> ConvMode.work, branch -> ConvMode.branch. Not
+--       called for other modes (the bar is hidden for them).
+--
+--   derive_bar_phase(conv: bedrock/Conversation) -> BarPhase
+--       core_status = idle  -> BarPhase.idle
+--       core_status = error -> BarPhase.error
+--       parent_status = context_exhausted -> BarPhase.context_exhausted
+--       Only called when phase_is_eligible is true.
+--
+--   resolve_pr_status(conv: bedrock/Conversation) -> pra/PrStatusView?
+--       The PrStatusView (pr-association, WorkScopePrStatusContract) for this
+--       conversation, or null while the status is still loading.
+--
+--   resolve_auto_fix_affordance(conv: bedrock/Conversation) -> pra/PrAutoFixAffordance
+--       The PrAutoFixAffordance derived via pr-association's
+--       WorkActionsPrAffordanceContract.derive_affordance from the current
+--       PrStatusView.
+--
+--   pr_addressable(status: pra/PrStatusView) -> Boolean
+--       True when the PR needs attention and auto-fix can act on it:
+--         status.pr != null
+--         AND status.pr.display_state in { open, draft }
+--         AND (status.check_state = failing OR status.feedback_freshness != null)
+--         AND status.auto_fix is enabled (the affordance passed alongside).
+--       Reads pra/PrCheckState and pra/PrFeedbackFreshness (the newly typed
+--       fields on PrStatusView), never the raw provider wire. In derive_*
+--       below the affordance.enabled term is supplied from BarInputs.
+--
+--   pr_merge_ready(status: pra/PrStatusView) -> Boolean
+--       True when status.pr != null AND status.pr.display_state = open AND
+--       status.check_state = passing.
+--
+--   derive_disposition(inputs: BarInputs) -> WorkDisposition
+--       Evaluates the REQ-WAB-004 table top-to-bottom and returns the first
+--       matching WorkDisposition. Total over every input combination.
+--
+--   finish_primary_for_disposition(d: WorkDisposition, status: pra/PrStatusView?) -> BarPrimary
+--       The SINGLE source of FINISH-primary selection, shared by the stuck and
+--       idle paths so the PR-state logic is not duplicated. Total over the
+--       FINISH-primary dispositions:
+--         PR merged           -> clean_up
+--         PR closed unmerged  -> abandon
+--         PR open/draft       -> abandon   (stuck only: merge on GitHub or abandon)
+--         no PR (refresh ok)  -> clean_up
+--         gh unavailable      -> clean_up
+--       Returns clean_up for stuck-with-no-PR and stuck-with-gh-unavailable.
+--       Never returns resolve or none.
+--
+--   inline_note_for(d: WorkDisposition, status: pra/PrStatusView?) -> InlineNote?
+--       Returns the InlineNote for the disposition, or null when no note is
+--       needed (continued -> continued_note, pr_closed -> pr_closed_note,
+--       gh_unavailable -> gh_unavailable_note, stuck-with-open-PR ->
+--       pr_open_stuck_note, otherwise null).
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ===========================================================
+-- WAB 1. VISIBILITY (REQ-WAB-001)
+-- ===========================================================
+
+rule BarRenderedWhenEligible {
+    when: ConversationRendered(conversation)
+
+    requires: phase_is_eligible(conversation)
+
+    ensures: WorkActionsBar.created(
+        conversation: conversation,
+        inputs: BarInputs{
+            phase: derive_bar_phase(conversation),
+            mode: conv_mode(conversation),
+            continued_in_conv_id: conversation.continued_in_conv_id,
+            pr_status: resolve_pr_status(conversation),
+            auto_fix_affordance: resolve_auto_fix_affordance(conversation)
+        }
+    )
+}
+
+rule BarHiddenWhenNotEligible {
+    when: ConversationRendered(conversation)
+
+    requires: not phase_is_eligible(conversation)
+
+    ensures: not WorkActionsBar.created
+}
+
+-- ===========================================================
+-- WAB 2. DISPOSITION DERIVATION (REQ-WAB-004)
+-- ===========================================================
+--
+-- Rows are evaluated top-to-bottom; the first whose `requires` holds wins.
+-- Every reachable input maps to exactly one row: continuation, then stuck,
+-- then the four idle-with-open-PR outcomes (address / merge_ready /
+-- pr_open_other), then merged / closed / no-PR / gh-unavailable. There is no
+-- gap.
+
+-- Row 1. Continued: no primary; RESOLVE + FINISH suppressed (REQ-WAB-009).
+rule DispositionContinued {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id != null
+
+    ensures: bar.presentation.disposition = continued
+    ensures: bar.presentation.resolve_zone.visible = false
+    ensures: bar.presentation.finish_zone.show_clean_up = false
+    ensures: bar.presentation.finish_zone.show_abandon = false
+    ensures: bar.presentation.primary = none
+    ensures: bar.presentation.inline_note = continued_note
+}
+
+-- Row 2. Stuck (error / context_exhausted): RESOLVE always suppressed
+-- (REQ-WAB-005); the primary collapses to a FINISH verb selected by PR state
+-- through the shared helper. View Diff and Abandon remain present.
+rule DispositionStuck {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id = null
+    requires: bar.inputs.phase in { error, context_exhausted }
+
+    ensures: bar.presentation.disposition = stuck
+    ensures: bar.presentation.resolve_zone.visible = false
+    ensures: bar.presentation.finish_zone.show_clean_up = true
+    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.primary = finish_primary_for_disposition(stuck, bar.inputs.pr_status)
+    ensures: bar.presentation.inline_note = inline_note_for(stuck, bar.inputs.pr_status)
+}
+
+-- Row 3. Address feedback: idle, PR open/draft, addressable (failing checks OR
+-- fresh feedback) AND auto-fix affordance enabled. RESOLVE is primary.
+rule DispositionAddressFeedback {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id = null
+    requires: bar.inputs.phase = idle
+    requires: bar.inputs.pr_status != null
+    requires: bar.inputs.pr_status.pr != null
+    requires: bar.inputs.pr_status.pr.display_state in { open, draft }
+    requires: pr_addressable(bar.inputs.pr_status)
+    requires: bar.inputs.auto_fix_affordance.enabled = true
+
+    ensures: bar.presentation.disposition = address_feedback
+    ensures: bar.presentation.resolve_zone.visible = true
+    ensures: bar.presentation.resolve_zone.verb = address_feedback
+    ensures: bar.presentation.finish_zone.show_clean_up = false
+    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.primary = resolve
+    ensures: bar.presentation.inline_note = null
+}
+
+-- Row 4. Merge ready: idle, PR open, checks passing. RESOLVE is primary, an
+-- honest "Merge PR #N ↗" external link.
+rule DispositionMergeReady {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id = null
+    requires: bar.inputs.phase = idle
+    requires: bar.inputs.pr_status != null
+    requires: bar.inputs.pr_status.pr != null
+    requires: bar.inputs.pr_status.pr.display_state = open
+    requires: pr_merge_ready(bar.inputs.pr_status)
+    requires: not pr_addressable(bar.inputs.pr_status)
+
+    ensures: bar.presentation.disposition = merge_ready
+    ensures: bar.presentation.resolve_zone.visible = true
+    ensures: bar.presentation.resolve_zone.verb = merge_link
+    ensures: bar.presentation.finish_zone.show_clean_up = false
+    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.primary = resolve
+    ensures: bar.presentation.inline_note = null
+}
+
+-- Row 5. PR open/draft but neither addressable nor green: pending checks, a
+-- draft, or failing-with-affordance-disabled. RESOLVE is primary, an honest
+-- "Open PR #N ↗" link — never labelled "Merge" when checks are not passing.
+rule DispositionPrOpenOther {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id = null
+    requires: bar.inputs.phase = idle
+    requires: bar.inputs.pr_status != null
+    requires: bar.inputs.pr_status.pr != null
+    requires: bar.inputs.pr_status.pr.display_state in { open, draft }
+    requires: not pr_addressable(bar.inputs.pr_status)
+    requires: not pr_merge_ready(bar.inputs.pr_status)
+
+    ensures: bar.presentation.disposition = pr_open_other
+    ensures: bar.presentation.resolve_zone.visible = true
+    ensures: bar.presentation.resolve_zone.verb = open_pr_link
+    ensures: bar.presentation.finish_zone.show_clean_up = false
+    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.primary = resolve
+    ensures: bar.presentation.inline_note = null
+}
+
+-- Row 6. PR merged: Clean up primary.
+rule DispositionCleanUpMerged {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id = null
+    requires: bar.inputs.phase = idle
+    requires: bar.inputs.pr_status != null
+    requires: bar.inputs.pr_status.pr != null
+    requires: bar.inputs.pr_status.pr.display_state = merged
+
+    ensures: bar.presentation.disposition = clean_up_merged
+    ensures: bar.presentation.resolve_zone.visible = false
+    ensures: bar.presentation.finish_zone.show_clean_up = true
+    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.primary = finish_primary_for_disposition(clean_up_merged, bar.inputs.pr_status)
+    ensures: bar.presentation.inline_note = null
+}
+
+-- Row 7. PR closed unmerged: Abandon primary; Clean up suppressed.
+rule DispositionPrClosed {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id = null
+    requires: bar.inputs.phase = idle
+    requires: bar.inputs.pr_status != null
+    requires: bar.inputs.pr_status.pr != null
+    requires: bar.inputs.pr_status.pr.display_state = closed
+
+    ensures: bar.presentation.disposition = pr_closed
+    ensures: bar.presentation.resolve_zone.visible = false
+    ensures: bar.presentation.finish_zone.show_clean_up = false
+    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.primary = finish_primary_for_disposition(pr_closed, bar.inputs.pr_status)
+    ensures: bar.presentation.inline_note = pr_closed_note
+}
+
+-- Row 8. No PR found, refresh not unavailable: Clean up primary.
+rule DispositionNoPr {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id = null
+    requires: bar.inputs.phase = idle
+    requires: bar.inputs.pr_status != null
+    requires: bar.inputs.pr_status.pr = null
+    requires: bar.inputs.pr_status.refresh.state != unavailable
+
+    ensures: bar.presentation.disposition = no_pr
+    ensures: bar.presentation.resolve_zone.visible = false
+    ensures: bar.presentation.finish_zone.show_clean_up = true
+    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.primary = finish_primary_for_disposition(no_pr, bar.inputs.pr_status)
+    ensures: bar.presentation.inline_note = null
+}
+
+-- Row 9. gh unavailable, no persisted PR identity: Clean up primary, warning
+-- note, single click — never a two-step enable-then-confirm toggle (REQ-WAB-008).
+rule DispositionGhUnavailable {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id = null
+    requires: bar.inputs.phase = idle
+    requires: bar.inputs.pr_status != null
+    requires: bar.inputs.pr_status.pr = null
+    requires: bar.inputs.pr_status.refresh.state = unavailable
+
+    ensures: bar.presentation.disposition = gh_unavailable
+    ensures: bar.presentation.resolve_zone.visible = false
+    ensures: bar.presentation.finish_zone.show_clean_up = true
+    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.primary = finish_primary_for_disposition(gh_unavailable, bar.inputs.pr_status)
+    ensures: bar.presentation.inline_note = gh_unavailable_note
+}
+
+-- ===========================================================
+-- WAB 3. REVIEW ZONE (REQ-WAB-002, REQ-WAB-006)
+-- ===========================================================
+
+rule ReviewZoneAlwaysShowsDiff {
+    when: WorkActionsBarRendered(bar)
+
+    ensures: bar.presentation.review_zone.show_view_diff = true
+
+    @guidance
+        -- View Diff opens the diff viewer through the viewer slot
+        -- (viewer_slot REQ-VS-003, fullscreen presentation). View Browser is
+        -- structurally absent from ReviewZone: there is no field for it. The
+        -- browser launcher is a work-scope affordance (work-scope-ui
+        -- REQ-WSUI-004), surfaced through the viewer slot (REQ-VS-008) — never
+        -- added here, even when a browser session is active.
+}
+
+-- ===========================================================
+-- WAB 4. RESOLVE LINK VERBS OPEN GITHUB (REQ-WAB-010)
+-- ===========================================================
+
+rule ResolveLinkVerbNavigatesToGitHub {
+    when: UserClicksResolveLink(bar)
+
+    requires: bar.presentation.resolve_zone.verb in { merge_link, open_pr_link }
+
+    ensures: ExternalNavigationRequested(bar.inputs.pr_status.pr.url)
+
+    @guidance
+        -- The link verbs render as
+        -- <a href="{url}" target="_blank" rel="noopener noreferrer">.
+        -- Phoenix has no merge API (work-lifecycle REQ-WL-002): it never merges
+        -- or pushes on the user's behalf. Neither merge_link nor open_pr_link
+        -- calls a Phoenix endpoint.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-WAB-003: a present RESOLVE verb is the bar's primary exactly when
+-- BarPrimary = resolve. Because BarPresentation.primary is a single BarPrimary,
+-- two glowing buttons cannot be represented; this invariant only ties the
+-- resolve slot's primacy to its visibility.
+invariant ResolvePrimaryImpliesVisible {
+    for b in WorkActionsBar:
+        b.presentation.primary = resolve implies
+            b.presentation.resolve_zone.visible = true
+}
+
+-- REQ-WAB-005: RESOLVE is invisible whenever the phase is stuck.
+invariant ResolveHiddenWhenStuck {
+    for b in WorkActionsBar:
+        b.inputs.phase in { error, context_exhausted } implies
+            b.presentation.resolve_zone.visible = false
+}
+
+-- REQ-WAB-009 / REQ-WAB-008: in the continued state nothing terminal is
+-- rendered, so there is no disabled-as-status button. (For every other
+-- disposition, a FINISH button is present exactly when its show_* flag is true,
+-- and a present button is always invocable — there is no disabled variant in
+-- the type.)
+invariant ContinuedSuppressesTerminalVerbs {
+    for b in WorkActionsBar:
+        b.presentation.disposition = continued implies
+            (b.presentation.finish_zone.show_clean_up = false
+             and b.presentation.finish_zone.show_abandon = false
+             and b.presentation.primary = none)
+}
+
+-- ResolveZone.verb is present exactly when the zone is visible. A visible
+-- RESOLVE zone always carries a verb; an invisible one never does.
+invariant ResolveVerbPresentIffVisible {
+    for b in WorkActionsBar:
+        (b.presentation.resolve_zone.visible = true
+            implies b.presentation.resolve_zone.verb != null)
+        and (b.presentation.resolve_zone.visible = false
+            implies b.presentation.resolve_zone.verb = null)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ConversationUser {
+    identified_by: bedrock/Conversation
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface WorkActionsBarSurface {
+    facing user: ConversationUser
+
+    context bar: WorkActionsBar
+
+    exposes:
+        bar.presentation
+
+    provides:
+        ConversationRendered(bar.conversation)
+        WorkActionsBarRendered(bar)
+        UserClicksResolveLink(bar)
+            when bar.presentation.resolve_zone.verb in { merge_link, open_pr_link }
+}
