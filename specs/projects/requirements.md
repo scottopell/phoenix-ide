@@ -211,10 +211,10 @@ AND SHALL use copy-on-write clone semantics only when supported by the platform/
 AND SHALL NOT fall back to a large physical copy
 AND SHALL NOT fail worktree creation when pre-warm cloning is unsupported or fails
 
-The allowlist is intentionally narrow: `target/`, `node_modules/.cache/`, `.next/cache/`,
-`.turbo/`, and project-local `.vite/`. Phoenix does not pre-warm `.git/`, `.phoenix*`,
-lock files, sockets, PID files, arbitrary ignored directories, or full dependency trees such
-as `node_modules/`.
+The allowlist is intentionally narrow: `node_modules/.cache/`, `.next/cache/`, `.turbo/`,
+and project-local `.vite/`. Phoenix does not pre-warm Cargo `target/` artifacts, `.git/`,
+`.phoenix*`, lock files, sockets, PID files, arbitrary ignored directories, or full dependency
+trees such as `node_modules/`.
 
 **Rationale:** Pre-warming improves time-to-first-build for isolated Phoenix worktrees on
 filesystems with cheap block cloning, while preserving the isolation guarantee. The cloned

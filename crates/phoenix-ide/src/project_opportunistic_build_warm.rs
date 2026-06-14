@@ -4,13 +4,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-const ALLOWLISTED_CACHE_DIRS: &[&str] = &[
-    "target",
-    "node_modules/.cache",
-    ".next/cache",
-    ".turbo",
-    ".vite",
-];
+const ALLOWLISTED_CACHE_DIRS: &[&str] = &["node_modules/.cache", ".next/cache", ".turbo", ".vite"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BuildWarmCandidate {
@@ -66,6 +60,13 @@ pub(crate) fn prewarm_project_build_caches_with_copier(
     dest_root: &Path,
     copier: &dyn WarmCopier,
 ) {
+    if !build_cache_prewarm_supported() {
+        tracing::debug!(
+            "build cache prewarm skipped: copy-on-write directory cloning unsupported on this platform"
+        );
+        return;
+    }
+
     for candidate in allowlisted_candidates() {
         let Some(prepared) = prepare_candidate(source_root, dest_root, candidate.relative_path())
         else {
@@ -122,10 +123,14 @@ fn prepare_candidate(
         return None;
     }
 
-    let temp_dst = dest_root.join(temp_candidate_name(relative));
-    if temp_dst.exists() {
-        cleanup_path(&temp_dst, relative, "stale temporary prewarm path");
-    }
+    let Some(temp_dst) = allocate_temp_candidate_path(dest_root, relative) else {
+        tracing::debug!(
+            destination = %dst.display(),
+            relative = %relative.display(),
+            "build cache prewarm skipped: could not allocate collision-free temporary path"
+        );
+        return None;
+    };
 
     Some(PreparedCandidate {
         relative: relative.to_path_buf(),
@@ -311,6 +316,22 @@ fn directory_style_path(relative: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn allocate_temp_candidate_path(dest_root: &Path, relative: &Path) -> Option<PathBuf> {
+    let base = temp_candidate_name(relative);
+    let first = dest_root.join(&base);
+    if !first.exists() {
+        return Some(first);
+    }
+
+    for attempt in 1..=16 {
+        let candidate = dest_root.join(format!("{base}-{attempt}"));
+        if !candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn temp_candidate_name(relative: &Path) -> String {
     let mut name = String::from(".phoenix-prewarm-");
     for (idx, component) in relative.components().enumerate() {
@@ -346,6 +367,10 @@ fn cleanup_path(path: &Path, relative: &Path, reason: &str) {
             "build cache prewarm cleanup failed"
         );
     }
+}
+
+fn build_cache_prewarm_supported() -> bool {
+    cfg!(any(target_os = "macos", test))
 }
 
 fn clone_dir_best_effort(src: &Path, dst: &Path) -> WarmCopyOutcome {
@@ -417,6 +442,13 @@ fn clone_dir_children(src: &Path, dst: &Path) -> Result<(), CloneDirError> {
             })?;
             clone_dir_children(&src_path, &dst_path)?;
         } else if file_type.is_file() {
+            if is_lock_or_pid_file(&src_path) {
+                tracing::debug!(
+                    source = %src_path.display(),
+                    "build cache prewarm skipped lock/pid file"
+                );
+                continue;
+            }
             clone_file(&src_path, &dst_path)?;
         } else {
             return Err(CloneDirError::Failed(format!(
@@ -426,6 +458,18 @@ fn clone_dir_children(src: &Path, dst: &Path) -> Result<(), CloneDirError> {
         }
     }
     Ok(())
+}
+
+fn is_lock_or_pid_file(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if file_name.eq_ignore_ascii_case("lock") || file_name.eq_ignore_ascii_case("pid") {
+        return true;
+    }
+    path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("lock") || extension.eq_ignore_ascii_case("pid")
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -492,36 +536,30 @@ mod tests {
 
         assert_eq!(
             found,
-            vec![
-                ".next/cache",
-                ".turbo",
-                ".vite",
-                "node_modules/.cache",
-                "target",
-            ]
+            vec![".next/cache", ".turbo", ".vite", "node_modules/.cache",]
         );
     }
 
     #[test]
     fn detector_ignores_missing_allowlisted_directories() {
         let temp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(temp.path().join("target")).unwrap();
+        fs::create_dir_all(temp.path().join(".turbo")).unwrap();
 
         let found: Vec<_> = detect_existing_candidates(temp.path())
             .into_iter()
             .map(|candidate| candidate.relative_path().to_string_lossy().to_string())
             .collect();
 
-        assert_eq!(found, vec!["target"]);
+        assert_eq!(found, vec![".turbo"]);
     }
 
     #[test]
     fn candidate_rejects_unsafe_relative_paths() {
-        assert!(BuildWarmCandidate::new("target").is_some());
+        assert!(BuildWarmCandidate::new(".turbo").is_some());
         assert!(BuildWarmCandidate::new("node_modules/.cache").is_some());
-        assert!(BuildWarmCandidate::new("../target").is_none());
-        assert!(BuildWarmCandidate::new("target/../.git").is_none());
-        assert!(BuildWarmCandidate::new("/tmp/target").is_none());
+        assert!(BuildWarmCandidate::new("../.turbo").is_none());
+        assert!(BuildWarmCandidate::new(".turbo/../.git").is_none());
+        assert!(BuildWarmCandidate::new("/tmp/.turbo").is_none());
         assert!(BuildWarmCandidate::new("").is_none());
     }
 
@@ -534,18 +572,18 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
         init_git_repo_with_ignore(
             &dest,
-            "target/\nnode_modules/.cache/\n.next/cache/\n.turbo/\n.vite/\n",
+            "node_modules/.cache/\n.next/cache/\n.turbo/\n.vite/\n",
         );
-        fs::create_dir_all(source.join("target")).unwrap();
-        fs::create_dir_all(dest.join("target")).unwrap();
-        fs::write(dest.join("target/owned.txt"), "keep").unwrap();
+        fs::create_dir_all(source.join(".turbo")).unwrap();
+        fs::create_dir_all(dest.join(".turbo")).unwrap();
+        fs::write(dest.join(".turbo/owned.txt"), "keep").unwrap();
 
         let copier = RecordingCopier::new(WarmCopyOutcome::Cloned);
         prewarm_project_build_caches_with_copier(&source, &dest, &copier);
 
         assert!(copier.calls.borrow().is_empty());
         assert_eq!(
-            fs::read_to_string(dest.join("target/owned.txt")).unwrap(),
+            fs::read_to_string(dest.join(".turbo/owned.txt")).unwrap(),
             "keep"
         );
     }
@@ -557,8 +595,8 @@ mod tests {
         let dest = temp.path().join("dest");
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&dest).unwrap();
-        init_git_repo_with_ignore(&dest, "target/\n.turbo/\n");
-        fs::create_dir_all(source.join("target")).unwrap();
+        init_git_repo_with_ignore(&dest, ".next/cache/\n.turbo/\n");
+        fs::create_dir_all(source.join(".next/cache")).unwrap();
         fs::create_dir_all(source.join(".turbo")).unwrap();
 
         let copier = RecordingCopier::new(WarmCopyOutcome::Failed {
@@ -567,7 +605,7 @@ mod tests {
         prewarm_project_build_caches_with_copier(&source, &dest, &copier);
 
         assert_eq!(copier.calls.borrow().len(), 2);
-        assert!(!dest.join("target").exists());
+        assert!(!dest.join(".next/cache").exists());
         assert!(!dest.join(".turbo").exists());
     }
 
@@ -595,18 +633,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         let dest = temp.path().join("dest");
-        let shared = temp.path().join("shared-target");
+        let shared = temp.path().join("shared-cache");
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&dest).unwrap();
         fs::create_dir_all(&shared).unwrap();
-        init_git_repo_with_ignore(&dest, "target/\n");
-        make_symlink(&shared, &source.join("target"));
+        init_git_repo_with_ignore(&dest, ".turbo/\n");
+        make_symlink(&shared, &source.join(".turbo"));
 
         let copier = RecordingCopier::new(WarmCopyOutcome::Cloned);
         prewarm_project_build_caches_with_copier(&source, &dest, &copier);
 
         assert!(copier.calls.borrow().is_empty());
-        assert!(!dest.join("target").exists());
+        assert!(!dest.join(".turbo").exists());
     }
 
     #[test]
@@ -615,17 +653,17 @@ mod tests {
         let source = temp.path().join("source");
         let dest = temp.path().join("dest");
         let shared = temp.path().join("shared-cache-file");
-        fs::create_dir_all(source.join("target")).unwrap();
+        fs::create_dir_all(source.join(".turbo")).unwrap();
         fs::create_dir_all(&dest).unwrap();
         fs::write(&shared, "shared").unwrap();
-        init_git_repo_with_ignore(&dest, "target/\n");
-        make_symlink(&shared, &source.join("target/link"));
+        init_git_repo_with_ignore(&dest, ".turbo/\n");
+        make_symlink(&shared, &source.join(".turbo/link"));
 
         let copier = RecordingCopier::new(WarmCopyOutcome::Cloned);
         prewarm_project_build_caches_with_copier(&source, &dest, &copier);
 
         assert!(copier.calls.borrow().is_empty());
-        assert!(!dest.join("target").exists());
+        assert!(!dest.join(".turbo").exists());
     }
 
     #[test]
@@ -633,7 +671,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         let dest = temp.path().join("dest");
-        fs::create_dir_all(source.join("target")).unwrap();
+        fs::create_dir_all(source.join(".turbo")).unwrap();
         fs::create_dir_all(&dest).unwrap();
         init_git_repo_with_ignore(&dest, "");
 
@@ -641,7 +679,7 @@ mod tests {
         prewarm_project_build_caches_with_copier(&source, &dest, &copier);
 
         assert!(copier.calls.borrow().is_empty());
-        assert!(!dest.join("target").exists());
+        assert!(!dest.join(".turbo").exists());
     }
 
     #[test]
@@ -670,16 +708,61 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         let dest = temp.path().join("dest");
-        fs::create_dir_all(source.join("target")).unwrap();
+        fs::create_dir_all(source.join(".turbo")).unwrap();
         fs::create_dir_all(&dest).unwrap();
-        init_git_repo_with_ignore(&dest, "target/\n");
+        init_git_repo_with_ignore(&dest, ".turbo/\n");
 
         let copier = RecordingCopier::create_then_fail();
         prewarm_project_build_caches_with_copier(&source, &dest, &copier);
 
         assert_eq!(copier.calls.borrow().len(), 1);
-        assert!(!dest.join("target").exists());
-        assert!(!dest.join(".phoenix-prewarm-target").exists());
+        assert!(!dest.join(".turbo").exists());
+        assert!(!dest.join(".phoenix-prewarm-.turbo").exists());
+    }
+
+    #[test]
+    fn temp_candidate_allocation_preserves_existing_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join(".phoenix-prewarm-.turbo")).unwrap();
+        fs::write(root.join(".phoenix-prewarm-.turbo/tracked.txt"), "keep").unwrap();
+
+        let allocated = allocate_temp_candidate_path(root, Path::new(".turbo")).unwrap();
+
+        assert_eq!(allocated, root.join(".phoenix-prewarm-.turbo-1"));
+        assert_eq!(
+            fs::read_to_string(root.join(".phoenix-prewarm-.turbo/tracked.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn lock_and_pid_file_filter_matches_only_process_markers() {
+        assert!(is_lock_or_pid_file(Path::new("cache.lock")));
+        assert!(is_lock_or_pid_file(Path::new("daemon.pid")));
+        assert!(is_lock_or_pid_file(Path::new("LOCK")));
+        assert!(is_lock_or_pid_file(Path::new("PID")));
+        assert!(!is_lock_or_pid_file(Path::new("package-lock.json")));
+        assert!(!is_lock_or_pid_file(Path::new("rapid-cache.txt")));
+    }
+
+    #[test]
+    fn copy_tree_for_test_filters_lock_and_pid_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("cache.txt"), "keep").unwrap();
+        fs::write(src.join("cache.lock"), "drop").unwrap();
+        fs::write(src.join("nested/worker.pid"), "drop").unwrap();
+        fs::write(src.join("package-lock.json"), "keep").unwrap();
+
+        copy_tree_for_test(&src, &dst);
+
+        assert!(dst.join("cache.txt").exists());
+        assert!(dst.join("package-lock.json").exists());
+        assert!(!dst.join("cache.lock").exists());
+        assert!(!dst.join("nested/worker.pid").exists());
     }
 
     fn init_git_repo_with_ignore(root: &Path, ignore: &str) {
@@ -719,7 +802,7 @@ mod tests {
             let dst_path = dst.join(entry.file_name());
             if file_type.is_dir() {
                 copy_tree_for_test(&src_path, &dst_path);
-            } else if file_type.is_file() {
+            } else if file_type.is_file() && !is_lock_or_pid_file(&src_path) {
                 fs::copy(&src_path, &dst_path).unwrap();
             }
         }
