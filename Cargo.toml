@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/phoenix-bash-display", "crates/phoenix-core", "crates/phoenix-db", "crates/phoenix-ide", "crates/phoenix-agents", "crates/phoenix-skills", "crates/phoenix-state-machine", "crates/phoenix-terminal", "crates/phoenix-tls", "crates/phoenix-tools"]
+# Standalone latency-probe crate (research/tier-a-encoder, workstream W3). It is
+# its own workspace root and must never be pulled into this one — it pins candle.
+exclude = ["research/tier-a-encoder/runtime-spike"]
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

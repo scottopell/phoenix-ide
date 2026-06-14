@@ -1,0 +1,34 @@
+# Standalone latency-probe crate for Tier A (task 29001, workstream W3).
+#
+# Its own `[workspace]` table makes this crate its OWN workspace root, so the
+# parent phoenix-ide workspace never pulls in candle. The parent also lists
+# this path under [workspace].exclude as belt-and-suspenders.
+[package]
+name = "tier-a-runtime-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Empty table => this crate is its own workspace root, isolated from the parent.
+[workspace]
+
+[dependencies]
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
+# Pin candle's CPU rayon pool to 1 thread (batch=1 is contention-bound otherwise).
+rayon = "1"
+
+# Opt-in Metal (Apple GPU) backend. CPU is the default and the number that
+# matters for the README hypothesis (sub-ms single short command on CPU).
+# Accelerate (Apple vecLib BLAS) is the default CPU path: the pure-Rust `gemm`
+# fallback is ~7x slower on these small matmuls (394us vs 56us for one FFN
+# matmul). Disable with --no-default-features to measure the fallback.
+[features]
+default = ["accelerate"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
