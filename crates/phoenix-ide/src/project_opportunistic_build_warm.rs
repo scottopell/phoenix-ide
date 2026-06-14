@@ -322,6 +322,7 @@ fn temp_candidate_name(relative: &Path) -> String {
     name
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn install_temp_candidate(temp_dst: &Path, dst: &Path) -> Result<(), String> {
     let parent = dst
         .parent()
