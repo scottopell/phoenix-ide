@@ -591,30 +591,29 @@ agent a stable annotation across all responses.
 
 ### REQ-BASH-011: Command Safety Checks
 
-WHEN bash command is submitted for execution (run path only)
-THE SYSTEM SHALL parse the command using a shell syntax parser
-(`brush-parser`)
-AND check for dangerous patterns before execution
+WHEN a bash `run` command is dispatched
+THE permission seam (specs/permissions/, deterministic deny layer) SHALL
+parse the command using a shell syntax parser (`brush-parser`) and reject
+dangerous patterns BEFORE the bash tool is invoked
+AND the bash tool itself SHALL NOT re-check — enforcement is single-homed at
+the seam.
 
-WHEN a dangerous pattern is detected
-THE SYSTEM SHALL reject the command with `error:
-"command_safety_rejected"` and a `reason` describing the matched pattern
-AND NOT execute the command (no handle is created, no tombstone is written)
-
-THE SYSTEM SHALL reject the following patterns:
+THE bash dangerous-pattern catalog the seam's Layer 0 applies is:
 - Blind git add: `git add -A`, `git add .`, `git add --all`, `git add *`
 - Force push: `git push --force`, `git push -f` (allow `--force-with-lease`)
 - Dangerous rm: `rm -rf` on `/`, `~`, `$HOME`, `.git`, `*`, `.*`
 
-WHEN command has `sudo` prefix
-THE SYSTEM SHALL apply safety checks to the command following sudo
+WHEN a pattern matches (in a simple command, a `sudo`-prefixed command, or any
+pipeline/compound component)
+THE seam SHALL reject with `error: "command_safety_rejected"` and a `reason`
+describing the matched pattern
+AND the command SHALL NOT execute (no handle is created, no tombstone written).
 
-WHEN command appears in a pipeline or compound command
-THE SYSTEM SHALL check all command components
-
-**Rationale:** Unchanged from the prior revision. Safety checks remain UX
-guardrails, not security boundaries. The check runs only on run, not on
-peek/wait/kill, since those operate on already-spawned handles.
+**Rationale:** Safety checks remain UX guardrails, not security boundaries.
+Enforcement lives at the permission seam rather than inside the bash tool so
+every tool — not just bash — passes one gate; the dangerous-pattern catalog is
+bash-domain knowledge the seam's Layer 0 applies. The check covers the `run` op
+only; peek/wait/kill operate on already-spawned handles. See specs/permissions/.
 
 ---
 

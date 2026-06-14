@@ -97,20 +97,34 @@ AST-based `brush_parser` matching and the `command_safety_rejected` error id /
 
 ## Scope
 
-In:
-- `DenyGate` + `CheckedToolCall` + `Denial` types; sole-mint invariant
-  (private fields, `#[cfg(test)]` constructor).
-- `ToolExecutor::execute` signature change + the 3-4 impls
-  (`ToolRegistryExecutor`, the test mocks in `runtime/traits.rs` /
+### Phase 1 — CBC seam + Layer 0 relocation (DELIVERED)
+- `DenyGate` + `CheckedToolCall` + `Denial` types in `runtime/deny_gate.rs`;
+  sole-mint invariant (private fields, `#[cfg(test)]` constructor).
+- `ToolExecutor::execute` signature change (`CheckedToolCall`) + all impls
+  (`ToolRegistryExecutor`, `Arc<T>` blanket, the test mocks in
   `runtime/testing.rs` / `runtime/executor.rs`).
-- Move bash deterministic rules into the registry; `bash_check` becomes a rule
-  in the registry rather than a bash-internal call.
-- Executor-side decision + denial counter + escalation threshold.
-- `specs/permissions/` spEARS trio (+ Allium for the escalation lifecycle).
-- Update `specs/bash` REQ-BASH-011 to defer the safety check to the permission
-  seam (bash no longer owns it).
+- Gate decision in `dispatch_tool_execution` before the spawn; deny → synthesize
+  `ToolOutput::error` via the existing `outcome_tx` (deny-and-continue works).
+- bash deterministic check relocated: gate's bash rule calls
+  `phoenix_tools::bash_check::check`; the inline call + `BashError`/
+  `BashErrorResponse` construction removed from the bash tool.
+- `specs/permissions/` spEARS trio + Allium; `specs/bash` REQ-BASH-011 relocated.
 
-Out:
+### Phase 2 — counters + escalation (DEFERRED, follow-up)
+- Per-conversation consecutive/total denial counters on the runtime.
+- Escalation threshold (3 consecutive OR 20 total) → **stop driving the model,
+  surface to human**. Needs a net-new state-machine state (no
+  awaiting-human/escalated state exists today) — that design is why it is split
+  out. REQ-PERM-006 in `specs/permissions/` is the contract; until phase 2 the
+  executive status table shows it Planned.
+
+### Phase 3 — wire-type unification (DEFERRED, cleanup)
+- Phase 1 keeps `BashErrorResponse::CommandSafetyRejected` as the documented
+  wire contract (now unconstructed in Rust; the gate's `Denial::into_tool_output`
+  emits the byte-identical shape) to avoid UI/codegen churn. Unify by moving
+  `command_safety_rejected` into a permission-layer wire type + one valibot edit.
+
+Out (all phases):
 - Tier A encoder (task 29001) — bolts on as a second `DenyGate::check` stage.
 - Tier B / overeagerness / transcript access / `ToolContext` changes.
 - Declarative config rules.

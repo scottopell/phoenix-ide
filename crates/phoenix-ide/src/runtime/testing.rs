@@ -180,12 +180,14 @@ impl Default for MockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for MockToolExecutor {
-    async fn execute(&self, name: &str, input: Value, _ctx: ToolContext) -> Option<ToolOutput> {
-        self.executions
-            .lock()
-            .unwrap()
-            .push((name.to_string(), input));
-        self.outputs.get(name).cloned()
+    async fn execute(
+        &self,
+        call: crate::runtime::deny_gate::CheckedToolCall,
+        _ctx: ToolContext,
+    ) -> Option<ToolOutput> {
+        let (name, input) = call.into_parts();
+        self.executions.lock().unwrap().push((name.clone(), input));
+        self.outputs.get(&name).cloned()
     }
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
@@ -270,18 +272,23 @@ impl DelayedMockToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for DelayedMockToolExecutor {
-    async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput> {
+    async fn execute(
+        &self,
+        call: crate::runtime::deny_gate::CheckedToolCall,
+        ctx: ToolContext,
+    ) -> Option<ToolOutput> {
+        let (name, input) = call.into_parts();
         self.inner
             .executions
             .lock()
             .unwrap()
-            .push((name.to_string(), input));
+            .push((name.clone(), input));
         self.execution_started.notify_waiters();
 
         // Race between delay and cancellation
         tokio::select! {
             () = tokio::time::sleep(self.delay) => {
-                self.inner.outputs.get(name).cloned()
+                self.inner.outputs.get(&name).cloned()
             }
             () = ctx.cancel.cancelled() => {
                 Some(ToolOutput::error("[command cancelled]"))
@@ -912,16 +919,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_tool_executor() {
+        use crate::runtime::deny_gate::CheckedToolCall;
         let executor = MockToolExecutor::new().with_tool("bash", ToolOutput::success("output"));
 
         let result = executor
-            .execute("bash", serde_json::json!({ "cmd": "ls" }), test_context())
+            .execute(
+                CheckedToolCall::cleared_for_test("bash", serde_json::json!({ "cmd": "ls" })),
+                test_context(),
+            )
             .await;
         assert!(result.is_some());
         assert!(result.unwrap().is_success());
 
         let result = executor
-            .execute("unknown", serde_json::json!({}), test_context())
+            .execute(
+                CheckedToolCall::cleared_for_test("unknown", serde_json::json!({})),
+                test_context(),
+            )
             .await;
         assert!(result.is_none());
     }

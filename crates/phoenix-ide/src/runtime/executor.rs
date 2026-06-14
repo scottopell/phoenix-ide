@@ -189,6 +189,25 @@ async fn forward_tool_outcome(
     let _ = outcome_tx.send(EffectOutcome::Tool(tool_outcome)).await;
 }
 
+/// Forward a permission-gate denial to the conversation loop as a completed
+/// tool outcome, without spawning a tool task (specs/permissions REQ-PERM-005,
+/// deny-and-continue). The denial reaches the model through the same channel a
+/// real tool result uses, so it can attempt an alternative.
+fn forward_denial_outcome(
+    tool_use_id: String,
+    denial: crate::runtime::deny_gate::Denial,
+    outcome_tx: mpsc::Sender<EffectOutcome>,
+) {
+    let outcome = ToolExecOutcome::Completed(ToolResult {
+        tool_use_id: tool_use_id.clone(),
+        outcome: tool_output_to_outcome(denial.into_tool_output()),
+        duration_ms: Some(0),
+    });
+    let (denied_tx, denied_rx) = oneshot::channel::<ToolExecOutcome>();
+    let _ = denied_tx.send(outcome);
+    tokio::spawn(forward_tool_outcome(denied_rx, tool_use_id, outcome_tx));
+}
+
 /// Await an LLM task's oneshot outcome and forward it, generation-tagged, to
 /// the executor's LLM-outcome channel, mapping a dropped sender to a typed
 /// `NetworkError` outcome.
@@ -2881,6 +2900,24 @@ where
         let tool_name = tool.name().to_string();
         let tool_input = tool.input.to_value();
 
+        // Permission seam (specs/permissions REQ-PERM-001): every tool call is
+        // gate-cleared before the tool task is spawned, upstream of the
+        // registry-vs-MCP split inside `ToolExecutor::execute` so MCP tools are
+        // covered too. On clear the minted `CheckedToolCall` is the only value
+        // `execute` accepts; on deny no task spawns and the denial returns via
+        // the existing outcome channel (REQ-PERM-005). `spawn_agents` is handled
+        // above and bypasses Layer 0 as intent-relative (REQ-PERM-007).
+        let checked =
+            match crate::runtime::deny_gate::DenyGate::check(tool_name.clone(), tool_input) {
+                Ok(checked) => checked,
+                Err(denial) => {
+                    tracing::info!(conv_id = %conv_id, tool = %tool_name, id = %tool_use_id,
+                    error = %denial.error, "Tool call denied by permission gate");
+                    forward_denial_outcome(forwarder_tool_use_id, denial, outcome_tx);
+                    return Ok(None);
+                }
+            };
+
         tokio::spawn(async move {
             tracing::info!(
                 conv_id = %conv_id,
@@ -2890,9 +2927,7 @@ where
             );
             let tool_start = std::time::Instant::now();
 
-            let output = tool_executor
-                .execute(&tool_name, tool_input, tool_ctx)
-                .await;
+            let output = tool_executor.execute(checked, tool_ctx).await;
 
             // Check if the tool was cancelled via the cancellation token.
             // IMPORTANT: We check the token state, NOT the output string.
@@ -5514,7 +5549,6 @@ mod explore_prompt_cache_shape_tests {
     use crate::system_prompt::{snapshot_next_taskmd_id_hint, ModeContext};
     use crate::tools::{BrowserSessionManager, ToolContext, ToolOutput};
     use async_trait::async_trait;
-    use serde_json::Value;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -5528,10 +5562,10 @@ mod explore_prompt_cache_shape_tests {
     impl ToolExecutor for TaskCreatingPatchExecutor {
         async fn execute(
             &self,
-            name: &str,
-            _input: Value,
+            call: crate::runtime::deny_gate::CheckedToolCall,
             _ctx: ToolContext,
         ) -> Option<ToolOutput> {
+            let (name, _input) = call.into_parts();
             if name != "patch" {
                 return None;
             }

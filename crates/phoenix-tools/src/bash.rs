@@ -985,47 +985,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Safety check still runs before run (REQ-BASH-011).
+    // Command safety (REQ-BASH-011) is enforced upstream by the permission
+    // seam, not by the bash tool — the deterministic-deny coverage lives in
+    // `crate::bash_check` unit tests and the seam's gate tests
+    // (phoenix-ide `runtime::deny_gate`). The bash tool runs whatever reaches
+    // it, so it has no rejection tests of its own.
     // -----------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_blocked_git_add() {
-        let tool = BashTool;
-        let result = tool
-            .run(json!({"op": "run", "cmd": "git add -A"}), ctx())
-            .await;
-        assert!(!result.is_success());
-        let v = parse_response(&result);
-        assert_eq!(v["error"], "command_safety_rejected");
-        assert!(v["reason"].as_str().unwrap().contains("blind git add"));
-    }
-
-    #[tokio::test]
-    async fn test_blocked_rm_rf_root() {
-        let tool = BashTool;
-        let result = tool
-            .run(json!({"op": "run", "cmd": "rm -rf /"}), ctx())
-            .await;
-        assert!(!result.is_success());
-        let v = parse_response(&result);
-        assert_eq!(v["error"], "command_safety_rejected");
-        assert!(v["reason"].as_str().unwrap().contains("critical data"));
-    }
-
-    #[tokio::test]
-    async fn test_blocked_git_push_force() {
-        let tool = BashTool;
-        let result = tool
-            .run(json!({"op": "run", "cmd": "git push --force"}), ctx())
-            .await;
-        assert!(!result.is_success());
-        let v = parse_response(&result);
-        assert_eq!(v["error"], "command_safety_rejected");
-        assert!(v["reason"]
-            .as_str()
-            .unwrap()
-            .contains("--force is not allowed"));
-    }
 
     #[tokio::test]
     async fn test_allowed_command_runs() {

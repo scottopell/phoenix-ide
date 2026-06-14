@@ -130,9 +130,6 @@ pub enum BashError {
         provided: i64,
         max: u64,
     },
-    CommandSafetyRejected {
-        reason: String,
-    },
     SpawnFailed {
         error_message: String,
     },
@@ -193,12 +190,6 @@ impl BashError {
                     ),
                     provided,
                     max_wait_seconds: max,
-                }
-            }
-            BashError::CommandSafetyRejected { reason } => {
-                BashErrorResponse::CommandSafetyRejected {
-                    error_message: reason.clone(),
-                    reason,
                 }
             }
             BashError::SpawnFailed { error_message } => {
@@ -457,10 +448,10 @@ async fn run_run(
     read_args: ReadArgs,
     ctx: &ToolContext,
 ) -> ToolOutput {
-    // REQ-BASH-011: safety check before reserving any resources.
-    if let Err(e) = crate::bash_check::check(cmd) {
-        return BashError::CommandSafetyRejected { reason: e.message }.into_tool_output();
-    }
+    // REQ-BASH-011: command safety is enforced upstream by the permission seam
+    // (specs/permissions, the deterministic deny layer) before this tool runs,
+    // not here — see `crate::bash_check`, which the seam invokes. No second
+    // check at the tool boundary keeps enforcement single-homed.
 
     let registry = ctx.bash_handle_registry().clone();
     let handles_arc = match ctx.bash_handles().await {

@@ -8,9 +8,13 @@
 -- Includes: run lifecycle, wait_seconds semantics, peek/wait/kill handle
 --           operations, ring buffer, in-memory tombstone demotion on exit,
 --           per-WorkScope handle cap, Phoenix startup subreaper +
---           shutdown kill-tree, command safety checks (delegated to
---           bash_check).
+--           shutdown kill-tree.
 -- Excludes:
+--   - Command safety (REQ-BASH-011): the dangerous-pattern catalog is
+--     bash-domain knowledge, but enforcement is the permission seam's
+--     deterministic deny layer (specs/permissions/), which runs the
+--     `bash_check` AST walk before this tool is invoked. The bash tool runs
+--     whatever reaches it; it does not gate.
 --   - Tmux integration / TTY-backed processes (specs/tmux-integration/)
 --   - Browser tool, patch tool, etc. (each in its own spec)
 --   - Conversation lifecycle (specs/bedrock/)
@@ -23,7 +27,9 @@
 --     specs/tmux-integration/ for the persistent path)
 --
 -- Requirement traceability: REQ-BASH-001 through REQ-BASH-015,
---   REQ-BASH-WS-001, REQ-BASH-WS-002
+--   REQ-BASH-WS-001, REQ-BASH-WS-002. REQ-BASH-011 (command safety) is
+--   enforced by the permission seam (specs/permissions/) and is not modelled
+--   as a bash run-path rule here.
 -- Dependencies: specs/bedrock/bedrock.allium
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -405,7 +411,7 @@ rule PhoenixKillsLiveHandlesOnShutdown {
 -- Rules — run
 ------------------------------------------------------------
 
--- REQ-BASH-001, REQ-BASH-002, REQ-BASH-005, REQ-BASH-011: a successful run.
+-- REQ-BASH-001, REQ-BASH-002, REQ-BASH-005: a successful run.
 -- Creates the Handle entity in status=running. The wait-window race is
 -- modelled by the response-shaping rules (RunExitsWithinWait,
 -- RunExceedsWait). "Run" is the agent operation; the system event it
@@ -420,7 +426,6 @@ rule HandleSpawned {
               < config.live_handle_cap
     requires: 0 <= wait_seconds
     requires: wait_seconds <= config.max_wait_seconds
-    requires: bash_check_passes(cmd)
     requires: label = null or len(label) <= config.max_label_length
 
     let h_id = next_handle_id(work_scope)
@@ -441,9 +446,9 @@ rule HandleSpawned {
         -- Run sequence (in src/tools/bash/operations.rs):
         --   1. Validate inputs (op discriminator and required fields per
         --      REQ-BASH-010, range checks, label length cap).
-        --   2. Run bash_check::check(cmd). On reject, return
-        --      command_safety_rejected WITHOUT spawning;
-        --      RunRejectedBySafety governs.
+        --   2. (Command safety already enforced upstream by the permission
+        --      seam before this tool is invoked; see specs/permissions/. No
+        --      check at the tool boundary.)
         --   3. Check live cap. On reject, return handle_cap_reached;
         --      RunRejectedByCap governs.
         --   4. Allocate handle_id (next sequential within work scope).
@@ -479,20 +484,6 @@ rule RunRejectedByCap {
         cap: config.live_handle_cap,
         live_handles: live_handle_summary(work_scope),
         hint: "kill or wait on a handle before running more, or use the tmux tool for long-runners"
-    )
-}
-
--- REQ-BASH-011: run rejected because bash_check found a dangerous pattern.
-rule RunRejectedBySafety {
-    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
-
-    requires: not bash_check_passes(cmd)
-
-    let reason = bash_check_reason(cmd)
-
-    ensures: AgentReceivesError(
-        error: "command_safety_rejected",
-        reason: reason
     )
 }
 
@@ -1202,8 +1193,7 @@ surface AgentBashAccess {
 
     provides:
         AgentCallsBashRun(conversation, cmd, wait_seconds, label)
-            when bash_check_passes(cmd)
-            and 0 <= wait_seconds and wait_seconds <= config.max_wait_seconds
+            when 0 <= wait_seconds and wait_seconds <= config.max_wait_seconds
             and (label = null or len(label) <= config.max_label_length)
             and count(Handle{work_scope: resolve_work_scope(conversation), status: running})
                 < config.live_handle_cap

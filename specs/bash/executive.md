@@ -61,9 +61,10 @@ terminal status or returns `kill_pending_kernel` for D-state hangs without
 holding the response forever. The waiter task survives `kill_pending_kernel`
 so a late-arriving exit still demotes correctly.
 
-Command safety checks (`brush-parser` AST walk for blind git-add,
-force-push, dangerous rm) and Landlock enforcement for Explore mode are
-unchanged from the prior revision; both run on the run path only.
+Command safety (`brush-parser` AST walk for blind git-add, force-push,
+dangerous rm) is enforced by the permission seam (specs/permissions/) before
+the bash tool runs, not inside the tool. Landlock enforcement for Explore mode
+is unchanged from the prior revision and runs on the run path only.
 
 ## Status Summary
 
@@ -79,7 +80,7 @@ unchanged from the prior revision; both run on the run path only.
 | **REQ-BASH-008:** Error Reporting | 🔄 Rewrite | Stable error ids, structured envelopes; non-zero exit is not an error |
 | **REQ-BASH-009:** No TTY Attached | 🔄 Carry-forward | Existing behavior; tool description points at `tmux` |
 | **REQ-BASH-010:** Tool Schema and Mutual Exclusion | 🔄 Rewrite (rev 3) | `op` discriminator with `run`/`peek`/`wait`/`kill`; `label` field added; legacy four-sibling inference, `mode` shim, `command` alias, and empty-string-as-absent tolerance retired (`deny_unknown_fields`); two narrow tolerances retained for active GPT default-fill (`since=0`, `lines+since`) |
-| **REQ-BASH-011:** Command Safety Checks | ✅ Carry-forward | `brush-parser` AST walk unchanged |
+| **REQ-BASH-011:** Command Safety Checks | 🔄 Relocated | Enforcement moved to the permission seam (specs/permissions/); `brush-parser` AST walk (`bash_check`) unchanged, now invoked by the seam |
 | **REQ-BASH-012:** Landlock Enforcement | 🔄 Renumbered | Was REQ-BASH-008; behavior unchanged |
 | **REQ-BASH-013:** Graceful Degradation Without Landlock | 🔄 Renumbered | Was REQ-BASH-009; behavior unchanged |
 | **REQ-BASH-014:** Stateless Tool with Per-WorkScope Handle Registry | 🔄 Rewrite | Was REQ-BASH-010; tool stays stateless, registry reached via `ctx.bash_handles()` matching browser pattern |
@@ -88,9 +89,10 @@ unchanged from the prior revision; both run on the run path only.
 | **REQ-BASH-015:** Display Command Simplification | 🔄 Carry-forward + extension | Was REQ-BASH-011; new display labels for peek/wait/kill |
 
 **Progress:** 0 of 17 implemented under the new spec; this revision is a
-greenfield rewrite of the runtime portion. Carry-forward items (REQ-BASH-011,
--012, -013, -015) reuse the existing `bash_check.rs`, Landlock integration,
-and display simplification logic; rewrite items require new code. The
+greenfield rewrite of the runtime portion. Carry-forward items (-012, -013,
+-015) and the relocated REQ-BASH-011 reuse the existing `bash_check.rs`
+(now invoked by the permission seam), Landlock integration, and display
+simplification logic; rewrite items require new code. The
 `WorkScope`-keying requirements (REQ-BASH-WS-001, -WS-002) re-key the registry
 from conversation id to `WorkScope` and bring the hard-delete cascade in line
 with the other `WorkScope`-keyed resources.

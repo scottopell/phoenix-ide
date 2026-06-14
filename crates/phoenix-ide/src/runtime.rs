@@ -10,6 +10,7 @@
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
 
+pub mod deny_gate;
 pub(crate) mod executor;
 pub(crate) mod fork_resolve;
 mod recovery;

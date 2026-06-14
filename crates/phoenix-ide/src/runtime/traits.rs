@@ -212,13 +212,16 @@ pub trait LlmClient: Send + Sync {
     fn model_id(&self) -> &str;
 }
 
+use crate::runtime::deny_gate::CheckedToolCall;
 use crate::tools::ToolContext;
 
 /// Executor for tools
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
-    /// Execute a tool by name with context
-    async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput>;
+    /// Execute a gate-cleared tool call. Accepting only a [`CheckedToolCall`]
+    /// — whose sole non-test mint is `DenyGate::check` — makes an ungated tool
+    /// call unrepresentable (specs/permissions REQ-PERM-001).
+    async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput>;
 
     /// Get tool definitions for LLM (phoenix-native).
     async fn definitions(&self) -> Vec<crate::llm::ToolDefinition>;
@@ -454,8 +457,8 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
 
 #[async_trait]
 impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
-    async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput> {
-        (**self).execute(name, input, ctx).await
+    async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput> {
+        (**self).execute(call, ctx).await
     }
 
     async fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
@@ -826,7 +829,8 @@ impl ToolRegistryExecutor {
 
 #[async_trait]
 impl ToolExecutor for ToolRegistryExecutor {
-    async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput> {
+    async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput> {
+        let (name, input) = call.into_parts();
         // Look up the tool while holding the read lock, then drop the guard
         // before the async .run() call (RwLockReadGuard is !Send).
         let tool = {
@@ -834,7 +838,7 @@ impl ToolExecutor for ToolRegistryExecutor {
                 .registry
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry.find_tool(name)
+            registry.find_tool(&name)
         };
         if let Some(t) = tool {
             return Some(t.run(input, ctx).await);
@@ -842,7 +846,7 @@ impl ToolExecutor for ToolRegistryExecutor {
 
         // Fall back to live MCP tool resolution.
         if let Some(ref manager) = self.mcp_manager {
-            if let Some(mcp_tool) = crate::tools::mcp::create_mcp_tool_by_name(manager, name).await
+            if let Some(mcp_tool) = crate::tools::mcp::create_mcp_tool_by_name(manager, &name).await
             {
                 return Some(mcp_tool.run(input, ctx).await);
             }

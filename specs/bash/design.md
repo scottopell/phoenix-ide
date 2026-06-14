@@ -334,17 +334,18 @@ subscriber sees the most recent value. `OnceLock<ExitState>` would also
 work; `watch` was picked because in-flight wait responses use
 `changed().await` naturally.
 
-## Run Flow (REQ-BASH-001, REQ-BASH-002, REQ-BASH-005, REQ-BASH-011)
+## Run Flow (REQ-BASH-001, REQ-BASH-002, REQ-BASH-005)
+
+Command safety (REQ-BASH-011) is enforced by the permission seam before
+`BashTool::run` is ever called; the run path below carries no safety check of
+its own. See specs/permissions/.
 
 ```
-agent → BashTool::run(input, ctx)
+agent → permission seam (deny layer) → BashTool::run(input, ctx)
         ├─ parse + validate input (op discriminator required, ranges, label cap)
         ├─ if op != run: dispatch to peek/wait/kill handlers
         │
         └─ run path:
-            ├─ bash_check::check(cmd) — REQ-BASH-011
-            │     ┌─ reject → command_safety_rejected error
-            │     └─ ok    → continue
             ├─ ctx.bash_handles().await? → Arc<RwLock<WorkScopeHandles>>
             ├─ WorkScopeHandles::reserve_slot()
             │     ┌─ count >= LIVE_HANDLE_CAP → handle_cap_reached error
@@ -368,10 +369,7 @@ Pseudocode:
 
 ```rust
 async fn run(&self, cmd: &str, wait_seconds: u64, label: Option<&str>, ctx: &ToolContext) -> ToolOutput {
-    if let Err(reason) = bash_check::check(cmd) {
-        return ToolOutput::error("command_safety_rejected", reason);
-    }
-
+    // Command safety already enforced upstream by the permission seam.
     let handles_arc = ctx.bash_handles().await?;
     let mut handles = handles_arc.write().await;
     let slot = match handles.reserve_slot() {
@@ -825,11 +823,12 @@ input layer.
 
 ## Command Safety Checks (REQ-BASH-011)
 
-Unchanged from the prior revision. `src/tools/bash_check.rs` parses the
-command via `brush-parser` and walks the AST for dangerous patterns. The
-run path calls `bash_check::check(cmd)` before reserving a handle slot;
-peek/wait/kill paths bypass this check (they operate on already-spawned
-handles whose original command was already vetted).
+Enforced by the permission seam (specs/permissions/), not the bash tool.
+`bash_check` parses the command via `brush-parser` and walks the AST for
+dangerous patterns; the seam's deterministic deny layer invokes it on the
+`run` op before `BashTool::run` is reached. peek/wait/kill carry no command
+and are not checked (they operate on already-spawned handles). The bash tool
+runs whatever the seam clears — enforcement is single-homed.
 
 The traversal handles pipelines, and/or chains, compound commands (loops,
 conditionals, subshells, brace groups), and function bodies, recursing
