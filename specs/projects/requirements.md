@@ -221,7 +221,9 @@ filesystems with cheap block cloning, while preserving the isolation guarantee. 
 files occupy independent worktree paths and diverge normally when rebuilt; failure to clone
 only loses an optimization, never correctness.
 
+---
 
+### REQ-PROJ-006: Task Files as Versioned Living Contracts
 
 WHEN the agent drafts a task file in Explore mode (REQ-PROJ-003)
 THE SYSTEM SHALL place it in the project's tasks directory (typically `tasks/`,
