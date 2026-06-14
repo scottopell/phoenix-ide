@@ -170,17 +170,31 @@ Sampling steps:
    `MeasureMode` (see Config capture). `File`/`RecurseSmall` produce
    `DiskSize::measured`; `NoMeasure`/`Pattern` produce `DiskSize::not_measured`;
    a missing real path yields `DiskSize::absent`; the attachment store yields
-   `inline_db`. The handler then appends the active codex credential row,
-   resolved here rather than at startup via `resolve_active_auth_path` (Phoenix's
-   own `~/.phoenix-ide/codex-auth.json`, or Codex CLI's `~/.codex/auth.json` under
-   `OPENAI_USE_CODEX_AUTH` piggyback mode, falling back to the canonical Phoenix
-   path reported absent). Resolving per request keeps the row correct after the
-   in-app login flow switches the active credential source at runtime.
+   `inline_db`. The handler then appends two rows resolved per request rather
+   than at startup. The active codex credential row is resolved via
+   `resolve_active_auth_path` (Phoenix's own `~/.phoenix-ide/codex-auth.json`, or
+   Codex CLI's `~/.codex/auth.json` under `OPENAI_USE_CODEX_AUTH` piggyback mode,
+   falling back to the canonical Phoenix path reported absent); resolving per
+   request keeps the row correct after the in-app login flow switches the active
+   credential source at runtime. The PR auto-fix context row aggregates the
+   per-worktree `{worktree}/.phoenix/pr-context/` bundle directories: their parent
+   worktrees live under each project's `{repo_root}/.phoenix/worktrees/`, so there
+   is no single startup-known path to size. The handler enumerates Work/Branch
+   worktrees from the database and sums each bundle directory's bytes into one
+   `measured` row (`absent` when no worktree holds a bundle directory). The `path`
+   is the `…/.phoenix/worktrees/*/.phoenix/pr-context` glob anchored at the lone
+   project root when all bundles share one, and a root-relative glob otherwise,
+   since a single `path` string cannot honestly point at several roots. Resolving
+   per request reflects worktrees created and torn down after startup. Each bundle
+   directory is capacity-bounded by the capture-site retention, so the aggregate
+   walk stays cheap.
 4. **`sampled_at`:** `Utc::now()` at the moment the snapshot is assembled.
 
 The `dir_size` helper is bounded: it recurses only the directories the spec
-classifies as small and never follows into the large-cache paths, so a single
-request cannot trigger a multi-gigabyte walk (REQ-DEPLOY-005).
+classifies as small — the owned data directory, TLS and skills directories, and
+the per-worktree PR-context bundle directories — and never follows into the
+large-cache paths, so a single request cannot trigger a multi-gigabyte walk
+(REQ-DEPLOY-005).
 
 ## Frontend
 

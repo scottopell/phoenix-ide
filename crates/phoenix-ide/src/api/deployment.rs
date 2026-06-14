@@ -196,6 +196,9 @@ pub async fn deployment_info(State(state): State<AppState>) -> impl IntoResponse
     // (Phoenix's own file vs Codex CLI's in piggyback mode), so a static row
     // would go stale after a credential switch.
     disk.push(measure_location(&active_codex_credentials_location()));
+    // PR auto-fix context bundles live per-worktree, not under a startup-known
+    // root, so this aggregate is resolved per request by enumerating worktrees.
+    disk.push(pr_context_aggregate(&state.db).await);
 
     Json(DeploymentInfo {
         build,
@@ -205,6 +208,77 @@ pub async fn deployment_info(State(state): State<AppState>) -> impl IntoResponse
         log: cfg.log.clone(),
         sampled_at: Utc::now(),
     })
+}
+
+/// Aggregate the PR auto-fix context bundles across every Work/Branch
+/// worktree into a single `DiskEntry`. These bundles are written under
+/// `{worktree}/.phoenix/pr-context/`; worktrees are scattered under each
+/// project's `{repo_root}/.phoenix/worktrees/`, so there is no single
+/// startup-known path to size — the set is resolved per request from the DB.
+///
+/// Each `.phoenix/pr-context` directory is small and owned (capacity-bounded by
+/// the capture-site retention), so summing them is a cheap bounded walk, not an
+/// open-ended recursion. A failed DB query yields a `NotMeasured` row rather
+/// than failing the whole snapshot.
+async fn pr_context_aggregate(db: &crate::db::Database) -> DiskEntry {
+    const LABEL: &str = "PR auto-fix context";
+    const PATTERN: &str = ".phoenix/worktrees/*/.phoenix/pr-context";
+
+    let convs = match db.get_work_conversations().await {
+        Ok(convs) => convs,
+        Err(e) => {
+            tracing::debug!(error = %e, "PR context aggregate: failed to enumerate worktrees");
+            return DiskEntry {
+                label: LABEL.to_string(),
+                path: PATTERN.to_string(),
+                size: DiskSize::NotMeasured,
+            };
+        }
+    };
+
+    let mut total: u64 = 0;
+    let mut any = false;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for conv in &convs {
+        let Some(wt) = conv.conv_mode.worktree_path().filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let wt = Path::new(wt);
+        let ctx_dir = wt.join(".phoenix").join("pr-context");
+        if !ctx_dir.is_dir() {
+            continue;
+        }
+        any = true;
+        total = total.saturating_add(dir_size(&ctx_dir));
+        if let Some(root) = crate::git_ops::repo_root_from_phoenix_worktree(wt) {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+
+    // Show a glob anchored at the project root when bundles all live under one;
+    // fall back to a relative pattern when zero or many roots are in play (a
+    // single `path` string cannot honestly point at several roots at once).
+    let path = match roots.as_slice() {
+        [root] => root.join(PATTERN).display().to_string(),
+        [first, rest @ ..] => format!(
+            "{} (+{} more roots)",
+            first.join(PATTERN).display(),
+            rest.len()
+        ),
+        [] => PATTERN.to_string(),
+    };
+    let size = if any {
+        DiskSize::Measured { bytes: total }
+    } else {
+        DiskSize::Absent
+    };
+    DiskEntry {
+        label: LABEL.to_string(),
+        path,
+        size,
+    }
 }
 
 /// The codex credential location the process loads from right now: Phoenix's own

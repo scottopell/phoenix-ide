@@ -728,6 +728,7 @@ fn capture_pr_auto_fix_context_for_pr_item(
     std::fs::write(&path, body).map_err(|e| {
         PrMonitorError::Internal(format!("Failed to write PR context artifact: {e}"))
     })?;
+    prune_pr_context_bundles(&dir, artifact.pr.number, PR_CONTEXT_RETAIN);
 
     let message = phoenix_core::llm_language::pr_auto_fix_instruction(llm_language, &rel_path);
     let baseline = artifact.baseline();
@@ -739,6 +740,44 @@ fn capture_pr_auto_fix_context_for_pr_item(
         },
         baseline,
     })
+}
+
+/// Number of most-recent context bundles to retain per PR number in a worktree.
+/// Each capture writes a fresh, timestamped bundle and hands its path to the
+/// agent; older bundles for the same PR exist only to cover an agent still
+/// reading a just-superseded file, so a small margin suffices. Unpruned, these
+/// accumulate unbounded — one bundle per "Address PR feedback & CI" click.
+const PR_CONTEXT_RETAIN: usize = 3;
+
+/// Delete all but the newest `keep` context bundles for `pr_number` in `dir`.
+/// Bundles are named `pr-{n}-{ts}.json` with a lexicographically-sortable
+/// timestamp, so filename order is chronological order. The `pr-{n}-` prefix
+/// (trailing dash) keeps `pr-1-` from matching `pr-12-`. Best-effort: an
+/// unreadable directory or a failed unlink is logged at debug and skipped —
+/// pruning is hygiene, never load-bearing for the capture that triggered it.
+fn prune_pr_context_bundles(dir: &Path, pr_number: u64, keep: usize) {
+    let prefix = format!("pr-{pr_number}-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut bundles: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect();
+    bundles.sort_unstable();
+    bundles.reverse(); // newest (lexicographically-greatest timestamp) first
+    for stale in bundles.into_iter().skip(keep) {
+        if let Err(e) = std::fs::remove_file(&stale) {
+            tracing::debug!(path = %stale.display(), error = %e, "failed to prune stale PR context bundle");
+        }
+    }
 }
 
 fn fresh_response(
@@ -2263,6 +2302,41 @@ mod tests {
         assert!(snippet.truncated);
         assert_eq!(snippet.snippet.len(), LOG_SNIPPET_LIMIT - 1);
         assert!(snippet.snippet.is_char_boundary(snippet.snippet.len()));
+    }
+
+    #[test]
+    fn prune_keeps_newest_n_per_pr_and_ignores_other_prs() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        // pr-12 has four bundles (ascending timestamps); pr-1 has one. The
+        // `pr-1-` prefix must not be pruned by a pr-12 pass and vice versa.
+        for ts in ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"] {
+            std::fs::write(dir.join(format!("pr-12-{ts}.json")), "x").unwrap();
+        }
+        std::fs::write(dir.join("pr-1-2026-01-01.json"), "x").unwrap();
+
+        prune_pr_context_bundles(dir, 12, 2);
+
+        let mut remaining: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec![
+                "pr-1-2026-01-01.json".to_string(),
+                "pr-12-2026-01-03.json".to_string(),
+                "pr-12-2026-01-04.json".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn prune_on_missing_dir_is_a_noop() {
+        let temp = TempDir::new().unwrap();
+        // Must not panic when the directory does not exist.
+        prune_pr_context_bundles(&temp.path().join("nope"), 1, 3);
     }
 
     #[test]
