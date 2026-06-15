@@ -5384,7 +5384,7 @@ mod hard_delete_cascade_tests {
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
             std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
-        let sessions = super::super::auth::SessionStore::new(db.clone());
+        let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
             runtime,
             llm_registry,
@@ -7519,7 +7519,7 @@ mod upgrade_model_state_guard_tests {
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
             std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
-        let sessions = super::super::auth::SessionStore::new(db.clone());
+        let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
             runtime,
             llm_registry,
@@ -7670,7 +7670,7 @@ mod file_read_tests {
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
             std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
-        let sessions = super::super::auth::SessionStore::new(db.clone());
+        let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
         AppState {
             runtime,
             llm_registry,

@@ -31,20 +31,38 @@ use super::AppState;
 /// the two can never disagree.
 const SESSION_TTL_SECS: i64 = 31_536_000; // 1 year
 
+/// Non-reversible fingerprint of a configured password, stored alongside each
+/// session token so that rotating `PHOENIX_PASSWORD` invalidates every session
+/// minted under the old one. SHA-256, base64-encoded; the password is never
+/// stored.
+pub fn password_fingerprint(password: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(password.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
 /// Server-side store of valid session tokens, backed by the `auth_sessions`
 /// table. A successful login mints a random token, persists it here, and hands
 /// it to the browser in the `phoenix-auth` cookie. Each subsequent request is
 /// authenticated by membership, so the password never leaves the server in a
 /// cookie and tokens are independently revocable. Persistence means tokens
 /// survive a server restart — a redeploy no longer logs everyone out.
+///
+/// Each token is bound to [`password_fingerprint`] of the password it was
+/// minted under; validation requires it to match the current password's
+/// fingerprint, so a password rotation invalidates all prior sessions.
 #[derive(Clone)]
 pub struct SessionStore {
     db: crate::db::Database,
+    password_fingerprint: String,
 }
 
 impl SessionStore {
-    pub fn new(db: crate::db::Database) -> Self {
-        Self { db }
+    pub fn new(db: crate::db::Database, password_fingerprint: String) -> Self {
+        Self {
+            db,
+            password_fingerprint,
+        }
     }
 
     /// Mint a fresh 256-bit random session token and persist it as valid.
@@ -57,16 +75,25 @@ impl SessionStore {
             tracing::warn!(error = %e, "failed to reap expired auth sessions; continuing");
         }
         self.db
-            .insert_auth_session(&token, chrono::Duration::seconds(SESSION_TTL_SECS))
+            .insert_auth_session(
+                &token,
+                &self.password_fingerprint,
+                chrono::Duration::seconds(SESSION_TTL_SECS),
+            )
             .await?;
         Ok(token)
     }
 
-    /// A token is valid iff it was minted previously and has not expired. A DB
-    /// error fails closed (treated as invalid) and is logged — an unreachable
-    /// store must never silently authenticate.
+    /// A token is valid iff it was minted previously, has not expired, and was
+    /// minted under the current password. A DB error fails closed (treated as
+    /// invalid) and is logged — an unreachable store must never silently
+    /// authenticate.
     async fn is_valid(&self, token: &str) -> bool {
-        match self.db.is_auth_session_valid(token).await {
+        match self
+            .db
+            .is_auth_session_valid(token, &self.password_fingerprint)
+            .await
+        {
             Ok(valid) => valid,
             Err(e) => {
                 tracing::warn!(error = %e, "auth session lookup failed; treating token as invalid");
@@ -565,7 +592,7 @@ mod tests {
         let db = crate::db::Database::open_in_memory()
             .await
             .expect("in-memory db");
-        SessionStore::new(db)
+        SessionStore::new(db, password_fingerprint("test-password"))
     }
 
     #[tokio::test]
@@ -602,9 +629,31 @@ mod tests {
         let db = crate::db::Database::open_in_memory()
             .await
             .expect("in-memory db");
-        let token = SessionStore::new(db.clone()).mint().await.unwrap();
-        // A brand-new store (as if the process restarted) sees the same token.
-        assert!(SessionStore::new(db).is_valid(&token).await);
+        let fp = password_fingerprint("pw");
+        let token = SessionStore::new(db.clone(), fp.clone())
+            .mint()
+            .await
+            .unwrap();
+        // A brand-new store (as if the process restarted) under the same
+        // password sees the same token.
+        assert!(SessionStore::new(db, fp).is_valid(&token).await);
+    }
+
+    /// Rotating the configured password invalidates tokens minted under the old
+    /// one: a fresh store with a different password fingerprint over the same DB
+    /// rejects the prior token. This restores the pre-persistence behaviour
+    /// where a restart cleared the in-memory store.
+    #[tokio::test]
+    async fn session_token_is_rejected_after_password_rotation() {
+        let db = crate::db::Database::open_in_memory()
+            .await
+            .expect("in-memory db");
+        let token = SessionStore::new(db.clone(), password_fingerprint("old"))
+            .mint()
+            .await
+            .unwrap();
+        let rotated = SessionStore::new(db, password_fingerprint("new"));
+        assert!(!rotated.is_valid(&token).await);
     }
 
     #[tokio::test]

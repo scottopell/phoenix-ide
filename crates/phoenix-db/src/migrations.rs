@@ -564,9 +564,16 @@ ALTER TABLE mcp_oauth_registrations ADD COLUMN redirect_uri TEXT;
 /// cookie itself is durable. The token is opaque and random, so the primary-key
 /// index is the only lookup path needed; `expires_at` makes the cookie's
 /// advertised lifetime authoritative and lets a sweep reclaim stale rows.
+///
+/// `password_fingerprint` binds each token to the password it was minted under
+/// (a non-reversible hash of `PHOENIX_PASSWORD`). Validation requires it to
+/// match the currently-configured password, so rotating the password
+/// invalidates every prior session — matching the pre-persistence behaviour
+/// where a restart cleared the in-memory store.
 const MIGRATION_024: &str = r"
 CREATE TABLE IF NOT EXISTS auth_sessions (
     token TEXT PRIMARY KEY,
+    password_fingerprint TEXT NOT NULL,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );

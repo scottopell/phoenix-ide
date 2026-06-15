@@ -19,6 +19,8 @@ config {
     max_login_failures: Integer
     -- How long a peer stays locked out once the threshold is reached.
     lockout_window: Duration
+    -- Lifetime of a minted session token; also the phoenix-auth cookie Max-Age.
+    session_ttl: Duration
 }
 
 ------------------------------------------------------------
@@ -48,9 +50,17 @@ external entity Peer {
 -- table) until its expiry, so it survives a server restart. A request bearing
 -- this token in its cookie is the Owner.
 -- The password never travels in the cookie; only this opaque token does.
+-- password_fingerprint binds the token to the password it was minted under
+-- (a non-reversible hash); rotating config.password invalidates the token.
 entity SessionToken {
     token: String               -- random, opaque, unguessable
+    password_fingerprint: String
     created_at: Timestamp
+    expires_at: Timestamp
+
+    -- A persisted token authenticates only while unexpired and only under the
+    -- password it was minted with. Expiry and password-rotation both revoke it.
+    is_valid: expires_at > now and password_fingerprint = fingerprint(config.password)
 }
 
 -- A per-peer throttle bucket for Bearer-password verification. Counts
@@ -89,7 +99,9 @@ entity ShareToken {
 --
 -- Identity predicates (black-box, pure over the request and current state):
 --   session_token_valid(request)    => the request's session_cookie names a
---                                       SessionToken that exists in the store.
+--                                       SessionToken that exists in the store
+--                                       and is_valid (unexpired, minted under
+--                                       the current config.password).
 --   bearer_password_matches(request) => the request's bearer_password equals
 --                                        config.password under constant-time
 --                                        comparison (see ConstantTimePasswordCheck).
@@ -203,7 +215,12 @@ rule LoginSucceeds {
 
     let bucket = ThrottleBucket{peer: request.peer}
 
-    ensures: SessionToken.created(token: random_token(), created_at: now)
+    ensures: SessionToken.created(
+        token: random_token(),
+        password_fingerprint: fingerprint(config.password),
+        created_at: now,
+        expires_at: now + session_ttl
+    )
     ensures:
         if exists bucket:
             bucket.consecutive_failures = 0
