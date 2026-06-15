@@ -89,7 +89,7 @@ tempfile = "3"
 futures = "0.3"
 # test-util enables tokio::time::{pause, advance} and #[tokio::test(start_paused)]
 # for deterministic timer tests (e.g. the bash reader idle-flush timeout).
-tokio = { version = "1", features = ["fs", "io-util", "process", "rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "sync", "time", "macros", "test-util"] }
 
 [lints]
 workspace = true

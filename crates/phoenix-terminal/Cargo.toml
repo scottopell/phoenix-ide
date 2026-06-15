@@ -21,7 +21,7 @@ test-support = []
 phoenix-core = { path = "../phoenix-core" }
 
 # Async runtime + PTY readiness (AsyncFd is epoll-backed).
-tokio = { version = "1", features = ["io-util", "net", "process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 
 # Async utilities for the WS<->PTY relay.
 futures = "0.3"
@@ -37,6 +37,8 @@ tracing = "0.1"
 
 [dev-dependencies]
 proptest = "1"
+# `rt-multi-thread` supports #[tokio::test] and Runtime::new() in this crate's tests.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

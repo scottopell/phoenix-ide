@@ -1928,7 +1928,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
 // Outcome Generators (for handle_outcome tests)
 // ============================================================================
 
-use super::outcome::{AbortReason, EffectOutcome, LlmOutcome, ToolExecOutcome};
+use super::outcome::{AbortReason, EffectOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 
 fn arb_abort_reason() -> impl Strategy<Value = AbortReason> {
     Just(AbortReason::CancellationRequested)
@@ -1937,7 +1937,7 @@ fn arb_abort_reason() -> impl Strategy<Value = AbortReason> {
 fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
     // Use selector + string to avoid Clone requirement on LlmOutcome.
     (
-        0..9u8,
+        0..10u8,
         proptest::collection::vec(arb_tool_call(), 0..3),
         "[a-zA-Z ]{1,20}",
     )
@@ -1987,7 +1987,8 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                 },
                 message: msg,
             },
-            _ => LlmOutcome::ServerOverloaded { message: msg },
+            8 => LlmOutcome::ServerOverloaded { message: msg },
+            _ => LlmOutcome::Cancelled,
         })
 }
 
@@ -2005,15 +2006,39 @@ fn arb_tool_outcome() -> impl Strategy<Value = ToolExecOutcome> {
     ]
 }
 
+fn arb_persist_outcome() -> impl Strategy<Value = PersistOutcome> {
+    (any::<bool>(), "[a-zA-Z ]{1,20}").prop_map(|(ok, error)| {
+        if ok {
+            PersistOutcome::Ok
+        } else {
+            PersistOutcome::Failed { error }
+        }
+    })
+}
+
 fn arb_effect_outcome() -> impl Strategy<Value = EffectOutcome> {
     // Use selector to avoid Clone requirement on EffectOutcome/LlmOutcome.
-    (0..3u8, arb_llm_outcome(), arb_tool_outcome(), 1u32..5).prop_map(
-        |(variant, llm, tool, attempt)| match variant {
-            0 => EffectOutcome::Llm(llm),
-            1 => EffectOutcome::Tool(tool),
-            _ => EffectOutcome::RetryTimeout { attempt },
-        },
+    (
+        0..5u8,
+        arb_llm_outcome(),
+        arb_tool_outcome(),
+        "[a-z]{8}",
+        arb_sub_agent_outcome(),
+        arb_persist_outcome(),
+        1u32..5,
     )
+        .prop_map(
+            |(variant, llm, tool, agent_id, sub_outcome, persist, attempt)| match variant {
+                0 => EffectOutcome::Llm(llm),
+                1 => EffectOutcome::Tool(tool),
+                2 => EffectOutcome::SubAgent {
+                    agent_id,
+                    outcome: sub_outcome,
+                },
+                3 => EffectOutcome::Persist(persist),
+                _ => EffectOutcome::RetryTimeout { attempt },
+            },
+        )
 }
 
 // ============================================================================
@@ -2035,8 +2060,32 @@ proptest! {
         let _ = handle_outcome(&state, &ctx, outcome);
     }
 
+    // PersistOutcome::Ok returns the same state unchanged
+    #[test]
+    fn prop_persist_ok_returns_same_state(state in arb_state()) {
+        let ctx = test_context();
+        let outcome = EffectOutcome::Persist(PersistOutcome::Ok);
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_ok());
+        prop_assert_eq!(
+            format!("{:?}", result.unwrap().new_state),
+            format!("{:?}", state),
+            "PersistOutcome::Ok should return unchanged state"
+        );
+    }
 
-    // LlmOutcome::AuthError always produces non-retryable error (goes to Error state)
+    // PersistOutcome::Failed always returns InvalidOutcome
+    #[test]
+    fn prop_persist_failed_returns_invalid(
+        state in arb_state(),
+        error in "[a-zA-Z ]{1,20}"
+    ) {
+        let ctx = test_context();
+        let outcome = EffectOutcome::Persist(PersistOutcome::Failed { error });
+        let result = handle_outcome(&state, &ctx, outcome);
+        prop_assert!(result.is_err());
+    }
+
     #[test]
     fn prop_auth_error_is_non_retryable(
         attempt in 1u32..5,

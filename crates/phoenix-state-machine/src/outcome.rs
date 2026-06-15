@@ -7,7 +7,7 @@
 //! cannot send an `LlmOutcome`. The executor wraps received outcomes in
 //! `EffectOutcome` before passing to `handle_outcome()`.
 
-use crate::state::ToolCall;
+use crate::state::{SubAgentOutcome, ToolCall};
 use phoenix_core::domain::db_schema::ToolResult;
 use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 use phoenix_core::domain::quota_details::QuotaDetails;
@@ -71,6 +71,9 @@ pub enum LlmOutcome {
     },
     /// Request rejected (400, content filter, etc.) — non-retryable
     RequestRejected { message: String },
+    /// Request was cancelled (abort signal received).
+    #[allow(dead_code)]
+    Cancelled,
 }
 
 // ============================================================================
@@ -101,6 +104,20 @@ pub enum AbortReason {
 }
 
 // ============================================================================
+// Persist Outcome — returned by executor persistence task via oneshot channel
+// ============================================================================
+
+/// Outcome of a persistence operation, sent through a typed oneshot channel.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum PersistOutcome {
+    /// Persistence succeeded
+    Ok,
+    /// Persistence failed
+    Failed { error: String },
+}
+
+// ============================================================================
 // EffectOutcome — union type for all outcomes the executor can produce
 // ============================================================================
 
@@ -112,6 +129,15 @@ pub enum EffectOutcome {
     Llm(LlmOutcome),
     /// Tool execution completed
     Tool(ToolExecOutcome),
+    /// Sub-agent completed.
+    #[allow(dead_code)]
+    SubAgent {
+        agent_id: String,
+        outcome: SubAgentOutcome,
+    },
+    /// Persistence completed.
+    #[allow(dead_code)]
+    Persist(PersistOutcome),
     /// Retry timer fired
     RetryTimeout { attempt: u32 },
 }

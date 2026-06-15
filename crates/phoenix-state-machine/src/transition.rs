@@ -13,7 +13,7 @@
 
 use super::effect::{compute_bash_display_data, CheckpointData};
 use super::event::{CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent};
-use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, ToolExecOutcome};
+use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
     AssistantMessage, ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind,
     ParentState, RecoveryKind, RecoveryResumeTarget, SubAgentResult, SubAgentState,
@@ -2854,6 +2854,12 @@ pub fn handle_outcome(
     let event = match outcome {
         EffectOutcome::Llm(llm) => llm_outcome_to_event(llm, state),
         EffectOutcome::Tool(tool) => tool_outcome_to_event(tool),
+        EffectOutcome::SubAgent { agent_id, outcome } => {
+            Event::SubAgentResult { agent_id, outcome }
+        }
+        EffectOutcome::Persist(persist) => {
+            return handle_persist_outcome(state, persist);
+        }
         EffectOutcome::RetryTimeout { attempt } => Event::RetryTimeout { attempt },
     };
 
@@ -2969,6 +2975,16 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::Cancelled => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message: "Request cancelled".to_string(),
+                error_kind: ErrorKind::Cancelled,
+                attempt,
+                recovery_in_progress: false,
+                resets_at: None,
+            }
+        }
     }
 }
 
@@ -2987,6 +3003,20 @@ fn tool_outcome_to_event(outcome: ToolExecOutcome) -> Event {
             tool_use_id: tool_use_id.clone(),
             result: ToolResult::error(tool_use_id, error),
         },
+    }
+}
+
+/// Handle `PersistOutcome` directly — no Event equivalent exists.
+/// Persistence failures are logged but don't change state.
+fn handle_persist_outcome(
+    state: &ConvState,
+    outcome: PersistOutcome,
+) -> Result<TransitionResult, InvalidOutcome> {
+    match outcome {
+        PersistOutcome::Ok => Ok(TransitionResult::new(state.clone())),
+        PersistOutcome::Failed { error } => Err(InvalidOutcome {
+            reason: format!("Persistence failed: {error}"),
+        }),
     }
 }
 
