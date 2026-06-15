@@ -415,6 +415,11 @@ where
     llm_registry: Arc<ModelRegistry>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
     terminals: crate::terminal::ActiveTerminals,
+    /// The permission seam every tool call clears before dispatch. Layer 0
+    /// deterministic deny + Tier A intrinsic-risk classification (task 29001).
+    /// Defaulted to `layer0_only()` (Tier A disabled) until a trained encoder
+    /// ships; wiring the encoder is a `with_tier_a` swap here, no call-site change.
+    deny_gate: crate::runtime::deny_gate::DenyGate,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
     broadcast_tx: SseBroadcaster,
@@ -591,6 +596,7 @@ where
             tmux_registry,
             llm_registry,
             terminals,
+            deny_gate: crate::runtime::deny_gate::DenyGate::layer0_only(),
             event_rx,
             event_tx,
             broadcast_tx,
@@ -2908,7 +2914,7 @@ where
         // the existing outcome channel (REQ-PERM-005). `spawn_agents` is handled
         // above and bypasses Layer 0 as intent-relative (REQ-PERM-007).
         let checked =
-            match crate::runtime::deny_gate::DenyGate::check(tool_name.clone(), tool_input) {
+            match self.deny_gate.check(tool_name.clone(), tool_input) {
                 Ok(checked) => checked,
                 Err(denial) => {
                     tracing::info!(conv_id = %conv_id, tool = %tool_name, id = %tool_use_id,
