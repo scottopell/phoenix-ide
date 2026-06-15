@@ -750,7 +750,10 @@ pub struct UserContent {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageData>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Non-image attachments. Always serialized (no `skip_serializing_if`) so
+    /// every persisted user row carries the key; legacy rows are backfilled by
+    /// the `backfill_user_content_files*` migrations. Missing `files` is a hard
+    /// deserialization error, not a silent default.
     pub files: Vec<FileAttachment>,
     /// Expanded text delivered to the LLM (REQ-IR-001).
     /// `None` means no expansion occurred and `text` is used verbatim for the LLM.
@@ -939,7 +942,10 @@ pub struct SkillContent {
     pub body: String,
     /// The original user text that triggered the invocation (for display)
     pub trigger: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Non-image attachments. Always serialized (no `skip_serializing_if`) so
+    /// every persisted skill row carries the key; legacy rows are backfilled by
+    /// the `backfill_user_content_files*` migrations. Missing `files` is a hard
+    /// deserialization error, not a silent default.
     pub files: Vec<FileAttachment>,
 }
 
@@ -1652,5 +1658,29 @@ mod conversation_serde_tests {
             serde_json::from_str(r#"{"tool_use_id":"t1","content":"out","is_error":false}"#)
                 .unwrap();
         assert!(content.images.is_empty());
+    }
+
+    /// `UserContent`/`SkillContent` `files` carry no `#[serde(default)]`: the
+    /// `backfill_user_content_files*` migrations guarantee every persisted
+    /// user/skill row has the key, and the field is serialized unconditionally,
+    /// so a missing `files` is a hard error rather than a silent empty vec
+    /// (mirrors `test_work_missing_fields_is_hard_error` for `ConvMode::Work`).
+    #[test]
+    fn user_and_skill_content_require_files_key() {
+        // Missing `files` → hard error.
+        assert!(serde_json::from_str::<UserContent>(r#"{"text":"hi"}"#).is_err());
+        assert!(serde_json::from_str::<SkillContent>(
+            r#"{"name":"build","body":"b","trigger":"/build"}"#
+        )
+        .is_err());
+
+        // Present `files` (even empty) → deserializes.
+        let user: UserContent = serde_json::from_str(r#"{"text":"hi","files":[]}"#).unwrap();
+        assert!(user.files.is_empty());
+
+        // Empty `files` is serialized (no skip_serializing_if): the key is
+        // always present so no future row can omit it.
+        let json = serde_json::to_value(&user).unwrap();
+        assert_eq!(json["files"], serde_json::json!([]));
     }
 }

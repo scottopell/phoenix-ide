@@ -129,6 +129,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_mcp_oauth_registration_redirect_uri",
         sql: MIGRATION_023,
     },
+    Migration {
+        version: 24,
+        name: "backfill_user_content_files_final",
+        sql: MIGRATION_024,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -553,6 +558,23 @@ const MIGRATION_023: &str = r"
 ALTER TABLE mcp_oauth_registrations ADD COLUMN redirect_uri TEXT;
 ";
 
+/// Make `files` a structurally-present field on every persisted user/skill
+/// message, retiring the `#[serde(default)]` read shim on `UserContent::files`
+/// and `SkillContent::files`.
+///
+/// Migration 014 backfilled `$.files = []` once, but `files` was serialized
+/// with `skip_serializing_if = "Vec::is_empty"`, so every empty-files message
+/// written after 014 ran omitted the key again — re-creating exactly the absent
+/// state 014 set out to eliminate. This migration re-runs the same idempotent
+/// backfill to cover those rows; the field is now serialized unconditionally, so
+/// no future row can omit it and deserialization can require the key.
+const MIGRATION_024: &str = r"
+UPDATE messages
+SET content = json_set(content, '$.files', json('[]'))
+WHERE message_type IN ('user', 'skill')
+  AND json_type(content, '$.files') IS NULL;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -680,10 +702,87 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 23);
+        assert_eq!(first, 24);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
+    }
+
+    /// Migration 024: user/skill message rows missing `$.files` get it
+    /// backfilled to `[]`; rows that already carry `files` (and non-user/skill
+    /// rows) are untouched.
+    #[tokio::test]
+    async fn migration_024_backfills_missing_user_content_files() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+             VALUES ('c', '{\"mode\":\"Explore\"}', '{\"type\":\"idle\"}', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // (message_id, message_type, content) — covering each case.
+        let rows: &[(&str, &str, &str)] = &[
+            // user, no files key → backfilled to []
+            ("m-user", "user", r#"{"text":"hi"}"#),
+            // skill, no files key → backfilled to []
+            (
+                "m-skill",
+                "skill",
+                r#"{"name":"build","body":"b","trigger":"/build"}"#,
+            ),
+            // user, already has files → untouched
+            (
+                "m-user-files",
+                "user",
+                r#"{"text":"hi","files":[{"original_name":"a.txt","media_type":"text/plain","size_bytes":1,"stored_path":"/p"}]}"#,
+            ),
+            // agent row → untouched (not user/skill)
+            ("m-agent", "agent", r#"[{"type":"text","text":"hi"}]"#),
+        ];
+        for (id, mt, content) in rows {
+            sqlx::query(
+                "INSERT INTO messages (message_id, conversation_id, message_type, content) \
+                 VALUES (?1, 'c', ?2, ?3)",
+            )
+            .bind(id)
+            .bind(mt)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let content_for = |id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("SELECT content FROM messages WHERE message_id = ?1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .get::<String, _>("content")
+            }
+        };
+
+        let user: serde_json::Value = serde_json::from_str(&content_for("m-user").await).unwrap();
+        assert_eq!(user["files"], serde_json::json!([]));
+
+        let skill: serde_json::Value = serde_json::from_str(&content_for("m-skill").await).unwrap();
+        assert_eq!(skill["files"], serde_json::json!([]));
+
+        // Pre-existing files preserved (not clobbered to []).
+        let with_files: serde_json::Value =
+            serde_json::from_str(&content_for("m-user-files").await).unwrap();
+        assert_eq!(with_files["files"].as_array().unwrap().len(), 1);
+
+        // Agent rows are untouched (still a bare array, no files key inserted).
+        let agent: serde_json::Value = serde_json::from_str(&content_for("m-agent").await).unwrap();
+        assert!(agent.is_array());
     }
 
     #[tokio::test]
