@@ -131,7 +131,7 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 24,
-        name: "backfill_user_content_files_final",
+        name: "backfill_user_content_attachments_final",
         sql: MIGRATION_024,
     },
 ];
@@ -558,21 +558,27 @@ const MIGRATION_023: &str = r"
 ALTER TABLE mcp_oauth_registrations ADD COLUMN redirect_uri TEXT;
 ";
 
-/// Make `files` a structurally-present field on every persisted user/skill
-/// message, retiring the `#[serde(default)]` read shim on `UserContent::files`
-/// and `SkillContent::files`.
+/// Make the user/skill attachment vectors structurally-present fields on every
+/// persisted message, retiring the `#[serde(default)]` read shims on
+/// `UserContent::{files,images}` and `SkillContent::files`.
 ///
-/// Migration 014 backfilled `$.files = []` once, but `files` was serialized
-/// with `skip_serializing_if = "Vec::is_empty"`, so every empty-files message
-/// written after 014 ran omitted the key again — re-creating exactly the absent
-/// state 014 set out to eliminate. This migration re-runs the same idempotent
-/// backfill to cover those rows; the field is now serialized unconditionally, so
-/// no future row can omit it and deserialization can require the key.
+/// Migration 014 backfilled `$.files = []` once, but the attachment vectors were
+/// serialized with `skip_serializing_if = "Vec::is_empty"`, so every empty-vec
+/// message written after 014 ran omitted the key again — re-creating exactly the
+/// absent state 014 set out to eliminate. `$.images` was never backfilled at all.
+/// This migration backfills both (images only on `user` rows — `SkillContent`
+/// has no images field); the fields are now serialized unconditionally, so no
+/// future row can omit them and deserialization can require the keys.
 const MIGRATION_024: &str = r"
 UPDATE messages
 SET content = json_set(content, '$.files', json('[]'))
 WHERE message_type IN ('user', 'skill')
   AND json_type(content, '$.files') IS NULL;
+
+UPDATE messages
+SET content = json_set(content, '$.images', json('[]'))
+WHERE message_type = 'user'
+  AND json_type(content, '$.images') IS NULL;
 ";
 
 /// Run all pending migrations against the database.
@@ -709,10 +715,11 @@ mod tests {
     }
 
     /// Migration 024: user/skill message rows missing `$.files` get it
-    /// backfilled to `[]`; rows that already carry `files` (and non-user/skill
-    /// rows) are untouched.
+    /// backfilled to `[]`, and user rows missing `$.images` likewise; rows that
+    /// already carry the key, skill rows (no images field), and non-user/skill
+    /// rows are untouched.
     #[tokio::test]
-    async fn migration_024_backfills_missing_user_content_files() {
+    async fn migration_024_backfills_missing_user_content_attachments() {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
         sqlx::query(
@@ -771,16 +778,20 @@ mod tests {
 
         let user: serde_json::Value = serde_json::from_str(&content_for("m-user").await).unwrap();
         assert_eq!(user["files"], serde_json::json!([]));
+        // user rows also get images backfilled.
+        assert_eq!(user["images"], serde_json::json!([]));
 
         let skill: serde_json::Value = serde_json::from_str(&content_for("m-skill").await).unwrap();
         assert_eq!(skill["files"], serde_json::json!([]));
+        // SkillContent has no images field, so skill rows must NOT get one.
+        assert!(skill.get("images").is_none());
 
         // Pre-existing files preserved (not clobbered to []).
         let with_files: serde_json::Value =
             serde_json::from_str(&content_for("m-user-files").await).unwrap();
         assert_eq!(with_files["files"].as_array().unwrap().len(), 1);
 
-        // Agent rows are untouched (still a bare array, no files key inserted).
+        // Agent rows are untouched (still a bare array, no files/images key inserted).
         let agent: serde_json::Value = serde_json::from_str(&content_for("m-agent").await).unwrap();
         assert!(agent.is_array());
     }

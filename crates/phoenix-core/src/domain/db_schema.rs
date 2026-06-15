@@ -748,12 +748,12 @@ pub struct UserContent {
     /// Display text — stored in DB and shown in conversation history.
     /// For messages with `@` expansion this is the original shorthand (REQ-IR-006).
     pub text: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Image attachments and non-image attachments. Both are serialized
+    /// unconditionally (no `skip_serializing_if`) so every persisted user row
+    /// carries the keys; legacy rows are backfilled by the
+    /// `backfill_user_content_*` migrations. A missing `images`/`files` is a
+    /// hard deserialization error, not a silent default.
     pub images: Vec<ImageData>,
-    /// Non-image attachments. Always serialized (no `skip_serializing_if`) so
-    /// every persisted user row carries the key; legacy rows are backfilled by
-    /// the `backfill_user_content_files*` migrations. Missing `files` is a hard
-    /// deserialization error, not a silent default.
     pub files: Vec<FileAttachment>,
     /// Expanded text delivered to the LLM (REQ-IR-001).
     /// `None` means no expansion occurred and `text` is used verbatim for the LLM.
@@ -944,8 +944,9 @@ pub struct SkillContent {
     pub trigger: String,
     /// Non-image attachments. Always serialized (no `skip_serializing_if`) so
     /// every persisted skill row carries the key; legacy rows are backfilled by
-    /// the `backfill_user_content_files*` migrations. Missing `files` is a hard
-    /// deserialization error, not a silent default.
+    /// the `backfill_user_content_*` migrations. Missing `files` is a hard
+    /// deserialization error, not a silent default. (`SkillContent` has no
+    /// images field — skill invocations never carry inline image payloads.)
     pub files: Vec<FileAttachment>,
 }
 
@@ -1660,27 +1661,33 @@ mod conversation_serde_tests {
         assert!(content.images.is_empty());
     }
 
-    /// `UserContent`/`SkillContent` `files` carry no `#[serde(default)]`: the
-    /// `backfill_user_content_files*` migrations guarantee every persisted
-    /// user/skill row has the key, and the field is serialized unconditionally,
-    /// so a missing `files` is a hard error rather than a silent empty vec
-    /// (mirrors `test_work_missing_fields_is_hard_error` for `ConvMode::Work`).
+    /// `UserContent::{images,files}` and `SkillContent::files` carry no
+    /// `#[serde(default)]`: the `backfill_user_content_*` migrations guarantee
+    /// every persisted user/skill row has the keys, and the fields are
+    /// serialized unconditionally, so a missing attachment vector is a hard
+    /// error rather than a silent empty vec (mirrors
+    /// `test_work_missing_fields_is_hard_error` for `ConvMode::Work`).
     #[test]
-    fn user_and_skill_content_require_files_key() {
-        // Missing `files` → hard error.
-        assert!(serde_json::from_str::<UserContent>(r#"{"text":"hi"}"#).is_err());
+    fn user_and_skill_content_require_attachment_keys() {
+        // UserContent: both images and files are required.
+        assert!(serde_json::from_str::<UserContent>(r#"{"text":"hi","files":[]}"#).is_err());
+        assert!(serde_json::from_str::<UserContent>(r#"{"text":"hi","images":[]}"#).is_err());
+        // SkillContent: files is required (it has no images field).
         assert!(serde_json::from_str::<SkillContent>(
             r#"{"name":"build","body":"b","trigger":"/build"}"#
         )
         .is_err());
 
-        // Present `files` (even empty) → deserializes.
-        let user: UserContent = serde_json::from_str(r#"{"text":"hi","files":[]}"#).unwrap();
+        // Present keys (even empty) → deserializes.
+        let user: UserContent =
+            serde_json::from_str(r#"{"text":"hi","images":[],"files":[]}"#).unwrap();
+        assert!(user.images.is_empty());
         assert!(user.files.is_empty());
 
-        // Empty `files` is serialized (no skip_serializing_if): the key is
-        // always present so no future row can omit it.
+        // Empty vectors are serialized (no skip_serializing_if): the keys are
+        // always present so no future row can omit them.
         let json = serde_json::to_value(&user).unwrap();
+        assert_eq!(json["images"], serde_json::json!([]));
         assert_eq!(json["files"], serde_json::json!([]));
     }
 }
