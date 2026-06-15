@@ -97,13 +97,13 @@ describe('visibility (REQ-WAB-001)', () => {
 // --- Row 1: continued -----------------------------------------------------
 
 describe('continued (REQ-WAB-009)', () => {
-  it('no primary, terminal verbs suppressed, abandon disabled, continued note', () => {
+  it('no primary, all terminal verbs hidden, continued note only', () => {
     const d = deriveWorkDisposition(input({ continuedInConvId: 'conv-123', prStatus: foundPr('merged') }));
     expect(d.visible).toBe(true);
     expect(d.primary).toBe('none');
     expect(d.resolve).toBeNull();
     expect(d.showCleanUp).toBe(false);
-    expect(d.abandonDisabled).toBe(true);
+    expect(d.showAbandon).toBe(false);
     expect(d.note?.kind).toBe('continued');
   });
 
@@ -119,14 +119,14 @@ describe('continued (REQ-WAB-009)', () => {
 // --- Row 2: checking / loading --------------------------------------------
 
 describe('checking / loading', () => {
-  it('abandon primary, no clean up, checking note, abandon enabled', () => {
+  it('abandon primary, no clean up, checking note, abandon shown', () => {
     const d = deriveWorkDisposition(input({ prLoading: true, prStatus: null }));
     expect(d.visible).toBe(true);
     expect(d.primary).toBe('abandon');
     expect(d.resolve).toBeNull();
     expect(d.showCleanUp).toBe(false);
     expect(d.cleanUpIsManualFallback).toBe(false);
-    expect(d.abandonDisabled).toBe(false);
+    expect(d.showAbandon).toBe(true);
     expect(d.note?.kind).toBe('checking');
   });
 
@@ -200,7 +200,37 @@ describe('idle open/draft — RESOLVE', () => {
     expect(d.primary).toBe('resolve');
     expect(d.resolve).toEqual({ kind: 'address_feedback' });
     expect(d.showCleanUp).toBe(false);
-    expect(d.abandonDisabled).toBe(false);
+    expect(d.showAbandon).toBe(true);
+  });
+
+  it('address_feedback when open + coverage gap, even with passing checks and no fresh feedback (codex #5)', () => {
+    const d = deriveWorkDisposition(
+      input({
+        prStatus: foundPr('open', {
+          check_state: 'passing' as PrCheckState,
+          feedback_coverage: { kind: 'auth_required', surfaces: ['review_threads'] },
+        }),
+      }),
+    );
+    // A coverage gap is actionable — route to Address feedback so its coverage
+    // marker (e.g. "GitHub sign-in needed") is visible, not hidden behind a link.
+    expect(d.primary).toBe('resolve');
+    expect(d.resolve).toEqual({ kind: 'address_feedback' });
+  });
+
+  it('stale unavailable persisted open PR keeps the manual Clean up fallback (codex #1)', () => {
+    const d = deriveWorkDisposition(
+      input({
+        prStatus: foundPr('open', {
+          refresh: { state: 'unavailable', last_attempted_at: '2026-01-01T00:00:00Z', stale: true },
+          unavailable_reason: 'command_failed',
+        }),
+      }),
+    );
+    expect(d.primary).toBe('clean_up');
+    expect(d.showCleanUp).toBe(true);
+    expect(d.cleanUpIsManualFallback).toBe(true);
+    expect(d.note?.kind).toBe('gh_unavailable');
   });
 
   it('address_feedback when open + fresh feedback present', () => {
@@ -391,10 +421,10 @@ describe('structural invariants', () => {
     }
   });
 
-  it('abandonDisabled is true only in the continued case', () => {
+  it('Abandon is hidden (on a visible bar) only in the continued case', () => {
     for (const inp of matrix()) {
       const d = deriveWorkDisposition(inp);
-      if (d.abandonDisabled) {
+      if (d.visible && !d.showAbandon) {
         expect(d.note?.kind).toBe('continued');
         expect(d.primary).toBe('none');
       }

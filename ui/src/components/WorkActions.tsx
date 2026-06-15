@@ -116,6 +116,7 @@ export function WorkControlBar({
               type="button"
               className={`work-actions-btn work-actions-address${primaryClass('resolve')}`}
               data-testid="address-feedback-button"
+              disabled={capturing}
               onClick={handleAddressFeedback}
             >
               {capturing ? 'Capturing...' : 'Address feedback'}
@@ -181,29 +182,33 @@ export function WorkControlBar({
             <InfoHint text={cleanUpHintText(isBranch)} />
           </>
         )}
-        <button
-          className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
-          data-testid="abandon-button"
-          disabled={disposition.abandonDisabled || isLoading}
-          onClick={async () => {
-            const confirmText = isBranch
-              ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
-              : 'Abandon this task? The worktree and task branch will be deleted.';
-            if (!window.confirm(confirmText)) return;
-            setError(null);
-            setAbandoning(true);
-            try {
-              await api.abandonTask(conversationId);
-            } catch (err) {
-              setError(err instanceof Error ? err.message : 'Failed to abandon task');
-            } finally {
-              setAbandoning(false);
-            }
-          }}
-        >
-          {abandoning ? 'Abandoning...' : 'Abandon'}
-        </button>
-        <InfoHint text={abandonHintText(isBranch)} />
+        {disposition.showAbandon && (
+          <>
+            <button
+              className={`work-actions-btn work-actions-abandon${primaryClass('abandon')}`}
+              data-testid="abandon-button"
+              disabled={isLoading}
+              onClick={async () => {
+                const confirmText = isBranch
+                  ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
+                  : 'Abandon this task? The worktree and task branch will be deleted.';
+                if (!window.confirm(confirmText)) return;
+                setError(null);
+                setAbandoning(true);
+                try {
+                  await api.abandonTask(conversationId);
+                } catch (err) {
+                  setError(err instanceof Error ? err.message : 'Failed to abandon task');
+                } finally {
+                  setAbandoning(false);
+                }
+              }}
+            >
+              {abandoning ? 'Abandoning...' : 'Abandon'}
+            </button>
+            <InfoHint text={abandonHintText(isBranch)} />
+          </>
+        )}
       </div>
 
       {/* Inline note — muted text, never a button. */}

@@ -127,16 +127,3 @@ enrichment that precedes them.
 - **work-actions-bar** — consumes `PrAutoFixAffordance` and renders the Address-CI control,
   its enable/disable state, the freshness advisory marker, and the copy. This spec derives the
   affordance; work-actions-bar composes the surface.
-
-## Provenance
-
-PR-association requirements were previously expressed as project-scope requirements REQ-PROJ-030
-through REQ-PROJ-032 in the `projects` spec. They are carried here, renumbered, so that PR
-identity, status freshness, auto-fix targeting, and feedback freshness own their own spec
-independent of project detection, mode selection, and worktree creation:
-
-| Prior ID | New ID | Subject |
-|----------|--------|---------|
-| REQ-PROJ-030 | REQ-PRA-001 | PR feedback freshness indicator |
-| REQ-PROJ-031 | REQ-PRA-002 | Agent-facing PR context baseline |
-| REQ-PROJ-032 | REQ-PRA-003 | Bounded PR feedback refresh |

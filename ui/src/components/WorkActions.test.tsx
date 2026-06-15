@@ -136,7 +136,7 @@ describe('WorkControlBar — visibility (REQ-WAB-001)', () => {
 });
 
 describe('WorkControlBar — continuation gate (REQ-WAB-009)', () => {
-  it('disables Abandon, shows the continuation note, and glows nothing', () => {
+  it('hides both terminal verbs, shows only the continuation note, glows nothing', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-1"
@@ -147,8 +147,9 @@ describe('WorkControlBar — continuation gate (REQ-WAB-009)', () => {
       />,
     );
 
-    const abandon = screen.getByTestId('abandon-button') as HTMLButtonElement;
-    expect(abandon.disabled).toBe(true);
+    // FINISH zone fully suppressed — no dead disabled button (REQ-WAB-008/009).
+    expect(screen.queryByTestId('abandon-button')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
 
     expect(
       document.querySelector('.work-actions-continuation-note'),
@@ -159,8 +160,6 @@ describe('WorkControlBar — continuation gate (REQ-WAB-009)', () => {
 
     // No primary glow in the continued case.
     expect(primaryCount()).toBe(0);
-    // Terminal verbs suppressed.
-    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
   });
 });
 
@@ -698,6 +697,8 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
 
     // Loading state holds while send is in flight; refresh not yet called.
     expect(button.textContent).toMatch(/Capturing/i);
+    // Button is disabled while capturing — no double-submit (codex #2).
+    expect((screen.getByTestId('address-feedback-button') as HTMLButtonElement).disabled).toBe(true);
     expect(handle.refresh).not.toHaveBeenCalled();
 
     resolveSend();

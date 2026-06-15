@@ -173,12 +173,3 @@ This spec does not re-specify bedrock's state machine. The interaction boundary 
    resolution, not an argument to `TaskResolved`.
 
 The transition to `terminal` is bedrock's; this spec owns steps 1 and 2.
-
-## Provenance
-
-The standing mapping from the prior project-scope requirement IDs to this spec's IDs is given
-canonically in `executive.md`. In brief: REQ-WL-001 (Abandon) and REQ-WL-002 (Mark as merged)
-each absorb the per-mode abandon/merge clauses of REQ-PROJ-010, REQ-PROJ-026, and
-REQ-PROJ-027 as rows in their disposition tables; REQ-WL-003 carries the PR-state cleanup gate
-from REQ-PROJ-011. REQ-PROJ-009 (squash-merge) is deprecated and not carried forward.
-REQ-PROJ-030 through REQ-PROJ-032 belong to the `pr-association` spec.

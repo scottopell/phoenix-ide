@@ -48,8 +48,10 @@ export interface WorkDisposition {
   showCleanUp: boolean;
   /** gh unavailable: Clean up is a single-click manual fallback with a warning note. */
   cleanUpIsManualFallback: boolean;
-  /** True only in the continued case — Abandon belongs on the continuation. */
-  abandonDisabled: boolean;
+  /** Render the Abandon verb in the FINISH zone. False when continued (the
+   *  continuation owns disposal — REQ-WAB-009 suppresses FINISH verbs, and the
+   *  no-disabled-as-status rule means we show the note, not a dead button). */
+  showAbandon: boolean;
   /** At most one inline note. */
   note: DispositionNote | null;
 }
@@ -79,7 +81,7 @@ function hidden(): WorkDisposition {
     resolve: null,
     showCleanUp: false,
     cleanUpIsManualFallback: false,
-    abandonDisabled: false,
+    showAbandon: false,
     note: null,
   };
 }
@@ -119,7 +121,7 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
       resolve: null,
       showCleanUp: false,
       cleanUpIsManualFallback: false,
-      abandonDisabled: true,
+      showAbandon: false,
       note: { kind: 'continued', text: NOTE_CONTINUED },
     };
   }
@@ -133,7 +135,7 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
       resolve: null,
       showCleanUp: false,
       cleanUpIsManualFallback: false,
-      abandonDisabled: false,
+      showAbandon: true,
       note: { kind: 'checking', text: NOTE_CHECKING },
     };
   }
@@ -175,11 +177,28 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
 
   // Row 4. idle, found, PR open/draft — push-forward RESOLVE.
   if (found && (ds === 'open' || ds === 'draft')) {
+    // gh cannot confirm a stale persisted PR (refresh failed over a previously
+    // observed PR). Keep the manual Clean up fallback (REQ-WL-003) rather than
+    // only offering a PR link — the work may have merged externally and the
+    // user must still be able to dispose without a working gh.
+    if (prStatus?.refresh?.state === 'unavailable' && prStatus?.refresh?.stale) {
+      return finish('clean_up', {
+        showCleanUp: true,
+        cleanUpIsManualFallback: true,
+        note: { kind: 'gh_unavailable', text: NOTE_GH_UNAVAILABLE },
+      });
+    }
+    // Addressable: an open PR with something to act on — failing checks, fresh
+    // feedback, or a feedback coverage gap (e.g. an unreadable surface / auth
+    // gap). The coverage marker only renders on the Address feedback button, so
+    // a coverage-only gap must route here or its actionable hint is hidden.
     const addressable =
       ds === 'open' &&
       canSendMessage &&
       prStatus?.refresh?.state !== 'unavailable' &&
-      (prStatus?.check_state === 'failing' || prStatus?.feedback_freshness != null);
+      (prStatus?.check_state === 'failing' ||
+        prStatus?.feedback_freshness != null ||
+        prStatus?.feedback_coverage != null);
 
     if (addressable) {
       return resolveVerb({ kind: 'address_feedback' });
@@ -239,7 +258,7 @@ function resolveVerb(verb: ResolveVerb): WorkDisposition {
     resolve: verb,
     showCleanUp: false,
     cleanUpIsManualFallback: false,
-    abandonDisabled: false,
+    showAbandon: true,
     note: null,
   };
 }
@@ -259,7 +278,7 @@ function finish(
     resolve: null,
     showCleanUp: opts.showCleanUp ?? false,
     cleanUpIsManualFallback: opts.cleanUpIsManualFallback ?? false,
-    abandonDisabled: false,
+    showAbandon: true,
     note: opts.note ?? null,
   };
 }
