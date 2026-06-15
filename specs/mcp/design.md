@@ -277,15 +277,21 @@ registers that exact URI) but not for a pre-registered app whose redirect
 allowlist Phoenix cannot edit. When such an app pins a fixed
 `http://localhost:<port>/callback` (the `callbackPort` on the pre-configured
 client), `begin_oauth_flow` uses that loopback URI as the flow's `redirect_uri`
-and `spawn_loopback_redirect` binds a one-shot `TcpListener` on
-`127.0.0.1:<port>`. The browser's callback lands there; the listener replies
-`302` to `{redirect_base}/api/mcp/oauth/callback` with the query forwarded
-verbatim, so the existing route runs the real completion (token exchange uses
-the loopback `redirect_uri`, matching what the authorization server saw). The
-listener binds loopback only (same-machine operator), accepts one request, and
-self-terminates on first use or a 5-minute timeout; `OAuthRuntime::loopback_listeners`
-holds the `AbortHandle` so a re-prompt cancels a stale listener before binding
-the port again.
+and binds the listener (`bind_loopback_listeners`) **synchronously, before
+publishing the authorization URL** — a bind failure (port in use) fails the
+flow with a clear error rather than surfacing a sign-in URL whose callback can
+never be received. The listener binds both `127.0.0.1` and `::1` (a browser
+resolving `localhost` to either family reaches it; binding only one family is
+fine if that is all the host has). The browser's callback lands there; the
+listener replies `302` to `{redirect_base}/api/mcp/oauth/callback` with the
+query forwarded verbatim, so the existing route runs the real completion (token
+exchange uses the loopback `redirect_uri`, matching what the authorization
+server saw). It binds loopback only (same-machine operator) and **accepts in a
+loop** until the flow resolves or a 5-minute window elapses — a token-exchange
+failure leaves the flow pending and retryable, so the listener must still
+receive the retry. `OAuthRuntime::loopback_listeners` holds the `JoinHandle`:
+`complete_oauth_authorization` aborts it once the flow resolves, and a re-prompt
+aborts *and awaits* a stale listener so the port is released before rebinding.
 
 The canonical redirect base can change across deployments (a new domain,
 default-port elision). A dynamic client registration is keyed only by

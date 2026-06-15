@@ -1026,12 +1026,14 @@ struct OAuthRuntime {
     /// authorize link will fail before opening it.
     redirect_warning: std::sync::Mutex<Option<String>>,
     pending: std::sync::Mutex<HashMap<String, PendingAuthFlow>>,
-    /// One-shot loopback callback listeners, keyed by server name. A server
-    /// whose pre-registered OAuth app only allows a fixed `http://localhost:<port>/callback`
-    /// redirect (it cannot register Phoenix's own callback route) gets an
-    /// ephemeral listener on that port that bounces the browser to the real
-    /// callback route (REQ-MCP-020). Held so a re-prompt can abort a stale one.
-    loopback_listeners: std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
+    /// Loopback callback listeners, keyed by server name. A server whose
+    /// pre-registered OAuth app only allows a fixed `http://localhost:<port>/callback`
+    /// redirect (it cannot register Phoenix's own callback route) gets a listener
+    /// on that port that bounces the browser to the real callback route
+    /// (REQ-MCP-020). The `JoinHandle` is held so a re-prompt can abort *and
+    /// await* a stale listener — releasing the port before rebinding it — and so
+    /// a completed flow can abort its listener.
+    loopback_listeners: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for OAuthRuntime {
@@ -1216,38 +1218,44 @@ async fn acquire_client_registration(
     redirect_uri: &str,
 ) -> Result<OAuthRegistrationRecord, String> {
     if let Some(cached) = &cached {
-        if cached
+        // Reuse a cached registration only if it still matches the current
+        // client identity and redirect. A changed pre-configured client_id
+        // (the config was re-keyed) must replace the stale row, not authorize
+        // against the old app forever (the registration is keyed by issuer, so
+        // the client_id is not in the key).
+        let client_matches = preconfigured.is_none_or(|pre| pre.client_id == cached.client_id);
+        let redirect_matches = cached
             .redirect_uri
             .as_deref()
-            .is_none_or(|registered| registered == redirect_uri)
-        {
+            .is_none_or(|registered| registered == redirect_uri);
+        if client_matches && redirect_matches {
             return Ok(cached.clone());
         }
     }
 
-    // A pre-configured client identity is now seeded — discovery has resolved
-    // the issuer the config could not name (REQ-MCP-010, preferred over DCR).
-    // The redirect is registered out of band by the operator, so it is left
-    // unknown and not compared (REQ-MCP-020). Public client: no secret, so the
-    // token endpoint is called with `none` client authentication (PKCE alone).
-    if cached.is_none() {
-        if let Some(pre) = preconfigured {
-            let registration = OAuthRegistrationRecord {
-                auth_server: metadata.issuer.clone(),
-                client_id: pre.client_id.clone(),
-                client_secret: None,
-                token_endpoint_auth_method: "none".to_string(),
-                redirect_uri: None,
-            };
-            oauth_rt.store().upsert_registration(&registration).await?;
-            tracing::info!(
-                server = %name,
-                auth_server = %metadata.issuer,
-                client_id = %registration.client_id,
-                "Seeded pre-configured OAuth client (authorization server disables DCR)"
-            );
-            return Ok(registration);
-        }
+    // A pre-configured client identity is seeded — discovery has resolved the
+    // issuer the config could not name (REQ-MCP-010, preferred over DCR).
+    // Reached when there is no cached row or the cached one no longer matches
+    // the configured client_id; the upsert (keyed by issuer) replaces a stale
+    // registration. The redirect is registered out of band by the operator, so
+    // it is left unknown and not compared (REQ-MCP-020). Public client: no
+    // secret, so the token endpoint uses `none` client authentication (PKCE).
+    if let Some(pre) = preconfigured {
+        let registration = OAuthRegistrationRecord {
+            auth_server: metadata.issuer.clone(),
+            client_id: pre.client_id.clone(),
+            client_secret: None,
+            token_endpoint_auth_method: "none".to_string(),
+            redirect_uri: None,
+        };
+        oauth_rt.store().upsert_registration(&registration).await?;
+        tracing::info!(
+            server = %name,
+            auth_server = %metadata.issuer,
+            client_id = %registration.client_id,
+            "Seeded pre-configured OAuth client (authorization server disables DCR)"
+        );
+        return Ok(registration);
     }
 
     let Some(endpoint) = metadata.registration_endpoint.clone() else {
@@ -1314,51 +1322,78 @@ fn callback_request_query(request: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Bind a one-shot loopback listener on `port` that bounces the authorization
-/// server's callback to Phoenix's real callback route under `target_base`
-/// (REQ-MCP-020). Aborts any prior listener for `name` first, so a re-prompt
-/// does not leave a stale task holding the port. The listener self-terminates
-/// after one request or a 5-minute idle timeout (the OAuth flow window).
-fn spawn_loopback_redirect(oauth_rt: &OAuthRuntime, name: &str, port: u16, target_base: String) {
-    let mut listeners = oauth_rt.loopback_listeners.lock().unwrap();
-    if let Some(prev) = listeners.remove(name) {
-        prev.abort();
+/// Bind loopback listeners on `port` for both IPv4 (`127.0.0.1`) and IPv6
+/// (`::1`), so a browser resolving `localhost` to either family reaches the
+/// callback (REQ-MCP-020). Returns every address that bound; errs only if
+/// *neither* did (the port is genuinely unavailable). A few short retries
+/// absorb the brief window where a just-aborted prior listener is still
+/// releasing the port.
+async fn bind_loopback_listeners(port: u16) -> std::io::Result<Vec<tokio::net::TcpListener>> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let mut last_err = None;
+    for attempt in 0..5 {
+        let mut bound = Vec::new();
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            match tokio::net::TcpListener::bind((ip, port)).await {
+                Ok(listener) => bound.push(listener),
+                // An IPv6-less host (or vice versa) is fine as long as the
+                // other family bound; only a total failure is fatal.
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if !bound.is_empty() {
+            return Ok(bound);
+        }
+        if attempt < 4 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
-    let server = name.to_string();
-    let handle = tokio::spawn(run_loopback_redirect(server, port, target_base));
-    listeners.insert(name.to_string(), handle.abort_handle());
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrInUse, "no loopback bound")))
 }
 
-async fn run_loopback_redirect(server: String, port: u16, target_base: String) {
+/// Bounce the authorization server's callbacks (arriving on the pre-bound
+/// loopback `listeners`) to Phoenix's real callback route under `target_base`
+/// (REQ-MCP-020). Accepts in a loop so a retry after a failed token exchange —
+/// which leaves the flow pending — is still received, until the flow resolves
+/// (the listener is aborted) or the 5-minute flow window elapses.
+async fn run_loopback_redirect(
+    server: String,
+    listeners: Vec<tokio::net::TcpListener>,
+    target_base: String,
+) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::debug!(server = %server, "OAuth loopback listener window elapsed");
+            return;
+        }
+        let accepts = listeners
+            .iter()
+            .map(|l| Box::pin(l.accept()))
+            .collect::<Vec<_>>();
+        match tokio::time::timeout(remaining, futures::future::select_all(accepts)).await {
+            Ok((Ok((stream, _)), _, _)) => bounce_loopback_callback(stream, &target_base).await,
+            Ok((Err(e), _, _)) => {
+                tracing::warn!(server = %server, "OAuth loopback accept failed: {e}");
+            }
+            Err(_) => {
+                tracing::debug!(server = %server, "OAuth loopback listener window elapsed");
+                return;
+            }
+        }
+    }
+}
+
+/// Read one callback request off `stream` and reply `302` to Phoenix's real
+/// callback route, forwarding the query verbatim.
+async fn bounce_loopback_callback(mut stream: tokio::net::TcpStream, target_base: &str) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-        Ok(listener) => listener,
-        Err(e) => {
-            tracing::warn!(
-                server = %server,
-                port,
-                "OAuth loopback callback listener could not bind (port in use?); \
-                 the authorization callback will not be received: {e}"
-            );
-            return;
-        }
-    };
-    tracing::debug!(server = %server, port, "OAuth loopback callback listener bound");
-
-    let accepted =
-        tokio::time::timeout(std::time::Duration::from_secs(300), listener.accept()).await;
-    let mut stream = match accepted {
-        Ok(Ok((stream, _))) => stream,
-        Ok(Err(e)) => {
-            tracing::warn!(server = %server, "OAuth loopback accept failed: {e}");
-            return;
-        }
-        Err(_) => {
-            tracing::debug!(server = %server, port, "OAuth loopback listener timed out");
-            return;
-        }
-    };
 
     let mut buf = vec![0u8; 8192];
     let n = stream.read(&mut buf).await.unwrap_or(0);
@@ -1378,9 +1413,10 @@ async fn run_loopback_redirect(server: String, port: u16, target_base: String) {
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
-    tracing::debug!(server = %server, "OAuth loopback callback bounced to {location}");
+    tracing::debug!("OAuth loopback callback bounced to {location}");
 }
 
+#[allow(clippy::too_many_lines)] // One ordered sequence: discover, acquire client, bind callback, publish.
 async fn begin_oauth_flow(
     oauth_rt: &OAuthRuntime,
     pending_oauth_urls: &Arc<RwLock<HashMap<String, String>>>,
@@ -1470,6 +1506,39 @@ async fn begin_oauth_flow(
         scopes,
         claim,
     };
+    // Bind the loopback listener BEFORE anything is published, so a bind
+    // failure (port in use) fails the flow with a clear error instead of
+    // surfacing a sign-in URL whose callback can never be received. The
+    // listener bounces the fixed-port callback to Phoenix's real route; the
+    // server-route case needs no listener.
+    if let Some(port) = loopback_port {
+        let Some(base) = oauth_rt.redirect_base() else {
+            return Err(format!(
+                "MCP server '{name}': loopback OAuth callback needs Phoenix's own address to \
+                 bounce to, but none is configured"
+            ));
+        };
+        // Abort and await any prior listener for this server so the port is
+        // released before we rebind it (a re-prompt during an active flow).
+        let prior = oauth_rt.loopback_listeners.lock().unwrap().remove(name);
+        if let Some(prior) = prior {
+            prior.abort();
+            let _ = prior.await;
+        }
+        let listeners = bind_loopback_listeners(port).await.map_err(|e| {
+            format!(
+                "MCP server '{name}': cannot bind OAuth callback port {port} on loopback \
+                 (already in use?): {e}"
+            )
+        })?;
+        let handle = tokio::spawn(run_loopback_redirect(name.to_string(), listeners, base));
+        oauth_rt
+            .loopback_listeners
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), handle);
+    }
+
     // Inserting rotates the nonce: a displaced older flow (and its claim)
     // drops, so its callback no longer matches any pending flow.
     oauth_rt
@@ -1477,20 +1546,6 @@ async fn begin_oauth_flow(
         .lock()
         .unwrap()
         .insert(name.to_string(), flow);
-    // Bind the loopback listener before the URL is surfaced, so it is ready
-    // when the operator clicks. Bounces the fixed-port callback to Phoenix's
-    // real route; the server-route case needs no listener.
-    if let Some(port) = loopback_port {
-        if let Some(base) = oauth_rt.redirect_base() {
-            spawn_loopback_redirect(oauth_rt, name, port, base);
-        } else {
-            tracing::warn!(
-                server = %name,
-                "loopback OAuth callback needs Phoenix's own address to bounce to; \
-                 none configured, so the callback will not be received"
-            );
-        }
-    }
     pending_oauth_urls
         .write()
         .await
@@ -1822,6 +1877,13 @@ impl McpClientManager {
             .map_err(|e| format!("MCP server '{name}': failed to persist OAuth token: {e}"))?;
 
         self.pending_oauth_urls.write().await.remove(&name);
+        // The flow is resolved; stop its loopback listener (if any) so it does
+        // not hold the port for the rest of its window. On exchange *failure*
+        // the flow stays pending and this is not reached, so the listener keeps
+        // accepting for a retry (REQ-MCP-020).
+        if let Some(handle) = self.oauth.loopback_listeners.lock().unwrap().remove(&name) {
+            handle.abort();
+        }
         let claim = resolved.claim;
         let config = resolved.config;
 
@@ -3007,6 +3069,14 @@ impl McpClientManager {
             }
             return Some(HttpAuth::Static(StaticCred::Headers(headers)));
         }
+        if auth.get("oauth").is_some() {
+            tracing::warn!(
+                server = %name,
+                "'auth.oauth' is no longer read; move the OAuth config to the top-level \
+                 'oauth' field (Claude Code's shape). Skipping this server until then."
+            );
+            return None;
+        }
         tracing::debug!(server = %name, "HTTP MCP server with unrecognized 'auth' shape");
         None
     }
@@ -3024,13 +3094,29 @@ impl McpClientManager {
         match oauth_value {
             Value::Bool(true) => Some(HttpAuth::OAuth(None)),
             Value::Object(fields) => match fields.get("clientId").and_then(Value::as_str) {
-                Some(client_id) => Some(HttpAuth::OAuth(Some(PreconfiguredClient {
-                    client_id: client_id.to_string(),
-                    callback_port: fields
-                        .get("callbackPort")
-                        .and_then(Value::as_u64)
-                        .and_then(|p| u16::try_from(p).ok()),
-                }))),
+                Some(client_id) => {
+                    // A present-but-malformed callbackPort (non-integer, 0, or
+                    // out of range) would silently fall back to the server-route
+                    // redirect, which a fixed-allowlist app rejects — a confusing
+                    // failure. Treat it as an unusable config and skip the server.
+                    let callback_port = match fields.get("callbackPort") {
+                        None => None,
+                        Some(value) => match value.as_u64().and_then(|p| u16::try_from(p).ok()) {
+                            Some(port) if port != 0 => Some(port),
+                            _ => {
+                                tracing::debug!(
+                                    server = %name,
+                                    "'oauth.callbackPort' must be an integer 1-65535; skipping server"
+                                );
+                                return None;
+                            }
+                        },
+                    };
+                    Some(HttpAuth::OAuth(Some(PreconfiguredClient {
+                        client_id: client_id.to_string(),
+                        callback_port,
+                    })))
+                }
                 // An object with no clientId (e.g. only callbackPort/scopes):
                 // OAuth via dynamic client registration, where DCR registers
                 // Phoenix's own callback, so a fixed loopback port is moot.
@@ -3955,6 +4041,43 @@ mod tests {
                 auth: HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
             })
         );
+    }
+
+    #[test]
+    fn classify_oauth_rejects_malformed_callback_port() {
+        // A present-but-unusable callbackPort skips the server rather than
+        // silently falling back to a redirect the fixed-allowlist app rejects.
+        for bad in [
+            serde_json::json!("3118"),
+            serde_json::json!(0),
+            serde_json::json!(70000),
+            serde_json::json!(-1),
+            serde_json::json!(3.5),
+        ] {
+            let cfg = serde_json::json!({
+                "type": "http",
+                "url": "https://example.com/mcp",
+                "oauth": {"clientId": "cid", "callbackPort": bad},
+            });
+            assert_eq!(
+                McpClientManager::classify_config_entry("s", &cfg),
+                None,
+                "callbackPort {bad} must skip the server"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_legacy_auth_oauth_shape_is_skipped() {
+        // The removed `auth.oauth` shape is no longer read; the server is
+        // skipped (with a migration warning) rather than silently downgraded
+        // to no-auth. OAuth now lives under the top-level `oauth` field.
+        let cfg = serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "auth": {"oauth": true},
+        });
+        assert_eq!(McpClientManager::classify_config_entry("s", &cfg), None);
     }
 
     #[test]

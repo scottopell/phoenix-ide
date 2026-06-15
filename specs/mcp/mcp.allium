@@ -410,9 +410,12 @@ rule OAuthClientPreconfigured {
         -- When the pre-configured client pins a loopback callback port (its
         -- app allows only http://localhost:<port>/callback and cannot register
         -- Phoenix's own route), the authorization_url's redirect_uri is that
-        -- loopback URI, and a one-shot listener on that port bounces the
-        -- browser's callback to the real /api/mcp/oauth/callback route
-        -- (REQ-MCP-020). Otherwise the redirect is Phoenix's server route.
+        -- loopback URI, and a listener on that port (bound before the URL is
+        -- surfaced, on both IP families, accepting until the flow resolves)
+        -- bounces the browser's callback to the real /api/mcp/oauth/callback
+        -- route (REQ-MCP-020). Otherwise the redirect is Phoenix's server route.
+        -- A cached registration is reused only when its client_id still matches
+        -- the configured one; a re-keyed clientId replaces the stale row.
 }
 
 -- No cached registration and no pre-configured client: acquire one via RFC

@@ -451,11 +451,17 @@ to an attacker-chosen destination.
 WHERE a pre-configured client supplies a fixed loopback callback port (its
 pre-registered authorization app allows only `http://localhost:<port>/callback`
 and cannot register Phoenix's own callback route), THE SYSTEM SHALL use that
-loopback redirect URI for the flow and bind a one-shot listener on that port
-that bounces the received callback to its real callback route. The listener
-SHALL bind loopback only, accept a single callback, self-terminate on first use
-or after the flow window elapses, and a prior listener for the same server SHALL
-be cancelled when a new flow starts.
+loopback redirect URI for the flow and bind a listener on that port that bounces
+each received callback to its real callback route. THE SYSTEM SHALL bind the
+listener before surfacing the authorization URL and fail the flow if the port
+cannot be bound, so a sign-in URL is never published when its callback could not
+be received. The listener SHALL bind loopback only (both IP families), accept
+callbacks until the flow resolves or the flow window elapses (a failed exchange
+leaves the flow retryable, so the listener must remain), and a prior listener
+for the same server SHALL be cancelled and its port released before a new flow
+binds it. A malformed `callbackPort` (non-integer, zero, or out of range)
+SHALL make the server config unusable rather than silently falling back to a
+redirect the app will reject.
 
 **Rationale:** The redirect URI must name an origin the operator's browser can
 reach and that routes back to this instance; the reachable domain already chosen
