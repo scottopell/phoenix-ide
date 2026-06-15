@@ -21,7 +21,7 @@ test-support = []
 phoenix-core = { path = "../phoenix-core" }
 
 # Async runtime + PTY readiness (AsyncFd is epoll-backed).
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["io-util", "net", "process", "rt", "sync", "time"] }
 
 # Async utilities for the WS<->PTY relay.
 futures = "0.3"
