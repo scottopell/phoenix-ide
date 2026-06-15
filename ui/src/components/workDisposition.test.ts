@@ -193,17 +193,30 @@ describe('stuck — RESOLVE always suppressed (REQ-WAB-005)', () => {
 describe('idle open/draft — RESOLVE', () => {
   const fresh: PrFeedbackFreshness = { state: 'new', count: 2 };
 
-  it('address_feedback when open + failing checks + canSendMessage', () => {
+  it('address_feedback when open + failing checks + canSendMessage; no secondary link (not green)', () => {
     const d = deriveWorkDisposition(
       input({ prStatus: foundPr('open', { check_state: 'failing' as PrCheckState }) }),
     );
     expect(d.primary).toBe('resolve');
     expect(d.resolve).toEqual({ kind: 'address_feedback' });
+    expect(d.secondaryResolve).toBeNull();
     expect(d.showCleanUp).toBe(false);
     expect(d.showAbandon).toBe(true);
   });
 
-  it('coverage gap is orthogonal — passing checks + coverage-only routes to merge, NOT address (codex #C)', () => {
+  it('open + passing checks → Address feedback primary, Merge rides as a secondary link', () => {
+    const d = deriveWorkDisposition(
+      input({ prStatus: foundPr('open', { check_state: 'passing' as PrCheckState }) }),
+    );
+    // Review comments may need addressing on a green PR, so Address feedback is
+    // the primary on every reachable open PR; the honest Merge link rides
+    // alongside as a non-glowing secondary (REQ-WAB-003 — never a 2nd primary).
+    expect(d.primary).toBe('resolve');
+    expect(d.resolve).toEqual({ kind: 'address_feedback' });
+    expect(d.secondaryResolve).toEqual({ kind: 'merge_pr', url: PR_URL, number: PR_NUMBER });
+  });
+
+  it('coverage gap is orthogonal — passing + coverage-only still Address primary + Merge secondary', () => {
     const d = deriveWorkDisposition(
       input({
         prStatus: foundPr('open', {
@@ -212,11 +225,11 @@ describe('idle open/draft — RESOLVE', () => {
         }),
       }),
     );
-    // A coverage gap does NOT assert a feedback change, so it must not force
-    // auto-fix routing / hide the Merge link. The coverage marker rides on the
-    // resolve verb instead (rendered by the component).
+    // A coverage gap does NOT change which verb shows; the coverage marker rides
+    // on the resolve verb (rendered by the component), not into routing.
     expect(d.primary).toBe('resolve');
-    expect(d.resolve).toEqual({ kind: 'merge_pr', url: PR_URL, number: PR_NUMBER });
+    expect(d.resolve).toEqual({ kind: 'address_feedback' });
+    expect(d.secondaryResolve).toEqual({ kind: 'merge_pr', url: PR_URL, number: PR_NUMBER });
   });
 
   it('stale/unavailable refresh on a persisted open PR → Open PR link, no one-click cleanup (codex #E)', () => {
@@ -263,33 +276,52 @@ describe('idle open/draft — RESOLVE', () => {
     expect(d.resolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
   });
 
-  it('merge_pr when open + passing checks', () => {
+  it('merge_pr as primary when open + passing but no message channel (canSendMessage false)', () => {
     const d = deriveWorkDisposition(
-      input({ prStatus: foundPr('open', { check_state: 'passing' as PrCheckState }) }),
+      input({ canSendMessage: false, prStatus: foundPr('open', { check_state: 'passing' as PrCheckState }) }),
     );
+    // No channel to post an auto-fix message → Address feedback unreachable, so
+    // the green PR routes to Merge as the primary (no secondary).
     expect(d.primary).toBe('resolve');
     expect(d.resolve).toEqual({ kind: 'merge_pr', url: PR_URL, number: PR_NUMBER });
+    expect(d.secondaryResolve).toBeNull();
   });
 
-  it('open_pr when open + pending checks (not addressable, not green)', () => {
+  it('open + pending checks → Address feedback primary, no secondary (pending ≠ green)', () => {
     const d = deriveWorkDisposition(
       input({ prStatus: foundPr('open', { check_state: 'pending' as PrCheckState }) }),
     );
-    expect(d.resolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
+    expect(d.resolve).toEqual({ kind: 'address_feedback' });
+    expect(d.secondaryResolve).toBeNull();
   });
 
   it('open_pr (never merge) for a draft even with passing checks', () => {
     const d = deriveWorkDisposition(
       input({ prStatus: foundPr('draft', { check_state: 'passing' as PrCheckState }) }),
     );
+    // Drafts are not addressable and never advertise a Merge.
     expect(d.resolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
+    expect(d.secondaryResolve).toBeNull();
   });
 
-  it('open passing PR missing url/number → safe abandon fallback (should not happen)', () => {
+  it('open PR missing url/number but addressable → Address feedback, no secondary', () => {
     const pr = foundPr('open', { check_state: 'passing' as PrCheckState });
     delete pr.url;
     delete pr.number;
     const d = deriveWorkDisposition(input({ prStatus: pr }));
+    // Address feedback needs no PR url (the auto-fix message is built from the
+    // conversation), so a missing link does not block it; the Merge secondary
+    // simply does not appear.
+    expect(d.primary).toBe('resolve');
+    expect(d.resolve).toEqual({ kind: 'address_feedback' });
+    expect(d.secondaryResolve).toBeNull();
+  });
+
+  it('open PR missing url/number AND no message channel → safe abandon fallback', () => {
+    const pr = foundPr('open', { check_state: 'passing' as PrCheckState });
+    delete pr.url;
+    delete pr.number;
+    const d = deriveWorkDisposition(input({ canSendMessage: false, prStatus: pr }));
     expect(d.primary).toBe('abandon');
     expect(d.resolve).toBeNull();
   });
@@ -409,6 +441,18 @@ describe('structural invariants', () => {
     for (const inp of matrix()) {
       const d = deriveWorkDisposition(inp);
       expect(d.resolve !== null).toBe(d.primary === 'resolve');
+    }
+  });
+
+  it('secondaryResolve, when present, rides only beside an address_feedback primary', () => {
+    for (const inp of matrix()) {
+      const d = deriveWorkDisposition(inp);
+      if (d.secondaryResolve !== null) {
+        expect(d.primary).toBe('resolve');
+        expect(d.resolve?.kind).toBe('address_feedback');
+        // It is always a GitHub link-out, never a second address button.
+        expect(['merge_pr', 'open_pr']).toContain(d.secondaryResolve.kind);
+      }
     }
   });
 

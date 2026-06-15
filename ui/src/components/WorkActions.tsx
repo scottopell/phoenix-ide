@@ -50,6 +50,35 @@ function CoverageMarker({
   );
 }
 
+/** An honest GitHub link-out RESOLVE verb (Merge / Open PR). `primary` glows it;
+ *  a secondary link rides beside the Address-feedback primary without glowing. */
+function ResolveLink({
+  verb,
+  primary,
+  coverageMarker,
+}: {
+  verb: { kind: 'merge_pr' | 'open_pr'; url: string; number: number };
+  primary: boolean;
+  coverageMarker: ReturnType<typeof prFeedbackCoverageMarker>;
+}) {
+  const isMerge = verb.kind === 'merge_pr';
+  const cls = isMerge ? 'work-actions-merge-link' : 'work-actions-open-link';
+  return (
+    <a
+      href={verb.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={`work-actions-btn ${cls}${primary ? ' work-actions-btn--primary' : ''}`}
+      data-testid={isMerge ? 'merge-pr-link' : 'open-pr-link'}
+    >
+      {isMerge ? 'Merge' : 'Open'} PR #{verb.number} ↗
+      {/* The coverage marker rides on the primary verb only — never duplicated
+          across both the primary and the secondary link. */}
+      {primary && <CoverageMarker marker={coverageMarker} />}
+    </a>
+  );
+}
+
 function cleanUpHintText(isBranch: boolean): string {
   return isBranch
     ? 'Mark as merged. Deletes the worktree; your branch is kept. No confirmation — use Abandon if you want a diff snapshot first.'
@@ -144,30 +173,21 @@ export function WorkControlBar({
               <CoverageMarker marker={coverageMarker} />
             </button>
           )}
-          {disposition.resolve.kind === 'merge_pr' && (
-            <a
-              href={disposition.resolve.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className={`work-actions-btn work-actions-merge-link${primaryClass('resolve')}`}
-              data-testid="merge-pr-link"
-            >
-              Merge PR #{disposition.resolve.number} ↗
-              <CoverageMarker marker={coverageMarker} />
-            </a>
+          {(disposition.resolve.kind === 'merge_pr' ||
+            disposition.resolve.kind === 'open_pr') && (
+            <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
           )}
-          {disposition.resolve.kind === 'open_pr' && (
-            <a
-              href={disposition.resolve.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className={`work-actions-btn work-actions-open-link${primaryClass('resolve')}`}
-              data-testid="open-pr-link"
-            >
-              Open PR #{disposition.resolve.number} ↗
-              <CoverageMarker marker={coverageMarker} />
-            </a>
-          )}
+          {/* Non-glowing secondary link-out beside the Address-feedback primary
+              (e.g. Merge on a passing PR). REQ-WAB-003: never a second primary. */}
+          {disposition.secondaryResolve &&
+            (disposition.secondaryResolve.kind === 'merge_pr' ||
+              disposition.secondaryResolve.kind === 'open_pr') && (
+              <ResolveLink
+                verb={disposition.secondaryResolve}
+                primary={false}
+                coverageMarker={coverageMarker}
+              />
+            )}
         </div>
       )}
 

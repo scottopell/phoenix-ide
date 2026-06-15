@@ -40,10 +40,11 @@ input maps to exactly one row:
 1. `continued_in_conv_id != null` → **continued**
 2. `phase ∈ {error, context_exhausted}` → **stuck** (FINISH primary via the shared selector;
    RESOLVE suppressed)
-3. `phase = idle`, PR `display_state ∈ {open, draft}`, addressable (`check_state = failing` OR
-   `feedback_freshness != null`) AND `affordance.enabled` → **address_feedback**
-4. `phase = idle`, PR `display_state = open`, `check_state = passing` → **merge_ready**
-5. `phase = idle`, PR `display_state ∈ {open, draft}`, not addressable and not passing →
+3. `phase = idle`, PR `display_state = open`, `affordance.enabled` → **address_feedback**
+   (carries a `merge_pr` secondary link when `check_state = passing`)
+4. `phase = idle`, PR `display_state = open`, `check_state = passing`, `affordance` disabled →
+   **merge_ready**
+5. `phase = idle`, PR `display_state ∈ {open, draft}`, no other RESOLVE matched →
    **pr_open_other**
 6. `phase = idle`, `display_state = merged` → **clean_up_merged**
 7. `phase = idle`, `display_state = closed` → **pr_closed**
@@ -51,9 +52,13 @@ input maps to exactly one row:
 9. `phase = idle`, `pr = null`, `refresh.state = unavailable` → **gh_unavailable**
 
 Rows 3–5 partition every idle open-or-draft PR; there is no open-PR state that falls through.
-The addressability and merge-readiness predicates read `PrStatusView.check_state` and
-`PrStatusView.feedback_freshness` (the typed `pr-association` fields), so the split is derived
-from typed status, not from re-parsing the provider.
+Addressability reads `affordance.enabled` (`PrAutoFixAffordance`) and `display_state = open`
+only — it does not gate on `check_state` or `feedback_freshness`, since review comments may
+need addressing regardless of check state and a freshness baseline is seeded only after the
+first address. The `merge_ready` predicate reads `PrStatusView.check_state` (a typed
+`pr-association` field); the same field decides whether the `merge_pr` secondary link rides
+beside the `address_feedback` primary. `feedback_freshness` and `feedback_coverage` drive
+on-button markers, not the disposition split.
 
 ## The Single FINISH-Primary Selector
 
@@ -84,7 +89,7 @@ disposition rows directly.
 | `stuck` (PR open/draft) | View Diff | — | Clean up | ★ Abandon | Abandon | "PR #N still open — merge on GitHub, or abandon." |
 | `stuck` (no PR) | View Diff | — | ★ Clean up | Abandon | Clean up | — |
 | `stuck` (gh unavailable) | View Diff | — | ★ Clean up | Abandon | Clean up | "gh unavailable — manual cleanup." |
-| `address_feedback` | View Diff | ★ Address feedback | — | Abandon | RESOLVE | — |
+| `address_feedback` | View Diff | ★ Address feedback (+ `Merge PR #N ↗` secondary link when checks pass) | — | Abandon | RESOLVE | — |
 | `merge_ready` | View Diff | ★ Merge PR #N ↗ | — | Abandon | RESOLVE | — |
 | `pr_open_other` | View Diff | ★ Open PR #N ↗ | — | Abandon | RESOLVE | — |
 | `clean_up_merged` | View Diff | — | ★ Clean up | Abandon | Clean up | — |
@@ -116,14 +121,22 @@ The feedback freshness label (`prFeedbackFreshnessLabel` from `ui/src/components
 renders inline inside the Address feedback button when `PrStatusView.feedback_freshness` is
 present (`"3 new"`, `"2 edited"`). The label is decorative — it tells the
 user there is something new to address; it does not gate the button. The gate is the
-addressability predicate of REQ-WAB-004 (failing checks or fresh feedback, affordance enabled).
+addressability predicate of REQ-WAB-004: an open PR with the auto-fix affordance enabled,
+regardless of check state or freshness.
+
+When the PR's checks are confirmed passing, the honest `Merge PR #N ↗` link rides beside the
+Address-feedback primary as a non-glowing secondary (`ResolveZone.secondary`), so a green PR
+with review comments offers both "address the feedback" and "go merge it" at once. The
+freshness and coverage markers ride on the primary verb only, never duplicated onto the
+secondary link.
 
 ## RESOLVE Zone: PR Link Verbs
 
 When `WorkDisposition = merge_ready`, the RESOLVE verb is an anchor tag (`<a>`) labelled
 `"Merge PR #N ↗"`. When `WorkDisposition = pr_open_other`, it is labelled `"Open PR #N ↗"`.
-Both point to `PrIdentity.url` with `target="_blank"` and `rel="noopener noreferrer"`, where
-`N` is `PrIdentity.number`.
+The `address_feedback` secondary link renders the same `"Merge PR #N ↗"` anchor (just not
+glowing). All point to `PrIdentity.url` with `target="_blank"` and `rel="noopener noreferrer"`,
+where `N` is `PrIdentity.number`.
 
 The label distinction is the honesty rule: "Merge" appears only when `check_state = passing`.
 A pending, draft, or failing-with-affordance-disabled PR gets "Open PR" — the bar never

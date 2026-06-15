@@ -59,8 +59,12 @@ THE SYSTEM SHALL organize the work actions bar into three zones, left to right:
   presentation). The committed diff is the artifact of the work; this is the REVIEW verb.
 
 **RESOLVE zone** — the push-forward action; suppressed in stuck phases (REQ-WAB-005):
-- The verb selected by `WorkDisposition` (REQ-WAB-004): `Address feedback`, `Merge PR #N ↗`,
-  or `Open PR #N ↗`.
+- The primary verb selected by `WorkDisposition` (REQ-WAB-004): `Address feedback`,
+  `Merge PR #N ↗`, or `Open PR #N ↗`.
+- Optionally a second, non-glowing link-out beside the primary: when the primary is
+  `Address feedback` and the PR's checks are confirmed passing, the honest `Merge PR #N ↗`
+  link rides alongside so an open PR offers both "address the feedback" and "go merge it"
+  at once. This secondary is never a glowing primary (REQ-WAB-003).
 
 **FINISH zone** — terminal verbs:
 - `Clean up` — calls `mark-merged`. Its git effects (worktree deletion, mode-dependent branch
@@ -84,10 +88,16 @@ WHEN `WorkDisposition` suppresses RESOLVE (stuck phases) or there is no push-for
 WHEN `WorkDisposition` is `continued`, there is no primary verb and all terminal verbs are
 suppressed (REQ-WAB-009).
 
+A RESOLVE disposition may additionally carry a single **secondary** link-out (the `Merge PR
+#N ↗` link beside an `Address feedback` primary). The secondary is structurally distinct from
+the primary and never glows; it exists only alongside an `address_feedback` primary. This does
+not violate the single-primary rule: there is still exactly one glowing button.
+
 **Design:** A single glowing button is the user's answer to "what do I do next?" The
 presentation carries the primary as a single slot selector (REVIEW / RESOLVE / Clean up /
 Abandon / none), so two glowing buttons are structurally unrepresentable rather than forbidden
-by a runtime check.
+by a runtime check. The secondary link is a separate, non-primary slot — present-or-absent,
+never glowing — so it cannot collapse into a second primary.
 
 ---
 
@@ -101,17 +111,21 @@ THE SYSTEM SHALL derive a single `WorkDisposition` value from the conversation's
 The derivation is evaluated top-to-bottom; the first matching row wins. It is **total**: every
 reachable combination of phase, continuation, and PR state maps to exactly one row.
 
-| # | Condition | WorkDisposition | Primary verb | Notes / suppressed |
+| # | Condition | WorkDisposition | Primary verb | Secondary / suppressed |
 |---|---|---|---|---|
 | 1 | `continued_in_conv_id` set | `continued` | none | RESOLVE + FINISH suppressed; muted note |
 | 2 | phase ∈ {error, context_exhausted} | `stuck` | `Clean up` or `Abandon` per FINISH sub-table | RESOLVE suppressed |
-| 3 | idle, PR open/draft, addressable (`check_state = failing` OR `feedback_freshness` present) AND affordance enabled | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed |
-| 4 | idle, PR open, `check_state = passing` | `merge_ready` | **Merge PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
-| 5 | idle, PR open/draft, not addressable and not passing (pending checks, draft, or affordance-disabled) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
+| 3 | idle, PR open, affordance enabled | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed; `Merge PR #N ↗` secondary link when `check_state = passing` |
+| 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
+| 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
 | 6 | idle, PR merged | `clean_up_merged` | **Clean up** (FINISH) | — |
 | 7 | idle, PR closed unmerged | `pr_closed` | **Abandon** (FINISH) | Clean up suppressed; note |
 | 8 | idle, no PR found, refresh ≠ unavailable | `no_pr` | **Clean up** (FINISH) | — |
 | 9 | idle, gh unavailable (no PR identity, refresh = unavailable) | `gh_unavailable` | **Clean up** (FINISH) | warning note; single click |
+
+The **affordance** is enabled when Phoenix can post an auto-fix message to the conversation:
+the conversation has a live message channel and the PR refresh is not `unavailable`
+(`PrAutoFixAffordance`, `pr-association`). A draft PR is never addressable.
 
 The **FINISH sub-table** is a single shared selector (used by `stuck` and by the idle FINISH
 rows), total over PR state:
@@ -124,11 +138,16 @@ rows), total over PR state:
 | no PR found (refresh ok) | `Clean up` | — |
 | gh unavailable | `Clean up` | "gh unavailable — manual cleanup." |
 
-Rows 3–5 together cover **every** idle open-or-draft PR: addressable → Address feedback;
-otherwise passing → Merge ready; otherwise (pending, draft, or failing-with-affordance-disabled)
-→ `pr_open_other`. The honest-label rule applies: rows 4 and 5 both open GitHub, but only a
-passing PR is labelled "Merge"; a non-passing open PR is labelled "Open PR" so the bar never
-promises a merge the checks do not support.
+Rows 3–5 together cover **every** idle open-or-draft PR. Address feedback is the primary on
+every reachable open PR — not gated on failing checks or a prior feedback-freshness signal —
+because review comments may need addressing whether checks pass or fail and whether or not a
+freshness baseline has yet been seeded; the freshness and coverage signals ride as markers on
+the button rather than gating its presence. When checks are confirmed passing, the honest
+`Merge PR #N ↗` link rides alongside as the non-glowing secondary. The Merge link is the
+primary only when the PR cannot be addressed (no message channel). The honest-label rule
+applies: rows 4 and 5 both open GitHub, but only a passing PR is labelled "Merge"; a
+non-passing open PR (or any draft) is labelled "Open PR" so the bar never promises a merge the
+checks do not support.
 
 **Design:** `WorkDisposition` is a pure function of inputs; no button state is stored in the
 bar. The bar re-derives the disposition on every render. The `check_state` and

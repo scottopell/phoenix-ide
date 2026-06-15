@@ -293,7 +293,7 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     );
   });
 
-  it('open PR, passing checks, no fresh feedback → merge-pr-link present + primary, honest href', () => {
+  it('open PR, passing checks → address-feedback primary, Merge rides as a non-primary secondary link', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-green"
@@ -311,15 +311,19 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
       />,
     );
 
+    const address = screen.getByTestId('address-feedback-button');
+    expect(address).toHaveClass('work-actions-btn--primary');
+
     const link = screen.getByTestId('merge-pr-link') as HTMLAnchorElement;
     expect(link).toBeInTheDocument();
     expect(link.textContent).toMatch(/Merge PR #77 ↗/);
     expect(link.getAttribute('href')).toBe('https://github.com/o/r/pull/77');
-    expect(link).toHaveClass('work-actions-btn--primary');
-    expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
+    // The Merge link is the secondary — it must NOT glow as a second primary.
+    expect(link).not.toHaveClass('work-actions-btn--primary');
+    expect(primaryCount()).toBe(1);
   });
 
-  it('open PR, pending checks → open-pr-link ("Open PR #N ↗")', () => {
+  it('open PR, pending checks → address-feedback primary, no PR link-out (pending ≠ green)', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-pending"
@@ -337,11 +341,11 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
       />,
     );
 
-    const link = screen.getByTestId('open-pr-link') as HTMLAnchorElement;
-    expect(link).toBeInTheDocument();
-    expect(link.textContent).toMatch(/Open PR #88 ↗/);
-    expect(link.getAttribute('href')).toBe('https://github.com/o/r/pull/88');
+    expect(screen.getByTestId('address-feedback-button')).toHaveClass(
+      'work-actions-btn--primary',
+    );
     expect(screen.queryByTestId('merge-pr-link')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('open-pr-link')).not.toBeInTheDocument();
   });
 
   it('draft PR → open-pr-link ("Open PR #N ↗")', () => {
@@ -633,7 +637,7 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
     expect(coverage).toHaveAttribute('title', expect.stringContaining('review threads'));
   });
 
-  it('renders the coverage marker on the Merge PR link when checks pass but a coverage gap exists (codex #C)', () => {
+  it('rides the coverage marker on the Address-feedback primary when a passing PR has a coverage gap', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-merge-cov"
@@ -647,20 +651,21 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
           url: 'https://gh/pr/142',
           display_state: 'open',
           check_state: 'passing',
-          // Coverage gap, no fresh feedback → not addressable; routes to Merge.
           feedback_coverage: { kind: 'auth_required', surfaces: ['review_threads'] },
         })}
       />,
     );
 
-    // Coverage is orthogonal: the PR is mergeable (Merge link), and the auth
-    // coverage marker still surfaces — on the link, not hidden.
+    // Address feedback is the primary (open + can send); Merge rides as the
+    // secondary link. The coverage marker rides on the primary verb only, never
+    // duplicated onto the secondary link.
+    const address = screen.getByTestId('address-feedback-button');
     const merge = screen.getByTestId('merge-pr-link');
-    expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
-    const coverage = merge.querySelector('.work-actions-pr-coverage');
+    const coverage = address.querySelector('.work-actions-pr-coverage');
     expect(coverage).toBeInTheDocument();
     expect(coverage).toHaveClass('work-actions-pr-coverage--auth');
     expect(coverage?.textContent).toContain('GitHub sign-in needed');
+    expect(merge.querySelector('.work-actions-pr-coverage')).toBeNull();
   });
 
   it('shows an actionable "GitHub sign-in needed" auth marker when feedback auth failed', () => {

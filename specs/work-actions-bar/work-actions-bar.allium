@@ -89,7 +89,11 @@ value ReviewZone {
 
 value ResolveZone {
     visible: Boolean
-    verb: ResolveVerb?        -- null exactly when visible = false
+    verb: ResolveVerb?        -- the primary RESOLVE verb; null exactly when visible = false
+    secondary: ResolveVerb?   -- a second, non-glowing link-out beside the primary.
+                              -- Non-null only when verb = address_feedback and the
+                              -- PR's checks pass (then secondary = merge_link). Never
+                              -- glows (BarPrimary stays a single slot, REQ-WAB-003).
 }
 
 value FinishZone {
@@ -123,9 +127,9 @@ enum ConvMode {
 enum WorkDisposition {
     continued           -- continued_in_conv_id set; no primary; RESOLVE + FINISH suppressed
     | stuck             -- phase in {error, context_exhausted}; RESOLVE suppressed; FINISH primary
-    | address_feedback  -- idle, PR open/draft, addressable: failing checks or fresh feedback, affordance enabled
-    | merge_ready       -- idle, PR open, checks passing
-    | pr_open_other     -- idle, PR open/draft, not addressable and not green (pending, draft, or affordance-disabled)
+    | address_feedback  -- idle, PR open, affordance enabled (any check state); a merge_link secondary rides along when checks pass
+    | merge_ready       -- idle, PR open, checks passing, affordance disabled
+    | pr_open_other     -- idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not green)
     | clean_up_merged   -- idle, PR merged
     | pr_closed         -- idle, PR closed unmerged
     | no_pr             -- idle, no PR found, refresh not unavailable
@@ -208,18 +212,28 @@ entity WorkActionsBar {
 --       PrStatusView.
 --
 --   pr_addressable(status: pra/PrStatusView) -> Boolean
---       True when the PR needs attention and auto-fix can act on it:
+--       True when Phoenix can post an auto-fix message for this PR:
 --         status.pr != null
---         AND status.pr.display_state in { open, draft }
---         AND (status.check_state = failing OR status.feedback_freshness != null)
+--         AND status.pr.display_state = open   (drafts are never addressable)
 --         AND status.auto_fix is enabled (the affordance passed alongside).
---       Reads pra/PrCheckState and pra/PrFeedbackFreshness (the newly typed
---       fields on PrStatusView), never the raw provider wire. In derive_*
---       below the affordance.enabled term is supplied from BarInputs.
+--       Does NOT gate on check_state or feedback_freshness: review comments may
+--       need addressing whether checks pass or fail, and a freshness baseline is
+--       seeded only after the first address, so gating on freshness would make
+--       the first address unreachable. The freshness and coverage signals ride
+--       as on-button markers instead. In derive_* below the affordance.enabled
+--       term is supplied from BarInputs.
 --
 --   pr_merge_ready(status: pra/PrStatusView) -> Boolean
 --       True when status.pr != null AND status.pr.display_state = open AND
---       status.check_state = passing.
+--       status.check_state = passing. Selects both the merge_ready primary (when
+--       the PR is not addressable) and the merge_link secondary that rides beside
+--       an address_feedback primary (when it is). Reads pra/PrCheckState, never
+--       the raw provider wire.
+--
+--   address_secondary_for(status: pra/PrStatusView) -> ResolveVerb?
+--       The non-glowing secondary link that rides beside an address_feedback
+--       primary: merge_link when pr_merge_ready(status), else null. Only ever
+--       merge_link or null — never a second address_feedback or open_pr_link.
 --
 --   derive_disposition(inputs: BarInputs) -> WorkDisposition
 --       Evaluates the REQ-WAB-004 table top-to-bottom and returns the first
@@ -317,8 +331,9 @@ rule DispositionStuck {
     ensures: bar.presentation.inline_note = inline_note_for(stuck, bar.inputs.pr_status)
 }
 
--- Row 3. Address feedback: idle, PR open/draft, addressable (failing checks OR
--- fresh feedback) AND auto-fix affordance enabled. RESOLVE is primary.
+-- Row 3. Address feedback: idle, PR open, auto-fix affordance enabled — any
+-- check state. RESOLVE is primary. When the PR's checks pass, an honest
+-- "Merge PR #N ↗" link rides alongside as the non-glowing secondary.
 rule DispositionAddressFeedback {
     when: WorkActionsBarRendered(bar)
 
@@ -326,21 +341,23 @@ rule DispositionAddressFeedback {
     requires: bar.inputs.phase = idle
     requires: bar.inputs.pr_status != null
     requires: bar.inputs.pr_status.pr != null
-    requires: bar.inputs.pr_status.pr.display_state in { open, draft }
+    requires: bar.inputs.pr_status.pr.display_state = open
     requires: pr_addressable(bar.inputs.pr_status)
     requires: bar.inputs.auto_fix_affordance.enabled = true
 
     ensures: bar.presentation.disposition = address_feedback
     ensures: bar.presentation.resolve_zone.visible = true
     ensures: bar.presentation.resolve_zone.verb = address_feedback
+    ensures: bar.presentation.resolve_zone.secondary = address_secondary_for(bar.inputs.pr_status)
     ensures: bar.presentation.finish_zone.show_clean_up = false
     ensures: bar.presentation.finish_zone.show_abandon = true
     ensures: bar.presentation.primary = resolve
     ensures: bar.presentation.inline_note = null
 }
 
--- Row 4. Merge ready: idle, PR open, checks passing. RESOLVE is primary, an
--- honest "Merge PR #N ↗" external link.
+-- Row 4. Merge ready: idle, PR open, checks passing, but NOT addressable (no
+-- auto-fix channel). RESOLVE is primary, an honest "Merge PR #N ↗" external
+-- link with no secondary.
 rule DispositionMergeReady {
     when: WorkActionsBarRendered(bar)
 
@@ -355,14 +372,15 @@ rule DispositionMergeReady {
     ensures: bar.presentation.disposition = merge_ready
     ensures: bar.presentation.resolve_zone.visible = true
     ensures: bar.presentation.resolve_zone.verb = merge_link
+    ensures: bar.presentation.resolve_zone.secondary = null
     ensures: bar.presentation.finish_zone.show_clean_up = false
     ensures: bar.presentation.finish_zone.show_abandon = true
     ensures: bar.presentation.primary = resolve
     ensures: bar.presentation.inline_note = null
 }
 
--- Row 5. PR open/draft but neither addressable nor green: pending checks, a
--- draft, or failing-with-affordance-disabled. RESOLVE is primary, an honest
+-- Row 5. PR open/draft with no other RESOLVE match: a draft, or
+-- affordance-disabled and not green. RESOLVE is primary, an honest
 -- "Open PR #N ↗" link — never labelled "Merge" when checks are not passing.
 rule DispositionPrOpenOther {
     when: WorkActionsBarRendered(bar)
@@ -378,6 +396,7 @@ rule DispositionPrOpenOther {
     ensures: bar.presentation.disposition = pr_open_other
     ensures: bar.presentation.resolve_zone.visible = true
     ensures: bar.presentation.resolve_zone.verb = open_pr_link
+    ensures: bar.presentation.resolve_zone.secondary = null
     ensures: bar.presentation.finish_zone.show_clean_up = false
     ensures: bar.presentation.finish_zone.show_abandon = true
     ensures: bar.presentation.primary = resolve
@@ -536,6 +555,17 @@ invariant ResolveVerbPresentIffVisible {
             implies b.presentation.resolve_zone.verb != null)
         and (b.presentation.resolve_zone.visible = false
             implies b.presentation.resolve_zone.verb = null)
+}
+
+-- REQ-WAB-003: the secondary link is a non-glowing companion of the
+-- address_feedback primary. It is present only when the primary verb is
+-- address_feedback, and when present it is always merge_link — never a second
+-- address_feedback and never the demoted open_pr_link.
+invariant SecondaryRidesOnlyOnAddressFeedback {
+    for b in WorkActionsBar:
+        b.presentation.resolve_zone.secondary != null implies
+            (b.presentation.resolve_zone.verb = address_feedback
+             and b.presentation.resolve_zone.secondary = merge_link)
 }
 
 ------------------------------------------------------------

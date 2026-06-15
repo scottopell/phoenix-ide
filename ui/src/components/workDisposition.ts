@@ -44,6 +44,14 @@ export interface WorkDisposition {
   primary: BarPrimary;
   /** Non-null iff `primary === 'resolve'`. */
   resolve: ResolveVerb | null;
+  /**
+   * A second, non-glowing RESOLVE verb shown beside the primary. Carries the
+   * honest Merge/Open PR link-out when the primary is `address_feedback`, so an
+   * open PR offers both "push the work forward" and "go to GitHub" at once
+   * without a second glowing primary. Non-null implies `primary === 'resolve'`
+   * (REQ-WAB-003); always null otherwise.
+   */
+  secondaryResolve: ResolveVerb | null;
   /** Render the Clean up (mark-merged) verb in the FINISH zone. */
   showCleanUp: boolean;
   /** Render the Abandon verb in the FINISH zone. False when continued (the
@@ -77,6 +85,7 @@ function hidden(): WorkDisposition {
     visible: false,
     primary: 'none',
     resolve: null,
+    secondaryResolve: null,
     showCleanUp: false,
     showAbandon: false,
     note: null,
@@ -116,6 +125,7 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
       visible: true,
       primary: 'none',
       resolve: null,
+      secondaryResolve: null,
       showCleanUp: false,
       showAbandon: false,
       note: { kind: 'continued', text: NOTE_CONTINUED },
@@ -129,6 +139,7 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
       visible: true,
       primary: 'abandon',
       resolve: null,
+      secondaryResolve: null,
       showCleanUp: false,
       showAbandon: true,
       note: { kind: 'checking', text: NOTE_CHECKING },
@@ -179,37 +190,36 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
   // forward (address / merge / open on GitHub), never a one-click cleanup.
   if (found && (ds === 'open' || ds === 'draft')) {
     const refreshUnavailable = prStatus?.refresh?.state === 'unavailable';
+    const hasLink = url != null && number != null;
+    const passing = prStatus?.check_state === 'passing';
 
-    // Addressable: an open PR that needs attention auto-fix can act on —
-    // failing checks or fresh feedback. A feedback *coverage* gap is orthogonal
-    // (it does not assert a feedback change) and is surfaced by the coverage
-    // marker on whichever resolve verb shows, not by routing into auto-fix.
-    const addressable =
-      ds === 'open' &&
-      canSendMessage &&
-      !refreshUnavailable &&
-      (prStatus?.check_state === 'failing' || prStatus?.feedback_freshness != null);
+    // Addressable: any open PR Phoenix can post an auto-fix message to. Review
+    // comments may need addressing whether or not checks fail and whether or
+    // not the freshness baseline has been seeded, so Address feedback is the
+    // primary on every reachable open PR — not gated on failing checks or a
+    // pre-existing freshness signal. Freshness/coverage ride as markers on the
+    // button. When checks are confirmed passing on a fresh status, the honest
+    // Merge link rides alongside as a non-glowing secondary so the bar offers
+    // both "address the feedback" and "go merge it" without a second primary.
+    const addressable = ds === 'open' && canSendMessage && !refreshUnavailable;
 
     if (addressable) {
-      return resolveVerb({ kind: 'address_feedback' });
+      const secondary: ResolveVerb | null =
+        passing && hasLink ? { kind: 'merge_pr', url, number } : null;
+      return resolveVerb({ kind: 'address_feedback' }, secondary);
     }
 
+    // Not addressable (draft, no message channel, or unavailable refresh):
     // "Merge" only when checks are confirmed passing on a fresh status. A stale
     // or unavailable refresh cannot assert mergeability, so it routes to the
     // honest "Open PR" link (verify on GitHub) — never a one-click cleanup.
-    if (
-      ds === 'open' &&
-      !refreshUnavailable &&
-      prStatus?.check_state === 'passing' &&
-      url != null &&
-      number != null
-    ) {
+    if (ds === 'open' && !refreshUnavailable && passing && hasLink) {
       return resolveVerb({ kind: 'merge_pr', url, number });
     }
 
-    // Draft, stale/unavailable refresh, or open-but-not-addressable-and-not-green
-    // → honest "Open PR" link.
-    if (url != null && number != null) {
+    // Draft, stale/unavailable refresh, or open-but-not-green → honest
+    // "Open PR" link.
+    if (hasLink) {
       return resolveVerb({ kind: 'open_pr', url, number });
     }
     // No usable url for a found open/draft PR — should not happen; Abandon is
@@ -244,12 +254,17 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
   return finish('clean_up', { showCleanUp: true });
 }
 
-/** Build a RESOLVE-primary disposition; Abandon stays present as a secondary. */
-function resolveVerb(verb: ResolveVerb): WorkDisposition {
+/**
+ * Build a RESOLVE-primary disposition; Abandon stays present as a secondary.
+ * `secondary` is the optional non-glowing RESOLVE link-out shown beside the
+ * primary (only meaningful when `verb` is `address_feedback`).
+ */
+function resolveVerb(verb: ResolveVerb, secondary: ResolveVerb | null = null): WorkDisposition {
   return {
     visible: true,
     primary: 'resolve',
     resolve: verb,
+    secondaryResolve: secondary,
     showCleanUp: false,
     showAbandon: true,
     note: null,
@@ -268,6 +283,7 @@ function finish(
     visible: true,
     primary,
     resolve: null,
+    secondaryResolve: null,
     showCleanUp: opts.showCleanUp ?? false,
     showAbandon: true,
     note: opts.note ?? null,
