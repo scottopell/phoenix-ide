@@ -66,6 +66,10 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 # Socket configuration
 socket2 = "0.6"
 
+# Enumerate host interface addresses to decide whether a request originates on
+# the server host (gates host-local file-manager reveal — see api/local_reveal.rs).
+if-addrs = "0.13"
+
 # Cross-platform (macOS + Linux) process/system resource sampling for the
 # About-this-deployment endpoint (specs/deployment-info/).
 sysinfo = "0.33"

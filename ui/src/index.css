@@ -4092,6 +4092,27 @@ pre:hover .copy-btn {
   text-align: right;
 }
 
+.deploy-table__action {
+  white-space: nowrap;
+  text-align: right;
+  padding-left: 8px;
+}
+
+.deploy-reveal-btn {
+  font-size: 11px;
+  padding: 1px 8px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.deploy-reveal-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
 /* Smooth theme transition */
 html * {
   transition: background-color 0.2s ease, border-color 0.2s ease;

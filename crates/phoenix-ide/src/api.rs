@@ -11,6 +11,7 @@ mod deployment;
 mod git_handlers;
 pub(crate) mod handlers;
 mod lifecycle_handlers;
+mod local_reveal;
 mod pr_monitoring;
 mod process_sample;
 mod sse;

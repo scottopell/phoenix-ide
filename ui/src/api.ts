@@ -772,6 +772,27 @@ export const api = {
     return resp.json();
   },
 
+  /** Open a path's containing folder in the server host's file manager.
+   * Only succeeds when the browser is on the server host (see
+   * DeploymentInfo.local_access); rejects with the server's message otherwise. */
+  async revealPath(path: string): Promise<void> {
+    const resp = await fetch('/api/files/reveal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    if (!resp.ok) {
+      let detail = 'Failed to reveal path';
+      try {
+        const body = (await resp.json()) as { error?: string };
+        if (body.error) detail = body.error;
+      } catch {
+        // non-JSON error body; keep the generic message
+      }
+      throw new Error(detail);
+    }
+  },
+
   async getNotificationSettings(): Promise<NotificationSettings> {
     const resp = await fetch('/api/settings/notifications');
     if (!resp.ok) throw new Error('Failed to load notification settings');

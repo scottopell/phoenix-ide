@@ -219,6 +219,7 @@ pub fn create_router(state: AppState) -> Router {
         // File browser API (REQ-PF-001 through REQ-PF-004)
         .route("/api/files/list", get(list_files))
         .route("/api/files/read", get(read_file))
+        .route("/api/files/reveal", post(super::local_reveal::reveal_path))
         .route(
             "/api/conversations/:id/files/search",
             get(search_conversation_files),
@@ -5304,6 +5305,8 @@ async fn shared_sse_stream(
 pub(super) enum AppError {
     BadRequest(String),
     NotFound(String),
+    /// 403 — the action is restricted to a caller on the server host.
+    Forbidden(String),
     Internal(String),
     /// 409 — conflict (dirty worktree, merge conflicts, etc.). Boxed because
     /// `ConflictErrorResponse` is the largest variant and grew with
@@ -5328,6 +5331,10 @@ impl IntoResponse for AppError {
             AppError::NotFound(ref msg) => {
                 tracing::debug!(error = %msg, "404 Not Found");
                 (StatusCode::NOT_FOUND, Json(ErrorResponse::new(msg.clone()))).into_response()
+            }
+            AppError::Forbidden(ref msg) => {
+                tracing::debug!(error = %msg, "403 Forbidden");
+                (StatusCode::FORBIDDEN, Json(ErrorResponse::new(msg.clone()))).into_response()
             }
             AppError::Internal(ref msg) => {
                 tracing::error!(error = %msg, "500 Internal Server Error");

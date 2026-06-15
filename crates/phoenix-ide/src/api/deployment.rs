@@ -10,7 +10,11 @@
 //! yields current values.
 
 use super::AppState;
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{
+    extract::{ConnectInfo, State},
+    response::IntoResponse,
+    Json,
+};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -68,6 +72,11 @@ pub struct DeploymentInfo {
     pub resources: ResourceUsage,
     pub disk: Vec<DiskEntry>,
     pub log: LogInfo,
+    /// Whether the requesting browser is on the server host, and so may use
+    /// host-local actions like revealing a path in the OS file manager. False
+    /// for any remote browser — the file-manager window opens on the server's
+    /// desktop, which a remote user cannot see.
+    pub local_access: bool,
     pub sampled_at: DateTime<Utc>,
 }
 
@@ -173,7 +182,10 @@ pub struct LogInfo {
 // ============================================================
 
 /// `GET /api/deployment` — assemble and return a [`DeploymentInfo`] snapshot.
-pub async fn deployment_info(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn deployment_info(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
     let cfg = &state.deployment;
 
     let build = BuildInfo {
@@ -206,6 +218,7 @@ pub async fn deployment_info(State(state): State<AppState>) -> impl IntoResponse
         resources,
         disk,
         log: cfg.log.clone(),
+        local_access: super::local_reveal::peer_is_local(peer.ip()),
         sampled_at: Utc::now(),
     })
 }

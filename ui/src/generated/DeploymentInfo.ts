@@ -8,4 +8,11 @@ import type { ResourceUsage } from "./ResourceUsage";
 /**
  * Snapshot returned by `GET /api/deployment`.
  */
-export type DeploymentInfo = { build: BuildInfo, network: NetworkInfo, resources: ResourceUsage, disk: Array<DiskEntry>, log: LogInfo, sampled_at: string, };
+export type DeploymentInfo = { build: BuildInfo, network: NetworkInfo, resources: ResourceUsage, disk: Array<DiskEntry>, log: LogInfo, 
+/**
+ * Whether the requesting browser is on the server host, and so may use
+ * host-local actions like revealing a path in the OS file manager. False
+ * for any remote browser — the file-manager window opens on the server's
+ * desktop, which a remote user cannot see.
+ */
+local_access: boolean, sampled_at: string, };

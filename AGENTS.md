@@ -374,6 +374,17 @@ Phoenix must treat the user's Git worktrees as owned environments: fetching remo
 
 (This constrains how Phoenix-the-app manipulates git on a user's behalf. For *your own* git workflow as a developer in this repo, see [Commits and pushes](#commits-and-pushes).)
 
+### The server filesystem is not the user's filesystem
+
+Phoenix is a server. The browser may run on a different machine than the server (e.g. browsing `https://host.local:8031` from a laptop). Every path the backend reports — database, data dir, TLS keys, log file, on-disk locations — is a handle into the *server's* filesystem, which the viewing machine generally cannot resolve. This splits affordances by whether they cross the wire:
+
+- **File *contents* are portable** — stream the bytes server→browser and any viewer works regardless of where the browser runs. This is why the file/log viewer (`/api/files/read` → MetaViewer) is machine-agnostic: the content travels, not a path handle.
+- **File *locations* are not portable** — a path string means nothing on the viewer's machine, and an OS handle (a Finder/Explorer window, an `open`/`xdg-open` invocation) targets the *server host's* desktop, which a remote user cannot see. So host-local OS actions must never be offered to a possibly-remote browser, and the gate is structural, not a UI guess.
+
+The one safe case is **same-host**: the browser is on the server machine. Detect it server-side from the request's connection peer — loopback, *or* a peer address matching one of the host's own interfaces (covers reaching the server by its LAN name from the same box). Use the raw connection peer, never `X-Forwarded-For`, since the action targets the physical server host. `DeploymentInfo.local_access` carries this to the UI; `POST /api/files/reveal` re-checks it (403 otherwise) and opens a *containing folder only* — never a file, which would launch it by association. See `api/local_reveal.rs`.
+
+This is the filesystem facet of a boundary the MCP work meets on the network side: the server's view of itself is not the remote browser's view of it (see `specs/mcp` REQ-MCP-020, where an all-interfaces bind that resolves to loopback is flagged as unreachable from another machine).
+
 ### Specifications
 
 This project uses two complementary specification formats. **Both are normative** — code that contradicts either is wrong.

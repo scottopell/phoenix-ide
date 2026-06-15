@@ -52,6 +52,14 @@ function resourceText(value: number | null, format: (n: number) => string): stri
   return value === null ? 'unavailable' : format(value);
 }
 
+/** A path is revealable when it names a concrete location on disk: absolute,
+ * present, and not a glob/aggregate pattern (e.g. the browser-profile or
+ * PR-context rows, whose `path` is a `*` pattern spanning many directories). */
+function isRevealable(path: string, size: DiskSize): boolean {
+  if (size.kind === 'absent') return false;
+  return path.startsWith('/') && !path.includes('*');
+}
+
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="deploy-row">
@@ -66,6 +74,14 @@ export function AboutDeploymentPage() {
   const [info, setInfo] = useState<DeploymentInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [revealError, setRevealError] = useState<string | null>(null);
+
+  const handleReveal = useCallback((path: string) => {
+    setRevealError(null);
+    api.revealPath(path).catch((e) => {
+      setRevealError(e instanceof Error ? e.message : String(e));
+    });
+  }, []);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -174,10 +190,28 @@ export function AboutDeploymentPage() {
                         <td className="deploy-table__label">{entry.label}</td>
                         <td className="deploy-table__path"><code>{entry.path}</code></td>
                         <td className="deploy-table__size">{diskSizeLabel(entry.size)}</td>
+                        <td className="deploy-table__action">
+                          {info.local_access && isRevealable(entry.path, entry.size) && (
+                            <button
+                              type="button"
+                              className="deploy-reveal-btn"
+                              title="Open the containing folder in the file manager"
+                              onClick={() => handleReveal(entry.path)}
+                            >
+                              Reveal
+                            </button>
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
+                {revealError && <div className="settings-section__error">{revealError}</div>}
+                {!info.local_access && (
+                  <div className="settings-section__hint">
+                    Reveal-in-file-manager is available only when viewing from the server host.
+                  </div>
+                )}
               </section>
 
               <section className="settings-section">
