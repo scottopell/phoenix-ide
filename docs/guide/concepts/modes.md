@@ -3,7 +3,7 @@ title: Modes
 summary: The four conversation modes — Direct, Explore, Work, Branch — and how much freedom each gives the agent.
 category: concepts
 keywords: [direct, explore, work, branch, worktree, mode, read-only]
-related: [concepts/tasks.md, concepts/workspace.md, howto/run-a-managed-task.md, reference/modes-matrix.md]
+related: [howto/run-a-managed-task.md, reference/managed-lifecycle-states.md, reference/glossary.md]
 ---
 
 # Modes
@@ -32,15 +32,15 @@ at all. The four modes form a spectrum from safest to most direct:
 
 Explore and Work are two halves of one **managed** lifecycle. A managed
 conversation starts read-only in Explore; when you approve a task the agent
-[proposes](tasks.md), Phoenix renames the temporary branch, commits the task
-file on it, and unlocks writes as **Work**. (Explore's lone write exception: the
-agent may `patch` inside `tasks/` to draft that very plan.)
+proposes, Phoenix renames the temporary branch, commits the task file on it, and
+unlocks writes as **Work**. (Explore's lone write exception: the agent may
+`patch` inside `tasks/` to draft that very plan.)
 
 You never select a mode directly. For a git repo you pick a **Workflow** card on
 the new-conversation screen and Phoenix derives the mode — see
 [Run a managed task](../howto/run-a-managed-task.md). Worktrees are isolated
 checkouts keyed to the conversation, so two conversations never collide and your
-working copy stays untouched — see [Workspace](workspace.md).
+working copy stays untouched.
 
 ## What you'll see
 
@@ -54,6 +54,6 @@ are covered in the [walkthrough](../howto/run-a-managed-task.md).
 
 ## See also
 
-- [Tasks](tasks.md) — the propose → approve lifecycle that drives Explore → Work
 - [Run a managed task](../howto/run-a-managed-task.md) — the end-to-end walkthrough
-- [Modes matrix](../reference/modes-matrix.md) — exact tool availability per mode
+- [Managed lifecycle states](../reference/managed-lifecycle-states.md) — every approval & Done? state
+- [Glossary](../reference/glossary.md) — canonical terms

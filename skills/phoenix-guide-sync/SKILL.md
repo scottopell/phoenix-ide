@@ -12,10 +12,16 @@ applying safe fixes directly and surfacing judgment calls instead of guessing.
 Run it routinely (see [Scheduling](#scheduling)), or on demand after a feature
 lands.
 
-The authoring principles you enforce live in `docs/guide/AUTHORING.md` — read it
-first. Any page you add or rewrite must pass its pre-flight checklist; in
-particular, **Principle 1 (ground every UI label in its rendering component,
-verbatim)** is the defect this skill exists to catch.
+This is the **"is it still *true*?"** loop. The sibling
+[`phoenix-guide-review`](../phoenix-guide-review/SKILL.md) skill is the
+**"is it still *good*?"** loop — don't conflate them; subjective quality
+findings belong there, not here.
+
+The authoring principles you enforce live in `docs/guide/AUTHORING.md` (read it
+first, especially **§ The North Star** and its pre-flight checklist). Any page
+you add or rewrite must pass that checklist; in particular, **Principle 1
+(ground every UI label in its rendering component, verbatim)** is the defect
+this skill exists to catch.
 
 ## Sources of truth
 
@@ -33,10 +39,11 @@ right and the guide is the bug.
 | **Exact UI labels quoted in how-tos/concepts** | the React component that renders them under `ui/src/` (button text, card titles, banners, badge tooltips) |
 | In-app routes the guide links to | `ui/src/App.tsx` |
 | Manifest / nav ordering | `docs/guide/SUMMARY.md` |
+| Canonical terms | `docs/guide/reference/glossary.md` (the term registry) |
 
 ## Drift categories
 
-Check all four, in order:
+Check all five, in order:
 
 1. **Structural** — cheapest, check first.
    - Files in `docs/guide/` not listed in `SUMMARY.md`, or `SUMMARY.md` links to
@@ -50,6 +57,10 @@ Check all four, in order:
      `*(planned)*` stub in `SUMMARY.md`).
    - A spec under `specs/` describing a user-facing feature with no concept/how-to
      page. (Skip contributor-only specs — this guide is product-users-only.)
+   - **A stateful feature surface with no reference card.** A user-facing
+     component with computed labels/enabled-state (a derived-label helper such as
+     `deriveWorkLifecycleControls`, a non-dismissible modal) is a coverage target
+     just like a tool — if no reference card enumerates its states, that's a gap.
    - A guide page for a tool/feature that no longer exists or was renamed.
 3. **Content** — documented values that are now wrong. These are the costly ones.
    - Reference cards state exact "drift targets" (e.g. bash's *8 live handles*).
@@ -63,8 +74,26 @@ Check all four, in order:
      component verbatim. Paraphrased or invented labels are the single most
      common quality defect — grep the component for the quoted text; if it's not
      there word-for-word, it's drift.
+   - **State completeness (Principle 7).** For a documented computed control,
+     re-enumerate the component's branches; a new terminal/blocked/error state
+     that the card omits is content drift.
+   - **Ungrounded behavioral claims.** A sentence asserting what *happens* on a
+     transition that traces to no REQ-ID or code path — or that contradicts the
+     component — is drift even though no label is quoted.
 4. **Template conformance** — pages drifting from the section's template shape in
    `_templates/` (missing "See also", reference card missing its limits table, etc.).
+5. **North-Star conformance** — the mechanizable slice of `AUTHORING.md`'s
+   aesthetic principles. These are **propose/flag only, never auto-fix** (rewriting
+   for tone is a judgment call — `phoenix-guide-review` owns the subjective part):
+   - **Line budget.** A concept page over its ~45-line budget (Principle 3).
+   - **Timeless voice (Principle 5).** Grep for `currently`, `recently`, `used to`,
+     `will soon`, task/PR refs (`task \d`, `PR #`), status chatter.
+   - **Layer topology (Principle 3).** A non-landing page whose links/`related`
+     don't reach at least one *other* layer.
+   - **Term variants (glossary).** Grep for known variant spellings of canonical
+     terms (e.g. "mode picker" for **Workflow card**, "Managed mode" as a control).
+   - **Prose where a table belongs (Principle 4).** Flag enumerable content (3+
+     parallel items with the same shape) written as prose.
 
 ## Procedure
 
@@ -118,6 +147,7 @@ Structural:   <n fixed> / <n outstanding>
 Coverage:     <n fixed> / <n proposed> / <n outstanding>
 Content:      <n fixed> / <n flagged>
 Conformance:  <n fixed>
+North-Star:   <n flagged>   (propose only — never auto-fixed)
 
 Applied:
 - <file>: <what changed>

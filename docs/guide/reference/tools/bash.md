@@ -3,7 +3,7 @@ title: bash
 summary: Runs shell commands as background-capable children of Phoenix, captured into a scrollback ring — no terminal attached.
 category: reference
 keywords: [bash, shell, command, handle, still_running, kill, peek, tmux]
-related: [reference/tools/tmux.md, howto/use-the-terminal.md, concepts/workspace.md]
+related: [concepts/modes.md, reference/glossary.md]
 ---
 
 # bash
@@ -11,7 +11,7 @@ related: [reference/tools/tmux.md, howto/use-the-terminal.md, concepts/workspace
 > **At a glance:** the agent runs a shell command; if it doesn't finish within
 > the agent's chosen wait window, it keeps running in the background as a
 > **handle**. Max **8 live handles** per workspace. No TTY — interactive
-> programs need [tmux](tmux.md) or the [terminal](../../howto/use-the-terminal.md).
+> programs need **tmux** or the in-app **terminal**.
 
 ## What it does
 
@@ -57,17 +57,15 @@ follow live output (and resource usage) in the **process inspector** panel.
   list of existing handles — nothing is silently evicted. The agent must
   `kill` or `wait` one out first.
 - **Ephemeral by design.** Handles do **not** survive a Phoenix or system
-  restart. For anything that must persist, the agent uses [tmux](tmux.md).
+  restart. For anything that must persist, the agent uses **tmux**.
 - **No TTY.** Programs needing a terminal (pagers, `vim`, prompts) won't behave;
-  use [tmux](tmux.md) or the in-app [terminal](../../howto/use-the-terminal.md).
+  use **tmux** or the in-app **terminal**.
 - **Read-only in Explore.** In [Explore mode](../../concepts/modes.md), bash is
   sandboxed and cannot write your tree.
 - **Dangerous commands are gated.** Blind `git add`, force-pushes, and dangerous
-  `rm` are screened by the [permission layer](../../concepts/permissions.md)
-  before bash runs.
+  `rm` are screened by the **permission layer** before bash runs.
 
 ## Related
 
-- [tmux](tmux.md) — persistent, TTY-backed sessions that survive restarts
-- [Use the terminal](../../howto/use-the-terminal.md) — your own interactive shell
-- [Workspace](../../concepts/workspace.md) — what "per workspace" means for the handle cap
+- [Modes](../../concepts/modes.md) — why bash is read-only in Explore
+- [Glossary](../glossary.md) — canonical terms (handle, WorkScope)

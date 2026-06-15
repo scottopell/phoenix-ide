@@ -3,7 +3,7 @@ title: Phoenix User Guide
 summary: Learn to drive Phoenix — conversations, modes, tasks, sub-agents, and the tools the agent uses on your behalf.
 category: landing
 keywords: [guide, help, getting started, overview]
-related: [concepts/overview.md, howto/getting-started.md]
+related: [concepts/modes.md, howto/run-a-managed-task.md, reference/glossary.md]
 ---
 
 # Phoenix User Guide
@@ -25,43 +25,26 @@ It is organized in three layers. Start wherever your question lives:
 > palette). The [`SUMMARY.md`](SUMMARY.md) manifest is the table of contents
 > both renderers read.
 
+Linked entries are written; the rest are `*(planned)*` and listed in
+[`SUMMARY.md`](SUMMARY.md). (Planned pages aren't linked here — a link to an
+unwritten page would 404 on GitHub.)
+
 ## Concepts
 
-- [Overview](concepts/overview.md) — *(planned)*
-- [Conversations](concepts/conversations.md) — *(planned)*
 - [Modes](concepts/modes.md) — Direct, Explore, Work, Branch
-- [Tasks](concepts/tasks.md) — *(planned)*
-- [Sub-agents](concepts/sub-agents.md) — *(planned)*
-- [Skills](concepts/skills.md) — *(planned)*
-- [Chains](concepts/chains.md) — *(planned)*
-- [Workspace](concepts/workspace.md) — worktrees & resource ownership *(planned)*
-- [Permissions](concepts/permissions.md) — *(planned)*
-- [Providers & models](concepts/providers.md) — *(planned)*
+- Overview, Conversations, Tasks, Sub-agents, Skills, Chains, Workspace, Permissions, Providers — *(planned)*
 
 ## How-to
 
-- [Getting started](howto/getting-started.md) — *(planned)*
 - [Run a managed task](howto/run-a-managed-task.md) — Explore → approve → Work → PR
-- [Spawn sub-agents](howto/spawn-sub-agents.md) — *(planned)*
-- [Use the terminal](howto/use-the-terminal.md) — *(planned)*
-- [Review changes](howto/review-changes.md) — *(planned)*
-- [Share read-only](howto/share-read-only.md) — *(planned)*
-- [Steer a running agent](howto/steer-a-running-agent.md) — *(planned)*
-- [Compose with references](howto/compose-with-references.md) — `@file` `/skill` `./path` *(planned)*
-- [Search conversations](howto/search-conversations.md) — *(planned)*
-- [Voice input](howto/voice-input.md) — *(planned)*
+- Getting started, Spawn sub-agents, Use the terminal, Review changes, Share read-only, Steer a running agent, Compose with references, Search conversations, Voice input — *(planned)*
 
 ## Reference
 
-- [Tools](reference/tools/) — one card per tool the agent can use
-  - [bash](reference/tools/bash.md)
-  - others — *(planned)*
-- [Keyboard shortcuts](reference/keyboard.md) — *(planned)*
-- [Input grammar](reference/input-grammar.md) — `@` `/` `./` *(planned)*
-- [Modes matrix](reference/modes-matrix.md) — mode × tool availability *(planned)*
-- [Conversation states](reference/states.md) — *(planned)*
-- [Command palette](reference/command-palette.md) — *(planned)*
-- [Glossary](reference/glossary.md) — *(planned)*
+- [Managed lifecycle states](reference/managed-lifecycle-states.md) — approval & Done? bar states
+- [Glossary](reference/glossary.md) — canonical term registry
+- [bash](reference/tools/bash.md) — and more tool cards *(planned)*
+- Keyboard shortcuts, Input grammar, Modes matrix, Conversation states, Command palette — *(planned)*
 
 ---
 

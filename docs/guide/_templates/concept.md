@@ -9,7 +9,8 @@ related: [<relative/path.md>, <relative/path.md>]
 # <Title>
 
 <!--
-CONCEPT TEMPLATE — orientation, macOS Help style.
+CONCEPT TEMPLATE — orientation. Serves the terseness leg of ../AUTHORING.md
+§ The North Star.
 Answers "what is this and why does it exist?", not "how do I do X".
 Audience: a product user driving Phoenix, not a contributor.
 

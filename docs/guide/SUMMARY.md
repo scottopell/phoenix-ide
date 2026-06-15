@@ -37,6 +37,8 @@ written.
 
 # Reference
 
+- [Managed lifecycle states](reference/managed-lifecycle-states.md)
+- [Glossary](reference/glossary.md) — canonical term registry
 - [bash](reference/tools/bash.md)
 - Tool cards (patch, keyword_search, browse, tmux, spawn_agents, ask_user_question, skill, propose_task, …) — `reference/tools/` *(planned)*
 - Keyboard shortcuts — `reference/keyboard.md` *(planned)*
@@ -44,7 +46,6 @@ written.
 - Modes matrix — `reference/modes-matrix.md` *(planned)*
 - Conversation states — `reference/states.md` *(planned)*
 - Command palette — `reference/command-palette.md` *(planned)*
-- Glossary — `reference/glossary.md` *(planned)*
 
 ---
 

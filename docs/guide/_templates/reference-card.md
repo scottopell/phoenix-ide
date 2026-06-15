@@ -9,11 +9,17 @@ related: [<relative/path.md>, <relative/path.md>]
 # <Title>
 
 <!--
-REFERENCE-CARD TEMPLATE — dense lookup, Bloomberg-terminal style.
-Maximize information density: tables over prose, exact values, no warm-up.
-For a TOOL card, write from the USER's vantage point — what the agent does with
-it and what you see in the transcript — not an API call spec for the agent.
+REFERENCE-CARD TEMPLATE — dense lookup. Serves the depth + precision legs of
+../../AUTHORING.md § The North Star.
+Maximize information density: tables over prose, exact values, no warm-up, no
+prose padding. For a TOOL card, write from the USER's vantage point — what the
+agent does with it and what you see in the transcript — not an API call spec.
 Every value here is a drift target the phoenix-guide-sync skill checks.
+
+STATE COVERAGE (Principle 7): if you are documenting a surface whose label or
+enabled-state is computed, enumerate EVERY reachable branch (terminal, blocked,
+loading, error) as a state table — not just the happy path. This card is where
+a how-to offloads its 3+-condition depth.
 
 REQUIRED PRE-FLIGHT (see ../../AUTHORING.md):
 Source exact values (limits, statuses, params) from the spec/Allium under
