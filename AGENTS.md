@@ -288,17 +288,38 @@ If data appears in two representations simultaneously, one is redundant. Redunda
 //          Non-overlapping consumers, non-overlapping contracts
 ```
 
-#### Schema evolution belongs in migrations, not serde annotations
+#### Persisted structure belongs in the schema, not in serde
 
-`#[serde(default)]` on a JSON-in-TEXT column field is a patch around a missing migration, not a solution. It is acceptable as a backward-compat shim *during rollout*, but the migration must exist or be tracked as a task. The decision to store structured data as a JSON TEXT blob must be explicitly owned, not treated as an inert constraint to work around.
+A JSON-in-TEXT column is *earned*, not a default. It is justified only for data that is always read and written as one indivisible aggregate and is never addressed field-wise by SQL. Everything else belongs in columns and rows, where shape is enforced by the schema — `NOT NULL`, foreign keys, `CHECK` — instead of by serde discipline that relies on human vigilance.
+
+**The objective test is the migration.** If a migration ever needs `json_extract` / `json_set` / `json_remove` on a column, that field wanted to be a column or a row. Reaching into a blob with SQL paths is doing relational work on a document: you pay for both models and get the safety of neither.
+
+**Child collections are never earned.** An array of records inside a blob (attachments, queued messages, tag lists) is the canonical "normalize me" — model it as a child table with a foreign key and an explicit `ordinal`. Presence becomes row existence, shape becomes `NOT NULL` columns, and `#[serde(default)]` / `skip_serializing_if` on that field become *unwritable* — the entire rollout-shim bug class cannot occur.
+
+A blob is earned only for a **polymorphic aggregate** read and written whole and never queried field-wise (a message's content tree of heterogeneous blocks) or for **intentionally-schemaless** data (opaque UI payloads). For a sum type whose discriminant SQL must filter on, add a discriminator column instead of `json_extract($.type)`.
+
+Inside an earned blob, serialization must be **total and lossless**:
+
+- No `skip_serializing_if` that makes "absent" a second encoding of "empty" — a value with one meaning must have one representation.
+- `#[serde(default)]` is allowed *only* for **true absence**: the feature postdated the row, so empty/`None` is the correct value, not a fabrication. Say so in a comment (`// owned: pre-feature rows had no X; empty is correct, no migration owed`).
+- A `#[serde(default)]` that hides **lost** data (the value existed but the row dropped it) is a bug owed a migration, acceptable only as a rollout shim with the migration tracked as a task.
+- A one-time backfill cannot make a skip-serialized field reliably present — the next empty write re-omits the key. To *require* a field, backfill **and** drop both `default` and `skip_serializing_if` so it always serializes; a missing key then becomes a hard error.
 
 ```rust
-// ❌ Bad: serde(default) as the complete schema change
+// ❌ Child collection hidden in a blob — normalize it to a child table
 #[serde(default)]
-pub images: Vec<ToolContentImage>,  // old rows silently get empty vec, no migration, no auditability
+pub files: Vec<FileAttachment>,   // belongs in message_files(message_id, ordinal, …)
 
-// ✅ Good: migration adds typed column; serde(default) covers the rollout window only
-// See db/migrations/ — every structural change to persisted data has a migration
+// ❌ Migration reaching into a blob — the field wanted to be a column
+// UPDATE conversations SET conv_mode = json_set(conv_mode, '$.worktree_path', cwd) …
+
+// ✅ Earned blob: polymorphic, read/written whole, never queried field-wise
+pub content: Vec<ContentBlock>,   // heterogeneous message blocks
+
+// ✅ True-absence default inside an earned blob, documented as owned
+// owned: pre-feature rows had no expansion; None is correct, no migration owed
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub llm_text: Option<String>,
 ```
 
 #### Capability gaps are logged, not silenced
@@ -327,9 +348,9 @@ A comment is safe when it describes a local fact about the line it's on. A comme
 // --force required: worktree may have uncommitted files
 run_git(cwd, &["worktree", "remove", &path, "--force"])?;
 
-// serde(default) rollout shim — migration tracked in task 0087
+// serde(default) rollout shim — backfill migration tracked in task 0087
 #[serde(default)]
-pub worktree_path: String,
+pub priority: Priority,
 ```
 
 **Move to spec, then delete:**
