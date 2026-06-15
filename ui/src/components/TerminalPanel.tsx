@@ -761,18 +761,21 @@ export function TerminalPanel({
       const encoded = new TextEncoder().encode(text);
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(dataFrame(encoded));
-      } else {
-        // Not OPEN yet (CONNECTING) or no longer OPEN (CLOSING/CLOSED).
-        // Queue rather than drop; onopen flushes. CONNECTING bytes reach
-        // the shell once the handshake completes; CLOSING/CLOSED bytes are
-        // released when this WS and its closures are torn down. The debug
-        // log makes a would-be-dropped keystroke visible (capability gaps
-        // are logged, not silenced) so a recurrence is diagnosable.
+      } else if (ws.readyState === WebSocket.CONNECTING) {
+        // Pre-handshake: queue rather than drop; onopen flushes in order, so
+        // input typed into a freshly-opened terminal reaches the shell once
+        // the handshake completes. The debug log makes a would-be-dropped
+        // keystroke visible (capability gaps are logged, not silenced) so a
+        // recurrence is diagnosable.
         pendingInput.push(encoded);
         console.debug(
-          `[terminal] buffered ${encoded.length}B of input; ws.readyState=${ws.readyState} (not OPEN)`,
+          `[terminal] buffered ${encoded.length}B of input during WS handshake (readyState=CONNECTING)`,
         );
       }
+      // CLOSING/CLOSED: the session is dead (e.g. "Shell exited"). This
+      // socket can never fire onopen, so buffering would leak memory + logs
+      // and never deliver. Drop — clicking reconnect spawns a fresh WS with
+      // its own buffer.
     });
 
     const handleResize = () => {
