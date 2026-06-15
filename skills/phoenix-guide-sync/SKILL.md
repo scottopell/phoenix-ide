@@ -12,6 +12,11 @@ applying safe fixes directly and surfacing judgment calls instead of guessing.
 Run it routinely (see [Scheduling](#scheduling)), or on demand after a feature
 lands.
 
+The authoring principles you enforce live in `docs/guide/AUTHORING.md` — read it
+first. Any page you add or rewrite must pass its pre-flight checklist; in
+particular, **Principle 1 (ground every UI label in its rendering component,
+verbatim)** is the defect this skill exists to catch.
+
 ## Sources of truth
 
 The guide is downstream of these. When they and the guide disagree, **they** are
@@ -73,8 +78,10 @@ Check all four, in order:
 4. **Classify** every finding (next section) and act on it.
 5. **Emit a drift report** (format below) even when you also applied fixes, so
    there's a record of what changed and what's outstanding.
-6. **Run `./dev.py check`** if you changed any file the check validates, and keep
-   `SUMMARY.md` in sync with any page you add or remove.
+6. **Pass the pre-flight.** Any page you added or rewrote must satisfy the
+   `docs/guide/AUTHORING.md` checklist before you commit it — especially UI
+   grounding. Keep `SUMMARY.md` in sync with any page you add or remove, and run
+   `./dev.py check` if you touched a file the check validates.
 
 ## Classify, then act
 

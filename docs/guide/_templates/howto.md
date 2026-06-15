@@ -13,6 +13,13 @@ HOW-TO TEMPLATE — goal-oriented walkthrough, macOS Help style.
 Answers "how do I accomplish X?". One goal per page. Assume the reader knows
 the relevant concepts (link to them) and wants the steps.
 Audience: a product user driving Phoenix.
+
+REQUIRED PRE-FLIGHT (see ../AUTHORING.md):
+Before writing the steps, open the rendering component(s) under ui/src/ for this
+flow and extract the EXACT control strings (button text, card titles, banners,
+confirmation dialogs) plus the conditions each appears under. Write each step
+against those verbatim strings — never paraphrase a control. Then run the
+../AUTHORING.md pre-flight checklist before committing.
 -->
 
 <One sentence: what this accomplishes and when you'd want it.>

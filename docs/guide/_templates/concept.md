@@ -14,6 +14,11 @@ Answers "what is this and why does it exist?", not "how do I do X".
 Keep it short. Define vocabulary the rest of the guide leans on. Link out to
 How-to pages for procedures and to Reference cards for exact values.
 Audience: a product user driving Phoenix, not a contributor.
+
+REQUIRED PRE-FLIGHT (see ../AUTHORING.md):
+Before writing "What you'll see", ground every UI label (badge text, tooltips,
+banners) in its rendering component under ui/src/ and quote it verbatim.
+Read ../AUTHORING.md and run its pre-flight checklist before committing.
 -->
 
 One or two sentences that define the concept and place it in the bigger picture.

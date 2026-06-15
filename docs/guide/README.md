@@ -65,6 +65,8 @@ It is organized in three layers. Start wherever your question lives:
 
 ---
 
-*Contributing to this guide?* Use the templates in [`_templates/`](_templates/)
-and keep [`SUMMARY.md`](SUMMARY.md) in sync. The `phoenix-guide-sync` skill
-audits this guide against the code and specs on a schedule.
+*Contributing to this guide?* Read [`AUTHORING.md`](AUTHORING.md) for the
+principles and pre-flight checklist, start from a template in
+[`_templates/`](_templates/), and keep [`SUMMARY.md`](SUMMARY.md) in sync. The
+`phoenix-guide-sync` skill audits this guide against the code and specs on a
+schedule.

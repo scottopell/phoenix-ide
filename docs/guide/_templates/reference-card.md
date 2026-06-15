@@ -14,6 +14,12 @@ Maximize information density: tables over prose, exact values, no warm-up.
 For a TOOL card, write from the USER's vantage point — what the agent does with
 it and what you see in the transcript — not an API call spec for the agent.
 Every value here is a drift target the phoenix-guide-sync skill checks.
+
+REQUIRED PRE-FLIGHT (see ../../AUTHORING.md):
+Source exact values (limits, statuses, params) from the spec/Allium under
+specs/<tool>/, and any quoted UI labels from the rendering component under
+ui/src/, verbatim. Run the ../../AUTHORING.md pre-flight checklist before
+committing.
 -->
 
 > **At a glance:** <one-line synopsis — what it does and its headline limit.>

@@ -50,4 +50,5 @@ written.
 
 # Meta
 
+- [Authoring the guide](AUTHORING.md) — principles + pre-flight checklist
 - [Templates](_templates/) — concept / how-to / reference-card
