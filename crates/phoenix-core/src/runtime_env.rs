@@ -226,8 +226,12 @@ impl PhoenixRuntimeEnvironment {
     /// auditable.
     ///
     /// `namespace` must be a single relative path component (no separators,
-    /// no `..`, not absolute) so the result cannot escape `tmp_root`;
-    /// anything else is an [`io::ErrorKind::InvalidInput`] error.
+    /// no `..`, not absolute) so the result cannot escape `tmp_root`.
+    ///
+    /// # Errors
+    /// Returns [`io::ErrorKind::InvalidInput`] if `namespace` is not a single
+    /// relative path component, or any error from `create_dir_all` if the
+    /// directory cannot be created.
     ///
     /// [`io::ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
     pub fn tmp_subdir(&self, namespace: &str) -> std::io::Result<PathBuf> {

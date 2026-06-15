@@ -43,7 +43,6 @@ use tokio::sync::{OnceCell, RwLock};
 
 use super::probe::{probe, ProbeResult};
 
-
 /// Default session name created on lazy spawn (REQ-TMUX-002 /
 /// `TMUX_DEFAULT_SESSION`).
 pub const TMUX_DEFAULT_SESSION: &str = "main";

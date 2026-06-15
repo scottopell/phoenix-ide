@@ -227,6 +227,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("use_codex_auth", &self.use_codex_auth)
             .field("codex_credential", &self.codex_credential.is_some())
             .field("codex_credential_path", &self.codex_credential_path)
+            .field("runtime_env", &self.runtime_env)
             .finish()
     }
 }

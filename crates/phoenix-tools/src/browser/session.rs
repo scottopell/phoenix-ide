@@ -368,6 +368,7 @@ pub(crate) fn truncate_unicode_safe(s: String, max_bytes: usize) -> String {
 /// Directory where the fetcher caches downloaded Chrome binaries. Resolved
 /// through [`PhoenixRuntimeEnvironment`] so it agrees with the path the
 /// deployment-info page reports.
+#[must_use]
 pub fn fetcher_cache_dir() -> PathBuf {
     PhoenixRuntimeEnvironment::detect().chromium_cache_dir()
 }

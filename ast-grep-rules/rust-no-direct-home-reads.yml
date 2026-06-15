@@ -1,0 +1,28 @@
+id: no-direct-home-reads
+language: Rust
+severity: error
+message: |
+  Direct `std::env::var(_os)("HOME"|"CODEX_HOME")` read. The filesystem
+  environment is resolved once at startup by
+  `phoenix_core::runtime_env::PhoenixRuntimeEnvironment` and threaded as an
+  `Arc` (on `AppState`) or re-resolved via `PhoenixRuntimeEnvironment::detect()`.
+  Read the home directory and the paths derived from it through that type
+  (`.home()`, `.codex_home()`, `.codex_auth_path()`, `.builtin_skills_dir()`,
+  `.tmux_socket_dir()`, `.chromium_cache_dir()`, `.terminal_output_dir()`,
+  `.tmp_subdir(..)`, …) so every subsystem agrees on where Phoenix's data lives
+  and the deployment-info page reports the locations the process actually opens.
+
+  `OPENAI_USE_CODEX_AUTH`, `$SHELL`, and `$USER`/`$LOGNAME`/`$PATH` are behaviour
+  flags or non-path env, not filesystem locations — they are read directly and
+  are not matched by this rule.
+note: "Centralize filesystem-environment access — see crates/phoenix-core/src/runtime_env.rs"
+rule:
+  any:
+    - pattern: std::env::var("HOME")
+    - pattern: std::env::var_os("HOME")
+    - pattern: std::env::var("CODEX_HOME")
+    - pattern: std::env::var_os("CODEX_HOME")
+ignores:
+  # The one sanctioned place that reads these vars: it is the type every other
+  # subsystem resolves through.
+  - "**/phoenix-core/src/runtime_env.rs"

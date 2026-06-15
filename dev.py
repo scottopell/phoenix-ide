@@ -2378,7 +2378,7 @@ _LANE_DEFS = [
     ("tsc", {"UI"}, "tsc -b --noEmit project typecheck"),
     ("ui-lint", {"UI"}, "eslint + stylelint"),
     ("vitest", {"UI"}, "vitest run"),
-    ("ast-grep", {"UI", "ASTGREP"}, "structural lint rules over ui/src/"),
+    ("ast-grep", {"UI", "RUST", "ASTGREP"}, "structural lint rules over ui/src/ + crates/"),
     ("allium", {"SPECS"}, "allium spec validation"),
     # spec-anchors cross-validates REQ-* anchors in code against specs/, so a
     # change to either side can orphan or satisfy an anchor.
@@ -3214,8 +3214,16 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         if not rule_files:
             return
         for rule_file in rule_files:
+            # Route each rule at the tree its language lives in: Rust rules
+            # scan crates/, everything else (Tsx/Ts) scans ui/src/.
+            is_rust = re.search(
+                r"^language:\s*Rust\b",
+                rule_file.read_text(),
+                re.MULTILINE,
+            )
+            target = "crates/" if is_rust else "ui/src/"
             run_step(f"ast-grep:{rule_file.stem[:14]}", [
-                "ast-grep", "scan", "--rule", str(rule_file), "ui/src/",
+                "ast-grep", "scan", "--rule", str(rule_file), target,
             ])
 
     def check_allium():
