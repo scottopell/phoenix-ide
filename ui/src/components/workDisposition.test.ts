@@ -148,18 +148,21 @@ describe('stuck — RESOLVE always suppressed (REQ-WAB-005)', () => {
     expect(d.note).toBeNull();
   });
 
-  it('closed → abandon primary, pr_closed note', () => {
+  it('closed → abandon primary, BOTH terminal verbs shown, pr_closed note', () => {
     const d = deriveWorkDisposition(input({ phaseType: 'context_exhausted', prStatus: foundPr('closed') }));
     expect(d.primary).toBe('abandon');
-    expect(d.showCleanUp).toBe(false);
+    // Stuck keeps Clean up available even when Abandon is primary (codex A / DispositionStuck).
+    expect(d.showCleanUp).toBe(true);
+    expect(d.showAbandon).toBe(true);
     expect(d.note?.kind).toBe('pr_closed');
   });
 
-  it('open → abandon primary, pr_open_stuck note', () => {
+  it('open → abandon primary, BOTH terminal verbs shown, pr_open_stuck note', () => {
     const d = deriveWorkDisposition(input({ phaseType: 'error', prStatus: foundPr('open') }));
     expect(d.primary).toBe('abandon');
     expect(d.resolve).toBeNull();
-    expect(d.showCleanUp).toBe(false);
+    expect(d.showCleanUp).toBe(true);
+    expect(d.showAbandon).toBe(true);
     expect(d.note?.kind).toBe('pr_open_stuck');
   });
 
@@ -203,7 +206,7 @@ describe('idle open/draft — RESOLVE', () => {
     expect(d.showAbandon).toBe(true);
   });
 
-  it('address_feedback when open + coverage gap, even with passing checks and no fresh feedback (codex #5)', () => {
+  it('coverage gap is orthogonal — passing checks + coverage-only routes to merge, NOT address (codex #C)', () => {
     const d = deriveWorkDisposition(
       input({
         prStatus: foundPr('open', {
@@ -212,25 +215,29 @@ describe('idle open/draft — RESOLVE', () => {
         }),
       }),
     );
-    // A coverage gap is actionable — route to Address feedback so its coverage
-    // marker (e.g. "GitHub sign-in needed") is visible, not hidden behind a link.
+    // A coverage gap does NOT assert a feedback change, so it must not force
+    // auto-fix routing / hide the Merge link. The coverage marker rides on the
+    // resolve verb instead (rendered by the component).
     expect(d.primary).toBe('resolve');
-    expect(d.resolve).toEqual({ kind: 'address_feedback' });
+    expect(d.resolve).toEqual({ kind: 'merge_pr', url: PR_URL, number: PR_NUMBER });
   });
 
-  it('stale unavailable persisted open PR keeps the manual Clean up fallback (codex #1)', () => {
+  it('stale/unavailable refresh on a persisted open PR → Open PR link, no one-click cleanup (codex #E)', () => {
     const d = deriveWorkDisposition(
       input({
         prStatus: foundPr('open', {
+          check_state: 'passing' as PrCheckState,
           refresh: { state: 'unavailable', last_attempted_at: '2026-01-01T00:00:00Z', stale: true },
           unavailable_reason: 'command_failed',
         }),
       }),
     );
-    expect(d.primary).toBe('clean_up');
-    expect(d.showCleanUp).toBe(true);
-    expect(d.cleanUpIsManualFallback).toBe(true);
-    expect(d.note?.kind).toBe('gh_unavailable');
+    // Refresh failure must not make Clean up the primary (would delete a worktree
+    // for a still-open PR). Route to Open PR (verify on GitHub); Abandon still disposes.
+    expect(d.primary).toBe('resolve');
+    expect(d.resolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
+    expect(d.showCleanUp).toBe(false);
+    expect(d.showAbandon).toBe(true);
   });
 
   it('address_feedback when open + fresh feedback present', () => {

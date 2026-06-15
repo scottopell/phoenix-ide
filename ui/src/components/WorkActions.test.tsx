@@ -637,6 +637,36 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
     expect(coverage).toHaveAttribute('title', expect.stringContaining('review threads'));
   });
 
+  it('renders the coverage marker on the Merge PR link when checks pass but a coverage gap exists (codex #C)', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-merge-cov"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 142,
+          url: 'https://gh/pr/142',
+          display_state: 'open',
+          check_state: 'passing',
+          // Coverage gap, no fresh feedback → not addressable; routes to Merge.
+          feedback_coverage: { kind: 'auth_required', surfaces: ['review_threads'] },
+        })}
+      />,
+    );
+
+    // Coverage is orthogonal: the PR is mergeable (Merge link), and the auth
+    // coverage marker still surfaces — on the link, not hidden.
+    const merge = screen.getByTestId('merge-pr-link');
+    expect(screen.queryByTestId('address-feedback-button')).not.toBeInTheDocument();
+    const coverage = merge.querySelector('.work-actions-pr-coverage');
+    expect(coverage).toBeInTheDocument();
+    expect(coverage).toHaveClass('work-actions-pr-coverage--auth');
+    expect(coverage?.textContent).toContain('GitHub sign-in needed');
+  });
+
   it('shows an actionable "GitHub sign-in needed" auth marker when feedback auth failed', () => {
     renderWithProviders(
       <WorkControlBar

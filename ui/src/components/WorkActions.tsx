@@ -30,6 +30,26 @@ function InfoHint({ text }: { text: string }) {
   );
 }
 
+/** The orthogonal PR feedback coverage marker (e.g. "⚠ GitHub sign-in needed").
+ *  Rendered on whichever RESOLVE verb shows, since a coverage gap is independent
+ *  of which action the PR routes to (it never forces auto-fix routing). */
+function CoverageMarker({
+  marker,
+}: {
+  marker: ReturnType<typeof prFeedbackCoverageMarker>;
+}) {
+  if (!marker) return null;
+  return (
+    <span
+      className={`work-actions-pr-coverage${marker.actionable ? ' work-actions-pr-coverage--auth' : ''}`}
+      title={marker.tooltip}
+    >
+      {'⚠'}
+      {marker.label ? ` ${marker.label}` : ''}
+    </span>
+  );
+}
+
 function cleanUpHintText(isBranch: boolean): string {
   return isBranch
     ? 'Mark as merged. Deletes the worktree; your branch is kept. No confirmation — use Abandon if you want a diff snapshot first.'
@@ -121,15 +141,7 @@ export function WorkControlBar({
             >
               {capturing ? 'Capturing...' : 'Address feedback'}
               {freshnessLabel && <span className="work-actions-pr-freshness">{freshnessLabel}</span>}
-              {coverageMarker && (
-                <span
-                  className={`work-actions-pr-coverage${coverageMarker.actionable ? ' work-actions-pr-coverage--auth' : ''}`}
-                  title={coverageMarker.tooltip}
-                >
-                  {'⚠'}
-                  {coverageMarker.label ? ` ${coverageMarker.label}` : ''}
-                </span>
-              )}
+              <CoverageMarker marker={coverageMarker} />
             </button>
           )}
           {disposition.resolve.kind === 'merge_pr' && (
@@ -141,6 +153,7 @@ export function WorkControlBar({
               data-testid="merge-pr-link"
             >
               Merge PR #{disposition.resolve.number} ↗
+              <CoverageMarker marker={coverageMarker} />
             </a>
           )}
           {disposition.resolve.kind === 'open_pr' && (
@@ -152,6 +165,7 @@ export function WorkControlBar({
               data-testid="open-pr-link"
             >
               Open PR #{disposition.resolve.number} ↗
+              <CoverageMarker marker={coverageMarker} />
             </a>
           )}
         </div>

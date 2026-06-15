@@ -308,27 +308,14 @@ the no-squash-merge constraint lives in work-lifecycle REQ-WL-002.
 
 ---
 
-### REQ-PROJ-010: Abandon a Conversation (Moved)
+### Work lifecycle and PR association (specified in dedicated specs)
 
-**Moved** to work-lifecycle REQ-WL-001.
-
----
-
-### REQ-PROJ-011: PR Status Is the Branch Health Indicator (Moved)
-
-**Moved** to work-lifecycle REQ-WL-003.
-
-### REQ-PROJ-030: PR Feedback Freshness Indicator (Moved)
-
-**Moved** to pr-association REQ-PRA-001.
-
-### REQ-PROJ-031: Agent-Facing PR Context Baseline (Moved)
-
-**Moved** to pr-association REQ-PRA-002.
-
-### REQ-PROJ-032: Bounded PR Feedback Refresh (Moved)
-
-**Moved** to pr-association REQ-PRA-003.
+The terminal-action lifecycle of a Work or Branch conversation — abandon, mark-merged, and the
+PR-merge cleanup gate — is specified by the **work-lifecycle** spec (REQ-WL-001 through
+REQ-WL-003). PR association, status, and feedback freshness are specified by the
+**pr-association** spec (REQ-PRA-001 through REQ-PRA-004). Those specs hold the current
+normative requirements; this spec covers project setup, mode selection, worktrees, task
+authoring, and branch sourcing.
 
 ---
 
@@ -774,15 +761,11 @@ iterative work on the same branch.
 
 ---
 
-### REQ-PROJ-026: Branch Mode Lifecycle -- Mark Merged, Abandon (Moved)
+### Branch and Managed mode terminal lifecycle (specified in work-lifecycle)
 
-**Moved** to work-lifecycle REQ-WL-001 (abandon) and REQ-WL-002 (mark-merged).
-
----
-
-### REQ-PROJ-027: Simplified Managed Mode Completion -- User Merges via PR (Moved)
-
-**Moved** to work-lifecycle REQ-WL-002.
+Mark-merged and abandon for both Branch and Managed mode conversations — worktree and branch
+disposition, the PR-aware cleanup guidance, and the no-squash / no-push completion model — are
+specified by the **work-lifecycle** spec (REQ-WL-001 and REQ-WL-002).
 
 ---
 

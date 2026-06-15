@@ -143,11 +143,15 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
   // Row 3. Stuck (error / context_exhausted): RESOLVE always suppressed
   // (REQ-WAB-005); primary collapses to a FINISH verb selected by PR state.
   if (stuck) {
+    // A stuck bar keeps BOTH terminal verbs visible (DispositionStuck): a stuck
+    // conversation must be maximally disposable, so Clean up stays available
+    // even when Abandon is the primary. Only the primary varies by PR state.
     if (ds === 'merged') {
       return finish('clean_up', { showCleanUp: true });
     }
     if (ds === 'closed') {
       return finish('abandon', {
+        showCleanUp: true,
         note: {
           kind: 'pr_closed',
           text: `PR #${number} is closed without merge. Use Abandon to clean up.`,
@@ -156,6 +160,7 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
     }
     if (ds === 'open' || ds === 'draft') {
       return finish('abandon', {
+        showCleanUp: true,
         note: {
           kind: 'pr_open_stuck',
           text: `PR #${number} still open — merge on GitHub, or abandon.`,
@@ -175,45 +180,41 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
 
   // From here: phaseType === 'idle'.
 
-  // Row 4. idle, found, PR open/draft — push-forward RESOLVE.
+  // Row 4. idle, found, PR open/draft — push-forward RESOLVE. Cleanup is
+  // suppressed here: an open PR is not done, so the primary moves the work
+  // forward (address / merge / open on GitHub), never a one-click cleanup.
   if (found && (ds === 'open' || ds === 'draft')) {
-    // gh cannot confirm a stale persisted PR (refresh failed over a previously
-    // observed PR). Keep the manual Clean up fallback (REQ-WL-003) rather than
-    // only offering a PR link — the work may have merged externally and the
-    // user must still be able to dispose without a working gh.
-    if (prStatus?.refresh?.state === 'unavailable' && prStatus?.refresh?.stale) {
-      return finish('clean_up', {
-        showCleanUp: true,
-        cleanUpIsManualFallback: true,
-        note: { kind: 'gh_unavailable', text: NOTE_GH_UNAVAILABLE },
-      });
-    }
-    // Addressable: an open PR with something to act on — failing checks, fresh
-    // feedback, or a feedback coverage gap (e.g. an unreadable surface / auth
-    // gap). The coverage marker only renders on the Address feedback button, so
-    // a coverage-only gap must route here or its actionable hint is hidden.
+    const refreshUnavailable = prStatus?.refresh?.state === 'unavailable';
+
+    // Addressable: an open PR that needs attention auto-fix can act on —
+    // failing checks or fresh feedback. A feedback *coverage* gap is orthogonal
+    // (it does not assert a feedback change) and is surfaced by the coverage
+    // marker on whichever resolve verb shows, not by routing into auto-fix.
     const addressable =
       ds === 'open' &&
       canSendMessage &&
-      prStatus?.refresh?.state !== 'unavailable' &&
-      (prStatus?.check_state === 'failing' ||
-        prStatus?.feedback_freshness != null ||
-        prStatus?.feedback_coverage != null);
+      !refreshUnavailable &&
+      (prStatus?.check_state === 'failing' || prStatus?.feedback_freshness != null);
 
     if (addressable) {
       return resolveVerb({ kind: 'address_feedback' });
     }
 
-    if (ds === 'open' && prStatus?.check_state === 'passing') {
-      // Honest "Merge" requires a real GitHub link. If url/number are somehow
-      // missing on a found open passing PR (should not happen), fall through to
-      // an honest open_pr link, else to a safe Abandon primary.
-      if (url != null && number != null) {
-        return resolveVerb({ kind: 'merge_pr', url, number });
-      }
+    // "Merge" only when checks are confirmed passing on a fresh status. A stale
+    // or unavailable refresh cannot assert mergeability, so it routes to the
+    // honest "Open PR" link (verify on GitHub) — never a one-click cleanup.
+    if (
+      ds === 'open' &&
+      !refreshUnavailable &&
+      prStatus?.check_state === 'passing' &&
+      url != null &&
+      number != null
+    ) {
+      return resolveVerb({ kind: 'merge_pr', url, number });
     }
 
-    // Draft, or open-but-not-addressable-and-not-green → honest "Open PR".
+    // Draft, stale/unavailable refresh, or open-but-not-addressable-and-not-green
+    // → honest "Open PR" link.
     if (url != null && number != null) {
       return resolveVerb({ kind: 'open_pr', url, number });
     }

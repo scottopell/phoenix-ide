@@ -128,23 +128,25 @@ rule ConfirmAbandon {
 
     requires: AbandonConfirmationPending(conversation)
     requires: exists worktree
-    requires: not has_live_worktree_co_owner(conversation)
-
-    let snapshot = DiffSnapshot{
-        commit_log: String,
-        committed_diff: String,
-        uncommitted_diff: String,
-        truncated: Boolean
-    }
 
     ensures: not AbandonConfirmationPending(conversation)
-    ensures: DiffSnapshotPersisted(conversation, snapshot)
-    ensures: not exists worktree
+
+    -- Worktree/branch removal is conditional, not gated: a live co-owner (a
+    -- context continuation or a Work sub-agent sharing this worktree) preserves
+    -- the worktree and branch. The conversation resolves either way — the
+    -- co-owner guard is an outcome on cleanup, not a precondition on the action.
+    ensures:
+        if not has_live_worktree_co_owner(conversation):
+            not exists worktree
 
     ensures:
-        if is_managed_mode(conversation):
+        if is_managed_mode(conversation) and not has_live_worktree_co_owner(conversation):
             BranchDeleted(worktree.branch_name)
         -- Branch mode: branch kept (user's PR branch, not ours to delete)
+
+    -- The diff snapshot is best-effort, not a guaranteed postcondition: capture
+    -- can fail or find no diff, and abandon still succeeds. The capture-before-
+    -- delete ordering and bounds are in @guidance, not a hard `ensures`.
 
     ensures: bedrock/TaskResolved(conversation, abandoned)
     ensures: SystemMessageEmitted(
@@ -201,12 +203,17 @@ rule MarkAsMerged {
     -- Existence implies mode in { work, branch } — Direct and Explore
     -- conversations have no worktree.
     requires: exists worktree
-    requires: not has_live_worktree_co_owner(conversation)
 
-    ensures: not exists worktree
+    -- Worktree/branch removal is conditional, not gated: a live co-owner (a
+    -- context continuation or a Work sub-agent sharing this worktree) preserves
+    -- the worktree and branch. The conversation resolves either way — the
+    -- co-owner guard is an outcome on cleanup, not a precondition on the action.
+    ensures:
+        if not has_live_worktree_co_owner(conversation):
+            not exists worktree
 
     ensures:
-        if is_managed_mode(conversation):
+        if is_managed_mode(conversation) and not has_live_worktree_co_owner(conversation):
             BranchDeleted(worktree.branch_name)
         -- Branch mode: branch kept (user's PR branch, not ours to delete)
 
