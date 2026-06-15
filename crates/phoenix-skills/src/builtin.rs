@@ -37,7 +37,9 @@ use std::path::{Path, PathBuf};
 struct BuiltinAssets;
 
 /// Subdirectory under the phoenix data dir where built-ins are extracted.
-pub const EXTRACT_SUBDIR: &str = "builtin-skills";
+/// Single source of truth lives in `phoenix-core` so the deployment-info disk
+/// row and the extraction target can never drift.
+pub const EXTRACT_SUBDIR: &str = phoenix_core::runtime_env::BUILTIN_SKILLS_SUBDIR;
 
 /// Default extraction target: `<HOME>/.phoenix-ide/builtin-skills/`.
 /// Returns `None` if `$HOME` is unset.

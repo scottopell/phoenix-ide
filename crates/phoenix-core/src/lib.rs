@@ -10,6 +10,7 @@ pub mod git;
 pub mod llm_language;
 pub mod llm_service;
 pub mod platform;
+pub mod runtime_env;
 pub mod task_handoff;
 pub mod task_source;
 pub mod work_scope;
