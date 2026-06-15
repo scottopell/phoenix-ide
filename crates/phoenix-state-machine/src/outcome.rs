@@ -7,7 +7,7 @@
 //! cannot send an `LlmOutcome`. The executor wraps received outcomes in
 //! `EffectOutcome` before passing to `handle_outcome()`.
 
-use crate::state::{SubAgentOutcome, ToolCall};
+use crate::state::ToolCall;
 use phoenix_core::domain::db_schema::ToolResult;
 use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 use phoenix_core::domain::quota_details::QuotaDetails;
@@ -71,9 +71,6 @@ pub enum LlmOutcome {
     },
     /// Request rejected (400, content filter, etc.) — non-retryable
     RequestRejected { message: String },
-    /// Request was cancelled (abort signal received)
-    #[allow(dead_code)] // Used when LLM abort is migrated to typed channels
-    Cancelled,
 }
 
 // ============================================================================
@@ -101,48 +98,6 @@ pub enum ToolExecOutcome {
 pub enum AbortReason {
     /// User explicitly cancelled
     CancellationRequested,
-    /// Execution time exceeded limit
-    #[allow(dead_code)] // Will be used when timeout support is added
-    Timeout,
-    /// Parent conversation was cancelled
-    #[allow(dead_code)] // Will be used when sub-agent cancellation uses typed channels
-    ParentCancelled,
-}
-
-// ============================================================================
-// Persist Outcome — returned by executor persistence task via oneshot channel
-// ============================================================================
-
-/// Outcome of a persistence operation, sent through a typed oneshot channel.
-#[derive(Debug)]
-#[allow(dead_code)] // Defined for architectural completeness; executor migrates incrementally
-pub enum PersistOutcome {
-    /// Persistence succeeded
-    Ok,
-    /// Persistence failed
-    Failed { error: String },
-}
-
-// ============================================================================
-// SpawnAgents Outcome — returned by executor spawn task
-// ============================================================================
-
-/// Outcome of a `spawn_agents` tool execution. This is handled synchronously
-/// in the executor (not via oneshot), but the type constrains what can be produced.
-#[derive(Debug)]
-#[allow(dead_code)] // Defined for architectural completeness; spawn_agents still synchronous
-pub enum SpawnOutcome {
-    /// Agents were spawned successfully, tool result and pending agents returned
-    Spawned {
-        tool_use_id: String,
-        result: ToolResult,
-        spawned: Vec<crate::state::PendingSubAgent>,
-    },
-    /// Spawning failed (returns error as a `ToolResult`)
-    Failed {
-        tool_use_id: String,
-        result: ToolResult,
-    },
 }
 
 // ============================================================================
@@ -157,15 +112,6 @@ pub enum EffectOutcome {
     Llm(LlmOutcome),
     /// Tool execution completed
     Tool(ToolExecOutcome),
-    /// Sub-agent completed (arrives via event channel, wrapped here for `handle_outcome`)
-    #[allow(dead_code)] // Sub-agent results still flow through event channel for now
-    SubAgent {
-        agent_id: String,
-        outcome: SubAgentOutcome,
-    },
-    /// Persistence completed
-    #[allow(dead_code)] // Persistence effects are still synchronous for now
-    Persist(PersistOutcome),
     /// Retry timer fired
     RetryTimeout { attempt: u32 },
 }
