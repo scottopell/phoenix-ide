@@ -12,6 +12,7 @@
 use super::AppState;
 use axum::{
     extract::{ConnectInfo, State},
+    http::HeaderMap,
     response::IntoResponse,
     Json,
 };
@@ -185,6 +186,7 @@ pub struct LogInfo {
 pub async fn deployment_info(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let cfg = &state.deployment;
 
@@ -218,7 +220,7 @@ pub async fn deployment_info(
         resources,
         disk,
         log: cfg.log.clone(),
-        local_access: super::local_reveal::peer_is_local(peer.ip()),
+        local_access: super::local_reveal::client_is_local(peer.ip(), &headers),
         sampled_at: Utc::now(),
     })
 }

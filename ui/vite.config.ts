@@ -46,6 +46,11 @@ export default defineConfig({
         changeOrigin: true,
         secure: proxySecure,
         ws: true, // proxy WebSocket upgrades (needed for terminal endpoint)
+        // Forward the real client so the backend's same-host check
+        // (DeploymentInfo.local_access / reveal) sees the browser's address, not
+        // this loopback proxy — otherwise a remote dev-mode browser would look
+        // local. See crates/phoenix-ide/src/api/local_reveal.rs.
+        xfwd: true,
       },
       '/preview': {
         target: apiTarget,

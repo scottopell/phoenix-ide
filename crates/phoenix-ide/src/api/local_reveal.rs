@@ -16,7 +16,7 @@
 
 use super::handlers::AppError;
 use axum::extract::ConnectInfo;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
@@ -28,17 +28,53 @@ pub struct RevealRequest {
     pub path: String,
 }
 
-/// Whether a connection from `peer` originated on this same host.
+/// Whether the requesting client is on the server host.
 ///
-/// True for loopback, and for any address that matches one of this machine's
-/// own network interfaces: when a host connects to its own LAN address (e.g. a
-/// browser opening `https://my-host.local:8031` on the machine that serves it),
-/// the server observes its *own* interface address as the peer. A genuinely
-/// remote host presents a different source address and is rejected. The peer is
-/// the completed-handshake TCP source, so it cannot be spoofed to the server's
-/// own address from another machine.
-pub fn peer_is_local(peer: IpAddr) -> bool {
-    peer.is_loopback() || host_addresses().into_iter().any(|ip| ip == peer)
+/// The connection peer is the primary signal: loopback, or an address matching
+/// one of this machine's own interfaces (a host reaching the server by its LAN
+/// name — `https://my-host.local:8031` — sees the server observe its *own*
+/// interface address as the peer). A genuinely remote host presents a different
+/// source address.
+///
+/// A *loopback* peer is ambiguous: it is either genuine localhost, or a
+/// same-host proxy forwarding for someone else (the Vite dev proxy forwards
+/// `/api` to Phoenix on `127.0.0.1`; a same-host reverse proxy does likewise).
+/// So when the peer is loopback and an `X-Forwarded-For` header is present, the
+/// original client is the first entry and locality is decided from *it*. This is
+/// not spoofable from off-host: reaching this branch requires a loopback peer,
+/// which a remote attacker connecting directly cannot present — their forged
+/// `X-Forwarded-For` is ignored because their peer is non-loopback. A loopback
+/// peer with no `X-Forwarded-For` is treated as genuine localhost.
+pub fn client_is_local(peer: IpAddr, headers: &HeaderMap) -> bool {
+    if peer.is_loopback() {
+        match forwarded_client(headers) {
+            Some(client) => return ip_is_local(client),
+            // Forwarded-for present but unparseable: a proxy hop we cannot
+            // resolve — refuse rather than assume local.
+            None if headers.contains_key("x-forwarded-for") => return false,
+            None => return true,
+        }
+    }
+    ip_is_local(peer)
+}
+
+/// The original client address from `X-Forwarded-For` (its first entry), or None
+/// when the header is absent or its leading entry does not parse as an IP.
+fn forwarded_client(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get("x-forwarded-for")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Whether `ip` belongs to this host: loopback or one of its interface addresses.
+fn ip_is_local(ip: IpAddr) -> bool {
+    ip.is_loopback() || host_addresses().into_iter().any(|own| own == ip)
 }
 
 /// This machine's interface addresses. Enumerated per call rather than cached:
@@ -59,9 +95,10 @@ fn host_addresses() -> Vec<IpAddr> {
 /// host's file manager. Refuses non-local callers (403).
 pub async fn reveal_path(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<RevealRequest>,
 ) -> Result<StatusCode, AppError> {
-    if !peer_is_local(peer.ip()) {
+    if !client_is_local(peer.ip(), &headers) {
         return Err(AppError::Forbidden(
             "reveal is available only to a browser running on the server host".to_string(),
         ));
@@ -122,10 +159,22 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    const REMOTE: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)); // TEST-NET-2
+
+    fn xff(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", value.parse().unwrap());
+        h
+    }
+
     #[test]
-    fn loopback_is_local() {
-        assert!(peer_is_local(IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert!(peer_is_local(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+    fn loopback_without_forwarded_for_is_local() {
+        let none = HeaderMap::new();
+        assert!(client_is_local(IpAddr::V4(Ipv4Addr::LOCALHOST), &none));
+        assert!(client_is_local(
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            &none
+        ));
     }
 
     #[test]
@@ -136,13 +185,49 @@ mod tests {
         let Some(own) = host_addresses().into_iter().find(|ip| !ip.is_loopback()) else {
             return;
         };
-        assert!(peer_is_local(own));
+        assert!(client_is_local(own, &HeaderMap::new()));
     }
 
     #[test]
-    fn documentation_example_remote_address_is_not_local() {
-        // A TEST-NET-2 address (RFC 5737) will not be a real interface here.
-        let remote = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
-        assert!(!peer_is_local(remote));
+    fn remote_peer_is_not_local() {
+        assert!(!client_is_local(REMOTE, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn proxied_remote_client_is_not_local() {
+        // A loopback peer (our dev/reverse proxy) forwarding a remote client must
+        // not be treated as local — this is the Vite-proxy bypass case.
+        assert!(!client_is_local(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &xff("198.51.100.7")
+        ));
+        assert!(!client_is_local(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &xff("198.51.100.7, 127.0.0.1")
+        ));
+    }
+
+    #[test]
+    fn proxied_local_client_is_local() {
+        // The proxy forwarding for genuine localhost stays local.
+        assert!(client_is_local(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &xff("127.0.0.1")
+        ));
+    }
+
+    #[test]
+    fn remote_peer_cannot_spoof_via_forwarded_for() {
+        // A direct remote connection (non-loopback peer) never consults XFF, so a
+        // forged header does not grant local access.
+        assert!(!client_is_local(REMOTE, &xff("127.0.0.1")));
+    }
+
+    #[test]
+    fn loopback_peer_with_unparseable_forwarded_for_is_rejected() {
+        assert!(!client_is_local(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            &xff("not-an-ip")
+        ));
     }
 }
