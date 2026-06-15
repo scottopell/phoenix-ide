@@ -624,6 +624,74 @@ def _list_dev_processes() -> list[tuple[int, str]]:
     return procs
 
 
+def _live_worktree_hashes() -> set[str] | None:
+    """Hashes of every worktree git currently tracks (the keep-set for dev DBs).
+
+    Returns None when the worktree list cannot be obtained — the caller must then
+    skip DB pruning rather than treat an empty set as "everything is orphaned".
+    """
+    try:
+        out = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=ROOT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    prefix = "worktree "
+    return {
+        hashlib.md5(line[len(prefix):].encode()).hexdigest()[:8]
+        for line in out.stdout.splitlines()
+        if line.startswith(prefix)
+    }
+
+
+def prune_orphan_dbs(verbose: bool = True, dry_run: bool = False) -> int:
+    """Delete per-worktree dev databases whose worktree no longer exists.
+
+    A dev DB is `phoenix-<hash>.db` (plus `-wal`/`-shm`/`.lock` sidecars), where
+    `<hash>` is the worktree-path hash. When a worktree is deleted without
+    `down`, `reap_orphans` reclaims its server but its DB files are left behind
+    and accumulate forever. This prunes them, keyed on the same orphan definition
+    reap uses: a hash that matches no currently-tracked worktree. Runs after the
+    process reap so a just-reaped server's DB is collected in the same pass.
+
+    Skips entirely (returns 0) when the live worktree set cannot be determined,
+    so a transient `git` failure never deletes a live worktree's database.
+    """
+    live = _live_worktree_hashes()
+    if live is None:
+        if verbose:
+            print("  Skipping DB prune: could not list worktrees.")
+        return 0
+
+    verb = "Would prune" if dry_run else "Pruned"
+    pruned = 0
+    freed = 0
+    db_re = re.compile(r"^phoenix-([0-9a-f]{8})\.db$")
+    for db in sorted(DB_DIR.glob("phoenix-*.db")):
+        m = db_re.match(db.name)
+        if not m or m.group(1) in live:
+            continue
+        h = m.group(1)
+        sidecars = sorted(DB_DIR.glob(f"phoenix-{h}.*"))
+        size = sum(f.stat().st_size for f in sidecars if f.exists())
+        if not dry_run:
+            for f in sidecars:
+                f.unlink(missing_ok=True)
+        pruned += 1
+        freed += size
+        if verbose:
+            print(f"  {verb} orphaned dev DB phoenix-{h} ({size / 1e6:.1f} MB)")
+    if pruned and not verbose:
+        print(f"{verb} {pruned} orphaned dev database(s), {freed / 1e6:.1f} MB.")
+    return pruned
+
+
 def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
     """Kill dev servers orphaned when their worktree was deleted without `down`.
 
@@ -688,8 +756,12 @@ def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
         if verbose:
             print(f"  {verb} orphan (PID {pid}) — cwd {cwd}")
 
-    if verbose and reaped == 0:
-        print("No orphaned dev servers found.")
+    # Reclaim DB files of deleted worktrees. Runs after the process reap so a
+    # server just killed above has its DB collected in the same pass.
+    pruned = prune_orphan_dbs(verbose=verbose, dry_run=dry_run)
+
+    if verbose and reaped == 0 and pruned == 0:
+        print("No orphaned dev servers or databases found.")
     return reaped
 
 
