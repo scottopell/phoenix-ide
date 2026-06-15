@@ -673,9 +673,30 @@ export function TerminalPanel({
     wsRef.current = ws;
     setStatus('Connecting…');
 
+    // Outbound input buffer. xterm hands us a keystroke the instant it's
+    // typed, which can be before the WebSocket finishes its handshake
+    // (readyState CONNECTING) — e.g. typing into a freshly-opened terminal
+    // while the connection is still being established. Sending only when
+    // OPEN silently dropped those bytes; instead we queue them here and
+    // flush in order on open. A keystroke xterm accepted is therefore
+    // always either in flight or queued — never discarded.
+    let pendingInput: Uint8Array[] = [];
+    const flushPendingInput = () => {
+      if (pendingInput.length === 0) return;
+      const queued = pendingInput;
+      pendingInput = [];
+      for (const payload of queued) {
+        ws.send(dataFrame(payload));
+      }
+    };
+
     ws.onopen = () => {
       const { cols, rows } = term;
+      // Resize frame first: the server's initial handshake reads frames
+      // until the first resize and the PTY is sized from it. Flushing
+      // buffered input only after the resize keeps that ordering intact.
       ws.send(resizeFrame(cols, rows));
+      flushPendingInput();
       setStatus('');
       setActivity('idle');
     };
@@ -737,9 +758,20 @@ export function TerminalPanel({
     };
 
     const disposeOnData = term.onData((text) => {
+      const encoded = new TextEncoder().encode(text);
       if (ws.readyState === WebSocket.OPEN) {
-        const encoded = new TextEncoder().encode(text);
         ws.send(dataFrame(encoded));
+      } else {
+        // Not OPEN yet (CONNECTING) or no longer OPEN (CLOSING/CLOSED).
+        // Queue rather than drop; onopen flushes. CONNECTING bytes reach
+        // the shell once the handshake completes; CLOSING/CLOSED bytes are
+        // released when this WS and its closures are torn down. The debug
+        // log makes a would-be-dropped keystroke visible (capability gaps
+        // are logged, not silenced) so a recurrence is diagnosable.
+        pendingInput.push(encoded);
+        console.debug(
+          `[terminal] buffered ${encoded.length}B of input; ws.readyState=${ws.readyState} (not OPEN)`,
+        );
       }
     });
 
