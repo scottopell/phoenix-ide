@@ -92,8 +92,6 @@ tracing-appender = "0.2"
 base64 = "0.22"
 sha2 = "0.11"
 rand = "0.10"
-similar = "3"  # For generating diffs
-
 # Process management
 # Process management and PTY
 nix = { version = "0.31", features = ["signal", "process", "term", "fs"] }
@@ -109,29 +107,16 @@ ignore = "0.4"
 # skill discovery (resolution_root); also used across tests.
 tempfile = "3"
 
-# Glob matching for search tool's include/exclude params
-globset = "0.4"
-
-# Regex for search tool
-regex = "1"
-
 # Markdown event-stream parser. Used to mask code regions during inline-
 # reference tokenization so `@`/`/` sigils inside fenced/inline/indented
 # code blocks don't get expanded as file or skill references.
 pulldown-cmark = { version = "0.13", default-features = false }
 
-# Browser automation
-chromiumoxide = { version = "0.9", default-features = false, features = ["fetcher", "rustls", "zip0"] }
-brush-parser = "0.4"
 taskmd-core = ">=1.1,<2"
 listenfd = "1.0.2"
 nucleo-matcher = "0.3.1"
 
-unicode-security = "0.1.2"
-
 # Locating tmux on PATH at registry init (specs/tmux-integration/REQ-TMUX-003).
-# Aligned with the `which 8` already pulled in transitively via chromiumoxide
-# to avoid duplicate-major-version build cost.
 which = "8"
 
 # Rust -> TypeScript type codegen for the SSE wire format.
