@@ -3707,7 +3707,10 @@ async fn list_directory(
 }
 
 /// Create a directory (with parents if needed)
-async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
+async fn mkdir(
+    State(state): State<AppState>,
+    Json(payload): Json<PathQuery>,
+) -> Json<MkdirResponse> {
     // Normalize path: remove trailing slashes (except for root)
     let path_str = payload.path.trim_end_matches('/');
     let path_str = if path_str.is_empty() { "/" } else { path_str };
@@ -3722,11 +3725,9 @@ async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
     }
 
     // Don't allow creating directories outside of user's home or /tmp
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
+    let home = state.runtime_env.home().to_string_lossy();
     let path_str = path.to_string_lossy();
-    if (home.is_empty() || !path_str.starts_with(&home)) && !path_str.starts_with("/tmp/") {
+    if (home.is_empty() || !path_str.starts_with(home.as_ref())) && !path_str.starts_with("/tmp/") {
         return Json(MkdirResponse {
             created: false,
             error: Some(format!(
@@ -3913,16 +3914,14 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
         .filter_map(|root| fs::canonicalize(root).ok())
         .collect();
 
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        let home = PathBuf::from(home);
-        for skill_root in [
-            home.join(".claude").join("skills"),
-            home.join(".agents").join("skills"),
-            home.join(".phoenix-ide").join("builtin-skills"),
-        ] {
-            if let Ok(dir) = fs::canonicalize(skill_root) {
-                roots.push(dir);
-            }
+    let home = state.runtime_env.home();
+    for skill_root in [
+        home.join(".claude").join("skills"),
+        home.join(".agents").join("skills"),
+        state.runtime_env.builtin_skills_dir(),
+    ] {
+        if let Ok(dir) = fs::canonicalize(skill_root) {
+            roots.push(dir);
         }
     }
 
@@ -4844,10 +4843,8 @@ async fn invalidate_credential(State(state): State<AppState>) -> impl IntoRespon
 // Environment Info
 // ============================================================
 
-async fn get_env() -> Json<serde_json::Value> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
+async fn get_env(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let home = state.runtime_env.home().to_string_lossy().into_owned();
     Json(serde_json::json!({ "home_dir": home }))
 }
 
