@@ -15,6 +15,12 @@ be bloated, shallow, or off-voice. This skill judges the things a grep can't.
 *flags and proposes*, and a human decides. Apply a fix only when the user
 approves it or it's a trivial, unambiguous follow-through.
 
+On the two principles that straddle both loops (1 grounding, 7 state coverage),
+you own the **judgment** slice — is a new page's claims grounded and specific
+enough (1), and did a surface *deserve* full coverage (7)? `phoenix-guide-sync`
+owns the regression slice (existing quotes still match, a documented control
+grew a new state). Don't re-file its mechanizable checks here.
+
 ## The bar
 
 Everything is measured against `docs/guide/AUTHORING.md` **§ The North Star**:

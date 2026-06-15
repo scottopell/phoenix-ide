@@ -192,6 +192,21 @@ conflated:
   and reference hold, does it teach. This is the judgment a tool can flag but not
   settle.
 
+### Two principles straddle the loops
+
+Principle 1 (grounding) and Principle 7 (state coverage) each split across both
+loops — deliberately:
+
+- **Principle 1** — *sync* re-checks that already-quoted labels still match their
+  component (a regression check); *review* judges whether a new page's claims are
+  grounded and specific enough. The grounding *act* itself is the author's
+  (pre-flight 1).
+- **Principle 7** — *sync* flags a *documented* control that grew a new state
+  (regression); *review* judges whether a surface deserved full coverage at all.
+
+Rule of thumb: **sync answers "did a fact change?"; review answers "was this good
+enough?"** Neither skill decides the other's question.
+
 ---
 
 ## Frontmatter schema
@@ -235,6 +250,8 @@ default.
 9. **State coverage (Principle 7).** Conditional controls enumerated or linked to
    a state table; no terminal/blocked/error branch silently dropped.
 
-The `phoenix-guide-sync` skill audits the mechanizable parts (2–7, plus line
-budget and the topology check). Steps **1, 8, and 9** are judgment calls no tool
-settles — they're yours, and the `phoenix-guide-review` skill flags candidates.
+The `phoenix-guide-sync` skill audits the mechanizable checks: 2–7, the line
+budget and topology, and the **regression** slice of step 9 (a *documented*
+control that quietly grew a new state). The **judgment** slices — grounding new
+claims (1), economy (8), and whether a surface *deserved* full coverage (9) — are
+yours; `phoenix-guide-review` flags candidates. See [The two loops](#the-two-loops).

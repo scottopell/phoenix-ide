@@ -15,7 +15,10 @@ lands.
 This is the **"is it still *true*?"** loop. The sibling
 [`phoenix-guide-review`](../phoenix-guide-review/SKILL.md) skill is the
 **"is it still *good*?"** loop — don't conflate them; subjective quality
-findings belong there, not here.
+findings belong there, not here. On the two principles that straddle both loops
+(1 grounding, 7 state coverage), you own the **regression** slice — re-verify
+existing quotes, flag a documented control that grew a new state — never the
+"was it grounded/complete *enough*" judgment, which is review's.
 
 The authoring principles you enforce live in `docs/guide/AUTHORING.md` (read it
 first, especially **§ The North Star** and its pre-flight checklist). Any page
