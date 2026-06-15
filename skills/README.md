@@ -83,6 +83,7 @@ We're starting conservatively to learn how agents consume skills:
 | [phoenix-deployment](phoenix-deployment/SKILL.md) | Production deployment across native launchd (macOS), native systemd, and daemon modes |
 | [phoenix-task-tracking](phoenix-task-tracking/SKILL.md) | Task file format, CLI commands, issue discovery protocol |
 | [phoenix-release](phoenix-release/SKILL.md) | Cut a version, push the tag, replace auto-notes with a sub-agent-drafted changelog |
+| [phoenix-guide-sync](phoenix-guide-sync/SKILL.md) | Audit the user guide (`docs/guide/`) for drift against code and specs; auto-fix structural issues, propose tasks for the rest |
 
 ---
 
