@@ -134,6 +134,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_auth_sessions",
         sql: MIGRATION_024,
     },
+    Migration {
+        version: 25,
+        name: "create_message_attachment_tables",
+        sql: MIGRATION_025,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -579,6 +584,55 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 );
 ";
 
+/// Normalize user/skill message attachments out of the `messages.content` blob
+/// into child tables (`specs`-tracked task: normalize-message-attachments).
+///
+/// Child collections never belong inside a JSON-TEXT aggregate. This creates the
+/// tables and performs the one-time extraction *out of* the blob via `json_each`
+/// — the legitimate move that the "if a migration needs `json_extract`, the
+/// field wanted to be a row" rule points at. `ordinal` preserves array order;
+/// `message_files` covers user+skill rows, `message_images` covers user rows
+/// (`SkillContent` has no images). Stripping the now-redundant keys from the
+/// blob and cutting the read/write paths over to these tables lands with the
+/// code change that makes them authoritative.
+const MIGRATION_025: &str = r"
+CREATE TABLE IF NOT EXISTS message_files (
+    message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (message_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS message_images (
+    message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (message_id, ordinal)
+);
+
+INSERT INTO message_files (message_id, ordinal, original_name, media_type, size_bytes, stored_path)
+SELECT m.message_id, f.key,
+       json_extract(f.value, '$.original_name'),
+       json_extract(f.value, '$.media_type'),
+       json_extract(f.value, '$.size_bytes'),
+       json_extract(f.value, '$.stored_path')
+FROM messages m, json_each(m.content, '$.files') f
+WHERE m.message_type IN ('user', 'skill')
+  AND json_type(m.content, '$.files') = 'array';
+
+INSERT INTO message_images (message_id, ordinal, media_type, data)
+SELECT m.message_id, im.key,
+       json_extract(im.value, '$.media_type'),
+       json_extract(im.value, '$.data')
+FROM messages m, json_each(m.content, '$.images') im
+WHERE m.message_type = 'user'
+  AND json_type(m.content, '$.images') = 'array';
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -706,10 +760,106 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 24);
+        assert_eq!(first, 25);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
+    }
+
+    /// Migration 025: attachments embedded in `messages.content` are extracted
+    /// into `message_files` / `message_images` preserving order (`ordinal`).
+    /// Skill rows contribute files only (no images field); the blob is left
+    /// intact at this phase (the strip lands with the read/write cutover).
+    #[tokio::test]
+    async fn migration_025_backfills_attachment_tables_from_content() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+             VALUES ('c', '{\"mode\":\"Explore\"}', '{\"type\":\"idle\"}', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // user message with two files (ordered) and one image.
+        let user_content = r#"{"text":"hi","images":[{"data":"AAA","media_type":"image/png"}],"files":[{"original_name":"a.txt","media_type":"text/plain","size_bytes":1,"stored_path":"/p/a"},{"original_name":"b.txt","media_type":"text/plain","size_bytes":2,"stored_path":"/p/b"}]}"#;
+        // skill message with one file, no images field.
+        let skill_content = r#"{"name":"build","body":"b","trigger":"/build","files":[{"original_name":"s.txt","media_type":"text/plain","size_bytes":3,"stored_path":"/p/s"}]}"#;
+        // user message with no attachments.
+        let plain_content = r#"{"text":"plain","images":[],"files":[]}"#;
+        for (id, mt, content) in [
+            ("m-user", "user", user_content),
+            ("m-skill", "skill", skill_content),
+            ("m-plain", "user", plain_content),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages (message_id, conversation_id, message_type, content) \
+                 VALUES (?1, 'c', ?2, ?3)",
+            )
+            .bind(id)
+            .bind(mt)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        // Files: two for m-user (ordered), one for m-skill, none for m-plain.
+        let files: Vec<(String, i64, String, String)> = sqlx::query(
+            "SELECT message_id, ordinal, original_name, stored_path FROM message_files \
+             ORDER BY message_id, ordinal",
+        )
+        .map(|row: sqlx::sqlite::SqliteRow| {
+            (
+                row.get::<String, _>("message_id"),
+                row.get::<i64, _>("ordinal"),
+                row.get::<String, _>("original_name"),
+                row.get::<String, _>("stored_path"),
+            )
+        })
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            files,
+            vec![
+                ("m-skill".into(), 0, "s.txt".into(), "/p/s".into()),
+                ("m-user".into(), 0, "a.txt".into(), "/p/a".into()),
+                ("m-user".into(), 1, "b.txt".into(), "/p/b".into()),
+            ]
+        );
+
+        // Images: one for m-user, none for skill/plain.
+        let images: Vec<(String, i64, String, String)> = sqlx::query(
+            "SELECT message_id, ordinal, media_type, data FROM message_images ORDER BY message_id, ordinal",
+        )
+        .map(|row: sqlx::sqlite::SqliteRow| {
+            (
+                row.get::<String, _>("message_id"),
+                row.get::<i64, _>("ordinal"),
+                row.get::<String, _>("media_type"),
+                row.get::<String, _>("data"),
+            )
+        })
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            images,
+            vec![("m-user".into(), 0, "image/png".into(), "AAA".into())]
+        );
+
+        // size_bytes round-trips as an integer.
+        let size: i64 = sqlx::query_scalar(
+            "SELECT size_bytes FROM message_files WHERE message_id = 'm-user' AND ordinal = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(size, 2);
     }
 
     #[tokio::test]

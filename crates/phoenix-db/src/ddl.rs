@@ -49,6 +49,27 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sequence_id);
 
+-- Per-message attachments, normalized out of the messages.content blob.
+-- Child collections never belong inside a JSON-TEXT aggregate: presence is row
+-- existence, shape is NOT NULL columns, order is the explicit ordinal.
+CREATE TABLE IF NOT EXISTS message_files (
+    message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (message_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS message_images (
+    message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (message_id, ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS turn_usage (
     id INTEGER PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
