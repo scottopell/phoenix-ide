@@ -77,6 +77,17 @@ Concepts stay short and define vocabulary; how-tos are numbered steps to one
 goal; reference cards are dense lookup (tables over prose). Each links across to
 the others rather than restating them.
 
+**Concept pages specifically** earn their length by building intuition fast:
+
+- **Lead with the mental model in one sentence, then a visual** — a spectrum, a
+  lifecycle diagram, or a comparison table — so the reader grasps the whole
+  space at a glance. Don't open with abstract "why it exists" prose.
+- **Hold a ~45-line budget.** Procedures, verbatim UI-label dumps, and
+  per-control walkthroughs belong in the How-to. If a concept page is teaching
+  *steps*, it has drifted into the wrong layer.
+- **Close with one "Remember" callout** — the single structural guarantee or
+  invariant to retain after closing the page.
+
 ## Principle 4 — Density, named controls *(macOS Help × Bloomberg)*
 
 Match Phoenix's own UI philosophy: information density, not minimalism.
