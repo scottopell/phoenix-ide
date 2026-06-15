@@ -596,7 +596,7 @@ where
             tmux_registry,
             llm_registry,
             terminals,
-            deny_gate: crate::runtime::deny_gate::DenyGate::layer0_only(),
+            deny_gate: crate::runtime::deny_gate::DenyGate::from_env(),
             event_rx,
             event_tx,
             broadcast_tx,
