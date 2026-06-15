@@ -78,8 +78,9 @@ THE SYSTEM SHALL display an error message and remain on the login page
 
 **Rationale:** The cookie carries a session token rather than the password,
 and persists across page refreshes so the user enters the password once per
-browser session, not on every page load. Tokens are cleared on restart;
-browsers re-login transparently.
+browser session, not on every page load. Tokens are persisted server-side
+and survive a restart, so a redeploy does not invalidate logged-in browsers;
+each token is valid until its expiry (matching the cookie lifetime).
 
 ---
 

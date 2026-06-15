@@ -129,6 +129,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_mcp_oauth_registration_redirect_uri",
         sql: MIGRATION_023,
     },
+    Migration {
+        version: 24,
+        name: "create_auth_sessions",
+        sql: MIGRATION_024,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -553,6 +558,20 @@ const MIGRATION_023: &str = r"
 ALTER TABLE mcp_oauth_registrations ADD COLUMN redirect_uri TEXT;
 ";
 
+/// Persist browser session tokens so they survive a server restart. Before this
+/// table the valid-token set lived only in process memory, so every redeploy
+/// silently invalidated every logged-in browser even though the `phoenix-auth`
+/// cookie itself is durable. The token is opaque and random, so the primary-key
+/// index is the only lookup path needed; `expires_at` makes the cookie's
+/// advertised lifetime authoritative and lets a sweep reclaim stale rows.
+const MIGRATION_024: &str = r"
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    token TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -680,7 +699,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 23);
+        assert_eq!(first, 24);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

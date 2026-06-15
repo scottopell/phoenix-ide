@@ -9,14 +9,17 @@ achieve the security and sharing requirements.
 
 ### Session-Token Auth (REQ-AUTH-001, REQ-AUTH-002)
 
-A successful login mints a random opaque session token, held server-side
-in a process-lifetime `SessionStore`, and sets it in the `phoenix-auth`
-cookie; the password itself never travels in a cookie. Each request is
-authenticated by token membership. API clients that do not run the cookie
-login flow may instead present the password directly via
+A successful login mints a random opaque session token, persisted
+server-side in the `auth_sessions` table (token, created_at, expires_at)
+via `SessionStore`, and sets it in the `phoenix-auth` cookie; the password
+itself never travels in a cookie. Each request is authenticated by token
+membership (an unexpired row in `auth_sessions`). API clients that do not
+run the cookie login flow may instead present the password directly via
 `Authorization: Bearer <password>`. The password is compared with a
 constant-time check (at login and on Bearer requests) to prevent timing
-attacks. Tokens are cleared on restart -- browsers re-login transparently.
+attacks. Tokens survive a server restart, so a redeploy does not log
+browsers out; a token is valid until its `expires_at` (matching the
+cookie's `Max-Age`), after which it is rejected and swept.
 
 When `PHOENIX_PASSWORD` is unset, the auth middleware is a no-op. No
 conditional compilation, no feature flags -- the middleware checks the env

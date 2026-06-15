@@ -44,8 +44,9 @@ external entity Peer {
 -- Entities
 ------------------------------------------------------------
 
--- A session token minted at login and held server-side for the lifetime
--- of the process. A request bearing this token in its cookie is the Owner.
+-- A session token minted at login and persisted server-side (auth_sessions
+-- table) until its expiry, so it survives a server restart. A request bearing
+-- this token in its cookie is the Owner.
 -- The password never travels in the cookie; only this opaque token does.
 entity SessionToken {
     token: String               -- random, opaque, unguessable
@@ -211,9 +212,10 @@ rule LoginSucceeds {
     @guidance
         -- POST /api/auth/login compares the submitted password against
         -- config.password with a constant-time check. On success the minted
-        -- token is added to the process-lifetime SessionStore and returned in
-        -- the Set-Cookie: phoenix-auth=<token> header. Tokens are cleared on
-        -- restart, so browsers re-login transparently.
+        -- token is persisted to the auth_sessions table (with an expiry
+        -- matching the cookie Max-Age) and returned in the
+        -- Set-Cookie: phoenix-auth=<token> header. Tokens survive a restart,
+        -- so a redeploy does not log browsers out.
 }
 
 -- Failed login: the password does not match. The peer's failure counter is

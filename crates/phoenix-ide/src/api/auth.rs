@@ -7,7 +7,7 @@
 //! `Authorization: Bearer <password>`. When `PHOENIX_PASSWORD` is unset, auth is
 //! bypassed entirely (backward compatible).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,40 +26,53 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 
-/// Server-side set of valid session tokens. A successful login mints a random
-/// token, inserts it here, and hands it to the browser in the `phoenix-auth`
-/// cookie. Each subsequent request is authenticated by membership, so the
-/// password never leaves the server in a cookie and tokens are independently
-/// revocable. Tokens are process-lifetime (cleared on restart).
-#[derive(Clone, Default)]
+/// Lifetime of a minted session token. Drives both the `expires_at` persisted
+/// with the token and the `Max-Age` advertised on the `phoenix-auth` cookie, so
+/// the two can never disagree.
+const SESSION_TTL_SECS: i64 = 31_536_000; // 1 year
+
+/// Server-side store of valid session tokens, backed by the `auth_sessions`
+/// table. A successful login mints a random token, persists it here, and hands
+/// it to the browser in the `phoenix-auth` cookie. Each subsequent request is
+/// authenticated by membership, so the password never leaves the server in a
+/// cookie and tokens are independently revocable. Persistence means tokens
+/// survive a server restart — a redeploy no longer logs everyone out.
+#[derive(Clone)]
 pub struct SessionStore {
-    tokens: Arc<Mutex<HashSet<String>>>,
+    db: crate::db::Database,
 }
 
 impl SessionStore {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(db: crate::db::Database) -> Self {
+        Self { db }
     }
 
-    /// Mint a fresh 256-bit random session token and record it as valid.
-    fn mint(&self) -> String {
+    /// Mint a fresh 256-bit random session token and persist it as valid.
+    /// Opportunistically reaps expired rows so the table cannot grow unbounded.
+    async fn mint(&self) -> Result<String, crate::db::DbError> {
         let mut bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut bytes);
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-        self.tokens
-            .lock()
-            .expect("session store poisoned")
-            .insert(token.clone());
-        token
+        if let Err(e) = self.db.delete_expired_auth_sessions().await {
+            tracing::warn!(error = %e, "failed to reap expired auth sessions; continuing");
+        }
+        self.db
+            .insert_auth_session(&token, chrono::Duration::seconds(SESSION_TTL_SECS))
+            .await?;
+        Ok(token)
     }
 
-    /// Constant-time-ish membership check: a token is valid iff it was minted by
-    /// this process and not yet evicted.
-    fn is_valid(&self, token: &str) -> bool {
-        self.tokens
-            .lock()
-            .expect("session store poisoned")
-            .contains(token)
+    /// A token is valid iff it was minted previously and has not expired. A DB
+    /// error fails closed (treated as invalid) and is logged — an unreachable
+    /// store must never silently authenticate.
+    async fn is_valid(&self, token: &str) -> bool {
+        match self.db.is_auth_session_valid(token).await {
+            Ok(valid) => valid,
+            Err(e) => {
+                tracing::warn!(error = %e, "auth session lookup failed; treating token as invalid");
+                false
+            }
+        }
     }
 }
 
@@ -221,15 +234,19 @@ fn extract_cookie_value(cookie_header: &str) -> Option<&str> {
 /// throttled: it proves prior possession of the password, so a legitimate
 /// browser user must never be locked out by an attacker brute-forcing Bearer
 /// guesses from the same peer IP.
-fn cookie_is_valid(req: &Request<Body>, sessions: &SessionStore) -> bool {
-    if let Some(cookie_header) = req.headers().get(header::COOKIE) {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            if let Some(cookie_value) = extract_cookie_value(cookie_str) {
-                return sessions.is_valid(cookie_value);
-            }
-        }
+/// Takes `&HeaderMap` rather than `&Request<Body>` deliberately: `Body` is not
+/// `Sync`, so a `&Request<Body>` borrow held across the `.await` below would make
+/// the enclosing handler future non-`Send` and fail axum's `Handler` bound.
+/// `HeaderMap` is `Sync`, so a borrow of it is safe to hold across the await.
+async fn cookie_is_valid(headers: &header::HeaderMap, sessions: &SessionStore) -> bool {
+    let token = headers
+        .get(header::COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(extract_cookie_value);
+    match token {
+        Some(token) => sessions.is_valid(token).await,
+        None => false,
     }
-    false
 }
 
 /// Extract the `Authorization: Bearer <token>` value, if present and parseable.
@@ -354,7 +371,7 @@ pub async fn auth_middleware(
 
     // Session cookie wins and is never throttled — a legitimate browser must
     // not be locked out by Bearer brute-force from the same peer IP.
-    if cookie_is_valid(&req, &state.sessions) {
+    if cookie_is_valid(req.headers(), &state.sessions).await {
         return next.run(req).await;
     }
 
@@ -404,7 +421,7 @@ pub async fn auth_status(
         }),
         Some(password) => {
             // Cookie auth is authoritative and never throttled.
-            let authenticated = if cookie_is_valid(&req, &state.sessions) {
+            let authenticated = if cookie_is_valid(req.headers(), &state.sessions).await {
                 true
             } else {
                 // This endpoint is auth-exempt, so its Bearer check is an
@@ -462,7 +479,17 @@ pub async fn auth_login(
     state.login_throttle.record_success(&key);
 
     // Mint an opaque session token; the password never enters the cookie.
-    let token = state.sessions.mint();
+    let token = match state.sessions.mint().await {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to persist session token at login");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Could not create session" })),
+            )
+                .into_response();
+        }
+    };
 
     // `Secure` only when the server terminates TLS — sending it over plain HTTP
     // would make the cookie undeliverable and silently break login.
@@ -471,8 +498,9 @@ pub async fn auth_login(
     } else {
         ""
     };
-    let cookie_value =
-        format!("phoenix-auth={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{secure}");
+    let cookie_value = format!(
+        "phoenix-auth={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECS}{secure}"
+    );
 
     (
         StatusCode::OK,
@@ -533,53 +561,73 @@ mod tests {
         assert!(!is_exempt_path("/preview/some/file.html"));
     }
 
-    #[test]
-    fn session_token_is_opaque_and_never_the_password() {
-        let store = SessionStore::new();
+    async fn test_store() -> SessionStore {
+        let db = crate::db::Database::open_in_memory()
+            .await
+            .expect("in-memory db");
+        SessionStore::new(db)
+    }
+
+    #[tokio::test]
+    async fn session_token_is_opaque_and_never_the_password() {
+        let store = test_store().await;
         let password = "hunter2";
-        let token = store.mint();
+        let token = store.mint().await.unwrap();
 
         // The minted token must not be the password — the whole point of the
         // scheme is that the cookie carries an opaque credential.
         assert_ne!(token, password);
         // A minted token validates; an arbitrary string (e.g. the password) does
         // not, because only minted tokens are members of the store.
-        assert!(store.is_valid(&token));
-        assert!(!store.is_valid(password));
-        assert!(!store.is_valid("not-a-real-token"));
+        assert!(store.is_valid(&token).await);
+        assert!(!store.is_valid(password).await);
+        assert!(!store.is_valid("not-a-real-token").await);
     }
 
-    #[test]
-    fn session_tokens_are_unique_per_mint() {
-        let store = SessionStore::new();
-        let a = store.mint();
-        let b = store.mint();
+    #[tokio::test]
+    async fn session_tokens_are_unique_per_mint() {
+        let store = test_store().await;
+        let a = store.mint().await.unwrap();
+        let b = store.mint().await.unwrap();
         assert_ne!(a, b);
-        assert!(store.is_valid(&a));
-        assert!(store.is_valid(&b));
+        assert!(store.is_valid(&a).await);
+        assert!(store.is_valid(&b).await);
     }
 
-    #[test]
-    fn cookie_holding_a_valid_session_token_authenticates() {
-        let sessions = SessionStore::new();
-        let token = sessions.mint();
+    /// A token minted by one `SessionStore` validates through a second store
+    /// over the *same* database — the persistence guarantee that makes sessions
+    /// survive a process restart (a redeploy no longer logs everyone out).
+    #[tokio::test]
+    async fn session_token_survives_a_fresh_store_over_the_same_db() {
+        let db = crate::db::Database::open_in_memory()
+            .await
+            .expect("in-memory db");
+        let token = SessionStore::new(db.clone()).mint().await.unwrap();
+        // A brand-new store (as if the process restarted) sees the same token.
+        assert!(SessionStore::new(db).is_valid(&token).await);
+    }
+
+    #[tokio::test]
+    async fn cookie_holding_a_valid_session_token_authenticates() {
+        let sessions = test_store().await;
+        let token = sessions.mint().await.unwrap();
         let req = Request::builder()
             .header(header::COOKIE, format!("phoenix-auth={token}"))
             .body(Body::empty())
             .unwrap();
-        assert!(cookie_is_valid(&req, &sessions));
+        assert!(cookie_is_valid(req.headers(), &sessions).await);
     }
 
-    #[test]
-    fn cookie_holding_the_raw_password_is_rejected() {
+    #[tokio::test]
+    async fn cookie_holding_the_raw_password_is_rejected() {
         // Old scheme set the cookie to the password itself. The new scheme must
         // reject a cookie that carries the password — only session tokens count.
-        let sessions = SessionStore::new();
+        let sessions = test_store().await;
         let req = Request::builder()
             .header(header::COOKIE, "phoenix-auth=the-password")
             .body(Body::empty())
             .unwrap();
-        assert!(!cookie_is_valid(&req, &sessions));
+        assert!(!cookie_is_valid(req.headers(), &sessions).await);
     }
 
     /// A correct Bearer password authenticates an API client and, as a side
@@ -629,10 +677,10 @@ mod tests {
     /// (b) A valid session cookie authenticates regardless of throttle state:
     /// cookie auth never consults the throttle, so a locked-out peer's browser
     /// session still works.
-    #[test]
-    fn valid_cookie_authenticates_during_lockout() {
+    #[tokio::test]
+    async fn valid_cookie_authenticates_during_lockout() {
         let throttle = LoginThrottle::new();
-        let sessions = SessionStore::new();
+        let sessions = test_store().await;
         let key = "10.0.0.6";
 
         // Drive the peer into lockout via Bearer guesses.
@@ -643,12 +691,12 @@ mod tests {
 
         // A valid cookie from that same peer still authenticates — cookie auth
         // is independent of the throttle.
-        let token = sessions.mint();
+        let token = sessions.mint().await.unwrap();
         let req = Request::builder()
             .header(header::COOKIE, format!("phoenix-auth={token}"))
             .body(Body::empty())
             .unwrap();
-        assert!(cookie_is_valid(&req, &sessions));
+        assert!(cookie_is_valid(req.headers(), &sessions).await);
     }
 
     /// (c) A correct Bearer *before* the threshold clears the failure counter,
