@@ -8092,12 +8092,14 @@ mod file_read_tests {
         .await
         .expect("seed conversation");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
-        let platform = PlatformCapability::None;
+        let platform = PlatformCapability::None {
+            details: "test".into(),
+        };
         let mcp_manager = Arc::new(McpClientManager::new());
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
-            platform,
+            platform.clone(),
             mcp_manager.clone(),
             None,
         ));
