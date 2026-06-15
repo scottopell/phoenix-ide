@@ -236,12 +236,18 @@ surface AgentToolGate {
         AgentEmitsToolCall(conversation_id, name, input)
 
     @guarantee NoUngatedExecution
-        -- Every tool call the agent emits is evaluated by DenyGate before any
-        -- tool executes. Tool execution accepts only a CheckedToolCall, whose
-        -- sole non-test constructor is DenyGate::check, so a call that has not
-        -- passed the gate cannot run — the guarantee is structural, not a
-        -- convention. Coverage includes live-resolved MCP tools, because the
-        -- gate sits upstream of the registry-vs-MCP split.
+        -- Every LLM tool call that reaches the runtime tool-executor boundary is
+        -- evaluated by DenyGate first. That boundary (ToolExecutor::execute)
+        -- accepts only a CheckedToolCall, whose sole non-test constructor is
+        -- DenyGate::check, so a call cannot execute through it without passing
+        -- the gate — structural, not convention. Coverage includes live-resolved
+        -- MCP tools (the gate sits upstream of the registry-vs-MCP split). The
+        -- guarantee is scoped to that boundary: the lower-level Tool::run
+        -- primitive is not itself sealed, but the registry exposes no ungated
+        -- name+input execute shortcut, so the runtime reaches run only through
+        -- the gated executor. Reducer-intercepted calls (spawn_agents,
+        -- propose_task, ask_user_question, submit_result, submit_error) never
+        -- reach this boundary and are gated by their own typed transitions.
 
     @guarantee DenyAndContinue
         -- A denial is delivered as an ordinary tool result with a reason, not a
@@ -270,17 +276,3 @@ deferred IntentAwareEnforcement
     -- the decision to thread a reasoning-blind transcript slice becomes
     -- load-bearing. Out of scope here by construction.
     -- Location: would live alongside DenyGate in the conversation runtime.
-
-------------------------------------------------------------
--- Open questions
-------------------------------------------------------------
-
--- No open questions remain. Decisions fixed for this layer:
---   - Layer 0 rules are a typed Rust registry keyed by tool name, not
---     declarative config: single-user self-hosted Phoenix does not face the
---     shared-repo self-granting threat that motivates config scoping.
---   - The decision runs executor-side (loop-local counters) while the proof is
---     required at the executor trait boundary (universal coverage); the two
---     properties hold together rather than trading off.
---   - Escalation thresholds: 3 consecutive or 20 total denials.
---   - Subagent delegation is excluded from Layer 0 as intent-relative.

@@ -6,19 +6,37 @@ The permission seam is a proof-token gate at the tool-dispatch chokepoint. It
 splits cleanly into a **decision** (evaluate the pending call) and a **proof**
 (the value that authorizes execution). The decision runs in the conversation
 runtime where loop state lives; the proof is required at the executor trait
-boundary where every tool — registry or MCP — converges.
+boundary (`ToolExecutor::execute`) where every *executed* tool call — registry
+or MCP — converges.
+
+Not every LLM tool call reaches that boundary. The state-machine reducer
+intercepts a fixed class of tool calls and handles them as typed transitions
+before any "execute this tool" effect is emitted: `spawn_agents`, `propose_task`,
+`ask_user_question`, `submit_result`, `submit_error`. These never reach
+`dispatch_tool_execution` and are a structural exception (REQ-PERM-007), each
+gated by its own typed-transition contract rather than Layer 0.
 
 ```
 LLM tool_use
+  → state-machine reducer
+      ├─ intercepted (spawn_agents / propose_task / ask_user_question /
+      │   submit_result / submit_error) → typed transition, NOT gated by Layer 0
+      └─ otherwise → Effect::ExecuteTool
   → dispatch_tool_execution            (runtime/executor.rs)   ── decision here
       DenyGate::check(name, input)
-        ├─ Deny  → count, synthesize denial outcome, forward, DO NOT spawn
+        ├─ Deny  → synthesize denial outcome, forward, DO NOT spawn
         └─ Allow → CheckedToolCall ──┐
                                      ↓ threaded into the spawned task
   → ToolExecutor::execute(CheckedToolCall, ctx)  (runtime/traits.rs) ── proof required
       ├─ registry tool.run(...)
       └─ live MCP mcp_tool.run(...)
 ```
+
+`Tool::run` and `ToolRegistry::find_tool` are lower-level primitives; the runtime
+reaches them only through the gated `ToolExecutor`. The registry exposes no
+name+input `execute` shortcut. So the guarantee is "no LLM tool call executes
+without a proof," scoped to the runtime executor boundary — not a universal seal
+of the `run` primitive (REQ-PERM-001 scope note).
 
 ## Correct-by-construction token
 
@@ -40,7 +58,8 @@ impl DenyGate {
 }
 ```
 
-Three properties make an ungated call unrepresentable:
+Three properties make an ungated call through the executor boundary
+unrepresentable:
 
 1. `CheckedToolCall` has **private fields and no public constructor**. The sole
    non-test mint is `DenyGate::check`. A `#[cfg(test)]` constructor exists for
@@ -53,7 +72,14 @@ Three properties make an ungated call unrepresentable:
    payload. A proof minted for tool A cannot be replayed to run tool B.
 
 This is parse-don't-validate: `DenyGate::check` is the parser that turns a raw
-`(name, input)` into the only type the executor will run.
+`(name, input)` into the only type `ToolExecutor::execute` will run.
+
+The guarantee is scoped to that boundary (REQ-PERM-001 scope note): it is the
+sole path the conversation runtime uses to execute an LLM tool call. The
+underlying `Tool::run` primitive is not itself sealed — the registry deliberately
+exposes no name+input `execute` shortcut, so the runtime cannot reach `run`
+except through the gated executor, but a future caller of the `run` primitive
+would sit outside this guarantee and is the thing the scope note flags.
 
 ## Placement: decision vs proof
 
@@ -104,11 +130,18 @@ autonomy posture: the consecutive trigger catches a model stuck retrying variant
 of a blocked action; the total trigger catches slow accumulation across a long
 session.
 
-## Subagent delegation
+## Reducer-intercepted tool calls
 
-The subagent-delegation path is special-cased ahead of the gate and does not pass
-through Layer 0 (REQ-PERM-007). Delegation authorization is an intent-relative
-judgment reserved for the intent-aware layer; Layer 0 stays purely intrinsic.
+A fixed class of tool calls never reaches the gate because the state-machine
+reducer handles them as typed transitions before any execute effect is emitted:
+`spawn_agents`, `propose_task`, `ask_user_question`, `submit_result`,
+`submit_error` (REQ-PERM-007). `spawn_agents` is additionally special-cased ahead
+of the gate in `dispatch_tool_execution`; the rest are intercepted upstream in
+the reducer. Each is gated by its own typed-transition contract — the reducer
+validates the proposal / question / submission against the relevant state — not
+by Layer 0, whose intrinsic-danger question does not apply to a typed transition.
+Delegation is additionally intent-relative (a Tier B judgment), a second reason
+it sits outside intent-agnostic Layer 0.
 
 ## Design Decisions
 
@@ -129,9 +162,12 @@ judgment reserved for the intent-aware layer; Layer 0 stays purely intrinsic.
 
 ## Failure Modes
 
-- **A new dispatch path reaches a tool ungated.** Prevented by construction:
-  execution consumes `CheckedToolCall`, the only mint is `DenyGate::check`. A new
-  caller cannot compile without going through the gate.
+- **A new caller invokes `ToolExecutor::execute` ungated.** Prevented by
+  construction: it consumes `CheckedToolCall`, whose only mint is
+  `DenyGate::check`, so the caller cannot compile without going through the gate.
+  (A caller of the lower-level `Tool::run` primitive sits outside this guarantee —
+  see the REQ-PERM-001 scope note; the registry exposes no ungated `execute`
+  shortcut, so the runtime has no such path today.)
 - **Proof/payload desync.** Prevented: the proof carries the payload; execution
   acts on the carried value.
 - **Denial loop.** Bounded by the escalation thresholds (REQ-PERM-006).

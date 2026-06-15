@@ -118,6 +118,14 @@ AST-based `brush_parser` matching and the `command_safety_rejected` error id /
   out. REQ-PERM-006 in `specs/permissions/` is the contract; until phase 2 the
   executive status table shows it Planned.
 
+### F1 hardening (review follow-up)
+- Phase 1 removed the dead `phoenix_tools::ToolRegistry::execute` raw name+input
+  shortcut so the runtime reaches `Tool::run` only via the gated `ToolExecutor`.
+- The `Tool::run` primitive itself is still callable in principle (it is a public
+  trait method). Fully sealing it behind the proof (so no caller can reach `run`
+  without a `CheckedToolCall`) is possible future hardening; the spec scopes the
+  guarantee to the executor boundary rather than overclaiming a universal seal.
+
 ### Phase 3 — wire-type unification (DEFERRED, cleanup)
 - Phase 1 keeps `BashErrorResponse::CommandSafetyRejected` as the documented
   wire contract (now unconstructed in Rust; the gate's `Denial::into_tool_output`

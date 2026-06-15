@@ -14,27 +14,32 @@ a permitted path. Subagent delegation is deliberately excluded as intent-relativ
 The seam is a parse-don't-validate proof token. `DenyGate::check(name, input)`
 returns either a `Denial` or a `CheckedToolCall` whose sole non-test constructor
 it is. `ToolExecutor::execute` consumes the proof, so registry and live-MCP tool
-execution alike are unreachable without it — an ungated call does not compile.
-The decision runs synchronously in `dispatch_tool_execution` (executor-side,
-before the tool task spawns) so denial counters stay loop-local; the proof is
-required at the executor trait boundary so coverage is universal. Layer 0 seeds
-with the three existing bash rules (blind `git add`, force push, dangerous `rm`),
-behaviour and `command_safety_rejected` wire shape unchanged, relocated from
-inside the bash tool.
+execution alike are unreachable through that boundary without it — an ungated
+call does not compile. The guarantee is scoped to the runtime executor boundary
+(the only path the runtime uses to execute an LLM tool call); the lower-level
+`Tool::run` primitive is not sealed, but the registry exposes no ungated
+`execute` shortcut. The decision runs synchronously in `dispatch_tool_execution`
+(executor-side, before the tool task spawns) so future denial counters stay
+loop-local. A fixed class of reducer-intercepted calls (`spawn_agents`,
+`propose_task`, `ask_user_question`, `submit_result`, `submit_error`) never reach
+the gate and is gated by typed transitions instead. Layer 0 seeds with the three
+existing bash rules (blind `git add`, force push, dangerous `rm`), behaviour and
+`command_safety_rejected` wire shape unchanged, relocated from inside the bash
+tool.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-PERM-001:** Single enforced seam | ⬜ Planned | `CheckedToolCall` sole mint = `DenyGate::check` |
-| **REQ-PERM-002:** Proof carries payload | ⬜ Planned | Parse-don't-validate; no proof/payload desync |
-| **REQ-PERM-003:** MCP coverage | ⬜ Planned | Gate upstream of registry/MCP split |
-| **REQ-PERM-004:** Layer 0 deterministic deny | ⬜ Planned | Relocate 3 bash rules to typed registry |
-| **REQ-PERM-005:** Denials as tool results | ⬜ Planned | Deny-and-continue via existing outcome channel |
-| **REQ-PERM-006:** Counting + escalation | ⬜ Planned | 3 consecutive OR 20 total → human |
-| **REQ-PERM-007:** Delegation out of Layer 0 | ⬜ Planned | `spawn_agents` special-cased above gate |
+| **REQ-PERM-001:** Single enforced seam | ✅ Delivered | `CheckedToolCall` sole mint = `DenyGate::check`; consumed by `ToolExecutor::execute`. Scoped to the executor boundary; raw `ToolRegistry::execute` shortcut removed |
+| **REQ-PERM-002:** Proof carries payload | ✅ Delivered | Parse-don't-validate; proof holds the validated `(name, input)` |
+| **REQ-PERM-003:** MCP coverage | ✅ Delivered | Gate runs upstream of the registry/MCP split in `dispatch_tool_execution` |
+| **REQ-PERM-004:** Layer 0 deterministic deny | ✅ Delivered | 3 bash rules relocated to the gate (`bash_check` AST walk) |
+| **REQ-PERM-005:** Denials as tool results | ✅ Delivered | Deny-and-continue via the existing outcome channel |
+| **REQ-PERM-006:** Counting + escalation | ⬜ Planned (phase 2) | 3 consecutive OR 20 total → human; needs a net-new state-machine halt state |
+| **REQ-PERM-007:** Reducer-intercepted exception | ✅ Delivered | `spawn_agents` / `propose_task` / `ask_user_question` / `submit_result` / `submit_error` handled as typed transitions, never reach the gate |
 
-**Progress:** 0 of 7 implemented (specification stage).
+**Progress:** 6 of 7 delivered; REQ-PERM-006 (counting + escalation) is phase 2.
 
 ## Scope Boundaries
 

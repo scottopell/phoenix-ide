@@ -29,17 +29,27 @@ convention.
 
 ### REQ-PERM-001: Single enforced seam
 
-WHEN a tool call is dispatched for execution
+WHEN a tool call is dispatched for execution through the conversation runtime
 THE SYSTEM SHALL evaluate it through DenyGate before the tool executes
-AND SHALL make tool execution reachable only with a CheckedToolCall proof.
+AND SHALL make execution via the runtime tool-executor boundary
+(`ToolExecutor::execute`) reachable only with a CheckedToolCall proof.
 
 THE SYSTEM SHALL provide exactly one non-test constructor of CheckedToolCall:
 `DenyGate::check`.
 
 **Rationale:** A check that is a function you must remember to call can be
 bypassed by a new dispatch path. Making the proof token the only accepted input
-to execution converts "forgot to gate" from a review-time catch into a
-compile-time error.
+to `ToolExecutor::execute` converts "forgot to gate" from a review-time catch
+into a compile-time error.
+
+**Scope of the guarantee.** The proof binds the *runtime tool-executor boundary*
+— the only path by which the conversation runtime executes an LLM-issued tool
+call. `Tool::run` and `ToolRegistry::find_tool` are lower-level primitives the
+runtime reaches solely through the gated `ToolExecutor`; the registry exposes no
+name+input `execute` helper that would offer an ungated shortcut. The guarantee
+is therefore "no LLM tool call executes without a proof," not "the `Tool::run`
+primitive is universally sealed." Hardening the primitives further (e.g. making
+`run` reachable only via a proof) is possible but out of scope for Layer 0.
 
 ### REQ-PERM-002: Proof carries the validated payload
 
@@ -111,13 +121,28 @@ THE SYSTEM SHALL stop driving the model and surface the condition to the human.
 escalate rather than loop. The consecutive trigger catches a stuck model; the
 total trigger catches slow grinding across a long session.
 
-### REQ-PERM-007: Subagent delegation is out of Layer 0
+### REQ-PERM-007: Reducer-intercepted tool calls are a structural exception
 
-THE SYSTEM SHALL NOT route the subagent-delegation path through Layer 0.
+Some LLM tool calls are intercepted by the conversation state-machine reducer
+and handled as typed state transitions, never becoming an "execute this tool"
+effect and so never reaching the runtime tool-executor boundary the seam gates.
+This class is: subagent delegation (`spawn_agents`), task proposal
+(`propose_task`), user questioning (`ask_user_question`), and subagent terminal
+submission (`submit_result` / `submit_error`).
 
-**Rationale:** Whether a delegated task is authorized is an intent-relative
-judgment (Tier B), not an intrinsic-danger judgment. Layer 0 is intent-agnostic
-by definition; folding delegation into it would conflate the two problems.
+THE SYSTEM SHALL treat these as a structural exception to REQ-PERM-001 — they are
+not gate-cleared by Layer 0 — AND each SHALL carry its own enforcement contract
+in the spec that owns it (the reducer validates the typed transition; e.g.
+`propose_task` is validated against the task file, subagent submission against
+sub-agent state).
+
+**Rationale:** These calls do not invoke a tool's `run` to take an arbitrary
+action; they drive a specific, typed transition the reducer already validates.
+Layer 0's question — "is this action intrinsically dangerous?" — does not apply.
+A future permission layer must not assume the seam covers them; their gate is the
+typed transition, not Layer 0. (Delegation specifically is also intent-relative —
+whether a delegated task is authorized is a Tier B judgment, not an intrinsic
+one — which is a second reason it sits outside intent-agnostic Layer 0.)
 
 ## Non-Goals
 

@@ -684,20 +684,15 @@ impl ToolRegistry {
 
     /// Find a tool by name, returning a cloned `Arc` so callers can use it
     /// after releasing any lock on the registry.
+    ///
+    /// This and `Tool::run` are lower-level primitives. The conversation
+    /// runtime reaches tool execution only through the gated
+    /// `ToolExecutor::execute` (specs/permissions/), which consumes a
+    /// `CheckedToolCall`; there is intentionally no name+input execute helper
+    /// on the registry that would offer an ungated shortcut.
     #[must_use]
     pub fn find_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.name() == name).cloned()
-    }
-
-    /// Execute a tool by name with context
-    #[allow(dead_code)] // Used in tests; production goes through find_tool() + run()
-    pub async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput> {
-        for tool in &self.tools {
-            if tool.name() == name {
-                return Some(tool.run(input, ctx).await);
-            }
-        }
-        None
     }
 }
 
