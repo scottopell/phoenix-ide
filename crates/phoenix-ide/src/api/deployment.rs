@@ -195,7 +195,9 @@ pub async fn deployment_info(State(state): State<AppState>) -> impl IntoResponse
     // startup: the in-app login flow can switch the active source at runtime
     // (Phoenix's own file vs Codex CLI's in piggyback mode), so a static row
     // would go stale after a credential switch.
-    disk.push(measure_location(&active_codex_credentials_location()));
+    disk.push(measure_location(&active_codex_credentials_location(
+        &state.runtime_env,
+    )));
     // PR auto-fix context bundles live per-worktree, not under a startup-known
     // root, so this aggregate is resolved per request by enumerating worktrees.
     disk.push(pr_context_aggregate(&state.db).await);
@@ -285,10 +287,12 @@ async fn pr_context_aggregate(db: &crate::db::Database) -> DiskEntry {
 /// `~/.phoenix-ide/codex-auth.json`, or Codex CLI's `~/.codex/auth.json` under
 /// `OPENAI_USE_CODEX_AUTH` piggyback mode; falls back to the canonical Phoenix
 /// path (reported absent) when no credentials are present.
-fn active_codex_credentials_location() -> DiskLocation {
+fn active_codex_credentials_location(
+    runtime_env: &phoenix_core::runtime_env::PhoenixRuntimeEnvironment,
+) -> DiskLocation {
     let path = absolutize(
-        &crate::llm::codex_credential::resolve_active_auth_path()
-            .unwrap_or_else(crate::llm::codex_credential::default_phoenix_auth_path),
+        &crate::llm::codex_credential::resolve_active_auth_path(runtime_env)
+            .unwrap_or_else(|| runtime_env.codex_auth_path()),
     );
     DiskLocation {
         label: "Codex credentials".to_string(),

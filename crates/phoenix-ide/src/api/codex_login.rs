@@ -165,13 +165,6 @@ fn new_session_id() -> String {
     })
 }
 
-/// Login flow always writes to Phoenix's own auth file. Piggybacking on Codex
-/// CLI's `~/.codex/auth.json` is read-only — that file belongs to the Codex
-/// CLI's lifecycle and we don't overwrite it from in-app login.
-fn login_target_path() -> PathBuf {
-    codex_credential::default_phoenix_auth_path()
-}
-
 // ---------------------------------------------------------------------------
 // PKCE handlers
 // ---------------------------------------------------------------------------
@@ -304,6 +297,10 @@ pub async fn pkce_start(
         let mgr_for_task = mgr.clone();
         let registry_for_task = state.llm_registry.clone();
         let cancel_for_task = cancel.clone();
+        // In-app login always writes to Phoenix's own auth file (never the
+        // Codex CLI's). Resolve it here where the runtime environment is in
+        // scope, then hand the destination to the background driver.
+        let login_target = state.runtime_env.codex_auth_path();
         tokio::spawn(async move {
             let outcome = drive_pkce(
                 cancel_for_task,
@@ -312,6 +309,7 @@ pub async fn pkce_start(
                 expected_state,
                 verifier,
                 redirect_uri,
+                login_target,
             )
             .await;
             settle_pkce(
@@ -340,6 +338,7 @@ async fn drive_pkce(
     expected_state: String,
     verifier: String,
     redirect_uri: String,
+    login_target: PathBuf,
 ) -> Result<LoginResult, LoginError> {
     // Race the loopback callback against the manual-paste channel and the
     // user-cancellation token. `biased` makes cancel preempt deterministically
@@ -412,7 +411,7 @@ async fn drive_pkce(
         return Err(LoginError::Cancelled);
     }
 
-    finalize_login(&login_target_path(), tokens)
+    finalize_login(&login_target, tokens)
 }
 
 async fn settle_pkce(
@@ -697,8 +696,9 @@ pub async fn device_start(
         let mgr_for_task = mgr.clone();
         let registry_for_task = state.llm_registry.clone();
         let session_id_for_task = session_id.clone();
+        let login_target = state.runtime_env.codex_auth_path();
         tokio::spawn(async move {
-            let outcome = drive_device_code(cancel, device).await;
+            let outcome = drive_device_code(cancel, device, login_target).await;
             settle_device(
                 &mgr_for_task,
                 &registry_for_task,
@@ -715,6 +715,7 @@ pub async fn device_start(
 async fn drive_device_code(
     cancel: CancellationToken,
     device: DeviceCode,
+    login_target: PathBuf,
 ) -> Result<LoginResult, LoginError> {
     // Race the long polling loop against user cancellation. Without this,
     // pressing Cancel only deletes the session record while the poll keeps
@@ -729,7 +730,7 @@ async fn drive_device_code(
     if cancel.is_cancelled() {
         return Err(LoginError::Cancelled);
     }
-    finalize_login(&login_target_path(), tokens)
+    finalize_login(&login_target, tokens)
 }
 
 async fn settle_device(
@@ -863,8 +864,8 @@ pub struct LoginPreflight {
 }
 
 pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
-    let auth_path = codex_credential::default_phoenix_auth_path();
-    let piggyback_path = codex_credential::default_auth_path();
+    let auth_path = state.runtime_env.codex_auth_path();
+    let piggyback_path = state.runtime_env.codex_cli_auth_path();
     let (already_signed_in, account_id) =
         match codex_credential::CodexCredential::load(auth_path.clone()) {
             Ok((_cred, account_id)) => (true, account_id),
@@ -907,7 +908,7 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
 /// `~/.codex/auth.json` via `OPENAI_USE_CODEX_AUTH=1`) is left alone: this
 /// endpoint only manages Phoenix's own auth file.
 pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let auth_path = codex_credential::default_phoenix_auth_path();
+    let auth_path = state.runtime_env.codex_auth_path();
     let removed = match std::fs::remove_file(&auth_path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -1018,8 +1019,8 @@ mod tests {
     /// We exercise the pre-poll cancel path: a token already cancelled when
     /// `drive_device_code` starts must error out with `Cancelled` from the
     /// `tokio::select!`, never reaching `poll_device_code` (which would hit
-    /// the network) or `finalize_login` (which would write to
-    /// `login_target_path()`). Asserting on the error type is what tells us
+    /// the network) or `finalize_login` (which would write to the supplied
+    /// login-target path). Asserting on the error type is what tells us
     /// the fix is in place — a regression that drops the cancel branch would
     /// surface as `LoginError::Network` or a hang on the unreachable issuer.
     #[tokio::test]
@@ -1037,7 +1038,9 @@ mod tests {
             client_id: "client".into(),
         };
 
-        let err = drive_device_code(cancel, device).await.unwrap_err();
+        let err = drive_device_code(cancel, device, std::path::PathBuf::from("/dev/null"))
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, LoginError::Cancelled),
             "expected Cancelled, got {err:?}"

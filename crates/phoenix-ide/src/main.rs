@@ -21,6 +21,7 @@ mod tls;
 // Re-export them at their historical crate-root paths so existing
 // `crate::llm_language::…` / `crate::task_source::…` call sites resolve
 // unchanged (move-down, re-export-up).
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::{llm_language, platform, task_source, work_scope};
 
 // Terminal-core (PTY spawn, relay, command tracking, session registry) now
@@ -75,7 +76,7 @@ mod logging;
 /// page reports the locations the process actually opens (specs/deployment-info/).
 fn build_deployment_config(
     bind_address: SocketAddr,
-    db_path: &str,
+    runtime_env: &PhoenixRuntimeEnvironment,
     tls_source: Option<&tls::ConfigSource>,
     loaded_tls: Option<&tls::LoadedConfig>,
     log: api::LogInfo,
@@ -103,7 +104,7 @@ fn build_deployment_config(
         _ => TlsInfo::disabled(),
     };
 
-    let locations = build_disk_locations(db_path, tls_source, loaded_tls);
+    let locations = build_disk_locations(runtime_env, tls_source, loaded_tls);
 
     api::DeploymentConfig {
         bind_address,
@@ -298,13 +299,13 @@ mod external_origin_tests {
 /// Build the on-disk location rows reported by `GET /api/deployment`, each with
 /// its sizing policy. Every path is normalized to absolute.
 fn build_disk_locations(
-    db_path: &str,
+    runtime_env: &PhoenixRuntimeEnvironment,
     tls_source: Option<&tls::ConfigSource>,
     loaded_tls: Option<&tls::LoadedConfig>,
 ) -> Vec<api::DiskLocation> {
     use api::{DiskLocation, MeasureMode};
 
-    let db_pb = api::absolutize(&PathBuf::from(db_path));
+    let db_pb = api::absolutize(&runtime_env.db_path());
     let data_dir = db_pb
         .parent()
         .map_or_else(|| db_pb.clone(), std::path::Path::to_path_buf);
@@ -363,13 +364,11 @@ fn build_disk_locations(
         _ => {}
     }
 
-    if let Some(dir) = skills::builtin::default_extract_dir() {
-        locations.push(DiskLocation {
-            label: "Built-in skills".to_string(),
-            path: dir,
-            mode: MeasureMode::RecurseSmall,
-        });
-    }
+    locations.push(DiskLocation {
+        label: "Built-in skills".to_string(),
+        path: runtime_env.builtin_skills_dir(),
+        mode: MeasureMode::RecurseSmall,
+    });
 
     // The codex credential row is NOT built here: the active credential source
     // can change at runtime via the in-app login flow, so the handler resolves
@@ -385,7 +384,7 @@ fn build_disk_locations(
 
     locations.push(DiskLocation {
         label: "Browser binary cache".to_string(),
-        path: tools::browser::session::fetcher_cache_dir(),
+        path: runtime_env.chromium_cache_dir(),
         mode: MeasureMode::NoMeasure,
     });
 
@@ -446,6 +445,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     hot_restart::record_start_time();
 
+    // Resolve every filesystem-environment path ($HOME / $CODEX_HOME / temp_dir
+    // and the Phoenix layout under them) once, behind a typed surface. Every
+    // subsystem that needs an on-disk location reads it from here.
+    let runtime_env = Arc::new(PhoenixRuntimeEnvironment::detect());
+
     // REQ-BASH-007: install the child subreaper so descendants whose
     // parent dies (double-forks, setsid daemons) reparent to Phoenix
     // rather than init. Must run before any tool spawns a child.
@@ -454,9 +458,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Log startup context: binary path, version, and whether this looks like a deploy
     let exe_path =
         std::env::current_exe().map_or_else(|_| "unknown".to_string(), |p| p.display().to_string());
-    let is_prod = std::env::var("PHOENIX_DB_PATH")
-        .ok()
-        .is_some_and(|p| p.contains("prod"));
+    let is_prod = runtime_env.is_production();
     tracing::info!(
         exe = %exe_path,
         pid = std::process::id(),
@@ -466,11 +468,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Phoenix IDE starting"
     );
 
-    // Configuration
-    let db_path = std::env::var("PHOENIX_DB_PATH").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{home}/.phoenix-ide/phoenix.db")
-    });
+    // Configuration. db_path materializes the env's resolved PathBuf as a
+    // string for the `&str`-taking APIs below (TLS config, Database::open).
+    let db_path = runtime_env.db_path().to_string_lossy().into_owned();
 
     let port: u16 = std::env::var("PHOENIX_PORT")
         .ok()
@@ -487,15 +487,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // discovery (filesystem-shadows-builtin override, companion-file reads,
     // etc.). Failure is non-fatal — built-ins simply won't appear in the
     // catalog and the user can still install filesystem skills.
-    if let Some(target) = skills::builtin::default_extract_dir() {
-        match skills::builtin::extract_to(&target) {
-            Ok(()) => tracing::info!(path = %target.display(), "extracted built-in skills"),
-            Err(e) => tracing::warn!(
-                path = %target.display(),
-                error = %e,
-                "failed to extract built-in skills",
-            ),
-        }
+    let builtin_skills_dir = runtime_env.builtin_skills_dir();
+    match skills::builtin::extract_to(&builtin_skills_dir) {
+        Ok(()) => tracing::info!(path = %builtin_skills_dir.display(), "extracted built-in skills"),
+        Err(e) => tracing::warn!(
+            path = %builtin_skills_dir.display(),
+            error = %e,
+            "failed to extract built-in skills",
+        ),
     }
 
     // Initialize database
@@ -539,7 +538,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize LLM registry with model discovery
-    let llm_config = LlmConfig::from_env();
+    let llm_config = LlmConfig::from_env(runtime_env.clone());
     let credential_helper = llm_config.credential_helper.clone();
     let llm_registry = Arc::new(ModelRegistry::new_with_discovery(&llm_config).await);
 
@@ -712,7 +711,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (specs/deployment-info/).
     let deployment = Arc::new(build_deployment_config(
         bind_address,
-        &db_path,
+        &runtime_env,
         tls_source.as_ref(),
         loaded_tls.as_ref(),
         log_config.to_log_info(),
@@ -729,6 +728,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         credential_helper,
         password,
         deployment,
+        runtime_env,
     )
     .await;
 

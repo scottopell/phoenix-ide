@@ -5399,6 +5399,7 @@ mod hard_delete_cascade_tests {
             message_retriever,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
         }
     }
 
@@ -7533,6 +7534,7 @@ mod upgrade_model_state_guard_tests {
             message_retriever,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
         }
     }
 
@@ -7683,6 +7685,7 @@ mod file_read_tests {
             message_retriever,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
         }
     }
 

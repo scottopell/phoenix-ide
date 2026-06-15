@@ -28,6 +28,7 @@ use crate::db::{Database, Fts5Retriever, MessageRetriever};
 use crate::llm::ModelRegistry;
 use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use crate::terminal::ActiveTerminals;
 use crate::tools::mcp::McpClientManager;
 use std::sync::Arc;
@@ -67,6 +68,11 @@ pub struct AppState {
     /// Static deployment facts (binding, TLS, on-disk layout) resolved once at
     /// startup. Served read-only by `GET /api/deployment`. See [`deployment`].
     pub deployment: Arc<DeploymentConfig>,
+    /// Filesystem-environment paths ($HOME / $CODEX_HOME / temp_dir and the
+    /// Phoenix layout under them) resolved once at startup. The single
+    /// authority handlers read on-disk locations from. See
+    /// [`PhoenixRuntimeEnvironment`].
+    pub runtime_env: Arc<PhoenixRuntimeEnvironment>,
 }
 
 impl AppState {
@@ -79,6 +85,7 @@ impl AppState {
         credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
         password: Option<String>,
         deployment: Arc<DeploymentConfig>,
+        runtime_env: Arc<PhoenixRuntimeEnvironment>,
     ) -> Self {
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
@@ -137,6 +144,7 @@ impl AppState {
             message_retriever,
             codex_login,
             deployment,
+            runtime_env,
         }
     }
 }
