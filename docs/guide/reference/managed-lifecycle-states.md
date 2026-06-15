@@ -3,7 +3,7 @@ title: Managed lifecycle states
 summary: Every state of the two stateful surfaces in the managed lifecycle — the task-approval reader and the Done? action bar.
 category: reference
 keywords: [approve, propose_task, done, work actions, mark as merged, abandon, pr, gh, continuation]
-related: [howto/run-a-managed-task.md, concepts/modes.md, reference/glossary.md]
+related: [howto/run-a-managed-task.md, concepts/modes.md, concepts/tasks.md, reference/glossary.md]
 ---
 
 # Managed lifecycle states
@@ -88,4 +88,5 @@ continuation instead."*). Act on the continuation instead.
 
 - [Run a managed task](../howto/run-a-managed-task.md) — the happy-path procedure
 - [Modes](../concepts/modes.md) — Explore, Work, Branch
+- [Tasks](../concepts/tasks.md) — the plan, and how approval makes the branch
 - [Glossary](glossary.md) — canonical terms

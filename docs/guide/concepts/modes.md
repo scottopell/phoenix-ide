@@ -3,7 +3,7 @@ title: Modes
 summary: The four conversation modes — Direct, Explore, Work, Branch — and how much freedom each gives the agent.
 category: concepts
 keywords: [direct, explore, work, branch, worktree, mode, read-only]
-related: [howto/run-a-managed-task.md, reference/managed-lifecycle-states.md, reference/glossary.md]
+related: [concepts/tasks.md, howto/run-a-managed-task.md, reference/managed-lifecycle-states.md, reference/glossary.md]
 ---
 
 # Modes
@@ -32,8 +32,8 @@ at all. The four modes form a spectrum from safest to most direct:
 
 Explore and Work are two halves of one **managed** lifecycle. A managed
 conversation starts read-only in Explore; when you approve a task the agent
-proposes, Phoenix renames the temporary branch, commits the task file on it, and
-unlocks writes as **Work**. (Explore's lone write exception: the agent may
+[proposes](tasks.md), Phoenix renames the temporary branch, commits the task
+file on it, and unlocks writes as **Work**. (Explore's lone write exception: the agent may
 `patch` inside `tasks/` to draft that very plan.)
 
 You never select a mode directly. For a git repo you pick a **Workflow** card on
@@ -54,6 +54,7 @@ are covered in the [walkthrough](../howto/run-a-managed-task.md).
 
 ## See also
 
+- [Tasks](tasks.md) — the plan that gates Explore → Work
 - [Run a managed task](../howto/run-a-managed-task.md) — the end-to-end walkthrough
 - [Managed lifecycle states](../reference/managed-lifecycle-states.md) — every approval & Done? state
 - [Glossary](../reference/glossary.md) — canonical terms

@@ -3,7 +3,7 @@ title: Run a managed task
 summary: Take a change from read-only investigation to a pushed task branch using the Explore → approve → Work lifecycle.
 category: howto
 keywords: [managed, explore, work, propose_task, approve, task, branch, pr, worktree]
-related: [concepts/modes.md, reference/managed-lifecycle-states.md, reference/glossary.md]
+related: [concepts/modes.md, concepts/tasks.md, reference/managed-lifecycle-states.md, reference/glossary.md]
 ---
 
 # Run a managed task
@@ -71,5 +71,6 @@ status** tracks the branch's health.
 ## See also
 
 - [Modes](../concepts/modes.md) — what Explore and Work can and can't do
+- [Tasks](../concepts/tasks.md) — the task file, and the two task-branch forms
 - [Managed lifecycle states](../reference/managed-lifecycle-states.md) — every state of the approval and Done? surfaces
 - [Glossary](../reference/glossary.md) — canonical terms

@@ -14,7 +14,7 @@ written.
 - Overview — `concepts/overview.md` *(planned)*
 - Conversations — `concepts/conversations.md` *(planned)*
 - [Modes](concepts/modes.md)
-- Tasks — `concepts/tasks.md` *(planned)*
+- [Tasks](concepts/tasks.md)
 - Sub-agents — `concepts/sub-agents.md` *(planned)*
 - Skills — `concepts/skills.md` *(planned)*
 - Chains — `concepts/chains.md` *(planned)*

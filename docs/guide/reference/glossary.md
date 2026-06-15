@@ -22,8 +22,8 @@ owns it once that page exists.
 | **managed** | The Explore → Work *lifecycle*, not a mode. Lowercase. There is no "Managed" control in the UI. | [Modes](../concepts/modes.md) |
 | **Workflow card** | A choice on the new-conversation screen (e.g. *"Chat in a fresh worktree"*) that selects a mode. Never "mode picker". | [Run a managed task](../howto/run-a-managed-task.md) |
 | **worktree** | An isolated git checkout keyed to the conversation. One word, lowercase. | Workspace |
-| **task branch** | The branch a managed task runs on, created on approval. | Tasks |
-| **task file** | The `tasks/NNNNN-…md` file that holds the plan; a living contract. | Tasks |
+| **task branch** | The branch a managed task runs on, renamed from `task-pending-{id}` on approval. Exact name depends on the plan form — see [Tasks](../concepts/tasks.md#from-plan-to-branch). | [Tasks](../concepts/tasks.md) |
+| **task file** | The `tasks/NNNNN-pX-status--slug.md` file that holds the plan; a living contract. | [Tasks](../concepts/tasks.md) |
 | **Done? bar** | The Work/Branch action bar (label `Done?`) with View Diff, completion, and Abandon. | [Managed lifecycle states](managed-lifecycle-states.md) |
 | **continuation** | A successor conversation a thread was continued into; locks the original's terminal actions. | [Managed lifecycle states](managed-lifecycle-states.md) |
 | **sub-agent** | A spawned child conversation running a delegated task. | Sub-agents |
