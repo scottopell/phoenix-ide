@@ -448,6 +448,15 @@ THE SYSTEM SHALL NOT derive the redirect origin from request-controlled headers
 (`Host`, `Forwarded`), so a forged header cannot redirect an authorization code
 to an attacker-chosen destination.
 
+WHERE a pre-configured client supplies a fixed loopback callback port (its
+pre-registered authorization app allows only `http://localhost:<port>/callback`
+and cannot register Phoenix's own callback route), THE SYSTEM SHALL use that
+loopback redirect URI for the flow and bind a one-shot listener on that port
+that bounces the received callback to its real callback route. The listener
+SHALL bind loopback only, accept a single callback, self-terminate on first use
+or after the flow window elapses, and a prior listener for the same server SHALL
+be cancelled when a new flow starts.
+
 **Rationale:** The redirect URI must name an origin the operator's browser can
 reach and that routes back to this instance; the reachable domain already chosen
 for the certificate is exactly that origin, so binding the two removes a
@@ -455,4 +464,12 @@ redundant, divergence-prone knob. A redirect target taken from a request header
 is attacker-influenceable in a way the `state` nonce and `iss` check do not
 defend -- they bind the callback to its flow and its authorization server, not
 its destination -- so the origin is taken from trusted configuration instead.
+An authorization server whose registered redirect allowlist Phoenix cannot edit
+(a shared pre-registered app) forces the redirect to a value already on that
+list -- a fixed loopback port with a `/callback` path -- which Phoenix cannot
+serve from its own bound port; the ephemeral loopback listener receives that
+callback on the same machine and bounces it to the real route, so the flow
+completes without a second token store or a proxy process. Loopback binding
+keeps it same-machine only, matching where a browser-on-the-same-host operator
+already is.
 </content>

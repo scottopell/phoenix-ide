@@ -405,6 +405,14 @@ rule OAuthClientPreconfigured {
     )
     ensures: srv.oauth_phase = awaiting_user
     ensures: srv.pending_auth_url = authorization_url(srv)
+
+    @guidance
+        -- When the pre-configured client pins a loopback callback port (its
+        -- app allows only http://localhost:<port>/callback and cannot register
+        -- Phoenix's own route), the authorization_url's redirect_uri is that
+        -- loopback URI, and a one-shot listener on that port bounces the
+        -- browser's callback to the real /api/mcp/oauth/callback route
+        -- (REQ-MCP-020). Otherwise the redirect is Phoenix's server route.
 }
 
 -- No cached registration and no pre-configured client: acquire one via RFC

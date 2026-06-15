@@ -3575,6 +3575,7 @@ mod tests {
         // the pre-configured client is seeded under that issuer post-discovery.
         let auth = HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
             client_id: "pre-1".to_string(),
+            callback_port: None,
         }));
         connect_http_managed(&manager, &server, auth)
             .await
@@ -3778,6 +3779,7 @@ mod tests {
             headers: HashMap::new(),
             auth: HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
                 client_id: client_id.to_string(),
+                callback_port: None,
             })),
         };
         let mcp = McpClientManager::connect_one(

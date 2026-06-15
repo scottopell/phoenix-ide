@@ -1026,6 +1026,12 @@ struct OAuthRuntime {
     /// authorize link will fail before opening it.
     redirect_warning: std::sync::Mutex<Option<String>>,
     pending: std::sync::Mutex<HashMap<String, PendingAuthFlow>>,
+    /// One-shot loopback callback listeners, keyed by server name. A server
+    /// whose pre-registered OAuth app only allows a fixed `http://localhost:<port>/callback`
+    /// redirect (it cannot register Phoenix's own callback route) gets an
+    /// ephemeral listener on that port that bounces the browser to the real
+    /// callback route (REQ-MCP-020). Held so a re-prompt can abort a stale one.
+    loopback_listeners: std::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
 }
 
 impl Default for OAuthRuntime {
@@ -1035,6 +1041,7 @@ impl Default for OAuthRuntime {
             redirect_base: std::sync::Mutex::new(None),
             redirect_warning: std::sync::Mutex::new(None),
             pending: std::sync::Mutex::new(HashMap::new()),
+            loopback_listeners: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -1057,6 +1064,12 @@ impl OAuthRuntime {
             .unwrap()
             .as_ref()
             .map(|base| format!("{}/api/mcp/oauth/callback", base.trim_end_matches('/')))
+    }
+
+    /// Phoenix's own externally reachable origin (no callback path), the bounce
+    /// target for a loopback listener. `None` until the server address is known.
+    fn redirect_base(&self) -> Option<String> {
+        self.redirect_base.lock().unwrap().clone()
     }
 }
 
@@ -1282,6 +1295,92 @@ async fn acquire_client_registration(
 /// (REQ-MCP-009..011, REQ-MCP-013). `extra_scopes` carries prior grants for a
 /// step-up union; `claim` keeps callers parked until re-authorization
 /// completes (it is released on every failure path by drop).
+/// Extract the query string (including the leading `?`) from an HTTP request's
+/// first line — e.g. `GET /callback?code=x&state=y HTTP/1.1` yields
+/// `?code=x&state=y`. Empty when the target has no query. The bytes are
+/// forwarded verbatim to Phoenix's real callback route, so the percent-encoding
+/// the authorization server produced is preserved.
+fn callback_request_query(request: &str) -> String {
+    let target = request
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("");
+    target
+        .split_once('?')
+        .map(|(_, query)| format!("?{query}"))
+        .unwrap_or_default()
+}
+
+/// Bind a one-shot loopback listener on `port` that bounces the authorization
+/// server's callback to Phoenix's real callback route under `target_base`
+/// (REQ-MCP-020). Aborts any prior listener for `name` first, so a re-prompt
+/// does not leave a stale task holding the port. The listener self-terminates
+/// after one request or a 5-minute idle timeout (the OAuth flow window).
+fn spawn_loopback_redirect(oauth_rt: &OAuthRuntime, name: &str, port: u16, target_base: String) {
+    let mut listeners = oauth_rt.loopback_listeners.lock().unwrap();
+    if let Some(prev) = listeners.remove(name) {
+        prev.abort();
+    }
+    let server = name.to_string();
+    let handle = tokio::spawn(run_loopback_redirect(server, port, target_base));
+    listeners.insert(name.to_string(), handle.abort_handle());
+}
+
+async fn run_loopback_redirect(server: String, port: u16, target_base: String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::warn!(
+                server = %server,
+                port,
+                "OAuth loopback callback listener could not bind (port in use?); \
+                 the authorization callback will not be received: {e}"
+            );
+            return;
+        }
+    };
+    tracing::debug!(server = %server, port, "OAuth loopback callback listener bound");
+
+    let accepted =
+        tokio::time::timeout(std::time::Duration::from_secs(300), listener.accept()).await;
+    let mut stream = match accepted {
+        Ok(Ok((stream, _))) => stream,
+        Ok(Err(e)) => {
+            tracing::warn!(server = %server, "OAuth loopback accept failed: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(server = %server, port, "OAuth loopback listener timed out");
+            return;
+        }
+    };
+
+    let mut buf = vec![0u8; 8192];
+    let n = stream.read(&mut buf).await.unwrap_or(0);
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let query = callback_request_query(&request);
+    let location = format!(
+        "{}/api/mcp/oauth/callback{}",
+        target_base.trim_end_matches('/'),
+        query
+    );
+    let body = "<!DOCTYPE html><html><body><p>Completing authorization, \
+                returning to Phoenix…</p></body></html>";
+    let response = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
+    tracing::debug!(server = %server, "OAuth loopback callback bounced to {location}");
+}
+
 async fn begin_oauth_flow(
     oauth_rt: &OAuthRuntime,
     pending_oauth_urls: &Arc<RwLock<HashMap<String, String>>>,
@@ -1294,9 +1393,23 @@ async fn begin_oauth_flow(
     let Some(url) = oauth_resource_url(entry) else {
         return Err("server is not OAuth-eligible".to_string());
     };
-    let redirect_uri = oauth_rt
-        .redirect_uri()
-        .ok_or("OAuth redirect base not configured (server address unknown)")?;
+    let preconfigured = match entry {
+        McpServerConfig::Http {
+            auth: HttpAuth::OAuth(Some(pre)),
+            ..
+        } => Some(pre),
+        McpServerConfig::Http { .. } | McpServerConfig::Stdio { .. } => None,
+    };
+    // A pre-registered app whose allowlist pins a fixed loopback port redirects
+    // there; Phoenix bounces that callback to its own route (REQ-MCP-020).
+    // Otherwise the redirect is Phoenix's own server-route callback.
+    let loopback_port = preconfigured.and_then(|pre| pre.callback_port);
+    let redirect_uri = match loopback_port {
+        Some(port) => format!("http://localhost:{port}/callback"),
+        None => oauth_rt
+            .redirect_uri()
+            .ok_or("OAuth redirect base not configured (server address unknown)")?,
+    };
     let client = oauth::oauth_http_client()?;
     let challenge = www_authenticate
         .map(oauth::parse_bearer_challenge)
@@ -1306,13 +1419,6 @@ async fn begin_oauth_flow(
     let (metadata, cached_registration) =
         resolve_authorization_server(oauth_rt, &client, &prm).await?;
 
-    let preconfigured = match entry {
-        McpServerConfig::Http {
-            auth: HttpAuth::OAuth(Some(pre)),
-            ..
-        } => Some(pre),
-        McpServerConfig::Http { .. } | McpServerConfig::Stdio { .. } => None,
-    };
     let registration = acquire_client_registration(
         oauth_rt,
         &client,
@@ -1371,6 +1477,20 @@ async fn begin_oauth_flow(
         .lock()
         .unwrap()
         .insert(name.to_string(), flow);
+    // Bind the loopback listener before the URL is surfaced, so it is ready
+    // when the operator clicks. Bounces the fixed-port callback to Phoenix's
+    // real route; the server-route case needs no listener.
+    if let Some(port) = loopback_port {
+        if let Some(base) = oauth_rt.redirect_base() {
+            spawn_loopback_redirect(oauth_rt, name, port, base);
+        } else {
+            tracing::warn!(
+                server = %name,
+                "loopback OAuth callback needs Phoenix's own address to bounce to; \
+                 none configured, so the callback will not be received"
+            );
+        }
+    }
     pending_oauth_urls
         .write()
         .await
@@ -2906,9 +3026,14 @@ impl McpClientManager {
             Value::Object(fields) => match fields.get("clientId").and_then(Value::as_str) {
                 Some(client_id) => Some(HttpAuth::OAuth(Some(PreconfiguredClient {
                     client_id: client_id.to_string(),
+                    callback_port: fields
+                        .get("callbackPort")
+                        .and_then(Value::as_u64)
+                        .and_then(|p| u16::try_from(p).ok()),
                 }))),
                 // An object with no clientId (e.g. only callbackPort/scopes):
-                // OAuth via dynamic client registration.
+                // OAuth via dynamic client registration, where DCR registers
+                // Phoenix's own callback, so a fixed loopback port is moot.
                 None => Some(HttpAuth::OAuth(None)),
             },
             Value::Null
@@ -3557,9 +3682,17 @@ pub enum StaticCred {
 /// client secret — keeping a long-lived app credential out of the app is the
 /// point. A server that mandates confidential client authentication is out of
 /// scope here.
+///
+/// `callback_port` (Claude Code's `oauth.callbackPort`) is set when the
+/// pre-registered app's redirect allowlist only contains a fixed
+/// `http://localhost:<port>/callback` loopback URI — it cannot register
+/// Phoenix's own server-route callback. Phoenix then uses that loopback
+/// redirect and bounces the browser to its real callback via an ephemeral
+/// listener on that port (REQ-MCP-020). Absent, Phoenix uses its server route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreconfiguredClient {
     pub client_id: String,
+    pub callback_port: Option<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3802,6 +3935,7 @@ mod tests {
                 headers: HashMap::new(),
                 auth: HttpAuth::OAuth(Some(PreconfiguredClient {
                     client_id: "cid-1".to_string(),
+                    callback_port: Some(3118),
                 })),
             })
         );
@@ -3821,6 +3955,22 @@ mod tests {
                 auth: HttpAuth::Static(StaticCred::Bearer("tok".to_string())),
             })
         );
+    }
+
+    #[test]
+    fn callback_request_query_extracts_query_verbatim() {
+        assert_eq!(
+            callback_request_query("GET /callback?code=abc&state=xyz HTTP/1.1\r\nHost: x\r\n"),
+            "?code=abc&state=xyz"
+        );
+        // An error callback's query is forwarded just the same.
+        assert_eq!(
+            callback_request_query("GET /callback?error=access_denied&state=xyz HTTP/1.1"),
+            "?error=access_denied&state=xyz"
+        );
+        // No query → empty (the real callback then reports a missing code).
+        assert_eq!(callback_request_query("GET /callback HTTP/1.1"), "");
+        assert_eq!(callback_request_query(""), "");
     }
 
     #[test]

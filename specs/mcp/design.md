@@ -130,8 +130,13 @@ enum StaticCred {
 // instead of attempting DCR. It does NOT pre-authorize the server -- there is
 // still no token until the flow completes (REQ-MCP-010). Public client only:
 // authorization-code + PKCE needs no secret, and none is accepted or stored.
+// `callback_port` (Claude Code's oauth.callbackPort) is set when the app's
+// redirect allowlist pins a fixed http://localhost:<port>/callback URI Phoenix
+// cannot edit; the flow then uses that loopback redirect and an ephemeral
+// listener bounces the callback to Phoenix's real route (REQ-MCP-020).
 struct PreconfiguredClient {
     client_id: String,
+    callback_port: Option<u16>,
 }
 ```
 
@@ -144,11 +149,17 @@ under `auth` -- `{"bearer": "<token>"}` or `{"headers": {...}}`, the two
 `oauth: true`, or an object without `clientId`, selects OAuth with a
 dynamically registered client; an object carrying `clientId` pre-configures a
 **public** client identity (`OAuth(Some(PreconfiguredClient))`) for a DCR-less
-authorization server. Claude-Code-only fields (`callbackPort`,
-`authServerMetadataUrl`, `scopes`) are accepted but `callbackPort` is ignored:
-Phoenix receives the redirect on its own server route, not a throwaway
-localhost listener. **No client secret is read from config or anywhere else**
--- the flow is authorization-code + PKCE, a public client. An `auth` object
+authorization server. `callbackPort` is captured on the pre-configured client: when present, the app's
+redirect allowlist pins `http://localhost:<port>/callback`, so the flow uses
+that loopback redirect and an ephemeral one-shot listener on that port (held in
+`OAuthRuntime::loopback_listeners`, keyed by server, aborted on re-prompt)
+bounces the browser to Phoenix's real `/api/mcp/oauth/callback` route, reusing
+the entire completion path (REQ-MCP-020). Absent a `callbackPort`, Phoenix uses
+its own server-route callback (the DCR case, where registration records
+Phoenix's redirect). The other Claude-Code-only fields (`authServerMetadataUrl`,
+`scopes`) are accepted but not yet honored. **No client secret is read from
+config or anywhere else** -- the flow is authorization-code + PKCE, a public
+client. An `auth` object
 with an unrecognized shape is skipped at `debug` rather than downgraded to
 no-auth -- silently dropping an intended credential would change which
 authorization path a 401 takes.
@@ -259,6 +270,22 @@ attack surface those would guard does not exist. An all-interfaces bind that
 still resolves to loopback has no reachable name configured; this is surfaced at
 startup *and* on every `unauthorized` status entry (`auth_redirect_warning`), so
 the operator sees why the authorize link will fail before opening it.
+
+The canonical-origin callback assumes the authorization server will accept
+Phoenix's `/api/mcp/oauth/callback` redirect -- true for a DCR client (it
+registers that exact URI) but not for a pre-registered app whose redirect
+allowlist Phoenix cannot edit. When such an app pins a fixed
+`http://localhost:<port>/callback` (the `callbackPort` on the pre-configured
+client), `begin_oauth_flow` uses that loopback URI as the flow's `redirect_uri`
+and `spawn_loopback_redirect` binds a one-shot `TcpListener` on
+`127.0.0.1:<port>`. The browser's callback lands there; the listener replies
+`302` to `{redirect_base}/api/mcp/oauth/callback` with the query forwarded
+verbatim, so the existing route runs the real completion (token exchange uses
+the loopback `redirect_uri`, matching what the authorization server saw). The
+listener binds loopback only (same-machine operator), accepts one request, and
+self-terminates on first use or a 5-minute timeout; `OAuthRuntime::loopback_listeners`
+holds the `AbortHandle` so a re-prompt cancels a stale listener before binding
+the port again.
 
 The canonical redirect base can change across deployments (a new domain,
 default-port elision). A dynamic client registration is keyed only by
