@@ -67,7 +67,7 @@ user branch belonging to the user's PR, not to Phoenix.
 5. Send `TaskResolved` with outcome `merged`; emit the system message.
 
 "Mark as merged" requires no separate confirmation dialog when the PR-state gate is present:
-the "Clean up merged PR" label is confirmation-sufficient for the merged case. The
+the cleanup affordance is confirmation-sufficient for the merged case. The
 `work-actions-bar` spec owns the exact confirmation affordances.
 
 ## Abandon — Git Sequence
@@ -130,10 +130,10 @@ PrStatusResult {
 The `work-actions-bar` spec owns how this maps to UI affordances (labels, disable states,
 explanatory text). This spec owns the contract:
 
-- `display_state = merged` → the "Clean up merged PR" happy path is appropriate.
+- `display_state = merged` → cleanup is the happy path.
 - `display_state ∈ {open, draft, closed}` (or `check_state ∈ {pending, failing}`) → a
-  discouraging note is appropriate; the user may opt into a manual fallback.
-- `found = false` → no note; manual fallback available without friction.
+  discouraging note is appropriate; cleanup remains user-initiated.
+- `found = false` → cleanup without PR confirmation remains available.
 
 `gh` failures (unavailable, unauthenticated, non-git directory, command failure) yield
 `found: false` with an `unavailable_reason`, are logged at `debug`, and surface as compact,

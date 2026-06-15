@@ -125,7 +125,6 @@ describe('checking / loading', () => {
     expect(d.primary).toBe('abandon');
     expect(d.resolve).toBeNull();
     expect(d.showCleanUp).toBe(false);
-    expect(d.cleanUpIsManualFallback).toBe(false);
     expect(d.showAbandon).toBe(true);
     expect(d.note?.kind).toBe('checking');
   });
@@ -172,13 +171,12 @@ describe('stuck — RESOLVE always suppressed (REQ-WAB-005)', () => {
     expect(d.note?.kind).toBe('pr_open_stuck');
   });
 
-  it('gh unavailable → clean_up primary, manual fallback, gh_unavailable note', () => {
+  it('gh unavailable → clean_up primary, gh_unavailable note', () => {
     const d = deriveWorkDisposition(
       input({ phaseType: 'error', prStatus: notFound('unavailable', { unavailable_reason: 'gh_missing' }) }),
     );
     expect(d.primary).toBe('clean_up');
     expect(d.showCleanUp).toBe(true);
-    expect(d.cleanUpIsManualFallback).toBe(true);
     expect(d.note?.kind).toBe('gh_unavailable');
   });
 
@@ -186,7 +184,6 @@ describe('stuck — RESOLVE always suppressed (REQ-WAB-005)', () => {
     const d = deriveWorkDisposition(input({ phaseType: 'context_exhausted', prStatus: notFound('fresh') }));
     expect(d.primary).toBe('clean_up');
     expect(d.showCleanUp).toBe(true);
-    expect(d.cleanUpIsManualFallback).toBe(false);
     expect(d.note).toBeNull();
   });
 });
@@ -315,12 +312,12 @@ describe('idle terminal dispositions', () => {
     expect(d.note?.kind).toBe('pr_closed');
   });
 
-  it('gh unavailable → clean_up primary, manual fallback, gh_unavailable note', () => {
+  it('gh unavailable → clean_up primary, gh_unavailable note', () => {
     const d = deriveWorkDisposition(
       input({ prStatus: notFound('unavailable', { unavailable_reason: 'not_authenticated' }) }),
     );
     expect(d.primary).toBe('clean_up');
-    expect(d.cleanUpIsManualFallback).toBe(true);
+    expect(d.showCleanUp).toBe(true);
     expect(d.note?.kind).toBe('gh_unavailable');
   });
 
@@ -329,14 +326,13 @@ describe('idle terminal dispositions', () => {
       input({ prStatus: notFound('fresh', { unavailable_reason: 'command_failed' }) }),
     );
     expect(d.note?.kind).toBe('gh_unavailable');
-    expect(d.cleanUpIsManualFallback).toBe(true);
+    expect(d.showCleanUp).toBe(true);
   });
 
-  it('no PR, refresh ok → clean_up primary, no manual fallback', () => {
+  it('no PR, refresh ok → clean_up primary, no warning note', () => {
     const d = deriveWorkDisposition(input({ prStatus: notFound('fresh') }));
     expect(d.primary).toBe('clean_up');
     expect(d.showCleanUp).toBe(true);
-    expect(d.cleanUpIsManualFallback).toBe(false);
     expect(d.note).toBeNull();
   });
 
@@ -438,12 +434,12 @@ describe('structural invariants', () => {
     }
   });
 
-  it('cleanUpIsManualFallback implies showCleanUp and a gh_unavailable note', () => {
+  it('gh_unavailable notes only appear with Clean up visible', () => {
     for (const inp of matrix()) {
       const d = deriveWorkDisposition(inp);
-      if (d.cleanUpIsManualFallback) {
+      if (d.note?.kind === 'gh_unavailable') {
         expect(d.showCleanUp).toBe(true);
-        expect(d.note?.kind).toBe('gh_unavailable');
+        expect(d.primary).toBe('clean_up');
       }
     }
   });

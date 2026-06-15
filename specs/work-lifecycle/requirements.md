@@ -103,24 +103,22 @@ as Merged may be initiated.
 
 WHEN a Work or Branch conversation has an associated pull request
 AND `gh` can observe the pull request's state for the branch
-THE SYSTEM SHALL use the observed PR state to label the cleanup action:
-- a `gh`-confirmed merged PR is presented as the "Clean up merged PR" happy path
-- an open, draft, failing, pending, or closed-unmerged PR annotates or discourages the
-  cleanup affordance with an explanatory note; the user may still opt into an explicit manual
-  fallback
+THE SYSTEM SHALL use the observed PR state to guide the cleanup action:
+- a `gh`-confirmed merged PR is presented as the happy path for cleanup
+- an open, draft, failing, pending, or closed-unmerged PR annotates or discourages cleanup
+  with explanatory text while leaving terminal disposition user-initiated
 
 WHEN `gh` is unavailable or the conversation has no associated PR
-THE SYSTEM SHALL permit the user to invoke "Mark as merged" as a manual fallback without
-  `gh` confirmation
+THE SYSTEM SHALL permit the user to initiate merged-work cleanup without `gh` confirmation
 
 THE SYSTEM SHALL NOT use PR merge state as an automatic trigger for the terminal transition —
   cleanup occurs only when the user initiates the action
 THE SYSTEM SHALL NOT display local commits-ahead or commits-behind badges as the branch
   health signal; PR state is the branch health signal
 
-**Design:** PR state makes the happy-path cleanup self-describing — the user knows why the
-button says "Clean up merged PR" — while preserving a manual escape for repositories where
-`gh` is not authenticated or configured. The advisory character of PR state is essential:
+**Design:** PR state makes the happy-path cleanup self-describing while preserving user-initiated
+cleanup for repositories where `gh` is not authenticated or configured. The advisory character
+ of PR state is essential:
 Phoenix observes no push event and cannot continuously poll every branch, so it must not
 auto-terminate a conversation based on inferred remote state. "The PR is merged" is a
 condition the user is always better positioned to assert than Phoenix is to detect — the user

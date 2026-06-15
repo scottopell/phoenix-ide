@@ -983,7 +983,7 @@ function ConversationPageContent() {
     }
   }
 
-  // Terminal cleanup (Clean up merged PR / Abandon) for a Work/Branch
+  // Terminal cleanup (Clean up / Abandon) for a Work/Branch
   // conversation stuck in a disposable phase (error or context-exhausted): the
   // backend and specs permit TaskResolved from those states. PR-aware; renders
   // nothing for non-Work/Branch conversations; once continued the actions

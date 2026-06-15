@@ -19,8 +19,6 @@ vi.mock('../hooks/useConversationPrStatus', () => ({
 function setPrState(state: ConversationPrStatusState) {
   mockUsePrStatus.mockReturnValue({
     state,
-    manualFallbackEnabled: false,
-    enableManualFallback: vi.fn(),
     refresh: vi.fn(),
   });
 }

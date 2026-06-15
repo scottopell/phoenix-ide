@@ -263,12 +263,11 @@ rule PrStatusObserved {
         -- the conversation page stays fully usable.
         --
         -- The work-actions-bar spec maps PrStatusResult to UI:
-        --   display_state = merged  -> "Clean up merged PR" enabled
+        --   display_state = merged  -> cleanup is the happy path
         --   display_state in { open, draft, closed }, or
         --     check_state in { pending, failing }
-        --                          -> cleanup discouraged + note;
-        --                             manual fallback available
-        --   found = false           -> "Mark as merged" available, no note
+        --                          -> cleanup discouraged + note
+        --   found = false           -> cleanup without PR confirmation remains available
         --
         -- No auto-transition: observing a merged PR does NOT call
         -- UserMarksAsMerged automatically. The user initiates.

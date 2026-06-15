@@ -8,8 +8,6 @@ export type ConversationPrStatusState =
 
 export interface ConversationPrStatusHandle {
   state: ConversationPrStatusState;
-  manualFallbackEnabled: boolean;
-  enableManualFallback: () => void;
   refresh: () => Promise<void>;
 }
 
@@ -23,7 +21,6 @@ export function useConversationPrStatus({
   branchName: string | null | undefined;
 }): ConversationPrStatusHandle {
   const [state, setState] = useState<ConversationPrStatusState>({ status: 'disabled', prStatus: null });
-  const [manualFallbackEnabled, setManualFallbackEnabled] = useState(false);
   const latestSeqRef = useRef(0);
   const activeScopeRef = useRef<string | null>(null);
   const scopeKey = conversationId && branchName && (convModeLabel === 'Work' || convModeLabel === 'Branch')
@@ -38,7 +35,6 @@ export function useConversationPrStatus({
       const prStatus = await api.getPrStatus(conversationId);
       if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
       setState({ status: 'ready', prStatus });
-      if (!prStatus.unavailable_reason) setManualFallbackEnabled(false);
     } catch {
       if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
       setState({
@@ -58,7 +54,6 @@ export function useConversationPrStatus({
   }, [conversationId, scopeKey]);
 
   useEffect(() => {
-    setManualFallbackEnabled(false);
     latestSeqRef.current += 1;
     activeScopeRef.current = scopeKey;
     if (!scopeKey) {
@@ -99,8 +94,6 @@ export function useConversationPrStatus({
 
   return {
     state,
-    manualFallbackEnabled,
-    enableManualFallback: () => setManualFallbackEnabled(true),
     refresh,
   };
 }

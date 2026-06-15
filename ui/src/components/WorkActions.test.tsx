@@ -66,16 +66,12 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }) 
   };
   return {
     state: { status: 'ready' as const, prStatus: status },
-    manualFallbackEnabled: false,
-    enableManualFallback: vi.fn(),
     refresh: vi.fn().mockResolvedValue(undefined),
   };
 }
 
 const loadingPrStatusHandle = {
   state: { status: 'loading' as const, prStatus: null },
-  manualFallbackEnabled: false,
-  enableManualFallback: vi.fn(),
   refresh: vi.fn().mockResolvedValue(undefined),
 };
 
@@ -388,7 +384,7 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
   });
 });
 
-describe('WorkControlBar — gh unavailable (single-click manual fallback)', () => {
+describe('WorkControlBar — gh unavailable cleanup', () => {
   it('no PR + refresh unavailable → Clean up present; a SINGLE click calls api.markMerged; warning note shown', () => {
     renderWithProviders(
       <WorkControlBar
@@ -406,7 +402,7 @@ describe('WorkControlBar — gh unavailable (single-click manual fallback)', () 
       document.querySelector('.work-actions-pr-note--warning'),
     ).toBeInTheDocument();
 
-    // Single click marks merged — no two-step enable-then-mark fallback.
+    // Single click marks merged — no enable-then-cleanup state.
     fireEvent.click(clean);
     expect(api.markMerged).toHaveBeenCalledTimes(1);
     expect(api.markMerged).toHaveBeenCalledWith('conv-1');

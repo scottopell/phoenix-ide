@@ -46,8 +46,6 @@ export interface WorkDisposition {
   resolve: ResolveVerb | null;
   /** Render the Clean up (mark-merged) verb in the FINISH zone. */
   showCleanUp: boolean;
-  /** gh unavailable: Clean up is a single-click manual fallback with a warning note. */
-  cleanUpIsManualFallback: boolean;
   /** Render the Abandon verb in the FINISH zone. False when continued (the
    *  continuation owns disposal — REQ-WAB-009 suppresses FINISH verbs, and the
    *  no-disabled-as-status rule means we show the note, not a dead button). */
@@ -80,7 +78,6 @@ function hidden(): WorkDisposition {
     primary: 'none',
     resolve: null,
     showCleanUp: false,
-    cleanUpIsManualFallback: false,
     showAbandon: false,
     note: null,
   };
@@ -120,7 +117,6 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
       primary: 'none',
       resolve: null,
       showCleanUp: false,
-      cleanUpIsManualFallback: false,
       showAbandon: false,
       note: { kind: 'continued', text: NOTE_CONTINUED },
     };
@@ -134,7 +130,6 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
       primary: 'abandon',
       resolve: null,
       showCleanUp: false,
-      cleanUpIsManualFallback: false,
       showAbandon: true,
       note: { kind: 'checking', text: NOTE_CHECKING },
     };
@@ -170,7 +165,6 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
     if (ghUnavailable) {
       return finish('clean_up', {
         showCleanUp: true,
-        cleanUpIsManualFallback: true,
         note: { kind: 'gh_unavailable', text: NOTE_GH_UNAVAILABLE },
       });
     }
@@ -238,11 +232,10 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
     });
   }
 
-  // Row 7. idle, gh unavailable (no PR identity) → Clean up, manual fallback.
+  // Row 7. idle, gh unavailable (no PR identity) → Clean up with a warning note.
   if (ghUnavailable) {
     return finish('clean_up', {
       showCleanUp: true,
-      cleanUpIsManualFallback: true,
       note: { kind: 'gh_unavailable', text: NOTE_GH_UNAVAILABLE },
     });
   }
@@ -258,7 +251,6 @@ function resolveVerb(verb: ResolveVerb): WorkDisposition {
     primary: 'resolve',
     resolve: verb,
     showCleanUp: false,
-    cleanUpIsManualFallback: false,
     showAbandon: true,
     note: null,
   };
@@ -269,7 +261,6 @@ function finish(
   primary: 'clean_up' | 'abandon',
   opts: {
     showCleanUp?: boolean;
-    cleanUpIsManualFallback?: boolean;
     note?: DispositionNote;
   },
 ): WorkDisposition {
@@ -278,7 +269,6 @@ function finish(
     primary,
     resolve: null,
     showCleanUp: opts.showCleanUp ?? false,
-    cleanUpIsManualFallback: opts.cleanUpIsManualFallback ?? false,
     showAbandon: true,
     note: opts.note ?? null,
   };
