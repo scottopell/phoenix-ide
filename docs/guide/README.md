@@ -33,7 +33,8 @@ unwritten page would 404 on GitHub.)
 
 - [Modes](concepts/modes.md) — Direct, Explore, Work, Branch
 - [Tasks](concepts/tasks.md) — the plan that gates Explore → Work
-- Overview, Conversations, Sub-agents, Skills, Chains, Workspace, Permissions, Providers — *(planned)*
+- [Chains](concepts/chains.md) — continuation runs, queryable as a unit
+- Overview, Conversations, Sub-agents, Skills, Workspace, Permissions, Providers — *(planned)*
 
 ## How-to
 

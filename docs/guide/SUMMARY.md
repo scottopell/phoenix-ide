@@ -17,7 +17,7 @@ written.
 - [Tasks](concepts/tasks.md)
 - Sub-agents — `concepts/sub-agents.md` *(planned)*
 - Skills — `concepts/skills.md` *(planned)*
-- Chains — `concepts/chains.md` *(planned)*
+- [Chains](concepts/chains.md)
 - Workspace — `concepts/workspace.md` *(planned)*
 - Permissions — `concepts/permissions.md` *(planned)*
 - Providers & models — `concepts/providers.md` *(planned)*
