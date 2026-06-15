@@ -25,6 +25,7 @@ right and the guide is the bug.
 | Modes & lifecycle | `specs/projects/executive.md`, `specs/bedrock/` |
 | Keyboard shortcuts | `specs/keyboard-interaction/`, `ui/src/components/ShortcutHelpPanel.tsx` |
 | Input grammar (`@` `/` `./`) | `specs/inline-references/` |
+| **Exact UI labels quoted in how-tos/concepts** | the React component that renders them under `ui/src/` (button text, card titles, banners, badge tooltips) |
 | In-app routes the guide links to | `ui/src/App.tsx` |
 | Manifest / nav ordering | `docs/guide/SUMMARY.md` |
 
@@ -51,6 +52,12 @@ Check all four, in order:
    - Mode × tool-availability claims vs `specs/projects` + tool registry.
    - Keyboard shortcuts vs `ShortcutHelpPanel.tsx`.
    - Route links vs `ui/src/App.tsx`.
+   - **Quoted UI labels.** Any string a page puts in quotes or `code`/**bold** as
+     something the user clicks or reads (button text, workflow-card titles,
+     banners, badge tooltips) must match the literal string in the rendering
+     component verbatim. Paraphrased or invented labels are the single most
+     common quality defect — grep the component for the quoted text; if it's not
+     there word-for-word, it's drift.
 4. **Template conformance** — pages drifting from the section's template shape in
    `_templates/` (missing "See also", reference card missing its limits table, etc.).
 
