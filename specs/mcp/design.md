@@ -123,45 +123,51 @@ enum StaticCred {
     Headers(HashMap<String, String>),  // auth headers, NOT the generic `headers`
 }
 
-// A pre-configured OAuth client for an authorization server that disables DCR.
-// It is registration *metadata*, not a credential: it seeds the
-// mcp_oauth_registrations row so a later 401 reuses it instead of attempting
-// DCR. It does NOT pre-authorize the server -- there is still no token until
-// the flow completes (REQ-MCP-010).
+// A pre-configured PUBLIC OAuth client (Claude Code's `oauth` shape) for an
+// authorization server that disables DCR. It is registration *metadata*, not a
+// credential: once discovery resolves the issuer the config does not name, it
+// seeds the mcp_oauth_registrations row under that issuer so the flow reuses it
+// instead of attempting DCR. It does NOT pre-authorize the server -- there is
+// still no token until the flow completes (REQ-MCP-010). Public client only:
+// authorization-code + PKCE needs no secret, and none is accepted or stored.
 struct PreconfiguredClient {
-    auth_server: String,
     client_id: String,
-    client_secret: Option<String>,
-    token_endpoint_auth_method: String,
 }
 ```
 
 `read_all_configs` classifies each `mcpServers` entry into a variant
-(REQ-MCP-001). The JSON shape of an HTTP entry is `{"type": "http", "url":
-..., "headers": {...}, "auth": ...}` where `auth` is absent (`HttpAuth::None`),
-`{"bearer": "<token>"}` or `{"headers": {...}}` (the two `StaticCred` shapes),
-or `{"oauth": true}` / `{"oauth": {...}}` (`HttpAuth::OAuth`). The `oauth`
-object pre-configures a client for a DCR-less authorization server:
-`auth_server` + `client_id` are required together, `client_secret` and
-`token_endpoint_auth_method` (default `none`) optional -- a partial
-pre-configured client skips the server rather than falling back to the DCR the
-user said is unavailable. An entry whose `auth` has an unrecognized shape is
-skipped at `debug` rather than downgraded to no-auth -- silently dropping an
-intended credential would change which authorization path a 401 takes. Crucially, presence of the generic `headers` map alone does
-**not** make a server `Static`: only an explicit auth credential
-(`StaticCred`) does. So three cases are distinct: a header-authed internal
-server (`Static(Headers)`) whose rejected key yields `StaticAuthRejected`; an
-OAuth server that *also* needs a non-auth header (the header rides every request
-under `OAuth` while the 401 still drives the flow); and an OAuth server behind a
-DCR-less authorization server (`OAuth(Some(PreconfiguredClient))`). A config
-`OAuth` server is **not** materialized pre-authorized: unless a usable stored
-token exists, it starts with no credential (`auth_scheme = none` in
-`mcp.allium`) and the `PreconfiguredClient` only seeds the registration row, so
-the first 401 runs `OAuthRequired → discovering → OAuthClientReused` (skipping
-DCR) rather than being stuck classified as already-authorized. The reload
-reconciler compares configs with `PartialEq` to decide unchanged-vs-restart; the
-comparison extends to the HTTP variant so a changed URL, header set, or auth
-scheme triggers a restart (`reload_from_configs`, REQ-MCP-015).
+(REQ-MCP-001). The JSON shape of an HTTP entry is `{"type": "http", "url": ...,
+"headers": {...}, "auth": ..., "oauth": ...}`. An explicit static credential
+under `auth` -- `{"bearer": "<token>"}` or `{"headers": {...}}`, the two
+`StaticCred` shapes -- wins; otherwise the sibling top-level `oauth` field
+(Claude Code's shape) selects `HttpAuth::OAuth`; otherwise `HttpAuth::None`.
+`oauth: true`, or an object without `clientId`, selects OAuth with a
+dynamically registered client; an object carrying `clientId` pre-configures a
+**public** client identity (`OAuth(Some(PreconfiguredClient))`) for a DCR-less
+authorization server. Claude-Code-only fields (`callbackPort`,
+`authServerMetadataUrl`, `scopes`) are accepted but `callbackPort` is ignored:
+Phoenix receives the redirect on its own server route, not a throwaway
+localhost listener. **No client secret is read from config or anywhere else**
+-- the flow is authorization-code + PKCE, a public client. An `auth` object
+with an unrecognized shape is skipped at `debug` rather than downgraded to
+no-auth -- silently dropping an intended credential would change which
+authorization path a 401 takes.
+Crucially, presence of the generic `headers` map alone does **not** make a
+server `Static`: only an explicit auth credential (`StaticCred`) does. So three
+cases are distinct: a header-authed internal server (`Static(Headers)`) whose
+rejected key yields `StaticAuthRejected`; an OAuth server that *also* needs a
+non-auth header (the header rides every request under `OAuth` while the 401
+still drives the flow); and an OAuth server behind a DCR-less authorization
+server (`OAuth(Some(PreconfiguredClient))`). A config `OAuth` server is **not**
+materialized pre-authorized: unless a usable stored token exists, it starts
+with no credential (`auth_scheme = none` in `mcp.allium`), and the
+`PreconfiguredClient` seeds the registration row only once discovery resolves
+the issuer the config could not name, so the first 401 runs `OAuthRequired →
+discovering → OAuthClientReused` (skipping DCR) rather than being stuck
+classified as already-authorized. The reload reconciler compares configs with
+`PartialEq` to decide unchanged-vs-restart; the comparison extends to the HTTP
+variant so a changed URL, header set, auth scheme, or pre-configured `client_id`
+triggers a restart (`reload_from_configs`, REQ-MCP-015).
 
 The `Skipping HTTP transport` branch in `read_all_configs` is removed: HTTP
 entries become `Http` configs instead of being dropped.

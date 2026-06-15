@@ -3571,13 +3571,10 @@ mod tests {
 
         let manager = Arc::new(McpClientManager::new());
         manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
-        // Configured with a trailing slash the metadata issuer does not have:
-        // issuer normalization must still resolve the seeded registration.
+        // The authorization server is discovered from the resource metadata;
+        // the pre-configured client is seeded under that issuer post-discovery.
         let auth = HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
-            auth_server: format!("{}/", server.base()),
             client_id: "pre-1".to_string(),
-            client_secret: None,
-            token_endpoint_auth_method: "none".to_string(),
         }));
         connect_http_managed(&manager, &server, auth)
             .await
@@ -3761,57 +3758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confidential_basic_client_authenticates_without_body_client_id() {
-        let server = TestServer::start(vec![]).await;
-        server.push_responses(vec![unauthorized(&server)]);
-        install_oauth_discovery(&server, false);
-        server.route("/token", token_response("at-1", None, None));
-
-        let manager = Arc::new(McpClientManager::new());
-        manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
-        let auth = HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
-            auth_server: server.base(),
-            client_id: "conf-1".to_string(),
-            client_secret: Some("s3cret".to_string()),
-            token_endpoint_auth_method: "client_secret_basic".to_string(),
-        }));
-        connect_http_managed(&manager, &server, auth)
-            .await
-            .err()
-            .expect("connect blocks on authorization");
-
-        let auth_url = pending_auth_url(&manager).await.expect("pending url");
-        let state = query_params(&auth_url).get("state").unwrap().clone();
-        server.push_responses(handshake_responses("sess-1"));
-        manager
-            .complete_oauth_authorization(&state, "code-1", Some(&server.base()))
-            .await
-            .expect("authorization completes");
-
-        // Exactly one client-authentication method (RFC 6749 §2.3.1): HTTP
-        // Basic carries the identity; the body must not duplicate it.
-        let requests = server.requests.lock().unwrap();
-        let token_request = requests
-            .iter()
-            .find(|r| r.path() == "/token")
-            .expect("token request");
-        let authorization = token_request
-            .header("authorization")
-            .expect("basic auth header");
-        assert!(authorization.starts_with("Basic "), "got: {authorization}");
-        let form = parse_form(&token_request.body);
-        assert!(
-            !form.contains_key("client_id"),
-            "body client_id must be absent"
-        );
-        assert!(
-            !form.contains_key("client_secret"),
-            "body secret must be absent"
-        );
-    }
-
-    #[tokio::test]
-    async fn reload_auth_server_repin_discards_the_stored_token() {
+    async fn reload_client_id_change_discards_the_stored_token() {
         let server = TestServer::start(handshake_responses("sess-1")).await;
         let manager = Arc::new(McpClientManager::new());
         manager
@@ -3826,19 +3773,16 @@ mod tests {
             ))
             .await
             .unwrap();
-        let preconfigured = |auth_server: String| McpServerConfig::Http {
+        let preconfigured = |client_id: &str| McpServerConfig::Http {
             url: server.url.clone(),
             headers: HashMap::new(),
             auth: HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
-                auth_server,
-                client_id: "cid-1".to_string(),
-                client_secret: None,
-                token_endpoint_auth_method: "none".to_string(),
+                client_id: client_id.to_string(),
             })),
         };
         let mcp = McpClientManager::connect_one(
             "remote",
-            &preconfigured("https://as-one.example".to_string()),
+            &preconfigured("cid-1"),
             Arc::clone(&manager.pending_oauth_urls),
             Arc::clone(&manager.oauth),
         )
@@ -3850,17 +3794,14 @@ mod tests {
             .await
             .insert("remote".to_string(), mcp);
 
-        // Same URL, different pinned authorization server: the token was
-        // minted under the old issuer and must not restore against the new
-        // one (ReloadInvalidatesOAuth). The restarted handshake therefore
-        // runs unauthenticated.
+        // Same URL, different pre-configured client_id: the token was minted
+        // under the old client identity and must not restore under the new one
+        // (ReloadInvalidatesOAuth). The restarted handshake therefore runs
+        // unauthenticated.
         server.push_responses(vec![delete_ack()]);
         server.push_responses(handshake_responses("sess-2"));
         let result = manager
-            .reload_from_configs(vec![(
-                "remote".to_string(),
-                preconfigured("https://as-two.example".to_string()),
-            )])
+            .reload_from_configs(vec![("remote".to_string(), preconfigured("cid-2"))])
             .await;
 
         assert_eq!(result.restarted, vec!["remote"]);
@@ -3872,7 +3813,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "a re-pinned authorization server must discard the stored token"
+            "a changed pre-configured client_id must discard the stored token"
         );
         let requests = server.requests.lock().unwrap();
         let last_init = requests

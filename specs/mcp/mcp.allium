@@ -166,13 +166,14 @@ rule ServerDiscovered {
         -- auth_scheme = static ONLY when an explicit auth credential (bearer
         -- token or auth header) is configured; generic per-request headers (org
         -- id, beta flag) do NOT imply static and must not preempt OAuth -- they
-        -- ride every request under any scheme. A config OAuth entry is NOT
-        -- pre-authorized: it materializes auth_scheme = none and (when it
-        -- carries a pre-configured client) seeds an OAuthRegistration so the
-        -- first 401 enters OAuthRequired -> discovering -> OAuthClientReused,
-        -- skipping DCR. Absent a credential the scheme is none, so a 401 drives
-        -- the OAuth flow. start_background_discovery / connect_one then spawns
-        -- or connects (REQ-MCP-001).
+        -- ride every request under any scheme. OAuth is selected by the
+        -- top-level oauth field (Claude Code's shape), not under auth. A config
+        -- OAuth entry is NOT pre-authorized: it materializes auth_scheme =
+        -- none, so the first 401 drives the OAuth flow. A pre-configured client
+        -- (oauth.clientId) is not seeded here: the authorization server is not
+        -- named in config, so seeding waits until discovery resolves the issuer
+        -- (OAuthClientPreconfigured). start_background_discovery / connect_one
+        -- then spawns or connects (REQ-MCP-001).
 }
 
 -- Discovery of an HTTP server that has no config credential but DOES have a
@@ -202,23 +203,6 @@ rule ServerDiscoveredWithStoredToken {
         -- is loaded from the persisted token; refresh/step-up proceed normally.
 }
 
--- A config OAuth entry carrying a pre-configured client (for a DCR-less
--- authorization server) seeds its OAuthRegistration at discovery, so the later
--- 401 -> registering finds has_registration(srv) = true and OAuthClientReused
--- skips DCR instead of attempting (and failing) registration (REQ-MCP-010).
--- Fires alongside ServerDiscovered; idempotent per authorization server.
-rule PreconfiguredClientSeeded {
-    when: ConfigServerDiscovered(name, transport, auth_scheme)
-
-    requires: has_preconfigured_client(name)
-
-    ensures: OAuthRegistration.created(
-        auth_server: preconfigured_auth_server(name),
-        client_id: preconfigured_client_id(name),
-        client_secret: preconfigured_client_secret(name),
-        token_endpoint_auth_method: preconfigured_auth_method(name)
-    )
-}
 
 -- A stdio server completes initialize + first tools/list and is ready.
 -- Covers both first connect and post-respawn reconnect.
@@ -360,6 +344,11 @@ rule OAuthRequired {
     @guidance
         -- 401 + WWW-Authenticate -> Protected Resource Metadata (RFC 9728)
         -- -> Authorization Server Metadata (RFC 8414). REQ-MCP-009.
+        -- An authorization server reached via the resource's advertised
+        -- authorization_servers list is trusted to declare its own issuer:
+        -- accept metadata whose issuer differs from the fetch URL (rejecting
+        -- only metadata with no issuer), and key the registration by the
+        -- declared issuer. A directly-named issuer keeps exact equality.
 }
 
 -- A 401 on a server using static config credentials is a hard failure --
@@ -383,7 +372,8 @@ rule OAuthMetadataResolved {
 }
 
 -- A client identity already exists for this server's authorization server
--- (pre-configured or previously registered): reuse it and prompt the user.
+-- (cached from a prior registration, possibly shared with another resource):
+-- reuse it and prompt the user.
 rule OAuthClientReused {
     when: OAuthClientResolved(srv)
 
@@ -394,13 +384,38 @@ rule OAuthClientReused {
     ensures: srv.pending_auth_url = authorization_url(srv)
 }
 
--- No client identity for this authorization server: acquire one (DCR as the
--- fallback), persist it keyed by the authorization server, prompt the user.
+-- No cached registration, but the config carries a pre-configured public
+-- client (oauth.clientId): now that discovery has resolved the issuer the
+-- config did not name, seed the OAuthRegistration under it with the client_id
+-- from config, no secret, and no token-endpoint client authentication (the
+-- authorization-code + PKCE flow needs none). Prefer this over DCR
+-- (REQ-MCP-010).
+rule OAuthClientPreconfigured {
+    when: OAuthClientResolved(srv)
+
+    requires: srv.oauth_phase = registering
+    requires: not has_registration(srv)
+    requires: has_preconfigured_client(srv)
+
+    ensures: OAuthRegistration.created(
+        auth_server: auth_server_of(srv),
+        client_id: preconfigured_client_id(srv),
+        client_secret: null,
+        token_endpoint_auth_method: "none"
+    )
+    ensures: srv.oauth_phase = awaiting_user
+    ensures: srv.pending_auth_url = authorization_url(srv)
+}
+
+-- No cached registration and no pre-configured client: acquire one via RFC
+-- 7591 dynamic client registration, persist it keyed by the authorization
+-- server, prompt the user.
 rule OAuthClientRegistered {
     when: OAuthClientResolved(srv)
 
     requires: srv.oauth_phase = registering
     requires: not has_registration(srv)
+    requires: not has_preconfigured_client(srv)
 
     ensures: OAuthRegistration.created(
         auth_server: auth_server_of(srv),
@@ -412,13 +427,14 @@ rule OAuthClientRegistered {
     ensures: srv.pending_auth_url = authorization_url(srv)
 
     @guidance
-        -- Client identity preference: pre-configured / cached registration
-        -- (keyed by authorization server) -> Client ID Metadata Document ->
-        -- RFC 7591 dynamic client registration as the fallback. Reused across
-        -- MCP servers sharing the authorization server (REQ-MCP-010). The
-        -- authorization URL carries the PKCE challenge (the client first
-        -- verifies code_challenge_methods_supported) and the RFC 8707 resource
-        -- indicator; the verifier is held for the token exchange (REQ-MCP-011).
+        -- Client identity preference: cached registration (keyed by
+        -- authorization server) -> pre-configured client (OAuthClientPreconfigured)
+        -- -> Client ID Metadata Document -> RFC 7591 dynamic client registration
+        -- as the fallback. Reused across MCP servers sharing the authorization
+        -- server (REQ-MCP-010). The authorization URL carries the PKCE challenge
+        -- (the client first verifies code_challenge_methods_supported) and the
+        -- RFC 8707 resource indicator; the verifier is held for the token
+        -- exchange (REQ-MCP-011).
 }
 
 -- The operator completed the browser authorization; exchange the code for
@@ -814,17 +830,14 @@ invariant OneTokenPerServer {
 --   table). Read at discovery/reload-add so a server disabled before a restart
 --   stays disabled (REQ-MCP-016).
 --
--- has_preconfigured_client(name): Bool
---   True iff `name`'s config is OAuth carrying a pre-configured client
---   (HttpAuth::OAuth(Some(PreconfiguredClient))).
+-- has_preconfigured_client(srv): Bool
+--   True iff srv's config is OAuth carrying a pre-configured public client
+--   (HttpAuth::OAuth(Some(PreconfiguredClient)) -- the oauth.clientId shape).
 --
--- preconfigured_auth_server(name): String
--- preconfigured_client_id(name): String
--- preconfigured_client_secret(name): String?
--- preconfigured_auth_method(name): String
---   The pre-configured client fields from `name`'s config, seeded into an
---   OAuthRegistration so a DCR-less authorization server is reused, not
---   re-registered (REQ-MCP-010).
+-- preconfigured_client_id(srv): String
+--   The clientId from srv's config. Seeded into the OAuthRegistration (with no
+--   secret) so a DCR-less authorization server is reused, not re-registered
+--   (REQ-MCP-010).
 --
 -- granted_scopes(srv, code): List<String>
 --   The scope set the authorization server granted in the token response for

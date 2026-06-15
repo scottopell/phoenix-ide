@@ -295,6 +295,24 @@ pub struct ProtectedResourceMetadata {
     pub scopes_supported: Vec<String>,
 }
 
+/// How strictly the advertised `issuer` in fetched Authorization Server
+/// Metadata must match the URL the metadata was fetched from (RFC 8414 §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssuerTrust {
+    /// The fetch URL is the issuer's own identifier: the advertised `issuer`
+    /// MUST equal it. This is the RFC 8414 §3.3 / RFC 9207 mix-up defense for
+    /// an issuer named directly (an operator-pinned authorization server).
+    Strict,
+    /// The fetch URL came from the resource's own Protected Resource Metadata
+    /// `authorization_servers` list — a hop already trusted by virtue of the
+    /// resource being configured. Accept the metadata's self-declared `issuer`
+    /// even when it differs from that URL: some providers serve their
+    /// authorization server metadata from the resource host while issuing
+    /// under a parent domain. The declared issuer (not the fetch URL) becomes
+    /// the registration key and flow issuer.
+    ResourceAdvertised,
+}
+
 /// Authorization Server Metadata (RFC 8414 / OIDC discovery): the endpoints
 /// the flow drives plus the capability flags it dispatches on.
 #[derive(Debug, Clone)]
@@ -450,17 +468,53 @@ fn as_metadata_candidates(issuer: &str) -> Vec<String> {
     }
 }
 
+/// Outcome of validating a fetched metadata document's `issuer` against the
+/// URL it was fetched from, under a given [`IssuerTrust`].
+#[derive(Debug, PartialEq, Eq)]
+enum IssuerCheck {
+    /// Advertised issuer present and equal to the fetch URL.
+    Ok,
+    /// Advertised issuer present but differs from the fetch URL, accepted
+    /// because the fetch URL was resource-advertised (a trusted hop).
+    Accepted,
+    /// The candidate must be skipped, with this reason.
+    Rejected(String),
+}
+
+/// Decide whether a fetched metadata document's advertised `issuer` is usable
+/// for a fetch from `fetch_url`. An empty advertised issuer is always rejected
+/// (it cannot key a registration); a mismatch is rejected under
+/// [`IssuerTrust::Strict`] (RFC 8414 §3.3) and accepted under
+/// [`IssuerTrust::ResourceAdvertised`].
+fn check_advertised_issuer(advertised: &str, fetch_url: &str, trust: IssuerTrust) -> IssuerCheck {
+    if advertised.is_empty() {
+        return IssuerCheck::Rejected("metadata declares no issuer".to_string());
+    }
+    if advertised.trim_end_matches('/') == fetch_url.trim_end_matches('/') {
+        return IssuerCheck::Ok;
+    }
+    match trust {
+        IssuerTrust::Strict => IssuerCheck::Rejected(format!(
+            "issuer '{advertised}' does not match '{fetch_url}'"
+        )),
+        IssuerTrust::ResourceAdvertised => IssuerCheck::Accepted,
+    }
+}
+
 /// Fetch and validate the Authorization Server Metadata for `issuer`
 /// (REQ-MCP-009), refusing an authorization server that does not advertise
 /// S256 PKCE support (REQ-MCP-011) — better to fail here than after the
-/// browser round trip.
+/// browser round trip. `trust` governs whether the advertised `issuer` must
+/// equal the fetch URL (see [`IssuerTrust`]).
 ///
 /// # Errors
-/// Returns a display string when no candidate yields usable metadata, the
-/// advertised issuer mismatches, or PKCE support is absent.
+/// Returns a display string when no candidate yields usable metadata, a
+/// [`IssuerTrust::Strict`] issuer mismatches, the advertised issuer is empty,
+/// or PKCE support is absent.
 pub async fn fetch_auth_server_metadata(
     client: &reqwest::Client,
     issuer: &str,
+    trust: IssuerTrust,
 ) -> Result<AuthServerMetadata, String> {
     let candidates = as_metadata_candidates(issuer);
     if candidates.is_empty() {
@@ -478,11 +532,20 @@ pub async fn fetch_auth_server_metadata(
         };
 
         let advertised_issuer = doc.get("issuer").and_then(Value::as_str).unwrap_or("");
-        if advertised_issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
-            errors.push(format!(
-                "{candidate}: issuer '{advertised_issuer}' does not match '{issuer}'"
-            ));
-            continue;
+        match check_advertised_issuer(advertised_issuer, issuer, trust) {
+            IssuerCheck::Ok => {}
+            IssuerCheck::Accepted => {
+                tracing::debug!(
+                    fetched_from = %candidate,
+                    advertised_issuer = %advertised_issuer,
+                    "authorization server metadata declares an issuer differing from its \
+                     resource-advertised location; accepting the declared issuer"
+                );
+            }
+            IssuerCheck::Rejected(reason) => {
+                errors.push(format!("{candidate}: {reason}"));
+                continue;
+            }
         }
 
         let (Some(authorization_endpoint), Some(token_endpoint)) = (
@@ -902,6 +965,64 @@ mod tests {
             normalize_issuer("https://as.example/tenant/"),
             "https://as.example/tenant"
         );
+    }
+
+    #[test]
+    fn advertised_issuer_strict_requires_exact_match() {
+        // A trailing-slash difference is not a mismatch.
+        assert_eq!(
+            check_advertised_issuer(
+                "https://as.example/",
+                "https://as.example",
+                IssuerTrust::Strict
+            ),
+            IssuerCheck::Ok
+        );
+        // A genuine mismatch is rejected under Strict (RFC 8414 §3.3 mix-up
+        // defense) — the path a directly-named authorization server takes.
+        assert!(matches!(
+            check_advertised_issuer(
+                "https://slack.com",
+                "https://mcp.slack.com",
+                IssuerTrust::Strict
+            ),
+            IssuerCheck::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn advertised_issuer_resource_advertised_accepts_mismatch() {
+        // The resource pointed us here, so the metadata's self-declared issuer
+        // is accepted even when it differs from the fetch URL (Slack serves AS
+        // metadata from mcp.slack.com but issues under slack.com).
+        assert_eq!(
+            check_advertised_issuer(
+                "https://slack.com",
+                "https://mcp.slack.com",
+                IssuerTrust::ResourceAdvertised
+            ),
+            IssuerCheck::Accepted
+        );
+        // An exact match is still the unremarkable Ok, not Accepted.
+        assert_eq!(
+            check_advertised_issuer(
+                "https://mcp.slack.com",
+                "https://mcp.slack.com",
+                IssuerTrust::ResourceAdvertised
+            ),
+            IssuerCheck::Ok
+        );
+    }
+
+    #[test]
+    fn advertised_issuer_empty_always_rejected() {
+        // An absent issuer cannot key a registration, under either trust mode.
+        for trust in [IssuerTrust::Strict, IssuerTrust::ResourceAdvertised] {
+            assert!(matches!(
+                check_advertised_issuer("", "https://mcp.slack.com", trust),
+                IssuerCheck::Rejected(_)
+            ));
+        }
     }
 
     #[test]
