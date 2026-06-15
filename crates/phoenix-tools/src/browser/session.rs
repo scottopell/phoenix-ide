@@ -22,6 +22,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::WorkScope;
 
 /// Derive a Chrome user data dir from a `WorkScope::stable_key()`.
@@ -364,11 +365,11 @@ pub(crate) fn truncate_unicode_safe(s: String, max_bytes: usize) -> String {
     format!("{prefix}…")
 }
 
-/// Directory where the fetcher caches downloaded Chrome binaries. Exposed so
-/// the About-this-deployment endpoint can report this (known-large) cache path.
+/// Directory where the fetcher caches downloaded Chrome binaries. Resolved
+/// through [`PhoenixRuntimeEnvironment`] so it agrees with the path the
+/// deployment-info page reports.
 pub fn fetcher_cache_dir() -> PathBuf {
-    let base = std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from);
-    base.join(".cache/phoenix-ide/chromium")
+    PhoenixRuntimeEnvironment::detect().chromium_cache_dir()
 }
 
 impl BrowserSession {

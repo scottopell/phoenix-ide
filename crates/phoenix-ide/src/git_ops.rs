@@ -500,7 +500,10 @@ fn prepare_temp_index(worktree: &Path) -> Option<TempPath> {
         }
     };
     let real_index = git_dir.join("index");
-    let temp = std::env::temp_dir().join(format!("phoenix-git-index-{}", uuid::Uuid::new_v4()));
+    let temp = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+        .tmp_subdir("git-index")
+        .ok()?
+        .join(format!("idx-{}", uuid::Uuid::new_v4()));
     if real_index.exists() {
         std::fs::copy(&real_index, &temp).ok()?;
     } else {

@@ -202,6 +202,15 @@ impl PhoenixRuntimeEnvironment {
         self.data_dir().join("tmux-sockets")
     }
 
+    /// `temp_dir()/phoenix-ide` — the root for Phoenix scratch namespaces.
+    /// Prefer [`tmp_subdir`](Self::tmp_subdir), which validates the namespace
+    /// and creates the directory; this accessor is for callers that only need
+    /// the path (e.g. to build a child path they create themselves).
+    #[must_use]
+    pub fn tmp_root(&self) -> &Path {
+        &self.tmp_root
+    }
+
     /// `home/.cache/phoenix-ide/chromium` — Chrome-for-Testing download cache.
     #[must_use]
     pub fn chromium_cache_dir(&self) -> PathBuf {

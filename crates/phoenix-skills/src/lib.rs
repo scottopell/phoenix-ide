@@ -378,7 +378,11 @@ pub fn discover_skills_with_options(
     // Skip if the walk-up already passed through $HOME.
     let resolved_home = match home_override {
         Some(h) => Some(h.to_path_buf()),
-        None => std::env::var("HOME").ok().map(PathBuf::from),
+        None => Some(
+            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+                .home()
+                .to_path_buf(),
+        ),
     };
     if let Some(home) = resolved_home {
         for skill_subdir in SKILL_DIRS {

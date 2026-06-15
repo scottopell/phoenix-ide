@@ -266,7 +266,10 @@ pub fn set_winsize_raw(fd: RawFd, dims: Dims) -> Result<(), String> {
 ///
 /// Never inherits the API server's environment — prevents secret leakage.
 pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_owned());
+    let home = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+        .home()
+        .to_string_lossy()
+        .into_owned();
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "user".to_owned());

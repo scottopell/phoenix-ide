@@ -397,10 +397,14 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         // spawn path reads `$SHELL` from the same env, so this matches what
         // the user's shell will actually be.
         shell: std::env::var("SHELL").ok(),
-        // REQ-SEED-*: surface $HOME so the UI can spawn a seeded conversation
-        // scoped to the user's home directory (e.g. for shell integration
-        // setup).
-        home_dir: std::env::var("HOME").ok(),
+        // REQ-SEED-*: surface the home directory so the UI can spawn a seeded
+        // conversation scoped to it (e.g. for shell integration setup).
+        home_dir: Some(
+            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+                .home()
+                .to_string_lossy()
+                .into_owned(),
+        ),
         seed_parent_slug: None,
         parent_conversation_slug: None,
         // Default to `false`; callers that have access to `AppState` set
@@ -737,7 +741,9 @@ const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 const ATTACHMENT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 fn attachment_root() -> PathBuf {
-    std::env::temp_dir().join("phoenix-ide-attachments")
+    phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+        .tmp_root()
+        .join("attachments")
 }
 
 fn collect_file_paths_from_content(value: &serde_json::Value, paths: &mut HashSet<PathBuf>) {

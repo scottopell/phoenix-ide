@@ -55,10 +55,9 @@ proptest! {
         );
     }
 
-    /// TILDE-USER / UNSUPPORTED-TILDE ALWAYS FALSE: a `~user` target (`~`
-    /// followed by a non-`/` char) never matches any cwd. The `~user` branch
-    /// returns false outright, and with HOME unset every `~` path returns false
-    /// too — so this holds regardless of environment.
+    /// TILDE ALWAYS FALSE: any `~`-prefixed target never matches a cwd. This
+    /// crate does not expand `~` (it has no access to the resolved home), so
+    /// every tilde path — `~`, `~/x`, `~user` — is reported as not-matching.
     #[test]
     fn prop_tilde_user_never_matches(
         user in "[a-z]{1,8}",

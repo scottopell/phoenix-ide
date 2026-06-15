@@ -35,6 +35,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::WorkScope;
 
 use thiserror::Error;
@@ -42,9 +43,6 @@ use tokio::sync::{OnceCell, RwLock};
 
 use super::probe::{probe, ProbeResult};
 
-/// Default sub-directory under the Phoenix data dir for per-conversation
-/// tmux sockets (REQ-TMUX-001 / `TMUX_SOCKET_DIR`).
-const DEFAULT_SOCKET_SUBDIR: &str = "tmux-sockets";
 
 /// Default session name created on lazy spawn (REQ-TMUX-002 /
 /// `TMUX_DEFAULT_SESSION`).
@@ -893,19 +891,12 @@ pub async fn spawn_session(
     })
 }
 
-/// Default socket directory: `$PHOENIX_DATA_DIR/tmux-sockets/` if set,
-/// else `$HOME/.phoenix-ide/tmux-sockets/`, else
-/// `/tmp/phoenix-ide/tmux-sockets/` as a last resort.
+/// Default socket directory, resolved through [`PhoenixRuntimeEnvironment`]:
+/// `$PHOENIX_DATA_DIR/tmux-sockets/` if set, else
+/// `$HOME/.phoenix-ide/tmux-sockets/`, falling back to the system temp dir
+/// when no home is resolvable.
 fn default_socket_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("PHOENIX_DATA_DIR") {
-        return PathBuf::from(dir).join(DEFAULT_SOCKET_SUBDIR);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".phoenix-ide")
-            .join(DEFAULT_SOCKET_SUBDIR);
-    }
-    PathBuf::from("/tmp/phoenix-ide").join(DEFAULT_SOCKET_SUBDIR)
+    PhoenixRuntimeEnvironment::detect().tmux_socket_dir()
 }
 
 #[cfg(test)]

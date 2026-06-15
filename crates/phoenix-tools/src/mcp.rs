@@ -2724,8 +2724,9 @@ impl McpClientManager {
     /// Read all MCP config files in priority order, merging by server name
     /// (first-seen wins).
     fn read_all_configs() -> Vec<(String, McpServerConfig)> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let home = PathBuf::from(home);
+        let home = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+            .home()
+            .to_path_buf();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         let config_paths = [

@@ -81,11 +81,9 @@ pub async fn terminal_ws_global_handler(
 ) -> impl IntoResponse {
     let terminals = state.terminals.clone();
     let runtime = Arc::clone(&state.runtime);
-    // Global terminal spawns in $HOME — the only stable cwd that doesn't
-    // depend on any conversation or worktree. Falls back to "/" if $HOME
-    // is unset, matching the safety net the shell would apply.
-    let cwd = std::env::var_os("HOME")
-        .map_or_else(|| std::path::PathBuf::from("/"), std::path::PathBuf::from);
+    // Global terminal spawns in the home directory — the only stable cwd that
+    // doesn't depend on any conversation or worktree.
+    let cwd = state.runtime_env.home().to_path_buf();
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,

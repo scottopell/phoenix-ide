@@ -220,11 +220,12 @@ impl CommandTracker {
     }
 
     fn disk_path_for_seq(&self) -> String {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        format!(
-            "{}/.phoenix-ide/terminal-output/{}/{}.txt",
-            home, self.session_id, self.seq
-        )
+        phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+            .terminal_output_dir()
+            .join(&self.session_id)
+            .join(format!("{}.txt", self.seq))
+            .to_string_lossy()
+            .into_owned()
     }
 }
 

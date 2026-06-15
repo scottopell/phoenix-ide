@@ -223,26 +223,17 @@ fn is_cd_to_cwd_simple_command(command: &SimpleCommand, cwd: &str) -> bool {
 fn paths_match(target: &str, cwd: &str) -> bool {
     use std::path::Path;
 
-    // Handle ~ expansion (common in cd commands)
-    let target = if target.starts_with('~') {
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = home.to_string_lossy();
-            if target == "~" {
-                home.to_string()
-            } else if let Some(rest) = target.strip_prefix("~/") {
-                format!("{home}/{rest}")
-            } else {
-                // ~user syntax - don't try to expand
-                return false;
-            }
-        } else {
-            return false;
-        }
-    } else {
-        target.to_string()
-    };
+    // `~`-prefixed targets are not expanded: this is a display-only crate with
+    // no access to the resolved home directory (it deliberately depends on
+    // nothing), and resolving `$HOME` here would re-introduce the inline env
+    // read PhoenixRuntimeEnvironment centralizes. A `~` target is reported as
+    // not-matching, so `cd ~ && x` stays rendered verbatim rather than being
+    // stripped to `x` — the safe direction (keep, don't drop).
+    if target.starts_with('~') {
+        return false;
+    }
 
-    let target_path = Path::new(&target);
+    let target_path = Path::new(target);
     let cwd_path = Path::new(cwd);
 
     // If target is relative, resolve it against cwd
