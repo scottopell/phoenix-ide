@@ -92,7 +92,7 @@ value PrFeedbackFreshness {
 -- mistaken for fresh feedback.
 value PrFeedbackCoverageHealth {
     kind: PrFeedbackCoverageKind
-    surfaces: [PrFeedbackCoverageSurface]
+    surfaces: Set<PrFeedbackCoverageSurface>
 }
 
 value PrStatusView {
