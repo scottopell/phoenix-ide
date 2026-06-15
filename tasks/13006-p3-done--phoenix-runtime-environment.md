@@ -147,3 +147,38 @@ Surfaced during PR #57 review when `default_phoenix_auth_path` had to
 pick its own fallback; the reviewer noted that `default_auth_path` falls
 back differently. The right fix is structural (this task), not adding a
 warning on each new site that needs a path.
+
+## Implementation notes (deviations from the sketch)
+
+The codebase was split into ~10 crates after this task was filed, which
+changed two things from the sketch above:
+
+- **`PhoenixRuntimeEnvironment` lives in `phoenix-core`, not
+  `phoenix-ide`.** Its consumers (tools, terminal, skills, agents) are
+  now lower-level crates that `phoenix-ide` depends on, so the type has
+  to sit in the acyclic base crate everyone shares — as a sibling of
+  `platform::PlatformCapability`, which follows the same
+  detect-once-at-startup / thread-as-`Arc` pattern.
+- **`with_root` is gated behind phoenix-core's `test-support` feature**
+  (not `#[cfg(test)]`) so dependent crates can build a deterministic
+  environment in their own test builds.
+
+Two acceptance criteria were intentionally narrowed:
+
+- **The ast-grep rule bans `HOME`/`CODEX_HOME` reads only, not
+  `temp_dir()`.** Per-test scratch dirs (`std::env::temp_dir().join(..)`)
+  are pervasive and idiomatic across the crates; banning `temp_dir()`
+  wholesale would false-positive on them with no clean way to exclude
+  inline `#[cfg(test)]` code. Production `temp_dir()` reads (git index
+  copy, attachment root) were migrated regardless.
+- **The "About this deployment" page is the justifying consumer.** Its
+  on-disk-locations table now derives every path from the env instead of
+  re-deriving them from `$HOME`, so the page reports the locations the
+  process actually opens.
+
+Out-of-scope reads left as documented exceptions: `tls.rs`'s deep TLS-dir
+fallback (uses the bare `env::var_os` form), `bin/monitor.rs` (separate
+binary), `phoenix-bash-display`'s `cd ~` display heuristic (a
+dependency-free display crate — it now declines to expand `~` rather than
+re-read `$HOME`), and behaviour flags (`OPENAI_USE_CODEX_AUTH`, `$SHELL`,
+`$USER`/`$LOGNAME`/`$PATH`), which are not filesystem locations.
