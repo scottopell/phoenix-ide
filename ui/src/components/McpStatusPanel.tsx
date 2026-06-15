@@ -204,28 +204,34 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     <div className={`mcp-panel${expanded ? ' is-expanded' : ''}`}>
       {!reloading && pendingOAuth.map(s => (
         <div key={s.name} className="mcp-oauth-banner">
-          <span className="mcp-oauth-label">Auth required:</span>
-          <a
-            href={s.pending_oauth_url}
-            target="_blank"
-            rel="noreferrer"
-            className="mcp-oauth-link"
-          >
-            {s.name} &rarr; sign in
-          </a>
+          <div className="mcp-banner-head">
+            <span className="mcp-oauth-label">Auth required</span>
+            <span className="mcp-banner-name">{s.name}</span>
+            <a
+              href={s.pending_oauth_url}
+              target="_blank"
+              rel="noreferrer"
+              className="mcp-oauth-link"
+            >
+              Sign in &rarr;
+            </a>
+          </div>
           {s.auth_redirect_warning && (
-            <span className="mcp-oauth-warning" title={s.auth_redirect_warning}>
+            <div className="mcp-oauth-warning">
               &#9888; {s.auth_redirect_warning}
-            </span>
+            </div>
           )}
         </div>
       ))}
       {!reloading && failedServers.map(s => (
         <div key={s.name} className="mcp-error-banner">
-          <span className="mcp-error-label">Failed:</span>
-          <span className="mcp-error-text" title={s.last_error}>
-            {s.name} &mdash; {s.last_error ?? 'connection failed'}
-          </span>
+          <div className="mcp-banner-head">
+            <span className="mcp-error-label">Failed</span>
+            <span className="mcp-banner-name">{s.name}</span>
+          </div>
+          <div className="mcp-error-text">
+            {s.last_error ?? 'connection failed'}
+          </div>
         </div>
       ))}
       <button className="mcp-panel-header" onClick={() => setExpanded(!expanded)}>
@@ -281,16 +287,6 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
                   <span className={`mcp-server-name ${!server.enabled ? 'mcp-name-disabled' : ''}`}>
                     {server.name}
                   </span>
-                  <span className="mcp-server-meta">
-                    {server.transport}{server.auth !== 'none' ? ` · ${server.auth}` : ''}
-                  </span>
-                  <span className="mcp-server-count">
-                    {server.state === 'failed'
-                      ? <span className="mcp-state-failed">failed</span>
-                      : server.state === 'unauthorized'
-                        ? <span className="mcp-auth-needed">auth needed</span>
-                        : `${server.tool_count} tool${server.tool_count !== 1 ? 's' : ''}`}
-                  </span>
                   <span
                     className={`mcp-server-toggle ${server.enabled ? 'on' : 'off'} ${togglingServers.has(server.name) ? 'toggling' : ''}`}
                     role="button"
@@ -310,6 +306,18 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
                     }}
                   >
                     {server.enabled ? '\u25CF' : '\u25CB'}
+                  </span>
+                  <span className="mcp-server-substatus">
+                    <span className="mcp-server-meta">
+                      {server.transport}{server.auth !== 'none' ? ` \u00B7 ${server.auth}` : ''}
+                    </span>
+                    <span className="mcp-server-state">
+                      {server.state === 'failed'
+                        ? <span className="mcp-state-failed">failed</span>
+                        : server.state === 'unauthorized'
+                          ? <span className="mcp-auth-needed">auth needed</span>
+                          : `${server.tool_count} tool${server.tool_count !== 1 ? 's' : ''}`}
+                    </span>
                   </span>
                 </button>
                 {expandedServers.has(server.name) && (

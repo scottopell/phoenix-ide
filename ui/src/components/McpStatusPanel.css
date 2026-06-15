@@ -116,6 +116,7 @@
 
 .mcp-server-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 4px;
   width: 100%;
@@ -144,9 +145,33 @@
 }
 
 .mcp-server-name {
+  flex: 1 1 auto;
+  min-width: 0;
   font-weight: 500;
   color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   transition: color 200ms ease;
+}
+
+/* Second row of a server item: transport · auth on the left, the
+ * state pill (tool count / auth needed / failed) on the right. Its
+ * flex-basis:100% forces it below the name+toggle row so a narrow
+ * sidebar never wraps "auth needed" mid-phrase. */
+.mcp-server-substatus {
+  flex: 1 0 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding-left: 12px;
+}
+
+.mcp-server-state {
+  margin-left: auto;
+  white-space: nowrap;
+  flex-shrink: 0;
+  color: var(--text-muted);
 }
 
 .mcp-server-name.mcp-name-disabled {
@@ -154,10 +179,6 @@
   color: var(--text-muted);
 }
 
-.mcp-server-count {
-  color: var(--text-muted);
-  margin-left: auto;
-}
 
 .mcp-server-toggle {
   display: inline-flex;
@@ -221,26 +242,58 @@
   color: var(--color-warning, #f5a623);
 }
 
-.mcp-oauth-banner {
+/* Actionable alert banners stack vertically: a head line (label + server
+ * + action) and a wrapping detail line below. The detail is the part the
+ * operator must read (the authorize-link warning, the failure cause), so it
+ * wraps to full readability instead of truncating in a narrow sidebar. */
+.mcp-oauth-banner,
+.mcp-error-banner {
   display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  background: var(--color-warning-bg, rgb(255 193 7 / 12%));
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border-color);
   font-size: 12px;
 }
 
-.mcp-oauth-label {
+.mcp-oauth-banner {
+  background: var(--color-warning-bg, rgb(255 193 7 / 12%));
+}
+
+/* Failed-connection banner: red, vs the yellow auth banner (REQ-MCP-018). */
+.mcp-error-banner {
+  background: var(--color-error-bg, rgb(244 67 54 / 12%));
+}
+
+.mcp-banner-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.mcp-banner-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-oauth-label,
+.mcp-error-label {
   color: var(--text-muted);
   flex-shrink: 0;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.04em;
 }
 
 .mcp-oauth-link {
+  margin-left: auto;
+  flex-shrink: 0;
   color: var(--color-warning, #f5a623);
+  font-weight: 600;
   text-decoration: none;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -248,37 +301,20 @@
   text-decoration: underline;
 }
 
-/* The OAuth redirect-unreachable diagnostic, shown next to the doomed
+/* The OAuth redirect-unreachable diagnostic, shown beneath the doomed
    authorize link (REQ-MCP-020). */
 .mcp-oauth-warning {
   color: var(--color-warning, #f5a623);
   font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Failed-connection banner: red, vs the yellow auth banner (REQ-MCP-018). */
-.mcp-error-banner {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  background: var(--color-error-bg, rgb(244 67 54 / 12%));
-  border-bottom: 1px solid var(--border-color);
-  font-size: 12px;
-}
-
-.mcp-error-label {
-  color: var(--text-muted);
-  flex-shrink: 0;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .mcp-error-text {
   color: var(--color-error, #f44336);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .mcp-failed-count {
@@ -293,7 +329,9 @@
 .mcp-server-meta {
   color: var(--text-muted);
   font-size: 11px;
-  margin-left: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mcp-server-error {
