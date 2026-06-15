@@ -460,6 +460,7 @@ fn clone_dir_children(src: &Path, dst: &Path) -> Result<(), CloneDirError> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn is_lock_or_pid_file(path: &Path) -> bool {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
