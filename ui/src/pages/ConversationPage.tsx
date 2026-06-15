@@ -1099,6 +1099,7 @@ function ConversationPageContent() {
         onCancelSteering={handleCancelSteering}
         onOpenFile={handleOpenFileFromPatch}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
+        workScopeKey={conversation.work_scope_key}
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}

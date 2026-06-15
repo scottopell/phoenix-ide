@@ -11663,6 +11663,20 @@ html * {
   color: var(--text-primary);
 }
 
+.bash-inspect {
+  border: none;
+  background: transparent;
+  color: var(--accent-blue, #4299e1);
+  font: inherit;
+  font-weight: 600;
+  padding: 0;
+  cursor: pointer;
+}
+
+.bash-inspect:hover {
+  text-decoration: underline;
+}
+
 .bash-label {
   padding: 1px 6px;
   border-radius: 3px;

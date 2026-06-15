@@ -28,6 +28,7 @@ import { useIsDesktop } from '../hooks';
 import { useDensity, isSignificantText } from '../hooks/useDensity';
 import { useConversationInlineStream, type InlineStreamState } from '../hooks/useConversationInlineStream';
 import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
+import { useViewerSlot } from '../contexts/ViewerSlotContext';
 
 import { linkifyText } from '../utils/linkify';
 import { CopyButton } from './CopyButton';
@@ -829,6 +830,7 @@ interface AgentMessageProps {
   toolResults: ReadonlyMap<string, Message>;
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   filePathRootDir?: string | undefined;
+  workScopeKey?: string | undefined;
   /**
    * When false, suppresses the "Phoenix HH:MM" header row. Used by the list
    * to collapse repeated headers across a run of consecutive agent messages
@@ -840,7 +842,7 @@ interface AgentMessageProps {
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, isFirstInTurn = true }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, isFirstInTurn = true }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
   const { theme } = useTheme();
@@ -1069,6 +1071,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, i
                   block={block}
                   result={toolResults.get(block.id || '')}
                   onOpenFile={onOpenFile}
+                  workScopeKey={workScopeKey}
                   toolStartedAtMs={toolStartedAtMs}
                 />
               );
@@ -1133,6 +1136,7 @@ interface ToolUseBlockProps {
   block: ContentBlock;
   result: Message | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  workScopeKey?: string | undefined;
   /** Server-clock unix ms when the runtime began dispatching this
    *  tool — sourced from the parent assistant message's
    *  `display_data.tool_starts[block.id]` (REQ-WPV-002). When present
@@ -1172,11 +1176,25 @@ function tryParseJson(text: string): Record<string, unknown> | null {
   return null;
 }
 
+function BashInspectButton({ workScopeKey, handle }: { workScopeKey: string; handle: string }) {
+  const { openInspect } = useViewerSlot();
+  return (
+    <button
+      type="button"
+      className="bash-inspect"
+      onClick={() => openInspect(workScopeKey, handle)}
+      title="Open the process inspector for this handle"
+    >
+      inspect →
+    </button>
+  );
+}
+
 // REQ-BASH-002 / REQ-BASH-003 / REQ-BASH-006: render the typed bash tool
 // response. Renders a status pill, optional kill-pending badge, the line
 // tail, and (when present) the agent-supplied `label` so concurrent
 // handles are distinguishable at a glance.
-function BashResponseView({ response }: { response: Record<string, unknown> }) {
+function BashResponseView({ response, workScopeKey }: { response: Record<string, unknown>; workScopeKey?: string | undefined }) {
   // Error envelope branch (REQ-BASH-008): `error` field present.
   if (typeof response['error'] === 'string') {
     return <BashErrorView response={response} />;
@@ -1222,6 +1240,7 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
                       : status}
         </span>
         {handle && <span className="bash-handle">{handle}</span>}
+        {handle && workScopeKey && <BashInspectButton workScopeKey={workScopeKey} handle={handle} />}
         {label && <span className="bash-label" title="agent-supplied handle label">{label}</span>}
         {(isExited || isTombstone) && exitCode !== undefined && exitCode !== null && (
           <span className="bash-exit-code">exit code {String(exitCode)}</span>
@@ -1638,7 +1657,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, toolStartedAtMs }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -1849,7 +1868,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
               />
             </div>
           ) : bashResponse ? (
-            <BashResponseView response={bashResponse} />
+            <BashResponseView response={bashResponse} workScopeKey={workScopeKey} />
           ) : tmuxResponse ? (
             <TmuxResponseView response={tmuxResponse} />
           ) : name === 'browser_profile' &&

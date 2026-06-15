@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { SubAgentStatus, AgentMessage, UserMessage } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu } from './MessageContextMenu';
@@ -9,6 +9,7 @@ import { api, ConflictError, type ConversationState, type Message, type ForkProp
 import { copyToClipboard } from '../utils/clipboard';
 import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposalsContext';
 import { ForkProposalReview } from './ForkProposalReview';
+import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 
 vi.mock('../utils/clipboard', () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
@@ -40,6 +41,11 @@ function agentMessage(messageId: string, blocks: unknown[], sequenceId = 1): Mes
     display_data: null,
     created_at: '2026-01-01T00:00:00Z',
   };
+}
+
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location-search">{location.search}</div>;
 }
 
 function toolMessage(toolUseId: string, content: string, sequenceId = 2): Message {
@@ -518,6 +524,68 @@ describe('finalized code fence highlighting', () => {
   });
 });
 
+describe('bash tool inspector affordance', () => {
+  const bashToolUse = { type: 'tool_use', id: 'tool-bash', name: 'bash', input: { op: 'run', cmd: 'sleep 60' } };
+
+  function bashResult(response: Record<string, unknown>) {
+    return toolMessage('tool-bash', JSON.stringify(response));
+  }
+
+  it('opens the process inspector for a structured bash result handle', async () => {
+    render(
+      <MemoryRouter initialEntries={['/c/test-conv']}>
+        <ViewerSlotProvider scopeKey="test-conv" browserSessionActive={false}>
+          <AgentMessage
+            message={agentMessage('agent-msg-bash', [bashToolUse])}
+            toolResults={new Map([['tool-bash', bashResult({ status: 'running', handle: 'b-17', lines: [] })]])}
+            onOpenFile={undefined}
+            workScopeKey="ws-test-123"
+          />
+          <LocationProbe />
+        </ViewerSlotProvider>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'inspect →' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location-search')).toHaveTextContent(
+        '?viewer=inspect&scope=ws-test-123&handle=b-17',
+      );
+    });
+  });
+
+  it('does not render inspect without a work scope key', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-bash', [bashToolUse])}
+          toolResults={new Map([['tool-bash', bashResult({ status: 'running', handle: 'b-17', lines: [] })]])}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByRole('button', { name: 'inspect →' })).not.toBeInTheDocument();
+  });
+
+  it('does not render inspect when the bash response has no handle', () => {
+    render(
+      <MemoryRouter>
+        <ViewerSlotProvider scopeKey="test-conv" browserSessionActive={false}>
+          <AgentMessage
+            message={agentMessage('agent-msg-bash', [bashToolUse])}
+            toolResults={new Map([['tool-bash', bashResult({ status: 'exited', exit_code: 0, lines: [] })]])}
+            onOpenFile={undefined}
+            workScopeKey="ws-test-123"
+          />
+        </ViewerSlotProvider>
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByRole('button', { name: 'inspect →' })).not.toBeInTheDocument();
+  });
+});
 describe('SubAgentStatus inline activity', () => {
   beforeEach(() => {
     vi.clearAllMocks();

@@ -54,6 +54,7 @@ interface MessageListProps {
   conversationId?: string | undefined;
   slug?: string | undefined;
   filePathRootDir?: string | undefined;
+  workScopeKey?: string | undefined;
   /** Scroll-spy: the inclusive range of `historicalUnits`/virtuoso item
    *  indices currently rendered. Fired (debounced by virtuoso) as the user
    *  scrolls. The conversation nav uses it to highlight the active chapter. */
@@ -104,6 +105,7 @@ function renderHistoricalUnit(
   filePathRootDir: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
+  workScopeKey: string | undefined,
 ): JSX.Element | null {
   switch (unit.kind) {
     case 'user':
@@ -143,6 +145,7 @@ function renderHistoricalUnit(
           toolResults={unit.toolResultsByUseId}
           onOpenFile={onOpenFile}
           filePathRootDir={filePathRootDir}
+          workScopeKey={workScopeKey}
           isFirstInTurn={unit.isFirstInTurn}
         />
       );
@@ -186,6 +189,7 @@ function renderUnit(
   filePathRootDir: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
+  workScopeKey: string | undefined,
 ): JSX.Element | null {
   if (
     unit.kind === 'sub_agent_status' ||
@@ -193,7 +197,7 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug);
   }
-  return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering);
+  return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey);
 }
 
 interface SystemPromptHeaderProps {
@@ -234,6 +238,7 @@ function MessageListImpl({
   conversationId,
   slug,
   filePathRootDir,
+  workScopeKey,
   onVisibleRangeChange,
   onChaptersChange,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
@@ -590,10 +595,10 @@ function MessageListImpl({
   const itemContent = useCallback(
     (_index: number, unit: RenderUnit) => (
       <div className="virtuoso-row" data-render-unit-key={unit.key}>
-        {renderUnit(unit, slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering)}
+        {renderUnit(unit, slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey)}
       </div>
     ),
-    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering],
+    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey],
   );
 
   const computeItemKey = useCallback(
