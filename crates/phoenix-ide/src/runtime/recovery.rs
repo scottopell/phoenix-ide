@@ -673,38 +673,6 @@ mod proptests {
         ]
     }
 
-    // Strategy to generate content blocks for agent messages
-    fn content_blocks_strategy() -> impl Strategy<Value = Vec<ContentBlock>> {
-        prop_oneof![
-            // Only tool_use
-            (1..=3usize).prop_flat_map(|n| {
-                proptest::collection::vec(
-                    ("[a-z]{3,8}".prop_map(|s| s.clone())).prop_map(|name| ContentBlock::ToolUse {
-                        id: format!("tool-{name}"),
-                        name,
-                        input: json!({}),
-                    }),
-                    n,
-                )
-            }),
-            // Only text
-            "[a-zA-Z ]{1,50}".prop_map(|text| vec![ContentBlock::Text { text }]),
-            // Text and tool_use
-            ("[a-zA-Z ]{1,50}", "[a-z]{3,8}").prop_map(|(text, name)| {
-                vec![
-                    ContentBlock::Text { text },
-                    ContentBlock::ToolUse {
-                        id: format!("tool-{name}"),
-                        name,
-                        input: json!({}),
-                    },
-                ]
-            }),
-            // Empty (edge case)
-            Just(vec![]),
-        ]
-    }
-
     // Helper to create messages for property tests
     fn make_message(seq: i64, msg_type: MessageType, has_text: bool) -> Message {
         let content = match msg_type {

@@ -1,7 +1,5 @@
 //! Model registry for managing available LLM providers
 
-#![allow(dead_code)] // new_empty() used in tests
-
 use super::{
     all_models, codex_credential, discover_models, probe_gateway, CodexCredential, DiscoveryConfig,
     LlmService, LlmServiceImpl, LoggingService, Provider,
@@ -418,10 +416,8 @@ pub struct ModelRegistry {
     /// current state. Diagnostic only; the preflight handler computes
     /// `restart_required_after_login` from the *current* loaded path
     /// (via [`Self::current_codex_loaded_path`]) instead.
+    #[allow(dead_code)]
     pub codex_bridge_loaded_at_startup: bool,
-    /// Frozen path the credential was loaded from at startup, if any. The
-    /// *current* path may differ after reload (`current_codex_loaded_path()`).
-    pub codex_loaded_path_at_startup: Option<std::path::PathBuf>,
     /// Path the **currently-loaded** credential was constructed from. `None`
     /// when no credential is active. Updated by `reload_codex_credential`
     /// in lockstep with the `OpenAI` bridge services.
@@ -434,6 +430,7 @@ pub struct ModelRegistry {
 
 impl ModelRegistry {
     /// Create an empty registry for testing purposes
+    #[cfg(test)]
     pub fn new_empty() -> Self {
         Self {
             services: std::sync::RwLock::new(HashMap::new()),
@@ -441,7 +438,6 @@ impl ModelRegistry {
             default_model: "test-model".to_string(),
             gateway_status: GatewayStatus::NotConfigured,
             codex_bridge_loaded_at_startup: false,
-            codex_loaded_path_at_startup: None,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             config: Arc::new(LlmConfig::default()),
         }
@@ -467,7 +463,6 @@ impl ModelRegistry {
             default_model,
             gateway_status: GatewayStatus::NotConfigured,
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
-            codex_loaded_path_at_startup: config.codex_credential_path.clone(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
             config: Arc::new(config.clone()),
         }
@@ -608,7 +603,6 @@ impl ModelRegistry {
             default_model,
             gateway_status: GatewayStatus::Healthy,
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
-            codex_loaded_path_at_startup: config.codex_credential_path.clone(),
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
             config: Arc::new(config.clone()),
         }
@@ -842,7 +836,6 @@ impl ModelRegistry {
             default_model: "claude-sonnet-4-6".to_string(),
             gateway_status: GatewayStatus::NotConfigured,
             codex_bridge_loaded_at_startup: false,
-            codex_loaded_path_at_startup: None,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             config: Arc::new(LlmConfig::default()),
         }
@@ -968,7 +961,6 @@ impl ModelRegistry {
                         previous_path: prior_path.clone(),
                         current_path: prior_path,
                         credential_loaded: false,
-                        account_id: None,
                     };
                 }
             },
@@ -1038,7 +1030,6 @@ impl ModelRegistry {
             previous_path,
             current_path: new_path,
             credential_loaded: cred_with_account.is_some(),
-            account_id: cred_with_account.and_then(|(_, a)| a),
         };
         tracing::info!(
             previous_path = ?outcome.previous_path,
@@ -1091,7 +1082,6 @@ pub struct CodexReloadOutcome {
     pub previous_path: Option<std::path::PathBuf>,
     pub current_path: Option<std::path::PathBuf>,
     pub credential_loaded: bool,
-    pub account_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -1342,7 +1332,6 @@ mod tests {
         assert_eq!(outcome.previous_path, None);
         assert_eq!(outcome.current_path.as_deref(), Some(auth_path.as_path()));
         assert!(outcome.credential_loaded);
-        assert_eq!(outcome.account_id.as_deref(), Some("acc-1"));
 
         assert!(
             registry.get("gpt-5.5").is_some(),
@@ -1394,7 +1383,6 @@ mod tests {
         let outcome = registry.reload_codex_credential_with(Some(path2.clone()));
         assert_eq!(outcome.previous_path.as_deref(), Some(path1.as_path()));
         assert_eq!(outcome.current_path.as_deref(), Some(path2.as_path()));
-        assert_eq!(outcome.account_id.as_deref(), Some("acc-new"));
         assert_eq!(
             registry.current_codex_loaded_path().as_deref(),
             Some(path2.as_path())

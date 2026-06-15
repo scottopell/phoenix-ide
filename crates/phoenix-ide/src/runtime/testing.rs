@@ -708,7 +708,9 @@ pub struct TestRuntime<L: LlmClient + 'static, T: ToolExecutor + 'static> {
     pub storage: Arc<InMemoryStorage>,
     pub event_tx: mpsc::Sender<Event>,
     pub broadcast_rx: broadcast::Receiver<SseEvent>,
+    #[allow(dead_code)]
     pub llm: Arc<L>,
+    #[allow(dead_code)]
     pub tools: Arc<T>,
     _runtime_handle: tokio::task::JoinHandle<()>,
 }
@@ -739,6 +741,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntimeBuilder<L, T>
         self
     }
 
+    #[allow(dead_code)]
     pub fn conv_id(mut self, id: impl Into<String>) -> Self {
         self.conv_id = id.into();
         self
@@ -820,6 +823,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     }
 
     /// Send cancel event
+    #[allow(dead_code)]
     pub async fn send_cancel(&self) {
         self.event_tx
             .send(Event::UserCancel { reason: None })

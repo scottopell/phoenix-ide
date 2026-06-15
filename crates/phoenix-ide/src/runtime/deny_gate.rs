@@ -25,6 +25,7 @@ pub struct CheckedToolCall {
 
 impl CheckedToolCall {
     /// The cleared tool's name.
+    #[cfg(test)]
     pub fn name(&self) -> &str {
         &self.name
     }

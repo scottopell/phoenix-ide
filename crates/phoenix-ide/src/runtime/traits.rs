@@ -57,6 +57,7 @@ pub trait MessageStore: Send + Sync {
     /// `AssistantMessage` timestamp atomically (single INSERT), so there
     /// is no window where a concurrent reconnect's init read could see
     /// a transient `Utc::now()` value before the alignment write lands.
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     async fn add_message_with_seq_at(
         &self,
@@ -73,6 +74,7 @@ pub trait MessageStore: Send + Sync {
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
 
     /// Get a single message by ID
+    #[allow(dead_code)]
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String>;
 
     /// Returns true if a message with the given `message_id` already exists.
@@ -148,6 +150,7 @@ pub trait StateStore: Send + Sync {
     /// Get the current conversation mode (used by effect handlers that need
     /// worktree path / branch name, since `ConvContext.mode` only carries the
     /// `ModeKind` discriminant, not the concrete paths).
+    #[allow(dead_code)]
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<ConvMode, String>;
 
     /// Update the conversation working directory. Conversation cwd is
@@ -791,6 +794,7 @@ pub struct ToolRegistryExecutor {
 impl ToolRegistryExecutor {
     /// Create an executor with built-in tools only (no MCP).
     /// Used for sub-agents which have a restricted tool set.
+    #[allow(dead_code)]
     pub fn builtin_only(
         registry: ToolRegistry,
         agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,

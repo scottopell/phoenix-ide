@@ -498,6 +498,7 @@ impl RuntimeManager {
 
     /// Thin sender for retire-on-terminal; awaits the best-effort cleanup so the
     /// terminal hook observes completion. See [`handle_retire_for_origin`].
+    #[cfg(test)]
     pub(crate) async fn retire_fork_proposals_for_terminal_origin(
         self: &std::sync::Arc<Self>,
         origin_id: &str,

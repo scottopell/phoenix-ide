@@ -5,7 +5,6 @@
 //! REQ-BED-010: Fixed Working Directory
 //! REQ-BED-011: Real-time Event Streaming
 
-#![allow(dead_code)] // browser_sessions() will be used when browser cleanup is wired up
 //! REQ-BED-012: Context Window Tracking
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
@@ -496,6 +495,7 @@ impl SseBroadcaster {
     /// Highest `sequence_id` emitted so far. Used to seed `SseEvent::Init`'s
     /// `last_sequence_id` so the client's `applyIfNewer` guard starts at the
     /// correct floor.
+    #[allow(dead_code)]
     pub fn current_seq(&self) -> i64 {
         self.last_seq.load(Ordering::Acquire)
     }
@@ -612,6 +612,7 @@ impl SseBroadcaster {
     /// Cost: O(entries) serialisations. Do not call on the hot path —
     /// scrape periodically from a gauge collector or read at truncation
     /// time only.
+    #[allow(dead_code)]
     pub fn replay_ring_bytes(&self) -> usize {
         self.ring.lock().expect("ReplayRing mutex").total_bytes()
     }
@@ -1013,6 +1014,7 @@ impl RuntimeManager {
     }
 
     /// Get the detected platform capability
+    #[allow(dead_code)]
     pub fn platform(&self) -> PlatformCapability {
         self.platform
     }

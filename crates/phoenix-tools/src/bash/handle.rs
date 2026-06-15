@@ -5,11 +5,6 @@
 //! writes pass, and the `ExitWatchPanicGuard` that publishes a sentinel
 //! on waiter-task panic.
 //!
-//! Some accessors here are surface for the future hard-delete cascade
-//! (task 02696) and the wire/UI migration (task 02697); silence the
-//! per-method dead-code lint until those land.
-#![allow(dead_code)]
-//!
 //! Lock ordering (per `bash.allium` @guidance on `HandleProcessExited`
 //! and `HandleKillPendingKernel`):
 //!

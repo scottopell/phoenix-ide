@@ -4,8 +4,6 @@
 //! REQ-BT-011: State Persistence
 //! REQ-BROWSER-WS-001: Sessions keyed by `WorkScope` so continuations share Chrome.
 
-#![allow(dead_code)] // Work in progress - browser tools being integrated
-
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
     cdp::js_protocol::runtime::{ConsoleApiCalledType, EventConsoleApiCalled, RemoteObject},
