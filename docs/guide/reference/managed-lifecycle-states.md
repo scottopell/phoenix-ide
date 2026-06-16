@@ -36,53 +36,58 @@ of unsent feedback. Send feedback, or approve without sending those notes."*
 ## The Done? bar
 
 Labelled `Done?`. Visible **only** when the mode badge is `Work` or `Branch`
-**and** the phase is `idle`, `error`, or `context_exhausted` — it is hidden
-while the agent is running or awaiting. (It stays up in `error`/`context_exhausted`
-so a stuck conversation is still disposable.)
+**and** the phase is `idle`, `error`, or `context_exhausted` — hidden while the
+agent runs or awaits. (It stays up while errored / out of context so a stuck
+conversation is still disposable.) Exactly **one** button glows as the *primary*
+at a time. The bar has three zones.
 
-Always present: **`View Diff`**. **`View Browser`** (title *"Show the live
-browser view"*) appears when a browser session is live.
+**Review** — always shows **`View Diff`**.
 
-### Address CI & comments
+**Resolve** — the "push it forward" zone, present only on an idle, open PR.
+Phoenix has no merge API, so Merge/Open are honest GitHub link-outs:
 
-The `Address CI & comments` button (→ `Capturing...` while working) appears only
-in the **`idle`** phase and only when the PR is **found and open**. It re-drives
-the agent against the PR's CI and review feedback. Disabled when PR refresh is
-unavailable or conversation input is unavailable; carries a `new`/`updated`
-freshness marker and a `⚠` coverage marker when relevant.
+| Verb (verbatim) | When | Does |
+|-----------------|------|------|
+| `Address feedback` (→ `Capturing...`) | an open PR Phoenix can post to | re-drives the agent against CI + review feedback; carries a freshness label and a `⚠` coverage marker |
+| `Merge on GitHub #N ↗` | checks confirmed passing | opens the PR on GitHub — rides as a non-glowing secondary beside `Address feedback` when green |
+| `Open PR #N ↗` | draft, not green, or stale status | opens the PR on GitHub to verify |
 
-### Completion button — six states
+**Finish** — the terminal verbs, each with an `ⓘ` hover hint:
 
-One button. Its label is computed from PR state and `gh` availability:
+| Verb (verbatim) | `ⓘ` hint (Work mode, verbatim) |
+|-----------------|-------------------------------|
+| `Clean up` (→ `Cleaning...`) | *"Mark as merged. Deletes the worktree and the task branch Phoenix created. No confirmation — use Abandon if you want a diff snapshot first."* |
+| `Abandon` (→ `Abandoning...`) | *"Captures a diff snapshot, then deletes the worktree and the task branch. Asks for confirmation."* |
 
-| Label (verbatim) | When | Clickable | Note shown |
-|------------------|------|-----------|------------|
-| `Checking PR…` | PR status loading | no | — |
-| `Clean up merged PR` | PR found, merged | yes → cleans up local state | — |
-| `PR closed without merge` | PR found, closed unmerged | no¹ | *"PR #N is closed without merge. Use Abandon to clean up local Phoenix state."* |
-| `Waiting for PR merge` | PR found, open, blocks cleanup | no¹ | *"PR #N is {state}; cleanup unlocks after GitHub reports merged."* |
-| `Use manual fallback` | `gh` unavailable, fallback off | yes → **first click only enables fallback** | — |
-| `Mark as Merged` | manual-fallback path | yes → asserts merged, cleans up | *"gh unavailable — manual cleanup fallback enabled."* |
-
-While acting the label is `Cleaning...`. ¹Blocked states become clickable once
-the manual fallback is enabled. The `Use manual fallback` → `Mark as Merged`
-path is two clicks: the first reveals the fallback, the second marks merged.
-
-### Abandon
-
-`Abandon` (→ `Abandoning...`). The confirmation differs by mode:
+In Branch mode both hints instead read *"…your branch is kept."* `Abandon` also
+asks to confirm, differing by mode:
 
 | Mode | Confirmation (verbatim) | Branch kept? |
 |------|-------------------------|--------------|
 | Work | *"Abandon this task? The worktree and task branch will be deleted."* | no |
 | Branch | *"Abandon this conversation? The worktree will be deleted but your branch will be kept."* | yes |
 
-### Continuation lock
+### Which disposition, when
 
-If the conversation was continued into another, **both** the completion button
-and `Abandon` are disabled, with the note *"Continued — actions belong on the
-continuation."* (tooltip: *"This conversation has been continued. Abandon the
-continuation instead."*). Act on the continuation instead.
+One row matches; first match wins. `Abandon` shows in every disposition **except
+continued**; `Clean up` shows where marked.
+
+| Situation | Primary glow | Resolve | Finish | Note (verbatim) |
+|-----------|--------------|---------|--------|-----------------|
+| Continued into another conversation | none | — | none | *"Continued — actions belong on the continuation."* |
+| PR status loading | `Abandon` | — | Abandon | *"Checking PR…"* |
+| Stuck¹, PR merged | `Clean up` | — | Clean up + Abandon | — |
+| Stuck¹, PR closed | `Abandon` | — | Clean up + Abandon | *"PR #N is closed without merge. Use Abandon to clean up."* |
+| Stuck¹, PR open/draft | `Abandon` | — | Clean up + Abandon | *"PR #N still open — merge on GitHub, or abandon."* |
+| Stuck¹, gh unavailable | `Clean up` | — | Clean up + Abandon | *"gh unavailable — manual cleanup."* |
+| idle, PR open/draft | `Address feedback` / `Open PR ↗` | yes | Abandon | — |
+| idle, PR merged | `Clean up` | — | Clean up + Abandon | — |
+| idle, PR closed | `Abandon` | — | Abandon | *"PR #N is closed without merge. Use Abandon to clean up."* |
+| idle, gh unavailable | `Clean up` | — | Clean up + Abandon | *"gh unavailable — manual cleanup."* |
+| idle, no PR found | `Clean up` | — | Clean up + Abandon | — |
+
+¹*Stuck* = the `error` or `context_exhausted` phase; the Resolve zone is always
+suppressed there, and a continued conversation's successor owns disposal.
 
 ## Related
 

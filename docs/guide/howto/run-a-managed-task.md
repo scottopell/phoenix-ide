@@ -41,10 +41,10 @@ appears once the working directory resolves as one.
    branch, commits the task file on it, and enables writes — the badge flips to
    `Work`. Review changes as they land with **View Diff** in the **Done?** bar.
 6. **Finish.** The agent pushes the branch with `git` (there's no push button).
-   Open a PR and merge it on your host; the **Done?** bar then offers **Clean up
-   merged PR**. To iterate on PR feedback use **Address CI & comments**; to drop
-   the work, **Abandon**. The bar's full state set — six completion labels, the
-   `gh` fallback, the continuation lock — is in
+   Open a PR and merge it on your host; the **Done?** bar then offers **Clean
+   up**. To iterate on PR feedback use **Address feedback**; to drop the work,
+   **Abandon**. The bar's full state set — its three zones, the GitHub link-outs,
+   the continuation lock — is in
    [Managed lifecycle states](../reference/managed-lifecycle-states.md#the-done-bar).
 
 ## Result
