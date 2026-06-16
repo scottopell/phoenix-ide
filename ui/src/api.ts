@@ -174,6 +174,8 @@ export interface PrFeedbackCoverage {
 
 export interface PrFeedbackItem {
   id?: string;
+  /** GraphQL `pullRequestReviewThread` node id (`PRRT_…`); present only for review_thread items. */
+  thread_id?: string;
   source: PrFeedbackSource;
   author: string;
   body: string;

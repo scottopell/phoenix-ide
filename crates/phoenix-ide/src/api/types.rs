@@ -783,6 +783,11 @@ pub struct PrFeedbackCoverage {
 pub struct PrFeedbackItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// GraphQL `pullRequestReviewThread` node id (`PRRT_…`). Populated only for
+    /// `ReviewThread` items — it is the id `resolveReviewThread` accepts, distinct
+    /// from `id` which is the per-comment node id and is rejected for resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub source: PrFeedbackSource,
     pub author: String,
     pub body: String,

@@ -280,7 +280,7 @@ impl GhClient for ShellGhClient<'_> {
           repository(owner:$owner, name:$name) {
             pullRequest(number:$number) {
               reviewThreads(first:100) {
-                nodes { isResolved path comments(first:100) { nodes { id body url createdAt author { login } } } }
+                nodes { id isResolved path comments(first:100) { nodes { id body url createdAt author { login } } } }
               }
             }
           }
@@ -1324,6 +1324,7 @@ fn review_threads_to_items(threads: Vec<GhReviewThread>) -> Vec<PrFeedbackItem> 
                 .into_iter()
                 .map(move |comment| PrFeedbackItem {
                     id: comment.id,
+                    thread_id: thread.id.clone(),
                     source: PrFeedbackSource::ReviewThread,
                     author: comment
                         .author
@@ -1673,6 +1674,7 @@ impl From<GhIssueComment> for PrFeedbackItem {
     fn from(comment: GhIssueComment) -> Self {
         Self {
             id: comment.id.map(|id| id.to_string()),
+            thread_id: None,
             source: PrFeedbackSource::IssueComment,
             author: comment
                 .user
@@ -1702,6 +1704,7 @@ impl From<GhReviewComment> for PrFeedbackItem {
     fn from(comment: GhReviewComment) -> Self {
         Self {
             id: comment.id.map(|id| id.to_string()),
+            thread_id: None,
             source: PrFeedbackSource::ReviewComment,
             author: comment
                 .user
@@ -1730,6 +1733,7 @@ impl From<GhReviewSummary> for PrFeedbackItem {
     fn from(review: GhReviewSummary) -> Self {
         Self {
             id: review.id.map(|id| id.to_string()),
+            thread_id: None,
             source: PrFeedbackSource::ReviewSummary,
             author: review
                 .user
@@ -1767,6 +1771,7 @@ struct GhReviewThreadsConnection {
 }
 #[derive(Debug, Clone, Deserialize)]
 struct GhReviewThread {
+    id: Option<String>,
     #[serde(rename = "isResolved")]
     is_resolved: bool,
     path: Option<String>,
@@ -2066,6 +2071,7 @@ mod tests {
             items: vec![
                 PrFeedbackItem {
                     id: Some("1".to_string()),
+                    thread_id: None,
                     source: PrFeedbackSource::IssueComment,
                     author: "u".to_string(),
                     body: "old".to_string(),
@@ -2076,6 +2082,7 @@ mod tests {
                 },
                 PrFeedbackItem {
                     id: Some("2".to_string()),
+                    thread_id: None,
                     source: PrFeedbackSource::IssueComment,
                     author: "u".to_string(),
                     body: "new".to_string(),
@@ -2113,6 +2120,7 @@ mod tests {
             }],
             items: vec![PrFeedbackItem {
                 id: Some("1".to_string()),
+                thread_id: None,
                 source: PrFeedbackSource::IssueComment,
                 author: "u".to_string(),
                 body: "old".to_string(),
@@ -2150,6 +2158,7 @@ mod tests {
             }],
             items: vec![PrFeedbackItem {
                 id: Some("1".to_string()),
+                thread_id: None,
                 source: PrFeedbackSource::IssueComment,
                 author: "u".to_string(),
                 body: "edited".to_string(),
