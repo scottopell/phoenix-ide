@@ -668,11 +668,18 @@ WHERE message_type = 'skill'
 /// Creates `steering_messages` and its grandchild attachment tables, then
 /// extracts the pending queue out of the blob via `json_each`. The column holds
 /// either the versioned envelope (`{"v":"v1","entries":[…]}`) or a pre-envelope
-/// bare array; the `entries` CTE normalizes both to one array so a single
-/// `json_each` walks it. `e.key` is the FIFO ordinal; per-entry `files`/`images`
-/// become grandchild rows; `skill_invocation` flattens to the `skill_*` columns.
-/// The blob column is left in place but unread after the code cutover (it carries
-/// no data — every write defaults it to `[]`).
+/// bare array; the `norm` CTE normalizes both to one array. `e.key` is the FIFO
+/// ordinal; per-entry `files`/`images` become grandchild rows; `skill_invocation`
+/// flattens to the `skill_*` columns. The blob column is left in place but unread
+/// after the code cutover (it carries no data — every write defaults it to `[]`).
+///
+/// The backfill is at least as tolerant as the `decode_steering_queue` it
+/// replaces, because a migration abort here would brick startup: malformed-JSON
+/// rows are skipped (`json_valid` guard), entries missing the required
+/// `message_id`/`text` are dropped, duplicate `message_id`s keep the first FIFO
+/// occurrence (the column had no uniqueness), the `skill_*` trio is written only
+/// when complete (else NULL, honoring the CHECK), and attachment rows missing a
+/// NOT NULL field are skipped.
 const MIGRATION_027: &str = r"
 CREATE TABLE IF NOT EXISTS steering_messages (
     message_id TEXT PRIMARY KEY,
@@ -713,9 +720,10 @@ CREATE TABLE IF NOT EXISTS steering_message_images (
 INSERT INTO steering_messages
     (message_id, conversation_id, ordinal, text, llm_text, user_agent,
      skill_name, skill_body, skill_dir)
-WITH entries AS (
+WITH norm AS (
     SELECT c.id AS conversation_id,
            CASE
+               WHEN NOT json_valid(c.steering_queue) THEN '[]'
                WHEN json_type(c.steering_queue, '$.entries') = 'array'
                    THEN json_extract(c.steering_queue, '$.entries')
                WHEN json_type(c.steering_queue, '$') = 'array'
@@ -723,23 +731,48 @@ WITH entries AS (
                ELSE '[]'
            END AS arr
     FROM conversations c
+),
+valid_entries AS (
+    SELECT conversation_id, ordinal, entry FROM (
+        SELECT norm.conversation_id AS conversation_id,
+               e.key AS ordinal,
+               e.value AS entry,
+               ROW_NUMBER() OVER (
+                   PARTITION BY json_extract(e.value, '$.message_id')
+                   ORDER BY norm.conversation_id, e.key
+               ) AS rn
+        FROM norm, json_each(norm.arr) e
+        WHERE json_extract(e.value, '$.message_id') IS NOT NULL
+          AND json_extract(e.value, '$.text') IS NOT NULL
+    )
+    WHERE rn = 1
 )
-SELECT json_extract(e.value, '$.message_id'),
-       entries.conversation_id,
-       e.key,
-       json_extract(e.value, '$.text'),
-       json_extract(e.value, '$.llm_text'),
-       json_extract(e.value, '$.user_agent'),
-       json_extract(e.value, '$.skill_invocation.name'),
-       json_extract(e.value, '$.skill_invocation.body'),
-       json_extract(e.value, '$.skill_invocation.skill_dir')
-FROM entries, json_each(entries.arr) e
-WHERE json_extract(e.value, '$.message_id') IS NOT NULL;
+SELECT json_extract(entry, '$.message_id'),
+       conversation_id,
+       ordinal,
+       json_extract(entry, '$.text'),
+       json_extract(entry, '$.llm_text'),
+       json_extract(entry, '$.user_agent'),
+       CASE WHEN json_extract(entry, '$.skill_invocation.name') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.body') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.skill_dir') IS NOT NULL
+            THEN json_extract(entry, '$.skill_invocation.name') END,
+       CASE WHEN json_extract(entry, '$.skill_invocation.name') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.body') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.skill_dir') IS NOT NULL
+            THEN json_extract(entry, '$.skill_invocation.body') END,
+       CASE WHEN json_extract(entry, '$.skill_invocation.name') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.body') IS NOT NULL
+             AND json_extract(entry, '$.skill_invocation.skill_dir') IS NOT NULL
+            THEN json_extract(entry, '$.skill_invocation.skill_dir') END
+FROM valid_entries;
 
 INSERT INTO steering_message_files
     (message_id, file_ordinal, original_name, media_type, size_bytes, stored_path)
-WITH entries AS (
-    SELECT CASE
+WITH norm AS (
+    SELECT c.id AS conversation_id,
+           CASE
+               WHEN NOT json_valid(c.steering_queue) THEN '[]'
                WHEN json_type(c.steering_queue, '$.entries') = 'array'
                    THEN json_extract(c.steering_queue, '$.entries')
                WHEN json_type(c.steering_queue, '$') = 'array'
@@ -747,20 +780,39 @@ WITH entries AS (
                ELSE '[]'
            END AS arr
     FROM conversations c
+),
+valid_entries AS (
+    SELECT entry FROM (
+        SELECT e.value AS entry,
+               ROW_NUMBER() OVER (
+                   PARTITION BY json_extract(e.value, '$.message_id')
+                   ORDER BY norm.conversation_id, e.key
+               ) AS rn
+        FROM norm, json_each(norm.arr) e
+        WHERE json_extract(e.value, '$.message_id') IS NOT NULL
+          AND json_extract(e.value, '$.text') IS NOT NULL
+    )
+    WHERE rn = 1
 )
-SELECT json_extract(e.value, '$.message_id'),
+SELECT json_extract(entry, '$.message_id'),
        f.key,
        json_extract(f.value, '$.original_name'),
        json_extract(f.value, '$.media_type'),
        json_extract(f.value, '$.size_bytes'),
        json_extract(f.value, '$.stored_path')
-FROM entries, json_each(entries.arr) e, json_each(e.value, '$.files') f
-WHERE json_type(e.value, '$.files') = 'array';
+FROM valid_entries, json_each(entry, '$.files') f
+WHERE json_type(entry, '$.files') = 'array'
+  AND json_extract(f.value, '$.original_name') IS NOT NULL
+  AND json_extract(f.value, '$.media_type') IS NOT NULL
+  AND json_extract(f.value, '$.size_bytes') IS NOT NULL
+  AND json_extract(f.value, '$.stored_path') IS NOT NULL;
 
 INSERT INTO steering_message_images
     (message_id, image_ordinal, media_type, data)
-WITH entries AS (
-    SELECT CASE
+WITH norm AS (
+    SELECT c.id AS conversation_id,
+           CASE
+               WHEN NOT json_valid(c.steering_queue) THEN '[]'
                WHEN json_type(c.steering_queue, '$.entries') = 'array'
                    THEN json_extract(c.steering_queue, '$.entries')
                WHEN json_type(c.steering_queue, '$') = 'array'
@@ -768,13 +820,28 @@ WITH entries AS (
                ELSE '[]'
            END AS arr
     FROM conversations c
+),
+valid_entries AS (
+    SELECT entry FROM (
+        SELECT e.value AS entry,
+               ROW_NUMBER() OVER (
+                   PARTITION BY json_extract(e.value, '$.message_id')
+                   ORDER BY norm.conversation_id, e.key
+               ) AS rn
+        FROM norm, json_each(norm.arr) e
+        WHERE json_extract(e.value, '$.message_id') IS NOT NULL
+          AND json_extract(e.value, '$.text') IS NOT NULL
+    )
+    WHERE rn = 1
 )
-SELECT json_extract(e.value, '$.message_id'),
+SELECT json_extract(entry, '$.message_id'),
        im.key,
        json_extract(im.value, '$.media_type'),
        json_extract(im.value, '$.data')
-FROM entries, json_each(entries.arr) e, json_each(e.value, '$.images') im
-WHERE json_type(e.value, '$.images') = 'array';
+FROM valid_entries, json_each(entry, '$.images') im
+WHERE json_type(entry, '$.images') = 'array'
+  AND json_extract(im.value, '$.media_type') IS NOT NULL
+  AND json_extract(im.value, '$.data') IS NOT NULL;
 ";
 
 /// Run all pending migrations against the database.
@@ -1033,6 +1100,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 3);
+    }
+
+    /// Migration 027 must be at least as tolerant as the decoder it replaced: a
+    /// corrupt/duplicate/invalid legacy `steering_queue` must not abort the
+    /// migration (which would brick startup). Malformed-JSON rows are skipped,
+    /// duplicate `message_id`s keep the first FIFO occurrence, and entries
+    /// missing required fields are dropped — without raising.
+    #[tokio::test]
+    async fn migration_027_tolerates_corrupt_duplicate_and_invalid_queues() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        // c-bad: not valid JSON at all.
+        // c-dup: same message_id twice (first FIFO occurrence wins).
+        // c-missing: an entry with no `text` (dropped) alongside a valid one.
+        // c-partial-skill: skill_invocation missing `body` → skill_* left NULL.
+        let dup = r#"[{"text":"a","message_id":"d1","images":[],"files":[]},
+                      {"text":"b","message_id":"d1","images":[],"files":[]}]"#;
+        let missing = r#"[{"message_id":"m-notext","images":[],"files":[]},
+                          {"text":"ok","message_id":"m-ok","images":[],"files":[]}]"#;
+        let partial = r#"[{"text":"s","message_id":"p1","images":[],"files":[],
+                           "skill_invocation":{"name":"build","skill_dir":"/d"}}]"#;
+        for (id, q) in [
+            ("c-bad", "{not json"),
+            ("c-dup", dup),
+            ("c-missing", missing),
+            ("c-partial-skill", partial),
+        ] {
+            sqlx::query(
+                "INSERT INTO conversations (id, steering_queue, state_updated_at, created_at, updated_at) \
+                 VALUES (?1, ?2, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(id)
+            .bind(q)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Must not raise despite the corrupt/duplicate/invalid rows.
+        run_pending_migrations(&pool).await.unwrap();
+
+        let ids = |conv: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT message_id FROM steering_messages WHERE conversation_id = ?1 ORDER BY ordinal",
+                )
+                .bind(conv)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        // Malformed JSON → no rows (skipped, not aborted).
+        assert!(ids("c-bad").await.is_empty());
+        // Duplicate message_id → exactly one row kept.
+        assert_eq!(ids("c-dup").await, vec!["d1".to_string()]);
+        // Missing-text entry dropped, valid one kept.
+        assert_eq!(ids("c-missing").await, vec!["m-ok".to_string()]);
+
+        // Partial skill trio → all skill_* columns NULL (CHECK satisfied).
+        let skill_name: Option<String> =
+            sqlx::query_scalar("SELECT skill_name FROM steering_messages WHERE message_id = 'p1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(skill_name.is_none());
     }
 
     /// Migration 025: attachments embedded in `messages.content` are extracted

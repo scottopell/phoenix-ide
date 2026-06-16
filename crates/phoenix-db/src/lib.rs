@@ -1689,6 +1689,11 @@ impl Database {
     /// Load a conversation's pending steering queue (FIFO) from the normalized
     /// tables, rehydrating each entry's attachments and skill invocation.
     ///
+    /// All reads run in one transaction so the parent and child rows come from a
+    /// single consistent snapshot — a concurrent `update_steering_queue` /
+    /// `remove_steering_entries` commit cannot produce a torn queue (an entry
+    /// read against one version with its attachments read against another).
+    ///
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
@@ -1700,12 +1705,14 @@ impl Database {
         use phoenix_core::domain::skill_invocation::SkillInvocation;
         use phoenix_core::domain::sm_event::SteerEntry;
 
+        let mut tx = self.pool.begin().await?;
+
         let rows = sqlx::query(
             "SELECT message_id, text, llm_text, user_agent, skill_name, skill_body, skill_dir
              FROM steering_messages WHERE conversation_id = ?1 ORDER BY ordinal ASC",
         )
         .bind(id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let mut queue = Vec::with_capacity(rows.len());
@@ -1722,7 +1729,7 @@ impl Database {
                 size_bytes: u64::try_from(r.get::<i64, _>("size_bytes")).unwrap_or(0),
                 stored_path: r.get("stored_path"),
             })
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
             let images = sqlx::query(
                 "SELECT media_type, data FROM steering_message_images
@@ -1733,7 +1740,7 @@ impl Database {
                 data: r.get("data"),
                 media_type: r.get("media_type"),
             })
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
             // The CHECK constraint guarantees the skill_* trio is all-or-nothing.
             let skill_invocation =
@@ -1761,6 +1768,7 @@ impl Database {
                 skill_invocation,
             });
         }
+        tx.commit().await?;
         Ok(queue)
     }
 
