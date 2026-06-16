@@ -100,8 +100,15 @@ eliminates.
 
 WHEN `buildRenderUnits` emits an `agent_turn` unit
 THE SYSTEM SHALL populate its `toolResultsByUseId: ReadonlyMap<string, Message>`
-at construction time by consuming the immediately-following sequence of
-`tool`-type messages until a non-tool boundary is reached
+at construction time with subsequent `tool`-type messages owned by that
+agent turn, keyed by each result's `tool_use_id`, until a `user`, `skill`,
+or subsequent `agent` message starts a new ownership scope
+
+WHEN a `system` message appears after an `agent_turn` and before that
+agent turn's tool result
+THE SYSTEM SHALL preserve the active agent ownership scope
+SO THAT live status/system events cannot make the result appear orphaned
+or leave the originating tool card in an in-flight state
 
 WHEN a `tool`-type message has a `tool_use_id` that does not match any
 `tool_use` block id in the preceding `agent_turn`'s content blocks

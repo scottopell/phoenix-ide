@@ -10,6 +10,7 @@ import { copyToClipboard } from '../utils/clipboard';
 import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposalsContext';
 import { ForkProposalReview } from './ForkProposalReview';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
+import { buildRenderUnits } from '../conversation/renderUnits';
 
 vi.mock('../utils/clipboard', () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
@@ -48,6 +49,7 @@ function LocationProbe() {
   return <div data-testid="location-search">{location.search}</div>;
 }
 
+
 function toolMessage(toolUseId: string, content: string, sequenceId = 2): Message {
   return {
     message_id: `tool-${toolUseId}`,
@@ -55,6 +57,18 @@ function toolMessage(toolUseId: string, content: string, sequenceId = 2): Messag
     conversation_id: 'agent-1',
     message_type: 'tool',
     content: { tool_use_id: toolUseId, content, is_error: false },
+    display_data: null,
+    created_at: '2026-01-01T00:00:01Z',
+  };
+}
+
+function systemMessage(messageId: string, text: string, sequenceId = 2): Message {
+  return {
+    message_id: messageId,
+    sequence_id: sequenceId,
+    conversation_id: 'agent-1',
+    message_type: 'system',
+    content: { text },
     display_data: null,
     created_at: '2026-01-01T00:00:01Z',
   };
@@ -118,6 +132,84 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     pending_truncated: false,
   });
 }
+
+describe('inline tool timers', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('stops the live elapsed counter when a live-arriving tool result renders after an interleaved system message', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:10Z'));
+
+    const startedAtMs = Date.parse('2026-01-01T00:00:00Z');
+    const agent = agentMessage('agent-tool-timer', [{
+      type: 'tool_use',
+      id: 'tool-read',
+      name: 'read_file',
+      input: { path: 'README.md' },
+    }]);
+    agent.display_data = { tool_starts: { 'tool-read': startedAtMs } };
+
+    const initialUnits = buildRenderUnits({
+      messages: [agent],
+      pendingMessages: [],
+      convState: { type: 'idle' },
+      streamingHandle: null,
+    });
+    const initialTurn = initialUnits.historicalUnits.find((u) => u.kind === 'agent_turn');
+    if (!initialTurn || initialTurn.kind !== 'agent_turn') throw new Error('missing initial agent turn');
+
+    const { rerender } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={initialTurn.agent}
+          toolResults={initialTurn.toolResultsByUseId}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(document.querySelector('.tool-block-elapsed')).toHaveTextContent('• 10s');
+
+    const completedResult = toolMessage('tool-read', '# README\nDone', 3);
+    completedResult.display_data = { duration_ms: 1234 };
+    const liveUnits = buildRenderUnits({
+      messages: [
+        agent,
+        systemMessage('sys-live', 'tool completed', 2),
+        completedResult,
+      ],
+      pendingMessages: [],
+      convState: { type: 'idle' },
+      streamingHandle: null,
+    });
+    const liveTurn = liveUnits.historicalUnits.find((u) => u.kind === 'agent_turn');
+    if (!liveTurn || liveTurn.kind !== 'agent_turn') throw new Error('missing live agent turn');
+
+    rerender(
+      <MemoryRouter>
+        <AgentMessage
+          message={liveTurn.agent}
+          toolResults={liveTurn.toolResultsByUseId}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(document.querySelector('.tool-block-output-content')).toHaveTextContent('# README Done');
+    expect(document.querySelector('.tool-block-elapsed')).toBeNull();
+    expect(screen.getByText('• 1.2s')).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+
+    expect(document.querySelector('.tool-block-elapsed')).toBeNull();
+    expect(screen.getByText('• 1.2s')).toBeInTheDocument();
+    expect(screen.queryByText('• 40s')).not.toBeInTheDocument();
+  });
+});
 
 describe('skill command rendering', () => {
   it('renders slash-command user messages as a flat command chip with normal args', () => {

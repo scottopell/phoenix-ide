@@ -137,6 +137,10 @@ entity Builder {
     historical: List<HistoricalUnit>
     tail: List<TailUnit>
     in_agent_run: Boolean
+    -- The most recent agent_turn that still owns subsequent tool results.
+    -- Cleared by user and skill messages; replaced by agent messages;
+    -- preserved by system messages.
+    active_agent_turn: HistoricalUnit?
 
     transitions phase {
         walking -> walking
@@ -188,6 +192,7 @@ rule EmitUserUnit {
 
     ensures: b.historical = append(b.historical, user_unit(current_message(b)))
     ensures: b.in_agent_run = false
+    ensures: b.active_agent_turn = null
     ensures: b.position = b.position + 1
 
     @guidance
@@ -208,12 +213,13 @@ rule EmitSkillUnit {
 
     ensures: b.historical = append(b.historical, skill_unit(current_message(b)))
     ensures: b.in_agent_run = false
+    ensures: b.active_agent_turn = null
     ensures: b.position = b.position + 1
 }
 
--- Agent message → agent_turn unit. Consumes the trailing run of
--- tool messages (results) and stores them in the unit's map keyed by
--- tool_use_id. isFirstInTurn is the inverse of the prior in_agent_run.
+-- Agent message → agent_turn unit. Creates the active tool-result owner
+-- and stores an empty result map keyed by future tool_use_id values.
+-- isFirstInTurn is the inverse of the prior in_agent_run.
 rule EmitAgentTurnUnit {
     when: BuilderStep(b)
 
@@ -226,35 +232,17 @@ rule EmitAgentTurnUnit {
                  not b.in_agent_run
              ))
     ensures: b.in_agent_run = true
-    ensures: b.position = b.position + 1 + count_trailing_tool_messages(b)
+    ensures: b.active_agent_turn = last(b.historical)
+    ensures: b.position = b.position + 1
 
     @guidance
         -- agent_turn_unit(messages, i, isFirstInTurn):
         --   agent := messages[i]
-        --   map := empty
-        --   j := i + 1
-        --   while j < len(messages) and messages[j].message_type = "tool":
-        --     tid := messages[j].content.tool_use_id
-        --     if tid != null:
-        --       map[tid] := messages[j]
-        --     else:
-        --       debug_log(message_id=messages[j].message_id,
-        --                 reason=missing_tool_use_id)
-        --     j := j + 1
         --   return { kind: agent_turn, key: agent.message_id,
         --            source_message_id: agent.message_id,
-        --            tool_results_by_use_id: map,
+        --            tool_results_by_use_id: empty,
         --            is_first_in_turn: isFirstInTurn }
-        --
-        -- count_trailing_tool_messages(messages, i):
-        --   j := i + 1
-        --   while j < len(messages) and messages[j].message_type = "tool":
-        --     j := j + 1
-        --   return j - (i + 1)
-        --
-        -- The agent message itself is consumed by position += 1; the
-        -- trailing tool messages are consumed by the count expression.
-        -- Net advance: 1 + (number of trailing tool messages).
+        -- Subsequent EmitToolResultIntoActiveAgent firings populate the map.
 }
 
 -- System message with non-empty text → system unit. Does NOT break the
@@ -270,6 +258,7 @@ rule EmitSystemUnitWithText {
 
     ensures: b.historical = append(b.historical, system_unit(current_message(b)))
     ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.active_agent_turn = b.active_agent_turn
     ensures: b.position = b.position + 1
 }
 
@@ -285,6 +274,7 @@ rule SkipEmptySystem {
 
     ensures: b.historical = b.historical
     ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.active_agent_turn = b.active_agent_turn
     ensures: b.position = b.position + 1
 
     @guidance
@@ -293,29 +283,67 @@ rule SkipEmptySystem {
         -- capability-gap visibility per CLAUDE.md.
 }
 
--- Tool message outside an agent run (i.e., the agent run was already
--- consumed by EmitAgentTurnUnit's trailing scan, OR no agent has been
--- seen yet) → skipped + logged. Reaching this rule means the backend
--- emitted a tool result without an immediately-preceding agent, which
--- is a backend invariant violation (see sse_wire).
+-- Tool message with an active owning agent_turn → attach to that unit's
+-- result map and emit no standalone unit.
+rule EmitToolResultIntoActiveAgent {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: current_message_type(b) = "tool"
+    requires: b.active_agent_turn != null
+    requires: current_tool_use_id(b) != null
+
+    ensures: b.active_agent_turn.tool_results_by_use_id = put(
+                 b.active_agent_turn.tool_results_by_use_id,
+                 current_tool_use_id(b),
+                 current_message(b)
+             )
+    ensures: b.historical = b.historical
+    ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.active_agent_turn = b.active_agent_turn
+    ensures: b.position = b.position + 1
+}
+
+-- Tool message with an active agent but no usable tool_use_id → skipped + logged.
+rule SkipToolResultMissingUseId {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: current_message_type(b) = "tool"
+    requires: b.active_agent_turn != null
+    requires: current_tool_use_id(b) = null
+
+    ensures: b.historical = b.historical
+    ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.active_agent_turn = b.active_agent_turn
+    ensures: b.position = b.position + 1
+
+    @guidance
+        -- debug_log(message_id=m.message_id, reason=missing_tool_use_id).
+}
+
+-- Tool message without an active agent owner → skipped + logged. Reaching
+-- this rule means no preceding agent ownership scope exists.
 rule SkipOrphanTool {
     when: BuilderStep(b)
 
     requires: b.phase = "walking"
     requires: b.position < len(b.messages)
     requires: current_message_type(b) = "tool"
+    requires: b.active_agent_turn = null
 
     ensures: b.historical = b.historical
     ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.active_agent_turn = b.active_agent_turn
     ensures: b.position = b.position + 1
 
     @guidance
         -- debug_log(message_id=m.message_id, reason=orphan_tool).
-        -- A correctly-ordered message stream consumes tool messages
-        -- inside EmitAgentTurnUnit's trailing scan; this rule fires
-        -- only when that scan was unavailable (no preceding agent) or
-        -- the messages are reordered. Logging makes the violation
-        -- visible without crashing the render.
+        -- Correctly-ordered tool messages attach to active_agent_turn.
+        -- This rule fires only when no preceding agent ownership scope is
+        -- active. Logging makes the violation visible without crashing the render.
 }
 
 -- Unknown message_type → skipped + logged. Forward-compatible: a new
@@ -330,6 +358,7 @@ rule SkipUnknownType {
 
     ensures: b.historical = b.historical
     ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.active_agent_turn = b.active_agent_turn
     ensures: b.position = b.position + 1
 
     @guidance
@@ -353,6 +382,7 @@ rule WalkComplete {
     ensures: b.position = b.position
     ensures: b.historical = b.historical
     ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.active_agent_turn = b.active_agent_turn
 }
 
 ------------------------------------------------------------

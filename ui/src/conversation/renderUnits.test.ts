@@ -275,7 +275,23 @@ describe('buildRenderUnits', () => {
       expect(at.toolResultsByUseId.size).toBe(20);
     });
 
-    it('stops consuming at the first non-tool boundary', () => {
+    it('attaches a tool result to the active agent turn across an interleaved system message', () => {
+      const a = agentMsg('a1');
+      const sys = systemMsg('sys1', 'tool finished');
+      const t = toolMsg('t1', 'use-1');
+      const out = buildRenderUnits({
+        messages: [a, sys, t],
+        pendingMessages: [],
+        convState: IDLE,
+        streamingHandle: null,
+      });
+      expect(out.historicalUnits).toHaveLength(2);
+      const first = assertAgentTurn(out.historicalUnits[0]);
+      expect(out.historicalUnits[1]).toMatchObject({ kind: 'system', key: 'sys1' });
+      expect(first.toolResultsByUseId.has('use-1')).toBe(true);
+    });
+
+    it('stops attaching tool results at user and agent boundaries', () => {
       const a1 = agentMsg('a1');
       const t1 = toolMsg('t1', 'use-1');
       const u = userMsg('u1');

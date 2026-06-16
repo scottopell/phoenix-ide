@@ -82,42 +82,37 @@ function debug(summary: string, fields: Record<string, unknown>): void {
   console.debug(`[renderUnits] ${summary}`, fields);
 }
 
-interface AgentTurnResult {
-  unit: HistoricalUnit;
-  consumed: number;
+type MutableAgentTurnUnit = Extract<HistoricalUnit, { kind: 'agent_turn' }> & {
+  toolResultsByUseId: Map<string, Message>;
+};
+
+function attachToolResult(
+  toolResultsByUseId: Map<string, Message>,
+  msg: Message,
+): void {
+  const content = msg.content as ToolResultContent | undefined;
+  if (content && typeof content.tool_use_id === 'string' && content.tool_use_id) {
+    toolResultsByUseId.set(content.tool_use_id, msg);
+  } else {
+    debug('tool result missing tool_use_id', {
+      message_id: msg.message_id,
+      reason: 'missing_tool_use_id',
+    });
+  }
 }
 
 function buildAgentTurn(
   messages: Message[],
   startIdx: number,
   isFirstInTurn: boolean,
-): AgentTurnResult {
+): MutableAgentTurnUnit {
   const agent = messages[startIdx]!;
-  const toolResultsByUseId = new Map<string, Message>();
-  let j = startIdx + 1;
-  while (j < messages.length) {
-    const next = messages[j]!;
-    if (getMessageType(next) !== 'tool') break;
-    const content = next.content as ToolResultContent | undefined;
-    if (content && typeof content.tool_use_id === 'string' && content.tool_use_id) {
-      toolResultsByUseId.set(content.tool_use_id, next);
-    } else {
-      debug('tool result missing tool_use_id', {
-        message_id: next.message_id,
-        reason: 'missing_tool_use_id',
-      });
-    }
-    j++;
-  }
   return {
-    unit: {
-      kind: 'agent_turn',
-      key: agent.message_id,
-      agent,
-      toolResultsByUseId,
-      isFirstInTurn,
-    },
-    consumed: j - startIdx,
+    kind: 'agent_turn',
+    key: agent.message_id,
+    agent,
+    toolResultsByUseId: new Map<string, Message>(),
+    isFirstInTurn,
   };
 }
 
@@ -128,23 +123,28 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
   let i = 0;
   let inAgentRun = false;
 
+  let activeAgentTurn: MutableAgentTurnUnit | null = null;
+
   while (i < messages.length) {
     const msg = messages[i]!;
     const type = getMessageType(msg);
 
     if (type === 'user') {
       historicalUnits.push({ kind: 'user', key: msg.message_id, message: msg });
+      activeAgentTurn = null;
       inAgentRun = false;
       i++;
     } else if (type === 'skill') {
       historicalUnits.push({ kind: 'skill', key: msg.message_id, message: msg });
+      activeAgentTurn = null;
       inAgentRun = false;
       i++;
     } else if (type === 'agent') {
-      const { unit, consumed } = buildAgentTurn(messages, i, !inAgentRun);
+      const unit = buildAgentTurn(messages, i, !inAgentRun);
       historicalUnits.push(unit);
+      activeAgentTurn = unit;
       inAgentRun = true;
-      i += consumed;
+      i++;
     } else if (type === 'system') {
       if (hasNonEmptyText(msg)) {
         historicalUnits.push({ kind: 'system', key: msg.message_id, message: msg });
@@ -155,17 +155,18 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
         });
       }
       // System messages do not break the agent run for header-suppression
-      // purposes (REQ-MLRU-003). inAgentRun is preserved.
+      // or tool-result ownership purposes (REQ-MLRU-003). inAgentRun and
+      // activeAgentTurn are preserved.
       i++;
     } else if (type === 'tool') {
-      // Orphan tool: not consumed by a preceding agent's trailing scan.
-      // Reaching this branch means either the conversation started with
-      // a tool message or messages were reordered. Skip + log; never
-      // emit a standalone unit (REQ-MLRU-002).
-      debug('skipped orphan tool', {
-        message_id: msg.message_id,
-        reason: 'orphan_tool',
-      });
+      if (activeAgentTurn) {
+        attachToolResult(activeAgentTurn.toolResultsByUseId, msg);
+      } else {
+        debug('skipped orphan tool', {
+          message_id: msg.message_id,
+          reason: 'orphan_tool',
+        });
+      }
       i++;
     } else {
       debug('skipped unknown type', {
