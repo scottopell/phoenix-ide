@@ -353,6 +353,7 @@ fn is_exempt_path(path: &str) -> bool {
         || path == "/new"
         || path == "/codex/login"
         || path == "/about"
+        || path == "/usage"
         || path.starts_with("/c/")
         || path.starts_with("/assets/")
         || path == "/service-worker.js"
@@ -570,6 +571,7 @@ mod tests {
         assert!(is_exempt_path("/new"));
         assert!(is_exempt_path("/codex/login"));
         assert!(is_exempt_path("/about"));
+        assert!(is_exempt_path("/usage"));
         assert!(is_exempt_path("/c/some-slug"));
         assert!(is_exempt_path("/assets/index-abc.js"));
         assert!(is_exempt_path("/service-worker.js"));

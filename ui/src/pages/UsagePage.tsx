@@ -254,6 +254,10 @@ export function UsagePage() {
     return data.daily.map((d) => ({ day: d.day, rate: cacheHitRate(d.totals) * 100 }));
   }, [data]);
 
+  // The cost chart is dollars-only; unpriced models carry cost_usd === 0 and
+  // would otherwise read as "$0 / free" rather than "unknown". Exclude them.
+  const pricedModels = useMemo(() => data?.by_model.filter((m) => m.priced) ?? [], [data]);
+
   const empty = data && data.windows.all.turns === 0;
 
   return (
@@ -374,9 +378,9 @@ export function UsagePage() {
                 </ChartCard>
 
                 <ChartCard title="Cost by model" hint="priced models, USD">
-                  <ResponsiveContainer width="100%" height={Math.max(120, data.by_model.length * 34)}>
+                  <ResponsiveContainer width="100%" height={Math.max(120, pricedModels.length * 34)}>
                     <BarChart
-                      data={data.by_model}
+                      data={pricedModels}
                       layout="vertical"
                       margin={{ top: 4, right: 16, left: 8, bottom: 4 }}
                     >

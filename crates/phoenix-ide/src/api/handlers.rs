@@ -78,6 +78,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/codex/login", get(serve_spa))
         // About this deployment page (SPA-rendered)
         .route("/about", get(serve_spa))
+        // Usage analytics page (SPA-rendered)
+        .route("/usage", get(serve_spa))
         // Service worker
         .route("/service-worker.js", get(serve_service_worker))
         // Favicon (referenced from index.html)
