@@ -377,11 +377,6 @@ pub struct Conversation {
     /// DB rows that predate this column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_name: Option<String>,
-    /// Steering messages queued while the conversation was busy.
-    /// Delivered (FIFO) when the conversation next reaches `Idle`.
-    /// `#[serde(default)]` handles old DB rows that predate this column.
-    #[serde(default)]
-    pub steering_queue: Vec<crate::domain::sm_event::SteerEntry>,
     /// LLM-facing prose language fixed at creation (e.g. `phoenix-native`,
     /// `caveman`). Chain continuations and sub-agents inherit it.
     /// `#[serde(default)]` handles old DB rows that predate this column.
@@ -1766,7 +1761,6 @@ mod conversation_serde_tests {
             seed_label: None,
             continued_in_conv_id,
             chain_name: None,
-            steering_queue: vec![],
             llm_language: crate::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }

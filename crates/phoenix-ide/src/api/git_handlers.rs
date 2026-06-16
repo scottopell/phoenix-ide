@@ -779,7 +779,6 @@ mod tests {
             seed_label: None,
             continued_in_conv_id: None,
             chain_name: None,
-            steering_queue: Vec::new(),
             llm_language: crate::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }

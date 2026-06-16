@@ -2069,6 +2069,14 @@ impl RuntimeManager {
         let (initial_state, initial_state_updated_at, needs_auto_continue) =
             self.determine_resume_state(conversation_id).await?;
 
+        // Seed the executor's in-memory steering queue from the normalized
+        // steering_messages tables.
+        let steering_queue = self
+            .db
+            .get_steering_queue(conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
         let runtime: ProductionRuntime = ConversationRuntime::new(
             context,
             initial_state,
@@ -2085,7 +2093,7 @@ impl RuntimeManager {
             broadcaster.clone(),
         )
         .with_state_updated_at(initial_state_updated_at)
-        .with_steering_queue(conv.steering_queue)
+        .with_steering_queue(steering_queue)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone())
@@ -2284,11 +2292,10 @@ impl RuntimeManager {
             skill_invocation: skill_invocation.clone(),
         };
         let db = self.db();
-        let conversation = db
-            .get_conversation(conversation_id)
+        let mut queue = db
+            .get_steering_queue(conversation_id)
             .await
-            .map_err(|e| format!("Failed to load conversation for steering persist: {e}"))?;
-        let mut queue = conversation.steering_queue;
+            .map_err(|e| format!("Failed to load steering queue for enqueue: {e}"))?;
         queue.push(new_entry);
         db.update_steering_queue(conversation_id, &queue)
             .await

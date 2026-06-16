@@ -997,7 +997,10 @@ mod tests {
             "SELECT skill_body, skill_dir FROM steering_messages WHERE message_id = 's2'",
         )
         .map(|r: sqlx::sqlite::SqliteRow| {
-            (r.get::<Option<String>, _>("skill_body"), r.get::<Option<String>, _>("skill_dir"))
+            (
+                r.get::<Option<String>, _>("skill_body"),
+                r.get::<Option<String>, _>("skill_dir"),
+            )
         })
         .fetch_one(&pool)
         .await
@@ -1016,11 +1019,12 @@ mod tests {
         .unwrap();
         assert_eq!(file, ("a.txt".into(), 9, "/p/a".into()));
 
-        let img_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM steering_message_images WHERE message_id = 's1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let img_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM steering_message_images WHERE message_id = 's1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(img_count, 1);
 
         // Empty queue contributes nothing.

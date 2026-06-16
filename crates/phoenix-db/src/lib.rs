@@ -682,8 +682,12 @@ impl Database {
             .execute(&self.pool)
             .await;
 
-        // Steering queue: pending user messages queued while the conversation
-        // was busy. Delivered FIFO when the conversation next reaches Idle.
+        // DEPRECATED: the steering queue is normalized into the
+        // `steering_messages` (+ attachment) tables; this column is no longer
+        // read or written (it defaults to '[]'). It is retained because the
+        // idempotent legacy-ALTER bootstrap would resurrect a dropped column on
+        // the next boot, and every historical migration replays against it. A
+        // physical column drop is a separate, careful follow-up.
         let _ = sqlx::raw_sql(
             "ALTER TABLE conversations ADD COLUMN steering_queue TEXT NOT NULL DEFAULT '[]'",
         )
@@ -1421,7 +1425,6 @@ impl Database {
             continued_in_conv_id: None,
             // REQ-CHN-007: fresh conversations have no user-set chain name.
             chain_name: None,
-            steering_queue: vec![],
             llm_language,
             spawned_from_conversation_id: None,
         })
@@ -1437,7 +1440,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
         )
@@ -1464,7 +1467,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
         )
@@ -1491,7 +1494,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
@@ -1538,7 +1541,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
@@ -1603,10 +1606,11 @@ impl Database {
         Ok(())
     }
 
-    /// Update the steering queue for a conversation. Persists the FIFO queue
-    /// of pending steering messages to `conversations.steering_queue` wrapped
-    /// in the versioned [`phoenix_core::domain::sm_event::SteeringQueueEnvelope`]
-    /// (see [`phoenix_core::domain::sm_event`]).
+    /// Replace a conversation's pending steering queue with `queue` (FIFO),
+    /// persisted across the normalized `steering_messages` + grandchild
+    /// attachment tables. Replace-all semantics: the existing rows are deleted
+    /// (cascading their attachments) and re-inserted in order inside one
+    /// transaction, so a reader never observes a torn queue.
     ///
     /// # Errors
     ///
@@ -1617,26 +1621,43 @@ impl Database {
         queue: &[phoenix_core::domain::sm_event::SteerEntry],
     ) -> DbResult<()> {
         let now = Utc::now();
-        let queue_json = phoenix_core::domain::sm_event::SteeringQueueEnvelope::to_json(queue)
-            .map_err(|e| DbError::Serialization(e.to_string()))?;
-        let result = sqlx::query(
-            "UPDATE conversations SET steering_queue = ?1, updated_at = ?2 WHERE id = ?3",
-        )
-        .bind(&queue_json)
-        .bind(now.to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
+        let mut tx = self.pool.begin().await?;
+
+        let exists = sqlx::query("SELECT 1 FROM conversations WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+
+        sqlx::query("DELETE FROM steering_messages WHERE conversation_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for (ordinal, entry) in queue.iter().enumerate() {
+            insert_steering_entry_tx(
+                &mut tx,
+                id,
+                i64::try_from(ordinal).unwrap_or(i64::MAX),
+                entry,
+            )
+            .await?;
+        }
+
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(now.to_rfc3339())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    /// Remove the specified `message_ids` from `conversations.steering_queue`.
-    /// Read-filter-write inside a transaction so a concurrent
-    /// `enqueue_steer_message` cannot lose a steer that arrived during the
-    /// drain window.
+    /// Remove the steering entries with the given `message_ids` from a
+    /// conversation. A plain `DELETE` on `steering_messages` (cascading the
+    /// grandchild attachment rows) — no read-modify-write window, so a
+    /// concurrent enqueue cannot be clobbered.
     ///
     /// # Errors
     ///
@@ -1647,29 +1668,100 @@ impl Database {
         }
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT steering_queue FROM conversations WHERE id = ?1")
+        for message_id in message_ids {
+            sqlx::query(
+                "DELETE FROM steering_messages WHERE conversation_id = ?1 AND message_id = ?2",
+            )
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .bind(message_id)
+            .execute(&mut *tx)
             .await?;
-        let Some(row) = row else {
-            return Err(DbError::ConversationNotFound(id.to_string()));
-        };
-        let queue_str: Option<String> = row.try_get("steering_queue")?;
-        let queue_str = queue_str.unwrap_or_else(|| "[]".to_string());
-        let mut queue = phoenix_core::domain::sm_event::decode_steering_queue(id, &queue_str);
-        let to_remove: std::collections::HashSet<&str> =
-            message_ids.iter().map(String::as_str).collect();
-        queue.retain(|entry| !to_remove.contains(entry.message_id.as_str()));
-        let new_json = phoenix_core::domain::sm_event::SteeringQueueEnvelope::to_json(&queue)
-            .map_err(|e| DbError::Serialization(e.to_string()))?;
-        sqlx::query("UPDATE conversations SET steering_queue = ?1, updated_at = ?2 WHERE id = ?3")
-            .bind(&new_json)
+        }
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
             .bind(now.to_rfc3339())
             .bind(id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Load a conversation's pending steering queue (FIFO) from the normalized
+    /// tables, rehydrating each entry's attachments and skill invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_steering_queue(
+        &self,
+        id: &str,
+    ) -> DbResult<Vec<phoenix_core::domain::sm_event::SteerEntry>> {
+        use phoenix_core::domain::db_schema::{FileAttachment, ImageData};
+        use phoenix_core::domain::skill_invocation::SkillInvocation;
+        use phoenix_core::domain::sm_event::SteerEntry;
+
+        let rows = sqlx::query(
+            "SELECT message_id, text, llm_text, user_agent, skill_name, skill_body, skill_dir
+             FROM steering_messages WHERE conversation_id = ?1 ORDER BY ordinal ASC",
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut queue = Vec::with_capacity(rows.len());
+        for row in rows {
+            let message_id: String = row.try_get("message_id")?;
+            let files = sqlx::query(
+                "SELECT original_name, media_type, size_bytes, stored_path
+                 FROM steering_message_files WHERE message_id = ?1 ORDER BY file_ordinal",
+            )
+            .bind(&message_id)
+            .map(|r: SqliteRow| FileAttachment {
+                original_name: r.get("original_name"),
+                media_type: r.get("media_type"),
+                size_bytes: u64::try_from(r.get::<i64, _>("size_bytes")).unwrap_or(0),
+                stored_path: r.get("stored_path"),
+            })
+            .fetch_all(&self.pool)
+            .await?;
+            let images = sqlx::query(
+                "SELECT media_type, data FROM steering_message_images
+                 WHERE message_id = ?1 ORDER BY image_ordinal",
+            )
+            .bind(&message_id)
+            .map(|r: SqliteRow| ImageData {
+                data: r.get("data"),
+                media_type: r.get("media_type"),
+            })
+            .fetch_all(&self.pool)
+            .await?;
+            // The CHECK constraint guarantees the skill_* trio is all-or-nothing.
+            let skill_invocation =
+                row.try_get::<Option<String>, _>("skill_name")?
+                    .map(|name| SkillInvocation {
+                        name,
+                        body: row
+                            .try_get::<Option<String>, _>("skill_body")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default(),
+                        skill_dir: row
+                            .try_get::<Option<String>, _>("skill_dir")
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default(),
+                    });
+            queue.push(SteerEntry {
+                text: row.try_get("text")?,
+                llm_text: row.try_get("llm_text")?,
+                images,
+                files,
+                message_id,
+                user_agent: row.try_get("user_agent")?,
+                skill_invocation,
+            });
+        }
+        Ok(queue)
     }
 
     /// Update conversation mode (e.g., Explore -> Work on task approval)
@@ -1743,7 +1835,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
@@ -2012,7 +2104,6 @@ impl Database {
             seed_label: None,
             continued_in_conv_id: None,
             chain_name: None,
-            steering_queue: vec![],
             llm_language: parent.llm_language,
             spawned_from_conversation_id: None,
         })
@@ -2204,7 +2295,6 @@ impl Database {
             // Continuations are not chain roots — chain_name lives on the
             // root only (REQ-CHN-007).
             chain_name: None,
-            steering_queue: vec![],
             // Inherit language from the parent so the whole chain speaks the
             // same way.
             llm_language: parent.llm_language,
@@ -2274,7 +2364,7 @@ impl Database {
             SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                    c.project_id, c.conv_mode, c.desired_base_branch,
-                   c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
+                   c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
             FROM conversations c
             JOIN chain ON c.id = chain.id
@@ -2881,7 +2971,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
@@ -3979,13 +4069,6 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         .map(phoenix_core::llm_language::LlmLanguage::parse_or_default)
         .unwrap_or_default();
 
-    let steering_queue = row
-        .try_get::<Option<String>, _>("steering_queue")
-        .unwrap_or(None)
-        .as_deref()
-        .map(|s| phoenix_core::domain::sm_event::decode_steering_queue(&id, s))
-        .unwrap_or_default();
-
     Ok(Conversation {
         id,
         slug,
@@ -4009,7 +4092,6 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         seed_label,
         continued_in_conv_id,
         chain_name,
-        steering_queue,
         llm_language,
         spawned_from_conversation_id,
     })
@@ -4084,6 +4166,70 @@ fn parse_fork_proposal_row(row: SqliteRow) -> Result<ForkProposal, sqlx::Error> 
 /// Insert a fully-formed `Conversation` row inside a transaction, writing every
 /// persisted column (including `spawned_from_conversation_id`). Idempotent on
 /// the PRIMARY KEY ONLY via `ON CONFLICT(id) DO NOTHING`, so a crash-retry that
+/// Insert one steering entry plus its attachments into the normalized tables,
+/// inside a transaction. The `skill_*` columns are written as an all-or-nothing
+/// trio (enforced by the table CHECK).
+async fn insert_steering_entry_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+    ordinal: i64,
+    entry: &phoenix_core::domain::sm_event::SteerEntry,
+) -> DbResult<()> {
+    let (skill_name, skill_body, skill_dir) = match &entry.skill_invocation {
+        Some(s) => (
+            Some(s.name.as_str()),
+            Some(s.body.as_str()),
+            Some(s.skill_dir.as_str()),
+        ),
+        None => (None, None, None),
+    };
+    sqlx::query(
+        "INSERT INTO steering_messages
+            (message_id, conversation_id, ordinal, text, llm_text, user_agent,
+             skill_name, skill_body, skill_dir)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )
+    .bind(&entry.message_id)
+    .bind(conversation_id)
+    .bind(ordinal)
+    .bind(&entry.text)
+    .bind(&entry.llm_text)
+    .bind(&entry.user_agent)
+    .bind(skill_name)
+    .bind(skill_body)
+    .bind(skill_dir)
+    .execute(&mut **tx)
+    .await?;
+    for (file_ordinal, file) in entry.files.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO steering_message_files
+                (message_id, file_ordinal, original_name, media_type, size_bytes, stored_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&entry.message_id)
+        .bind(i64::try_from(file_ordinal).unwrap_or(i64::MAX))
+        .bind(&file.original_name)
+        .bind(&file.media_type)
+        .bind(i64::try_from(file.size_bytes).unwrap_or(i64::MAX))
+        .bind(&file.stored_path)
+        .execute(&mut **tx)
+        .await?;
+    }
+    for (image_ordinal, image) in entry.images.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO steering_message_images (message_id, image_ordinal, media_type, data)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&entry.message_id)
+        .bind(i64::try_from(image_ordinal).unwrap_or(i64::MAX))
+        .bind(&image.media_type)
+        .bind(&image.data)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 /// finds the deterministic child id already present is a no-op (REQ-PROJ-034
 /// recovery model) — but a UNIQUE `slug` collision with a DIFFERENT conversation
 /// is NOT swallowed; it surfaces as an error rather than silently skipping the
@@ -4099,17 +4245,18 @@ async fn insert_conversation_tx(
         serde_json::to_string(&conv.state).map_err(|e| DbError::Serialization(e.to_string()))?;
     let conv_mode_json = serde_json::to_string(&conv.conv_mode)
         .map_err(|e| DbError::Serialization(e.to_string()))?;
-    let steering_json = serde_json::to_string(&conv.steering_queue)
-        .map_err(|e| DbError::Serialization(e.to_string()))?;
 
+    // A forked/copied conversation starts with an empty steering queue (pending
+    // steers are not inherited), so the steering_messages tables are not written
+    // here. The legacy `steering_queue` column defaults to '[]'.
     sqlx::query(
         "INSERT INTO conversations (
             id, slug, title, cwd, parent_conversation_id, user_initiated, state,
             state_updated_at, created_at, updated_at, archived, model, project_id,
             conv_mode, desired_base_branch, seed_parent_id, seed_label,
-            continued_in_conv_id, chain_name, steering_queue, llm_language,
+            continued_in_conv_id, chain_name, llm_language,
             spawned_from_conversation_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -4131,7 +4278,6 @@ async fn insert_conversation_tx(
     .bind(&conv.seed_label)
     .bind(&conv.continued_in_conv_id)
     .bind(&conv.chain_name)
-    .bind(&steering_json)
     .bind(conv.llm_language.as_str())
     .bind(&conv.spawned_from_conversation_id)
     .execute(&mut **tx)
@@ -5313,6 +5459,95 @@ mod tests {
             | MessageContent::Error(_)
             | MessageContent::Continuation(_) => panic!("expected skill content"),
         }
+    }
+
+    /// Steering queue round-trips through the normalized tables: replace-all
+    /// writes entries + attachments + skill trio, `get_steering_queue` rehydrates
+    /// them in FIFO order, and `remove_steering_entries` deletes an entry and
+    /// cascades its attachments.
+    #[tokio::test]
+    async fn steering_queue_round_trips_and_removes_via_child_tables() {
+        use phoenix_core::domain::db_schema::{FileAttachment, ImageData};
+        use phoenix_core::domain::skill_invocation::SkillInvocation;
+        use phoenix_core::domain::sm_event::SteerEntry;
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-s", "slug-s", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let entry_a = SteerEntry {
+            text: "first".into(),
+            llm_text: Some("first-expanded".into()),
+            images: vec![ImageData {
+                data: "IMG".into(),
+                media_type: "image/png".into(),
+            }],
+            files: vec![FileAttachment {
+                original_name: "a.txt".into(),
+                media_type: "text/plain".into(),
+                size_bytes: 5,
+                stored_path: "/store/a".into(),
+            }],
+            message_id: "sa".into(),
+            user_agent: Some("UA".into()),
+            skill_invocation: None,
+        };
+        let entry_b = SteerEntry {
+            text: "second".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "sb".into(),
+            user_agent: None,
+            skill_invocation: Some(SkillInvocation {
+                name: "build".into(),
+                body: "BODY".into(),
+                skill_dir: "/skills/build".into(),
+            }),
+        };
+        db.update_steering_queue("conv-s", &[entry_a, entry_b])
+            .await
+            .unwrap();
+
+        let queue = db.get_steering_queue("conv-s").await.unwrap();
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].message_id, "sa");
+        assert_eq!(queue[0].llm_text.as_deref(), Some("first-expanded"));
+        assert_eq!(queue[0].images.len(), 1);
+        assert_eq!(queue[0].files[0].original_name, "a.txt");
+        assert!(queue[0].skill_invocation.is_none());
+        assert_eq!(queue[1].message_id, "sb");
+        let skill = queue[1].skill_invocation.as_ref().unwrap();
+        assert_eq!(skill.name, "build");
+        assert_eq!(skill.skill_dir, "/skills/build");
+
+        // The legacy blob column carries no data (defaulted to '[]').
+        let blob: String =
+            sqlx::query_scalar("SELECT steering_queue FROM conversations WHERE id = 'conv-s'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(blob, "[]");
+
+        // Remove entry A; its grandchild rows cascade away, B survives.
+        db.remove_steering_entries("conv-s", &["sa".to_string()])
+            .await
+            .unwrap();
+        let queue = db.get_steering_queue("conv-s").await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].message_id, "sb");
+        let orphan_files: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM steering_message_files WHERE message_id = 'sa'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(orphan_files, 0);
+
+        // Replace-all with an empty queue clears everything.
+        db.update_steering_queue("conv-s", &[]).await.unwrap();
+        assert!(db.get_steering_queue("conv-s").await.unwrap().is_empty());
     }
 
     /// Regression for task 02679: messages must persist with the seq their

@@ -754,54 +754,26 @@ fn attachment_root() -> PathBuf {
     phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect().attachments_dir()
 }
 
-fn collect_file_paths_from_content(value: &serde_json::Value, paths: &mut HashSet<PathBuf>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(path) = map.get("stored_path").and_then(serde_json::Value::as_str) {
-                paths.insert(PathBuf::from(path));
-            }
-            for child in map.values() {
-                collect_file_paths_from_content(child, paths);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_file_paths_from_content(item, paths);
-            }
-        }
-        _ => {}
-    }
-}
-
 async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet<PathBuf>, String> {
     // Message file attachments are normalized into `message_files`; read the
     // stored paths directly rather than scanning the content blob. (Images are
     // inline base64, not on-disk files, so they need no sweep entry.)
-    let file_rows = sqlx::query("SELECT stored_path FROM message_files")
-        .fetch_all(db.pool())
-        .await
-        .map_err(|e| format!("failed to read message attachment references: {e}"))?;
-    // Steering-queue attachments still live in the JSON blob (not yet
-    // normalized), so they are scanned the same way.
-    let steering_rows = sqlx::query(
-        "SELECT steering_queue FROM conversations WHERE steering_queue LIKE '%stored_path%'",
+    // Both message and steering file attachments are normalized into child
+    // tables; read the stored paths directly. (Images are inline base64, not
+    // on-disk files, so they need no sweep entry.)
+    let file_rows = sqlx::query(
+        "SELECT stored_path FROM message_files
+         UNION
+         SELECT stored_path FROM steering_message_files",
     )
     .fetch_all(db.pool())
     .await
-    .map_err(|e| format!("failed to read steering attachment references: {e}"))?;
+    .map_err(|e| format!("failed to read attachment references: {e}"))?;
 
     let mut paths = HashSet::new();
     for row in file_rows {
         if let Ok(stored_path) = row.try_get::<String, _>("stored_path") {
             paths.insert(PathBuf::from(stored_path));
-        }
-    }
-    for row in steering_rows {
-        let Ok(raw) = row.try_get::<String, _>("steering_queue") else {
-            continue;
-        };
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
-            collect_file_paths_from_content(&value, &mut paths);
         }
     }
     Ok(paths)
@@ -2371,11 +2343,16 @@ async fn send_chat(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let steering_queue = state
+        .runtime
+        .db()
+        .get_steering_queue(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     // Steering queue idempotency: if message_id is already in the queue a
     // retry returns the same accepted response without double-enqueuing.
-    if conversation
-        .steering_queue
+    if steering_queue
         .iter()
         .any(|e| e.message_id == req.message_id)
     {
@@ -2406,7 +2383,7 @@ async fn send_chat(
         if steer {
             // Enforce queue depth limit before accepting.
             const MAX_STEER_QUEUE_DEPTH: usize = 5;
-            if conversation.steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
+            if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     "Steering queue is full; try again once a queued message has been delivered."
                         .to_string(),
@@ -2667,24 +2644,20 @@ async fn cancel_steering_message(
     State(state): State<AppState>,
     Path((id, message_id)): Path<(String, String)>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let conversation = state
+    // 404 if the conversation does not exist; the removal itself is idempotent.
+    state
         .runtime
         .db()
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    // Filter out the target message_id
-    let new_queue: Vec<crate::state_machine::event::SteerEntry> = conversation
-        .steering_queue
-        .into_iter()
-        .filter(|e| e.message_id != message_id)
-        .collect();
-
+    // Delete the entry directly (cascading its attachments); a missing entry is
+    // a no-op, matching the idempotent contract.
     state
         .runtime
         .db()
-        .update_steering_queue(&id, &new_queue)
+        .remove_steering_entries(&id, std::slice::from_ref(&message_id))
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -8090,19 +8063,6 @@ mod attachment_storage_tests {
             "secret_notes.txt"
         );
         assert_eq!(sanitize_attachment_name("..."), "attachment");
-    }
-
-    #[test]
-    fn collects_attachment_paths_from_nested_message_and_steering_json() {
-        let value = serde_json::json!({
-            "v": "v1",
-            "entries": [{
-                "files": [{"stored_path": "/tmp/phoenix-ide-attachments/c/m.txt"}]
-            }]
-        });
-        let mut paths = HashSet::new();
-        collect_file_paths_from_content(&value, &mut paths);
-        assert!(paths.contains(&PathBuf::from("/tmp/phoenix-ide-attachments/c/m.txt")));
     }
 
     #[test]
