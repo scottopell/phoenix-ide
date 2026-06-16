@@ -211,6 +211,21 @@ impl PhoenixRuntimeEnvironment {
         &self.tmp_root
     }
 
+    /// `temp_dir()/phoenix-ide-attachments` — scratch root for message
+    /// attachments. Deliberately a **sibling** of [`tmp_root`](Self::tmp_root),
+    /// not a child: this is the path attachments have always shipped at, and
+    /// the TTL sweep and conversation-delete cleanup only ever walk the
+    /// current root, so relocating it would strand pre-existing files that
+    /// nothing would then reclaim.
+    #[must_use]
+    pub fn attachments_dir(&self) -> PathBuf {
+        // `tmp_root` is `<temp>/phoenix-ide`; its parent is `<temp>`.
+        self.tmp_root.parent().map_or_else(
+            || self.tmp_root.join("attachments"),
+            |temp| temp.join("phoenix-ide-attachments"),
+        )
+    }
+
     /// `home/.cache/phoenix-ide/chromium` — Chrome-for-Testing download cache.
     #[must_use]
     pub fn chromium_cache_dir(&self) -> PathBuf {
@@ -291,6 +306,9 @@ mod tests {
             env.chromium_cache_dir(),
             root.join(".cache/phoenix-ide/chromium")
         );
+        // Attachments live beside tmp_root (root/tmp here), not under it, so the
+        // historical path is preserved.
+        assert_eq!(env.attachments_dir(), root.join("phoenix-ide-attachments"));
     }
 
     #[test]

@@ -81,8 +81,7 @@ pub async fn terminal_ws_global_handler(
 ) -> impl IntoResponse {
     let terminals = state.terminals.clone();
     let runtime = Arc::clone(&state.runtime);
-    // Global terminal spawns in the home directory — the only stable cwd that
-    // doesn't depend on any conversation or worktree.
+    // cwd per specs/terminal/terminal.allium (WorkScope::Global -> $HOME).
     let cwd = state.runtime_env.home().to_path_buf();
     ws.on_upgrade(move |socket| {
         handle_socket(

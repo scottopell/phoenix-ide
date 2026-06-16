@@ -741,9 +741,7 @@ const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 const ATTACHMENT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 fn attachment_root() -> PathBuf {
-    phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
-        .tmp_root()
-        .join("attachments")
+    phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect().attachments_dir()
 }
 
 fn collect_file_paths_from_content(value: &serde_json::Value, paths: &mut HashSet<PathBuf>) {
