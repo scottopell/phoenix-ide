@@ -54,6 +54,7 @@ are covered in the [walkthrough](../howto/run-a-managed-task.md).
 
 ## See also
 
+- [Conversations](conversations.md) — what a mode is a property of
 - [Tasks](tasks.md) — the plan that gates Explore → Work
 - [Run a managed task](../howto/run-a-managed-task.md) — the end-to-end walkthrough
 - [Managed lifecycle states](../reference/managed-lifecycle-states.md) — every approval & Done? state

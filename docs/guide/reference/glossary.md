@@ -16,7 +16,7 @@ owns it once that page exists.
 
 | Term | Means | Owner |
 |------|-------|-------|
-| **conversation** | One thread with the agent, tied to a working directory and a mode. | Conversations |
+| **conversation** | One thread with the agent, tied to a working directory and a mode. | [Conversations](../concepts/conversations.md) |
 | **mode** | A conversation's freedom level: one of Direct, Explore, Work, Branch. Lowercase except the four proper names. | [Modes](../concepts/modes.md) |
 | **Direct / Explore / Work / Branch** | The four modes, capitalized. Match the badge text exactly. | [Modes](../concepts/modes.md) |
 | **managed** | The Explore → Work *lifecycle*, not a mode. Lowercase. There is no "Managed" control in the UI. | [Modes](../concepts/modes.md) |

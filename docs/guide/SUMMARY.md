@@ -12,7 +12,7 @@ written.
 # Concepts
 
 - Overview — `concepts/overview.md` *(planned)*
-- Conversations — `concepts/conversations.md` *(planned)*
+- [Conversations](concepts/conversations.md)
 - [Modes](concepts/modes.md)
 - [Tasks](concepts/tasks.md)
 - Sub-agents — `concepts/sub-agents.md` *(planned)*

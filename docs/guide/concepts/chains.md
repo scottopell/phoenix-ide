@@ -3,7 +3,7 @@ title: Chains
 summary: A run of conversations linked by continuation, named and queryable as one unit — ask it recall questions without re-explaining.
 category: concepts
 keywords: [chain, continuation, recall, q&a, ask the chain, freshness]
-related: [reference/glossary.md]
+related: [concepts/conversations.md, reference/glossary.md]
 ---
 
 # Chains
@@ -48,5 +48,5 @@ written, and tagged with its age when the chain has grown since you asked.
 
 ## See also
 
+- [Conversations](conversations.md) — what a chain is made of
 - [Glossary](../reference/glossary.md) — chain, continuation, chain Q&A
-- Conversations, Continuation — *(planned)*
