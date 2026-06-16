@@ -774,12 +774,15 @@ fn collect_file_paths_from_content(value: &serde_json::Value, paths: &mut HashSe
 }
 
 async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet<PathBuf>, String> {
-    let message_rows = sqlx::query(
-        "SELECT content FROM messages WHERE message_type IN ('user', 'skill') AND content LIKE '%stored_path%'",
-    )
-    .fetch_all(db.pool())
-    .await
-    .map_err(|e| format!("failed to read message attachment references: {e}"))?;
+    // Message file attachments are normalized into `message_files`; read the
+    // stored paths directly rather than scanning the content blob. (Images are
+    // inline base64, not on-disk files, so they need no sweep entry.)
+    let file_rows = sqlx::query("SELECT stored_path FROM message_files")
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| format!("failed to read message attachment references: {e}"))?;
+    // Steering-queue attachments still live in the JSON blob (not yet
+    // normalized), so they are scanned the same way.
     let steering_rows = sqlx::query(
         "SELECT steering_queue FROM conversations WHERE steering_queue LIKE '%stored_path%'",
     )
@@ -788,12 +791,9 @@ async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet
     .map_err(|e| format!("failed to read steering attachment references: {e}"))?;
 
     let mut paths = HashSet::new();
-    for row in message_rows {
-        let Ok(content) = row.try_get::<String, _>("content") else {
-            continue;
-        };
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
-            collect_file_paths_from_content(&value, &mut paths);
+    for row in file_rows {
+        if let Ok(stored_path) = row.try_get::<String, _>("stored_path") {
+            paths.insert(PathBuf::from(stored_path));
         }
     }
     for row in steering_rows {

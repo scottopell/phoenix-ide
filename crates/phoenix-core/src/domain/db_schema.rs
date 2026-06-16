@@ -943,6 +943,75 @@ pub struct SkillContent {
     pub files: Vec<FileAttachment>,
 }
 
+/// Persisted projection of [`UserContent`].
+///
+/// The `messages.content` blob does NOT carry attachments — they live in the
+/// `message_files` / `message_images` child tables, hydrated onto the runtime
+/// [`UserContent`] by the DB layer. This stored shape has no attachment fields,
+/// so a child collection cannot be smuggled back into the blob: the rollout-shim
+/// bug class is structurally unrepresentable here.
+#[derive(Serialize, Deserialize)]
+struct StoredUserContent {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    llm_text: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    is_meta: bool,
+}
+
+impl From<&UserContent> for StoredUserContent {
+    fn from(c: &UserContent) -> Self {
+        Self {
+            text: c.text.clone(),
+            llm_text: c.llm_text.clone(),
+            is_meta: c.is_meta,
+        }
+    }
+}
+
+impl StoredUserContent {
+    /// Rebuild the runtime content with empty attachments; the DB layer fills
+    /// them from the child tables.
+    fn into_runtime(self) -> UserContent {
+        UserContent {
+            text: self.text,
+            images: Vec::new(),
+            files: Vec::new(),
+            llm_text: self.llm_text,
+            is_meta: self.is_meta,
+        }
+    }
+}
+
+/// Persisted projection of [`SkillContent`] — see [`StoredUserContent`].
+#[derive(Serialize, Deserialize)]
+struct StoredSkillContent {
+    name: String,
+    body: String,
+    trigger: String,
+}
+
+impl From<&SkillContent> for StoredSkillContent {
+    fn from(c: &SkillContent) -> Self {
+        Self {
+            name: c.name.clone(),
+            body: c.body.clone(),
+            trigger: c.trigger.clone(),
+        }
+    }
+}
+
+impl StoredSkillContent {
+    fn into_runtime(self) -> SkillContent {
+        SkillContent {
+            name: self.name,
+            body: self.body,
+            trigger: self.trigger,
+            files: Vec::new(),
+        }
+    }
+}
+
 /// Typed message content
 ///
 /// This enum provides type safety for message content while maintaining
@@ -1018,6 +1087,87 @@ impl MessageContent {
             MessageType::Skill => serde_json::from_value(value)
                 .map(Self::Skill)
                 .map_err(|e| format!("Invalid skill content: {e}")),
+        }
+    }
+
+    /// Serialize content for the persisted `messages.content` column.
+    ///
+    /// User/skill attachments are NOT included — they persist in the
+    /// `message_files` / `message_images` child tables. Every other variant is
+    /// byte-identical to [`Self::to_json`]. The wire path uses `to_json` (with
+    /// attachments); only the DB write path uses this.
+    #[must_use]
+    pub fn to_stored_json(&self) -> Value {
+        match self {
+            Self::User(c) => {
+                serde_json::to_value(StoredUserContent::from(c)).unwrap_or(Value::Null)
+            }
+            Self::Skill(c) => {
+                serde_json::to_value(StoredSkillContent::from(c)).unwrap_or(Value::Null)
+            }
+            Self::Agent(_)
+            | Self::Tool(_)
+            | Self::System(_)
+            | Self::Error(_)
+            | Self::Continuation(_) => self.to_json(),
+        }
+    }
+
+    /// Deserialize content from the persisted `messages.content` column.
+    ///
+    /// User/skill attachments come back EMPTY; the DB layer hydrates them from
+    /// the child tables via [`Self::set_attachments`]. Every other variant
+    /// matches [`Self::from_json`].
+    ///
+    /// # Errors
+    /// Returns `Err` if `value` does not deserialize into the stored shape
+    /// implied by `msg_type`.
+    pub fn from_stored_json(msg_type: MessageType, value: Value) -> Result<Self, String> {
+        match msg_type {
+            MessageType::User => serde_json::from_value::<StoredUserContent>(value)
+                .map(|s| Self::User(s.into_runtime()))
+                .map_err(|e| format!("Invalid user content: {e}")),
+            MessageType::Skill => serde_json::from_value::<StoredSkillContent>(value)
+                .map(|s| Self::Skill(s.into_runtime()))
+                .map_err(|e| format!("Invalid skill content: {e}")),
+            MessageType::Agent
+            | MessageType::Tool
+            | MessageType::System
+            | MessageType::Error
+            | MessageType::Continuation => Self::from_json(msg_type, value),
+        }
+    }
+
+    /// The user/skill attachments carried by this content — the source for the
+    /// child-table writes. Empty for variants and messages that have none.
+    #[must_use]
+    pub fn attachments(&self) -> (&[ImageData], &[FileAttachment]) {
+        match self {
+            Self::User(c) => (&c.images, &c.files),
+            Self::Skill(c) => (&[], &c.files),
+            Self::Agent(_)
+            | Self::Tool(_)
+            | Self::System(_)
+            | Self::Error(_)
+            | Self::Continuation(_) => (&[], &[]),
+        }
+    }
+
+    /// Replace the user/skill attachments — used when hydrating a row read from
+    /// the DB with its child-table rows. `images` is ignored for skill content
+    /// (skill invocations carry no inline images).
+    pub fn set_attachments(&mut self, images: Vec<ImageData>, files: Vec<FileAttachment>) {
+        match self {
+            Self::User(c) => {
+                c.images = images;
+                c.files = files;
+            }
+            Self::Skill(c) => c.files = files,
+            Self::Agent(_)
+            | Self::Tool(_)
+            | Self::System(_)
+            | Self::Error(_)
+            | Self::Continuation(_) => {}
         }
     }
 

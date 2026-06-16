@@ -139,6 +139,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_message_attachment_tables",
         sql: MIGRATION_025,
     },
+    Migration {
+        version: 26,
+        name: "strip_message_content_attachments",
+        sql: MIGRATION_026,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -633,6 +638,25 @@ WHERE m.message_type = 'user'
   AND json_type(m.content, '$.images') = 'array';
 ";
 
+/// Strip the now-redundant `files`/`images` keys from the `messages.content`
+/// blob, completing the cutover begun in migration 025. After 025 copied the
+/// attachments into `message_files`/`message_images`, the blob copy is a stale
+/// parallel representation; the read/write paths now treat the child tables as
+/// the single source of truth, so the blob keys are removed. `json_remove` is a
+/// no-op when the path is absent, so this is safe across both back-filled and
+/// freshly written (already attachment-free) rows.
+const MIGRATION_026: &str = r"
+UPDATE messages
+SET content = json_remove(content, '$.files', '$.images')
+WHERE message_type = 'user'
+  AND (json_type(content, '$.files') IS NOT NULL OR json_type(content, '$.images') IS NOT NULL);
+
+UPDATE messages
+SET content = json_remove(content, '$.files')
+WHERE message_type = 'skill'
+  AND json_type(content, '$.files') IS NOT NULL;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -760,7 +784,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 25);
+        assert_eq!(first, 26);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -860,6 +884,30 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(size, 2);
+
+        // Migration 026 (run in the same pass) strips the now-redundant blob
+        // keys: content keeps its scalar fields but no longer carries
+        // files/images.
+        let content_for = |id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let s: String =
+                    sqlx::query_scalar("SELECT content FROM messages WHERE message_id = ?1")
+                        .bind(id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                serde_json::from_str::<serde_json::Value>(&s).unwrap()
+            }
+        };
+        let user = content_for("m-user").await;
+        assert!(user.get("files").is_none() && user.get("images").is_none());
+        assert_eq!(user["text"], "hi");
+        let skill = content_for("m-skill").await;
+        assert!(skill.get("files").is_none());
+        assert_eq!(skill["name"], "build");
+        let plain = content_for("m-plain").await;
+        assert!(plain.get("files").is_none() && plain.get("images").is_none());
     }
 
     #[tokio::test]

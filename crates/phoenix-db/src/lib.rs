@@ -1855,11 +1855,11 @@ impl Database {
         .unwrap();
         let seed_content =
             MessageContent::User(UserContent::meta(approved_task_seed_message(approval)));
-        let seed_content_str = serde_json::to_string(&seed_content.to_json()).unwrap();
+        let seed_content_str = serde_json::to_string(&seed_content.to_stored_json()).unwrap();
         let seed_display = serde_json::json!({ "user_agent": "Phoenix Task Handoff" });
         let seed_display_str = serde_json::to_string(&seed_display).unwrap();
         let handoff_summary = MessageContent::continuation(approved_task_handoff_summary(approval));
-        let handoff_summary_str = serde_json::to_string(&handoff_summary.to_json()).unwrap();
+        let handoff_summary_str = serde_json::to_string(&handoff_summary.to_stored_json()).unwrap();
 
         let mut tx = self.pool.begin().await?;
         let actual_slug = loop {
@@ -1913,6 +1913,9 @@ impl Database {
         .bind(&now_str)
         .execute(&mut *tx)
         .await?;
+        // Uniform with every other user/skill write: attachments (none for a
+        // meta seed today) live in the child tables, never the content blob.
+        insert_message_attachments(&mut tx, &seed_message_id, &seed_content).await?;
 
         let parent_next_sequence_id: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
@@ -3377,7 +3380,7 @@ impl Database {
         let now = Utc::now();
         let msg_type = content.message_type();
 
-        let content_str = serde_json::to_string(&content.to_json()).unwrap();
+        let content_str = serde_json::to_string(&content.to_stored_json()).unwrap();
         let display_str = display_data.map(|v| serde_json::to_string(v).unwrap());
         let usage_str = usage_data.map(|u| serde_json::to_string(u).unwrap());
 
@@ -3395,6 +3398,11 @@ impl Database {
         .bind(now.to_rfc3339())
         .execute(&self.pool)
         .await?;
+
+        {
+            let mut conn = self.pool.acquire().await?;
+            insert_message_attachments(&mut conn, message_id, content).await?;
+        }
 
         // Update conversation timestamp
         sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
@@ -3450,7 +3458,7 @@ impl Database {
         created_at: DateTime<Utc>,
     ) -> DbResult<Message> {
         let msg_type = content.message_type();
-        let content_str = serde_json::to_string(&content.to_json()).unwrap();
+        let content_str = serde_json::to_string(&content.to_stored_json()).unwrap();
         let display_str = display_data.map(|v| serde_json::to_string(v).unwrap());
         let usage_str = usage_data.map(|u| serde_json::to_string(u).unwrap());
 
@@ -3468,6 +3476,11 @@ impl Database {
         .bind(created_at.to_rfc3339())
         .execute(&self.pool)
         .await?;
+
+        {
+            let mut conn = self.pool.acquire().await?;
+            insert_message_attachments(&mut conn, message_id, content).await?;
+        }
 
         // Mirror the `add_message_with_seq` side-effect: bump the
         // conversation's `updated_at` so list-ordering stays current.
@@ -3506,7 +3519,7 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
-        let rows = sqlx::query(
+        let mut rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
         )
@@ -3515,6 +3528,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        hydrate_attachments(&self.pool, &mut rows).await?;
         Ok(rows)
     }
 
@@ -3528,7 +3542,7 @@ impl Database {
         conversation_id: &str,
         after_sequence: i64,
     ) -> DbResult<Vec<Message>> {
-        let rows = sqlx::query(
+        let mut rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages WHERE conversation_id = ?1 AND sequence_id > ?2 ORDER BY sequence_id ASC",
         )
@@ -3538,6 +3552,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
+        hydrate_attachments(&self.pool, &mut rows).await?;
         Ok(rows)
     }
 
@@ -3547,7 +3562,7 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_message_by_id(&self, message_id: &str) -> DbResult<Message> {
-        sqlx::query(
+        let mut message = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
              FROM messages WHERE message_id = ?1",
         )
@@ -3561,7 +3576,10 @@ impl Database {
             } else {
                 DbError::Sqlx(e)
             }
-        })
+        })?;
+
+        hydrate_attachments(&self.pool, std::slice::from_mut(&mut message)).await?;
+        Ok(message)
     }
 
     /// Check if a message with the given `message_id` already exists
@@ -3650,7 +3668,9 @@ impl Database {
         .try_map(parse_message_row)
         .fetch_optional(&self.pool)
         .await?;
-        if let Some(message) = updated {
+        if let Some(mut message) = updated {
+            // Hydrate attachments so the re-indexed text keeps file-context tags.
+            hydrate_attachments(&self.pool, std::slice::from_mut(&mut message)).await?;
             if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
                 tracing::warn!(
                     message_id = %message.message_id, error = %e,
@@ -4500,7 +4520,7 @@ async fn insert_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     msg: &Message,
 ) -> DbResult<()> {
-    let content_str = serde_json::to_string(&msg.content.to_json())
+    let content_str = serde_json::to_string(&msg.content.to_stored_json())
         .map_err(|e| DbError::Serialization(e.to_string()))?;
     let display_str = msg
         .display_data
@@ -4529,12 +4549,100 @@ async fn insert_message_tx(
     .bind(msg.created_at.to_rfc3339())
     .execute(&mut **tx)
     .await?;
+    insert_message_attachments(tx, &msg.message_id, &msg.content).await?;
     // Index for retrieval atomically with the message insert, so tx-based
     // persists (fork-resolution seed messages, checkpoint replays) get the
     // same FTS coverage as `add_message_with_seq` — no message reaches a chain
     // unindexed before the startup reconcile (specs/conversation-retrieval/
     // REQ-RET-003).
     retrieval::fts_upsert_conn(tx, msg).await?;
+    Ok(())
+}
+
+/// Write a message's user/skill attachments to the `message_files` /
+/// `message_images` child tables. `INSERT OR IGNORE` keyed on
+/// `(message_id, ordinal)` makes this idempotent under retry, matching the
+/// `INSERT OR IGNORE` on the parent message row.
+async fn insert_message_attachments(
+    conn: &mut sqlx::SqliteConnection,
+    message_id: &str,
+    content: &MessageContent,
+) -> DbResult<()> {
+    let (images, files) = content.attachments();
+    for (ordinal, file) in files.iter().enumerate() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO message_files
+             (message_id, ordinal, original_name, media_type, size_bytes, stored_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(message_id)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(&file.original_name)
+        .bind(&file.media_type)
+        .bind(i64::try_from(file.size_bytes).unwrap_or(i64::MAX))
+        .bind(&file.stored_path)
+        .execute(&mut *conn)
+        .await?;
+    }
+    for (ordinal, image) in images.iter().enumerate() {
+        sqlx::query(
+            "INSERT OR IGNORE INTO message_images (message_id, ordinal, media_type, data)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(message_id)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(&image.media_type)
+        .bind(&image.data)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Load each message's attachments from the child tables onto its runtime
+/// content. User/skill rows read from the DB come back with empty attachments
+/// (the blob no longer carries them); this restores them. Non-user/skill
+/// messages are left untouched.
+pub(crate) async fn hydrate_attachments(
+    pool: &SqlitePool,
+    messages: &mut [Message],
+) -> Result<(), sqlx::Error> {
+    for msg in messages.iter_mut() {
+        if !matches!(msg.message_type, MessageType::User | MessageType::Skill) {
+            continue;
+        }
+        let files = sqlx::query(
+            "SELECT original_name, media_type, size_bytes, stored_path
+             FROM message_files WHERE message_id = ?1 ORDER BY ordinal",
+        )
+        .bind(&msg.message_id)
+        .map(|row: SqliteRow| FileAttachment {
+            original_name: row.get("original_name"),
+            media_type: row.get("media_type"),
+            size_bytes: u64::try_from(row.get::<i64, _>("size_bytes")).unwrap_or(0),
+            stored_path: row.get("stored_path"),
+        })
+        .fetch_all(pool)
+        .await?;
+
+        // SkillContent has no images; skip the query for skill rows.
+        let images = if matches!(msg.message_type, MessageType::User) {
+            sqlx::query(
+                "SELECT media_type, data FROM message_images WHERE message_id = ?1 ORDER BY ordinal",
+            )
+            .bind(&msg.message_id)
+            .map(|row: SqliteRow| ImageData {
+                data: row.get("data"),
+                media_type: row.get("media_type"),
+            })
+            .fetch_all(pool)
+            .await?
+        } else {
+            Vec::new()
+        };
+
+        msg.content.set_attachments(images, files);
+    }
     Ok(())
 }
 
@@ -4585,8 +4693,9 @@ fn parse_message_row(row: SqliteRow) -> Result<Message, sqlx::Error> {
     let content_str: String = row.try_get("content")?;
     let content_value: serde_json::Value = serde_json::from_str(&content_str).unwrap_or_default();
 
-    // Parse content using the message type as discriminator
-    let content = MessageContent::from_json(msg_type, content_value)
+    // Parse the persisted (attachment-free) content; the caller hydrates
+    // user/skill attachments from the child tables via `hydrate_attachments`.
+    let content = MessageContent::from_stored_json(msg_type, content_value)
         .unwrap_or_else(|_| MessageContent::error(format!("Failed to parse {msg_type} message")));
 
     Ok(Message {
@@ -5098,6 +5207,112 @@ mod tests {
         let after = db.get_messages_after("conv-1", 1).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].message_id, "msg-2");
+    }
+
+    /// User/skill attachments round-trip through the normalized child tables:
+    /// they are written to `message_files`/`message_images`, the `content` blob
+    /// stays attachment-free, and `get_messages` rehydrates them in order.
+    #[tokio::test]
+    async fn attachments_persist_in_child_tables_and_rehydrate() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-a", "slug-a", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let images = vec![
+            ImageData {
+                data: "AAA".into(),
+                media_type: "image/png".into(),
+            },
+            ImageData {
+                data: "BBB".into(),
+                media_type: "image/jpeg".into(),
+            },
+        ];
+        let files = vec![FileAttachment {
+            original_name: "notes.txt".into(),
+            media_type: "text/plain".into(),
+            size_bytes: 42,
+            stored_path: "/store/notes.txt".into(),
+        }];
+        db.add_message(
+            "m-user",
+            "conv-a",
+            &MessageContent::user_with_attachments("hi", images, files),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.add_message(
+            "m-skill",
+            "conv-a",
+            &MessageContent::Skill(SkillContent {
+                name: "build".into(),
+                body: "body".into(),
+                trigger: "/build".into(),
+                files: vec![FileAttachment {
+                    original_name: "s.txt".into(),
+                    media_type: "text/plain".into(),
+                    size_bytes: 7,
+                    stored_path: "/store/s.txt".into(),
+                }],
+            }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The persisted content blob carries no attachment keys.
+        for id in ["m-user", "m-skill"] {
+            let raw: String =
+                sqlx::query_scalar("SELECT content FROM messages WHERE message_id = ?1")
+                    .bind(id)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                v.get("files").is_none() && v.get("images").is_none(),
+                "blob for {id} must be attachment-free, got {raw}"
+            );
+        }
+
+        // get_messages rehydrates attachments (in order) from the child tables.
+        let messages = db.get_messages("conv-a").await.unwrap();
+        let user = messages.iter().find(|m| m.message_id == "m-user").unwrap();
+        match &user.content {
+            MessageContent::User(u) => {
+                assert_eq!(u.text, "hi");
+                assert_eq!(u.images.len(), 2);
+                assert_eq!(u.images[0].data, "AAA");
+                assert_eq!(u.images[1].media_type, "image/jpeg");
+                assert_eq!(u.files.len(), 1);
+                assert_eq!(u.files[0].original_name, "notes.txt");
+                assert_eq!(u.files[0].size_bytes, 42);
+            }
+            MessageContent::Agent(_)
+            | MessageContent::Tool(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_)
+            | MessageContent::Skill(_) => panic!("expected user content"),
+        }
+        let skill = messages.iter().find(|m| m.message_id == "m-skill").unwrap();
+        match &skill.content {
+            MessageContent::Skill(s) => {
+                assert_eq!(s.files.len(), 1);
+                assert_eq!(s.files[0].stored_path, "/store/s.txt");
+            }
+            MessageContent::User(_)
+            | MessageContent::Agent(_)
+            | MessageContent::Tool(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_) => panic!("expected skill content"),
+        }
     }
 
     /// Regression for task 02679: messages must persist with the seq their

@@ -167,12 +167,15 @@ impl Fts5Retriever {
             existing.insert(id, hash);
         }
 
-        let messages = sqlx::query(
+        let mut messages = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at FROM messages",
         )
         .try_map(crate::parse_message_row)
         .fetch_all(&self.pool)
         .await?;
+        // Attachments live in child tables, not the content blob; hydrate so the
+        // indexed text includes user/skill file-context tags (`index_text`).
+        crate::hydrate_attachments(&self.pool, &mut messages).await?;
 
         let mut stats = ReconcileStats::default();
         for m in &messages {
@@ -287,7 +290,7 @@ impl MessageRetriever for Fts5Retriever {
         };
 
         // Current source messages for these conversations.
-        let messages = {
+        let mut messages = {
             let sql = format!(
                 "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at \
                  FROM messages WHERE conversation_id IN ({placeholders})"
@@ -300,6 +303,10 @@ impl MessageRetriever for Fts5Retriever {
                 .fetch_all(&self.pool)
                 .await?
         };
+        // Hydrate attachments so the recomputed fingerprints match the
+        // (hydrated) text that was indexed at write time — otherwise every
+        // user/skill message carrying files would read as permanently stale.
+        crate::hydrate_attachments(&self.pool, &mut messages).await?;
 
         // Indexed content fingerprints for these conversations.
         // Physical index rows for these conversations (one row per chunk). We
