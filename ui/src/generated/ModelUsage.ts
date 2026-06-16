@@ -2,6 +2,6 @@
 import type { Totals } from "./Totals";
 
 /**
- * Per-model rollup. `priced` is false for models excluded from cost.
+ * Per-model rollup. `provider` is resolved from the model registry.
  */
-export type ModelUsage = { model: string, provider: string, priced: boolean, totals: Totals, };
+export type ModelUsage = { model: string, provider: string, totals: Totals, };

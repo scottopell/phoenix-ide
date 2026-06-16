@@ -3,4 +3,4 @@
 /**
  * One turn in the per-conversation drill-down.
  */
-export type TurnPoint = { index: number, created_at: string, model: string, input_tokens: number, output_tokens: number, cache_write_tokens: number, cache_read_tokens: number, total_tokens: number, cost_usd: number, priced: boolean, };
+export type TurnPoint = { index: number, created_at: string, model: string, input_tokens: number, output_tokens: number, cache_write_tokens: number, cache_read_tokens: number, total_tokens: number, };

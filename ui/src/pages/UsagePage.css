@@ -128,7 +128,7 @@
 
 .usage-table__row {
   display: grid;
-  grid-template-columns: 1fr 90px 90px 64px 64px;
+  grid-template-columns: 1fr 90px 64px 64px;
   gap: 8px;
   align-items: center;
   padding: 6px 8px;

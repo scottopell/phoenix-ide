@@ -10,8 +10,4 @@ import type { UsageWindows } from "./UsageWindows";
 /**
  * The full `/api/usage` payload.
  */
-export type UsageOverview = { generated_at: string, windows: UsageWindows, daily: Array<DailyUsage>, by_model: Array<ModelUsage>, by_provider: Array<ProviderUsage>, by_project: Array<ProjectUsage>, conversations: Array<ConversationUsageRow>, turn_token_histogram: Array<HistogramBucket>, 
-/**
- * Models that contributed tokens but have no wired-in pricing.
- */
-unpriced_models: Array<string>, };
+export type UsageOverview = { generated_at: string, windows: UsageWindows, daily: Array<DailyUsage>, by_model: Array<ModelUsage>, by_provider: Array<ProviderUsage>, by_project: Array<ProjectUsage>, conversations: Array<ConversationUsageRow>, turn_token_histogram: Array<HistogramBucket>, };

@@ -27,14 +27,6 @@ function fmtTokens(n: number): string {
   return `${(n / 1_000_000_000).toFixed(2)}B`;
 }
 
-function fmtUsd(n: number): string {
-  if (n === 0) return '$0';
-  if (n < 0.01) return '<$0.01';
-  if (n < 1000) return `$${n.toFixed(2)}`;
-  if (n < 1_000_000) return `$${(n / 1000).toFixed(1)}k`;
-  return `$${(n / 1_000_000).toFixed(2)}M`;
-}
-
 function fmtPct(n: number): string {
   return `${(n * 100).toFixed(1)}%`;
 }
@@ -45,8 +37,6 @@ function numOf(v: unknown): number {
   if (Array.isArray(v)) return Number(v[0]);
   return Number(v ?? 0);
 }
-const tipUsd = (v: unknown) => fmtUsd(numOf(v));
-const tipPct1 = (v: unknown) => `${numOf(v).toFixed(1)}%`;
 const tipTurns = (v: unknown) => `${numOf(v)} turns`;
 
 /** Share of input-side tokens served from cache. */
@@ -66,15 +56,12 @@ const AXIS = { stroke: 'var(--text-muted)', fontSize: 11 };
 const GRID = 'var(--border-color)';
 
 function KpiCard({ label, totals }: { label: string; totals: Totals }) {
-  const cost = totals.has_unpriced ? `${fmtUsd(totals.cost_usd)}+` : fmtUsd(totals.cost_usd);
   return (
     <div className="usage-kpi">
       <div className="usage-kpi__label">{label}</div>
-      <div className="usage-kpi__cost" title={totals.has_unpriced ? 'Excludes unpriced models' : undefined}>
-        {cost}
-      </div>
+      <div className="usage-kpi__cost">{fmtTokens(totals.total_tokens)}</div>
       <div className="usage-kpi__sub">
-        <span>{fmtTokens(totals.total_tokens)} tok</span>
+        <span>tokens</span>
         <span>{Math.round(totals.turns)} turns</span>
         <span>{fmtPct(cacheHitRate(totals))} cache</span>
       </div>
@@ -137,16 +124,14 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
     };
   }, [id]);
 
-  // Cumulative cost + tokens across the turn sequence — the natural "spend
-  // over the run" curve for a single conversation.
+  // Cumulative tokens across the turn sequence — the "spend over the run" curve
+  // for a single conversation.
   const series = useMemo(() => {
     if (!detail) return [];
-    let cost = 0;
     let tokens = 0;
     return detail.turns.map((t) => {
-      cost += t.cost_usd;
       tokens += t.total_tokens;
-      return { index: t.index + 1, turnTokens: t.total_tokens, cumCost: cost, cumTokens: tokens };
+      return { index: t.index + 1, turnTokens: t.total_tokens, cumTokens: tokens };
     });
   }, [detail]);
 
@@ -157,9 +142,7 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
           <h3>{label}</h3>
           {detail && (
             <span className="usage-card__hint">
-              {fmtUsd(detail.totals.cost_usd)}
-              {detail.totals.has_unpriced ? '+' : ''} · {fmtTokens(detail.totals.total_tokens)} tok ·{' '}
-              {Math.round(detail.totals.turns)} turns
+              {fmtTokens(detail.totals.total_tokens)} tokens · {Math.round(detail.totals.turns)} turns
             </span>
           )}
         </div>
@@ -184,19 +167,16 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
             </ResponsiveContainer>
           </div>
           <div>
-            <div className="usage-card__hint">Cumulative cost</div>
+            <div className="usage-card__hint">Cumulative tokens</div>
             <ResponsiveContainer width="100%" height={180}>
               <AreaChart data={series} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
                 <CartesianGrid stroke={GRID} vertical={false} />
                 <XAxis dataKey="index" {...AXIS} />
-                <YAxis tickFormatter={fmtUsd} width={48} {...AXIS} />
-                <Tooltip
-                  formatter={tipUsd}
-                  contentStyle={{ background: 'var(--bg-secondary)', border: `1px solid ${GRID}` }}
-                />
+                <YAxis tickFormatter={fmtTokens} width={48} {...AXIS} />
+                <Tooltip content={<TokenTooltip />} />
                 <Area
-                  dataKey="cumCost"
-                  name="Cost"
+                  dataKey="cumTokens"
+                  name="Cumulative"
                   stroke="var(--accent-green)"
                   fill="var(--accent-green)"
                   fillOpacity={0.15}
@@ -246,10 +226,6 @@ export function UsagePage() {
     return data.daily.map((d) => ({ day: d.day, rate: cacheHitRate(d.totals) * 100 }));
   }, [data]);
 
-  // The cost chart is dollars-only; unpriced models carry cost_usd === 0 and
-  // would otherwise read as "$0 / free" rather than "unknown". Exclude them.
-  const pricedModels = useMemo(() => data?.by_model.filter((m) => m.priced) ?? [], [data]);
-
   const empty = data && data.windows.all.turns === 0;
 
   return (
@@ -274,12 +250,6 @@ export function UsagePage() {
 
           {data && !empty && (
             <>
-              {data.unpriced_models.length > 0 && (
-                <div className="usage-note">
-                  Costs exclude unpriced models: {data.unpriced_models.join(', ')}. Their tokens are still counted.
-                </div>
-              )}
-
               <div className="usage-kpis">
                 <KpiCard label="Today" totals={data.windows.today} />
                 <KpiCard label="7 days" totals={data.windows.week} />
@@ -316,29 +286,6 @@ export function UsagePage() {
                   </ResponsiveContainer>
                 </ChartCard>
 
-                <ChartCard title="Cost per day" hint="priced models, USD">
-                  <ResponsiveContainer width="100%" height={240}>
-                    <AreaChart data={data.daily} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                      <CartesianGrid stroke={GRID} vertical={false} />
-                      <XAxis dataKey="day" {...AXIS} minTickGap={32} />
-                      <YAxis tickFormatter={fmtUsd} width={48} {...AXIS} />
-                      <Tooltip
-                        formatter={tipUsd}
-                        labelStyle={{ color: 'var(--text-secondary)' }}
-                        contentStyle={{ background: 'var(--bg-secondary)', border: `1px solid ${GRID}` }}
-                      />
-                      <Area
-                        type="monotone"
-                        dataKey="totals.cost_usd"
-                        name="Cost"
-                        stroke="var(--accent-green)"
-                        fill="var(--accent-green)"
-                        fillOpacity={0.2}
-                      />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                </ChartCard>
-
                 <ChartCard title="Cache hit rate" hint="% of input tokens served from cache">
                   <ResponsiveContainer width="100%" height={240}>
                     <LineChart data={cacheTrend} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
@@ -346,7 +293,7 @@ export function UsagePage() {
                       <XAxis dataKey="day" {...AXIS} minTickGap={32} />
                       <YAxis tickFormatter={(v: number) => `${v.toFixed(0)}%`} domain={[0, 100]} width={40} {...AXIS} />
                       <Tooltip
-                        formatter={tipPct1}
+                        formatter={(v: unknown) => `${numOf(v).toFixed(1)}%`}
                         contentStyle={{ background: 'var(--bg-secondary)', border: `1px solid ${GRID}` }}
                       />
                       <Line type="monotone" dataKey="rate" name="Cache" stroke="var(--accent-purple)" dot={false} />
@@ -369,21 +316,18 @@ export function UsagePage() {
                   </ResponsiveContainer>
                 </ChartCard>
 
-                <ChartCard title="Cost by model" hint="priced models, USD">
-                  <ResponsiveContainer width="100%" height={Math.max(120, pricedModels.length * 34)}>
+                <ChartCard title="Tokens by model" hint="all token classes">
+                  <ResponsiveContainer width="100%" height={Math.max(120, data.by_model.length * 34)}>
                     <BarChart
-                      data={pricedModels}
+                      data={data.by_model}
                       layout="vertical"
                       margin={{ top: 4, right: 16, left: 8, bottom: 4 }}
                     >
                       <CartesianGrid stroke={GRID} horizontal={false} />
-                      <XAxis type="number" tickFormatter={fmtUsd} {...AXIS} />
+                      <XAxis type="number" tickFormatter={fmtTokens} {...AXIS} />
                       <YAxis type="category" dataKey="model" width={130} {...AXIS} />
-                      <Tooltip
-                        formatter={tipUsd}
-                        contentStyle={{ background: 'var(--bg-secondary)', border: `1px solid ${GRID}` }}
-                      />
-                      <Bar dataKey="totals.cost_usd" name="Cost" fill="var(--accent-green)" />
+                      <Tooltip content={<TokenTooltip />} />
+                      <Bar dataKey="totals.total_tokens" name="Tokens" fill="var(--accent-green)" />
                     </BarChart>
                   </ResponsiveContainer>
                 </ChartCard>
@@ -405,11 +349,10 @@ export function UsagePage() {
                 </ChartCard>
               </div>
 
-              <ChartCard title="Conversations" hint="highest cost first — click to drill in">
+              <ChartCard title="Conversations" hint="highest token use first — click to drill in">
                 <div className="usage-table">
                   <div className="usage-table__head usage-table__row">
                     <span>Conversation</span>
-                    <span className="num">Cost</span>
                     <span className="num">Tokens</span>
                     <span className="num">Turns</span>
                     <span className="num">Cache</span>
@@ -424,10 +367,6 @@ export function UsagePage() {
                       <span className="usage-conv-label">
                         <span className="usage-conv-title">{c.label}</span>
                         {c.worktree && <span className="usage-conv-meta">{c.worktree}</span>}
-                      </span>
-                      <span className="num">
-                        {fmtUsd(c.totals.cost_usd)}
-                        {c.totals.has_unpriced ? '+' : ''}
                       </span>
                       <span className="num">{fmtTokens(c.totals.total_tokens)}</span>
                       <span className="num">{Math.round(c.totals.turns)}</span>

@@ -2,25 +2,21 @@
 //!
 //! Serves `GET /api/usage` (the aggregate dashboard) and
 //! `GET /api/usage/conversation/:id` (per-conversation drill-down). Both are
-//! computed from the `turn_usage` table: the persistence layer returns raw
-//! token aggregates, and this module prices them per model (see
-//! [`crate::llm::pricing`]) and resolves each model's provider.
+//! computed from the `turn_usage` table, which records token counts and the
+//! model per LLM turn. This surface is purely token-oriented — it carries no
+//! notion of monetary cost. A token-to-cost layer, if ever wanted, can map
+//! these counts downstream without touching the persistence or query layers.
 //!
 //! Token counts cross the wire as `f64` rather than `u64`: every realistic
 //! count is well under 2^53, so the value is exact, and the UI gets plain
-//! `number`s for charting instead of `bigint`. Dollar costs are `f64` USD.
-//!
-//! A model with no wired-in pricing (e.g. the `OpenAI` (`gpt-*`) models) is
-//! *unpriced*: its tokens are counted but excluded from `cost_usd`, and the
-//! enclosing scope is flagged `has_unpriced` so the UI can mark the figure as a
-//! lower bound rather than silently under-reporting.
+//! `number`s for charting instead of `bigint`.
 
 // Token counts cross the wire as f64 (see module docs); every count is < 2^53,
 // so the i64/usize -> f64 casts here are exact, not lossy.
 #![allow(clippy::cast_precision_loss)]
 
 use super::AppState;
-use crate::llm::{all_models, pricing};
+use crate::llm::all_models;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -29,11 +25,11 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use ts_rs::TS;
 
-/// Aggregated token counts, turn count, and priced cost for one scope (a day, a
-/// model, a provider, a project, a conversation, or a rolling window).
+/// Aggregated token counts and turn count for one scope (a day, a model, a
+/// provider, a project, a conversation, or a rolling window).
 #[derive(Debug, Clone, Default, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct Totals {
@@ -43,26 +39,16 @@ pub struct Totals {
     pub cache_read_tokens: f64,
     pub total_tokens: f64,
     pub turns: f64,
-    /// Summed cost over *priced* models in this scope, USD. Excludes any tokens
-    /// from unpriced models (see `has_unpriced`).
-    pub cost_usd: f64,
-    /// True if this scope includes tokens from a model with no wired-in pricing,
-    /// so `cost_usd` is a lower bound.
-    pub has_unpriced: bool,
 }
 
 impl Totals {
-    fn add(&mut self, model: &str, input: i64, output: i64, cw: i64, cr: i64, turns: i64) {
+    fn add(&mut self, input: i64, output: i64, cw: i64, cr: i64, turns: i64) {
         self.input_tokens += input as f64;
         self.output_tokens += output as f64;
         self.cache_write_tokens += cw as f64;
         self.cache_read_tokens += cr as f64;
         self.total_tokens += (input + output + cw + cr) as f64;
         self.turns += turns as f64;
-        match pricing::cost_from_totals(model, input, output, cw, cr) {
-            Some(c) => self.cost_usd += c.total(),
-            None => self.has_unpriced = true,
-        }
     }
 }
 
@@ -84,13 +70,12 @@ pub struct DailyUsage {
     pub totals: Totals,
 }
 
-/// Per-model rollup. `priced` is false for models excluded from cost.
+/// Per-model rollup. `provider` is resolved from the model registry.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ModelUsage {
     pub model: String,
     pub provider: String,
-    pub priced: bool,
     pub totals: Totals,
 }
 
@@ -148,8 +133,6 @@ pub struct UsageOverview {
     pub by_project: Vec<ProjectUsage>,
     pub conversations: Vec<ConversationUsageRow>,
     pub turn_token_histogram: Vec<HistogramBucket>,
-    /// Models that contributed tokens but have no wired-in pricing.
-    pub unpriced_models: Vec<String>,
 }
 
 /// One turn in the per-conversation drill-down.
@@ -164,8 +147,6 @@ pub struct TurnPoint {
     pub cache_write_tokens: f64,
     pub cache_read_tokens: f64,
     pub total_tokens: f64,
-    pub cost_usd: f64,
-    pub priced: bool,
 }
 
 /// The `/api/usage/conversation/:id` payload.
@@ -230,7 +211,7 @@ fn build_histogram(per_turn_totals: &[i64]) -> Vec<HistogramBucket> {
     buckets
 }
 
-/// Cap on the number of conversations returned (highest cost first).
+/// Cap on the number of conversations returned (highest token use first).
 const MAX_CONVERSATIONS: usize = 200;
 
 /// Accumulator for one conversation's rollup while grouping the per-model rows.
@@ -277,42 +258,37 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
     let mut daily_map: BTreeMap<String, Totals> = BTreeMap::new();
     let mut model_map: BTreeMap<String, Totals> = BTreeMap::new();
     let mut provider_map: BTreeMap<String, Totals> = BTreeMap::new();
-    let mut unpriced: BTreeSet<String> = BTreeSet::new();
 
     for row in &daily_rows {
-        let (m, i, o, cw, cr, t) = (
-            row.model.as_str(),
+        let (i, o, cw, cr, t) = (
             row.input_tokens,
             row.output_tokens,
             row.cache_creation_tokens,
             row.cache_read_tokens,
             row.turns,
         );
-        if !pricing::is_priced(m) {
-            unpriced.insert(m.to_string());
-        }
         daily_map
             .entry(row.day.clone())
             .or_default()
-            .add(m, i, o, cw, cr, t);
+            .add(i, o, cw, cr, t);
         model_map
-            .entry(m.to_string())
+            .entry(row.model.clone())
             .or_default()
-            .add(m, i, o, cw, cr, t);
+            .add(i, o, cw, cr, t);
         provider_map
-            .entry(provider_display(m))
+            .entry(provider_display(&row.model))
             .or_default()
-            .add(m, i, o, cw, cr, t);
+            .add(i, o, cw, cr, t);
 
-        windows.all.add(m, i, o, cw, cr, t);
+        windows.all.add(i, o, cw, cr, t);
         if row.day.as_str() >= month_start.as_str() {
-            windows.month.add(m, i, o, cw, cr, t);
+            windows.month.add(i, o, cw, cr, t);
         }
         if row.day.as_str() >= week_start.as_str() {
-            windows.week.add(m, i, o, cw, cr, t);
+            windows.week.add(i, o, cw, cr, t);
         }
         if row.day == today {
-            windows.today.add(m, i, o, cw, cr, t);
+            windows.today.add(i, o, cw, cr, t);
         }
     }
 
@@ -325,12 +301,11 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
         .into_iter()
         .map(|(model, totals)| ModelUsage {
             provider: provider_display(&model),
-            priced: pricing::is_priced(&model),
             model,
             totals,
         })
         .collect();
-    by_model.sort_by(|a, b| b.totals.cost_usd.total_cmp(&a.totals.cost_usd));
+    by_model.sort_by(|a, b| b.totals.total_tokens.total_cmp(&a.totals.total_tokens));
 
     let mut by_provider: Vec<ProviderUsage> = provider_map
         .into_iter()
@@ -343,8 +318,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
     let mut project_map: BTreeMap<Option<String>, Totals> = BTreeMap::new();
 
     for row in &conv_rows {
-        let (m, i, o, cw, cr, t) = (
-            row.model.as_str(),
+        let (i, o, cw, cr, t) = (
             row.input_tokens,
             row.output_tokens,
             row.cache_creation_tokens,
@@ -366,14 +340,14 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
                 started_at: row.started_at.clone(),
                 totals: Totals::default(),
             });
-        acc.totals.add(m, i, o, cw, cr, t);
+        acc.totals.add(i, o, cw, cr, t);
         if row.started_at < acc.started_at {
             acc.started_at.clone_from(&row.started_at);
         }
         project_map
             .entry(row.project_id.clone())
             .or_default()
-            .add(m, i, o, cw, cr, t);
+            .add(i, o, cw, cr, t);
     }
 
     let mut conversations: Vec<ConversationUsageRow> = conv_map
@@ -388,19 +362,14 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
             totals: a.totals,
         })
         .collect();
-    conversations.sort_by(|a, b| {
-        b.totals
-            .cost_usd
-            .total_cmp(&a.totals.cost_usd)
-            .then(b.totals.total_tokens.total_cmp(&a.totals.total_tokens))
-    });
+    conversations.sort_by(|a, b| b.totals.total_tokens.total_cmp(&a.totals.total_tokens));
     conversations.truncate(MAX_CONVERSATIONS);
 
     let mut by_project: Vec<ProjectUsage> = project_map
         .into_iter()
         .map(|(project_id, totals)| ProjectUsage { project_id, totals })
         .collect();
-    by_project.sort_by(|a, b| b.totals.cost_usd.total_cmp(&a.totals.cost_usd));
+    by_project.sort_by(|a, b| b.totals.total_tokens.total_cmp(&a.totals.total_tokens));
 
     let overview = UsageOverview {
         generated_at: now.to_rfc3339(),
@@ -411,7 +380,6 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
         by_project,
         conversations,
         turn_token_histogram: build_histogram(&per_turn),
-        unpriced_models: unpriced.into_iter().collect(),
     };
 
     Json(overview).into_response()
@@ -437,19 +405,11 @@ pub async fn usage_conversation_detail(
         .enumerate()
         .map(|(idx, r)| {
             totals.add(
-                &r.model,
                 r.input_tokens,
                 r.output_tokens,
                 r.cache_creation_tokens,
                 r.cache_read_tokens,
                 1,
-            );
-            let cost = pricing::cost_from_totals(
-                &r.model,
-                r.input_tokens,
-                r.output_tokens,
-                r.cache_creation_tokens,
-                r.cache_read_tokens,
             );
             TurnPoint {
                 index: idx as f64,
@@ -463,8 +423,6 @@ pub async fn usage_conversation_detail(
                     + r.output_tokens
                     + r.cache_creation_tokens
                     + r.cache_read_tokens) as f64,
-                cost_usd: cost.map_or(0.0, pricing::Cost::total),
-                priced: cost.is_some(),
             }
         })
         .collect();
@@ -499,13 +457,13 @@ mod tests {
     }
 
     #[test]
-    fn totals_flags_unpriced_and_sums_priced() {
+    fn totals_sum_tokens_and_turns() {
         let mut t = Totals::default();
-        t.add("claude-opus-4-8", 1_000_000, 0, 0, 0, 1); // $5
-        t.add("gpt-5.5", 1_000_000, 0, 0, 0, 1); // unpriced
-        assert!(t.has_unpriced);
-        assert!((t.cost_usd - 5.0).abs() < 1e-9);
-        assert_eq!(t.total_tokens, 2_000_000.0);
+        t.add(1_000_000, 0, 0, 0, 1);
+        t.add(0, 500_000, 250_000, 1_000_000, 1);
+        assert_eq!(t.input_tokens, 1_000_000.0);
+        assert_eq!(t.output_tokens, 500_000.0);
+        assert_eq!(t.total_tokens, 2_750_000.0);
         assert_eq!(t.turns, 2.0);
     }
 

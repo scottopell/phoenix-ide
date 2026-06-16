@@ -63,7 +63,6 @@ mod error;
 mod mock;
 mod models;
 mod openai;
-pub mod pricing;
 #[cfg(test)]
 mod proptests;
 pub mod rate_limit;
