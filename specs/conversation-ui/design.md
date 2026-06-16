@@ -50,7 +50,6 @@ ui/src/
 │   ├── InputArea.tsx             # Message composition
 │   ├── StateBar.tsx              # Bottom bar (slug, model, live agent status)
 │   ├── PillStrip.tsx             # Shared horizontal pill list primitive
-│   ├── BreadcrumbBar.tsx         # Step trail (SharePage)
 │   ├── ConversationNav.tsx       # Top-slot conversation chapter strip
 │   ├── ConversationNavStack.tsx  # Nav strip + MessageList coordination
 │   ├── DensityProvider.tsx       # Full|Compact density context provider
@@ -430,19 +429,15 @@ load and streaming:
   inline pill strip rendered by `MessageComponents`, never into the top slot or
   the StateBar.
 
-`BreadcrumbBar` is a step-trail pill list retained for `SharePage`, which renders
-a static reconstructed trail of a finished conversation. It is not part of the
-live conversation view's top slot.
-
 ### Shared `<PillStrip>` primitive
 
 `PillStrip` is the generic horizontal pill list — items joined by `→`
-separators, optional hover tooltip via a portal, and opt-in auto-scroll-to-end.
-Three surfaces consume it: the `BreadcrumbBar` step trail, the compact-mode
-inline tool strip, and `ConversationNav`. Each passes its own `pillClassName` /
-`arrowClassName` / `tooltipClassName` so the visual identity (tool vs sub-agent
-color, prompt vs prose styling) lives at the call site while the layout,
-tooltip, and scroll behavior live once in the primitive.
+separators, with active pills kept horizontally visible and opt-in
+auto-scroll-to-end for callers that append items. Two surfaces consume it: the
+compact-mode inline tool strip and `ConversationNav`. Each passes its own
+`pillClassName` / `arrowClassName` so the visual identity (tool vs sub-agent
+color, prompt vs prose styling) lives at the call site while the keyboard,
+separator, and scroll behavior live once in the primitive.
 
 ### Significance threshold — one definition for both features
 
@@ -776,11 +771,10 @@ The app machine coordinates:
 | `StreamingMessage` | In-progress token display | REQ-CONV-019 |
 | `InputArea` | Composition, drafts, queue | REQ-CONV-003, REQ-CONV-004 |
 | `StateBar` | Connection status, context info, live agent-activity indicator | REQ-CONV-005, REQ-CONV-007 |
-| `PillStrip` | Shared horizontal pill list primitive (separators, tooltip, auto-scroll) | REQ-CONV-007, REQ-CONV-022, REQ-CONV-023 |
+| `PillStrip` | Shared horizontal pill list primitive (separators, active visibility, auto-scroll-to-end) | REQ-CONV-022, REQ-CONV-023 |
 | `ConversationNav` | Whole-conversation chapter strip in the top slot | REQ-CONV-023 |
 | `ConversationNavStack` | Nav strip ↔ `MessageList` coordination (chapters, scroll-spy, jump) | REQ-CONV-023 |
 | `DensityProvider` / `useDensity` | Full \| Compact density preference + significance threshold | REQ-CONV-022 |
-| `BreadcrumbBar` | Static step trail for a finished conversation (`SharePage`) | — |
 
 ---
 
@@ -845,6 +839,6 @@ intentional access from defensive guessing.
 |----------|----------|----------|
 | **Priya Sundaram** (FRP) | Single canonical atom with reducer, selectors derived | Yes — atom + reducer architecture |
 | **Konstantin Orel** (SSE Protocol) | Typed protocol with `generation_id`, `token_done`, `reset`; session store | Protocol: deferred (backend work needed). Session concept: yes (router-level context) |
-| **Maya Chen** (Transparency) | 14-question transparency contract; StatusBar + BreadcrumbBar separation | Contract: yes (framing section in requirements.md). Separate StatusBar: no (fix existing) |
+| **Maya Chen** (Transparency) | 14-question transparency contract; separate live activity and navigation surfaces | Contract: yes (framing section in requirements.md). Separate StatusBar: no (fix existing) |
 | **Diego Ramos** (Offline-First) | IndexedDB as authoritative store; write-through cache | No — React context sufficient for navigation persistence. IndexedDB can be retrofitted later |
 | **Anya Kowalski** (Type Systems) | Discriminated unions with `satisfies never`; `StreamingState` union | Yes — type foundation for all state |
