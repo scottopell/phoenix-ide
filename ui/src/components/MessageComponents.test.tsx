@@ -125,7 +125,6 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     last_sequence_id: 100,
     presentation_mode: 'idle',
     context_window_size: 0,
-    breadcrumbs: [],
     project_name: null,
     pending_anchor_sequence_id: messages.reduce((max, m) => Math.max(max, m.sequence_id), 0),
     pending_events: pendingEvents,

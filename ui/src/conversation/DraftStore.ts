@@ -5,7 +5,7 @@ import { RoutedStore } from './RoutedStore';
  * conversation state and client-typed draft state don't share a
  * subscription target — without that separation, every keystroke would
  * invalidate `ConversationPageContent`'s whole-atom snapshot and
- * re-render the message list, terminal, and breadcrumbs.
+ * re-render the message list and terminal.
  *
  * Slug-keying replaces the `expectedConversationId` guard the
  * conversation atom uses for client-originated actions: a stale-closure

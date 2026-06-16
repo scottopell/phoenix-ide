@@ -485,7 +485,7 @@ function MessageListImpl({
 
   // Conversation-nav jump + post-mount pulse. The target row is usually
   // unmounted at click time (react-virtuoso), so we can't add the highlight
-  // class synchronously the way the legacy near-viewport breadcrumb jump did.
+  // class synchronously for a near-viewport target.
   // We stash the target unit's render-unit key and apply the pulse once the
   // row exists, after the scroll settles. `data-render-unit-key` is stamped on
   // every virtuoso row wrapper (see `itemContent`).

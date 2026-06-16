@@ -101,7 +101,7 @@ AND SHALL NOT show partial or duplicate content from the interrupted stream
 
 WHEN client reconnects during a tool round before its checkpoint persists
 THE SYSTEM SHALL include the in-flight assistant message (containing the LLM's text and any pending tool_use blocks) in the init payload
-AND SHALL surface the current tool execution state via the breadcrumb / state_change event delivered in init's pending_events
+AND SHALL surface the current tool execution state via the state_change event delivered in init's pending_events
 SO THAT the user sees the active tool render in the main message list rather than a blank gap until the tool round completes
 
 **Rationale:** Users expect real-time feedback during agent execution. Token streaming provides immediate evidence that the system is working. The `after` parameter enables seamless reconnection without a separate fetch request, eliminating race conditions. Reconnection correctness ensures dropped connections during long generations never leave users with stale or broken views. The in-flight-assistant-message coverage on reconnect closes the symmetric gap during tool execution: without it, a reconnect between "LLM finished, tool started" and "tool finished, checkpoint persisted" would blank out the assistant's message and the tool card.

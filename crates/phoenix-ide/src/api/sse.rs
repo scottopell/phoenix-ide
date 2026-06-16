@@ -100,7 +100,7 @@ mod tests {
     use super::*;
     use crate::db::{ConvMode, Conversation, Message, MessageContent, MessageType, UsageData};
     use crate::runtime::user_facing_error::UserFacingError;
-    use crate::runtime::{ConversationMetadataUpdate, EnrichedConversation, SseBreadcrumb};
+    use crate::runtime::{ConversationMetadataUpdate, EnrichedConversation};
     use crate::state_machine::state::ConvState;
     use chrono::{TimeZone, Utc};
     use serde_json::{json, Value};
@@ -123,7 +123,6 @@ mod tests {
                 presentation_mode,
                 last_sequence_id,
                 context_window_size,
-                breadcrumbs,
                 project_name,
                 pending_anchor_sequence_id,
                 pending_events,
@@ -148,7 +147,6 @@ mod tests {
                     "presentation_mode": presentation_mode,
                     "last_sequence_id": last_sequence_id,
                     "context_window_size": context_window_size,
-                    "breadcrumbs": breadcrumbs,
                     "project_name": project_name,
                     "pending_anchor_sequence_id": pending_anchor_sequence_id,
                     "pending_events": pending_json,
@@ -435,16 +433,6 @@ mod tests {
         }
     }
 
-    fn fixture_breadcrumbs() -> Vec<SseBreadcrumb> {
-        vec![SseBreadcrumb {
-            crumb_type: "user".to_string(),
-            label: "first message".to_string(),
-            tool_id: None,
-            sequence_id: Some(1),
-            preview: None,
-        }]
-    }
-
     // ------------------------------------------------------------------
     // Parity tests — one per SseEvent variant
     // ------------------------------------------------------------------
@@ -459,7 +447,6 @@ mod tests {
             presentation_mode: "idle".to_string(),
             last_sequence_id: 42,
             context_window_size: 2048,
-            breadcrumbs: fixture_breadcrumbs(),
             project_name: Some("phoenix".to_string()),
             pending_anchor_sequence_id: 0,
             pending_events: Vec::new(),
@@ -507,7 +494,6 @@ mod tests {
             presentation_mode: "working".to_string(),
             last_sequence_id: 45,
             context_window_size: 2048,
-            breadcrumbs: fixture_breadcrumbs(),
             project_name: Some("phoenix".to_string()),
             pending_anchor_sequence_id: anchor,
             pending_events: pending,
@@ -552,7 +538,6 @@ mod tests {
             presentation_mode: "idle".to_string(),
             last_sequence_id: 99,
             context_window_size: 0,
-            breadcrumbs: Vec::new(),
             project_name: None,
             pending_anchor_sequence_id: 50,
             pending_events: Vec::new(),
@@ -922,7 +907,6 @@ mod tests {
             presentation_mode: "working".to_string(),
             last_sequence_id: init_seq,
             context_window_size: 0,
-            breadcrumbs: Vec::new(),
             project_name: None,
             pending_anchor_sequence_id,
             pending_events,
@@ -1019,7 +1003,6 @@ mod tests {
             presentation_mode: "idle".to_string(),
             last_sequence_id: init_seq,
             context_window_size: 0,
-            breadcrumbs: Vec::new(),
             project_name: None,
             pending_anchor_sequence_id: anchor,
             pending_events: events,

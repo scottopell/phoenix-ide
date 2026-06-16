@@ -5,8 +5,8 @@
 // turns the tool_use blocks already present on an `agent_turn` render unit
 // into the lightweight `{ name, toolId, isSubAgent, hasResult, isError }`
 // descriptors the inline pill strip paints. It reads ONLY the turn's own
-// data (content blocks + `toolResultsByUseId`), never phase/breadcrumb
-// state — the source of truth for what a turn did is the turn itself.
+// data (content blocks + `toolResultsByUseId`), never phase state — the
+// source of truth for what a turn did is the turn itself.
 
 import type { ContentBlock, Message, ToolResultContent } from '../api';
 

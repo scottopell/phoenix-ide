@@ -694,30 +694,6 @@ pub struct EnrichedConversation {
     pub work_scope_key: String,
 }
 
-/// Breadcrumb entry for showing LLM thought-process trail in the UI.
-///
-/// `Option<T>` fields use `skip_serializing_if = "Option::is_none"`, which
-/// means `None` is absent from the wire JSON rather than emitted as `null`.
-/// `#[ts(optional)]` tells ts-rs to mirror that by generating `field?: T`
-/// (undefined when absent) rather than the default `field: T | null`.
-#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct SseBreadcrumb {
-    #[serde(rename = "type")]
-    #[ts(rename = "type")]
-    pub crumb_type: String,
-    pub label: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub tool_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub sequence_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub preview: Option<String>,
-}
-
 /// Events sent to SSE clients.
 ///
 /// Every variant carries a `sequence_id` drawn from the conversation's single
@@ -742,7 +718,6 @@ pub enum SseEvent {
         last_sequence_id: i64,
         /// Current context window usage in tokens
         context_window_size: u64,
-        breadcrumbs: Vec<SseBreadcrumb>,
         /// Human-readable project name derived from the repo root directory name.
         project_name: Option<String>,
         /// `sequence_id` of the most recent persisted Message at subscribe

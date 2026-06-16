@@ -1,8 +1,7 @@
 import { useState, useCallback, useEffect, useRef, type Dispatch } from 'react';
 import * as v from 'valibot';
-import type { SseInitData, SseBreadcrumb } from '../api';
+import type { SseInitData } from '../api';
 import type { SSEAction, InitPayload } from '../conversation/atom';
-import type { Breadcrumb } from '../types';
 import { parseConversationState } from '../utils';
 import { notifyConversationStateChange } from '../notifications';
 import { setCodexQuota } from '../codexQuota';
@@ -148,16 +147,6 @@ interface UseConnectionOptions {
   dispatch: Dispatch<SSEAction>;
 }
 
-function transformBreadcrumb(b: SseBreadcrumb): Breadcrumb {
-  return {
-    type: b.type,
-    label: b.label,
-    toolId: b.tool_id,
-    sequenceId: b.sequence_id,
-    preview: b.preview,
-  };
-}
-
 function transformInitData(raw: SseInitData): InitPayload {
   const conversation = raw.project_name != null
     ? { ...raw.conversation, project_name: raw.project_name }
@@ -165,19 +154,10 @@ function transformInitData(raw: SseInitData): InitPayload {
   const messages = raw.messages || [];
   const phase = parseConversationState(conversation?.state);
 
-  const breadcrumbs = (raw.breadcrumbs || []).map(transformBreadcrumb);
-  const breadcrumbSequenceIds = new Set(
-    breadcrumbs
-      .filter((b): b is Breadcrumb & { sequenceId: number } => b.sequenceId !== undefined)
-      .map((b) => b.sequenceId)
-  );
-
   return {
     conversation,
     messages,
     phase,
-    breadcrumbs,
-    breadcrumbSequenceIds,
     contextWindow: {
       used: raw.context_window_size ?? 0,
     },

@@ -224,7 +224,7 @@ via `isAgentWorking()`. One source, one answer.
 ### Conversation Atom and Reducer
 
 All conversation state lives in a single atom managed by `useReducer`. No independent
-`useState` calls for `convState`, `agentWorking`, `breadcrumbs`, `contextWindowUsed`,
+`useState` calls for `convState`, `agentWorking`, `contextWindowUsed`,
 `stateData`, or `contextExhaustedSummary`. All are fields in the atom or selectors
 derived from it.
 
@@ -233,8 +233,6 @@ interface ConversationAtom {
   conversationId: string;
   phase: ConversationState;
   messages: Message[];
-  breadcrumbs: Breadcrumb[];
-  breadcrumbSequenceIds: ReadonlySet<number>;
   contextWindow: { used: number; total: number; exhaustedSummary: string | null };
   systemPrompt: string | null;
   pendingImages: PendingImage[];
@@ -271,7 +269,7 @@ type SSEAction =
 function conversationReducer(atom: ConversationAtom, action: SSEAction): ConversationAtom {
   switch (action.type) {
     case 'sse_init':
-      // Authoritative: replace breadcrumbs entirely, clear streaming buffer
+      // Authoritative snapshot: replace atom state, clear streaming buffer
       return { ...atom, ...action.payload, streamingBuffer: null };
 
     case 'sse_message':
@@ -285,16 +283,9 @@ function conversationReducer(atom: ConversationAtom, action: SSEAction): Convers
 
     case 'sse_state_change': {
       if (atom.lastSequenceId >= action.sequenceId) return atom;
-      const newCrumb = breadcrumbFromPhase(action.phase, action.sequenceId);
       return {
         ...atom,
         phase: action.phase,
-        breadcrumbs: newCrumb && !atom.breadcrumbSequenceIds.has(action.sequenceId)
-          ? [...atom.breadcrumbs, newCrumb]
-          : atom.breadcrumbs,
-        breadcrumbSequenceIds: newCrumb
-          ? new Set([...atom.breadcrumbSequenceIds, action.sequenceId])
-          : atom.breadcrumbSequenceIds,
         lastSequenceId: action.sequenceId,
       };
     }
@@ -332,8 +323,6 @@ function conversationReducer(atom: ConversationAtom, action: SSEAction): Convers
 **Key invariants enforced by the reducer:**
 - Streaming buffer and finalized message cannot both exist — `sse_message` clears the
   buffer atomically in one reducer call, producing one React render (REQ-CONV-019).
-- `init` replaces breadcrumbs entirely. `state_change` appends with `sequenceId` dedup.
-  No external `updateBreadcrumbsFromState()` mutation path.
 - Idempotency via `lastSequenceId >= event.sequenceId` — O(1) check, replaces
   unbounded `seenIdsRef: Set<number>`.
 - Malformed SSE events become typed `UIError` values, not unhandled exceptions.
@@ -371,7 +360,6 @@ function useConversationSelectors(convId: string) {
     currentTool: selectCurrentTool(atom),
     streamingText: atom.streamingBuffer?.text ?? null,
     contextWarning: selectContextWarning(atom),
-    breadcrumbs: atom.breadcrumbs,
     dispatch,
   };
 }
@@ -460,7 +448,7 @@ Density is purely presentational: `buildRenderUnits` remains the single source o
 truth for which messages render and how they group. Density changes only how an
 already-built `agent_turn` and short text block *paint*. The compact tool strip
 is derived by `deriveToolStripItems` from the turn's own `ContentBlock[]`
-tool_use blocks paired with `toolResultsByUseId` — never from phase or breadcrumb
+tool_use blocks paired with `toolResultsByUseId` — never from phase
 state, so the strip reflects what the turn actually did. `think` blocks are
 excluded (model reasoning, already a self-collapsing aside). A streaming turn
 renders full regardless of density; compaction applies only once the turn is
@@ -812,13 +800,6 @@ behavior with ad-hoc `useState`. Neither imports the other. Bugs fixed in one ar
 reflected in the other.
 **Prevention:** `useAppMachine.ts` wraps `appMachine.ts`'s `transition()`. One running
 implementation, testable in isolation.
-
-**UI-FM-5: Breadcrumbs have two conflicting writers.**
-`init` events send server-reconstructed breadcrumbs. `state_change` events trigger
-`updateBreadcrumbsFromState()`. No protocol defines which writer owns which portion.
-Reconnect mid-conversation can produce duplicates.
-**Prevention:** Reducer is the single writer. `init` replaces entirely. `state_change`
-appends with `sequenceId` dedup. No external mutation path.
 
 **UI-FM-6: Navigation destroys in-flight state with no handoff.**
 All state lives in `ConversationPage` `useState`. Navigation unmounts the component,

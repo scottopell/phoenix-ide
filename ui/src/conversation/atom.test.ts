@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import {
   conversationReducer,
   createInitialAtom,
-  breadcrumbFromPhase,
   type ConversationAtom,
   type SSEAction,
   type InitPayload,
@@ -41,8 +40,6 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
     conversation: testConversation,
     messages: [],
     phase: { type: 'idle' },
-    breadcrumbs: [],
-    breadcrumbSequenceIds: new Set(),
     contextWindow: { used: 1000 },
     lastSequenceId,
     // Default to "no pending replay": anchor matches the tip and the ring
@@ -110,22 +107,6 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_init', payload: makeInitPayload() });
 
       expect(next.streamingBuffer).toBeNull();
-    });
-
-    it('replaces breadcrumbs entirely from server payload', () => {
-      const atom: ConversationAtom = {
-        ...createInitialAtom(),
-        breadcrumbs: [{ type: 'user', label: 'Old breadcrumb' }],
-      };
-      const payload = makeInitPayload({
-        breadcrumbs: [{ type: 'llm', label: 'LLM', sequenceId: 2 }],
-        breadcrumbSequenceIds: new Set([2]),
-      });
-
-      const next = dispatch(atom, { type: 'sse_init', payload });
-
-      expect(next.breadcrumbs).toHaveLength(1);
-      expect(next.breadcrumbs[0]!.type).toBe('llm');
     });
 
     // Task 24683 defensive dedup: even if the server unexpectedly re-sends
@@ -697,91 +678,6 @@ describe('conversationReducer', () => {
       expect(next.streamingBuffer).toBeNull();
       expect(next.messages).toHaveLength(1);
     });
-
-    it('updates resultSummary on matching tool breadcrumb when tool result arrives', () => {
-      const atom: ConversationAtom = {
-        ...createInitialAtom(),
-        breadcrumbs: [
-          { type: 'user', label: 'User' },
-          { type: 'tool', label: 'bash', toolId: 'toolu-abc', sequenceId: 5 },
-        ],
-      };
-      const toolResultMsg: Message = {
-        message_id: 'msg-10',
-        sequence_id: 10,
-        conversation_id: 'conv-1',
-        message_type: 'tool',
-        content: { tool_use_id: 'toolu-abc', content: 'hello world\nmore output', is_error: false } as Message['content'],
-        created_at: '2024-01-01T00:00:00Z',
-      };
-
-      const next = dispatch(atom, { type: 'sse_message', message: toolResultMsg, sequenceId: 10 });
-
-      const toolCrumb = next.breadcrumbs.find((b) => b.toolId === 'toolu-abc');
-      expect(toolCrumb?.resultSummary).toBe('hello world');
-    });
-
-    it('sets error resultSummary when tool result is an error', () => {
-      const atom: ConversationAtom = {
-        ...createInitialAtom(),
-        breadcrumbs: [
-          { type: 'tool', label: 'bash', toolId: 'toolu-xyz', sequenceId: 5 },
-        ],
-      };
-      const toolResultMsg: Message = {
-        message_id: 'msg-11',
-        sequence_id: 11,
-        conversation_id: 'conv-1',
-        message_type: 'tool',
-        content: {
-          tool_use_id: 'toolu-xyz',
-          content: '[command failed: exit code 1]\nsome output',
-          is_error: true,
-        } as Message['content'],
-        created_at: '2024-01-01T00:00:00Z',
-      };
-
-      const next = dispatch(atom, { type: 'sse_message', message: toolResultMsg, sequenceId: 11 });
-
-      const toolCrumb = next.breadcrumbs.find((b) => b.toolId === 'toolu-xyz');
-      expect(toolCrumb?.resultSummary).toBe('error: [command failed: exit code 1]');
-    });
-
-    it('does not modify breadcrumbs when tool_use_id has no matching breadcrumb', () => {
-      const atom: ConversationAtom = {
-        ...createInitialAtom(),
-        breadcrumbs: [{ type: 'tool', label: 'bash', toolId: 'toolu-other', sequenceId: 5 }],
-      };
-      const toolResultMsg: Message = {
-        message_id: 'msg-12',
-        sequence_id: 12,
-        conversation_id: 'conv-1',
-        message_type: 'tool',
-        content: { tool_use_id: 'toolu-nomatch', content: 'output' } as Message['content'],
-        created_at: '2024-01-01T00:00:00Z',
-      };
-
-      const next = dispatch(atom, { type: 'sse_message', message: toolResultMsg, sequenceId: 12 });
-
-      expect(next.breadcrumbs[0]?.resultSummary).toBeUndefined();
-    });
-
-    it('resets breadcrumbs on user message', () => {
-      const atom: ConversationAtom = {
-        ...createInitialAtom(),
-        breadcrumbs: [{ type: 'llm', label: 'LLM' }, { type: 'tool', label: 'bash' }],
-      };
-      const userMsg = makeMessage(10, 'user');
-
-      const next = dispatch(atom, {
-        type: 'sse_message',
-        message: userMsg,
-        sequenceId: 10,
-      });
-
-      expect(next.breadcrumbs).toHaveLength(1);
-      expect(next.breadcrumbs[0]!.type).toBe('user');
-    });
   });
 
   describe('sse_message_updated', () => {
@@ -964,25 +860,6 @@ describe('conversationReducer', () => {
       expect(next.phase.type).toBe('awaiting_llm');
     });
 
-    it('appends breadcrumb for tool_executing', () => {
-      const atom = createInitialAtom();
-
-      const next = dispatch(atom, {
-        type: 'sse_state_change',
-        sequenceId: 5,
-        phase: {
-          type: 'tool_executing',
-          current_tool: { id: 'tool-1', name: 'bash', input: { _tool: 'bash' } },
-          remaining_tools: [],
-        },
-        stateUpdatedAt: 0,
-      });
-
-      expect(next.breadcrumbs).toHaveLength(1);
-      expect(next.breadcrumbs[0]!.type).toBe('tool');
-      expect(next.breadcrumbs[0]!.label).toBe('bash');
-    });
-
     it('is a no-op for sequenceId already seen', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 10 };
 
@@ -994,46 +871,6 @@ describe('conversationReducer', () => {
       });
 
       expect(next).toBe(atom);
-    });
-
-    it('replaces LLM breadcrumb on retry', () => {
-      const atom: ConversationAtom = {
-        ...createInitialAtom(),
-        breadcrumbs: [{ type: 'llm', label: 'LLM', sequenceId: 5 }],
-      };
-
-      const next = dispatch(atom, {
-        type: 'sse_state_change',
-        sequenceId: 10,
-        phase: { type: 'llm_requesting', attempt: 2 },
-        stateUpdatedAt: 0,
-      });
-
-      expect(next.breadcrumbs).toHaveLength(1);
-      expect(next.breadcrumbs[0]!.label).toBe('LLM (retry 2)');
-    });
-
-    it('replaces subagents breadcrumb on count update', () => {
-      const atom: ConversationAtom = {
-        ...createInitialAtom(),
-        breadcrumbs: [{ type: 'subagents', label: 'sub-agents (0/2)', sequenceId: 3 }],
-      };
-
-      const next = dispatch(atom, {
-        type: 'sse_state_change',
-        sequenceId: 8,
-        phase: {
-          type: 'awaiting_sub_agents',
-          pending: [{ agent_id: 'a2', task: 'task2' }],
-          completed_results: [
-            { agent_id: 'a1', task: 'task1', outcome: { type: 'success' } },
-          ],
-        },
-        stateUpdatedAt: 0,
-      });
-
-      expect(next.breadcrumbs).toHaveLength(1);
-      expect(next.breadcrumbs[0]!.label).toBe('sub-agents (1/2)');
     });
 
     it('advances lastSequenceId on acceptance', () => {
@@ -1734,72 +1571,5 @@ describe('conversationReducer', () => {
       });
       expect(next).toBe(atom);
     });
-  });
-});
-
-describe('breadcrumbFromPhase', () => {
-  it('returns null for non-breadcrumb phases', () => {
-    expect(breadcrumbFromPhase({ type: 'idle' }, 1)).toBeNull();
-    expect(breadcrumbFromPhase({ type: 'awaiting_llm' }, 1)).toBeNull();
-    expect(breadcrumbFromPhase({ type: 'error', message: 'err', error_kind: 'server_error' }, 1)).toBeNull();
-  });
-
-  it('returns tool breadcrumb with queue depth', () => {
-    const crumb = breadcrumbFromPhase(
-      {
-        type: 'tool_executing',
-        current_tool: { id: 't1', name: 'bash', input: { _tool: 'bash' } },
-        remaining_tools: [
-          { id: 't2', name: 'bash', input: {} },
-          { id: 't3', name: 'bash', input: {} },
-        ],
-      },
-      5
-    );
-
-    expect(crumb?.type).toBe('tool');
-    expect(crumb?.label).toBe('bash (+2)');
-    expect(crumb?.toolId).toBe('t1');
-  });
-
-  it('uses top-level name for tools that serialize as ToolInput::Unknown', () => {
-    // Rust ToolInput::Unknown serializes as { _tool: "unknown", ... } inside
-    // `input` — the authoritative name lives at ToolCall.name (set by the
-    // custom Serialize impl on the Rust side).
-    const crumb = breadcrumbFromPhase(
-      {
-        type: 'tool_executing',
-        current_tool: {
-          id: 't1',
-          name: 'subagent',
-          input: { _tool: 'unknown', name: 'subagent', input: { slug: 'explore' } },
-        },
-        remaining_tools: [],
-      },
-      5
-    );
-
-    expect(crumb?.label).toBe('subagent');
-  });
-
-  it('returns LLM breadcrumb with retry number', () => {
-    const crumb = breadcrumbFromPhase({ type: 'llm_requesting', attempt: 3 }, 7);
-
-    expect(crumb?.type).toBe('llm');
-    expect(crumb?.label).toBe('LLM (retry 3)');
-  });
-
-  it('returns subagents breadcrumb with progress', () => {
-    const crumb = breadcrumbFromPhase(
-      {
-        type: 'awaiting_sub_agents',
-        pending: [{ agent_id: 'a2', task: 't2' }],
-        completed_results: [{ agent_id: 'a1', task: 't1', outcome: { type: 'success' } }],
-      },
-      10
-    );
-
-    expect(crumb?.type).toBe('subagents');
-    expect(crumb?.label).toBe('sub-agents (1/2)');
   });
 });

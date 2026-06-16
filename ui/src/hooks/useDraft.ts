@@ -54,7 +54,7 @@ function useDraftStore() {
 /**
  * Subscribe to the draft text only. Re-renders the calling component on
  * draft changes and nothing else. Consumers of the conversation atom —
- * message list, terminal, breadcrumbs — never see keystroke mutations.
+ * message list, terminal — never see keystroke mutations.
  */
 export function useDraftValue(slug: string): string {
   const store = useDraftStore();

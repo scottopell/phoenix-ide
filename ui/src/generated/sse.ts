@@ -13,7 +13,6 @@ export type { SseWireEvent } from './SseWireEvent';
 export type { ChainSseWireEvent } from './ChainSseWireEvent';
 export type { EnrichedMessage } from './EnrichedMessage';
 export type { MessageType } from './MessageType';
-export type { SseBreadcrumb } from './SseBreadcrumb';
 export type { UsageData } from './UsageData';
 export type { UserFacingError } from './UserFacingError';
 export type { UserFacingErrorKind } from './UserFacingErrorKind';

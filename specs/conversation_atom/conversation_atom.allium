@@ -89,14 +89,6 @@ value UIError {
     message: String
 }
 
--- Breadcrumb displayed in the phase trail. Kind-discriminated; the
--- reducer threads sequence_ids through for dedup on reconnect.
-value Breadcrumb {
-    kind: String
-    label: String
-    sequence_id: Integer?
-}
-
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -107,7 +99,6 @@ entity ConversationAtom {
     conversationId: String?
     phase: Phase
     messages: List<Message>
-    breadcrumbs: List<Breadcrumb>
     lastSequenceId: Integer
     streamingBuffer: StreamingBuffer?
     uiError: UIError?
@@ -212,7 +203,6 @@ rule SseInitFreshConnect {
     -- their normal applyIfNewer guard.
     ensures: atom.messages = payload.messages
     ensures: atom.phase = payload.phase
-    ensures: atom.breadcrumbs = payload.breadcrumbs
     ensures: atom.lastSequenceId = payload.pending_anchor_sequence_id
     ensures: atom.streamingBuffer = null
     ensures: atom.uiError = null
@@ -279,7 +269,6 @@ rule SseInitReconnectMerge {
     -- else, because the turn ended while disconnected.
     ensures: atom.messages = merge_by_id(atom.messages, payload.messages)
     ensures: atom.phase = payload.phase
-    ensures: atom.breadcrumbs = payload.breadcrumbs
     ensures: atom.streamingBuffer = preserve_buffer_when_streaming(atom.streamingBuffer, payload.phase, payload.pending_truncated)
     ensures: atom.uiError = null
 
@@ -363,11 +352,6 @@ rule SseMessageAppended {
         -- disappears" shape we see in production. The React reducer's
         -- single return statement gives us atomicity by construction as
         -- long as all three fields are set in that return.
-        --
-        -- User/skill messages additionally reset breadcrumbs to a fresh
-        -- agent turn. Tool-result messages update the matching tool
-        -- breadcrumb with a result summary derived from content. These
-        -- are local to breadcrumbs; they do not relax the triple.
 }
 
 -- `message` when the message_id is already present (defense-in-depth
@@ -434,11 +418,6 @@ rule SseStateChangeApplied {
 
     ensures: atom.phase = newPhase
     ensures: atom.lastSequenceId = seq
-
-    @guidance
-        -- Also threads the breadcrumb for the new phase (llm_requesting,
-        -- tool_executing, etc.) through applyBreadcrumb, which dedups
-        -- by sequence_id. Elided here to keep the rule focused.
 }
 
 -- `agent_done` — turn complete. Phase collapses to idle and the
@@ -851,7 +830,7 @@ invariant LastSseEventAtPositive {
 -- <ConversationPage> must NOT subscribe to either. It selects a stable
 -- projection (useConversationView / ConversationPageView) over only the
 -- fields it renders — conversationId, conversation, phase, messages,
--- breadcrumbs, contextWindow, systemPrompt, uiError, toolExecutingStartedAt,
+-- contextWindow, systemPrompt, uiError, toolExecutingStartedAt,
 -- phaseStateUpdatedAt, firstByteRequestId, turnRetryContext — compared
 -- by a cached-reference equality so an excluded-field bump yields an
 -- equal projection and no page re-render.
@@ -871,8 +850,8 @@ invariant LastSseEventAtPositive {
 --                        tick granularity, not instantly.)
 --
 -- WHY IT MATTERS. Excluding the volatile fields is what keeps the page
--- and its non-memoized children (StateBar, InputArea, WorkActions,
--- BreadcrumbBar) out of per-token / per-ping render churn. If a future
+-- and its non-memoized children (StateBar, InputArea, WorkActions)
+-- out of per-token / per-ping render churn. If a future
 -- change reads streamingBuffer or lastSseEventAt back into the page-view
 -- projection, or drops the cached-reference equality, the render-count
 -- assertions in useConversationView.perf-isolation.test.tsx fail — that

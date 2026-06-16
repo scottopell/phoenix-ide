@@ -102,7 +102,6 @@ function makeInitPayload(convId: string, slug: string) {
     last_sequence_id: 0,
     presentation_mode: 'idle',
     context_window_size: 0,
-    breadcrumbs: [],
     project_name: null,
     pending_anchor_sequence_id: 0,
     pending_events: [],

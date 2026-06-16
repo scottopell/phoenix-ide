@@ -13,7 +13,7 @@ export {
   useWorkScope,
 } from './useConversationAtom';
 export type { ConversationPageView } from './useConversationAtom';
-export { conversationReducer, createInitialAtom, breadcrumbFromPhase } from './atom';
+export { conversationReducer, createInitialAtom } from './atom';
 export type {
   ConversationAtom,
   SSEAction,

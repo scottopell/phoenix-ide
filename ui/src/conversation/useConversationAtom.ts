@@ -55,7 +55,6 @@ export type ConversationPageView = Pick<
   | 'conversation'
   | 'phase'
   | 'messages'
-  | 'breadcrumbs'
   | 'contextWindow'
   | 'systemPrompt'
   | 'uiError'
@@ -70,7 +69,6 @@ const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'conversation',
   'phase',
   'messages',
-  'breadcrumbs',
   'contextWindow',
   'systemPrompt',
   'uiError',
@@ -117,7 +115,6 @@ export function useConversationView(
       conversation: a.conversation,
       phase: a.phase,
       messages: a.messages,
-      breadcrumbs: a.breadcrumbs,
       contextWindow: a.contextWindow,
       systemPrompt: a.systemPrompt,
       uiError: a.uiError,
@@ -204,7 +201,6 @@ export function useConversationSelectors(slug: string) {
     isAgentWorking: isAgentWorking(atom.phase),
     currentTool,
     streamingText: atom.streamingBuffer?.text ?? null,
-    breadcrumbs: atom.breadcrumbs,
   };
 }
 

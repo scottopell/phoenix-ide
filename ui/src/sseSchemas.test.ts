@@ -109,7 +109,7 @@ describe('parseEvent', () => {
 
   describe('init schema', () => {
     // Task 02677 tightened the init schema so that fields the Rust side
-    // always sets (presentation_mode, context_window_size, breadcrumbs,
+    // always sets (presentation_mode, context_window_size,
     // project_name) are required here too. The generated TS type in
     // `./generated/sse` is the source of truth; the schema
     // `satisfies v.GenericSchema<unknown, WireInitData>` would fail to
@@ -122,7 +122,6 @@ describe('parseEvent', () => {
       last_sequence_id: 0,
       presentation_mode: 'idle',
       context_window_size: 0,
-      breadcrumbs: [],
       project_name: null,
       pending_anchor_sequence_id: 0,
       pending_events: [],

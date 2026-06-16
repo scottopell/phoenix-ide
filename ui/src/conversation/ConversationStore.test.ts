@@ -66,7 +66,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
 
   it('preserves SSE-driven fields when upserting a newer snapshot', () => {
     // The cardinal invariant: a polling tick that arrives mid-stream
-    // must not throw away `messages`, `breadcrumbs`, `lastSequenceId`,
+    // must not throw away `messages`, `lastSequenceId`,
     // `connectionEpoch`, etc. The upsert path mutates only
     // `atom.conversation`.
     const store = new ConversationStore();

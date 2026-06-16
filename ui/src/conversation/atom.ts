@@ -1,7 +1,6 @@
 import * as v from 'valibot';
-import type { ConversationState, Message, Conversation, ToolResultContent } from '../api';
+import type { ConversationState, Message, Conversation } from '../api';
 import type { ErrorPresentation } from '../errorPresentation';
-import type { Breadcrumb } from '../types';
 import type { WorkScopeInventory } from '../generated/sse';
 import {
   SseTokenDataSchema,
@@ -43,8 +42,6 @@ export interface ConversationAtom {
   conversation: Conversation | null;
   phase: ConversationState;
   messages: Message[];
-  breadcrumbs: Breadcrumb[];
-  breadcrumbSequenceIds: ReadonlySet<number>;
   contextWindow: { used: number };
   systemPrompt: string | null;
   lastSequenceId: number;
@@ -132,8 +129,6 @@ export interface InitPayload {
   conversation: Conversation;
   messages: Message[];
   phase: ConversationState;
-  breadcrumbs: Breadcrumb[];
-  breadcrumbSequenceIds: ReadonlySet<number>;
   contextWindow: { used: number };
   lastSequenceId: number;
   /** ReplayRing anchor: seq of the last persisted Message at subscribe time.
@@ -307,8 +302,6 @@ export function createInitialAtom(): ConversationAtom {
     conversation: null,
     phase: { type: 'idle' },
     messages: [],
-    breadcrumbs: [],
-    breadcrumbSequenceIds: new Set(),
     contextWindow: { used: 0 },
     systemPrompt: null,
     lastSequenceId: 0,
@@ -339,81 +332,6 @@ function reasonText(reason: 'rate_limit' | 'server_error' | 'network'): string {
     case 'network':
       return 'network error';
   }
-}
-
-export function breadcrumbFromPhase(
-  phase: ConversationState,
-  sequenceId: number
-): Breadcrumb | null {
-  switch (phase.type) {
-    case 'tool_executing': {
-      // `current_tool.name` is authoritative on both wire paths (NotifyClient
-      // summary and the PersistState full-serialize) — see ToolCall's custom
-      // Serialize in state_machine/state.rs.
-      const toolName = phase.current_tool?.name || 'tool';
-      const remaining = phase.remaining_tools?.length ?? 0;
-      const label =
-        remaining > 0 ? `${toolName} (+${remaining})` : toolName;
-      return { type: 'tool', label, toolId: phase.current_tool?.id, sequenceId };
-    }
-    case 'llm_requesting': {
-      const label = phase.attempt > 1 ? `LLM (retry ${phase.attempt})` : 'LLM';
-      return { type: 'llm', label, sequenceId };
-    }
-    case 'awaiting_sub_agents': {
-      const pending = phase.pending.length;
-      const completed = phase.completed_results.length;
-      const total = pending + completed;
-      const label = `sub-agents (${completed}/${total})`;
-      return { type: 'subagents', label, sequenceId };
-    }
-    default:
-      return null;
-  }
-}
-
-function deriveResultSummary(result: ToolResultContent): string {
-  const MAX_LEN = 80;
-  const truncate = (s: string) => (s.length > MAX_LEN ? s.slice(0, MAX_LEN - 1) + '…' : s);
-
-  const outputText = result.content ?? result.result ?? result.error ?? '';
-
-  if (result.is_error) {
-    const firstLine = outputText.split('\n').find((l) => l.trim()) ?? 'error';
-    return truncate(`error: ${firstLine.trim()}`);
-  }
-
-  const firstLine = outputText.split('\n').find((l) => l.trim()) ?? 'done';
-  return truncate(firstLine.trim());
-}
-
-function applyBreadcrumb(
-  breadcrumbs: Breadcrumb[],
-  breadcrumbSequenceIds: ReadonlySet<number>,
-  newCrumb: Breadcrumb | null,
-  sequenceId: number | undefined
-): { breadcrumbs: Breadcrumb[]; breadcrumbSequenceIds: ReadonlySet<number> } {
-  if (!newCrumb || (sequenceId !== undefined && breadcrumbSequenceIds.has(sequenceId))) {
-    return { breadcrumbs, breadcrumbSequenceIds };
-  }
-
-  let newBreadcrumbs: Breadcrumb[];
-  if (newCrumb.type === 'llm') {
-    // Replace existing LLM breadcrumb (handles retry label update)
-    newBreadcrumbs = [...breadcrumbs.filter((b) => b.type !== 'llm'), newCrumb];
-  } else if (newCrumb.type === 'subagents') {
-    // Replace existing subagents breadcrumb (handles count update)
-    newBreadcrumbs = [...breadcrumbs.filter((b) => b.type !== 'subagents'), newCrumb];
-  } else {
-    newBreadcrumbs = [...breadcrumbs, newCrumb];
-  }
-
-  const newIds =
-    sequenceId !== undefined
-      ? new Set([...breadcrumbSequenceIds, sequenceId])
-      : breadcrumbSequenceIds;
-
-  return { breadcrumbs: newBreadcrumbs, breadcrumbSequenceIds: newIds };
 }
 
 /**
@@ -752,30 +670,6 @@ export function conversationReducer(
         mergedMessages = p.messages;
       }
 
-      // Derive in-progress phase breadcrumb if the server breadcrumbs don't
-      // already carry it. UI-only enrichment; not in the spec but preserves
-      // the rendering contract for snapshots whose phase is mid-turn.
-      const currentCrumb = breadcrumbFromPhase(p.phase, p.lastSequenceId);
-      let snapshotBreadcrumbs = p.breadcrumbs;
-      let snapshotBreadcrumbSeqIds = p.breadcrumbSequenceIds;
-      if (currentCrumb) {
-        const alreadyPresent = p.breadcrumbs.some(
-          (b) =>
-            b.type === currentCrumb.type &&
-            (b.type !== 'tool' || b.toolId === currentCrumb.toolId)
-        );
-        if (!alreadyPresent) {
-          const applied = applyBreadcrumb(
-            snapshotBreadcrumbs,
-            snapshotBreadcrumbSeqIds,
-            currentCrumb,
-            undefined
-          );
-          snapshotBreadcrumbs = applied.breadcrumbs;
-          snapshotBreadcrumbSeqIds = applied.breadcrumbSequenceIds;
-        }
-      }
-
       const phase1Floor = isFreshConnect ? p.pendingAnchorSequenceId : atom.lastSequenceId;
       // streamingBuffer policy: fresh-connect always clears (atom had no
       // buffer to preserve). Reconnect preserves the existing buffer when
@@ -802,8 +696,6 @@ export function conversationReducer(
         conversation: p.conversation,
         messages: mergedMessages,
         phase: p.phase,
-        breadcrumbs: snapshotBreadcrumbs,
-        breadcrumbSequenceIds: snapshotBreadcrumbSeqIds,
         contextWindow: p.contextWindow,
         lastSequenceId: phase1Floor,
         streamingBuffer: phase1StreamingBuffer,
@@ -874,36 +766,10 @@ export function conversationReducer(
         }
         const newMessages = [...a.messages, action.message];
 
-        // User and skill messages reset breadcrumbs to start a fresh agent turn
-        const isUserMessage =
-          action.message.message_type === 'user' ||
-          action.message.type === 'user' ||
-          action.message.message_type === 'skill';
-
-        let breadcrumbs: Breadcrumb[] = isUserMessage
-          ? [{ type: 'user', label: 'User' }]
-          : a.breadcrumbs;
-
-        // Tool result message: update matching breadcrumb with result summary
-        if (!isUserMessage && action.message.message_type === 'tool') {
-          const toolResult = action.message.content as ToolResultContent;
-          if (toolResult.tool_use_id) {
-            const matchIdx = breadcrumbs.findIndex(
-              (b) => b.type === 'tool' && b.toolId === toolResult.tool_use_id
-            );
-            if (matchIdx >= 0) {
-              const summary = deriveResultSummary(toolResult);
-              breadcrumbs = [...breadcrumbs];
-              breadcrumbs[matchIdx] = { ...breadcrumbs[matchIdx]!, resultSummary: summary };
-            }
-          }
-        }
-
         return {
           ...a,
           messages: newMessages,
           streamingBuffer: null,
-          breadcrumbs,
         };
       });
     }
@@ -970,13 +836,6 @@ export function conversationReducer(
           action.phase.type === 'error' && action.error
             ? { ...action.phase, error: action.error }
             : action.phase;
-        const newCrumb = breadcrumbFromPhase(phase, action.sequenceId);
-        const { breadcrumbs, breadcrumbSequenceIds } = applyBreadcrumb(
-          a.breadcrumbs,
-          a.breadcrumbSequenceIds,
-          newCrumb,
-          action.sequenceId
-        );
         // Track when we enter tool_executing — reset on each new tool so the
         // live elapsed counter in StateBar always reflects the current tool.
         const toolExecutingStartedAt =
@@ -993,8 +852,6 @@ export function conversationReducer(
           // first-byte concept and must clear it so a subsequent
           // llm_requesting doesn't inherit a stale value.
           firstByteRequestId: null,
-          breadcrumbs,
-          breadcrumbSequenceIds,
           toolExecutingStartedAt,
         };
       });

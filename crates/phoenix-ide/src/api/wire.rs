@@ -55,8 +55,7 @@ use ts_rs::TS;
 use crate::chain_runtime::ChainSseEvent;
 use crate::db::{ErrorKind, Message, MessageType, UsageData};
 use crate::runtime::{
-    user_facing_error::UserFacingError, ConversationMetadataUpdate, EnrichedConversation,
-    SseBreadcrumb, SseEvent,
+    user_facing_error::UserFacingError, ConversationMetadataUpdate, EnrichedConversation, SseEvent,
 };
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -229,7 +228,6 @@ pub enum SseWireEvent {
         presentation_mode: String,
         last_sequence_id: i64,
         context_window_size: u64,
-        breadcrumbs: Vec<SseBreadcrumb>,
         project_name: Option<String>,
         /// `ReplayRing` anchor: the seq of the last persisted Message at
         /// subscribe time. Every entry in `pending_events` has
@@ -433,7 +431,6 @@ impl From<SseEvent> for SseWireEvent {
                 presentation_mode,
                 last_sequence_id,
                 context_window_size,
-                breadcrumbs,
                 project_name,
                 pending_anchor_sequence_id,
                 pending_events,
@@ -446,7 +443,6 @@ impl From<SseEvent> for SseWireEvent {
                 presentation_mode,
                 last_sequence_id,
                 context_window_size,
-                breadcrumbs,
                 project_name,
                 pending_anchor_sequence_id,
                 pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),

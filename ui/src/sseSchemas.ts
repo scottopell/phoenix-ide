@@ -49,7 +49,6 @@ import type {
   QuotaDetails as WireQuotaDetails,
   RateLimitWindow as WireRateLimitWindow,
   CreditsSnapshot as WireCreditsSnapshot,
-  SseBreadcrumb as GeneratedSseBreadcrumb,
   ChainQaTokenData as WireChainQaTokenData,
   ChainQaCompletedData as WireChainQaCompletedData,
   ChainQaFailedData as WireChainQaFailedData,
@@ -132,29 +131,6 @@ const MessageSchema = v.pipe(
   v.transform((obj): Message => obj as unknown as Message),
 );
 
-/** Breadcrumb as it appears on the wire (snake_case) before the UI transform.
- *
- *  The schema is stricter than the generated `SseBreadcrumb` type (which has
- *  `type: string` because the Rust field is a `String`, not an enum). We
- *  intentionally enforce the closed `picklist` here — the set of breadcrumb
- *  kinds is small, stable, and UI code does symbol-style comparisons on it.
- *  A Rust-side change that introduces a new crumb type would fail at runtime
- *  in prod (toast via `sse_error`) until this list is updated.
- *
- *  `v.exactOptional` (rather than `v.optional`) lines up with ts-rs'
- *  `#[ts(optional)]` emission — with `exactOptionalPropertyTypes: true`
- *  in tsconfig, `field?: T` forbids an explicit `undefined` value. The
- *  Rust wire uses `skip_serializing_if = "Option::is_none"`, so `None`
- *  means "key absent", not "key = undefined". */
-const SseBreadcrumbSchema = v.looseObject({
-  type: v.picklist(['user', 'llm', 'tool', 'subagents']),
-  label: v.string(),
-  tool_id: v.exactOptional(v.string()),
-  sequence_id: v.exactOptional(v.number()),
-  preview: v.exactOptional(v.string()),
-}) satisfies v.GenericSchema<unknown, GeneratedSseBreadcrumb>;
-export type SseBreadcrumb = v.InferOutput<typeof SseBreadcrumbSchema>;
-
 // ---------------------------------------------------------------------------
 // Event schemas. One per `addEventListener` in useConnection.ts.
 //
@@ -171,7 +147,7 @@ export type SseBreadcrumb = v.InferOutput<typeof SseBreadcrumbSchema>;
 
 /** `init`: full state snapshot at connect / reconnect.
  *
- *  `conversation`, `messages`, `breadcrumbs` are the structured fields the
+ *  `conversation` and `messages` are the structured fields the
  *  reducer reads. `project_name` is a top-level mirror that
  *  `transformInitData` in useConnection.ts merges back into the conversation
  *  object — it lives at the top level on the wire because the Rust
@@ -192,7 +168,6 @@ export const SseInitDataSchema = v.looseObject({
   last_sequence_id: v.number(),
   presentation_mode: v.string(),
   context_window_size: v.number(),
-  breadcrumbs: v.array(SseBreadcrumbSchema),
   project_name: v.nullable(v.string()),
   // ReplayRing snapshot (Phase 2: server-side wiring). The reducer does
   // not yet consume these — see `specs/sse_wire/sse_wire.allium`

@@ -23,13 +23,12 @@ import { notifyConversationSnapshotChange } from '../notifications';
  *     rendering.
  *   - **live**: a `ConversationPage` mounted for this slug, opened SSE,
  *     and the SSE init / wire events have populated `messages`,
- *     `breadcrumbs`, `connectionEpoch`, etc. on top of the existing
- *     `conversation`.
+ *     `connectionEpoch`, etc. on top of the existing `conversation`.
  *
  * Polling and cache hydration write through `upsertSnapshot` /
  * `upsertSnapshots`, which only touch `atom.conversation` and only
  * when the row is genuinely newer (`(id, updated_at)` per-row
- * idempotency). SSE-driven fields (`messages`, `breadcrumbs`,
+ * idempotency). SSE-driven fields (`messages`,
  * `lastSequenceId`, `connectionEpoch`, etc.) are never affected by
  * snapshot upserts — a polling tick mid-stream cannot clobber a live
  * conversation's state.

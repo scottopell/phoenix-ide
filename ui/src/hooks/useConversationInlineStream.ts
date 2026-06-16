@@ -9,10 +9,8 @@ import {
   SseMessageUpdatedDataSchema,
   SseStateChangeDataSchema,
   SseTokenDataSchema,
-  type SseBreadcrumb,
   type SseInitData,
 } from '../sseSchemas';
-import type { Breadcrumb } from '../types';
 import { parseConversationState, isAgentWorking } from '../utils';
 import { conversationReducer, createInitialAtom, type ConversationAtom, type InitPayload } from '../conversation/atom';
 import * as v from 'valibot';
@@ -46,31 +44,14 @@ function reducer(state: InlineStreamState, action: InlineStreamAction): InlineSt
   }
 }
 
-function transformBreadcrumb(b: SseBreadcrumb): Breadcrumb {
-  return {
-    type: b.type,
-    label: b.label,
-    toolId: b.tool_id,
-    sequenceId: b.sequence_id,
-    preview: b.preview,
-  };
-}
-
 function transformInitData(raw: SseInitData): InitPayload {
   const conversation = raw.project_name != null
     ? { ...raw.conversation, project_name: raw.project_name }
     : raw.conversation;
-  const breadcrumbs = (raw.breadcrumbs || []).map(transformBreadcrumb);
   return {
     conversation,
     messages: raw.messages || [],
     phase: parseConversationState(conversation?.state),
-    breadcrumbs,
-    breadcrumbSequenceIds: new Set(
-      breadcrumbs
-        .filter((b): b is Breadcrumb & { sequenceId: number } => b.sequenceId !== undefined)
-        .map((b) => b.sequenceId),
-    ),
     contextWindow: { used: raw.context_window_size ?? 0 },
     lastSequenceId: raw.last_sequence_id ?? 0,
     pendingAnchorSequenceId: raw.pending_anchor_sequence_id,
@@ -108,8 +89,6 @@ function snapshotPayload(conversation: Conversation, messages: Message[], contex
     conversation,
     messages,
     phase: conversation.state ? parseConversationState(conversation.state) : { type: 'idle' },
-    breadcrumbs: [],
-    breadcrumbSequenceIds: new Set(),
     contextWindow: { used: contextWindowSize },
     lastSequenceId,
     pendingAnchorSequenceId: lastSequenceId,

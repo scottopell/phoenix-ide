@@ -182,9 +182,9 @@ surface SharedConversation {
     -- No provides block: viewers cannot trigger any actions.
 
     @guarantee LiveUpdates
-        -- Viewer receives real-time SSE events for new messages,
-        -- state changes, and breadcrumb updates. Same stream as
-        -- the owner, filtered to exclude sensitive metadata.
+        -- Viewer receives real-time SSE events for new messages
+        -- and state changes. Same stream as the owner, filtered to
+        -- exclude sensitive metadata.
 
     @guarantee FullHistory
         -- Viewer sees all messages from conversation creation,

@@ -779,7 +779,7 @@ function CollapsibleTextImpl({
 /**
  * The inline mini pill-strip a compact-mode agent turn shows in place of its
  * tool blocks. Built purely from the turn's own tool_use blocks + paired
- * results (via `deriveToolStripItems`), never from phase/breadcrumb state.
+ * results (via `deriveToolStripItems`), never from phase state.
  * Clicking any pill calls `onExpand(toolId)` so the parent can reveal the full
  * tool detail and scroll the clicked tool into view.
  */
