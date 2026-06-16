@@ -70,6 +70,46 @@ CREATE TABLE IF NOT EXISTS message_images (
     PRIMARY KEY (message_id, ordinal)
 );
 
+-- Pending steering messages, normalized out of the conversations.steering_queue
+-- blob. A steering entry is a queued user message; its own attachments are
+-- grandchild collections (never an earned blob). skill_* is an all-or-nothing
+-- trio enforced by CHECK. `ordinal` is the FIFO position within a conversation.
+CREATE TABLE IF NOT EXISTS steering_messages (
+    message_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    llm_text TEXT,
+    user_agent TEXT,
+    skill_name TEXT,
+    skill_body TEXT,
+    skill_dir TEXT,
+    UNIQUE (conversation_id, ordinal),
+    CHECK ((skill_name IS NULL) = (skill_body IS NULL)
+       AND (skill_name IS NULL) = (skill_dir IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_steering_messages_conversation
+    ON steering_messages(conversation_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS steering_message_files (
+    message_id TEXT NOT NULL REFERENCES steering_messages(message_id) ON DELETE CASCADE,
+    file_ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (message_id, file_ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS steering_message_images (
+    message_id TEXT NOT NULL REFERENCES steering_messages(message_id) ON DELETE CASCADE,
+    image_ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (message_id, image_ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS turn_usage (
     id INTEGER PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
