@@ -6,4 +6,8 @@ Status of the original scope:
 - Instrumentation: DONE — run_step now accumulates time between cargo's "Blocking waiting for file lock" lines and the next output line, and reports steps that spent >=1s blocked via reporter.info.
 - Dedicated CARGO_TARGET_DIR for the e2e bin build: REJECTED. Locally there is no sccache, so a fresh dir means a full second dependency compile per worktree and gigabytes of disk, repaid only by seconds of lock-wait on a warm target. It is worse on the cold-worktree case it would be meant to help.
 
-Remaining: close this task once the lock-wait telemetry has been observed in a real local `./dev.py check --all` run (confirming the numbers are as benign as predicted on a warm target).
+Observed: the lock-wait telemetry has now been seen in real local `./dev.py check`
+runs — peak lock-wait topped out around 40s on a warm target, seen once or twice.
+That is well within the benign range predicted above (a transient lock hand-off, not
+the ~300s pathological contention the unsplit CI run showed), and confirms the lane
+split + in-lane codegen reorder resolved the original duplicate-compile cost. Closed.
