@@ -3457,11 +3457,15 @@ where
             let request = LlmRequest {
                 messages,
                 system: vec![SystemContent::new(
-                    "You are wrapping up a conversation that has reached its context limit. \
-                    Provide a concise summary to help continue in a new conversation.",
+                    "You are an agent writing a handoff note for the next agent, who will \
+                    continue this work in the same working directory with no memory of this \
+                    session. Be precise and concrete: real file paths, real commands, and an \
+                    honest split between what you verified and what you only assumed.",
                 )],
-                tools: vec![],          // No tools for continuation
-                max_tokens: Some(2000), // Limit summary length
+                tools: vec![], // No tools for continuation
+                // Handoff quality favors completeness; cap high enough that a
+                // thorough summary is not truncated mid-thought.
+                max_tokens: Some(4096),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the
                 // conv id keeps the cache cohort coherent.
@@ -4717,30 +4721,74 @@ fn execute_approve_plain_markdown_blocking(
     })
 }
 
-/// Build the continuation prompt (REQ-BED-020)
+/// Build the continuation prompt (REQ-BED-020).
+///
+/// The summary seeds a fresh agent that restarts with no memory of this session
+/// but full tool access in the same working directory, so the prompt asks for
+/// an operational handoff (exact paths, repo state, verified-vs-assumed) rather
+/// than a human-facing recap.
 fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
     let mut prompt = String::from(
-        "The conversation context is nearly full. Please provide a brief continuation summary \
-        that could seed a new conversation.\n\n\
-        Include:\n\
-        1. Current task status and progress\n\
-        2. Key files, concepts, or decisions discussed\n\
-        3. Suggested next steps to continue the work\n\n\
-        Keep your response concise and actionable.",
+        "This conversation has reached its context limit. Write a handoff that lets a fresh \
+        agent — no memory of this session, but full tool access in the same working \
+        directory — pick up exactly where you left off.\n\n\
+        Cover:\n\
+        1. The goal: what you were asked to do, and the current status toward it.\n\
+        2. Work done: concrete changes made, with exact file paths; commands run and their \
+        outcome.\n\
+        3. Verified vs. assumed: what you confirmed works (tests run, output observed) versus \
+        what you believe but have not checked.\n\
+        4. Repo state: branch, what is committed vs. uncommitted, anything pushed.\n\
+        5. Next steps: the specific actions to take next, the first concrete one first.\n\
+        6. Pitfalls: dead ends, gotchas, or context the next agent would otherwise have to \
+        rediscover the hard way.\n\n\
+        Favor completeness over brevity — a dropped file path or an unstated caveat costs the \
+        next agent far more than length does. Write directly to that agent.",
     );
 
     if !rejected_tool_calls.is_empty() {
         use std::fmt::Write;
         prompt.push_str(
-            "\n\nNote: The following tool calls were requested but not executed due to context limits:\n",
+            "\n\nThese tool calls were pending when the limit hit and did not run. Fold the \
+            intended actions into the next steps:\n",
         );
         for tool in rejected_tool_calls {
-            let _ = writeln!(prompt, "- {}", tool.name());
+            let _ = writeln!(prompt, "- {}", render_rejected_tool_call(tool));
         }
-        prompt.push_str("Include these pending actions in your summary.");
     }
 
     prompt
+}
+
+/// Render a pending (rejected) tool call as `name: {compact-json-args}`, with
+/// the arguments truncated on a char boundary so one oversized payload cannot
+/// bloat the prompt. The next agent needs to know *what* was about to run
+/// (which file the patch targeted, which command was queued), not just the
+/// tool type. The internal `_tool` discriminant is stripped since the name is
+/// already printed.
+fn render_rejected_tool_call(tool: &ToolCall) -> String {
+    const MAX_ARGS_CHARS: usize = 500;
+    let name = tool.name();
+    let args = match serde_json::to_value(&tool.input) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("_tool");
+            }
+            serde_json::to_string(&v).unwrap_or_default()
+        }
+        Err(_) => String::new(),
+    };
+    if args.is_empty() || args == "{}" {
+        return name.to_string();
+    }
+    // Truncate by char count rather than byte slice: respects UTF-8 boundaries
+    // by construction and satisfies clippy::string_slice.
+    if args.chars().count() > MAX_ARGS_CHARS {
+        let truncated: String = args.chars().take(MAX_ARGS_CHARS).collect();
+        format!("{name}: {truncated}… (truncated)")
+    } else {
+        format!("{name}: {args}")
+    }
 }
 
 fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind {
@@ -4811,6 +4859,56 @@ fn llm_error_to_outcome(error: crate::llm::LlmError) -> LlmOutcome {
         LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => LlmOutcome::RequestRejected {
             message: error.message,
         },
+    }
+}
+
+#[cfg(test)]
+mod continuation_prompt_tests {
+    use super::*;
+    use crate::state_machine::state::ToolInput;
+    use crate::tools::BashToolInput;
+
+    #[test]
+    fn rejected_tool_call_includes_arguments_without_tool_discriminant() {
+        let call = ToolCall::new("t1", ToolInput::Bash(BashToolInput::run("cargo test")));
+        let rendered = render_rejected_tool_call(&call);
+        assert!(rendered.starts_with("bash: "), "got: {rendered}");
+        assert!(rendered.contains("cargo test"), "args missing: {rendered}");
+        assert!(
+            !rendered.contains("_tool"),
+            "discriminant should be stripped: {rendered}"
+        );
+    }
+
+    #[test]
+    fn rejected_tool_call_truncates_oversized_arguments_on_char_boundary() {
+        let big = "é".repeat(2000); // multi-byte chars stress the boundary walk
+        let call = ToolCall::new("t1", ToolInput::Bash(BashToolInput::run(big)));
+        let rendered = render_rejected_tool_call(&call);
+        assert!(rendered.ends_with("… (truncated)"), "got tail: {rendered}");
+        // Truncated near the char cap, not the full 2000-char payload, and
+        // still valid UTF-8 (constructing it would have panicked otherwise).
+        assert!(
+            rendered.chars().count() < 600,
+            "not truncated: {} chars",
+            rendered.chars().count()
+        );
+    }
+
+    #[test]
+    fn continuation_prompt_lists_rejected_calls_and_drops_brevity_framing() {
+        let calls = vec![ToolCall::new(
+            "t1",
+            ToolInput::Bash(BashToolInput::run("git push")),
+        )];
+        let prompt = build_continuation_prompt(&calls);
+        assert!(prompt.contains("handoff"), "should frame as handoff");
+        assert!(prompt.contains("git push"), "rejected args should appear");
+        assert!(
+            !prompt.to_lowercase().contains("brief")
+                && !prompt.to_lowercase().contains("concise"),
+            "brevity framing should be gone: {prompt}"
+        );
     }
 }
 

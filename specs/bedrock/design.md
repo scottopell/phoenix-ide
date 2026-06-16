@@ -1284,33 +1284,24 @@ The check happens in `transition()` at the `(LlmRequesting, LlmResponse)` arm, B
 
 ### Continuation Prompt
 
-The continuation prompt includes context about rejected tools:
+The summary's consumer is a fresh agent that resumes in the same working
+directory with no memory of the session, so the prompt is framed as an
+operational handoff written agent-to-agent, not a human-facing recap. It asks
+for: the goal and current status; concrete work done with exact file paths and
+command outcomes; an honest split between what was verified and what was only
+assumed; repo state (branch, committed vs. uncommitted, pushed); ordered next
+steps; and pitfalls the next agent would otherwise rediscover. It instructs the
+model to favor completeness over brevity — a dropped path or unstated caveat
+costs the next agent more than length does — and the request's `max_tokens` is
+sized so a thorough handoff is not truncated mid-thought. The system prompt
+carries the agent-to-agent role and the verified-vs-assumed discipline; the user
+prompt carries the structure, so the two do not restate each other.
 
-```rust
-const CONTINUATION_PROMPT: &str = r#"
-The conversation context is nearly full. Please provide a brief continuation summary that could seed a new conversation.
-
-Include:
-1. Current task status (if any)
-2. Key files or concepts discussed
-3. Suggested next steps
-
-Keep your response concise.
-"#;
-
-fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
-    let mut prompt = CONTINUATION_PROMPT.to_string();
-    
-    if !rejected_tool_calls.is_empty() {
-        prompt.push_str("\n\nNote: The following tool calls were requested but not executed due to context limits:\n");
-        for tool in rejected_tool_calls {
-            prompt.push_str(&format!("- {}\n", tool.name()));
-        }
-    }
-    
-    prompt
-}
-```
+Rejected tool calls (requested but not executed when the limit hit) are listed
+with their intended arguments, not just the tool name, so the next agent knows
+*what* was about to run (which file a patch targeted, which command was queued).
+Arguments are serialized compactly and truncated on a char boundary so a single
+oversized payload cannot bloat the prompt.
 
 ### Continuation Transitions
 

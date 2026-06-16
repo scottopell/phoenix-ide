@@ -375,7 +375,8 @@ AND compare against model-specific context window size
 WHEN continuation flow is triggered
 THE SYSTEM SHALL request a session summary from the LLM
 AND the request SHALL NOT include any tool capabilities
-AND the request SHALL mention any tools that were requested but not executed
+AND the request SHALL frame the summary as an operational handoff to a fresh agent that resumes in the same working directory with no memory of the session
+AND the request SHALL describe any tools that were requested but not executed, including their intended arguments
 
 WHEN continuation summary is received
 THE SYSTEM SHALL store it as a continuation message
@@ -390,7 +391,7 @@ THE SYSTEM SHALL reject the request as an invalid cancellation state
 AND SHALL NOT abort the in-flight continuation request
 AND SHALL remain awaiting the continuation summary
 
-**Rationale:** The summary preserves session context for users to seed a new conversation. Mentioning rejected tools acknowledges what the agent intended. Failures shouldn't block users from moving on.
+**Rationale:** The summary's consumer is a fresh agent that restarts cold in the same worktree, so it is framed as an operational handoff — exact paths, repo state, and an honest verified-vs-assumed split — rather than a human-facing recap, and completeness is favored over brevity. Describing rejected tool calls with their arguments tells the next agent what was about to run, not merely which tool type. Failures shouldn't block users from moving on.
 
 ---
 
