@@ -61,7 +61,6 @@ export function ConversationNav({ chapters, activeUnitIndex, onJump }: Conversat
       trailId="conversation-nav-trail"
       pillClassName="conversation-nav-item"
       arrowClassName="conversation-nav-arrow"
-      tooltipClassName="conversation-nav-tooltip"
     />
   );
 }

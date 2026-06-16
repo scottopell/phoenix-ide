@@ -814,8 +814,8 @@ function CompactToolStripImpl({
     <div className="compact-tool-strip">
       <PillStrip
         items={pills}
-        pillClassName="compact-tool-pill breadcrumb-item"
-        arrowClassName="breadcrumb-arrow"
+        pillClassName="compact-tool-pill"
+        arrowClassName="compact-tool-arrow"
       />
     </div>
   );

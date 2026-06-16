@@ -246,146 +246,8 @@ body {
 
 /* (conv-slug replaced by .statebar-slug in state bar layout section) */
 
-/* Breadcrumb Bar */
-#breadcrumb-bar {
-  flex: 0 0 auto;
-  height: var(--breadcrumb-height);
-  background: var(--bg-tertiary);
-  border-top: 1px solid var(--border-color);
-  overflow: auto hidden;
-  white-space: nowrap;
-  -webkit-overflow-scrolling: touch;
-  scrollbar-width: none;
-  padding: 0 12px;
-  position: relative;
-  z-index: 1;
-}
-
-#breadcrumb-bar::-webkit-scrollbar {
-  display: none;
-}
-
-#breadcrumb-trail {
-  display: inline-flex;
-  align-items: center;
-  height: 100%;
-  padding: 0 12px;
-  gap: 4px;
-}
-
-.breadcrumb-item {
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 8px;
-  font-size: 12px;
-  color: var(--text-secondary);
-  background: var(--bg-secondary);
-  border-radius: 4px;
-  cursor: pointer;
-  flex-shrink: 0;
-  position: relative;
-}
-
-.breadcrumb-item:hover {
-  background: var(--border-color);
-}
-
-.breadcrumb-item.active {
-  color: var(--accent-blue);
-  background: rgb(88 166 255 / 15%);
-}
-
-.breadcrumb-item.tool {
-  color: var(--accent-purple);
-}
-
-.breadcrumb-item.subagents {
-  color: var(--accent-yellow);
-  background: rgb(210 153 34 / 15%);
-}
-
-.breadcrumb-item.subagents.active {
-  color: var(--accent-yellow);
-  background: rgb(210 153 34 / 25%);
-}
-
-/* Breadcrumb tooltip */
-.breadcrumb-tooltip {
-  position: fixed;
-
-  /* left/top are set dynamically via inline style */
-  width: min(280px, calc(100vw - 16px));
-  background: var(--bg-primary);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 8px 12px;
-  min-width: 120px;
-  max-width: 280px;
-  white-space: normal;
-  z-index: 1000;
-  box-shadow: 0 4px 12px rgb(0 0 0 / 30%);
-  pointer-events: none;
-}
-
-/* Arrow rendered as a real element so its left position can be set dynamically.
-   The element's `left` style is the item-center offset within the tooltip box.
-   Pseudo-elements are offset by -6px/-5px to visually center the 12px/10px triangles. */
-.breadcrumb-tooltip-arrow {
-  position: absolute;
-  top: 100%;
-
-  /* left is set dynamically via inline style */
-  width: 0;
-  height: 0;
-}
-
-.breadcrumb-tooltip-arrow::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: -6px;
-  border: 6px solid transparent;
-  border-top-color: var(--border-color);
-}
-
-.breadcrumb-tooltip-arrow::before {
-  content: '';
-  position: absolute;
-  top: 1px;
-  left: -5px;
-  border: 5px solid transparent;
-  border-top-color: var(--bg-primary);
-  z-index: 1;
-}
-
-.breadcrumb-tooltip strong {
-  display: block;
-  font-size: 12px;
-  color: var(--text-primary);
-  margin-bottom: 4px;
-}
-
-.breadcrumb-tooltip-preview {
-  display: block;
-  font-size: 11px;
-  color: var(--text-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  overflow-wrap: anywhere;
-  line-height: 1.4;
-}
-
-.breadcrumb-arrow {
-  color: var(--text-muted);
-  font-size: 10px;
-  flex-shrink: 0;
-}
-
 /* Conversation navigation strip — the permanent occupant of the top
-   horizontal slot, an outline over the whole conversation. Reuses the
-   breadcrumb pill primitive, but sits ABOVE the message list (border-bottom)
-   rather than below it, and is type-styled per chapter: user prompts in the
-   default text color, assistant prose tinted, the in-view chapter active. */
+   horizontal slot, an outline over the whole conversation. */
 #conversation-nav {
   flex: 0 0 auto;
   height: var(--breadcrumb-height);
@@ -455,11 +317,7 @@ body {
   flex-shrink: 0;
 }
 
-/* Compact density — per-turn inline tool pill strip.
-   Reuses the breadcrumb pill visual primitive (.breadcrumb-item) for the
-   shell; these rules tune it for the in-message-list context (wraps instead
-   of horizontal-scrolls, tighter margin). Tool = purple, sub-agents = yellow,
-   matching the breadcrumb color language. */
+/* Compact density — per-turn inline tool pill strip. */
 .compact-tool-strip {
   margin: 4px 0;
 }
@@ -476,7 +334,26 @@ body {
 }
 
 .compact-tool-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  font-size: 12px;
   color: var(--accent-purple);
+  background: var(--bg-secondary);
+  border-radius: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.compact-tool-pill:hover {
+  background: var(--border-color);
+}
+
+.compact-tool-arrow {
+  color: var(--text-muted);
+  font-size: 10px;
+  flex-shrink: 0;
 }
 
 .compact-tool-pill.subagents {
@@ -794,14 +671,14 @@ body {
   transition: box-shadow 0.3s ease;
 }
 
-@keyframes breadcrumb-pulse {
+@keyframes jump-pulse {
   0%, 100% { box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgb(88 166 255 / 30%); }
   50% { box-shadow: 0 0 0 3px var(--accent-blue), 0 0 24px rgb(88 166 255 / 50%); }
 }
 
-.message.breadcrumb-highlight {
+.message.jump-highlight {
   box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgb(88 166 255 / 30%);
-  animation: breadcrumb-pulse 0.75s ease-in-out 2;
+  animation: jump-pulse 0.75s ease-in-out 2;
 }
 
 .message.user {
@@ -6862,11 +6739,6 @@ html * {
     min-height: 44px;
     padding: 10px 20px;
     font-size: 14px;
-  }
-
-  /* Hide trajectory bar on mobile -- not worth the pixels */
-  #breadcrumb-bar {
-    display: none;
   }
 
   /* Collapsed StateBar: thin one-line summary, tap to expand.

@@ -16,10 +16,7 @@ function topEdgeOcclusionBottom(selector: string, scrollerTop: number): number |
 
 export function visibleJumpTop(scroller: HTMLElement): number {
   const scrollerTop = scroller.getBoundingClientRect().top;
-  const navBottom = Math.max(
-    topEdgeOcclusionBottom('#conversation-nav', scrollerTop) ?? Number.NEGATIVE_INFINITY,
-    topEdgeOcclusionBottom('#breadcrumb-bar', scrollerTop) ?? Number.NEGATIVE_INFINITY,
-  );
+  const navBottom = topEdgeOcclusionBottom('#conversation-nav', scrollerTop) ?? Number.NEGATIVE_INFINITY;
   return Math.max(scrollerTop, navBottom) + JUMP_TOP_PADDING_PX;
 }
 

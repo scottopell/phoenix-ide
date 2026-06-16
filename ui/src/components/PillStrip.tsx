@@ -1,7 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
-import type { MouseEvent } from 'react';
-import { createPortal } from 'react-dom';
-import { calcTooltipPosition } from './breadcrumbTooltipPosition';
+import { useEffect, useMemo, useRef } from 'react';
 
 export interface PillItem {
   /** Unique key for React reconciliation. */
@@ -14,8 +11,6 @@ export interface PillItem {
   active?: boolean | undefined;
   /** Accessible label for the pill element. */
   ariaLabel?: string | undefined;
-  /** Optional hover tooltip. When present, hovering shows a portal tooltip after a delay. */
-  tooltip?: { title: string; body: string } | undefined;
   /** Click handler for the pill. */
   onClick?: (() => void) | undefined;
 }
@@ -34,11 +29,7 @@ interface PillStripProps {
   activeClassName?: string;
   /** Class for the `→` arrow separators. */
   arrowClassName?: string;
-  /** Class for the portal tooltip box. */
-  tooltipClassName?: string;
 }
-
-const HOVER_DELAY_MS = 150;
 
 export function PillStrip({
   items,
@@ -48,12 +39,10 @@ export function PillStrip({
   pillClassName = 'pill-item',
   activeClassName = 'active',
   arrowClassName = 'pill-arrow',
-  tooltipClassName = 'pill-tooltip',
 }: PillStripProps) {
   const barRef = useRef<HTMLElement>(null);
-  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
-  const [tooltipPos, setTooltipPos] = useState<ReturnType<typeof calcTooltipPosition> | null>(null);
-  const hoverTimeoutRef = useRef<number | null>(null);
+
+  const activeItemKey = useMemo(() => items.find((item) => item.active)?.key ?? null, [items]);
 
   useEffect(() => {
     if (autoScrollToEnd && barRef.current) {
@@ -62,61 +51,31 @@ export function PillStrip({
   }, [items, autoScrollToEnd]);
 
   useEffect(() => {
-    return () => {
-      if (hoverTimeoutRef.current) {
-        clearTimeout(hoverTimeoutRef.current);
-      }
-    };
-  }, []);
-
-  const handleMouseEnter = (index: number, e: MouseEvent<HTMLSpanElement>) => {
-    const target = e.currentTarget;
-    if (hoverTimeoutRef.current) {
-      clearTimeout(hoverTimeoutRef.current);
-      hoverTimeoutRef.current = null;
+    if (!barRef.current || activeItemKey === null) {
+      return;
     }
-    hoverTimeoutRef.current = window.setTimeout(() => {
-      const rect = target.getBoundingClientRect();
-      setTooltipPos(calcTooltipPosition(rect));
-      setHoveredIndex(index);
-    }, HOVER_DELAY_MS);
-  };
 
-  const handleMouseLeave = () => {
-    if (hoverTimeoutRef.current) {
-      clearTimeout(hoverTimeoutRef.current);
-      hoverTimeoutRef.current = null;
+    const bar = barRef.current;
+    const activePill = bar.querySelector<HTMLElement>('[data-active="true"]');
+    if (!activePill) {
+      return;
     }
-    setHoveredIndex(null);
-    setTooltipPos(null);
-  };
 
-  const hoveredItem = hoveredIndex !== null ? items[hoveredIndex] : null;
-  const hoveredTooltip = hoveredItem?.tooltip;
-  const tooltip = hoveredTooltip && tooltipPos !== null && typeof document !== 'undefined'
-    ? createPortal(
-        <span
-          className={tooltipClassName}
-          style={{
-            left: tooltipPos.tooltipLeft,
-            top: tooltipPos.tooltipTop,
-            transform: 'translateY(-100%)',
-          }}
-        >
-          <strong>{hoveredTooltip.title}</strong>
-          <span className={`${tooltipClassName}-preview`}>{hoveredTooltip.body}</span>
-          <span
-            className={`${tooltipClassName}-arrow`}
-            style={{ left: tooltipPos.arrowLeft }}
-          />
-        </span>,
-        document.body,
-      )
-    : null;
+    const visibleLeft = bar.scrollLeft;
+    const visibleRight = visibleLeft + bar.clientWidth;
+    const pillLeft = activePill.offsetLeft;
+    const pillRight = pillLeft + activePill.offsetWidth;
+
+    if (pillLeft < visibleLeft) {
+      bar.scrollLeft = pillLeft;
+    } else if (pillRight > visibleRight) {
+      bar.scrollLeft = pillRight - bar.clientWidth;
+    }
+  }, [activeItemKey]);
+
 
   return (
-    <>
-      <nav id={navId} ref={barRef}>
+    <nav id={navId} ref={barRef}>
         <div id={trailId}>
           {items.map((item, i) => {
             const isLast = i === items.length - 1;
@@ -137,6 +96,7 @@ export function PillStrip({
                 <span
                   className={classes}
                   data-index={i}
+                  data-active={item.active ? 'true' : undefined}
                   role={onClick ? 'button' : undefined}
                   tabIndex={onClick ? 0 : undefined}
                   onClick={onClick}
@@ -150,8 +110,6 @@ export function PillStrip({
                         }
                       : undefined
                   }
-                  onMouseEnter={item.tooltip ? (e) => handleMouseEnter(i, e) : undefined}
-                  onMouseLeave={item.tooltip ? handleMouseLeave : undefined}
                   aria-label={item.ariaLabel}
                 >
                   {item.label}
@@ -161,8 +119,6 @@ export function PillStrip({
             );
           })}
         </div>
-      </nav>
-      {tooltip}
-    </>
+    </nav>
   );
 }

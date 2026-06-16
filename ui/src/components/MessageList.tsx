@@ -530,9 +530,9 @@ function MessageListImpl({
     const target = row?.querySelector('.message') ?? row;
     if (!target) return;
     pendingPulseKeyRef.current = null;
-    target.classList.add('breadcrumb-highlight');
+    target.classList.add('jump-highlight');
     const t = window.setTimeout(() => {
-      target.classList.remove('breadcrumb-highlight');
+      target.classList.remove('jump-highlight');
     }, 1500);
     pulseTimersRef.current.push(t);
   }, [findRowByKey]);

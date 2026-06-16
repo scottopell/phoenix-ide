@@ -382,8 +382,8 @@ describe('MessageList', () => {
       });
 
       expect(scroller.scrollTop).toBe(81);
-      expect(firstRow.querySelector('.message')).not.toHaveClass('breadcrumb-highlight');
-      expect(secondRow.querySelector('.message')).toHaveClass('breadcrumb-highlight');
+      expect(firstRow.querySelector('.message')).not.toHaveClass('jump-highlight');
+      expect(secondRow.querySelector('.message')).toHaveClass('jump-highlight');
     } finally {
       vi.useRealTimers();
     }

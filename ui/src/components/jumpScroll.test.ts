@@ -36,18 +36,6 @@ describe('jumpScroll', () => {
     expect(visibleJumpTop(scroller)).toBe(44);
   });
 
-  it('ignores breadcrumb bars below the message scroller', () => {
-    const scroller = document.createElement('div');
-    scroller.getBoundingClientRect = () => rect(36, 400);
-    document.body.append(scroller);
-
-    const breadcrumb = document.createElement('div');
-    breadcrumb.id = 'breadcrumb-bar';
-    breadcrumb.getBoundingClientRect = () => rect(400, 436);
-    document.body.append(breadcrumb);
-
-    expect(visibleJumpTop(scroller)).toBe(44);
-  });
 
   it('moves scrollTop only when the target top would be hidden by the nav strip', () => {
     const nav = document.createElement('div');

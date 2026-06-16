@@ -11,9 +11,6 @@ import type {
 import { parseConversationState } from '../utils';
 import { MessageList } from '../components/MessageList';
 import { MessageListSkeleton } from '../components/Skeleton';
-import { BreadcrumbBar } from '../components/BreadcrumbBar';
-import type { Breadcrumb } from '../types';
-import type { SseBreadcrumb } from '../api';
 import { parseEvent } from '../hooks/useConnection';
 import {
   SseInitDataSchema,
@@ -23,16 +20,6 @@ import {
 } from '../sseSchemas';
 import type { SSEAction } from '../conversation/atom';
 
-function transformBreadcrumb(b: SseBreadcrumb): Breadcrumb {
-  return {
-    type: b.type,
-    label: b.label,
-    toolId: b.tool_id,
-    sequenceId: b.sequence_id,
-    preview: b.preview,
-  };
-}
-
 type ShareStatus = 'loading' | 'connected' | 'error' | 'not_found';
 
 export function SharePage() {
@@ -41,7 +28,6 @@ export function SharePage() {
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [convState, setConvState] = useState<ConversationState>({ type: 'idle' });
-  const [breadcrumbs, setBreadcrumbs] = useState<Breadcrumb[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const lastSequenceIdRef = useRef(0);
@@ -50,7 +36,6 @@ export function SharePage() {
     setConversation(raw.conversation);
     setMessages(raw.messages || []);
     setConvState(parseConversationState(raw.conversation?.state));
-    setBreadcrumbs((raw.breadcrumbs || []).map(transformBreadcrumb));
     lastSequenceIdRef.current = raw.last_sequence_id ?? 0;
     setStatus('connected');
   }, []);
@@ -208,7 +193,6 @@ export function SharePage() {
           onOpenFile={undefined}
           conversationId={conversation.id}
         />
-        <BreadcrumbBar breadcrumbs={breadcrumbs} visible={breadcrumbs.length > 0} />
       </main>
     </div>
   );
