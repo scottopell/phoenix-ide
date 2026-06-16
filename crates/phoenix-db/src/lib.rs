@@ -3765,6 +3765,137 @@ impl Database {
 
         Ok(ConversationUsage { own, total })
     }
+
+    /// All `turn_usage` aggregated by `(UTC day, model)`, oldest day first.
+    ///
+    /// This single rollup feeds every aggregate the `/usage` page needs —
+    /// rolling-window totals, by-model and by-provider breakdowns, the daily
+    /// timeseries, and the cache-hit-rate trend. Pricing is applied per row by
+    /// the API layer, so mixed-model days cost correctly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn usage_daily_by_model(&self) -> DbResult<Vec<UsageDailyModelRow>> {
+        let rows = sqlx::query(
+            "SELECT date(created_at) AS day, model, \
+             COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+             COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+             COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens, \
+             COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
+             COUNT(*) AS turns \
+             FROM turn_usage GROUP BY day, model ORDER BY day ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(UsageDailyModelRow {
+                    day: r.try_get("day")?,
+                    model: r.try_get("model")?,
+                    input_tokens: r.try_get("input_tokens")?,
+                    output_tokens: r.try_get("output_tokens")?,
+                    cache_creation_tokens: r.try_get("cache_creation_tokens")?,
+                    cache_read_tokens: r.try_get("cache_read_tokens")?,
+                    turns: r.try_get("turns")?,
+                })
+            })
+            .collect()
+    }
+
+    /// `turn_usage` aggregated by `(root conversation, model)`, joined to the
+    /// conversation's display metadata. Sub-agent turns roll into their root
+    /// (matching the `total` scope of [`Self::get_conversation_usage`]); a
+    /// mixed-model conversation yields one row per model.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn usage_by_conversation(&self) -> DbResult<Vec<UsageConversationModelRow>> {
+        let rows = sqlx::query(
+            "SELECT tu.root_conversation_id AS rid, tu.model AS model, \
+             c.slug AS slug, c.title AS title, c.project_id AS project_id, \
+             c.conv_mode AS conv_mode, MIN(tu.created_at) AS started_at, \
+             COALESCE(SUM(tu.input_tokens), 0) AS input_tokens, \
+             COALESCE(SUM(tu.output_tokens), 0) AS output_tokens, \
+             COALESCE(SUM(tu.cache_creation_tokens), 0) AS cache_creation_tokens, \
+             COALESCE(SUM(tu.cache_read_tokens), 0) AS cache_read_tokens, \
+             COUNT(*) AS turns \
+             FROM turn_usage tu \
+             LEFT JOIN conversations c ON c.id = tu.root_conversation_id \
+             GROUP BY tu.root_conversation_id, tu.model",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(UsageConversationModelRow {
+                    root_conversation_id: r.try_get("rid")?,
+                    model: r.try_get("model")?,
+                    slug: r.try_get("slug").ok().flatten(),
+                    title: r.try_get("title").ok().flatten(),
+                    project_id: r.try_get("project_id").ok().flatten(),
+                    conv_mode: r.try_get("conv_mode").ok().flatten(),
+                    started_at: r.try_get("started_at")?,
+                    input_tokens: r.try_get("input_tokens")?,
+                    output_tokens: r.try_get("output_tokens")?,
+                    cache_creation_tokens: r.try_get("cache_creation_tokens")?,
+                    cache_read_tokens: r.try_get("cache_read_tokens")?,
+                    turns: r.try_get("turns")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Per-turn total token counts (input + output + cache) across all of
+    /// `turn_usage`, for the tokens-per-turn distribution. One element per
+    /// turn; the API layer buckets them into a histogram.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn usage_turn_token_totals(&self) -> DbResult<Vec<i64>> {
+        let rows = sqlx::query(
+            "SELECT (input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) \
+             AS total FROM turn_usage",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(|r| Ok(r.try_get("total")?)).collect()
+    }
+
+    /// Every `turn_usage` row under one root conversation, oldest first, for the
+    /// per-conversation drill-down. `root_id` is matched against
+    /// `root_conversation_id`, so sub-agent turns are included.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn usage_conversation_turns(&self, root_id: &str) -> DbResult<Vec<UsageTurnRow>> {
+        let rows = sqlx::query(
+            "SELECT model, created_at, input_tokens, output_tokens, \
+             cache_creation_tokens, cache_read_tokens \
+             FROM turn_usage WHERE root_conversation_id = ?1 ORDER BY created_at ASC",
+        )
+        .bind(root_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(UsageTurnRow {
+                    model: r.try_get("model")?,
+                    created_at: r.try_get("created_at")?,
+                    input_tokens: r.try_get("input_tokens")?,
+                    output_tokens: r.try_get("output_tokens")?,
+                    cache_creation_tokens: r.try_get("cache_creation_tokens")?,
+                    cache_read_tokens: r.try_get("cache_read_tokens")?,
+                })
+            })
+            .collect()
+    }
 }
 
 /// Parse a conversation row from the database

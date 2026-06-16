@@ -17,6 +17,7 @@ mod process_sample;
 mod sse;
 mod terminal_ws;
 mod types;
+mod usage;
 pub(crate) mod wire;
 
 pub use deployment::{absolutize, DeploymentConfig, DiskLocation, LogInfo, MeasureMode, TlsInfo};

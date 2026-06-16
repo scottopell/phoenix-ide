@@ -1265,6 +1265,54 @@ pub struct ConversationUsage {
     pub total: UsageTotals,
 }
 
+/// One `(day, model)` aggregate of `turn_usage`. `day` is the UTC calendar day
+/// (`date(created_at)`). Cost is *not* computed here — the API layer prices each
+/// row by model, so the persistence layer stays pricing-agnostic.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageDailyModelRow {
+    pub day: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub turns: i64,
+}
+
+/// One `(root_conversation, model)` aggregate of `turn_usage`, carrying the
+/// conversation's display metadata. Sub-agent turns roll into their root, so a
+/// conversation with mixed models yields one row per model — the API sums their
+/// per-model costs to get a correct conversation total.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageConversationModelRow {
+    pub root_conversation_id: String,
+    pub model: String,
+    pub slug: Option<String>,
+    pub title: Option<String>,
+    pub project_id: Option<String>,
+    /// Raw `conv_mode` JSON, for extracting the worktree path. `None` for
+    /// pre-mode rows.
+    pub conv_mode: Option<String>,
+    pub started_at: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub turns: i64,
+}
+
+/// One `turn_usage` row, scoped to a single conversation tree, for the
+/// per-conversation drill-down timeseries.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageTurnRow {
+    pub model: String,
+    pub created_at: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+}
+
 #[cfg(test)]
 mod conv_mode_tests {
     use super::*;
