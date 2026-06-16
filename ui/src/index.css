@@ -8717,7 +8717,7 @@ html * {
   border-color: var(--accent-green, #3fb950);
 }
 
-/* External link buttons (Merge PR ↗, Open PR ↗) — styled identically to
+/* External link buttons (Merge on GitHub ↗, Open PR ↗) — styled identically to
  * .work-actions-btn: no underline, same sizing and chrome. */
 .work-actions-merge-link,
 .work-actions-open-link {

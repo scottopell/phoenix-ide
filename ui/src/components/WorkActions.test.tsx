@@ -316,7 +316,7 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
 
     const link = screen.getByTestId('merge-pr-link') as HTMLAnchorElement;
     expect(link).toBeInTheDocument();
-    expect(link.textContent).toMatch(/Merge PR #77 ↗/);
+    expect(link.textContent).toMatch(/Merge on GitHub #77 ↗/);
     expect(link.getAttribute('href')).toBe('https://github.com/o/r/pull/77');
     // The Merge link is the secondary — it must NOT glow as a second primary.
     expect(link).not.toHaveClass('work-actions-btn--primary');

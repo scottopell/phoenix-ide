@@ -60,9 +60,9 @@ THE SYSTEM SHALL organize the work actions bar into three zones, left to right:
 
 **RESOLVE zone** — the push-forward action; suppressed in stuck phases (REQ-WAB-005):
 - The primary verb selected by `WorkDisposition` (REQ-WAB-004): `Address feedback`,
-  `Merge PR #N ↗`, or `Open PR #N ↗`.
+  `Merge on GitHub #N ↗`, or `Open PR #N ↗`.
 - Optionally a second, non-glowing link-out beside the primary: when the primary is
-  `Address feedback` and the PR's checks are confirmed passing, the honest `Merge PR #N ↗`
+  `Address feedback` and the PR's checks are confirmed passing, the honest `Merge on GitHub #N ↗`
   link rides alongside so an open PR offers both "address the feedback" and "go merge it"
   at once. This secondary is never a glowing primary (REQ-WAB-003).
 
@@ -88,8 +88,8 @@ WHEN `WorkDisposition` suppresses RESOLVE (stuck phases) or there is no push-for
 WHEN `WorkDisposition` is `continued`, there is no primary verb and all terminal verbs are
 suppressed (REQ-WAB-009).
 
-A RESOLVE disposition may additionally carry a single **secondary** link-out (the `Merge PR
-#N ↗` link beside an `Address feedback` primary). The secondary is structurally distinct from
+A RESOLVE disposition may additionally carry a single **secondary** link-out (the
+`Merge on GitHub #N ↗` link beside an `Address feedback` primary). The secondary is structurally distinct from
 the primary and never glows; it exists only alongside an `address_feedback` primary. This does
 not violate the single-primary rule: there is still exactly one glowing button.
 
@@ -115,8 +115,8 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 |---|---|---|---|---|
 | 1 | `continued_in_conv_id` set | `continued` | none | RESOLVE + FINISH suppressed; muted note |
 | 2 | phase ∈ {error, context_exhausted} | `stuck` | `Clean up` or `Abandon` per FINISH sub-table | RESOLVE suppressed |
-| 3 | idle, PR open, affordance enabled | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed; `Merge PR #N ↗` secondary link when `check_state = passing` |
-| 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
+| 3 | idle, PR open, affordance enabled | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed; `Merge on GitHub #N ↗` secondary link when `check_state = passing` |
+| 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
 | 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
 | 6 | idle, PR merged | `clean_up_merged` | **Clean up** (FINISH) | — |
 | 7 | idle, PR closed unmerged | `pr_closed` | **Abandon** (FINISH) | Clean up suppressed; note |
@@ -143,11 +143,12 @@ every reachable open PR — not gated on failing checks or a prior feedback-fres
 because review comments may need addressing whether checks pass or fail and whether or not a
 freshness baseline has yet been seeded; the freshness and coverage signals ride as markers on
 the button rather than gating its presence. When checks are confirmed passing, the honest
-`Merge PR #N ↗` link rides alongside as the non-glowing secondary. The Merge link is the
+`Merge on GitHub #N ↗` link rides alongside as the non-glowing secondary. The Merge link is the
 primary only when the PR cannot be addressed (no message channel). The honest-label rule
-applies: rows 4 and 5 both open GitHub, but only a passing PR is labelled "Merge"; a
+applies: rows 4 and 5 both open GitHub, but only a passing PR is labelled "Merge on GitHub"; a
 non-passing open PR (or any draft) is labelled "Open PR" so the bar never promises a merge the
-checks do not support.
+checks do not support. Both labels carry the ↗ external-navigation glyph and open GitHub in a
+new tab — neither performs the merge in Phoenix (REQ-WAB-010).
 
 **Design:** `WorkDisposition` is a pure function of inputs; no button state is stored in the
 bar. The bar re-derives the disposition on every render. The `check_state` and
@@ -253,7 +254,7 @@ continuation, so the suppressed bar matches the server-side legality gate.
 
 ### REQ-WAB-010: PR Link Verbs Open GitHub
 
-WHEN `WorkDisposition` is `merge_ready` (verb `Merge PR #N ↗`) or `pr_open_other` (verb
+WHEN `WorkDisposition` is `merge_ready` (verb `Merge on GitHub #N ↗`) or `pr_open_other` (verb
 `Open PR #N ↗`)
 THE SYSTEM SHALL render the RESOLVE verb as a link that opens the PR's GitHub URL in a new
 browser tab, NOT as a button that calls a Phoenix API.

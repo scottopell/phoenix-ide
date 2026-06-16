@@ -71,7 +71,7 @@ function ResolveLink({
       className={`work-actions-btn ${cls}${primary ? ' work-actions-btn--primary' : ''}`}
       data-testid={isMerge ? 'merge-pr-link' : 'open-pr-link'}
     >
-      {isMerge ? 'Merge' : 'Open'} PR #{verb.number} ↗
+      {isMerge ? 'Merge on GitHub' : 'Open PR'} #{verb.number} ↗
       {/* The coverage marker rides on the primary verb only — never duplicated
           across both the primary and the secondary link. */}
       {primary && <CoverageMarker marker={coverageMarker} />}

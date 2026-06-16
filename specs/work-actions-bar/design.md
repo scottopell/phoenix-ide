@@ -89,8 +89,8 @@ disposition rows directly.
 | `stuck` (PR open/draft) | View Diff | — | Clean up | ★ Abandon | Abandon | "PR #N still open — merge on GitHub, or abandon." |
 | `stuck` (no PR) | View Diff | — | ★ Clean up | Abandon | Clean up | — |
 | `stuck` (gh unavailable) | View Diff | — | ★ Clean up | Abandon | Clean up | "gh unavailable — manual cleanup." |
-| `address_feedback` | View Diff | ★ Address feedback (+ `Merge PR #N ↗` secondary link when checks pass) | — | Abandon | RESOLVE | — |
-| `merge_ready` | View Diff | ★ Merge PR #N ↗ | — | Abandon | RESOLVE | — |
+| `address_feedback` | View Diff | ★ Address feedback (+ `Merge on GitHub #N ↗` secondary link when checks pass) | — | Abandon | RESOLVE | — |
+| `merge_ready` | View Diff | ★ Merge on GitHub #N ↗ | — | Abandon | RESOLVE | — |
 | `pr_open_other` | View Diff | ★ Open PR #N ↗ | — | Abandon | RESOLVE | — |
 | `clean_up_merged` | View Diff | — | ★ Clean up | Abandon | Clean up | — |
 | `pr_closed` | View Diff | — | — | ★ Abandon | Abandon | "PR closed — abandon to clean up." |
@@ -124,7 +124,7 @@ user there is something new to address; it does not gate the button. The gate is
 addressability predicate of REQ-WAB-004: an open PR with the auto-fix affordance enabled,
 regardless of check state or freshness.
 
-When the PR's checks are confirmed passing, the honest `Merge PR #N ↗` link rides beside the
+When the PR's checks are confirmed passing, the honest `Merge on GitHub #N ↗` link rides beside the
 Address-feedback primary as a non-glowing secondary (`ResolveZone.secondary`), so a green PR
 with review comments offers both "address the feedback" and "go merge it" at once. The
 freshness and coverage markers ride on the primary verb only, never duplicated onto the
@@ -133,12 +133,14 @@ secondary link.
 ## RESOLVE Zone: PR Link Verbs
 
 When `WorkDisposition = merge_ready`, the RESOLVE verb is an anchor tag (`<a>`) labelled
-`"Merge PR #N ↗"`. When `WorkDisposition = pr_open_other`, it is labelled `"Open PR #N ↗"`.
-The `address_feedback` secondary link renders the same `"Merge PR #N ↗"` anchor (just not
+`"Merge on GitHub #N ↗"`. When `WorkDisposition = pr_open_other`, it is labelled `"Open PR #N ↗"`.
+The `address_feedback` secondary link renders the same `"Merge on GitHub #N ↗"` anchor (just not
 glowing). All point to `PrIdentity.url` with `target="_blank"` and `rel="noopener noreferrer"`,
 where `N` is `PrIdentity.number`.
 
-The label distinction is the honesty rule: "Merge" appears only when `check_state = passing`.
+The label distinction is the honesty rule: "Merge on GitHub" appears only when
+`check_state = passing`. The "on GitHub" qualifier plus the ↗ glyph make the destination
+explicit, so the verb never reads as a one-click in-Phoenix merge.
 A pending, draft, or failing-with-affordance-disabled PR gets "Open PR" — the bar never
 promises a merge the checks do not support. Phoenix has no merge API (REQ-WAB-010); the ↗
 glyph signals external navigation, and neither verb calls a Phoenix endpoint.
@@ -213,8 +215,9 @@ exactly one of `address_feedback`, `merge_ready`, or `pr_open_other`; every stuc
 resolves through the shared FINISH selector. There is no open-PR state that falls through to a
 disabled or empty bar.
 
-**Honest RESOLVE labels.** "Merge PR" appears only when checks are passing. A non-passing open
-PR gets "Open PR", so the bar never offers a merge affordance the PR's checks do not support.
+**Honest RESOLVE labels.** "Merge on GitHub" appears only when checks are passing — the
+qualifier names the destination so the verb never reads as an in-Phoenix merge. A non-passing
+open PR gets "Open PR", so the bar never offers a merge affordance the PR's checks do not support.
 
 **RESOLVE suppressed in stuck phases, not disabled.** A disabled "Address feedback" on an
 errored conversation would imply the user could resume by addressing feedback. Suppressing it

@@ -142,7 +142,7 @@ enum WorkDisposition {
 -- address_feedback posts a UserMessage in-Phoenix.
 enum ResolveVerb {
     address_feedback    -- "Address feedback": posts a UserMessage via PrAutoFixAffordance
-    | merge_link        -- "Merge PR #N ↗": opens PrIdentity.url in a new tab (Phoenix has no merge API)
+    | merge_link        -- "Merge on GitHub #N ↗": opens PrIdentity.url in a new tab (Phoenix has no merge API)
     | open_pr_link      -- "Open PR #N ↗": opens PrIdentity.url; honest when checks are not passing
 }
 
@@ -333,7 +333,7 @@ rule DispositionStuck {
 
 -- Row 3. Address feedback: idle, PR open, auto-fix affordance enabled — any
 -- check state. RESOLVE is primary. When the PR's checks pass, an honest
--- "Merge PR #N ↗" link rides alongside as the non-glowing secondary.
+-- "Merge on GitHub #N ↗" link rides alongside as the non-glowing secondary.
 rule DispositionAddressFeedback {
     when: WorkActionsBarRendered(bar)
 
@@ -356,7 +356,7 @@ rule DispositionAddressFeedback {
 }
 
 -- Row 4. Merge ready: idle, PR open, checks passing, but NOT addressable (no
--- auto-fix channel). RESOLVE is primary, an honest "Merge PR #N ↗" external
+-- auto-fix channel). RESOLVE is primary, an honest "Merge on GitHub #N ↗" external
 -- link with no secondary.
 rule DispositionMergeReady {
     when: WorkActionsBarRendered(bar)
@@ -381,7 +381,7 @@ rule DispositionMergeReady {
 
 -- Row 5. PR open/draft with no other RESOLVE match: a draft, or
 -- affordance-disabled and not green. RESOLVE is primary, an honest
--- "Open PR #N ↗" link — never labelled "Merge" when checks are not passing.
+-- "Open PR #N ↗" link — never labelled "Merge on GitHub" when checks are not passing.
 rule DispositionPrOpenOther {
     when: WorkActionsBarRendered(bar)
 
