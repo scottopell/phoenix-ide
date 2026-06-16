@@ -38,6 +38,9 @@ const AboutDeploymentPage = lazy(() =>
 const SharePage = lazy(() =>
   import('./pages/SharePage').then((m) => ({ default: m.SharePage })),
 );
+const UsagePage = lazy(() =>
+  import('./pages/UsagePage').then((m) => ({ default: m.UsagePage })),
+);
 
 /** Route loading fallback — blank div sized to the viewport to avoid CLS. */
 function RouteFallback() {
@@ -85,6 +88,7 @@ function AppRoutes() {
                 <Route path="/chains/:rootConvId" element={<ChainPage />} />
                 <Route path="/codex/login" element={<CodexLoginPage />} />
                 <Route path="/about" element={<AboutDeploymentPage />} />
+                <Route path="/usage" element={<UsagePage />} />
               </Routes>
             </DesktopLayout>
           } />

@@ -2,6 +2,8 @@ import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { FileViewerKind } from './generated/FileViewerKind';
+import type { UsageOverview } from './generated/UsageOverview';
+import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
 // Phoenix API Client
 
 // SSE event types come from the runtime schemas in `./sseSchemas`, which
@@ -774,6 +776,20 @@ export const api = {
   async deploymentInfo(): Promise<DeploymentInfo> {
     const resp = await fetch('/api/deployment');
     if (!resp.ok) throw new Error('Failed to load deployment info');
+    return resp.json();
+  },
+
+  /** Aggregate token/cost usage dashboard. */
+  async usageOverview(): Promise<UsageOverview> {
+    const resp = await fetch('/api/usage');
+    if (!resp.ok) throw new Error('Failed to load usage');
+    return resp.json();
+  },
+
+  /** Per-conversation usage drill-down (root conversation id). */
+  async usageConversationDetail(id: string): Promise<ConversationUsageDetail> {
+    const resp = await fetch(`/api/usage/conversation/${encodeURIComponent(id)}`);
+    if (!resp.ok) throw new Error('Failed to load conversation usage');
     return resp.json();
   },
 
