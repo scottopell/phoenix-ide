@@ -17,6 +17,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { computeAncestors, isUnderRoot } from './computeAncestors';
+import type { FileViewerKind } from '../../generated/FileViewerKind';
 
 // Types
 export interface FileItem {
@@ -25,8 +26,9 @@ export interface FileItem {
   is_directory: boolean;
   size?: number;
   modified_time?: number;
-  file_type: 'folder' | 'markdown' | 'code' | 'config' | 'text' | 'image' | 'data' | 'unknown';
-  is_text_file: boolean;
+  /** Server's verdict on how the viewer treats this entry — the single source
+   *  of openability, shared with quick-open and @-mention. */
+  viewer: FileViewerKind;
   is_gitignored: boolean;
 }
 
@@ -151,7 +153,7 @@ const FileTreeItem = memo(function FileTreeItem({
   activeFile,
   onItemClick,
 }: FileTreeItemProps) {
-  const isDisabled = !item.is_directory && !item.is_text_file;
+  const isDisabled = !item.is_directory && item.viewer.kind === 'opaque';
   const className = [
     'ft-item',
     isDisabled && 'ft-item--disabled',
@@ -167,7 +169,7 @@ const FileTreeItem = memo(function FileTreeItem({
         onClick={() => !isDisabled && onItemClick(item)}
         role="button"
         tabIndex={isDisabled ? -1 : 0}
-        title={isDisabled ? 'Non-text file' : item.path}
+        title={isDisabled ? 'Non-viewable file' : item.path}
         data-path={item.path}
       >
         {item.is_directory && (
@@ -452,7 +454,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   const handleItemClick = useCallback((item: FileItem) => {
     if (item.is_directory) {
       toggleExpand(item.path);
-    } else if (item.is_text_file) {
+    } else if (item.viewer.kind !== 'opaque') {
       onFileSelect(item.path, rootPath);
     }
   }, [toggleExpand, onFileSelect, rootPath]);

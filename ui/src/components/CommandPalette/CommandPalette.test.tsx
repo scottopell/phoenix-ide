@@ -99,7 +99,7 @@ describe('CommandPalette file root', () => {
       worktree_path: '/repo/.phoenix/worktrees/conv-1',
     });
     mocks.searchConversationFiles.mockResolvedValue({
-      items: [{ path: 'src/main.rs', is_text_file: true }],
+      items: [{ path: 'src/main.rs', viewer: { kind: 'text', category: 'code' } }],
     });
     mocks.searchConversationCode.mockResolvedValue({ items: [] });
 

@@ -33,15 +33,15 @@ describe('classifyViewerFile — extension fallback (no server type)', () => {
   });
 });
 
-describe('classifyViewerFile — server file_type as authority', () => {
-  it('trusts the server bucket for the markdown/code/config/text split', () => {
+describe('classifyViewerFile — server TextCategory as authority', () => {
+  it('trusts the server category for the markdown/code/plain split', () => {
     // Server says config; render highlights as code.
     expect(classifyViewerFile('settings.ini', 'config').renderKind).toBe('code');
-    // Server says text for .log; render as plain lines.
-    expect(classifyViewerFile('server.log', 'text').renderKind).toBe('text');
+    // Server says plain for .log; render as plain lines.
+    expect(classifyViewerFile('server.log', 'plain').renderKind).toBe('text');
     // Server's "unknown" → plain text, never code.
     expect(classifyViewerFile('Makefile', 'unknown').renderKind).toBe('text');
-    expect(classifyViewerFile('blob.dat', 'data').renderKind).toBe('text');
+    expect(classifyViewerFile('README.md', 'markdown').renderKind).toBe('markdown');
   });
 
   it('still applies the html override even when the server bucketed it as code', () => {
@@ -50,12 +50,8 @@ describe('classifyViewerFile — server file_type as authority', () => {
     expect(classifyViewerFile('index.html', 'code')).toEqual({ renderKind: 'html', language: 'html' });
   });
 
-  it('keeps the extension-derived language regardless of server bucket', () => {
+  it('keeps the extension-derived language regardless of server category', () => {
     expect(classifyViewerFile('main.rs', 'code').language).toBe('rust');
     expect(classifyViewerFile('q.graphql', 'config').language).toBe('graphql');
-  });
-
-  it('ignores an unrecognized server file_type string and falls back to extension', () => {
-    expect(classifyViewerFile('main.rs', 'bogus').renderKind).toBe('code');
   });
 });

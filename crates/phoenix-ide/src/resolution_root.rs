@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tempfile::TempDir;
 
 use crate::api::handlers::{fuzzy_score_path, search_files_in_root};
-use crate::api::FileSearchEntry;
+use crate::api::{FileSearchEntry, FileViewerKind};
 use crate::git_ops::{run_git, run_git_bytes};
 
 /// Outcome of resolving a single `@file` reference's content.
@@ -241,44 +241,6 @@ fn bytes_to_resolution(bytes: Vec<u8>) -> FileResolution {
     }
 }
 
-/// Extensions we treat as text when listing a git tree, where reading every
-/// blob to sniff content would be prohibitively expensive. The `is_text_file`
-/// flag is a cosmetic autocomplete hint, so an extension guess is sufficient.
-fn looks_textual(path: &str) -> bool {
-    !matches!(
-        Path::new(path).extension().and_then(|e| e.to_str()),
-        Some(
-            "png"
-                | "jpg"
-                | "jpeg"
-                | "gif"
-                | "webp"
-                | "ico"
-                | "pdf"
-                | "zip"
-                | "gz"
-                | "tar"
-                | "wasm"
-                | "so"
-                | "dylib"
-                | "dll"
-                | "exe"
-                | "bin"
-                | "o"
-                | "a"
-                | "class"
-                | "jar"
-                | "mp3"
-                | "mp4"
-                | "mov"
-                | "woff"
-                | "woff2"
-                | "ttf"
-                | "otf"
-        )
-    )
-}
-
 /// Process-global cache of a committed tree's full path listing, keyed by the
 /// resolved commit SHA. `git ls-tree -r` enumerates the entire tree, which for
 /// a large monorepo is expensive to run on every autocomplete keystroke; the
@@ -344,7 +306,7 @@ fn list_files_in_tree(
             .take(limit)
             .map(|p| FileSearchEntry {
                 path: p.clone(),
-                is_text_file: looks_textual(p),
+                viewer: FileViewerKind::for_path(Path::new(p)),
             })
             .collect();
     }
@@ -358,7 +320,7 @@ fn list_files_in_tree(
                 score,
                 FileSearchEntry {
                     path: rel_path.clone(),
-                    is_text_file: looks_textual(rel_path),
+                    viewer: FileViewerKind::for_path(Path::new(rel_path)),
                 },
             ));
         }

@@ -15,7 +15,11 @@ const URL_REGEX = /https?:\/\/[^\s<>"'`\]\)]+[^\s<>"'`\]\).,:;!?]/g;
 
 // File extension whitelist for relative/project paths (where we need the extension
 // to avoid false positives). Absolute paths starting with / don't need this.
-const FILE_EXTENSIONS = 'md|markdown|rs|ts|tsx|js|jsx|py|go|json|yaml|yml|toml|txt|css|scss|html|htm|vue|svelte|sh|bash|sql|graphql|proto|xml|ini|env|conf|cfg|lock|c|h|cpp|hpp|java|kt|swift|rb|php|ex|exs|hs|ml|zig|scala|mod|sum';
+// Includes viewer-openable image extensions so an image path mentioned in a
+// conversation linkifies and opens in the image viewer — the same reach the
+// sidebar and quick-open have. Kept in sync with the server's image bucket in
+// `FileViewerKind::for_path`.
+const FILE_EXTENSIONS = 'md|markdown|rs|ts|tsx|js|jsx|py|go|json|yaml|yml|toml|txt|css|scss|html|htm|vue|svelte|sh|bash|sql|graphql|proto|xml|ini|env|conf|cfg|lock|c|h|cpp|hpp|java|kt|swift|rb|php|ex|exs|hs|ml|zig|scala|mod|sum|png|jpg|jpeg|gif|svg|webp|ico|bmp|tiff|tif';
 
 // Regex for matching file paths that look like real files
 // Two strategies:

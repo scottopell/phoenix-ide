@@ -40,9 +40,9 @@ AND sort each group alphabetically (case-insensitive)
 AND display file/folder names with appropriate icons
 AND show file sizes for files (human readable: KiB, MiB, GiB)
 AND show modification time (relative: "2 hours ago", "3 days ago")
-AND show all files including non-text files (images, binaries, etc.)
-AND disable non-text files with visual indication (grayed out)
-AND show tooltip or subtitle "Non-text file" for disabled items
+AND show all files including non-viewable files (binaries, etc.)
+AND disable non-viewable files with visual indication (grayed out)
+AND show tooltip or subtitle "Non-viewable file" for disabled items
 
 WHEN directory contains more than 100 items
 THE SYSTEM SHALL virtualize the list for performance
@@ -50,7 +50,7 @@ THE SYSTEM SHALL virtualize the list for performance
 WHEN directory is empty
 THE SYSTEM SHALL show "Empty directory" message
 
-**Rationale:** Consistent ordering and metadata helps users find files efficiently. Showing all files (even non-reviewable ones) gives complete directory context. Virtualization prevents performance issues in large directories.
+**Rationale:** Consistent ordering and metadata helps users find files efficiently. Showing all files (even non-viewable ones) gives complete directory context. Virtualization prevents performance issues in large directories.
 
 ---
 
@@ -99,11 +99,15 @@ THE SYSTEM SHALL use backend-provided type information
 AND backend MAY check shebang for scripts (e.g., `#!/usr/bin/env python`)
 AND backend SHALL NOT peek at file contents in large directories
 
-WHEN file is non-text (images, binaries, data files)
+WHEN file is non-viewable (binaries, data files)
 THE SYSTEM SHALL show with appropriate icon but in disabled/grayed state
 AND NOT allow selection
 
-**Rationale:** Visual file type indicators help users quickly identify relevant files to review. Minimalistic icons maintain a clean, professional interface. Showing but disabling non-text files provides complete directory context without confusion. Backend-side type detection prevents frontend performance issues when browsing large directories.
+WHEN file is viewer-openable (text or image)
+THE SYSTEM SHALL allow selection
+AND open it in the viewer — text in the prose reader, images in the image preview
+
+**Rationale:** Visual file type indicators help users quickly identify relevant files to review. Minimalistic icons maintain a clean, professional interface. Images are openable in the viewer, so only genuinely non-viewable binaries are disabled — and that openability is one server-side classification shared by every entry point (sidebar, quick-open, linkified paths), never re-derived per surface. Showing but disabling non-viewable files provides complete directory context without confusion. Backend-side type detection prevents frontend performance issues when browsing large directories.
 
 ---
 

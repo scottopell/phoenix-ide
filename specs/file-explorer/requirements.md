@@ -48,20 +48,22 @@ AND retain expansion state when switching between conversations
 
 ### REQ-FE-003: File Selection
 
-WHEN user clicks a text file in the file tree
-THE SYSTEM SHALL open the file in the prose reader
-AND display the prose reader in the main content area (replacing conversation view)
+WHEN user clicks a viewer-openable file in the file tree
+THE SYSTEM SHALL open the file in the viewer
+AND display the viewer in the main content area (replacing conversation view)
 AND keep conversation sidebar and file explorer panel visible
 
-WHEN user clicks a non-text file
+WHEN user clicks a non-viewable file
 THE SYSTEM SHALL show the file as disabled (not clickable)
-AND indicate "Non-text file" via visual treatment
+AND indicate "Non-viewable file" via visual treatment
 
 WHEN prose reader is open and user clicks the conversation in sidebar
 THE SYSTEM SHALL close the prose reader
 AND return to the conversation view
 
 **Rationale:** Click-to-view is the simplest interaction. Keeping the sidebar and file tree visible maintains navigation context.
+
+A file is *viewer-openable* exactly when the server classifies it as text or as an image — the same verdict that drives quick-open and linkified conversation paths, so a file's clickability never depends on which entry point reached it. Openability is a single typed classification carried on the listing entry, not re-derived per surface; only genuinely non-viewable content (binaries) is disabled. Text opens in the prose reader, images in the image preview.
 
 ---
 

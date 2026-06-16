@@ -4,6 +4,7 @@ import { ViewerShell } from './viewer/ViewerShell';
 import { MetaViewer } from './viewer/MetaViewer';
 import { classifyViewerFile } from './viewer/viewerFileTypes';
 import type { MetaViewerPayload, PatchContext, TextRenderMode } from './viewer/metaViewerTypes';
+import type { TextCategory } from '../generated/TextCategory';
 
 /**
  * FileViewer — the file loader/adapter.
@@ -16,8 +17,8 @@ import type { MetaViewerPayload, PatchContext, TextRenderMode } from './viewer/m
  */
 
 type ReadFileResult =
-  | { kind: 'text'; content: string; encoding: string; file_type: string }
-  | { kind: 'image'; mime_type: string; url: string; file_type: string };
+  | { kind: 'text'; content: string; encoding: string; category: TextCategory }
+  | { kind: 'image'; mime_type: string; url: string };
 
 export interface FileViewerProps {
   filePath: string;
@@ -38,13 +39,13 @@ async function readFile(path: string): Promise<ReadFileResult> {
   }
   const data = await response.json();
   if (data.kind === 'image') {
-    return { kind: 'image', mime_type: data.mime_type, url: data.url, file_type: data.file_type };
+    return { kind: 'image', mime_type: data.mime_type, url: data.url };
   }
   return {
     kind: 'text',
     content: data.content,
     encoding: data.encoding ?? 'utf-8',
-    file_type: data.file_type ?? 'text',
+    category: data.category ?? 'unknown',
   };
 }
 
@@ -173,7 +174,7 @@ function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayl
     return { kind: 'image', ...common, url: data.url, mimeType: data.mime_type, fileName: ctx.fileName };
   }
 
-  const { renderKind, language } = classifyViewerFile(ctx.filePath, data.file_type);
+  const { renderKind, language } = classifyViewerFile(ctx.filePath, data.category);
   // Code renders through Pierre's virtualized CodeView, which stays responsive
   // on large files, so it never needs the plain-text fallback. Text/markdown
   // still build line-per-node DOM, so they keep the large-file guard.

@@ -177,7 +177,7 @@ export function useInlineReferences({
         const items: AutocompleteItem[] = result.items.map((entry) => ({
           id: entry.path,
           label: entry.path,
-          ...(entry.is_text_file ? {} : { subtitle: 'binary' }),
+          ...(entry.viewer.kind === 'opaque' ? { subtitle: 'binary' } : {}),
           metadata: entry,
         }));
         setFileAcItems(items);

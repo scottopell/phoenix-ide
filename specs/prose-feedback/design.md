@@ -67,33 +67,32 @@ Response: {
 4. **Cache results** - Store file type in metadata cache if using content detection
 
 **Backend Implementation Notes:**
+
+A single classifier, `FileViewerKind::for_path`, is the authority on "how does
+the viewer treat this path." It is extension-only (no I/O), so the same function
+serves the directory listing, `/api/files/read`, conversation-scoped search, and
+git-tree discovery — openability is computed once and carried as data, never
+re-derived per surface. Its structure encodes openability directly: only
+`Opaque` is non-openable, so there is no separate boolean to drift.
+
 ```rust
-// Pseudo-code for efficient type detection
-fn detect_file_type(path: &Path, metadata: &Metadata) -> FileType {
-    // 1. Directory check (from metadata, no I/O)
-    if metadata.is_dir() {
-        return FileType::Folder;
+// Pseudo-code for efficient, I/O-free classification
+fn for_path(path: &Path) -> FileViewerKind {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("md") | Some("markdown") => Text { category: Markdown },
+        Some("rs") | Some("py") | Some("js") => Text { category: Code },
+        Some("png") | Some("jpg") | Some("svg") => Image,
+        Some("zip") | Some("bin") | Some("pdf") => Opaque, // known-binary
+        // ... etc
+        _ => Text { category: Unknown }, // optimistic; read path content-sniffs
     }
-    
-    // 2. Extension-based detection (no I/O)
-    if let Some(ext) = path.extension() {
-        return match ext.to_str() {
-            Some("md") | Some("markdown") => FileType::Markdown,
-            Some("rs") | Some("py") | Some("js") => FileType::Code,
-            // ... etc
-            _ => FileType::Unknown
-        };
-    }
-    
-    // 3. Special handling for no extension
-    if metadata.len() < 1024 * 1024 {  // Only files <1MB
-        // Could check shebang for scripts
-        // But this is OPTIONAL - can just return Unknown
-    }
-    
-    FileType::Unknown
 }
 ```
+
+The listing reports directories as `Opaque` (they are entered, not opened);
+`is_directory` carries the "expandable" affordance separately. `/api/files/read`
+dispatches on the same verdict: `Image` → image preview, `Text { category }` →
+read + content-sniff + return text, `Opaque` → binary error.
 
 **File Type Detection:**
 The backend handles all file type detection to avoid performance issues:
@@ -115,14 +114,15 @@ const FileIcon = ({ type }: { type: FileType }) => {
   return icons[type] || icons.unknown;
 };
 
-// Frontend uses isTextFile flag from API
+// Frontend dispatches on the server's typed `viewer` verdict — the same
+// classification quick-open and linkified paths use, never re-derived here.
 const handleFileClick = (item: FileItem) => {
   if (item.isDirectory) {
     navigateToDirectory(item.path);
-  } else if (item.isTextFile) {
-    openProseReader(item.path);
+  } else if (item.viewer.kind !== 'opaque') {
+    openViewer(item.path);  // text → prose reader, image → image preview
   }
-  // Non-text files are disabled by CSS
+  // Non-viewable (opaque) files are disabled by CSS
 };
 ```
 
@@ -593,7 +593,7 @@ All styles namespaced to avoid conflicts:
 - `.file-browser-header` - Path display and navigation
 - `.file-browser-list` - Scrollable file list
 - `.file-browser-item` - Individual file/folder row
-- `.file-browser-item--disabled` - Non-text file styling (grayed out)
+- `.file-browser-item--disabled` - Non-viewable file styling (grayed out)
 - `.file-browser-empty` - Empty directory message
 
 ### Prose Reader Classes

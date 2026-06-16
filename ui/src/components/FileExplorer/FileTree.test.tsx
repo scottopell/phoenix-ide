@@ -13,27 +13,30 @@ import { FileTree } from './FileTree';
 import { computeAncestors, isUnderRoot } from './computeAncestors';
 
 // /api/files/list response shapes — keyed by absolute path.
+const DIR = { kind: 'opaque' } as const;
+const TEXT = (category: string) => ({ kind: 'text', category }) as const;
 const FS: Record<string, Array<{
   name: string;
   path: string;
   is_directory: boolean;
-  file_type: string;
-  is_text_file: boolean;
+  viewer: { kind: string; category?: string };
   is_gitignored: boolean;
 }>> = {
   '/proj': [
-    { name: 'ui', path: '/proj/ui', is_directory: true, file_type: 'folder', is_text_file: false, is_gitignored: false },
-    { name: 'README.md', path: '/proj/README.md', is_directory: false, file_type: 'markdown', is_text_file: true, is_gitignored: false },
+    { name: 'ui', path: '/proj/ui', is_directory: true, viewer: DIR, is_gitignored: false },
+    { name: 'README.md', path: '/proj/README.md', is_directory: false, viewer: TEXT('markdown'), is_gitignored: false },
+    { name: 'logo.png', path: '/proj/logo.png', is_directory: false, viewer: { kind: 'image' }, is_gitignored: false },
+    { name: 'archive.zip', path: '/proj/archive.zip', is_directory: false, viewer: { kind: 'opaque' }, is_gitignored: false },
   ],
   '/proj/ui': [
-    { name: 'src', path: '/proj/ui/src', is_directory: true, file_type: 'folder', is_text_file: false, is_gitignored: false },
+    { name: 'src', path: '/proj/ui/src', is_directory: true, viewer: DIR, is_gitignored: false },
   ],
   '/proj/ui/src': [
-    { name: 'components', path: '/proj/ui/src/components', is_directory: true, file_type: 'folder', is_text_file: false, is_gitignored: false },
+    { name: 'components', path: '/proj/ui/src/components', is_directory: true, viewer: DIR, is_gitignored: false },
   ],
   '/proj/ui/src/components': [
-    { name: 'FileTree.tsx', path: '/proj/ui/src/components/FileTree.tsx', is_directory: false, file_type: 'code', is_text_file: true, is_gitignored: false },
-    { name: 'Other.tsx', path: '/proj/ui/src/components/Other.tsx', is_directory: false, file_type: 'code', is_text_file: true, is_gitignored: false },
+    { name: 'FileTree.tsx', path: '/proj/ui/src/components/FileTree.tsx', is_directory: false, viewer: TEXT('code'), is_gitignored: false },
+    { name: 'Other.tsx', path: '/proj/ui/src/components/Other.tsx', is_directory: false, viewer: TEXT('code'), is_gitignored: false },
   ],
 };
 
@@ -207,6 +210,31 @@ describe('FileTree — reveal active file', () => {
 
     expect(await screen.findByText('FileTree.tsx')).toBeInTheDocument();
     expect(screen.getByText('Other.tsx')).toBeInTheDocument();
+  });
+
+  it('opens image files and disables only non-viewable (opaque) files', async () => {
+    const onFileSelect = vi.fn();
+    render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={onFileSelect}
+        activeFile={null}
+        conversationId="conv-test-image"
+      />,
+    );
+
+    // An image is viewer-openable — clickable, not disabled, opens like text.
+    const imageRow = (await screen.findByText('logo.png')).closest('.ft-item') as HTMLElement;
+    expect(imageRow.classList.contains('ft-item--disabled')).toBe(false);
+    fireEvent.click(imageRow);
+    expect(onFileSelect).toHaveBeenCalledWith('/proj/logo.png', '/proj');
+
+    // A binary archive is opaque — disabled, and clicking is a no-op.
+    onFileSelect.mockClear();
+    const binRow = screen.getByText('archive.zip').closest('.ft-item') as HTMLElement;
+    expect(binRow.classList.contains('ft-item--disabled')).toBe(true);
+    fireEvent.click(binRow);
+    expect(onFileSelect).not.toHaveBeenCalled();
   });
 
   it('does NOT scroll or expand when activeFile is outside rootPath', async () => {

@@ -1,6 +1,7 @@
 import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
+import type { FileViewerKind } from './generated/FileViewerKind';
 // Phoenix API Client
 
 // SSE event types come from the runtime schemas in `./sseSchemas`, which
@@ -481,7 +482,9 @@ export interface ModelsResponse {
 /** A single file search result from the conversation-scoped file search API (REQ-IR-004) */
 export interface FileSearchEntry {
   path: string;
-  is_text_file: boolean;
+  /** Server's verdict on how the viewer treats this path — shared with the
+   *  sidebar and quick-open via the same classifier. */
+  viewer: FileViewerKind;
 }
 
 export interface CodeSearchEntry {

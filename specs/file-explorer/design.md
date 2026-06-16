@@ -126,7 +126,6 @@ interface RecentFilesStripProps {
 interface RecentFile {
   path: string;
   name: string;
-  fileType: FileItem['file_type'];
   openedAt: number;
 }
 
@@ -143,7 +142,7 @@ function RecentFilesStrip({ files, onFileClick }: RecentFilesStripProps) {
           onClick={() => onFileClick(file.path)}
           title={file.name}
         >
-          <FileIcon type={file.fileType} />
+          <FileIcon name={file.name} />
         </button>
       ))}
     </div>

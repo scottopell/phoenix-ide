@@ -23,10 +23,11 @@ use super::types::{
     ConversationListResponse, ConversationResponse, ConversationWithMessagesResponse,
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
-    GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
-    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    FileViewerKind, GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse,
+    ModelsResponse, NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery,
+    ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse,
+    SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
+    ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -3768,45 +3769,6 @@ async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
 // File Browser API (REQ-PF-001 through REQ-PF-004)
 // ============================================================
 
-/// Detect file type from extension (REQ-PF-004)
-fn detect_file_type(path: &std::path::Path) -> (String, bool) {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_lowercase);
-
-    match ext.as_deref() {
-        // Markdown
-        Some("md" | "markdown") => ("markdown".to_string(), true),
-        // Code files
-        Some(
-            "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "cpp" | "c" | "h" | "hpp"
-            | "css" | "html" | "htm" | "vue" | "svelte" | "php" | "rb" | "swift" | "kt" | "scala"
-            | "sh" | "bash" | "zsh" | "fish" | "ps1" | "sql" | "graphql" | "proto",
-        ) => ("code".to_string(), true),
-        // Config files
-        Some(
-            "json" | "yaml" | "yml" | "toml" | "ini" | "env" | "conf" | "cfg" | "xml"
-            | "properties",
-        ) => ("config".to_string(), true),
-        // Text files
-        Some("txt" | "log" | "csv" | "tsv" | "rtf") => ("text".to_string(), true),
-        // Image files
-        Some("png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" | "tiff" | "tif") => {
-            ("image".to_string(), false)
-        }
-        // Data/binary files
-        Some(
-            "db" | "sqlite" | "sqlite3" | "bin" | "dat" | "exe" | "dll" | "so" | "dylib" | "o"
-            | "a" | "wasm" | "class" | "jar" | "war" | "pyc" | "pyo" | "pdf" | "doc" | "docx"
-            | "xls" | "xlsx" | "ppt" | "pptx" | "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar"
-            | "mp3" | "mp4" | "wav" | "avi" | "mkv" | "mov" | "webm" | "flac" | "ogg",
-        ) => ("data".to_string(), false),
-        // Unknown - could be text, need to check when reading
-        _ => ("unknown".to_string(), true),
-    }
-}
-
 /// Check if file content appears to be valid text
 fn is_valid_text(content: &[u8]) -> bool {
     if content.contains(&0) {
@@ -4025,10 +3987,12 @@ async fn list_files(
 
             let is_directory = metadata.as_ref().is_some_and(std::fs::Metadata::is_dir);
 
-            let (file_type, is_text_file) = if is_directory {
-                ("folder".to_string(), false)
+            // Directories are entered, not opened — they report Opaque, and
+            // `is_directory` carries the "expandable" affordance separately.
+            let viewer = if is_directory {
+                FileViewerKind::Opaque
             } else {
-                detect_file_type(&entry_path)
+                FileViewerKind::for_path(&entry_path)
             };
 
             let size = if is_directory {
@@ -4054,8 +4018,7 @@ async fn list_files(
                 is_directory,
                 size,
                 modified_time,
-                file_type,
-                is_text_file,
+                viewer,
                 is_gitignored,
             }
         })
@@ -4097,29 +4060,32 @@ async fn read_file(
         ));
     }
 
-    let (file_type, _is_text_file) = detect_file_type(&path);
-    if file_type == "image" {
-        let mime_type = mime_guess::from_path(&path)
-            .first_or_octet_stream()
-            .to_string();
-        // Carry `cwd` into the preview URL so an image admitted only by the
-        // cwd-widened allowlist (a fresh project's task/skill subtree, before a
-        // conversation roots it) is also servable by `serve_preview_file`, which
-        // otherwise consults only the base allowlist and would 404 it.
-        let url = match query.cwd.as_deref() {
-            Some(cwd) => format!(
-                "{}?cwd={}",
-                preview_url_for_path(&path),
-                percent_encode_query_value(cwd)
-            ),
-            None => preview_url_for_path(&path),
-        };
-        return Ok(Json(ReadFileResponse::Image {
-            mime_type,
-            url,
-            file_type,
-        }));
-    }
+    let category = match FileViewerKind::for_path(&path) {
+        FileViewerKind::Image => {
+            let mime_type = mime_guess::from_path(&path)
+                .first_or_octet_stream()
+                .to_string();
+            // Carry `cwd` into the preview URL so an image admitted only by the
+            // cwd-widened allowlist (a fresh project's task/skill subtree, before
+            // a conversation roots it) is also servable by `serve_preview_file`,
+            // which otherwise consults only the base allowlist and would 404 it.
+            let url = match query.cwd.as_deref() {
+                Some(cwd) => format!(
+                    "{}?cwd={}",
+                    preview_url_for_path(&path),
+                    percent_encode_query_value(cwd)
+                ),
+                None => preview_url_for_path(&path),
+            };
+            return Ok(Json(ReadFileResponse::Image { mime_type, url }));
+        }
+        FileViewerKind::Opaque => {
+            return Err(AppError::BadRequest(
+                "File appears to be binary or has invalid encoding".to_string(),
+            ));
+        }
+        FileViewerKind::Text { category } => category,
+    };
 
     let content =
         fs::read(&path).map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
@@ -4136,7 +4102,7 @@ async fn read_file(
     Ok(Json(ReadFileResponse::Text {
         content: text,
         encoding: "utf-8".to_string(),
-        file_type,
+        category,
     }))
 }
 
@@ -4313,7 +4279,7 @@ pub(crate) fn search_files_in_root(
             .to_string_lossy()
             .to_string();
 
-        let (_, is_text_file) = detect_file_type(abs_path);
+        let viewer = FileViewerKind::for_path(abs_path);
 
         if q.is_empty() {
             // No query: return all files up to limit
@@ -4321,7 +4287,7 @@ pub(crate) fn search_files_in_root(
                 0i32,
                 FileSearchEntry {
                     path: rel_path,
-                    is_text_file,
+                    viewer,
                 },
             ));
             if items.len() >= limit {
@@ -4336,7 +4302,7 @@ pub(crate) fn search_files_in_root(
                     s,
                     FileSearchEntry {
                         path: rel_path,
-                        is_text_file,
+                        viewer,
                     },
                 ));
             }
@@ -4464,8 +4430,12 @@ async fn search_conversation_code(
         }
 
         let abs_path = entry.path();
-        let (_, extension_says_text) = detect_file_type(abs_path);
-        if !extension_says_text {
+        // Only grep files the viewer would open as text; images and binaries
+        // have no greppable text content.
+        if !matches!(
+            FileViewerKind::for_path(abs_path),
+            FileViewerKind::Text { .. }
+        ) {
             continue;
         }
 
@@ -7820,13 +7790,8 @@ mod file_read_tests {
         .expect("image response");
 
         match response {
-            ReadFileResponse::Image {
-                mime_type,
-                url,
-                file_type,
-            } => {
+            ReadFileResponse::Image { mime_type, url } => {
                 assert_eq!(mime_type, "image/png");
-                assert_eq!(file_type, "image");
                 // URL reflects the canonicalized (symlink-resolved) path.
                 assert_eq!(
                     url,
@@ -7860,11 +7825,11 @@ mod file_read_tests {
             ReadFileResponse::Text {
                 content,
                 encoding,
-                file_type,
+                category,
             } => {
                 assert_eq!(content, "hello\n");
                 assert_eq!(encoding, "utf-8");
-                assert_eq!(file_type, "text");
+                assert_eq!(category, crate::api::TextCategory::Plain);
             }
             other @ ReadFileResponse::Image { .. } => {
                 panic!("expected text response, got {other:?}")

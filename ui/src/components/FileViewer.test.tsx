@@ -31,7 +31,6 @@ describe('FileViewer typed file responses', () => {
       kind: 'image',
       mime_type: 'image/png',
       url: '/preview/tmp/project/screenshot.png',
-      file_type: 'image',
     }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
 
     renderReader('screenshot.png');
@@ -47,7 +46,7 @@ describe('FileViewer typed file responses', () => {
       kind: 'text',
       content: 'hello text file',
       encoding: 'utf-8',
-      file_type: 'text',
+      category: 'plain',
     }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
 
     renderReader('notes.txt');
@@ -63,7 +62,7 @@ describe('FileViewer typed file responses', () => {
       kind: 'text',
       content: `${'line\n'.repeat(2_001)}tail`,
       encoding: 'utf-8',
-      file_type: 'text',
+      category: 'plain',
     }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
 
     renderReader('big.txt');

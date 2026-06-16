@@ -45,7 +45,7 @@ Resolution:
 </file>
 ```
 
-File lookup uses `working_dir` from the conversation record. Paths may be absolute or relative. Symlinks are followed. Binary files (detected by `is_text_file` flag in the existing file API) are rejected with a user-visible error.
+File lookup uses `working_dir` from the conversation record. Paths may be absolute or relative. Symlinks are followed. Non-viewable files (those the file API classifies as `viewer.kind == "opaque"`) are rejected with a user-visible error.
 
 ### REQ-IR-002 and REQ-IR-003 Implementation: Skill Reference (`/skill-name`)
 
@@ -127,7 +127,7 @@ Reuse the existing `GET /api/files/list?path=<dir>` for directory-level browsing
 ```
 GET /api/conversations/:id/files/search?q=<query>&limit=<n>                  (conversation-scoped)
 GET /api/files/search?cwd=<dir>&q=<query>&limit=<n>&mode=<m>&base_branch=<b> (directory-scoped)
-Response: { items: [{ path, is_text_file }] }
+Response: { items: [{ path, viewer }] }   // viewer: the shared FileViewerKind verdict
 ```
 A `WorkingDir` root walks the directory with the `ignore` crate (gitignore-aware);
 a `GitTree` root lists the ref's committed paths via `git ls-tree`. Both cap at
