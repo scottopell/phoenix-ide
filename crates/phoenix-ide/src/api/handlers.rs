@@ -32,14 +32,13 @@ use super::types::{
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
 use crate::db::{
-    ConvMode, Conversation, ConversationUsage, ImageData, Message, MessageContent, MessageType,
-    NotificationSettings,
+    ConvMode, Conversation, ConversationUsage, ImageData, Message, NotificationSettings,
 };
 use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
     GitOpError, PhoenixIgnoreStrategy,
 };
-use crate::llm::{ContentBlock, GatewayStatus};
+use crate::llm::GatewayStatus;
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
 
@@ -5106,7 +5105,7 @@ impl IntoResponse for AppError {
 mod hard_delete_cascade_tests {
     use super::*;
     use crate::chain_qa::ChainQa;
-    use crate::db::Database;
+    use crate::db::{Database, MessageContent};
     use crate::llm::ModelRegistry;
     use crate::platform::PlatformCapability;
     use crate::runtime::RuntimeManager;
