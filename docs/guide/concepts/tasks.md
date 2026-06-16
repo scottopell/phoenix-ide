@@ -41,11 +41,9 @@ the exact branch name depends on the plan's form:
 ## What you'll see
 
 A collapsible **Tasks** panel in the conversation lists the repo's tasks, grouped
-active vs. closed (`No tasks found` when empty); the one this conversation is
-working on carries a `current` badge. Click a task to open its viewer — a
-**Details** block (`Status`, `Priority`, `Slug`, `File`) above the content —
-where **Start working** spins up a conversation on it and **Go to conversation →**
-jumps to the one already on it.
+active vs. closed and flagging the one this conversation is working on. Open a
+task to read its metadata and body, start a conversation on it, or jump to the
+one already working it.
 
 > **Remember:** the task file is the contract. Approving it is what turns
 > read-only Explore into write-enabled Work — no approved task, no writes.

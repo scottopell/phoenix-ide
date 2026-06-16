@@ -39,11 +39,9 @@ conversation — or starting a fresh one and re-supplying context — just to as
 
 ## What you'll see
 
-A chain is nested under its name in the sidebar. Its **chain page** holds the
-Q&A: type into `Ask the chain a question…` and press **Ask** (`Sending…` while it
-works); the answer streams under an `A:` beside your `Q:`. A persisted answer
-whose chain has since grown carries a tag like *"answered when chain had 3
-conversations (now 5)"*. Name the chain inline via `Name this chain…`.
+A chain is nested under its name in the sidebar. Its **chain page** is where you
+ask recall questions and read past answers — each answer streamed live as it's
+written, and tagged with its age when the chain has grown since you asked.
 
 > **Remember:** the chain Q&A agent is read-only and chain-scoped — it recalls
 > across the whole run but cannot change anything or see beyond the chain.

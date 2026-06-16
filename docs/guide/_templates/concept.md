@@ -20,12 +20,17 @@ SHAPE (see ../AUTHORING.md, Principle 3):
   comparison table. Don't open with abstract "why it exists" prose.
 - Keep it tight — concepts target ~45 lines of content. Procedures, UI label
   dumps, and per-control walkthroughs belong in the How-to, not here.
+- Name surfaces, not controls. "What you'll see" points at WHERE a thing appears
+  (a badge, a panel, a page); it does NOT quote button text, placeholders, or
+  states (`Sending…`, `Ask`). Those are chrome — route them to the How-to and
+  Reference. Showing a data shape that IS the model (a filename grammar) is fine.
 - Close with one "Remember" callout: the single structural guarantee or
   invariant to retain after closing the page.
 
 REQUIRED PRE-FLIGHT (see ../AUTHORING.md):
-Ground any UI label you mention (badge text, tooltips, banners) in its rendering
-component under ui/src/, verbatim. Run the pre-flight checklist before committing.
+A concept names surfaces, not controls — so it should quote few or no UI strings.
+If you catch yourself quoting a button/placeholder/state, that content belongs in
+a how-to or reference card. Run the pre-flight checklist before committing.
 -->
 
 One sentence that defines the concept, followed by the visual that frames it:
@@ -41,8 +46,9 @@ keep prose to what the table can't carry.
 
 ## What you'll see
 
-How the concept surfaces in the UI — the badge, panel, or transcript item that
-makes it concrete. One or two lines; defer the full control set to the How-to.
+Name the *surface* where the concept becomes visible — a badge, a panel, a page —
+so the reader recognizes it. One or two lines. Do NOT quote control labels,
+placeholders, or states; those are chrome and live in the How-to and Reference.
 
 > **Remember:** <the one guarantee or invariant the reader should keep.>
 

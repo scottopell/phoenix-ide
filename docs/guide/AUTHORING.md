@@ -114,6 +114,13 @@ the others rather than restating them.
 - **Hold a ~45-line budget.** Procedures, verbatim UI-label dumps, and
   per-control walkthroughs belong in the How-to. If a concept page is teaching
   *steps*, it has drifted into the wrong layer.
+- **Name surfaces, not controls.** A concept may point at *where* it appears (a
+  badge, a panel, the chain page) and show the data shapes that *are* the model
+  (a filename grammar, a branch-name pattern). It must **not** quote UI control
+  text, placeholders, or transient states (`Sending…`, `Ask`, `No tasks found`) —
+  those are chrome, and they live in the How-to (named in flow) and Reference
+  cards (exhaustive lookup). Verbatim grounding (Principle 1) governs *those*
+  layers; if a concept needs to quote a button, it's reaching into the wrong one.
 - **Close with one "Remember" callout** — the single structural guarantee or
   invariant to retain after closing the page.
 
