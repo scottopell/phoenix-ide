@@ -2599,6 +2599,35 @@ def _changed_paths_vs_base():
     return paths
 
 
+def _on_integration_base():
+    """True when the checked-out branch IS the integration base branch
+    (origin/HEAD's target, else main/master, else PHOENIX_CHECK_BASE).
+
+    Incremental gating only makes sense on a feature branch measured against
+    its base; on the base branch the merge-base diff is degenerate. A detached
+    HEAD returns False — checking out a base commit without the branch ref is
+    not "working on main", and we'd rather gate than over-run there.
+    """
+    def _git(args):
+        return subprocess.run(
+            ["git", *args], cwd=ROOT, capture_output=True, text=True,
+        )
+
+    cur = _git(["symbolic-ref", "--quiet", "--short", "HEAD"])
+    if cur.returncode != 0 or not cur.stdout.strip():
+        return False
+    current = cur.stdout.strip()
+
+    base_names = {"main", "master"}
+    head_ref = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+    if head_ref.returncode == 0 and head_ref.stdout.strip():
+        base_names.add(head_ref.stdout.strip().removeprefix("refs/remotes/origin/"))
+    explicit = os.environ.get("PHOENIX_CHECK_BASE")
+    if explicit:
+        base_names.add(explicit.removeprefix("origin/"))
+    return current in base_names
+
+
 def _gate_lanes():
     """Decide which lanes to run for this check invocation.
 
@@ -2637,6 +2666,13 @@ def _gate_lanes():
                 file=sys.stderr,
             )
             sys.exit(1)
+    elif _on_integration_base():
+        # HEAD is the integration base branch itself. Gating compares HEAD
+        # against that base, so the diff is degenerate (empty, or reversed
+        # once unpushed commits land) and lane selection is meaningless. CI
+        # forbids this path entirely (the CI block above); locally we just
+        # run every lane. Mirrors the SELF short-circuit below.
+        return all_lanes, {}
     else:
         paths = _changed_paths_vs_base()
         if paths is None:
