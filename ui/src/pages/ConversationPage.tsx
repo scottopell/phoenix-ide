@@ -1242,16 +1242,6 @@ function ConversationPageContent() {
           </button>
         </div>
       )}
-      {convStateForChildren.type === 'terminal' && (
-        <div className="terminal-banner">
-          <button
-            className="btn-primary"
-            onClick={() => navigate('/new')}
-          >
-            Start new conversation
-          </button>
-        </div>
-      )}
       {convStateForChildren.type === 'awaiting_recovery' ? (
         <>
         {credentialStatus && (
