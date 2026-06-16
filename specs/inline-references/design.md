@@ -45,7 +45,7 @@ Resolution:
 </file>
 ```
 
-File lookup uses `working_dir` from the conversation record. Paths may be absolute or relative. Symlinks are followed. Non-viewable files (those the file API classifies as `viewer.kind == "opaque"`) are rejected with a user-visible error.
+File lookup uses `working_dir` from the conversation record. Paths may be absolute or relative. Symlinks are followed. Expansion inlines file *contents as text*, so the gate is content-based: files whose bytes contain a NUL or are not valid UTF-8 are rejected with a user-visible error. This is a distinct axis from viewer-openability — an image is viewer-openable but not includable as text, and a text-content file with a binary-looking extension is includable. The `@` autocomplete shows an extension-based "binary" hint (everything but `viewer.kind == "text"`) as an up-front prediction; the content check at expansion time is the authority.
 
 ### REQ-IR-002 and REQ-IR-003 Implementation: Skill Reference (`/skill-name`)
 

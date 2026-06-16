@@ -37,8 +37,9 @@ interface FileItem {
   isDirectory: boolean;
   size?: number;
   modifiedTime?: number;
-  type: 'folder' | 'markdown' | 'code' | 'config' | 'text' | 'image' | 'data' | 'unknown';
-  isTextFile: boolean; // Can be opened in prose reader
+  // The server's single openability verdict (see FileViewerKind). Directories
+  // report `opaque`; `isDirectory` carries the expandable affordance.
+  viewer: FileViewerKind; // { kind: 'text', category } | { kind: 'image' } | { kind: 'opaque' }
 }
 ```
 
@@ -53,9 +54,7 @@ Response: {
     isDirectory: boolean,
     size?: number,
     modifiedTime?: number,
-    type: 'folder' | 'markdown' | 'code' | 'config' | 'text' | 'image' | 'data' | 'unknown',
-    isTextFile: boolean,  // Can be opened in prose reader
-    mimeType?: string     // Optional, for additional context
+    viewer: FileViewerKind  // { kind: 'text', category } | { kind: 'image' } | { kind: 'opaque' }
   }]
 }
 ```
@@ -565,15 +564,15 @@ Response: Array of file/directory metadata with type detection
 ```
 GET /api/files/read?path={filePath}
 ```
-Response: `{ content: string, encoding: string }`
+Response is a `kind`-tagged union dispatched on the shared `FileViewerKind`:
+- `{ kind: 'text', content: string, encoding: string, category: TextCategory }`
+- `{ kind: 'image', mime_type: string, url: string }`
 
 **Text encoding detection happens HERE:**
 - Only when actually reading the file
 - Can check magic bytes, BOMs, etc.
 - Return error if binary/invalid encoding
 - Already limited to single file, so no performance concern
-
-Response: `{ content: string }`
 
 If these endpoints don't exist, they need to be added as part of the implementation.
 

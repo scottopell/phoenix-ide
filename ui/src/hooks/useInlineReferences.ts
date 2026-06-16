@@ -177,7 +177,12 @@ export function useInlineReferences({
         const items: AutocompleteItem[] = result.items.map((entry) => ({
           id: entry.path,
           label: entry.path,
-          ...(entry.viewer.kind === 'opaque' ? { subtitle: 'binary' } : {}),
+          // @-mention expansion includes file *contents as text*, so the hint
+          // is the includable-as-text axis (only `text`), not viewer-openability
+          // (which also covers images). Images can't be inlined into the prompt,
+          // so they keep the binary hint. Final gate is content-sniffing at
+          // expansion time; this extension-based verdict is the up-front hint.
+          ...(entry.viewer.kind === 'text' ? {} : { subtitle: 'binary' }),
           metadata: entry,
         }));
         setFileAcItems(items);

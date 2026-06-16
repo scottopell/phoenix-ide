@@ -26,7 +26,12 @@ export function createFileSource(
       if (!query.trim()) return [];
       try {
         const result = await api.searchConversationFiles(convId, query, 50, signal);
-        return result.items.map(entry => toItem(entry.path, rootDir));
+        // Quick-open is a viewer entry point: offer only files the viewer can
+        // open, the same verdict the sidebar dispatches on. Opaque files would
+        // route into the `/api/files/read` 400 path.
+        return result.items
+          .filter(entry => entry.viewer.kind !== 'opaque')
+          .map(entry => toItem(entry.path, rootDir));
       } catch (err) {
         if (err instanceof Error && err.name === 'AbortError') return [];
         return [];

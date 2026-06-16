@@ -99,7 +99,12 @@ describe('CommandPalette file root', () => {
       worktree_path: '/repo/.phoenix/worktrees/conv-1',
     });
     mocks.searchConversationFiles.mockResolvedValue({
-      items: [{ path: 'src/main.rs', viewer: { kind: 'text', category: 'code' } }],
+      items: [
+        { path: 'src/main.rs', viewer: { kind: 'text', category: 'code' } },
+        // Opaque (binary) — quick-open is a viewer entry point and must not
+        // offer it, else selecting routes into the /api/files/read 400 path.
+        { path: 'assets/blob.zip', viewer: { kind: 'opaque' } },
+      ],
     });
     mocks.searchConversationCode.mockResolvedValue({ items: [] });
 
@@ -116,7 +121,9 @@ describe('CommandPalette file root', () => {
       );
     });
 
-    fireEvent.click(await screen.findByText('main.rs'));
+    const mainRow = await screen.findByText('main.rs');
+    expect(screen.queryByText('blob.zip')).not.toBeInTheDocument();
+    fireEvent.click(mainRow);
 
     expect(mocks.openFile).toHaveBeenCalledWith(
       '/repo/.phoenix/worktrees/conv-1/src/main.rs',
