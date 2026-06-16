@@ -32,10 +32,6 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
 
-// ============================================================
-// Wire types
-// ============================================================
-
 /// Aggregated token counts, turn count, and priced cost for one scope (a day, a
 /// model, a provider, a project, a conversation, or a rolling window).
 #[derive(Debug, Clone, Default, Serialize, TS)]
@@ -181,10 +177,6 @@ pub struct ConversationUsageDetail {
     pub turns: Vec<TurnPoint>,
 }
 
-// ============================================================
-// Helpers
-// ============================================================
-
 /// Resolve a model id to a provider display name, or `"Unknown"` if the id is
 /// not in the registry.
 fn provider_display(model_id: &str) -> String {
@@ -250,10 +242,6 @@ struct ConvAcc {
     started_at: String,
     totals: Totals,
 }
-
-// ============================================================
-// Handlers
-// ============================================================
 
 /// `GET /api/usage` — assemble the aggregate usage dashboard.
 #[allow(clippy::too_many_lines)] // one linear assembly of the dashboard payload

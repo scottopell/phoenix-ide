@@ -20,8 +20,6 @@ import type { ConversationUsageDetail } from '../generated/ConversationUsageDeta
 import type { Totals } from '../generated/Totals';
 import './UsagePage.css';
 
-// --- formatters ---------------------------------------------------------
-
 function fmtTokens(n: number): string {
   if (n < 1000) return `${Math.round(n)}`;
   if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
@@ -66,8 +64,6 @@ const TOKEN_SERIES = [
 
 const AXIS = { stroke: 'var(--text-muted)', fontSize: 11 };
 const GRID = 'var(--border-color)';
-
-// --- small pieces -------------------------------------------------------
 
 function KpiCard({ label, totals }: { label: string; totals: Totals }) {
   const cost = totals.has_unpriced ? `${fmtUsd(totals.cost_usd)}+` : fmtUsd(totals.cost_usd);
@@ -119,8 +115,6 @@ function ChartCard({ title, hint, children }: { title: string; hint?: string; ch
     </section>
   );
 }
-
-// --- conversation drill -------------------------------------------------
 
 function ConversationDrill({ id, label, onClose }: { id: string; label: string; onClose: () => void }) {
   const [detail, setDetail] = useState<ConversationUsageDetail | null>(null);
@@ -215,8 +209,6 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
     </div>
   );
 }
-
-// --- page ---------------------------------------------------------------
 
 export function UsagePage() {
   const navigate = useNavigate();
