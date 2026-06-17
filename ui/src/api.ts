@@ -238,6 +238,27 @@ export type PrFeedbackCoverageHealth =
   | { kind: 'auth_required'; surfaces: PrFeedbackCoverageSurface[] }
   | { kind: 'incomplete'; surfaces: PrFeedbackCoverageSurface[] };
 
+export type WorkChangeNeedsReviewReason =
+  | 'uncommitted_changes'
+  | 'branch_not_pushed'
+  | 'local_ahead_of_remote'
+  | 'remote_diverged'
+  | 'non_github_remote'
+  | 'unknown_remote'
+  | 'unknown';
+
+export type WorkChangeSummary =
+  | { kind: 'clean' }
+  | {
+      kind: 'dirty_pr_ready';
+      create_pr_url: string;
+      branch_name: string;
+      base_branch: string;
+    }
+  | { kind: 'dirty_needs_review'; reason: WorkChangeNeedsReviewReason }
+  | { kind: 'loading' }
+  | { kind: 'unavailable'; reason: string };
+
 export interface PrStatusResponse {
   found: boolean;
   pr?: PrIdentity;
@@ -257,6 +278,7 @@ export interface PrStatusResponse {
   display_state?: PrDisplayState;
   feedback_freshness?: PrFeedbackFreshness;
   feedback_coverage?: PrFeedbackCoverageHealth;
+  work_change: WorkChangeSummary;
 }
 
 export interface Project {

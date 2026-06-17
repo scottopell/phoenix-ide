@@ -970,6 +970,36 @@ pub enum PrFeedbackCoverageHealth {
     },
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkChangeSummary {
+    Clean,
+    DirtyPrReady {
+        create_pr_url: String,
+        branch_name: String,
+        base_branch: String,
+    },
+    DirtyNeedsReview {
+        reason: WorkChangeNeedsReviewReason,
+    },
+    Loading,
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkChangeNeedsReviewReason {
+    UncommittedChanges,
+    BranchNotPushed,
+    LocalAheadOfRemote,
+    RemoteDiverged,
+    NonGithubRemote,
+    UnknownRemote,
+    Unknown,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PrStatusResponse {
     pub found: bool,
@@ -1009,6 +1039,10 @@ pub struct PrStatusResponse {
     /// content change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feedback_coverage: Option<PrFeedbackCoverageHealth>,
+    /// Coarse state of branch/worktree changes, used by the `WorkActions` bar to
+    /// avoid terminal cleanup affordances for dirty no-PR work. Always present:
+    /// unavailable/loading are explicit states, not omitted fields.
+    pub work_change: WorkChangeSummary,
 }
 
 impl PrStatusResponse {
@@ -1039,6 +1073,7 @@ impl PrStatusResponse {
             display_state: None,
             feedback_freshness: None,
             feedback_coverage: None,
+            work_change: WorkChangeSummary::Loading,
         }
     }
 

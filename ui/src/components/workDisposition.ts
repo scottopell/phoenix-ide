@@ -17,7 +17,7 @@ import type { PrStatusResponse } from '../api';
  */
 
 /** The single glowing slot across the whole bar (REQ-WAB-003). */
-export type BarPrimary = 'none' | 'resolve' | 'clean_up' | 'abandon';
+export type BarPrimary = 'none' | 'review' | 'resolve' | 'clean_up' | 'abandon';
 
 /**
  * The push-forward verb in the RESOLVE zone. External-link variants carry the
@@ -27,7 +27,8 @@ export type BarPrimary = 'none' | 'resolve' | 'clean_up' | 'abandon';
 export type ResolveVerb =
   | { kind: 'address_feedback' }
   | { kind: 'merge_pr'; url: string; number: number }
-  | { kind: 'open_pr'; url: string; number: number };
+  | { kind: 'open_pr'; url: string; number: number }
+  | { kind: 'create_pr'; url: string; branchName: string };
 
 /** At most one inline note is shown per render. */
 export type DispositionNote =
@@ -35,6 +36,7 @@ export type DispositionNote =
   | { kind: 'checking'; text: string }
   | { kind: 'pr_closed'; text: string }
   | { kind: 'pr_open_stuck'; text: string }
+  | { kind: 'no_pr_dirty'; text: string }
   | { kind: 'gh_unavailable'; text: string };
 
 export interface WorkDisposition {
@@ -71,6 +73,8 @@ export interface WorkDispositionInput {
   prStatus: PrStatusResponse | null;
   /** PR status still loading (no usable prStatus yet). */
   prLoading: boolean;
+  /** Worktree/branch change state, structurally supplied by the backend. */
+  workChange: PrStatusResponse['work_change'] | null;
   /** onSendMessage available — false for stuck bars, gates Address feedback. */
   canSendMessage: boolean;
 }
@@ -101,7 +105,7 @@ const ELIGIBLE_MODES = new Set(['Work', 'Branch']);
  * the REQ-WAB-004 table order exactly.
  */
 export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposition {
-  const { convModeLabel, phaseType, continuedInConvId, prStatus, prLoading, canSendMessage } = input;
+  const { convModeLabel, phaseType, continuedInConvId, prStatus, prLoading, workChange, canSendMessage } = input;
 
   // VISIBILITY (REQ-WAB-001): Work/Branch mode AND a disposable phase.
   if (!ELIGIBLE_MODES.has(convModeLabel ?? '') || !ELIGIBLE_PHASES.has(phaseType)) {
@@ -250,8 +254,48 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
     });
   }
 
-  // Row 8. idle, no PR found (refresh ok / no PR) → Clean up.
-  return finish('clean_up', { showCleanUp: true });
+  // Row 8. idle, no PR found → split by work-change state.
+  const noPrWorkChange = workChange ?? { kind: 'loading' as const };
+  if (noPrWorkChange.kind === 'clean') {
+    return finish('clean_up', { showCleanUp: true });
+  }
+  if (noPrWorkChange.kind === 'dirty_pr_ready') {
+    return resolveVerb(
+      {
+        kind: 'create_pr',
+        url: noPrWorkChange.create_pr_url,
+        branchName: noPrWorkChange.branch_name,
+      },
+      null,
+      { kind: 'no_pr_dirty', text: 'Changes found but no PR. Open a PR on GitHub before cleanup.' },
+    );
+  }
+  if (noPrWorkChange.kind === 'dirty_needs_review') {
+    return reviewPrimary(noPrDirtyNote(noPrWorkChange.reason));
+  }
+  if (noPrWorkChange.kind === 'unavailable') {
+    return reviewPrimary('Could not inspect work changes. Review the diff before cleanup.');
+  }
+  return reviewPrimary('Checking work changes. Review the diff before cleanup.');
+}
+
+function noPrDirtyNote(reason: Extract<PrStatusResponse['work_change'], { kind: 'dirty_needs_review' }>['reason']): string {
+  switch (reason) {
+    case 'uncommitted_changes':
+      return 'Uncommitted changes found. Review, commit, and push before opening a PR.';
+    case 'branch_not_pushed':
+      return 'Branch is not pushed. Review the diff, then push and open a PR.';
+    case 'local_ahead_of_remote':
+      return 'Local commits are not pushed. Review the diff, then push and open a PR.';
+    case 'remote_diverged':
+      return 'Branch diverged from origin. Review the diff and reconcile before opening a PR.';
+    case 'non_github_remote':
+      return 'Changes found on a non-GitHub remote. Review the diff before cleanup.';
+    case 'unknown_remote':
+      return 'Remote state is unknown. Review the diff before cleanup.';
+    case 'unknown':
+      return 'Changes found but no PR. Review the diff before cleanup.';
+  }
 }
 
 /**
@@ -259,7 +303,11 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
  * `secondary` is the optional non-glowing RESOLVE link-out shown beside the
  * primary (only meaningful when `verb` is `address_feedback`).
  */
-function resolveVerb(verb: ResolveVerb, secondary: ResolveVerb | null = null): WorkDisposition {
+function resolveVerb(
+  verb: ResolveVerb,
+  secondary: ResolveVerb | null = null,
+  note: DispositionNote | null = null,
+): WorkDisposition {
   return {
     visible: true,
     primary: 'resolve',
@@ -267,7 +315,19 @@ function resolveVerb(verb: ResolveVerb, secondary: ResolveVerb | null = null): W
     secondaryResolve: secondary,
     showCleanUp: false,
     showAbandon: true,
-    note: null,
+    note,
+  };
+}
+
+function reviewPrimary(text: string): WorkDisposition {
+  return {
+    visible: true,
+    primary: 'review',
+    resolve: null,
+    secondaryResolve: null,
+    showCleanUp: false,
+    showAbandon: true,
+    note: { kind: 'no_pr_dirty', text },
   };
 }
 

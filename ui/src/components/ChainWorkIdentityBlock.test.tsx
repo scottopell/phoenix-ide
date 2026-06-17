@@ -78,6 +78,7 @@ describe('ChainWorkIdentityBlock', () => {
       display_state: 'open',
       check_state: 'passing',
       feedback_freshness: { state: 'new', count: 3 },
+      work_change: { kind: 'clean' },
       refresh: { state: 'fresh', stale: false, last_attempted_at: '2026-04-29T12:00:00Z' },
     };
     setPrState({ status: 'ready', prStatus });
@@ -98,6 +99,7 @@ describe('ChainWorkIdentityBlock', () => {
         stale: false,
         last_attempted_at: '2026-04-29T12:00:00Z',
       },
+      work_change: { kind: 'unavailable', reason: 'gh_missing' },
     };
     setPrState({ status: 'ready', prStatus });
 

@@ -53,6 +53,10 @@ vi.mock('../api', () => ({
   },
 }));
 
+function cleanWorkChange(): PrStatusResponse['work_change'] {
+  return { kind: 'clean' };
+}
+
 function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }) {
   const status: PrStatusResponse = {
     found: false,
@@ -62,6 +66,7 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }) 
       last_refreshed_at: '2026-01-01T00:00:00Z',
       stale: false,
     },
+    work_change: cleanWorkChange(),
     ...prStatus,
   };
   return {
@@ -370,7 +375,7 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     expect(link.textContent).toMatch(/Open PR #89 ↗/);
   });
 
-  it('no PR found (refresh ok) → Clean up present and primary', () => {
+  it('no PR found + clean work → Clean up present and primary', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-none"
@@ -386,9 +391,55 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     expect(clean).toHaveClass('work-actions-btn--primary');
     expect(primaryCount()).toBe(1);
   });
-});
+  it('no PR + dirty PR-ready work → Create PR external link is primary and Clean up hidden', () => {
+    const createUrl = 'https://github.com/o/r/compare/main...task-1?expand=1';
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-none"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({
+          found: false,
+          work_change: {
+            kind: 'dirty_pr_ready',
+            create_pr_url: createUrl,
+            branch_name: 'task-1',
+            base_branch: 'main',
+          },
+        })}
+      />,
+    );
 
-describe('WorkControlBar — gh unavailable cleanup', () => {
+    const link = screen.getByTestId('create-pr-link') as HTMLAnchorElement;
+    expect(link).toHaveClass('work-actions-btn--primary');
+    expect(link).toHaveAttribute('href', createUrl);
+    expect(link.textContent).toMatch(/Create PR on GitHub ↗/);
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByTestId('abandon-button')).toBeInTheDocument();
+    expect(primaryCount()).toBe(1);
+  });
+
+  it('no PR + dirty needs review → View Diff is primary and Clean up hidden', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-none"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({
+          found: false,
+          work_change: { kind: 'dirty_needs_review', reason: 'uncommitted_changes' },
+        })}
+      />,
+    );
+
+    const viewDiff = screen.getByTestId('view-diff-button');
+    expect(viewDiff).toHaveClass('work-actions-btn--primary');
+    expect(screen.queryByTestId('clean-up-button')).not.toBeInTheDocument();
+    expect(screen.getByText(/Uncommitted changes found/i)).toBeInTheDocument();
+    expect(primaryCount()).toBe(1);
+  });
   it('no PR + refresh unavailable → Clean up present; a SINGLE click calls api.markMerged; warning note shown', () => {
     renderWithProviders(
       <WorkControlBar

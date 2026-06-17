@@ -5,7 +5,8 @@
 use super::handlers::AppError;
 use super::types::{
     ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
-    PrAutoFixContextResponse, PrStatusResponse, PrUnavailableReason,
+    PrAutoFixContextResponse, PrStatusResponse, PrUnavailableReason, WorkChangeNeedsReviewReason,
+    WorkChangeSummary,
 };
 use super::AppState;
 use crate::db::ConvMode;
@@ -15,6 +16,7 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
+use std::fmt::Write as _;
 use std::path::{Path as FsPath, PathBuf};
 
 pub(crate) async fn list_git_branches(
@@ -329,6 +331,183 @@ fn ls_remote_cached(cwd: &std::path::Path) -> Result<Vec<String>, AppError> {
     Ok(refs)
 }
 
+fn percent_encode_url_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+fn github_owner_repo_from_remote(remote: &str) -> Option<(String, String)> {
+    let remote = remote.trim();
+    let path = if let Some(rest) = remote.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = remote.strip_prefix("ssh://git@github.com/") {
+        rest
+    } else if let Some(rest) = remote.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = remote.strip_prefix("http://github.com/") {
+        rest
+    } else {
+        return None;
+    };
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let owner = parts.next()?.to_string();
+    let repo = parts.next()?.to_string();
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some((owner, repo))
+}
+
+pub(crate) fn summarize_work_change(
+    worktree: &FsPath,
+    branch_name: &str,
+    base_branch: &str,
+) -> WorkChangeSummary {
+    let has_uncommitted = match run_git(
+        worktree,
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
+    ) {
+        Ok(status) => !status.trim().is_empty(),
+        Err(error) => return WorkChangeSummary::Unavailable { reason: error },
+    };
+    if has_uncommitted {
+        return WorkChangeSummary::DirtyNeedsReview {
+            reason: WorkChangeNeedsReviewReason::UncommittedChanges,
+        };
+    }
+
+    let comparator = crate::git_ops::effective_base_ref(worktree, base_branch);
+    let work_commit_count = run_git(
+        worktree,
+        &["rev-list", "--count", &format!("{comparator}..HEAD")],
+    )
+    .ok()
+    .and_then(|s| s.trim().parse::<u32>().ok())
+    .unwrap_or(0);
+    if work_commit_count == 0 {
+        return WorkChangeSummary::Clean;
+    }
+
+    let remote_ref = format!("origin/{branch_name}");
+    if run_git(worktree, &["rev-parse", "--verify", &remote_ref]).is_err() {
+        return WorkChangeSummary::DirtyNeedsReview {
+            reason: WorkChangeNeedsReviewReason::BranchNotPushed,
+        };
+    }
+
+    let counts = run_git(
+        worktree,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{branch_name}...{remote_ref}"),
+        ],
+    )
+    .ok()
+    .and_then(|s| {
+        let mut parts = s.split_whitespace();
+        let ahead = parts.next()?.parse::<u32>().ok()?;
+        let behind = parts.next()?.parse::<u32>().ok()?;
+        Some((ahead, behind))
+    });
+    let Some((ahead, behind)) = counts else {
+        return WorkChangeSummary::DirtyNeedsReview {
+            reason: WorkChangeNeedsReviewReason::Unknown,
+        };
+    };
+    if ahead > 0 && behind > 0 {
+        return WorkChangeSummary::DirtyNeedsReview {
+            reason: WorkChangeNeedsReviewReason::RemoteDiverged,
+        };
+    }
+    if ahead > 0 {
+        return WorkChangeSummary::DirtyNeedsReview {
+            reason: WorkChangeNeedsReviewReason::LocalAheadOfRemote,
+        };
+    }
+    if behind > 0 {
+        return WorkChangeSummary::DirtyNeedsReview {
+            reason: WorkChangeNeedsReviewReason::RemoteDiverged,
+        };
+    }
+
+    let remote_url = match run_git(worktree, &["config", "--get", "remote.origin.url"]) {
+        Ok(url) if !url.trim().is_empty() => url,
+        Ok(_) | Err(_) => {
+            return WorkChangeSummary::DirtyNeedsReview {
+                reason: WorkChangeNeedsReviewReason::UnknownRemote,
+            };
+        }
+    };
+    let Some((owner, repo)) = github_owner_repo_from_remote(&remote_url) else {
+        return WorkChangeSummary::DirtyNeedsReview {
+            reason: WorkChangeNeedsReviewReason::NonGithubRemote,
+        };
+    };
+
+    WorkChangeSummary::DirtyPrReady {
+        create_pr_url: format!(
+            "https://github.com/{}/{}/compare/{}...{}?expand=1",
+            percent_encode_url_component(&owner),
+            percent_encode_url_component(&repo),
+            percent_encode_url_component(base_branch),
+            percent_encode_url_component(branch_name),
+        ),
+        branch_name: branch_name.to_string(),
+        base_branch: base_branch.to_string(),
+    }
+}
+fn stale_primary_response_with_work_change(
+    primary: &crate::db::WorkScopePrAssociation,
+    refresh: crate::api::pr_monitoring::PrStatusRefresh,
+) -> PrStatusResponse {
+    let mut response = crate::api::pr_monitoring::stale_primary_response_with_refresh_state(
+        primary,
+        refresh.response.refresh.state,
+        refresh.response.refresh.reason.clone(),
+        refresh.response.refresh.last_attempted_at,
+    );
+    response.work_change = refresh.response.work_change;
+    response
+}
+
+async fn pr_status_response_for_missing_worktree(
+    state: &AppState,
+    work_scope: &crate::work_scope::WorkScope,
+) -> Result<PrStatusResponse, AppError> {
+    let attempted_at = chrono::Utc::now().to_rfc3339();
+    let mut response = match state
+        .runtime
+        .db()
+        .primary_work_scope_pr_association(work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        Some(pr) => crate::api::pr_monitoring::stale_response(
+            pr,
+            PrUnavailableReason::NotGitRepo,
+            attempted_at,
+        ),
+        None => PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
+    };
+    response.work_change = WorkChangeSummary::Unavailable {
+        reason: "worktree path is not a directory".to_string(),
+    };
+    Ok(response)
+}
+
 pub(crate) async fn get_conversation_pr_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -340,18 +519,21 @@ pub(crate) async fn get_conversation_pr_status(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let (branch_name, cwd, work_scope) = match &conv.conv_mode {
+    let (branch_name, base_branch, cwd, work_scope) = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
+            base_branch,
             worktree_path,
             ..
         }
         | ConvMode::Branch {
             branch_name,
+            base_branch,
             worktree_path,
             ..
         } => (
             branch_name.to_string(),
+            base_branch.to_string(),
             worktree_path.to_string(),
             crate::work_scope::WorkScope::resolve(
                 &id,
@@ -368,29 +550,28 @@ pub(crate) async fn get_conversation_pr_status(
     };
 
     let cwd = PathBuf::from(cwd);
-    let cwd_for_status = cwd.clone();
     if !cwd.is_dir() {
-        let attempted_at = chrono::Utc::now().to_rfc3339();
-        let response = match state
-            .runtime
-            .db()
-            .primary_work_scope_pr_association(&work_scope)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?
-        {
-            Some(pr) => crate::api::pr_monitoring::stale_response(
-                pr,
-                PrUnavailableReason::NotGitRepo,
-                attempted_at,
-            ),
-            None => PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
-        };
+        let response = pr_status_response_for_missing_worktree(&state, &work_scope).await?;
         return Ok(Json(response));
     }
 
     let db = state.runtime.db().clone();
+    let cwd_for_status = cwd.clone();
+    let cwd_for_change = cwd.clone();
+    let branch_name_for_status = branch_name.clone();
+    let branch_name_for_change = branch_name.clone();
+    let base_branch_for_change = base_branch.clone();
     let refresh = tokio::task::spawn_blocking(move || {
-        crate::api::pr_monitoring::get_pr_status_for_branch(&cwd_for_status, &branch_name)
+        let mut refresh = crate::api::pr_monitoring::get_pr_status_for_branch(
+            &cwd_for_status,
+            &branch_name_for_status,
+        );
+        refresh.response.work_change = summarize_work_change(
+            &cwd_for_change,
+            &branch_name_for_change,
+            &base_branch_for_change,
+        );
+        refresh
     })
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
@@ -407,25 +588,15 @@ pub(crate) async fn get_conversation_pr_status(
         .map_err(|e| AppError::Internal(e.to_string()))?
     {
         if refresh.response.refresh.state != crate::api::types::PrRefreshState::Fresh {
-            return Ok(Json(
-                crate::api::pr_monitoring::stale_primary_response_with_refresh_state(
-                    &primary,
-                    refresh.response.refresh.state,
-                    refresh.response.refresh.reason.clone(),
-                    refresh.response.refresh.last_attempted_at,
-                ),
-            ));
+            return Ok(Json(stale_primary_response_with_work_change(
+                &primary, refresh,
+            )));
         }
 
         if refresh.response.number != Some(primary.pr_number) {
-            return Ok(Json(
-                crate::api::pr_monitoring::stale_primary_response_with_refresh_state(
-                    &primary,
-                    refresh.response.refresh.state,
-                    refresh.response.refresh.reason.clone(),
-                    refresh.response.refresh.last_attempted_at,
-                ),
-            ));
+            return Ok(Json(stale_primary_response_with_work_change(
+                &primary, refresh,
+            )));
         }
     }
 
@@ -783,6 +954,208 @@ mod tests {
             llm_language: crate::llm_language::LlmLanguage::default(),
             spawned_from_conversation_id: None,
         }
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        run_git(dir, &["init", "--quiet", "--initial-branch=main"]).unwrap();
+        run_git(dir, &["config", "user.email", "probe@test"]).unwrap();
+        run_git(dir, &["config", "user.name", "probe"]).unwrap();
+        run_git(dir, &["commit", "--allow-empty", "-q", "-m", "init"]).unwrap();
+    }
+
+    fn commit_file(dir: &std::path::Path, name: &str, content: &str, message: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+        run_git(dir, &["add", name]).unwrap();
+        run_git(dir, &["commit", "-q", "-m", message]).unwrap();
+    }
+
+    fn bare_remote() -> tempfile::TempDir {
+        let remote = tempfile::tempdir().unwrap();
+        run_git(
+            remote.path(),
+            &["init", "--bare", "--quiet", "--initial-branch=main"],
+        )
+        .unwrap();
+        remote
+    }
+
+    fn push_branch(repo: &std::path::Path, branch: &str) {
+        run_git(repo, &["push", "--quiet", "-u", "origin", branch]).unwrap();
+        run_git(repo, &["fetch", "--quiet", "origin"]).unwrap();
+    }
+
+    #[test]
+    fn work_change_clean_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        assert_eq!(
+            summarize_work_change(repo.path(), "main", "main"),
+            WorkChangeSummary::Clean
+        );
+    }
+
+    #[test]
+    fn work_change_uncommitted_changes_need_review() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
+        assert_eq!(
+            summarize_work_change(repo.path(), "main", "main"),
+            WorkChangeSummary::DirtyNeedsReview {
+                reason: WorkChangeNeedsReviewReason::UncommittedChanges
+            }
+        );
+    }
+
+    #[test]
+    fn work_change_branch_not_pushed() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(repo.path(), &["checkout", "-q", "-b", "task"]).unwrap();
+        commit_file(repo.path(), "a.txt", "a", "a");
+        assert_eq!(
+            summarize_work_change(repo.path(), "task", "main"),
+            WorkChangeSummary::DirtyNeedsReview {
+                reason: WorkChangeNeedsReviewReason::BranchNotPushed
+            }
+        );
+    }
+
+    #[test]
+    fn work_change_pushed_github_branch_is_pr_ready() {
+        let remote = bare_remote();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        )
+        .unwrap();
+        push_branch(repo.path(), "main");
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:acme/repo.git",
+            ],
+        )
+        .unwrap();
+        run_git(repo.path(), &["checkout", "-q", "-b", "task"]).unwrap();
+        commit_file(repo.path(), "a.txt", "a", "a");
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                remote.path().to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        push_branch(repo.path(), "task");
+        run_git(
+            repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:acme/repo.git",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            summarize_work_change(repo.path(), "task", "main"),
+            WorkChangeSummary::DirtyPrReady {
+                create_pr_url: "https://github.com/acme/repo/compare/main...task?expand=1"
+                    .to_string(),
+                branch_name: "task".to_string(),
+                base_branch: "main".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn work_change_local_ahead_of_remote_needs_review() {
+        let remote = bare_remote();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        )
+        .unwrap();
+        push_branch(repo.path(), "main");
+        run_git(repo.path(), &["checkout", "-q", "-b", "task"]).unwrap();
+        commit_file(repo.path(), "a.txt", "a", "a");
+        push_branch(repo.path(), "task");
+        commit_file(repo.path(), "b.txt", "b", "b");
+        assert_eq!(
+            summarize_work_change(repo.path(), "task", "main"),
+            WorkChangeSummary::DirtyNeedsReview {
+                reason: WorkChangeNeedsReviewReason::LocalAheadOfRemote
+            }
+        );
+    }
+
+    #[test]
+    fn work_change_remote_diverged_needs_review() {
+        let remote = bare_remote();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        )
+        .unwrap();
+        push_branch(repo.path(), "main");
+        run_git(repo.path(), &["checkout", "-q", "-b", "task"]).unwrap();
+        commit_file(repo.path(), "a.txt", "a", "a");
+        push_branch(repo.path(), "task");
+        run_git(
+            repo.path(),
+            &["checkout", "-q", "-b", "remote-task", "origin/task"],
+        )
+        .unwrap();
+        commit_file(repo.path(), "remote.txt", "remote", "remote");
+        run_git(
+            repo.path(),
+            &["push", "--quiet", "origin", "remote-task:task"],
+        )
+        .unwrap();
+        run_git(repo.path(), &["checkout", "-q", "task"]).unwrap();
+        commit_file(repo.path(), "local.txt", "local", "local");
+        run_git(repo.path(), &["fetch", "--quiet", "origin"]).unwrap();
+        assert_eq!(
+            summarize_work_change(repo.path(), "task", "main"),
+            WorkChangeSummary::DirtyNeedsReview {
+                reason: WorkChangeNeedsReviewReason::RemoteDiverged
+            }
+        );
+    }
+
+    #[test]
+    fn work_change_non_github_remote_needs_review() {
+        let remote = bare_remote();
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        )
+        .unwrap();
+        push_branch(repo.path(), "main");
+        run_git(repo.path(), &["checkout", "-q", "-b", "task"]).unwrap();
+        commit_file(repo.path(), "a.txt", "a", "a");
+        push_branch(repo.path(), "task");
+        assert_eq!(
+            summarize_work_change(repo.path(), "task", "main"),
+            WorkChangeSummary::DirtyNeedsReview {
+                reason: WorkChangeNeedsReviewReason::NonGithubRemote
+            }
+        );
     }
 
     #[test]

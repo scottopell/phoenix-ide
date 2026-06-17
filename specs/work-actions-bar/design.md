@@ -32,6 +32,7 @@ primary slot.
 | `mode` | `Work` or `Branch` |
 | `continued_in_conv_id` | `conversation.continued_in_conv_id` |
 | `PrStatusView` | `useConversationPrStatus` → `prStatusHandle.state` |
+| `WorkChangeSummary` | `useConversationPrStatus` → `PrStatusResponse.work_change`; cheap git summary, not full diff text |
 | `PrAutoFixAffordance` | `WorkActionsPrAffordanceContract.derive_affordance(status)` |
 
 Derivation is strict top-to-bottom; the first matching row wins. It is total — every reachable
@@ -48,8 +49,10 @@ input maps to exactly one row:
    **pr_open_other**
 6. `phase = idle`, `display_state = merged` → **clean_up_merged**
 7. `phase = idle`, `display_state = closed` → **pr_closed**
-8. `phase = idle`, `pr = null`, `refresh.state != unavailable` → **no_pr**
-9. `phase = idle`, `pr = null`, `refresh.state = unavailable` → **gh_unavailable**
+8. `phase = idle`, no PR, `work_change = clean` → **no_pr_clean**
+9. `phase = idle`, no PR, `work_change = dirty_pr_ready` → **no_pr_create_pr**
+10. `phase = idle`, no PR, work change dirty-needs-review / loading / unavailable → **no_pr_review**
+11. `phase = idle`, `pr = null`, `refresh.state = unavailable` → **gh_unavailable**
 
 Rows 3–5 partition every idle open-or-draft PR; there is no open-PR state that falls through.
 Addressability reads `affordance.enabled` (`PrAutoFixAffordance`) and `display_state = open`
@@ -71,7 +74,8 @@ duplicated. It is total over PR state:
 | merged | `Clean up` |
 | closed unmerged | `Abandon` |
 | open / draft | `Abandon` (stuck only; idle open/draft is handled by rows 3–5 with a RESOLVE primary) |
-| no PR found | `Clean up` |
+| no PR found, clean work | `Clean up` |
+| no PR found, dirty work | REVIEW primary (`View Diff`) or RESOLVE primary (`Create PR on GitHub ↗`) |
 | gh unavailable | `Clean up` |
 
 The selector never returns the RESOLVE slot and never returns `none`; those are decided by the
@@ -94,7 +98,9 @@ disposition rows directly.
 | `pr_open_other` | View Diff | ★ Open PR #N ↗ | — | Abandon | RESOLVE | — |
 | `clean_up_merged` | View Diff | — | ★ Clean up | Abandon | Clean up | — |
 | `pr_closed` | View Diff | — | — | ★ Abandon | Abandon | "PR closed — abandon to clean up." |
-| `no_pr` | View Diff | — | ★ Clean up | Abandon | Clean up | — |
+| `no_pr_clean` | View Diff | — | ★ Clean up | Abandon | Clean up | — |
+| `no_pr_create_pr` | View Diff | ★ Create PR on GitHub ↗ | — | Abandon | RESOLVE | "Changes found but no PR..." |
+| `no_pr_review` | ★ View Diff | — | — | Abandon | REVIEW | reason-specific dirty/no-PR note |
 | `gh_unavailable` | View Diff | — | ★ Clean up | Abandon | Clean up | "gh unavailable — manual cleanup." |
 
 The `stuck` rows expand the shared FINISH selector; they are not separate dispositions.

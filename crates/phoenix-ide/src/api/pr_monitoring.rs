@@ -803,6 +803,7 @@ fn fresh_response(
         display_state: Some(pr.display_state.clone()),
         feedback_freshness: None,
         feedback_coverage: None,
+        work_change: crate::api::types::WorkChangeSummary::Loading,
         pr: Some(pr),
         refresh: PrRefreshMetadata {
             state: PrRefreshState::Fresh,
@@ -880,6 +881,7 @@ pub(crate) fn stale_response_with_refresh_state(
         display_state: Some(identity.display_state.clone()),
         feedback_freshness: None,
         feedback_coverage: None,
+        work_change: crate::api::types::WorkChangeSummary::Loading,
         pr: Some(identity),
         refresh: PrRefreshMetadata {
             state: refresh_state,
@@ -937,6 +939,7 @@ pub(crate) fn persisted_primary_response(
         display_state: Some(identity.display_state.clone()),
         feedback_freshness: None,
         feedback_coverage: None,
+        work_change: crate::api::types::WorkChangeSummary::Loading,
         pr: Some(identity),
         refresh,
     }

@@ -60,7 +60,7 @@ THE SYSTEM SHALL organize the work actions bar into three zones, left to right:
 
 **RESOLVE zone** — the push-forward action; suppressed in stuck phases (REQ-WAB-005):
 - The primary verb selected by `WorkDisposition` (REQ-WAB-004): `Address feedback`,
-  `Merge on GitHub #N ↗`, or `Open PR #N ↗`.
+  `Merge on GitHub #N ↗`, `Open PR #N ↗`, or `Create PR on GitHub ↗`.
 - Optionally a second, non-glowing link-out beside the primary: when the primary is
   `Address feedback` and the PR's checks are confirmed passing, the honest `Merge on GitHub #N ↗`
   link rides alongside so an open PR offers both "address the feedback" and "go merge it"
@@ -85,6 +85,8 @@ WHEN `WorkDisposition` produces a RESOLVE verb (idle phase only), that verb is t
 WHEN `WorkDisposition` suppresses RESOLVE (stuck phases) or there is no push-forward action
 (merged / closed / no-PR / gh-unavailable), the primary collapses to a FINISH verb
 (`Clean up` or `Abandon`).
+WHEN dirty no-PR work has no honest PR-creation link, `View Diff` in the REVIEW zone is the
+primary so the user reviews the work before any terminal cleanup.
 WHEN `WorkDisposition` is `continued`, there is no primary verb and all terminal verbs are
 suppressed (REQ-WAB-009).
 
@@ -120,7 +122,9 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 | 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
 | 6 | idle, PR merged | `clean_up_merged` | **Clean up** (FINISH) | — |
 | 7 | idle, PR closed unmerged | `pr_closed` | **Abandon** (FINISH) | Clean up suppressed; note |
-| 8 | idle, no PR found, refresh ≠ unavailable | `no_pr` | **Clean up** (FINISH) | — |
+| 8a | idle, no PR found, refresh ≠ unavailable, work-change state = clean | `no_pr_clean` | **Clean up** (FINISH) | — |
+| 8b | idle, no PR found, refresh ≠ unavailable, work-change state = dirty and PR-ready | `no_pr_create_pr` | **Create PR on GitHub ↗** (RESOLVE, GitHub link) | Clean up suppressed; note |
+| 8c | idle, no PR found, refresh ≠ unavailable, work-change state dirty-needs-review / loading / unavailable | `no_pr_review` | **View Diff** (REVIEW) | Clean up suppressed; note |
 | 9 | idle, gh unavailable (no PR identity, refresh = unavailable) | `gh_unavailable` | **Clean up** (FINISH) | warning note; single click |
 
 The **affordance** is enabled when Phoenix can post an auto-fix message to the conversation:
@@ -150,7 +154,8 @@ non-passing open PR (or any draft) is labelled "Open PR" so the bar never promis
 checks do not support. Both labels carry the ↗ external-navigation glyph and open GitHub in a
 new tab — neither performs the merge in Phoenix (REQ-WAB-010).
 
-**Design:** `WorkDisposition` is a pure function of inputs; no button state is stored in the
+Rows 8a–8c split no-PR work by the typed work-change summary. Clean no-PR work is terminal and may clean up. Dirty no-PR work is not terminal: if the local committed work is pushed to a matching GitHub remote branch, the bar may offer an honest `Create PR on GitHub ↗` link; otherwise `View Diff` is the safe primary. Uncommitted changes, unpushed commits, remote divergence, unknown remote state, and non-GitHub remotes all route to `View Diff`. The bar never makes commit, push, merge, or terminal automation the hero.
+
 bar. The bar re-derives the disposition on every render. The `check_state` and
 `feedback_freshness` signals are read as typed fields on `PrStatusView`, never reconstructed
 from the raw provider wire.
@@ -254,8 +259,8 @@ continuation, so the suppressed bar matches the server-side legality gate.
 
 ### REQ-WAB-010: PR Link Verbs Open GitHub
 
-WHEN `WorkDisposition` is `merge_ready` (verb `Merge on GitHub #N ↗`) or `pr_open_other` (verb
-`Open PR #N ↗`)
+WHEN `WorkDisposition` is `merge_ready` (verb `Merge on GitHub #N ↗`), `pr_open_other` (verb
+`Open PR #N ↗`), or `no_pr_create_pr` (verb `Create PR on GitHub ↗`)
 THE SYSTEM SHALL render the RESOLVE verb as a link that opens the PR's GitHub URL in a new
 browser tab, NOT as a button that calls a Phoenix API.
 

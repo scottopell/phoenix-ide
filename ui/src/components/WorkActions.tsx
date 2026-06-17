@@ -57,24 +57,33 @@ function ResolveLink({
   primary,
   coverageMarker,
 }: {
-  verb: { kind: 'merge_pr' | 'open_pr'; url: string; number: number };
+  verb:
+    | { kind: 'merge_pr' | 'open_pr'; url: string; number: number }
+    | { kind: 'create_pr'; url: string; branchName: string };
   primary: boolean;
   coverageMarker: ReturnType<typeof prFeedbackCoverageMarker>;
 }) {
   const isMerge = verb.kind === 'merge_pr';
+  const isCreate = verb.kind === 'create_pr';
   const cls = isMerge ? 'work-actions-merge-link' : 'work-actions-open-link';
+  const testId = isMerge ? 'merge-pr-link' : isCreate ? 'create-pr-link' : 'open-pr-link';
+  const label = isMerge
+    ? `Merge on GitHub #${verb.number}`
+    : isCreate
+      ? 'Create PR on GitHub'
+      : `Open PR #${verb.number}`;
   return (
     <a
       href={verb.url}
       target="_blank"
       rel="noopener noreferrer"
       className={`work-actions-btn ${cls}${primary ? ' work-actions-btn--primary' : ''}`}
-      data-testid={isMerge ? 'merge-pr-link' : 'open-pr-link'}
+      data-testid={testId}
     >
-      {isMerge ? 'Merge on GitHub' : 'Open PR'} #{verb.number} ↗
+      {label} ↗
       {/* The coverage marker rides on the primary verb only — never duplicated
           across both the primary and the secondary link. */}
-      {primary && <CoverageMarker marker={coverageMarker} />}
+      {primary && !isCreate && <CoverageMarker marker={coverageMarker} />}
     </a>
   );
 }
@@ -116,11 +125,12 @@ export function WorkControlBar({
     prStatus,
     prLoading,
     canSendMessage: !!onSendMessage,
+    workChange: prStatus?.work_change ?? null,
   });
   if (!disposition.visible) return null;
 
   const isBranch = convModeLabel === 'Branch';
-  const primaryClass = (role: 'resolve' | 'clean_up' | 'abandon') =>
+  const primaryClass = (role: 'review' | 'resolve' | 'clean_up' | 'abandon') =>
     disposition.primary === role ? ' work-actions-btn--primary' : '';
 
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
@@ -149,7 +159,7 @@ export function WorkControlBar({
       {/* REVIEW zone */}
       <div className="work-actions-zone work-actions-zone--review">
         <button
-          className="work-actions-btn work-actions-view-diff"
+          className={`work-actions-btn work-actions-view-diff${primaryClass('review')}`}
           data-testid="view-diff-button"
           onClick={() => viewerSlot.openDiffFullscreen()}
         >
@@ -174,7 +184,8 @@ export function WorkControlBar({
             </button>
           )}
           {(disposition.resolve.kind === 'merge_pr' ||
-            disposition.resolve.kind === 'open_pr') && (
+            disposition.resolve.kind === 'open_pr' ||
+            disposition.resolve.kind === 'create_pr') && (
             <ResolveLink verb={disposition.resolve} primary coverageMarker={coverageMarker} />
           )}
           {/* Non-glowing secondary link-out beside the Address-feedback primary
@@ -255,7 +266,7 @@ export function WorkControlBar({
       {note?.kind === 'gh_unavailable' && (
         <span className="work-actions-pr-note work-actions-pr-note--warning">{note.text}</span>
       )}
-      {(note?.kind === 'pr_closed' || note?.kind === 'pr_open_stuck') && (
+      {(note?.kind === 'pr_closed' || note?.kind === 'pr_open_stuck' || note?.kind === 'no_pr_dirty') && (
         <span className="work-actions-pr-note">{note.text}</span>
       )}
 

@@ -48,6 +48,7 @@ export function useConversationPrStatus({
             last_attempted_at: new Date().toISOString(),
             stale: false,
           },
+          work_change: { kind: 'unavailable', reason: 'command_failed' },
         },
       });
     }

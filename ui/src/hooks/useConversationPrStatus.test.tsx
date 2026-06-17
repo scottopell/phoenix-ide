@@ -20,6 +20,7 @@ function prStatus(number: number): PrStatusResponse {
       last_refreshed_at: '2026-01-01T00:00:00Z',
       stale: false,
     },
+    work_change: { kind: 'clean' },
   };
 }
 

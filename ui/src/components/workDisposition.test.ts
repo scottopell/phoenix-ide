@@ -25,6 +25,14 @@ function refresh(state: PrRefreshState): PrStatusResponse['refresh'] {
   };
 }
 
+function loadingWorkChange(): PrStatusResponse['work_change'] {
+  return { kind: 'loading' };
+}
+
+function cleanWorkChange(): PrStatusResponse['work_change'] {
+  return { kind: 'clean' };
+}
+
 /** A found PR in a given display state, refresh fresh, no checks/feedback. */
 function foundPr(
   display_state: PrDisplayState,
@@ -36,6 +44,7 @@ function foundPr(
     url: PR_URL,
     display_state,
     refresh: refresh('fresh'),
+    work_change: cleanWorkChange(),
     ...extra,
   };
 }
@@ -45,6 +54,7 @@ function notFound(refreshState: PrRefreshState, extra: Partial<PrStatusResponse>
   return {
     found: false,
     refresh: refresh(refreshState),
+    work_change: cleanWorkChange(),
     ...extra,
   };
 }
@@ -56,6 +66,7 @@ function input(overrides: Partial<WorkDispositionInput> = {}): WorkDispositionIn
     continuedInConvId: null,
     prStatus: null,
     prLoading: false,
+    workChange: cleanWorkChange(),
     canSendMessage: true,
     ...overrides,
   };
@@ -361,17 +372,66 @@ describe('idle terminal dispositions', () => {
     expect(d.showCleanUp).toBe(true);
   });
 
-  it('no PR, refresh ok → clean_up primary, no warning note', () => {
-    const d = deriveWorkDisposition(input({ prStatus: notFound('fresh') }));
+  it('no PR, refresh ok, clean work → clean_up primary, no warning note', () => {
+    const d = deriveWorkDisposition(input({ prStatus: notFound('fresh'), workChange: cleanWorkChange() }));
     expect(d.primary).toBe('clean_up');
     expect(d.showCleanUp).toBe(true);
     expect(d.note).toBeNull();
   });
 
-  it('no prStatus at all (not loading) → clean_up primary (no PR, refresh ok)', () => {
-    const d = deriveWorkDisposition(input({ prStatus: null }));
-    expect(d.primary).toBe('clean_up');
-    expect(d.showCleanUp).toBe(true);
+  it('no PR, dirty PR-ready work → create PR primary, cleanup hidden', () => {
+    const createUrl = 'https://github.com/acme/repo/compare/main...task-1?expand=1';
+    const d = deriveWorkDisposition(input({
+      prStatus: notFound('fresh'),
+      workChange: {
+        kind: 'dirty_pr_ready',
+        create_pr_url: createUrl,
+        branch_name: 'task-1',
+        base_branch: 'main',
+      },
+    }));
+    expect(d.primary).toBe('resolve');
+    expect(d.resolve).toEqual({ kind: 'create_pr', url: createUrl, branchName: 'task-1' });
+    expect(d.showCleanUp).toBe(false);
+    expect(d.showAbandon).toBe(true);
+    expect(d.note?.kind).toBe('no_pr_dirty');
+  });
+
+  it('no PR, dirty uncommitted work → View Diff primary, cleanup hidden', () => {
+    const d = deriveWorkDisposition(input({
+      prStatus: notFound('fresh'),
+      workChange: { kind: 'dirty_needs_review', reason: 'uncommitted_changes' },
+    }));
+    expect(d.primary).toBe('review');
+    expect(d.resolve).toBeNull();
+    expect(d.showCleanUp).toBe(false);
+    expect(d.showAbandon).toBe(true);
+    expect(d.note?.text).toContain('Uncommitted changes');
+  });
+
+  it('no PR, branch not pushed → View Diff primary and push/PR note', () => {
+    const d = deriveWorkDisposition(input({
+      prStatus: notFound('fresh'),
+      workChange: { kind: 'dirty_needs_review', reason: 'branch_not_pushed' },
+    }));
+    expect(d.primary).toBe('review');
+    expect(d.showCleanUp).toBe(false);
+    expect(d.note?.text).toContain('push and open a PR');
+  });
+
+  it('no PR, work-change loading or unavailable → no cleanup hero', () => {
+    for (const workChange of [loadingWorkChange(), { kind: 'unavailable' as const, reason: 'git failed' }]) {
+      const d = deriveWorkDisposition(input({ prStatus: notFound('fresh'), workChange }));
+      expect(d.primary).toBe('review');
+      expect(d.showCleanUp).toBe(false);
+      expect(d.showAbandon).toBe(true);
+    }
+  });
+
+  it('no prStatus at all (not loading) → View Diff primary until work-change state is known', () => {
+    const d = deriveWorkDisposition(input({ prStatus: null, workChange: null }));
+    expect(d.primary).toBe('review');
+    expect(d.showCleanUp).toBe(false);
   });
 });
 
@@ -400,6 +460,7 @@ describe('structural invariants', () => {
                         continuedInConvId,
                         prStatus: null,
                         prLoading,
+                        workChange: cleanWorkChange(),
                         canSendMessage,
                       };
                       yield base;
@@ -412,8 +473,9 @@ describe('structural invariants', () => {
                             ...(display_state ? { display_state } : {}),
                             ...(check_state ? { check_state } : {}),
                             refresh: refresh(rs),
+                            work_change: cleanWorkChange(),
                           }
-                        : { found: false, refresh: refresh(rs) };
+                        : { found: false, refresh: refresh(rs), work_change: cleanWorkChange() };
                       yield { ...base, prStatus: pr };
                     }
                   }
@@ -427,7 +489,7 @@ describe('structural invariants', () => {
   }
 
   it('always returns exactly one primary and never throws', () => {
-    const valid: WorkDisposition['primary'][] = ['none', 'resolve', 'clean_up', 'abandon'];
+    const valid: WorkDisposition['primary'][] = ['none', 'review', 'resolve', 'clean_up', 'abandon'];
     let count = 0;
     for (const inp of matrix()) {
       count++;

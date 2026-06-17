@@ -60,7 +60,7 @@ value BarInputs {
     phase: BarPhase
     mode: ConvMode
     continued_in_conv_id: String?
-    pr_status: pra/PrStatusView?
+    work_change: WorkChangeState
     auto_fix_affordance: pra/PrAutoFixAffordance
 }
 
@@ -116,6 +116,14 @@ enum BarPhase {
     | context_exhausted
 }
 
+enum WorkChangeState {
+    clean
+    | dirty_pr_ready
+    | dirty_needs_review
+    | loading
+    | unavailable
+}
+
 enum ConvMode {
     work
     | branch
@@ -123,7 +131,7 @@ enum ConvMode {
 
 -- The single derived state that selects the primary verb and which verbs are
 -- present (REQ-WAB-004). Total: every reachable combination of phase,
--- continuation, and PR state maps to exactly one variant via derive_disposition.
+-- continuation, PR state, and no-PR work-change state maps to exactly one variant via derive_disposition.
 enum WorkDisposition {
     continued           -- continued_in_conv_id set; no primary; RESOLVE + FINISH suppressed
     | stuck             -- phase in {error, context_exhausted}; RESOLVE suppressed; FINISH primary
@@ -132,7 +140,9 @@ enum WorkDisposition {
     | pr_open_other     -- idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not green)
     | clean_up_merged   -- idle, PR merged
     | pr_closed         -- idle, PR closed unmerged
-    | no_pr             -- idle, no PR found, refresh not unavailable
+    | no_pr_clean       -- idle, no PR found, work-change summary clean
+    | no_pr_create_pr   -- idle, no PR found, dirty committed work pushed to GitHub remote branch
+    | no_pr_review      -- idle, no PR found, dirty/unknown work state needs diff review
     | gh_unavailable    -- idle, no PR identity, refresh unavailable
 }
 
@@ -144,6 +154,7 @@ enum ResolveVerb {
     address_feedback    -- "Address feedback": posts a UserMessage via PrAutoFixAffordance
     | merge_link        -- "Merge on GitHub #N ↗": opens PrIdentity.url in a new tab (Phoenix has no merge API)
     | open_pr_link      -- "Open PR #N ↗": opens PrIdentity.url; honest when checks are not passing
+    | create_pr_link    -- "Create PR on GitHub ↗": opens GitHub compare/new-PR URL
 }
 
 -- The single glowing slot across the whole bar (REQ-WAB-003). Exactly one of
@@ -152,6 +163,7 @@ enum ResolveVerb {
 -- primaries are unrepresentable.
 enum BarPrimary {
     none                -- continued: no glowing verb anywhere
+    | review            -- the REVIEW View Diff verb glows
     | resolve           -- the RESOLVE verb glows (idle, push-forward available)
     | clean_up          -- the FINISH Clean up verb glows
     | abandon           -- the FINISH Abandon verb glows
@@ -163,6 +175,7 @@ enum InlineNote {
     | pr_open_stuck_note     -- "PR #N still open — merge on GitHub, or abandon."
     | pr_closed_note        -- "PR closed — abandon to clean up."
     | gh_unavailable_note   -- "gh unavailable — manual cleanup."
+    | no_pr_dirty_note     -- dirty no-PR work needs review or PR creation before cleanup
 }
 
 ------------------------------------------------------------
@@ -205,6 +218,13 @@ entity WorkActionsBar {
 --   resolve_pr_status(conv: bedrock/Conversation) -> pra/PrStatusView?
 --       The PrStatusView (pr-association, WorkScopePrStatusContract) for this
 --       conversation, or null while the status is still loading.
+--
+--   resolve_work_change(conv: bedrock/Conversation) -> WorkChangeState
+--       Cheap git summary for the conversation branch/worktree. clean permits terminal
+--       no-PR cleanup. dirty_pr_ready means committed work exists, the branch is pushed
+--       to a matching GitHub remote branch, and no uncommitted/ahead/diverged state would
+--       make the create-PR link dishonest. dirty_needs_review, loading, and unavailable
+--       all require View Diff before cleanup.
 --
 --   resolve_auto_fix_affordance(conv: bedrock/Conversation) -> pra/PrAutoFixAffordance
 --       The PrAutoFixAffordance derived via pr-association's
@@ -277,6 +297,7 @@ rule BarRenderedWhenEligible {
             mode: conv_mode(conversation),
             continued_in_conv_id: conversation.continued_in_conv_id,
             pr_status: resolve_pr_status(conversation),
+            work_change: resolve_work_change(conversation),
             auto_fix_affordance: resolve_auto_fix_affordance(conversation)
         }
     )
@@ -439,8 +460,8 @@ rule DispositionPrClosed {
     ensures: bar.presentation.inline_note = pr_closed_note
 }
 
--- Row 8. No PR found, refresh not unavailable: Clean up primary.
-rule DispositionNoPr {
+-- Row 8a. No PR found, refresh not unavailable, clean work: Clean up primary.
+rule DispositionNoPrClean {
     when: WorkActionsBarRendered(bar)
 
     requires: bar.inputs.continued_in_conv_id = null
@@ -448,13 +469,54 @@ rule DispositionNoPr {
     requires: bar.inputs.pr_status != null
     requires: bar.inputs.pr_status.pr = null
     requires: bar.inputs.pr_status.refresh.state != unavailable
+    requires: bar.inputs.work_change = clean
 
-    ensures: bar.presentation.disposition = no_pr
+    ensures: bar.presentation.disposition = no_pr_clean
     ensures: bar.presentation.resolve_zone.visible = false
     ensures: bar.presentation.finish_zone.show_clean_up = true
     ensures: bar.presentation.finish_zone.show_abandon = true
-    ensures: bar.presentation.primary = finish_primary_for_disposition(no_pr, bar.inputs.pr_status)
+    ensures: bar.presentation.primary = clean_up
     ensures: bar.presentation.inline_note = null
+}
+
+-- Row 8b. No PR found, dirty work safely PR-ready: Create PR link primary.
+rule DispositionNoPrCreatePr {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id = null
+    requires: bar.inputs.phase = idle
+    requires: bar.inputs.pr_status != null
+    requires: bar.inputs.pr_status.pr = null
+    requires: bar.inputs.pr_status.refresh.state != unavailable
+    requires: bar.inputs.work_change = dirty_pr_ready
+
+    ensures: bar.presentation.disposition = no_pr_create_pr
+    ensures: bar.presentation.resolve_zone.visible = true
+    ensures: bar.presentation.resolve_zone.verb = create_pr_link
+    ensures: bar.presentation.resolve_zone.secondary = null
+    ensures: bar.presentation.finish_zone.show_clean_up = false
+    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.primary = resolve
+    ensures: bar.presentation.inline_note = no_pr_dirty_note
+}
+
+-- Row 8c. No PR found, dirty/unknown work state: View Diff primary.
+rule DispositionNoPrReview {
+    when: WorkActionsBarRendered(bar)
+
+    requires: bar.inputs.continued_in_conv_id = null
+    requires: bar.inputs.phase = idle
+    requires: bar.inputs.pr_status != null
+    requires: bar.inputs.pr_status.pr = null
+    requires: bar.inputs.pr_status.refresh.state != unavailable
+    requires: bar.inputs.work_change in { dirty_needs_review, loading, unavailable }
+
+    ensures: bar.presentation.disposition = no_pr_review
+    ensures: bar.presentation.resolve_zone.visible = false
+    ensures: bar.presentation.finish_zone.show_clean_up = false
+    ensures: bar.presentation.finish_zone.show_abandon = true
+    ensures: bar.presentation.primary = review
+    ensures: bar.presentation.inline_note = no_pr_dirty_note
 }
 
 -- Row 9. gh unavailable, no persisted PR identity: Clean up primary, warning
@@ -501,7 +563,7 @@ rule ReviewZoneAlwaysShowsDiff {
 rule ResolveLinkVerbNavigatesToGitHub {
     when: UserClicksResolveLink(bar)
 
-    requires: bar.presentation.resolve_zone.verb in { merge_link, open_pr_link }
+    requires: bar.presentation.resolve_zone.verb in { merge_link, open_pr_link, create_pr_link }
 
     ensures: ExternalNavigationRequested(bar.inputs.pr_status.pr.url)
 
@@ -592,5 +654,5 @@ surface WorkActionsBarSurface {
         ConversationRendered(bar.conversation)
         WorkActionsBarRendered(bar)
         UserClicksResolveLink(bar)
-            when bar.presentation.resolve_zone.verb in { merge_link, open_pr_link }
+            when bar.presentation.resolve_zone.verb in { merge_link, open_pr_link, create_pr_link }
 }
