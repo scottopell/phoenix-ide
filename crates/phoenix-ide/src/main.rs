@@ -6,6 +6,7 @@
 mod api;
 mod chain_qa;
 mod chain_runtime;
+mod conversation_cwd;
 pub(crate) mod git_ops;
 mod llm;
 mod mcp_oauth_store;

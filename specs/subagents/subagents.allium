@@ -10,6 +10,7 @@
 --   - SubAgentMode (explore/work) and parent-mode rules
 --   - One-writer invariant (per-call AND across calls per parent)
 --   - cwd-scoping invariant for Work sub-agents (incl. task.cwd overrides)
+--   - system-root cwd rejection for every sub-agent mode
 --   - Explore-sub-agent working_dir derivation
 --   - Per-mode tool-registry selection (fresh spawn + resume path)
 --   - Model and max-turns defaulting & validation (config in @guidance)
@@ -221,8 +222,27 @@ rule SpawnRejectedUnknownAgentType {
 }
 
 -- ===========================================================
--- 4. CWD SCOPING (REQ-PROJ-008)
+-- 4. CWD VALIDATION AND SCOPING (REQ-PROJ-000, REQ-PROJ-008)
 -- ===========================================================
+
+-- Every sub-agent's effective cwd must be an existing non-root directory
+-- after symlink and parent-directory traversal resolution. This rule is
+-- mode-independent: read-only tools can still consume unbounded resources
+-- when rooted at the filesystem root.
+rule SpawnRejectedSystemRootCwd {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: any_task_effective_cwd_resolves_to_system_root(
+        tasks, parent.working_dir)
+    ensures: SpawnAgentsRejected(parent,
+        reason: "Sub-agent cwd must not resolve to the filesystem root")
+
+    @guidance
+        -- effective cwd resolution is `t.cwd` when present, otherwise
+        -- `parent.working_dir`. Validation canonicalises the effective cwd;
+        -- failure to canonicalise to an existing directory is rejected before
+        -- creating a SubAgentSpec. This rule applies to Explore and Work
+        -- sub-agents and to Direct parents as well as managed parents.
+}
 
 -- The Work sub-agent's *effective* cwd — including any per-task `cwd`
 -- override — must be inside the parent's worktree. Without this guard a
@@ -291,6 +311,8 @@ rule SubAgentSpecsResolved {
         or active_work_subagents(parent) = 0
     requires: not any_task_has_unknown_model(tasks)
     requires: not any_task_has_unknown_agent_type(tasks, parent.working_dir)
+    requires: not any_task_effective_cwd_resolves_to_system_root(
+        tasks, parent.working_dir)
     requires: parent.mode not in { work, branch }
         or not any_work_task_has_cwd_outside_worktree(
             tasks, parent.worktree_path)
@@ -338,6 +360,11 @@ rule SubAgentSpecsResolved {
         --   resolve_cwd(t, parent):
         --     t.cwd.present => t.cwd
         --     else          => parent.working_dir
+        --
+        --   validate_cwd(resolve_cwd(t, parent)) must prove the path is an
+        --   existing directory after canonicalisation and that the canonical
+        --   directory is not the filesystem root. Failure rejects the entire
+        --   spawn call before any child conversation is persisted.
         --
         -- After this rule fires, bedrock's `SpawnAgentsCompletesAsLastTool`
         -- (or `SpawnAgentsCompletesWithMoreTools`) drives the parent into

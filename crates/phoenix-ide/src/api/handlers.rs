@@ -1191,14 +1191,9 @@ async fn create_conversation_with_id(
     mut req: CreateConversationRequest,
     raw_files: Vec<RawAttachmentPart>,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    // Validate directory exists
-    let path = PathBuf::from(&req.cwd);
-    if !path.exists() {
-        return Err(AppError::BadRequest("Directory does not exist".to_string()));
-    }
-    if !path.is_dir() {
-        return Err(AppError::BadRequest("Path is not a directory".to_string()));
-    }
+    let valid_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
+        .map_err(AppError::BadRequest)?;
+    let path = valid_cwd.as_path();
 
     // REQ-SEED-001: seeded conversations may be created empty so the UI can
     // hydrate the input area with a draft and let the user review before
@@ -1293,7 +1288,7 @@ async fn create_conversation_with_id(
     };
 
     // Detect project from git repo root (REQ-PROJ-001)
-    let project_id = if let Some(repo_root) = phoenix_core::git::detect_git_repo_root(&path) {
+    let project_id = if let Some(repo_root) = phoenix_core::git::detect_git_repo_root(path) {
         match state.db.find_or_create_project(&repo_root).await {
             Ok(project) => {
                 tracing::info!(project_id = %project.id, path = %repo_root, "Associated conversation with project");
@@ -1346,7 +1341,7 @@ async fn create_conversation_with_id(
                 "Branch mode requires a git repository".to_string(),
             ));
         }
-        let repo_root = phoenix_core::git::detect_git_repo_root(&path).ok_or_else(|| {
+        let repo_root = phoenix_core::git::detect_git_repo_root(path).ok_or_else(|| {
             AppError::BadRequest("Could not determine git repository root".to_string())
         })?;
 
@@ -1411,7 +1406,7 @@ async fn create_conversation_with_id(
         // Infer the current branch from the cwd. For an explicit `mode=managed`
         // (the form path), require an explicit base_branch — the form picks one
         // deliberately and the caller deserves a 400 if it's missing.
-        let repo_root = phoenix_core::git::detect_git_repo_root(&path).ok_or_else(|| {
+        let repo_root = phoenix_core::git::detect_git_repo_root(path).ok_or_else(|| {
             AppError::BadRequest("Could not determine git repository root".to_string())
         })?;
         let inferred_base = if req.mode.as_deref() == Some("auto") && req.base_branch.is_none() {
@@ -1472,7 +1467,7 @@ async fn create_conversation_with_id(
             worktree_path,
         )
     } else {
-        (crate::db::ConvMode::Direct, req.cwd.clone())
+        (crate::db::ConvMode::Direct, valid_cwd.into_raw())
     };
 
     let desired_base_branch = managed_base_branch.as_deref();
@@ -5082,10 +5077,92 @@ impl IntoResponse for AppError {
 }
 
 // ============================================================
+// Conversation cwd validation tests
+// ============================================================
+#[cfg(test)]
+mod conversation_cwd_validation_tests {
+    use super::*;
+    use crate::api::types::CreateConversationRequest;
+
+    fn create_request(cwd: String) -> CreateConversationRequest {
+        CreateConversationRequest {
+            cwd,
+            model: None,
+            text: "hello".to_string(),
+            message_id: uuid::Uuid::new_v4().to_string(),
+            images: Vec::new(),
+            files: Vec::new(),
+            mode: Some("direct".to_string()),
+            base_branch: None,
+            seed_parent_id: None,
+            seed_label: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_conversation_rejects_filesystem_root_cwd() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let err = create_conversation_with_id(
+            state,
+            "conv-root-cwd".to_string(),
+            create_request("/".to_string()),
+            Vec::new(),
+        )
+        .await
+        .expect_err("root cwd rejected");
+
+        match err {
+            AppError::BadRequest(msg) => assert!(msg.contains("filesystem root"), "got: {msg}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_conversation_rejects_cwd_that_resolves_to_root() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let err = create_conversation_with_id(
+            state,
+            "conv-dotdot-root-cwd".to_string(),
+            create_request("/..".to_string()),
+            Vec::new(),
+        )
+        .await
+        .expect_err("canonical root rejected");
+
+        match err {
+            AppError::BadRequest(msg) => assert!(msg.contains("filesystem root"), "got: {msg}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_conversation_accepts_deep_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let deep = tmp.path().join("project/src");
+        std::fs::create_dir_all(&deep).expect("deep dir");
+        let state = hard_delete_cascade_tests::make_test_state().await;
+
+        let Json(response) = create_conversation_with_id(
+            state,
+            "conv-deep-cwd".to_string(),
+            create_request(deep.to_string_lossy().to_string()),
+            Vec::new(),
+        )
+        .await
+        .expect("deep cwd accepted");
+
+        assert_eq!(
+            response.conversation["cwd"].as_str(),
+            Some(deep.to_str().unwrap())
+        );
+    }
+}
+
+// ============================================================
 // Hard-delete cascade tests (REQ-BED-032)
 // ============================================================
 #[cfg(test)]
-mod hard_delete_cascade_tests {
+pub(crate) mod hard_delete_cascade_tests {
     use super::*;
     use crate::chain_qa::ChainQa;
     use crate::db::{Database, MessageContent};
@@ -5100,7 +5177,7 @@ mod hard_delete_cascade_tests {
     /// The state machine handler is started so `runtime.try_get_handle`
     /// works when the test wants to verify SSE events; conversations
     /// are otherwise inert (no LLM calls fire).
-    async fn make_test_state() -> AppState {
+    pub(crate) async fn make_test_state() -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
         let platform = PlatformCapability::None;

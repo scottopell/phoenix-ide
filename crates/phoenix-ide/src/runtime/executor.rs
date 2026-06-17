@@ -1986,6 +1986,19 @@ where
 
         for (task, &(agent, mode)) in input.tasks.iter().zip(&resolved_tasks) {
             let cwd = task.cwd.clone().unwrap_or_else(|| parent_cwd.clone());
+            let cwd = match crate::conversation_cwd::validate_conversation_cwd(&cwd) {
+                Ok(valid) => valid.into_raw(),
+                Err(e) => {
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        format!("Invalid sub-agent working directory: {e}"),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                }
+            };
 
             // Resolve model: task field > agent default > mode default
             // (REQ-AG-005, REQ-PROJ-008). An explicit model from either the
@@ -3569,8 +3582,9 @@ where
         // terminal conversations without a state guard. Resetting to
         // repo_root gives them a valid directory rather than a deleted
         // worktree path.
+        let repo_root_cwd = crate::conversation_cwd::validate_conversation_cwd(&repo_root)?;
         self.storage
-            .update_conversation_cwd_recovery_only(conv_id, &repo_root)
+            .update_conversation_cwd_recovery_only(conv_id, repo_root_cwd.raw())
             .await?;
 
         // Inject system message
@@ -3695,7 +3709,10 @@ where
                 storage
                     .update_conversation_cwd_recovery_only(
                         &self.context.conversation_id,
-                        &approval_result.worktree_path,
+                        crate::conversation_cwd::validate_conversation_cwd(
+                            &approval_result.worktree_path,
+                        )?
+                        .raw(),
                     )
                     .await?;
                 self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
@@ -7000,21 +7017,18 @@ mod work_subagent_cwd_guard_tests {
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
-    fn runtime_in_work_mode(
-        worktree_path: &std::path::Path,
+    fn runtime_in_mode(
+        working_dir: &std::path::Path,
+        mode_context: ModeContext,
     ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
         let storage = Arc::new(InMemoryStorage::new());
         let mut context = ConvContext::new(
             "cwd-guard-conv",
-            worktree_path.to_path_buf(),
+            working_dir.to_path_buf(),
             "test-model",
             200_000,
         );
-        context.mode_context = Some(ModeContext::Work {
-            branch_name: "task-99999-x".to_string(),
-            base_branch: "main".to_string(),
-            worktree_path: worktree_path.to_string_lossy().to_string(),
-        });
+        context.mode_context = Some(mode_context);
         context.mode = crate::state_machine::state::ModeKind::Managed;
 
         let (_event_tx, event_rx) = mpsc::channel(32);
@@ -7038,6 +7052,25 @@ mod work_subagent_cwd_guard_tests {
         )
     }
 
+    fn runtime_in_work_mode(
+        worktree_path: &std::path::Path,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        runtime_in_mode(
+            worktree_path,
+            ModeContext::Work {
+                branch_name: "task-99999-x".to_string(),
+                base_branch: "main".to_string(),
+                worktree_path: worktree_path.to_string_lossy().to_string(),
+            },
+        )
+    }
+
+    fn runtime_in_direct_mode(
+        working_dir: &std::path::Path,
+    ) -> ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>> {
+        runtime_in_mode(working_dir, ModeContext::Direct)
+    }
+
     fn spawn_tool(input: SpawnAgentsInput) -> ToolCall {
         ToolCall::new("tool-spawn-1", ToolInput::SpawnAgents(input))
     }
@@ -7048,6 +7081,102 @@ mod work_subagent_cwd_guard_tests {
                 output.clone()
             }
             ToolOutcome::Cancelled { message } => message.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_direct_subagent_cwd_at_filesystem_root() {
+        let parent = TempDir::new().expect("parent tempdir");
+        let mut rt = runtime_in_direct_mode(parent.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "inspect everything".to_string(),
+                    cwd: Some("/".to_string()),
+                    mode: Some(SubAgentMode::Explore),
+                    model: None,
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                assert!(result.is_error(), "root cwd must surface as tool error");
+                let msg = tool_result_text(&result);
+                assert!(
+                    msg.contains("filesystem root"),
+                    "error should explain root cwd rejection, got: {msg}"
+                );
+            }
+            other => panic!("expected ToolComplete with cwd error, got {other:?}"),
+        }
+        assert_eq!(rt.active_work_subagents, 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_inherited_direct_subagent_cwd_at_filesystem_root() {
+        let mut rt = runtime_in_direct_mode(std::path::Path::new("/"));
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "inherit root".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Explore),
+                    model: None,
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                assert!(result.is_error(), "inherited root cwd must be rejected");
+                let msg = tool_result_text(&result);
+                assert!(msg.contains("filesystem root"), "got: {msg}");
+            }
+            other => panic!("expected ToolComplete with cwd error, got {other:?}"),
+        }
+        assert_eq!(rt.active_work_subagents, 0);
+    }
+
+    #[tokio::test]
+    async fn accepts_direct_subagent_cwd_in_deep_directory() {
+        let parent = TempDir::new().expect("parent tempdir");
+        let deep = parent.path().join("project/src");
+        std::fs::create_dir_all(&deep).expect("deep dir");
+        let mut rt = runtime_in_direct_mode(parent.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "inspect project".to_string(),
+                    cwd: Some(deep.to_string_lossy().to_string()),
+                    mode: Some(SubAgentMode::Explore),
+                    model: None,
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                let msg = tool_result_text(&result);
+                assert!(
+                    !msg.contains("filesystem root"),
+                    "deep cwd should not trip root-floor guard; got: {msg}"
+                );
+            }
+            Some(Event::SpawnAgentsComplete { .. }) => {}
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 

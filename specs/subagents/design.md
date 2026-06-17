@@ -55,9 +55,12 @@ Two layers cooperate:
    cancellation propagation). Normative in `bedrock.allium`.
 
 3. **Cross-spec seam** — projects.allium owns the worktree contract
-   (`WorkSubAgentInheritsWorktree`, `ExploreSubAgentDirectory`). The
-   cwd-scoping invariant in `subagents.allium` keeps Work sub-agent
-   writes inside that boundary.
+   (`WorkSubAgentInheritsWorktree`, `ExploreSubAgentDirectory`) and the
+   universal working-directory root floor: a conversation or sub-agent cwd
+   must canonicalise to an existing non-root directory before it is persisted
+   or used to build a runtime context. The cwd-scoping invariant in
+   `subagents.allium` additionally keeps Work sub-agent writes inside the
+   parent's worktree boundary.
 
 4. **Named-agent seam** — [`agents.allium`](../agents/agents.allium) owns
    agent discovery, the `agent_type` schema enum, and persona composition.
@@ -80,6 +83,11 @@ Two layers cooperate:
 
 The mode-validation, one-writer, and cwd-scoping rules are normative in
 `subagents.allium` §§1–4.
+
+Every sub-agent mode inherits or accepts only a cwd that canonicalises to an
+existing non-root directory. The root-floor guard is independent of write
+capability because read-only search/listing tools rooted at the filesystem root
+can consume unbounded resources.
 
 ## Defaulting (config)
 

@@ -1592,6 +1592,23 @@ impl RuntimeManager {
             SubAgentMode::Work => parent_conv.conv_mode.clone(),
         };
 
+        let spec_cwd = match crate::conversation_cwd::validate_conversation_cwd(&spec.cwd) {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                tracing::warn!(agent_id = %spec.agent_id, cwd = %spec.cwd, error = %e, "Rejected sub-agent spawn with invalid cwd");
+                let _ = parent_event_tx
+                    .send(Event::SubAgentResult {
+                        agent_id: spec.agent_id,
+                        outcome: SubAgentOutcome::Failure {
+                            error: format!("Invalid sub-agent working directory: {e}"),
+                            error_kind: crate::db::ErrorKind::SubAgentError,
+                        },
+                    })
+                    .await;
+                return;
+            }
+        };
+
         // 2. Create conversation in DB with correct conv_mode
         let slug = format!("sub-{}", spec.agent_id.get(..8).unwrap_or(&spec.agent_id));
         let conv = match self
@@ -1599,7 +1616,7 @@ impl RuntimeManager {
             .create_conversation_with_project(
                 &spec.agent_id,
                 &slug,
-                &spec.cwd,
+                spec_cwd.raw(),
                 false, // user_initiated = false
                 Some(&parent_conversation_id),
                 Some(&spec.model_id), // inherit parent's model
@@ -1671,7 +1688,7 @@ impl RuntimeManager {
         let context_window = self.llm_registry.context_window(&spec.model_id);
         let mut conv_context = ConvContext::sub_agent(
             &conv.id,
-            PathBuf::from(&conv.cwd),
+            spec_cwd.path_buf(),
             &spec.model_id,
             context_window,
             root_conversation_id,
@@ -1873,6 +1890,11 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
+        let conv_cwd = crate::conversation_cwd::validate_conversation_cwd_for_runtime(
+            conversation_id,
+            &conv.cwd,
+        )?;
+
         // Check if this is a sub-agent being resumed (shouldn't happen normally)
         let is_sub_agent = conv.parent_conversation_id.is_some();
 
@@ -1887,18 +1909,13 @@ impl RuntimeManager {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
             ConvContext::sub_agent(
                 &conv.id,
-                PathBuf::from(&conv.cwd),
+                conv_cwd.path_buf(),
                 &model_id,
                 context_window,
                 root_id,
             )
         } else {
-            ConvContext::new(
-                &conv.id,
-                PathBuf::from(&conv.cwd),
-                &model_id,
-                context_window,
-            )
+            ConvContext::new(&conv.id, conv_cwd.path_buf(), &model_id, context_window)
         };
         context.mode_context = Some(mode_context);
         context.desired_base_branch = conv.desired_base_branch.clone();

@@ -263,6 +263,23 @@ config {
 -- 1. PROJECT DETECTION & MODE (REQ-PROJ-001, 002, 016, 018)
 -- ===========================================================
 
+-- REQ-PROJ-000: Conversation cwd must not be the filesystem root.
+rule ConversationRootCwdRejected {
+    when: ConversationCreated(conversation, directory)
+
+    requires: directory_resolves_to_filesystem_root(directory)
+        or not directory_resolves_to_existing_directory(directory)
+
+    ensures: ConversationCreationRejected(conversation,
+        reason: "Conversation cwd must be an existing non-root directory")
+
+    @guidance
+        -- Validate before persistence and before runtime context creation.
+        -- Resolution follows symlinks and parent-directory traversal. The
+        -- root floor is independent of mode because read-only tools can
+        -- consume unbounded resources when rooted at the filesystem root.
+}
+
 -- REQ-PROJ-001: Git directory detected as project
 rule GitDirectoryDetected {
     when: ConversationCreated(conversation, directory)
