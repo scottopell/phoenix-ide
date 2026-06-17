@@ -732,18 +732,25 @@ WITH norm AS (
            END AS arr
     FROM conversations c
 ),
+elems AS (
+    -- Substitute an empty object for any non-object array element so the
+    -- json_extract predicates below never parse a scalar element (a bare
+    -- string would raise SQLite 'malformed JSON' and abort the migration).
+    SELECT norm.conversation_id AS conversation_id,
+           e.key AS ordinal,
+           CASE WHEN e.type = 'object' THEN e.value ELSE '{}' END AS entry
+    FROM norm, json_each(norm.arr) e
+),
 valid_entries AS (
     SELECT conversation_id, ordinal, entry FROM (
-        SELECT norm.conversation_id AS conversation_id,
-               e.key AS ordinal,
-               e.value AS entry,
+        SELECT conversation_id, ordinal, entry,
                ROW_NUMBER() OVER (
-                   PARTITION BY json_extract(e.value, '$.message_id')
-                   ORDER BY norm.conversation_id, e.key
+                   PARTITION BY json_extract(entry, '$.message_id')
+                   ORDER BY conversation_id, ordinal
                ) AS rn
-        FROM norm, json_each(norm.arr) e
-        WHERE json_extract(e.value, '$.message_id') IS NOT NULL
-          AND json_extract(e.value, '$.text') IS NOT NULL
+        FROM elems
+        WHERE json_extract(entry, '$.message_id') IS NOT NULL
+          AND json_extract(entry, '$.text') IS NOT NULL
     )
     WHERE rn = 1
 )
@@ -781,31 +788,46 @@ WITH norm AS (
            END AS arr
     FROM conversations c
 ),
+elems AS (
+    -- Substitute an empty object for any non-object array element so the
+    -- json_extract predicates below never parse a scalar element (a bare
+    -- string would raise SQLite 'malformed JSON' and abort the migration).
+    SELECT norm.conversation_id AS conversation_id,
+           e.key AS ordinal,
+           CASE WHEN e.type = 'object' THEN e.value ELSE '{}' END AS entry
+    FROM norm, json_each(norm.arr) e
+),
 valid_entries AS (
-    SELECT entry FROM (
-        SELECT e.value AS entry,
+    SELECT conversation_id, ordinal, entry FROM (
+        SELECT conversation_id, ordinal, entry,
                ROW_NUMBER() OVER (
-                   PARTITION BY json_extract(e.value, '$.message_id')
-                   ORDER BY norm.conversation_id, e.key
+                   PARTITION BY json_extract(entry, '$.message_id')
+                   ORDER BY conversation_id, ordinal
                ) AS rn
-        FROM norm, json_each(norm.arr) e
-        WHERE json_extract(e.value, '$.message_id') IS NOT NULL
-          AND json_extract(e.value, '$.text') IS NOT NULL
+        FROM elems
+        WHERE json_extract(entry, '$.message_id') IS NOT NULL
+          AND json_extract(entry, '$.text') IS NOT NULL
     )
     WHERE rn = 1
+),
+file_elems AS (
+    SELECT json_extract(entry, '$.message_id') AS message_id,
+           f.key AS file_ordinal,
+           CASE WHEN f.type = 'object' THEN f.value ELSE '{}' END AS fval
+    FROM valid_entries, json_each(entry, '$.files') f
+    WHERE json_type(entry, '$.files') = 'array'
 )
-SELECT json_extract(entry, '$.message_id'),
-       f.key,
-       json_extract(f.value, '$.original_name'),
-       json_extract(f.value, '$.media_type'),
-       json_extract(f.value, '$.size_bytes'),
-       json_extract(f.value, '$.stored_path')
-FROM valid_entries, json_each(entry, '$.files') f
-WHERE json_type(entry, '$.files') = 'array'
-  AND json_extract(f.value, '$.original_name') IS NOT NULL
-  AND json_extract(f.value, '$.media_type') IS NOT NULL
-  AND json_extract(f.value, '$.size_bytes') IS NOT NULL
-  AND json_extract(f.value, '$.stored_path') IS NOT NULL;
+SELECT message_id,
+       file_ordinal,
+       json_extract(fval, '$.original_name'),
+       json_extract(fval, '$.media_type'),
+       json_extract(fval, '$.size_bytes'),
+       json_extract(fval, '$.stored_path')
+FROM file_elems
+WHERE json_extract(fval, '$.original_name') IS NOT NULL
+  AND json_extract(fval, '$.media_type') IS NOT NULL
+  AND json_extract(fval, '$.size_bytes') IS NOT NULL
+  AND json_extract(fval, '$.stored_path') IS NOT NULL;
 
 INSERT INTO steering_message_images
     (message_id, image_ordinal, media_type, data)
@@ -821,27 +843,48 @@ WITH norm AS (
            END AS arr
     FROM conversations c
 ),
+elems AS (
+    -- Substitute an empty object for any non-object array element so the
+    -- json_extract predicates below never parse a scalar element (a bare
+    -- string would raise SQLite 'malformed JSON' and abort the migration).
+    SELECT norm.conversation_id AS conversation_id,
+           e.key AS ordinal,
+           CASE WHEN e.type = 'object' THEN e.value ELSE '{}' END AS entry
+    FROM norm, json_each(norm.arr) e
+),
 valid_entries AS (
-    SELECT entry FROM (
-        SELECT e.value AS entry,
+    SELECT conversation_id, ordinal, entry FROM (
+        SELECT conversation_id, ordinal, entry,
                ROW_NUMBER() OVER (
-                   PARTITION BY json_extract(e.value, '$.message_id')
-                   ORDER BY norm.conversation_id, e.key
+                   PARTITION BY json_extract(entry, '$.message_id')
+                   ORDER BY conversation_id, ordinal
                ) AS rn
-        FROM norm, json_each(norm.arr) e
-        WHERE json_extract(e.value, '$.message_id') IS NOT NULL
-          AND json_extract(e.value, '$.text') IS NOT NULL
+        FROM elems
+        WHERE json_extract(entry, '$.message_id') IS NOT NULL
+          AND json_extract(entry, '$.text') IS NOT NULL
     )
     WHERE rn = 1
+),
+image_elems AS (
+    SELECT json_extract(entry, '$.message_id') AS message_id,
+           im.key AS image_ordinal,
+           CASE WHEN im.type = 'object' THEN im.value ELSE '{}' END AS imval
+    FROM valid_entries, json_each(entry, '$.images') im
+    WHERE json_type(entry, '$.images') = 'array'
 )
-SELECT json_extract(entry, '$.message_id'),
-       im.key,
-       json_extract(im.value, '$.media_type'),
-       json_extract(im.value, '$.data')
-FROM valid_entries, json_each(entry, '$.images') im
-WHERE json_type(entry, '$.images') = 'array'
-  AND json_extract(im.value, '$.media_type') IS NOT NULL
-  AND json_extract(im.value, '$.data') IS NOT NULL;
+SELECT message_id,
+       image_ordinal,
+       json_extract(imval, '$.media_type'),
+       json_extract(imval, '$.data')
+FROM image_elems
+WHERE json_extract(imval, '$.media_type') IS NOT NULL
+  AND json_extract(imval, '$.data') IS NOT NULL;
+
+-- Clear the now-migrated blob so the column carries no data: the child tables
+-- are the single source of truth and nothing reads this column anymore.
+UPDATE conversations
+SET steering_queue = '[]'
+WHERE steering_queue IS NOT NULL AND steering_queue <> '[]';
 ";
 
 /// Run all pending migrations against the database.
@@ -1113,9 +1156,13 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         // c-bad: not valid JSON at all.
+        // c-scalar: valid array but a non-object element + an object whose
+        //   `files` array holds a scalar element (both must be skipped, not raise).
         // c-dup: same message_id twice (first FIFO occurrence wins).
         // c-missing: an entry with no `text` (dropped) alongside a valid one.
         // c-partial-skill: skill_invocation missing `body` → skill_* left NULL.
+        let scalar =
+            r#"["bad",{"text":"ok2","message_id":"m-scalar","images":[],"files":["junk"]}]"#;
         let dup = r#"[{"text":"a","message_id":"d1","images":[],"files":[]},
                       {"text":"b","message_id":"d1","images":[],"files":[]}]"#;
         let missing = r#"[{"message_id":"m-notext","images":[],"files":[]},
@@ -1124,6 +1171,7 @@ mod tests {
                            "skill_invocation":{"name":"build","skill_dir":"/d"}}]"#;
         for (id, q) in [
             ("c-bad", "{not json"),
+            ("c-scalar", scalar),
             ("c-dup", dup),
             ("c-missing", missing),
             ("c-partial-skill", partial),
@@ -1139,7 +1187,7 @@ mod tests {
             .unwrap();
         }
 
-        // Must not raise despite the corrupt/duplicate/invalid rows.
+        // Must not raise despite the corrupt/scalar/duplicate/invalid rows.
         run_pending_migrations(&pool).await.unwrap();
 
         let ids = |conv: &'static str| {
@@ -1157,6 +1205,16 @@ mod tests {
 
         // Malformed JSON → no rows (skipped, not aborted).
         assert!(ids("c-bad").await.is_empty());
+        // Non-object array element skipped; the valid object survives with no
+        // file rows (its scalar `files` element is dropped, not extracted).
+        assert_eq!(ids("c-scalar").await, vec!["m-scalar".to_string()]);
+        let scalar_files: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM steering_message_files WHERE message_id = 'm-scalar'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scalar_files, 0);
         // Duplicate message_id → exactly one row kept.
         assert_eq!(ids("c-dup").await, vec!["d1".to_string()]);
         // Missing-text entry dropped, valid one kept.
@@ -1169,6 +1227,14 @@ mod tests {
                 .await
                 .unwrap();
         assert!(skill_name.is_none());
+
+        // The legacy blob is cleared on every migrated row (no parallel rep).
+        let dirty: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE steering_queue <> '[]'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(dirty, 0);
     }
 
     /// Migration 025: attachments embedded in `messages.content` are extracted
