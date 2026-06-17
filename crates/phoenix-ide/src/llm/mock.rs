@@ -6,7 +6,7 @@
 //!
 //! Test-driver markers (parsed from the latest user message text):
 //! - `[[scenario:NAME]]` — force a specific scripted response
-//!   (`plain_text`, `markdown`, `bash`, `read_file`, `think`,
+//!   (`plain_text`, `markdown`, `mermaid`, `bash`, `read_file`, `think`,
 //!   `multi_tool`, `long`, `patch`, `spawn_agents`).
 //! - `[[perf:N]]` — deterministic text-only response of ~N words
 //!   (performance fingerprint, no rand).
@@ -61,6 +61,7 @@ pub struct MockLlmService;
 enum Scenario {
     PlainText,
     Markdown,
+    Mermaid,
     BashToolCall,
     ReadFileToolCall,
     ThinkThenRespond,
@@ -130,8 +131,8 @@ impl Scenario {
 /// Scenario-fixture marker: a user message containing `[[scenario:NAME]]`
 /// forces selection of a specific scripted response, bypassing the hash-based
 /// roulette. Symmetric with `[[perf:N]]` — both make the mock authorable for
-/// E2E tests. Recognized NAMEs: `plain_text`, `markdown`, `bash`, `read_file`,
-/// `think`, `multi_tool`, `long`, `patch`, `spawn_agents`. Dev-only: mock is
+/// E2E tests. Recognized NAMEs: `plain_text`, `markdown`, `mermaid`, `bash`,
+/// `read_file`, `think`, `multi_tool`, `long`, `patch`, `spawn_agents`. Dev-only: mock is
 /// opt-in (`PHOENIX_ENABLE_MOCK_MODEL=1`).
 fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
     let text = request.messages.iter().rev().find_map(|m| {
@@ -156,6 +157,7 @@ fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
     match name {
         "plain_text" => Some(Scenario::PlainText),
         "markdown" => Some(Scenario::Markdown),
+        "mermaid" => Some(Scenario::Mermaid),
         "bash" => Some(Scenario::BashToolCall),
         "read_file" => Some(Scenario::ReadFileToolCall),
         "think" => Some(Scenario::ThinkThenRespond),
@@ -223,6 +225,33 @@ This preserves `Authorization` while still stripping internal auth headers.
 | `Authorization` | Stripped | Preserved |
 | `Auth-Token` | Stripped | Stripped |
 | `Auth-Internal` | Stripped | Stripped |"#;
+
+const MERMAID_TEXT: &str = r#"## Mermaid fixture
+
+A flowchart should render as a diagram while preserving the source.
+
+```mermaid
+flowchart TD
+  User[Developer] --> Prompt["Ask Phoenix for a diagram"]
+  Prompt --> Mock{Mock model}
+  Mock --> Fence["mermaid fenced code block"]
+  Fence --> Renderer[MermaidDiagram component]
+  Renderer --> SVG[Rendered SVG]
+```
+
+A sequence diagram in the same response exercises multiple diagram blocks.
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant P as Phoenix UI
+  participant M as Mock LLM
+  U->>P: Send [[scenario:mermaid]]
+  P->>M: Stream request
+  M-->>P: Markdown with Mermaid fences
+  P-->>U: Render themed diagrams
+```
+"#;
 
 const LONG_TEXT: &str = "Let me walk through this step by step.\n\n\
 First, I need to understand the data flow. The input comes from the WebSocket \
@@ -472,6 +501,13 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
                 text: MARKDOWN_TEXT.to_string(),
             }],
             MARKDOWN_TEXT.to_string(),
+        ),
+
+        Scenario::Mermaid => (
+            vec![ContentBlock::Text {
+                text: MERMAID_TEXT.to_string(),
+            }],
+            MERMAID_TEXT.to_string(),
         ),
 
         Scenario::BashToolCall => {
@@ -809,6 +845,7 @@ mod tests {
         let cases = [
             ("[[scenario:plain_text]] hi", Scenario::PlainText),
             ("[[scenario:markdown]]", Scenario::Markdown),
+            ("[[scenario:mermaid]]", Scenario::Mermaid),
             ("[[scenario:bash]]", Scenario::BashToolCall),
             ("[[scenario:read_file]]", Scenario::ReadFileToolCall),
             ("[[scenario:think]]", Scenario::ThinkThenRespond),
