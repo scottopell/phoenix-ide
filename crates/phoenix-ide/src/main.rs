@@ -13,6 +13,7 @@ mod message_expander;
 mod project_opportunistic_build_warm;
 mod resolution_root;
 mod runtime;
+mod suggest;
 mod system_prompt;
 mod title_generator;
 mod tls;

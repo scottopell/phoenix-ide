@@ -196,6 +196,15 @@ class PhoenixClient:
         )
         resp.raise_for_status()
 
+    def suggest(self, query: str, model: str | None = None) -> list[str]:
+        """One-shot shell-command suggestion. Stateless: no conversation."""
+        payload: dict = {"query": query}
+        if model:
+            payload["model"] = model
+        resp = self.http.post(f"{self.base_url}/api/suggest", json=payload)
+        resp.raise_for_status()
+        return resp.json().get("commands", [])
+
     def get_messages(self, conv_id: str, after_sequence: int = 0) -> dict:
         """Get conversation with messages."""
         params = {}
@@ -325,6 +334,19 @@ class PhoenixClient:
             return self.stream_until_complete(conv_id, timeout)
 
 
+def osc8_run_link(command: str) -> str:
+    """Render a command as a clickable OSC 8 hyperlink with a phxrun: URI.
+
+    The visible text is the command itself (prefixed with ▶ to signal it is
+    runnable); the link target carries the base64-encoded command. Phoenix's
+    terminal intercepts phxrun: links and drops the decoded command onto the
+    shell prompt for the user to review and run.
+    """
+    b64 = base64.b64encode(command.encode()).decode()
+    esc, st = "\033", "\033\\"
+    return f"{esc}]8;;phxrun:{b64}{st}▶ {command}{esc}]8;;{st}"
+
+
 def encode_image(path: str) -> dict:
     """Read and base64-encode an image file."""
     p = Path(path)
@@ -426,6 +448,9 @@ def format_response(data: dict) -> str:
               help='Model ID for new conversations (e.g. claude-4.5-sonnet)')
 @click.option('--list-models', is_flag=True, help='List available models and exit')
 @click.option('--list-projects', is_flag=True, help='List projects and exit')
+@click.option('--suggest', 'suggest', is_flag=True,
+              help='One-shot shell-command suggestion (stateless). MESSAGE may be piped on stdin. '
+                   'Emits clickable run-links for the Phoenix terminal.')
 @click.option('--api-url', default=None,
               help='API endpoint URL (default: auto-detect from dev.py or PHOENIX_API_URL)')
 @click.option('--timeout', default=600, help='Timeout in seconds')
@@ -433,7 +458,7 @@ def format_response(data: dict) -> str:
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
 @click.option('--password', envvar='PHOENIX_PASSWORD', default=None,
               help='Password for authenticated access (or set PHOENIX_PASSWORD)')
-def main(message, conversation, directory, images, model, list_models, list_projects, api_url, timeout, poll_interval, poll, password):
+def main(message, conversation, directory, images, model, list_models, list_projects, suggest, api_url, timeout, poll_interval, poll, password):
     """Send a message to Phoenix IDE and wait for response.
 
     Uses SSE (Server-Sent Events) for real-time streaming by default.
@@ -482,6 +507,22 @@ def main(message, conversation, directory, images, model, list_models, list_proj
             for p in projects:
                 convs = p.get('conversation_count', 0)
                 click.echo(f"  {p.get('name', p['id']):30s} {convs} conversation(s)  {p.get('repo_root', '')}")
+        return
+
+    if suggest:
+        # Query comes from MESSAGE or, if absent, stdin (so prompts can be piped).
+        query = message
+        if not query and not sys.stdin.isatty():
+            query = sys.stdin.read().strip()
+        if not query:
+            raise click.UsageError("--suggest needs a query as MESSAGE or piped on stdin.")
+        commands = client.suggest(query, model=model)
+        if not commands:
+            click.echo("No commands suggested.", err=True)
+            return
+        click.echo("Suggested commands (click ▶ to drop onto your prompt):", err=True)
+        for command in commands:
+            print(osc8_run_link(command))
         return
 
     if not message:

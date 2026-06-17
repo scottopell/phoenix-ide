@@ -201,6 +201,18 @@ function dataFrame(payload: Uint8Array): Uint8Array {
   return buf;
 }
 
+/** URI scheme for click-to-run command suggestions (emitted by `phx --suggest`
+ *  as OSC 8 hyperlinks). The decoded command is dropped onto the shell prompt
+ *  for the user to review and run — never auto-executed. */
+const PHXRUN_SCHEME = 'phxrun:';
+
+/** Decode a base64 string into UTF-8 text (atob yields a binary string). */
+function decodeBase64Utf8(b64: string): string {
+  const bin = atob(b64);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
 /** Truncate from the LEFT, preserving the tail (cwd + prompt glyph). */
 function truncateLeft(s: string, max: number): string {
   if (s.length <= max) return s;
@@ -418,6 +430,33 @@ export function TerminalPanel({
       // below); this is only for the modifier-drag path that yields an
       // xterm-side selection.
       macOptionClickForcesSelection: true,
+      // Intercept OSC 8 hyperlinks. `phxrun:` links are command suggestions
+      // (from `phx --suggest`): clicking drops the decoded command onto the
+      // shell prompt WITHOUT a trailing newline, so the user reviews it and
+      // presses Enter — suggestion, never auto-execution. Ordinary http(s)
+      // links keep the default open-in-new-tab behavior. allowNonHttpProtocols
+      // is required for xterm to surface the custom scheme to this handler.
+      linkHandler: {
+        allowNonHttpProtocols: true,
+        activate: (_event, uri) => {
+          if (uri.startsWith(PHXRUN_SCHEME)) {
+            let command: string;
+            try {
+              command = decodeBase64Utf8(uri.slice(PHXRUN_SCHEME.length));
+            } catch {
+              return;
+            }
+            const ws = wsRef.current;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(dataFrame(new TextEncoder().encode(command)));
+            }
+            return;
+          }
+          if (uri.startsWith('http://') || uri.startsWith('https://')) {
+            window.open(uri, '_blank', 'noopener,noreferrer');
+          }
+        },
+      },
     });
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
