@@ -7,6 +7,7 @@ import { useTheme } from '../../hooks/useTheme';
 import { oneDark, oneLight } from '../../utils/syntaxHighlighter';
 import { AnnotatableBlock } from './AnnotatableBlock';
 import type { ViewerBodyProps } from './AnnotatableBlock';
+import { MermaidDiagram } from '../MermaidDiagram';
 
 // Stable plugin reference — a fresh array each render defeats ReactMarkdown's
 // internal memoization and forces a full re-parse.
@@ -65,7 +66,11 @@ export function MarkdownViewerBody({
       li: annotatable('li'),
       blockquote: annotatable('blockquote'),
       code: ({ inline, className, children, ...props }: { inline?: boolean; className?: string; children?: React.ReactNode; [key: string]: unknown }) => {
-        const match = /language-(\w+)/.exec(className || '');
+        const match = /language-([^\s]+)/.exec(className || '');
+        const language = match?.[1]?.toLowerCase();
+        if (!inline && language === 'mermaid') {
+          return <MermaidDiagram code={String(children)} />;
+        }
         return !inline && match ? (
           <SyntaxHighlighter style={syntaxStyle} language={match[1]} PreTag="div" {...props}>
             {String(children).replace(/\n$/, '')}

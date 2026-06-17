@@ -7,6 +7,7 @@ import type { StreamingBuffer } from '../conversation/atom';
 import { useStreamingBuffer } from '../conversation/useConversationAtom';
 import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
 import { ConversationMarkdownAnchor } from './conversationMarkdown';
+import { MermaidDiagram } from './MermaidDiagram';
 
 // Stable markdown configuration — avoids creating new references on every render
 const REMARK_PLUGINS = [remarkGfm];
@@ -160,6 +161,10 @@ const StreamingBlock = memo(function StreamingBlock({ block, syntaxStyle }: Stre
   }
 
   if (block.complete) {
+    if ((block.lang || '').toLowerCase() === 'mermaid') {
+      return <MermaidDiagram code={block.content} />;
+    }
+
     return (
       <SyntaxHighlighter
         style={syntaxStyle}

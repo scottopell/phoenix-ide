@@ -1,9 +1,20 @@
+import mermaid from 'mermaid';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MetaViewer } from './MetaViewer';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import type { MetaViewerPayload } from './metaViewerTypes';
 import { resetCodeViewMock } from './__testutils__/codeViewMock';
+
+vi.mock('mermaid', () => ({
+  default: {
+    initialize: vi.fn(),
+    render: vi.fn((_id: string, code: string) => Promise.resolve({
+      svg: `<svg role="img" aria-label="Viewer Mermaid"><text>${code}</text></svg>`,
+      bindFunctions: vi.fn(),
+    })),
+  },
+}));
 
 // Code payloads render through Pierre's CodeView; stub it so its async
 // tokenizer doesn't run under happy-dom (see DiffView.test).
@@ -85,6 +96,14 @@ describe('MetaViewer payload routing', () => {
   it('routes a markdown payload to rendered markdown', () => {
     renderViewer({ ...textCommon, kind: 'markdown', content: '# Hello\n\nbody text' });
     expect(screen.getByRole('heading', { name: 'Hello' })).toBeInTheDocument();
+  });
+
+  it('routes markdown mermaid fences to the shared diagram renderer', async () => {
+    renderViewer({ ...textCommon, kind: 'markdown', content: '```mermaid\nflowchart TD\n  A --> B\n```' });
+
+    expect(await screen.findByTestId('mermaid-diagram')).toBeInTheDocument();
+    expect(await screen.findByRole('img', { name: 'Viewer Mermaid' })).toBeInTheDocument();
+    expect(mermaid.render).toHaveBeenCalledWith(expect.stringMatching(/^phoenix-mermaid-/), 'flowchart TD\n  A --> B');
   });
 
   it('routes a code payload to the Pierre file code view, not the legacy code body', () => {

@@ -1,3 +1,4 @@
+import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
@@ -11,6 +12,16 @@ import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposa
 import { ForkProposalReview } from './ForkProposalReview';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { buildRenderUnits } from '../conversation/renderUnits';
+
+vi.mock('mermaid', () => ({
+  default: {
+    initialize: vi.fn(),
+    render: vi.fn((_id: string, code: string) => Promise.resolve({
+      svg: `<svg role="img" aria-label="Rendered Mermaid"><text>${code}</text></svg>`,
+      bindFunctions: vi.fn(),
+    })),
+  },
+}));
 
 vi.mock('../utils/clipboard', () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
@@ -573,6 +584,56 @@ describe('markdown table rendering', () => {
 describe('finalized code fence highlighting', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+
+  it('renders mermaid fences as diagrams with source controls', async () => {
+    const mermaidSource = 'flowchart TD\n  User[Developer] --> Cmd["./dda.py inv"]';
+
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-mermaid', [{
+            type: 'text',
+            text: `\`\`\`mermaid\n${mermaidSource}\n\`\`\``,
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('img', { name: 'Rendered Mermaid' })).toBeInTheDocument();
+    expect(mermaid.render).toHaveBeenCalledWith(expect.stringMatching(/^phoenix-mermaid-/), mermaidSource);
+    expect(container.querySelector('code.language-mermaid')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Source' }));
+
+    expect(screen.getByText(/flowchart TD/)).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Copy Mermaid source' }));
+    });
+    expect(copyToClipboard).toHaveBeenCalledWith(mermaidSource);
+  });
+
+  it('falls back to source when mermaid rendering fails', async () => {
+    vi.mocked(mermaid.render).mockRejectedValueOnce(new Error('Parse error on line 2'));
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-mermaid-error', [{
+            type: 'text',
+            text: '```mermaid\nnot a diagram\n```',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText('Mermaid render failed.')).toBeInTheDocument();
+    expect(screen.getByText('Parse error on line 2')).toBeInTheDocument();
+    expect(screen.getByText('not a diagram')).toBeInTheDocument();
+    expect(screen.queryByRole('img', { name: 'Rendered Mermaid' })).not.toBeInTheDocument();
   });
 
   it('renders readable code immediately and upgrades highlighting during idle time', async () => {

@@ -933,6 +933,7 @@ body {
   hyphens: none;
 }
 
+
 .deferred-code {
   display: block;
   font-family: inherit;
@@ -940,6 +941,123 @@ body {
   white-space: pre;
   background: transparent;
   color: inherit;
+}
+
+.mermaid-diagram-pre {
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+}
+
+.mermaid-diagram {
+  margin: 16px 0;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-secondary) 86%, var(--bg-primary));
+  overflow: hidden;
+}
+
+.mermaid-diagram-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--bg-tertiary) 72%, transparent);
+}
+
+.mermaid-diagram-tabs {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-primary);
+}
+
+.mermaid-diagram-tab {
+  border: 0;
+  border-radius: 6px;
+  padding: 4px 9px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.mermaid-diagram-tab.active {
+  background: var(--accent-blue);
+  color: var(--bg-primary);
+}
+
+.mermaid-diagram-tab:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.mermaid-copy-source.copy-btn {
+  width: 28px;
+  height: 28px;
+}
+
+.mermaid-diagram-body {
+  padding: 16px;
+  overflow-x: auto;
+}
+
+.mermaid-svg {
+  display: flex;
+  justify-content: center;
+  min-width: min-content;
+}
+
+.mermaid-svg svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.mermaid-source {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--code-bg);
+  color: var(--text-primary);
+  overflow-x: auto;
+}
+
+.mermaid-source-code {
+  display: block;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font-family: var(--font-mono);
+  white-space: pre;
+}
+
+.mermaid-diagram-error {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent-red) 55%, var(--border-color));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent-red) 10%, var(--bg-secondary));
+  color: var(--text-primary);
+  font-size: 0.85rem;
+}
+
+.mermaid-diagram-error span,
+.mermaid-diagram-loading {
+  color: var(--text-secondary);
+}
+
+.mermaid-diagram-loading {
+  padding: 24px;
+  text-align: center;
 }
 
 /* Images in messages */
