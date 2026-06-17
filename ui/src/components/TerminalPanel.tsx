@@ -871,25 +871,40 @@ export function TerminalPanel({
     term.options.theme = readXtermTheme();
   }, [theme]);
 
-  // Refit when the parent height changes (drag-resize).
+  // Refit on any container size change — drag-resize (height), sidebar
+  // resize/collapse and the standalone /terminal layout (width-only), and
+  // window resize. REQ-TPANEL-002 requires the panel stay usable across
+  // window resize and layout change, not just height changes; observing the
+  // element catches all of them, whereas keying off the `height` prop misses
+  // width-only changes and leaves xterm with stale columns.
   useEffect(() => {
-    if (collapsed) return;
-    const fit = fitAddonRef.current;
-    const term = termRef.current;
-    const ws = wsRef.current;
-    if (!fit || !term) return;
-    const id = requestAnimationFrame(() => {
-      try {
-        fit.fit();
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(resizeFrame(term.cols, term.rows));
+    const el = containerRef.current;
+    if (!el) return;
+    let raf = 0;
+    const ro = new ResizeObserver(() => {
+      if (collapsedRef.current) return;
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const fit = fitAddonRef.current;
+        const term = termRef.current;
+        const ws = wsRef.current;
+        if (!fit || !term) return;
+        try {
+          fit.fit();
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(resizeFrame(term.cols, term.rows));
+          }
+        } catch {
+          // FitAddon throws if the container is 0×0; a later resize retries.
         }
-      } catch {
-        // FitAddon throws if the container is 0×0; ignore.
-      }
+      });
     });
-    return () => cancelAnimationFrame(id);
-  }, [height, collapsed]);
+    ro.observe(el);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+  }, []);
 
   // Reset unread counter when collapse flips true → false
   useEffect(() => {

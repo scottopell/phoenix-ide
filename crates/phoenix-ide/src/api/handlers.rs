@@ -73,6 +73,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/c/:slug", get(serve_spa))
         // New conversation page
         .route("/new", get(serve_spa))
+        // Dedicated home-terminal page (SPA-rendered)
+        .route("/terminal", get(serve_spa))
         // Codex/ChatGPT login page (SPA-rendered)
         .route("/codex/login", get(serve_spa))
         // About this deployment page (SPA-rendered)

@@ -1,10 +1,9 @@
 import { useLayoutEffect, useRef, useState } from 'react';
 import { TerminalPanel } from '../components/TerminalPanel';
 
-// Dedicated full-page mount of the singleton global terminal (WorkScope::Global,
-// $HOME, one shared tmux session). It is the same scope the `/new` pane attaches
-// to, so navigating here and expanding the pane there reclaim the *same* PTY and
-// tmux session — never two competing shells.
+// Dedicated full-page mount of the singleton global terminal. Shared-session
+// semantics across the `/new` pane and this route are specified in
+// specs/terminal REQ-TERM-WS-001 (both target WorkScope::Global).
 //
 // TerminalPanel is sized in absolute pixels (it drives xterm's FitAddon off the
 // `height` prop), so the page measures its own content box and feeds that height

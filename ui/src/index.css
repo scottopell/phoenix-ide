@@ -7022,8 +7022,13 @@ html * {
   overflow: hidden;
 }
 
+/* Own viewport height rather than borrowing it from the desktop flex parent:
+   below the desktop breakpoint DesktopLayout drops the `.desktop-main`/
+   `.desktop-layout` wrappers, so a flex-only `.terminal-page` would collapse to
+   0 height and the page would measure clientHeight === 0 and never mount. */
 .terminal-page {
-  flex: 1 1 auto;
+  height: 100vh;
+  height: 100dvh;
   min-height: 0;
   display: flex;
   flex-direction: column;
