@@ -601,7 +601,53 @@ describe('WorkControlBar — PR feedback freshness + coverage (#288)', () => {
 
     const button = screen.getByTestId('address-feedback-button');
     expect(button.querySelector('.work-actions-pr-freshness')?.textContent).toBe(
-      '1 comment updated',
+      '1 updated',
+    );
+  });
+
+  it('renders no freshness badge when there is no actionable freshness signal', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-resolved-only"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 144,
+          url: 'https://gh/pr/144',
+          display_state: 'open',
+        })}
+      />,
+    );
+
+    const button = screen.getByTestId('address-feedback-button');
+    expect(button.querySelector('.work-actions-pr-freshness')).toBeNull();
+  });
+
+  it('renders edited actionable feedback as "N updated" with degraded coverage prefix', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-edited-incomplete"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 143,
+          url: 'https://gh/pr/143',
+          display_state: 'open',
+          feedback_freshness: { state: 'edited', count: 2 },
+          feedback_coverage: { kind: 'incomplete', surfaces: ['review_threads'] },
+        })}
+      />,
+    );
+
+    const button = screen.getByTestId('address-feedback-button');
+    expect(button.querySelector('.work-actions-pr-freshness')?.textContent).toBe(
+      'at least 2 updated',
     );
   });
 

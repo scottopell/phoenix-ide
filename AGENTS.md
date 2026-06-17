@@ -248,6 +248,10 @@ Byte-for-byte wire parity with the pre-typed `json!()` path is guarded by the `p
 
 These are constraints on the technical artifact, not process guidelines. They override existing code patterns and unreviewed plan decisions. When a plan says to do something that violates these, deviate from the plan and note why.
 
+#### PR feedback is an actionable snapshot, not a GitHub mirror
+
+Phoenix stores a compact baseline of **agent-actionable PR feedback**. GitHub remains the source of truth for the PR model. Phoenix does not mirror GitHub; it only snapshots enough to prepare an autofix prompt and avoid misleading freshness badges.
+
 #### Correct-by-construction is the governing principle
 
 Design so invalid states cannot be structurally represented. If a type permits a value that is semantically wrong, the type is wrong — fix the type, not the discipline. Runtime checks, comments, and conventions that rely on human vigilance are not substitutes.

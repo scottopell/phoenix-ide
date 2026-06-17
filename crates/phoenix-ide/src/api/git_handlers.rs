@@ -472,7 +472,7 @@ async fn attach_pr_feedback_freshness(
                 // derived from the same fetch: the count reflects only the
                 // surfaces that were read, and coverage flags any that weren't.
                 response.feedback_freshness =
-                    crate::api::pr_monitoring::feedback_freshness_from_baseline(
+                    crate::api::pr_monitoring::actionable_feedback_freshness_from_baseline(
                         &baseline,
                         Some(&feedback),
                     );
