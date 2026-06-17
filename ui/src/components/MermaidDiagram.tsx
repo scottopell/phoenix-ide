@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import mermaid from 'mermaid';
+import type { Mermaid } from 'mermaid';
 import { useTheme, type Theme } from '../hooks/useTheme';
 import { CopyButton } from './CopyButton';
 
@@ -92,23 +92,27 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
     let cancelled = false;
     setRenderState({ status: 'rendering' });
 
-    mermaid.initialize({
-      startOnLoad: false,
-      theme: 'base',
-      securityLevel: 'strict',
-      themeVariables: mermaidThemeVariables(theme),
-      flowchart: {
-        curve: 'basis',
-        htmlLabels: false,
-        nodeSpacing: 48,
-        rankSpacing: 58,
-        useMaxWidth: true,
-      },
-    });
-
-    mermaid.render(diagramId, source)
-      .then(({ svg, bindFunctions }) => {
+    import('mermaid')
+      .then(({ default: mermaid }: { default: Mermaid }) => {
         if (cancelled) return;
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: 'base',
+          securityLevel: 'strict',
+          themeVariables: mermaidThemeVariables(theme),
+          flowchart: {
+            curve: 'basis',
+            htmlLabels: false,
+            nodeSpacing: 48,
+            rankSpacing: 58,
+            useMaxWidth: true,
+          },
+        });
+        return mermaid.render(diagramId, source);
+      })
+      .then((result) => {
+        if (cancelled || !result) return;
+        const { svg, bindFunctions } = result;
         setRenderState({ status: 'rendered', svg });
         window.requestAnimationFrame(() => {
           if (cancelled || !bindFunctions || !svgContainerRef.current) return;

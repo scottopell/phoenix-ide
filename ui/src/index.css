@@ -999,8 +999,10 @@ body {
 }
 
 .mermaid-copy-source.copy-btn {
+  position: static;
   width: 28px;
   height: 28px;
+  opacity: 1;
 }
 
 .mermaid-diagram-body {

@@ -13,6 +13,8 @@ import { ForkProposalReview } from './ForkProposalReview';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { buildRenderUnits } from '../conversation/renderUnits';
 
+let mockDensity: 'full' | 'compact' = 'full';
+
 vi.mock('mermaid', () => ({
   default: {
     initialize: vi.fn(),
@@ -22,6 +24,14 @@ vi.mock('mermaid', () => ({
     })),
   },
 }));
+
+vi.mock('../hooks/useDensity', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../hooks/useDensity')>();
+  return {
+    ...actual,
+    useDensity: () => ({ density: mockDensity, setDensity: vi.fn() }),
+  };
+});
 
 vi.mock('../utils/clipboard', () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
@@ -41,6 +51,10 @@ vi.mock('../api', async (importOriginal) => {
       requestChangesForkProposal: vi.fn(),
     },
   };
+});
+
+beforeEach(() => {
+  mockDensity = 'full';
 });
 
 function agentMessage(messageId: string, blocks: unknown[], sequenceId = 1): Message {
@@ -613,6 +627,26 @@ describe('finalized code fence highlighting', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Copy Mermaid source' }));
     });
     expect(copyToClipboard).toHaveBeenCalledWith(mermaidSource);
+  });
+
+  it('renders short mermaid fences in compact mode instead of collapsing them', async () => {
+    mockDensity = 'compact';
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-short-mermaid', [{
+            type: 'text',
+            text: '```mermaid\nflowchart TD\n  A --> B\n```',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByTestId('mermaid-diagram')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /```mermaid/ })).not.toBeInTheDocument();
+    expect(mermaid.render).toHaveBeenCalledWith(expect.stringMatching(/^phoenix-mermaid-/), 'flowchart TD\n  A --> B');
   });
 
   it('falls back to source when mermaid rendering fails', async () => {

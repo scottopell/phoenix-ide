@@ -145,6 +145,10 @@ function usesGfmSyntax(text: string): boolean {
     || /\[\^[^\]]+\]/.test(text);
 }
 
+function containsMermaidFence(text: string): boolean {
+  return /(^|\n)```\s*mermaid(?:\s|\n|$)/i.test(text);
+}
+
 /** Format a tool execution duration for display in the tool block header.
  *  < 1s    -> "743ms" (integer milliseconds)
  *  < 10s   -> "3.2s" (one decimal place)
@@ -1020,7 +1024,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
               const remarkPlugins = usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
               // Compact: short prose folds to a faded expandable one-liner.
               // Substantial prose (>= threshold) always renders full.
-              if (compact && !isSignificantText(block.text)) {
+              if (compact && !isSignificantText(block.text) && !containsMermaidFence(block.text)) {
                 return (
                   <CollapsibleText
                     key={i}
