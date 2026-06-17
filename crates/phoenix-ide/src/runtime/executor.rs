@@ -3447,14 +3447,20 @@ where
             // text is capped so a single huge result can't dominate.
             let messages = flatten_tool_blocks(messages);
 
-            // Proactive overflow guard: continuation fires at ~90% of the
+            // Proactive overflow guard: continuation fires near the top of the
             // window, so the flattened history can still exceed it. Keep the
-            // most-recent messages within a token budget (window minus reserves
-            // for the reply and the prompt/system overhead), dropping oldest
-            // first, so the request can't 400 with ContextWindowExceeded and
-            // loop deterministically to the fallback summary.
-            let input_budget = context_window
-                .saturating_sub(CONTINUATION_OUTPUT_RESERVE_TOKENS + CONTINUATION_OVERHEAD_TOKENS);
+            // most-recent messages within a token budget, dropping oldest first,
+            // so the request can't 400 with ContextWindowExceeded and loop
+            // deterministically to the fallback summary. The budget reserves the
+            // model's reply plus the *actual* size of the continuation prompt
+            // and system text — both grow (the prompt with rejected-call args)
+            // and must not be allowed to push the request over the window after
+            // history has filled the budget.
+            let fixed_tokens = estimate_text_tokens(&continuation_prompt)
+                + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
+                + CONTINUATION_OUTPUT_RESERVE_TOKENS
+                + CONTINUATION_SAFETY_MARGIN_TOKENS;
+            let input_budget = context_window.saturating_sub(fixed_tokens);
             let (mut messages, dropped) = cap_messages_to_token_budget(messages, input_budget);
             if dropped > 0 {
                 tracing::debug!(
@@ -3474,12 +3480,7 @@ where
             // Build a tool-less request
             let request = LlmRequest {
                 messages,
-                system: vec![SystemContent::new(
-                    "You are an agent writing a handoff note for the next agent, who will \
-                    continue this work in the same working directory with no memory of this \
-                    session. Be precise and concrete: real file paths, real commands, and an \
-                    honest split between what you verified and what you only assumed.",
-                )],
+                system: vec![SystemContent::new(CONTINUATION_SYSTEM_PROMPT)],
                 tools: vec![], // No tools for continuation
                 // Handoff quality favors completeness; cap high enough that a
                 // thorough summary is not truncated mid-thought.
@@ -3970,14 +3971,36 @@ const CONTINUATION_BLOCK_CHAR_CAP: usize = 2000;
 /// `max_tokens` on the continuation request.
 const CONTINUATION_OUTPUT_RESERVE_TOKENS: usize = 4096;
 
-/// Reserve (tokens) for the continuation prompt, system prompt, and a safety
-/// margin against the chars/token estimate being optimistic.
-const CONTINUATION_OVERHEAD_TOKENS: usize = 2000;
+/// Safety margin (tokens) against the chars/token estimate being optimistic.
+/// The prompt and system text are budgeted from their actual size separately,
+/// so this only covers estimate error, not their bulk.
+const CONTINUATION_SAFETY_MARGIN_TOKENS: usize = 512;
 
 /// Rough chars-per-token ratio for the proactive budget estimate. Deliberately
-/// conservative (English prose is ~4); paired with [`CONTINUATION_OVERHEAD_TOKENS`]
-/// it errs toward dropping a message rather than overflowing the window.
+/// conservative (English prose is ~4); paired with the per-message overhead and
+/// ceiling rounding below it errs toward dropping a message rather than
+/// overflowing the window.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+/// Per-message token overhead for role framing and wire envelope. Charged on
+/// top of content so a long run of tiny messages (e.g. repeated one-word turns)
+/// cannot slip under the budget at an estimated zero cost each.
+const MESSAGE_OVERHEAD_TOKENS: usize = 4;
+
+/// System prompt for the continuation request. A module const so the budget
+/// estimate and the request that is actually sent draw from the same text and
+/// cannot drift.
+const CONTINUATION_SYSTEM_PROMPT: &str = "You are an agent writing a handoff note for the next \
+    agent, who will continue this work in the same working directory with no memory of this \
+    session, with the same tools available to you now. Be precise and concrete: real file paths, \
+    real commands, and an honest split between what you verified and what you only assumed.";
+
+/// Estimate the token cost of a string for the proactive budget. Ceiling
+/// division so a sub-`CHARS_PER_TOKEN_ESTIMATE` string still costs at least one
+/// token rather than rounding to zero.
+fn estimate_text_tokens(text: &str) -> usize {
+    text.chars().count().div_ceil(CHARS_PER_TOKEN_ESTIMATE)
+}
 
 /// Flatten tool-related blocks into text for the tool-less continuation request.
 ///
@@ -4050,13 +4073,17 @@ fn estimate_message_tokens(msg: &LlmMessage) -> usize {
     // A flattened-and-replayed image still costs a fixed block of tokens on the
     // wire; approximate rather than under-count it to zero.
     const IMAGE_TOKEN_ESTIMATE: usize = 1500;
-    msg.content
+    let content: usize = msg
+        .content
         .iter()
         .map(|block| match block {
             ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
-            other => other.render_text().chars().count() / CHARS_PER_TOKEN_ESTIMATE,
+            other => estimate_text_tokens(&other.render_text()),
         })
-        .sum()
+        .sum();
+    // Per-message overhead bounds the count of tiny messages so a long run of
+    // them cannot be retained wholesale under a small budget.
+    content + MESSAGE_OVERHEAD_TOKENS
 }
 
 /// Keep the most-recent messages whose combined estimated token cost fits
@@ -4464,6 +4491,31 @@ mod strip_tool_blocks_tests {
         let (kept, dropped) = cap_messages_to_token_budget(msgs, 1);
         assert_eq!(kept.len(), 1, "the sole newest message is always kept");
         assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn budget_cap_charges_overhead_for_tiny_messages() {
+        // A run of sub-CHARS_PER_TOKEN messages must still be bounded: the
+        // per-message overhead (and ceiling rounding) keeps them from being
+        // retained wholesale at an estimated zero cost each.
+        let msgs: Vec<LlmMessage> = (0..100).map(|_| user_text("x")).collect();
+        let (kept, dropped) = cap_messages_to_token_budget(msgs, 20);
+        assert!(
+            dropped > 0,
+            "tiny messages must still be charged and dropped"
+        );
+        assert!(kept.len() < 100, "not every tiny message should fit");
+    }
+
+    #[test]
+    fn estimate_text_tokens_rounds_up() {
+        assert_eq!(estimate_text_tokens(""), 0);
+        assert_eq!(
+            estimate_text_tokens("x"),
+            1,
+            "sub-ratio text costs >= 1 token"
+        );
+        assert_eq!(estimate_text_tokens(&"x".repeat(5)), 2);
     }
 
     // ----- strip_unavailable_tool_blocks -----
@@ -4909,13 +4961,16 @@ fn execute_approve_plain_markdown_blocking(
 /// Build the continuation prompt (REQ-BED-020).
 ///
 /// The summary seeds a fresh agent that restarts with no memory of this session
-/// but full tool access in the same working directory, so the prompt asks for
-/// an operational handoff (exact paths, repo state, verified-vs-assumed) rather
-/// than a human-facing recap.
+/// in the same working directory. That successor inherits this conversation's
+/// mode and tool set (continuation copies `conv_mode` verbatim), so the prompt
+/// promises "the same tools you have now" rather than full access — an Explore
+/// continuation stays in Explore mode and cannot run write/edit tools. It asks
+/// for an operational handoff (exact paths, repo state, verified-vs-assumed)
+/// rather than a human-facing recap.
 fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
     let mut prompt = String::from(
         "This conversation has reached its context limit. Write a handoff that lets a fresh \
-        agent — no memory of this session, but full tool access in the same working \
+        agent — no memory of this session, but the same tools you have now, in the same working \
         directory — pick up exactly where you left off.\n\n\
         Cover:\n\
         1. The goal: what you were asked to do, and the current status toward it.\n\

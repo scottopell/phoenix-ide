@@ -1316,11 +1316,22 @@ images are preserved as image blocks so screenshots remain available.
 
 Because continuation fires near the top of the context window, the flattened
 history can still exceed it. A proactive token-budget cap keeps the most-recent
-messages within the window minus reserves for the reply and the prompt/system
-overhead, dropping the oldest first to preserve a contiguous recent window (the
-single newest message is always kept). This makes the request structurally
-unable to overflow, so it cannot fail with a context-window error and then
-deterministically replay the same oversized request until it falls back.
+messages within the window minus reserves for the reply and the *actual* size of
+the continuation prompt and system text — both vary (the prompt grows with the
+rejected-call arguments it lists) and must be reserved from their measured size,
+not a fixed guess, or a large prompt would push the request over the window
+after history has filled the budget. The cap drops the oldest messages first to
+preserve a contiguous recent window (the single newest message is always kept).
+Each message is charged a small per-message overhead and token costs round up,
+so a long run of tiny messages cannot slip under the budget at zero estimated
+cost. This makes the request structurally unable to overflow, so it cannot fail
+with a context-window error and then deterministically replay the same oversized
+request until it falls back.
+
+The handoff prompt promises the successor "the same tools you have now," not full
+access: a continuation inherits the exhausted conversation's mode verbatim, so an
+Explore continuation stays in Explore mode with its restricted tool registry and
+must not be told it can run write/edit tools.
 
 An empty or whitespace-only summary is routed through the same fallback path as
 a generation failure: a blank summary is indistinguishable to the user from a
