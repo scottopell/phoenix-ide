@@ -388,13 +388,17 @@ pub(crate) fn summarize_work_change(
     }
 
     let comparator = crate::git_ops::effective_base_ref(worktree, base_branch);
-    let work_commit_count = run_git(
+    let work_commit_count = match run_git(
         worktree,
         &["rev-list", "--count", &format!("{comparator}..HEAD")],
-    )
-    .ok()
-    .and_then(|s| s.trim().parse::<u32>().ok())
-    .unwrap_or(0);
+    ) {
+        Ok(count) => count.trim().parse::<u32>().unwrap_or(0),
+        Err(_) => {
+            return WorkChangeSummary::DirtyNeedsReview {
+                reason: WorkChangeNeedsReviewReason::Unknown,
+            };
+        }
+    };
     if work_commit_count == 0 {
         return WorkChangeSummary::Clean;
     }
@@ -1017,6 +1021,20 @@ mod tests {
             summarize_work_change(repo.path(), "task", "main"),
             WorkChangeSummary::DirtyNeedsReview {
                 reason: WorkChangeNeedsReviewReason::BranchNotPushed
+            }
+        );
+    }
+
+    #[test]
+    fn work_change_missing_base_needs_review() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(repo.path(), &["checkout", "-q", "-b", "task"]).unwrap();
+        commit_file(repo.path(), "a.txt", "a", "a");
+        assert_eq!(
+            summarize_work_change(repo.path(), "task", "missing-base"),
+            WorkChangeSummary::DirtyNeedsReview {
+                reason: WorkChangeNeedsReviewReason::Unknown
             }
         );
     }

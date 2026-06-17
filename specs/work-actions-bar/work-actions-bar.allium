@@ -277,7 +277,11 @@ entity WorkActionsBar {
 --       gh_unavailable -> gh_unavailable_note, stuck-with-open-PR ->
 --       pr_open_stuck_note, otherwise null).
 
-------------------------------------------------------------
+--   create_pr_url_for(work_change: WorkChangeState) -> String
+--       Returns the GitHub compare/new-PR URL carried by a dirty_pr_ready work-change
+--       summary. Only valid when work_change = dirty_pr_ready.
+--
+--------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
 
@@ -565,7 +569,10 @@ rule ResolveLinkVerbNavigatesToGitHub {
 
     requires: bar.presentation.resolve_zone.verb in { merge_link, open_pr_link, create_pr_link }
 
-    ensures: ExternalNavigationRequested(bar.inputs.pr_status.pr.url)
+    ensures: bar.presentation.resolve_zone.verb in { merge_link, open_pr_link } implies
+        ExternalNavigationRequested(bar.inputs.pr_status.pr.url)
+    ensures: bar.presentation.resolve_zone.verb = create_pr_link implies
+        ExternalNavigationRequested(create_pr_url_for(bar.inputs.work_change))
 
     @guidance
         -- The link verbs render as
