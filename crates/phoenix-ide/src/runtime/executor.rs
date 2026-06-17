@@ -3423,6 +3423,7 @@ where
         let storage = self.storage.clone();
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
+        let context_window = self.context.context_window;
 
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
@@ -3438,14 +3439,31 @@ where
                 }
             };
 
-            // The continuation request is tool-less: strip every tool-related
-            // block (regular ToolUse/ToolResult, server-handled ServerToolUse,
-            // ToolSearchToolResult, MCP, etc.) so the API doesn't reject the
-            // request because history references tools we're no longer
-            // declaring. The model still has the assistant's narration to
-            // summarize from. Rejected tool calls are described in prose in
-            // the continuation prompt instead of synthetic tool_result blocks.
-            let mut messages = strip_all_tool_blocks(messages);
+            // The continuation request declares no tools, so any tool_use /
+            // tool_result / server-handled block left in history would make the
+            // API 400 ("tool reference not found"). Flatten them to text rather
+            // than deleting them — the diffs applied, commands run, and output
+            // observed are exactly what the summary should draw on. Each block's
+            // text is capped so a single huge result can't dominate.
+            let messages = flatten_tool_blocks(messages);
+
+            // Proactive overflow guard: continuation fires at ~90% of the
+            // window, so the flattened history can still exceed it. Keep the
+            // most-recent messages within a token budget (window minus reserves
+            // for the reply and the prompt/system overhead), dropping oldest
+            // first, so the request can't 400 with ContextWindowExceeded and
+            // loop deterministically to the fallback summary.
+            let input_budget = context_window
+                .saturating_sub(CONTINUATION_OUTPUT_RESERVE_TOKENS + CONTINUATION_OVERHEAD_TOKENS);
+            let (mut messages, dropped) = cap_messages_to_token_budget(messages, input_budget);
+            if dropped > 0 {
+                tracing::debug!(
+                    dropped,
+                    context_window,
+                    input_budget,
+                    "continuation: dropped oldest messages to fit token budget"
+                );
+            }
 
             // Add the continuation request as a user message
             messages.push(LlmMessage {
@@ -3487,6 +3505,23 @@ where
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
+
+                    if summary.trim().is_empty() {
+                        // An empty summary is indistinguishable to the user from
+                        // "no summary" but silently seeds a blank continuation.
+                        // Route it through the same fallback path as a failure
+                        // so the terminal state carries an explanatory message.
+                        tracing::warn!(
+                            conv_id = %conv_id,
+                            "continuation: model returned an empty summary; using fallback"
+                        );
+                        let _ = event_tx
+                            .send(Event::ContinuationFailed {
+                                error: "the model returned an empty summary".to_string(),
+                            })
+                            .await;
+                        return;
+                    }
 
                     let _ = event_tx.send(Event::ContinuationResponse { summary }).await;
                 }
@@ -3925,36 +3960,133 @@ struct TaskApprovalResult {
     base_branch: String,
 }
 
-/// Drop every tool-related block from the message history.
+/// Per-block character cap when flattening tool blocks for the continuation
+/// request. Bounds a single huge tool result (a large file read, verbose
+/// command output) so it cannot dominate the summary input. Overall request
+/// size is bounded separately by [`cap_messages_to_token_budget`].
+const CONTINUATION_BLOCK_CHAR_CAP: usize = 2000;
+
+/// Reserve (tokens) for the continuation reply — kept in lockstep with the
+/// `max_tokens` on the continuation request.
+const CONTINUATION_OUTPUT_RESERVE_TOKENS: usize = 4096;
+
+/// Reserve (tokens) for the continuation prompt, system prompt, and a safety
+/// margin against the chars/token estimate being optimistic.
+const CONTINUATION_OVERHEAD_TOKENS: usize = 2000;
+
+/// Rough chars-per-token ratio for the proactive budget estimate. Deliberately
+/// conservative (English prose is ~4); paired with [`CONTINUATION_OVERHEAD_TOKENS`]
+/// it errs toward dropping a message rather than overflowing the window.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+/// Flatten tool-related blocks into text for the tool-less continuation request.
 ///
-/// Used by the continuation summary path: that request is sent with
-/// `tools: []`, so any `tool_use`, `tool_result`, `server_tool_use`,
-/// `tool_search_tool_result`, or MCP block in history would cause the
-/// API to 400 with "Tool reference X not found in available tools".
-/// The summary still has the assistant's text narration to work with.
-fn strip_all_tool_blocks(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
+/// The continuation request declares no tools, so any `tool_use`, `tool_result`,
+/// `server_tool_use`, `tool_search_tool_result`, or MCP block left in history
+/// would make the API 400 with "Tool reference X not found in available tools".
+/// Rather than delete those blocks — discarding the work record the summary
+/// should draw on — each is rendered to text via the exhaustive
+/// [`ContentBlock::render_text`] and capped at [`CONTINUATION_BLOCK_CHAR_CAP`].
+/// `Text` and `Image` blocks pass through untouched; a tool result's images are
+/// preserved as image blocks so screenshots remain available to the summary.
+fn flatten_tool_blocks(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
     use crate::llm::ContentBlock;
 
     messages
         .into_iter()
         .map(|msg| {
-            let filtered: Vec<ContentBlock> = msg
-                .content
-                .into_iter()
-                .filter(|block| {
-                    matches!(
-                        block,
-                        ContentBlock::Text { .. } | ContentBlock::Image { .. }
-                    )
-                })
-                .collect();
+            let mut flattened: Vec<ContentBlock> = Vec::with_capacity(msg.content.len());
+            for block in msg.content {
+                match block {
+                    ContentBlock::Text { .. } | ContentBlock::Image { .. } => {
+                        flattened.push(block);
+                    }
+                    ContentBlock::ToolResult {
+                        content,
+                        images,
+                        is_error,
+                        ..
+                    } => {
+                        let marker = if is_error {
+                            "[tool result (error)]: "
+                        } else {
+                            "[tool result]: "
+                        };
+                        flattened.push(ContentBlock::text(format!(
+                            "{marker}{}",
+                            cap_block_text(content)
+                        )));
+                        for source in images {
+                            flattened.push(ContentBlock::Image { source });
+                        }
+                    }
+                    other => {
+                        flattened.push(ContentBlock::text(cap_block_text(other.render_text())));
+                    }
+                }
+            }
             LlmMessage {
                 role: msg.role,
-                content: filtered,
+                content: flattened,
             }
         })
         .filter(|msg| !msg.content.is_empty())
         .collect()
+}
+
+/// Truncate flattened-block text to [`CONTINUATION_BLOCK_CHAR_CAP`] chars,
+/// counting by chars so the result is always valid UTF-8.
+fn cap_block_text(text: String) -> String {
+    if text.chars().count() <= CONTINUATION_BLOCK_CHAR_CAP {
+        return text;
+    }
+    let truncated: String = text.chars().take(CONTINUATION_BLOCK_CHAR_CAP).collect();
+    format!("{truncated}…[truncated]")
+}
+
+/// Estimate the token cost of a single message for the proactive budget.
+fn estimate_message_tokens(msg: &LlmMessage) -> usize {
+    use crate::llm::ContentBlock;
+    // A flattened-and-replayed image still costs a fixed block of tokens on the
+    // wire; approximate rather than under-count it to zero.
+    const IMAGE_TOKEN_ESTIMATE: usize = 1500;
+    msg.content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+            other => other.render_text().chars().count() / CHARS_PER_TOKEN_ESTIMATE,
+        })
+        .sum()
+}
+
+/// Keep the most-recent messages whose combined estimated token cost fits
+/// `budget_tokens`, dropping the oldest first to preserve a contiguous recent
+/// window. The single most-recent message is always kept even if it alone
+/// exceeds the budget (sending an over-budget request is strictly better than
+/// sending none). Returns the kept messages and the number dropped.
+fn cap_messages_to_token_budget(
+    messages: Vec<LlmMessage>,
+    budget_tokens: usize,
+) -> (Vec<LlmMessage>, usize) {
+    let total = messages.len();
+    if total == 0 {
+        return (messages, 0);
+    }
+    let mut running = 0usize;
+    let mut keep_from = 0usize;
+    for (i, msg) in messages.iter().enumerate().rev() {
+        let est = estimate_message_tokens(msg);
+        // Always keep the newest message; for older ones, stop once adding
+        // would exceed the budget so the kept window stays contiguous.
+        if i != total - 1 && running + est > budget_tokens {
+            keep_from = i + 1;
+            break;
+        }
+        running += est;
+    }
+    let dropped = keep_from;
+    let kept = messages.into_iter().skip(keep_from).collect();
+    (kept, dropped)
 }
 
 /// Merge a `duration_ms` value into an existing `display_data` JSON blob.
@@ -4190,22 +4322,36 @@ mod strip_tool_blocks_tests {
         }
     }
 
-    // ----- strip_all_tool_blocks -----
+    // ----- flatten_tool_blocks -----
+
+    /// No block survives that the tool-less continuation request could not
+    /// declare — i.e. nothing but `Text`/`Image` remains. This is the
+    /// invariant that keeps the API from 400ing on an undeclared tool ref.
+    fn assert_no_tool_blocks(out: &[LlmMessage]) {
+        for msg in out {
+            for block in &msg.content {
+                assert!(
+                    matches!(block, ContentBlock::Text { .. } | ContentBlock::Image { .. }),
+                    "flatten left a non-text/image block: {block:?}"
+                );
+            }
+        }
+    }
 
     #[test]
-    fn strip_all_keeps_text_only_history_unchanged() {
+    fn flatten_keeps_text_only_history_unchanged() {
         let msgs = vec![
             user_text("hello"),
             assistant(vec![ContentBlock::text("hi")]),
         ];
-        let out = strip_all_tool_blocks(msgs.clone());
+        let out = flatten_tool_blocks(msgs.clone());
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].content.len(), 1);
         assert_eq!(out[1].content.len(), 1);
     }
 
     #[test]
-    fn strip_all_keeps_image_blocks() {
+    fn flatten_keeps_image_blocks() {
         // Continuation summary should retain images (e.g. screenshots from
         // the user's earlier turns) so the model has the visual context.
         let msgs = vec![user(vec![
@@ -4217,13 +4363,13 @@ mod strip_tool_blocks_tests {
                 },
             },
         ])];
-        let out = strip_all_tool_blocks(msgs);
+        let out = flatten_tool_blocks(msgs);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].content.len(), 2);
     }
 
     #[test]
-    fn strip_all_drops_regular_tool_use_and_result() {
+    fn flatten_renders_tool_use_and_result_as_text() {
         let msgs = vec![
             assistant(vec![
                 ContentBlock::text("calling bash"),
@@ -4232,25 +4378,25 @@ mod strip_tool_blocks_tests {
             user(vec![tool_result("t1")]),
             assistant(vec![ContentBlock::text("done")]),
         ];
-        let out = strip_all_tool_blocks(msgs);
-        assert_eq!(
-            out.len(),
-            2,
-            "tool-result-only user message must be dropped"
-        );
-        // First survivor: assistant with just text (tool_use stripped)
-        assert_eq!(out[0].content.len(), 1);
-        assert!(
-            matches!(&out[0].content[0], ContentBlock::Text { text } if text == "calling bash")
-        );
-        // Second survivor: assistant "done"
-        assert!(matches!(&out[1].content[0], ContentBlock::Text { text } if text == "done"));
+        let out = flatten_tool_blocks(msgs);
+        // Every message survives now — the work record is preserved as text
+        // rather than deleted.
+        assert_eq!(out.len(), 3);
+        assert_no_tool_blocks(&out);
+        // tool_use is flattened alongside the narration it accompanied.
+        assert_eq!(out[0].content.len(), 2);
+        assert!(matches!(&out[0].content[0], ContentBlock::Text { text } if text == "calling bash"));
+        assert!(matches!(&out[0].content[1], ContentBlock::Text { text } if text.contains("bash")));
+        // tool_result becomes a marked text block carrying its content.
+        assert!(matches!(&out[1].content[0], ContentBlock::Text { text }
+            if text.contains("tool result") && text.contains("ok")));
     }
 
     #[test]
-    fn strip_all_drops_server_tool_use_and_tool_search_result() {
+    fn flatten_renders_server_blocks_as_text() {
         // Reproduces the production failure shape: tool_search-discovered MCP
-        // tool referenced in history with tools=[] in the request.
+        // tool referenced in history. With tools=[] the request would 400 on
+        // these blocks; flattening renders them to text so it can't.
         let msgs = vec![
             assistant(vec![
                 server_tool_use("srv1", "tool_search_tool_regex"),
@@ -4260,25 +4406,55 @@ mod strip_tool_blocks_tests {
             user(vec![tool_result("call1")]),
             assistant(vec![ContentBlock::text("summary so far")]),
         ];
-        let out = strip_all_tool_blocks(msgs);
-        // Only the two text-bearing messages should remain (the tool_result
-        // user message and the all-server-blocks message after stripping
-        // are empty, but the first assistant survives if it had any text;
-        // here it had no text, so it should be dropped entirely).
-        assert_eq!(out.len(), 1);
-        assert!(
-            matches!(&out[0].content[0], ContentBlock::Text { text } if text == "summary so far")
-        );
+        let out = flatten_tool_blocks(msgs);
+        assert_eq!(out.len(), 3);
+        assert_no_tool_blocks(&out);
+        assert_eq!(out[0].content.len(), 3, "three server/tool blocks flattened");
     }
 
     #[test]
-    fn strip_all_drops_messages_that_become_empty() {
+    fn flatten_preserves_tool_only_messages_as_text() {
+        // A message whose only blocks were tool blocks is no longer dropped —
+        // its work record is rendered to text.
         let msgs = vec![
             assistant(vec![tool_use("t1", "bash")]),
             user(vec![tool_result("t1")]),
         ];
-        let out = strip_all_tool_blocks(msgs);
-        assert!(out.is_empty());
+        let out = flatten_tool_blocks(msgs);
+        assert_eq!(out.len(), 2);
+        assert_no_tool_blocks(&out);
+    }
+
+    #[test]
+    fn cap_block_text_truncates_by_chars() {
+        let capped = cap_block_text("é".repeat(CONTINUATION_BLOCK_CHAR_CAP + 100));
+        assert!(capped.ends_with("…[truncated]"));
+        assert!(capped.chars().count() <= CONTINUATION_BLOCK_CHAR_CAP + 12);
+    }
+
+    #[test]
+    fn budget_cap_keeps_recent_drops_oldest() {
+        // Each message ~5 chars of text => ~1 token. Budget of 2 tokens keeps
+        // roughly the two newest; oldest are dropped, newest always survives.
+        let msgs = vec![
+            user_text("aaaaaaaa"),
+            assistant(vec![ContentBlock::text("bbbbbbbb")]),
+            user_text("cccccccc"),
+        ];
+        let (kept, dropped) = cap_messages_to_token_budget(msgs, 2);
+        assert!(dropped >= 1, "oldest should be dropped");
+        assert_eq!(kept.len() + dropped, 3);
+        // The newest message is always retained.
+        assert!(matches!(&kept.last().unwrap().content[0],
+            ContentBlock::Text { text } if text == "cccccccc"));
+    }
+
+    #[test]
+    fn budget_cap_keeps_single_oversized_newest_message() {
+        let msgs = vec![user_text(&"x".repeat(10_000))];
+        let (kept, dropped) = cap_messages_to_token_budget(msgs, 1);
+        assert_eq!(kept.len(), 1, "the sole newest message is always kept");
+        assert_eq!(dropped, 0);
     }
 
     // ----- strip_unavailable_tool_blocks -----

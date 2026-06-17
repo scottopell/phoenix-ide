@@ -377,6 +377,8 @@ THE SYSTEM SHALL request a session summary from the LLM
 AND the request SHALL NOT include any tool capabilities
 AND the request SHALL frame the summary as an operational handoff to a fresh agent that resumes in the same working directory with no memory of the session
 AND the request SHALL describe any tools that were requested but not executed, including their intended arguments
+AND the request SHALL preserve the prior tool history as text rather than discarding it
+AND the request SHALL be bounded to fit the context window so it cannot itself exceed the limit
 
 WHEN continuation summary is received
 THE SYSTEM SHALL store it as a continuation message
@@ -386,12 +388,15 @@ WHEN continuation request fails after standard retries
 THE SYSTEM SHALL transition to context exhausted state
 AND use a fallback summary indicating the failure
 
+WHEN the continuation summary is empty or whitespace-only
+THE SYSTEM SHALL treat it as a generation failure and use the fallback summary
+
 WHEN user requests cancellation during continuation summary generation
 THE SYSTEM SHALL reject the request as an invalid cancellation state
 AND SHALL NOT abort the in-flight continuation request
 AND SHALL remain awaiting the continuation summary
 
-**Rationale:** The summary's consumer is a fresh agent that restarts cold in the same worktree, so it is framed as an operational handoff — exact paths, repo state, and an honest verified-vs-assumed split — rather than a human-facing recap, and completeness is favored over brevity. Describing rejected tool calls with their arguments tells the next agent what was about to run, not merely which tool type. Failures shouldn't block users from moving on.
+**Rationale:** The summary's consumer is a fresh agent that restarts cold in the same worktree, so it is framed as an operational handoff — exact paths, repo state, and an honest verified-vs-assumed split — rather than a human-facing recap, and completeness is favored over brevity. Describing rejected tool calls with their arguments tells the next agent what was about to run, not merely which tool type. The prior tool history is flattened to text rather than deleted so the summary can draw on the actual work record, and the request is bounded to fit the window so it cannot overflow and loop to the fallback. An empty summary would silently seed a blank continuation, so it is treated as a failure. Failures shouldn't block users from moving on.
 
 ---
 

@@ -1303,6 +1303,30 @@ with their intended arguments, not just the tool name, so the next agent knows
 Arguments are serialized compactly and truncated on a char boundary so a single
 oversized payload cannot bloat the prompt.
 
+### Continuation Request Construction
+
+The request declares no tools, so any `tool_use` / `tool_result` / server-handled
+block left in the replayed history would make the API reject the request for
+referencing a tool that is no longer available. Those blocks are *flattened to
+text* rather than deleted: the diffs applied, commands run, and output observed
+are the work record the summary should draw on, so each block is rendered to its
+textual form and capped at a per-block character limit (a single huge result
+cannot dominate). Text and image blocks pass through unchanged; a tool result's
+images are preserved as image blocks so screenshots remain available.
+
+Because continuation fires near the top of the context window, the flattened
+history can still exceed it. A proactive token-budget cap keeps the most-recent
+messages within the window minus reserves for the reply and the prompt/system
+overhead, dropping the oldest first to preserve a contiguous recent window (the
+single newest message is always kept). This makes the request structurally
+unable to overflow, so it cannot fail with a context-window error and then
+deterministically replay the same oversized request until it falls back.
+
+An empty or whitespace-only summary is routed through the same fallback path as
+a generation failure: a blank summary is indistinguishable to the user from a
+missing one but would silently seed an empty continuation, so it instead yields
+the explanatory fallback message.
+
 ### Continuation Transitions
 
 ```rust
