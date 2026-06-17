@@ -4331,7 +4331,10 @@ mod strip_tool_blocks_tests {
         for msg in out {
             for block in &msg.content {
                 assert!(
-                    matches!(block, ContentBlock::Text { .. } | ContentBlock::Image { .. }),
+                    matches!(
+                        block,
+                        ContentBlock::Text { .. } | ContentBlock::Image { .. }
+                    ),
                     "flatten left a non-text/image block: {block:?}"
                 );
             }
@@ -4385,7 +4388,9 @@ mod strip_tool_blocks_tests {
         assert_no_tool_blocks(&out);
         // tool_use is flattened alongside the narration it accompanied.
         assert_eq!(out[0].content.len(), 2);
-        assert!(matches!(&out[0].content[0], ContentBlock::Text { text } if text == "calling bash"));
+        assert!(
+            matches!(&out[0].content[0], ContentBlock::Text { text } if text == "calling bash")
+        );
         assert!(matches!(&out[0].content[1], ContentBlock::Text { text } if text.contains("bash")));
         // tool_result becomes a marked text block carrying its content.
         assert!(matches!(&out[1].content[0], ContentBlock::Text { text }
@@ -4409,7 +4414,11 @@ mod strip_tool_blocks_tests {
         let out = flatten_tool_blocks(msgs);
         assert_eq!(out.len(), 3);
         assert_no_tool_blocks(&out);
-        assert_eq!(out[0].content.len(), 3, "three server/tool blocks flattened");
+        assert_eq!(
+            out[0].content.len(),
+            3,
+            "three server/tool blocks flattened"
+        );
     }
 
     #[test]
@@ -5081,8 +5090,7 @@ mod continuation_prompt_tests {
         assert!(prompt.contains("handoff"), "should frame as handoff");
         assert!(prompt.contains("git push"), "rejected args should appear");
         assert!(
-            !prompt.to_lowercase().contains("brief")
-                && !prompt.to_lowercase().contains("concise"),
+            !prompt.to_lowercase().contains("brief") && !prompt.to_lowercase().contains("concise"),
             "brevity framing should be gone: {prompt}"
         );
     }
