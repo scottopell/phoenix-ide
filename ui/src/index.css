@@ -7015,6 +7015,20 @@ html * {
   overflow: hidden;
 }
 
+/* Dedicated /terminal route: the panel fills the whole content area and must
+   not scroll the page — TerminalPanel handles its own internal scrollback. */
+.desktop-main:has(.terminal-page) {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.terminal-page {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 /* Wrapper around the messages/input/state-bar stack so the terminal split-pane
    can sit underneath without forcing the conversation column to overflow. */
 .conversation-column {
@@ -7573,6 +7587,17 @@ html * {
 .sidebar-icon-btn.disabled {
   opacity: 0.4;
   pointer-events: none;
+}
+
+/* Home-terminal nav button — keep its 36px box in the crowded expanded
+   header, and highlight it while the /terminal route is active. */
+.sidebar-terminal-btn {
+  flex-shrink: 0;
+}
+
+.sidebar-terminal-btn.active {
+  background: var(--bg-tertiary);
+  color: var(--accent, var(--text-primary));
 }
 
 .sidebar-logo-icon {
@@ -9853,6 +9878,45 @@ html * {
 
 .terminal-panel-header--collapsed {
   user-select: none;
+}
+
+/* /new pre-mount reveal strip — visually echoes the collapsed terminal header
+   so the affordance reads as "the terminal lives here". */
+.global-terminal-reveal {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 4px 12px;
+  background: var(--terminal-header-bg);
+  border: none;
+  border-top: 1px solid var(--terminal-border);
+  box-sizing: border-box;
+  cursor: pointer;
+  user-select: none;
+  font-family: var(--font-mono);
+}
+
+.global-terminal-reveal:hover {
+  background: var(--bg-tertiary);
+}
+
+.global-terminal-reveal-glyph {
+  font-size: 13px;
+  color: var(--accent-green, #4ec9b0);
+  font-weight: 600;
+}
+
+.global-terminal-reveal-label {
+  font-size: 13px;
+  color: var(--text-primary, #e6edf3);
+}
+
+.global-terminal-reveal-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
 .terminal-panel-title {

@@ -14,6 +14,15 @@ document fills that gap. See `specs/terminal-panel/executive.md` for
 the full boundary, and `specs/terminal-panel/design.md` for the
 implementation that delivers the requirements below.
 
+The same panel also mounts standalone on the dedicated `/terminal`
+route, where it fills the content area and the collapse affordance is
+omitted — there is nothing to collapse into on a full-page mount. Every
+other requirement below (connection, HUD, command tracking, reclaim)
+applies identically; only the collapse-specific behaviour is inert when
+standalone. The `/terminal` route targets `WorkScope::Global`, so it
+shares one shell with the `/new` pane (see `specs/terminal/`
+REQ-TERM-WS-001).
+
 ## User Story
 
 As a Phoenix user inside a conversation, I want a real terminal pane I

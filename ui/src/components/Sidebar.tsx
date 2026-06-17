@@ -23,6 +23,12 @@ const ChevronRight = () => (
     <polyline points="9 18 15 12 9 6" />
   </svg>
 );
+const TerminalGlyph = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="4 17 10 11 4 5" />
+    <line x1="12" y1="19" x2="20" y2="19" />
+  </svg>
+);
 
 interface SidebarProps {
   collapsed: boolean;
@@ -181,6 +187,10 @@ export function Sidebar({
     navigate('/new');
   }, [navigate]);
 
+  const handleTerminalClick = useCallback(() => {
+    navigate('/terminal');
+  }, [navigate]);
+
   const handleConversationClick = useCallback((conv: Conversation) => {
     navigate(`/c/${conv.slug}`);
   }, [navigate]);
@@ -260,6 +270,7 @@ export function Sidebar({
   }, []);
 
   const isOnNewPage = location.pathname === '/' || location.pathname === '/new';
+  const isOnTerminalPage = location.pathname === '/terminal';
 
   if (collapsed) {
     return (
@@ -276,6 +287,13 @@ export function Sidebar({
           title="New conversation"
         >
           +
+        </button>
+        <button
+          className={`sidebar-icon-btn sidebar-terminal-btn ${isOnTerminalPage ? 'active' : ''}`}
+          onClick={handleTerminalClick}
+          title="Home terminal"
+        >
+          <TerminalGlyph />
         </button>
         <SettingsDropdown
           theme={theme}
@@ -322,6 +340,14 @@ export function Sidebar({
           onClick={handleNewClick}
         >
           + New
+        </button>
+        <button
+          className={`sidebar-icon-btn sidebar-terminal-btn ${isOnTerminalPage ? 'active' : ''}`}
+          onClick={handleTerminalClick}
+          title="Home terminal"
+          aria-label="Home terminal"
+        >
+          <TerminalGlyph />
         </button>
         <SettingsDropdown
           theme={theme}

@@ -358,6 +358,27 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
               }
             }}
           />
+          {/* Pre-mount discoverability: until the pane is first expanded only
+              the thin divider renders, which is easy to miss. Show a visible,
+              clickable strip labelling the home terminal. Clicking it (not a
+              passive visit) is what mounts TerminalPanel — so the lazy xterm
+              chunk + WebSocket are still deferred until the user opts in. */}
+          {!everExpanded && (
+            <button
+              type="button"
+              className="global-terminal-reveal"
+              onClick={() => {
+                setEverExpanded(true);
+                terminalPane.expandFromCollapsed();
+              }}
+              title="Open the home terminal"
+              style={{ height: GLOBAL_TERMINAL_COLLAPSED_PX }}
+            >
+              <span className="global-terminal-reveal-glyph">❯_</span>
+              <span className="global-terminal-reveal-label">Terminal</span>
+              <span className="global-terminal-reveal-hint">click to open</span>
+            </button>
+          )}
           {everExpanded && (
             <Suspense fallback={null}>
               <TerminalPanel

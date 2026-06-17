@@ -116,6 +116,12 @@ interface TerminalPanelProps {
   onExpand: () => void;
   /** Click on the expanded-state close button collapses back to strip */
   onCollapse: () => void;
+  /**
+   * Dedicated full-page mount (the `/terminal` route). The panel always fills
+   * its container and the collapse affordance is omitted — there is nothing to
+   * collapse into on a standalone page, so the chevron would be a dead control.
+   */
+  standalone?: boolean;
   /** Fallback prompt text when xterm buffer has no content yet */
   cwd?: string;
   /** Server-user's $SHELL, used to tailor the absent-state hint snippet. */
@@ -287,6 +293,7 @@ export function TerminalPanel({
   collapsed,
   onExpand,
   onCollapse,
+  standalone = false,
   cwd,
   shell,
   homeDir,
@@ -1112,19 +1119,21 @@ export function TerminalPanel({
         onClick={handleHeaderClick}
         style={headerClickable ? { cursor: 'pointer' } : undefined}
       >
-        <button
-          type="button"
-          className={`terminal-panel-chevron${collapsed ? '' : ' terminal-panel-chevron--expanded'}`}
-          aria-label={collapsed ? 'Expand terminal' : 'Collapse terminal'}
-          title={collapsed ? 'Expand terminal' : 'Collapse terminal'}
-          onClick={(e) => {
-            e.stopPropagation();
-            if (collapsed) onExpand();
-            else onCollapse();
-          }}
-        >
-          {collapsed ? <ChevronUpHeader /> : <ChevronDownHeader />}
-        </button>
+        {!standalone && (
+          <button
+            type="button"
+            className={`terminal-panel-chevron${collapsed ? '' : ' terminal-panel-chevron--expanded'}`}
+            aria-label={collapsed ? 'Expand terminal' : 'Collapse terminal'}
+            title={collapsed ? 'Expand terminal' : 'Collapse terminal'}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (collapsed) onExpand();
+              else onCollapse();
+            }}
+          >
+            {collapsed ? <ChevronUpHeader /> : <ChevronDownHeader />}
+          </button>
+        )}
         <span
           className={`terminal-live-dot-wrap${integrationStatus === 'absent' ? ' terminal-live-dot-wrap--hint' : ''}`}
           onMouseEnter={handleDotMouseEnter}

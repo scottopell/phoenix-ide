@@ -516,9 +516,13 @@ it doesn't understand.
 Phoenix MUST key terminal session ownership by `WorkScope`:
 `WorkScope::Worktree(path)` for managed/branch worktrees,
 `WorkScope::Conversation(conversation_id)` for Direct conversations, and
-`WorkScope::Global` for the singleton scope surfaced on the `/new` page
-(and any other UI surface that wants a terminal not bound to a single
-conversation).
+`WorkScope::Global` for the singleton scope surfaced by every UI surface
+that wants a terminal not bound to a single conversation. Two such
+surfaces exist: the collapsible pane on the `/new` page and the dedicated
+`/terminal` route, which mounts the same singleton full-screen. Because
+both resolve to `WorkScope::Global`, they attach to one PTY and one tmux
+session — opening one while the other is attached reclaims the shared
+session rather than spawning a competing shell.
 
 The `ActiveTerminals` registry MUST be a `HashMap<WorkScope, …>` rather
 than a `HashMap<String, …>` keyed by conversation id. Continuation
