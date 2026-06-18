@@ -410,26 +410,63 @@ fn build_disk_locations(
     locations
 }
 
+/// Resolve the suggest capability token, persisting it across restarts.
+///
+/// The token is stored in `app_settings` alongside the password fingerprint it
+/// was minted under (mirroring [`api::auth`]'s session binding). A persisted
+/// token is reused only when that fingerprint still matches the current
+/// password, so a normal restart keeps the same token — existing terminals
+/// stay authorized — while rotating `PHOENIX_PASSWORD` re-mints it. Persistence
+/// failures degrade to a fresh per-process token (logged), never fatal.
+async fn resolve_suggest_token(db: &crate::db::Database, password: Option<&str>) -> String {
+    const TOKEN_KEY: &str = "suggest_token";
+    const FINGERPRINT_KEY: &str = "suggest_token_password_fingerprint";
+
+    let current_fp = password
+        .map(api::auth::password_fingerprint)
+        .unwrap_or_default();
+
+    if let (Ok(Some(token)), Ok(Some(fp))) = (
+        db.get_app_setting(TOKEN_KEY).await,
+        db.get_app_setting(FINGERPRINT_KEY).await,
+    ) {
+        if !token.is_empty() && fp == current_fp {
+            return token;
+        }
+    }
+
+    let token = mint_suggest_token();
+    if let Err(e) = db.set_app_setting(TOKEN_KEY, &token).await {
+        tracing::warn!(error = %e, "failed to persist suggest token; phx will need a fresh token after restart");
+    } else if let Err(e) = db.set_app_setting(FINGERPRINT_KEY, &current_fp).await {
+        tracing::warn!(error = %e, "failed to persist suggest-token fingerprint");
+    }
+    token
+}
+
+/// Mint a fresh 256-bit suggest capability token (URL-safe base64).
+fn mint_suggest_token() -> String {
+    use base64::Engine as _;
+    use rand::Rng as _;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 /// Install the in-terminal `phx` companion and the PTY env injection it relies
-/// on, returning the minted suggest capability token.
+/// on.
 ///
 /// Materializes `<data_dir>/bin/phx` as a symlink to this binary (refreshed
 /// each start so it tracks upgrades) and registers a [`PtyEnvInjection`] that
 /// prepends that bin dir to every terminal's `PATH` and injects
 /// `PHOENIX_API_URL` + `PHOENIX_SUGGEST_TOKEN`. Symlink failure is non-fatal
-/// (logged); `phx` simply won't be on PATH, but the token is still returned so
-/// the endpoint gate is consistent.
+/// (logged); `phx` simply won't be on PATH.
 fn setup_phx_companion(
     runtime_env: &PhoenixRuntimeEnvironment,
     bind_address: std::net::SocketAddr,
     tls_loaded: bool,
-) -> String {
-    use base64::Engine as _;
-    use rand::Rng as _;
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-
+    token: &str,
+) {
     let scheme = if tls_loaded { "https" } else { "http" };
     let api_url = format!("{scheme}://127.0.0.1:{}", bind_address.port());
 
@@ -437,7 +474,7 @@ fn setup_phx_companion(
         path_prefix: None,
         extra: vec![
             ("PHOENIX_API_URL".to_string(), api_url),
-            ("PHOENIX_SUGGEST_TOKEN".to_string(), token.clone()),
+            ("PHOENIX_SUGGEST_TOKEN".to_string(), token.to_string()),
         ],
     };
 
@@ -449,7 +486,6 @@ fn setup_phx_companion(
     }
 
     phoenix_terminal::spawn::set_pty_env_injection(injection);
-    token
 }
 
 /// Create `<data_dir>/bin/phx` as a symlink to the running binary, returning the
@@ -791,7 +827,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Install the `phx` terminal companion: a symlink to this binary on the
     // PTY PATH plus the env (API URL + capability token) it needs to call back.
-    let suggest_token = setup_phx_companion(&runtime_env, bind_address, loaded_tls.is_some());
+    // The token persists across restarts (bound to the password fingerprint) so
+    // terminals opened before a restart stay authorized.
+    let suggest_token = resolve_suggest_token(&db, password.as_deref()).await;
+    setup_phx_companion(
+        &runtime_env,
+        bind_address,
+        loaded_tls.is_some(),
+        &suggest_token,
+    );
 
     // Create application state
     let state = AppState::new(
@@ -1185,6 +1229,39 @@ async fn reconcile_project_main_refs(db: &Database) {
 ///
 /// These run against an on-disk `SQLite` DB (tempdir) so the project/
 /// conversation foreign keys resolve correctly through migrations.
+#[cfg(test)]
+mod suggest_token_tests {
+    use super::*;
+
+    /// The suggest token must survive a "restart" (a fresh resolve against the
+    /// same persisted DB and password) and must rotate when the password
+    /// changes — the two properties the persistence fix guarantees.
+    #[tokio::test]
+    async fn token_persists_across_restarts_and_rotates_on_password_change() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+
+        // First resolve mints + persists.
+        let first = resolve_suggest_token(&db, None).await;
+        assert!(!first.is_empty());
+
+        // A later resolve with the same (no-)password reuses it: a restart
+        // keeps existing terminals authorized.
+        let after_restart = resolve_suggest_token(&db, None).await;
+        assert_eq!(first, after_restart, "token must persist across restarts");
+
+        // Setting a password rotates the token (fingerprint changed).
+        let after_pw = resolve_suggest_token(&db, Some("hunter2")).await;
+        assert_ne!(
+            after_pw, first,
+            "token must rotate when the password changes"
+        );
+
+        // The rotated token is itself stable across a subsequent restart.
+        let after_pw_again = resolve_suggest_token(&db, Some("hunter2")).await;
+        assert_eq!(after_pw, after_pw_again);
+    }
+}
+
 #[cfg(test)]
 mod reconcile_worktrees_tests {
     use super::*;
