@@ -302,6 +302,86 @@ impl ToolExecutor for DelayedMockToolExecutor {
 }
 
 // ============================================================================
+// Uncooperative Mock Tool Executor (for liveness testing)
+// ============================================================================
+
+/// Mock tool executor that DELIBERATELY ignores its cancellation token,
+/// modelling a tool stuck in a blocking child process or syscall whose
+/// `execute()` never returns until externally released.
+///
+/// Unlike [`DelayedMockToolExecutor`] — which cooperatively races
+/// `ctx.cancel.cancelled()` — this executor never selects on the cancel
+/// token. It notifies `execution_started` then awaits `release` (or, if
+/// `release` is never fired, sleeps a long fixed duration). This pins the
+/// liveness invariant: cancelling such a tool must still drive the
+/// conversation back to `Idle`.
+#[allow(dead_code)]
+pub struct UncooperativeMockToolExecutor {
+    inner: MockToolExecutor,
+    /// Notified when execution starts (mirrors `DelayedMockToolExecutor`).
+    pub execution_started: Arc<Notify>,
+    /// When notified, lets a stuck `execute()` return. Tests may leave this
+    /// un-fired to model a permanently blocked tool.
+    pub release: Arc<Notify>,
+}
+
+#[allow(dead_code)]
+impl UncooperativeMockToolExecutor {
+    pub fn new() -> Self {
+        Self {
+            inner: MockToolExecutor::new(),
+            execution_started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn with_tool(mut self, name: impl Into<String>, output: ToolOutput) -> Self {
+        self.inner = self.inner.with_tool(name, output);
+        self
+    }
+}
+
+impl Default for UncooperativeMockToolExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for UncooperativeMockToolExecutor {
+    async fn execute(
+        &self,
+        call: crate::runtime::deny_gate::CheckedToolCall,
+        ctx: ToolContext,
+    ) -> Option<ToolOutput> {
+        let (name, input) = call.into_parts();
+        self.inner
+            .executions
+            .lock()
+            .unwrap()
+            .push((name.clone(), input));
+        self.execution_started.notify_waiters();
+
+        // Deliberately do NOT select on `ctx.cancel.cancelled()`. Hold a
+        // reference so clippy doesn't flag the unused field, but never observe
+        // it — that is the whole point of "uncooperative".
+        let _ignored_cancel = &ctx.cancel;
+
+        // Block until explicitly released, with a long backstop so a forgotten
+        // release can't hang the suite indefinitely.
+        tokio::select! {
+            () = self.release.notified() => {}
+            () = tokio::time::sleep(Duration::from_secs(3600)) => {}
+        }
+        self.inner.outputs.get(&name).cloned()
+    }
+
+    async fn definitions(&self) -> Vec<ToolDefinition> {
+        self.inner.definitions().await
+    }
+}
+
+// ============================================================================
 // In-Memory Storage
 // ============================================================================
 
@@ -1364,6 +1444,121 @@ mod tests {
         assert!(
             cancel_elapsed < Duration::from_millis(200),
             "Cancellation should complete in < 200ms, took {cancel_elapsed:?}"
+        );
+    }
+
+    /// Liveness invariant (task 08692, P0): cancelling a conversation whose
+    /// running tool ignores its cancellation token MUST still drive the
+    /// conversation back to `Idle` (and emit `AgentDone`).
+    ///
+    /// `UncooperativeMockToolExecutor::execute()` never returns until released,
+    /// modelling a tool blocked in a child process/syscall. Against current
+    /// code this wedges in `CancellingTool` forever: `Effect::AbortTool` only
+    /// flips the cooperative token and the spawned tool task checks
+    /// `is_cancelled()` *after* `execute().await` returns — which it never does.
+    ///
+    /// Timing approach: a REAL bounded `tokio::time::timeout(3s)`, not a paused
+    /// clock. The runtime runs on a spawned background task and the mock parks
+    /// on a 3600s backstop sleep; a paused clock would require the test to
+    /// drive `advance` deterministically across that spawned task, which does
+    /// not compose cleanly here. The real timeout fails fast (≤3s) against
+    /// current code and never hangs the suite.
+    #[ignore = "pins P0 liveness invariant (task 08692); un-ignored in Phase 2 when the fix lands"]
+    #[tokio::test]
+    async fn cancel_with_uncooperative_tool_still_reaches_idle() {
+        use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::state_machine::ConvContext;
+        use std::path::PathBuf;
+        use tokio::sync::mpsc;
+
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::tool_use(
+                "tool-1",
+                "bash",
+                serde_json::json!({"op": "run", "cmd": "sleep 100"}),
+            )],
+            end_turn: false,
+            usage: Usage::default(),
+        });
+
+        let tools = Arc::new(
+            UncooperativeMockToolExecutor::new().with_tool("bash", ToolOutput::success("done")),
+        );
+        let execution_started = tools.execution_started.clone();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
+
+        let runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage.clone(),
+            llm,
+            tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx.clone(),
+            broadcast_tx,
+        );
+
+        tokio::spawn(async move { runtime.run().await });
+
+        event_tx
+            .send(Event::UserMessage {
+                text: "Run blocking command".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: uuid::Uuid::new_v4().to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            })
+            .await
+            .unwrap();
+
+        // Wait for the uncooperative tool to start executing.
+        tokio::time::timeout(Duration::from_secs(2), execution_started.notified())
+            .await
+            .expect("Tool execution should start");
+
+        // Cancel while the tool is wedged.
+        event_tx
+            .send(Event::UserCancel { reason: None })
+            .await
+            .unwrap();
+
+        // Liveness assertion: AgentDone within a bounded deadline. Against
+        // current code this never arrives (wedged in CancellingTool).
+        let mut agent_done = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(SseEvent::AgentDone { .. })) =
+                tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
+            {
+                agent_done = true;
+                break;
+            }
+        }
+
+        assert!(
+            agent_done,
+            "Cancelling an uncooperative tool must still reach Idle / emit AgentDone, \
+             but the conversation stayed wedged in CancellingTool"
+        );
+
+        // And the persisted state must be Idle, not stuck mid-cancel.
+        let final_state = storage.get_current_state("test-conv");
+        assert!(
+            matches!(final_state, Some(ConvState::Idle)),
+            "Conversation should return to Idle after cancel, got {final_state:?}"
         );
     }
 
