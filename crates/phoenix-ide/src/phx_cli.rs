@@ -62,10 +62,19 @@ async fn run_inner() -> Result<(), String> {
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
+    let mut payload = serde_json::json!({ "query": query });
+    // Optional model pin: PHOENIX_SUGGEST_MODEL overrides the server's default
+    // cheap model for command suggestion.
+    if let Ok(model) = std::env::var("PHOENIX_SUGGEST_MODEL") {
+        if !model.is_empty() {
+            payload["model"] = serde_json::Value::String(model);
+        }
+    }
+
     let resp = client
         .post(format!("{}/api/suggest", base.trim_end_matches('/')))
         .header("X-Phoenix-Suggest-Token", token)
-        .json(&serde_json::json!({ "query": query }))
+        .json(&payload)
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;

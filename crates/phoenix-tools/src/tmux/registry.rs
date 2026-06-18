@@ -783,6 +783,23 @@ pub async fn cascade_tmux_on_delete(
         .await
 }
 
+/// Apply the server-wide PTY env injection to a tmux command so the spawned
+/// server (and thus its pane shells) carry the `phx` shim on PATH plus
+/// `PHOENIX_API_URL` / `PHOENIX_SUGGEST_TOKEN`. No-op when no injection is
+/// installed (e.g. tests).
+fn apply_pty_env_injection(cmd: &mut tokio::process::Command) {
+    let Some(inj) = phoenix_terminal::spawn::pty_env_injection() else {
+        return;
+    };
+    if let Some(prefix) = &inj.path_prefix {
+        let base = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}:{base}", prefix.display()));
+    }
+    for (k, v) in &inj.extra {
+        cmd.env(k, v);
+    }
+}
+
 /// Spawn a fresh detached tmux session named `main` against
 /// `socket_path` with `cwd` as the pane's start directory
 /// (REQ-TMUX-002 / `tmux_default_session`). This is the only place
@@ -804,20 +821,27 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
-    let output = tokio::process::Command::new("tmux")
-        .args([
-            "-f",
-            &config_path.to_string_lossy(),
-            "-S",
-            &socket_path.to_string_lossy(),
-            "new-session",
-            "-d",
-            "-c",
-            &cwd.to_string_lossy(),
-            "-s",
-            TMUX_DEFAULT_SESSION,
-        ])
-        .env_remove("TMUX")
+    let mut cmd = tokio::process::Command::new("tmux");
+    cmd.args([
+        "-f",
+        &config_path.to_string_lossy(),
+        "-S",
+        &socket_path.to_string_lossy(),
+        "new-session",
+        "-d",
+        "-c",
+        &cwd.to_string_lossy(),
+        "-s",
+        TMUX_DEFAULT_SESSION,
+    ])
+    .env_remove("TMUX");
+    // A tmux pane shell inherits the tmux *server's* environment, captured when
+    // the server is spawned here — not `build_env`'s, which only dresses the
+    // short-lived `tmux attach` client. Apply the same PTY env injection (PATH
+    // prefix for the `phx` shim + API URL + capability token) so terminal
+    // affordances work identically on the tmux and direct-shell paths.
+    apply_pty_env_injection(&mut cmd);
+    let output = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

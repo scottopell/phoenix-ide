@@ -44,6 +44,14 @@ pub fn set_pty_env_injection(injection: PtyEnvInjection) {
     let _ = ENV_INJECTION.set(injection);
 }
 
+/// Read the server-wide PTY env injection, if one was installed. The tmux path
+/// needs this too: a pane shell is a child of the tmux *server*, not of the PTY
+/// child `build_env` dresses, so the same injection must be applied when the
+/// server is spawned (see `phoenix_tools::tmux` `spawn_session`).
+pub fn pty_env_injection() -> Option<&'static PtyEnvInjection> {
+    ENV_INJECTION.get()
+}
+
 /// What the PTY child should exec into.
 ///
 /// `Tmux` carries the conversation's resolved socket path and the
