@@ -507,24 +507,36 @@ rule CancellingToolDeadlineFires {
     when: CancellationDeadlineExpires(conversation)
     requires: conversation.core_status = cancelling_tool
     ensures: CancellationCheckpointed(conversation)
-    ensures: conversation.core_status = idle
-    ensures: AgentDone(conversation)
     ensures: CancellationDeadlineExceeded(conversation)
     ensures: SystemMessageInjected(conversation,
         "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
+    -- Mirror the conditional next-state of the cooperative ToolAbortConfirmed:
+    -- if sub-agents were spawned earlier in this tool round they must still be
+    -- cancelled, so the backstop drains into cancelling_sub_agents (which has
+    -- its own deadline backstop) rather than skipping straight to idle.
+    ensures:
+        if conversation.sub_agents_pending?.count = 0:
+            conversation.core_status = idle
+            AgentDone(conversation)
+        else:
+            conversation.core_status = cancelling_sub_agents
+            SubAgentsCancelRequested(conversation)
 
     @guidance
         -- Sequence on deadline expiry: abort the tool's executing task (do not
         -- wait for it), reap any subprocesses it spawned (process-group kill),
         -- synthesize cancelled results for the current and remaining tools,
-        -- checkpoint, then settle to idle. Reaching idle (not error) is
-        -- deliberate: a cancel the user requested and that succeeded from their
-        -- view must not be presented as a failure. CancellationDeadlineExceeded
-        -- is the executor's WARN-level liveness marker; SystemMessageInjected
-        -- keeps the user oriented — the conversation is idle even though
-        -- background resource reclamation may still be in flight. The OS child
-        -- process is reaped regardless of task cooperation (REQ-BED-005); this
-        -- backstop covers the in-process "task never returns" case.
+        -- checkpoint, then settle. Settling reaches idle (not error) — a cancel
+        -- the user requested and that succeeded from their view must not be
+        -- presented as a failure — except when the round had spawned sub-agents,
+        -- where it drains through cancelling_sub_agents first (those agents'
+        -- liveness is then bounded by CancellingSubAgentsDeadlineFires). The
+        -- user-visible orientation message is sequenced AFTER the cancellation
+        -- checkpoint so history replay never shows the notice before the tool
+        -- call/results it describes. CancellationDeadlineExceeded is the
+        -- executor's WARN-level liveness marker. The OS child process is reaped
+        -- regardless of task cooperation (REQ-BED-005); this backstop covers the
+        -- in-process "task never returns" case.
 }
 
 -- cancelling_sub_agents's cooperative exit (LastSubAgentDuringCancellation)
