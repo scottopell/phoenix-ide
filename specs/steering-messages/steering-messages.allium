@@ -33,9 +33,11 @@
 --   preserves the single-writer transcript-persistence invariant: all user
 --   messages, including drained steers, flow through Effect::persist_user_message.
 --
---   The queue is persisted in the DB steering_queue column (JSON) and loaded
---   into executor memory on startup, enabling crash recovery without
---   re-delivery (PRIMARY KEY on message_id prevents double-insert).
+--   The queue is persisted in the steering_messages table (one row per entry,
+--   ordered by ordinal; each entry's attachments live in the grandchild
+--   steering_message_files / steering_message_images tables) and loaded into
+--   executor memory on startup, enabling crash recovery without re-delivery
+--   (the message_id PRIMARY KEY prevents double-insert).
 --
 -- Requirement traceability: REQ-STEER-001 through REQ-STEER-005
 
@@ -46,7 +48,8 @@ use "./bedrock.allium" as bedrock
 ------------------------------------------------------------
 
 -- A pending steering entry, structurally identical to a UserMessage payload.
--- Stored in the DB as JSON and held in the executor's in-memory queue.
+-- Persisted as a steering_messages row (with attachments in the grandchild
+-- tables) and held in the executor's in-memory queue.
 value SteerEntry {
     -- Human-readable display text. Always present.
     text: String
@@ -54,8 +57,12 @@ value SteerEntry {
     -- Absent when expansion produced no change. Both llm_text and
     -- skill_invocation below are outputs of the same expansion step.
     llm_text: String?
-    -- Image attachments (mirrors the normal send path).
+    -- Image attachments (mirrors the normal send path). Persisted as
+    -- steering_message_images rows keyed by message_id.
     images: List<ImageData>
+    -- Non-image file attachments (mirrors the normal send path). Persisted as
+    -- steering_message_files rows keyed by message_id.
+    files: List<FileAttachment>
     -- Client-generated UUID. Used as the cancellation key.
     message_id: String
     -- HTTP User-Agent of the originating client, for tracing.
@@ -70,6 +77,14 @@ value ImageData {
     media_type: String
     -- Base64-encoded image bytes.
     data: String
+}
+
+value FileAttachment {
+    original_name: String
+    media_type: String
+    size_bytes: Integer
+    -- Server-side path where the uploaded bytes are stored.
+    stored_path: String
 }
 
 value SkillInvocation {
@@ -397,7 +412,8 @@ surface SteeringQueueApi {
         -- A steering message enqueued while a drain is in progress is not lost.
         -- Effect::ClearSteeringQueueEntries removes only the specific drained
         -- message_ids (not the whole queue); the DB method
-        -- Database::remove_steering_entries does read-filter-write under a
-        -- transaction so a concurrent enqueue's read-append-write cannot be
-        -- clobbered.
+        -- Database::remove_steering_entries deletes exactly those message_id
+        -- rows from steering_messages (cascading their attachments) as a direct
+        -- DELETE — there is no read-modify-write window, so a concurrent
+        -- enqueue's read-append-write cannot be clobbered.
 }

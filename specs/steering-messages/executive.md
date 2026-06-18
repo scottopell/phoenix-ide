@@ -4,7 +4,7 @@
 
 A steering message is a user-directed instruction sent to a conversation that is currently *busy* — running an LLM turn, waiting on tools, or in any non-idle state. Without this feature, the API would reject the send (`agent_busy`) and the user would have to wait for the turn to finish before redirecting it. The steering queue accepts the message anyway, persists it, and delivers it as a normal `UserMessage` at the next drain point. From the LLM's perspective, drained messages are indistinguishable from regular sends; from the user's perspective, the conversation never refuses input even when it's "thinking".
 
-The queue is FIFO, survives Phoenix restarts (persisted in `conversations.steering_queue` JSON column), and supports cancellation by `message_id`. Cancellation is idempotent — cancelling an already-drained or never-existed entry is a successful 200 OK. Terminal conversations refuse steering entirely; the queue is bounded by absence rather than a numeric cap.
+The queue is FIFO, survives Phoenix restarts (persisted in the `steering_messages` table — one row per pending entry, ordered by `ordinal` — with `steering_message_files` / `steering_message_images` holding each entry's attachments), and supports cancellation by `message_id`. Cancellation is idempotent — cancelling an already-drained or never-existed entry is a successful 200 OK. Terminal conversations refuse steering entirely; the queue is bounded by absence rather than a numeric cap.
 
 **Drain semantics (REQ-STEER-002, REQ-STEER-005):** all queued entries drain together as a batch at each hook point — the queue is never partially drained. There are two hook points:
 
@@ -38,7 +38,7 @@ Three persistence-ordering rules are load-bearing:
 
 FIFO order is preserved because the queue is a `Vec` with append-at-tail enqueue and whole-vec take at drain; the bedrock arm iterates the drained `entries` in order when emitting persist effects.
 
-The persisted JSON array round-trips through `db.update_steering_queue` (`crates/phoenix-ide/src/db.rs:576`) and is loaded into the executor on startup via `with_steering_queue` (`runtime.rs:1007`). The queue is therefore live immediately after a Phoenix restart — no warm-up.
+The queue round-trips through `Database::update_steering_queue`, which has replace-all semantics: in one transaction it deletes the conversation's `steering_messages` rows (cascading their attachment grandchildren) and re-inserts the current entries with fresh `ordinal`s. On startup the executor is seeded via `with_steering_queue`, sourced from `Database::get_steering_queue`, which rehydrates each entry's attachments and skill invocation from a single read snapshot (one read transaction) so a concurrent replace/remove can never hand back a torn entry. The queue is therefore live immediately after a Phoenix restart — no warm-up.
 
 ## Status Summary
 
@@ -53,14 +53,14 @@ The spec was distilled from a working implementation; all rules and invariants a
 | **DrainOnEnteringLlmRound** (REQ-STEER-005) | Complete | Detector: `runtime/executor.rs:787` (`maybe_drain_steering_queue`, `entering_llm_requesting_from_tool_round` branch). Inline processing + deferred-RequestLlm: `:732` (`run_effects_with_inline_drain`). Bedrock arm: `state_machine/transition.rs:454` (`(LlmRequesting, SteerDrainedUserMessages)` — emits N `persist_user_message`, `PersistState`, `ClearSteeringQueueEntries`; no `RequestLlm` — executor's deferred-RequestLlm carries the in-flight call). |
 | **DepthNonNegative** (entity invariant) | Complete by construction | `entries: Vec<SteerEntry>` — `len()` is `usize`, structurally non-negative |
 | **UniqueMessageIds** (entity invariant) | Complete | `enqueue_steer_message` does not allow duplicate IDs; client-generated UUIDs |
-| **OneQueuePerConversation** (invariant) | Complete by construction | Queue is a column on `conversations`; one row per conversation |
+| **OneQueuePerConversation** (invariant) | Complete by construction | `steering_messages` rows are keyed by `conversation_id` with a per-conversation `ordinal` (`UNIQUE(conversation_id, ordinal)`); the queue is the set of rows for a conversation, so it is one-to-one by construction |
 | **IdempotentCancel** (surface guarantee) | Complete | Cancel handler returns 200 whether or not the entry was present |
 | **SteerMessageQueuedAck** (surface guarantee) | Complete | `SseWireEvent::SteerMessageQueued` emitted from `runtime/executor.rs:542`; client subscribes at `ui/src/hooks/useConnection.ts` |
 | **PersistenceBeforeResponse** (surface guarantee) | Complete | Both enqueue (P1) and cancel (P2) write to DB before HTTP response |
 | **MidTurnDrainSemantics** (surface guarantee) | Complete | Bedrock arm at `state_machine/transition.rs:454` omits `RequestLlm`. Executor's `run_effects_with_inline_drain` (`runtime/executor.rs:732`) runs persists first, then the deferred `RequestLlm`, so the in-flight call deterministically sees the steered messages — no race, no "steers persisted but unanswered" failure mode. |
 | **DirectSendTransparency** (surface guarantee) | Complete | When `not is_busy`, message bypasses queue entirely; SSE `steer_message_queued` event is not emitted |
-| **EnqueueDuringDrainPreserved** (surface guarantee) | Complete | `Effect::ClearSteeringQueueEntries { message_ids }` removes only the drained ids (not the whole queue). DB method `Database::remove_steering_entries` (`db.rs:601`) does read-filter-write under a transaction, so a concurrent `enqueue_steer_message` cannot be lost. |
-| **Crash recovery** | Complete | DB queue updated AFTER persist effects via `Effect::ClearSteeringQueueEntries` (`runtime/executor.rs:1403`). `Effect::PersistMessage` is idempotent via `storage.message_exists` precheck gated by `idempotent: bool` flag (`runtime/executor.rs:1185`). Queue loaded on startup via `with_steering_queue` (`runtime.rs:1007`). On crash mid-drain: queue still has the drained entries, restart loads them, next drain re-fires the event, already-persisted entries are skipped. At-least-once delivery without double-insertion. |
+| **EnqueueDuringDrainPreserved** (surface guarantee) | Complete | `Effect::ClearSteeringQueueEntries { message_ids }` removes only the drained ids (not the whole queue). `Database::remove_steering_entries` deletes exactly those `message_id` rows from `steering_messages` (cascading their attachments) — a direct `DELETE`, no read-modify-write window, so a concurrent `enqueue_steer_message` cannot be clobbered. |
+| **Crash recovery** | Complete | DB queue updated AFTER persist effects via `Effect::ClearSteeringQueueEntries`. `Effect::PersistMessage` is idempotent via `storage.message_exists` precheck gated by `idempotent: bool` flag. Queue loaded on startup via `with_steering_queue` (sourced from `Database::get_steering_queue`). On crash mid-drain: the `steering_messages` rows for drained-but-uncleared entries survive, restart loads them, next drain re-fires the event, already-persisted entries are skipped. At-least-once delivery without double-insertion. |
 
 **Progress:** All five rules (REQ-STEER-001..005) and all invariants/guarantees implemented.
 
