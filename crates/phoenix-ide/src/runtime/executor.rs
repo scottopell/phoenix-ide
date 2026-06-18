@@ -3232,6 +3232,17 @@ where
         // Forward the typed outcome — a dropped sender becomes a typed Failed
         // outcome so a panicked/aborted tool task can never wedge the
         // conversation. See `forward_tool_outcome`.
+        //
+        // No generation guard here, unlike the LLM/retry paths: a stale tool
+        // outcome (from an aborted/superseded task) is rejected structurally by
+        // the state machine, which gates every tool outcome on BOTH the
+        // `tool_use_id` matching the current tool AND the conversation being in
+        // a tool state. Tool ids are opaque LLM-issued strings and a tool round
+        // never re-enters the same `ToolExecuting`, so the id/state gate is the
+        // equivalent of a generation epoch. If tool retry-in-place is ever added
+        // (re-executing a tool without a fresh round/id), this no longer holds
+        // and the tool path needs its own generation guard. See specs/bedrock
+        // REQ-BED-005a.
         tokio::spawn(forward_tool_outcome(
             tool_rx,
             forwarder_tool_use_id,
