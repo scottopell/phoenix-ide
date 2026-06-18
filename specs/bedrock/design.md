@@ -381,22 +381,31 @@ failure would be wrong. The user-visible message notes that aborted work may
 still be reclaiming resources in the background, keeping the user oriented while
 the conversation is already idle.
 
-#### Stale tool outcomes are rejected by id/state, not a generation epoch
+#### Stale tool outcomes are rejected by a generation epoch
 
 An aborted or superseded tool task can still deliver a late outcome (its
-forwarder maps a dropped sender to a synthetic failure). The in-flight LLM and
-retry-timer paths discard such stale outcomes with a generation epoch, because
-those requests can be aborted and re-issued into the *same* state, where only
-the epoch distinguishes the live request from a superseded one. The tool path
-deliberately carries no generation epoch: every tool outcome is gated on **both**
-the `tool_use_id` matching the current tool **and** the conversation being in a
-tool state, and a tool round never re-enters the same `ToolExecuting` with the
-same (opaque, LLM-issued) id. A stale tool outcome therefore matches no current
-tool/state and is rejected as an invalid transition — the id/state gate is the
-structural equivalent of a generation guard. This equivalence depends on tool
-execution being one-shot per round: introducing tool retry-in-place (re-running
-a tool without a fresh round and id) would break it and require the tool path to
-adopt a generation epoch like the other in-flight paths.
+forwarder maps a dropped sender to a synthetic failure). Every in-flight effect
+path — LLM, retry timer, and tool — discards such stale outcomes with a
+generation epoch. Each tool dispatch opens a fresh generation; the outcome
+forwarder stamps the dispatching generation, and the executor drops any tool
+outcome whose generation is no longer current before it reaches the reducer.
+The generation is also bumped at the `CancellingTool` forced-teardown backstop,
+which aborts a wedged task (dropping its sender) and settles to `Idle` via a
+synthetic event — so the dropped task's synthetic failure is stale and ignored.
+
+The epoch is bumped at dispatch and at the backstop, **not** on the cooperative
+`AbortTool`: `AbortTool` only cancels the token, and the tool task then produces
+a real `Aborted` outcome carrying the still-current dispatch generation that the
+state machine consumes to reach `Idle`. Discarding that outcome would wedge
+cooperative cancellation.
+
+The reducer additionally gates every tool outcome on **both** the `tool_use_id`
+matching the current tool **and** the conversation being in a tool state. This
+id/state gate is retained as defense in depth, but it is not sufficient on its
+own: `tool_use_id` uniqueness across turns is provider-dependent, not
+structurally enforced. If a later turn reuses a still-in-flight stale outcome's
+id, the id/state gate alone would mistake the stale failure for the new tool's
+result; the generation epoch is what closes that race.
 
 This is the same liveness family as the sub-agent deadline in
 `specs/subagents/` (REQ-SA-006): a wedged worker must never be able to hold its
