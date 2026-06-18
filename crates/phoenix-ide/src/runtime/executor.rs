@@ -2035,10 +2035,15 @@ where
             tracing::warn!(error = %e, "Failed to process cancellation backstop ToolAborted");
         }
 
-        // Persist+broadcast the user-visible system message AFTER the checkpoint
-        // commits, so its sequence is strictly after the cancelled tool round it
-        // describes (history replays by `sequence_id`).
-        self.broadcast_cancellation_backstop_message().await;
+        // Announce completion only if we actually reached Idle. When the
+        // cancelled round had spawned sub-agents, ToolAborted transitions to
+        // CancellingSubAgents (not Idle) — that path's own backstop announces
+        // completion when it drains to Idle, so broadcasting here would be both
+        // premature (cancellation isn't done) and a duplicate. Persisted AFTER
+        // the checkpoint so its sequence is strictly after the round it describes.
+        if matches!(self.state, ConvState::Idle) {
+            self.broadcast_cancellation_backstop_message().await;
+        }
     }
 
     /// Handle the hard stop after grace turn (REQ-BED-026 `SubAgentTurnLimitHardStop`):

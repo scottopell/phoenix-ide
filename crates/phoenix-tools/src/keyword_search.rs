@@ -288,6 +288,13 @@ IMPORTANT: Do NOT use this tool if you have precise information like log lines, 
                     }
                 }
                 Err(e) => {
+                    // Stop prechecking the moment cancellation fires — otherwise
+                    // a large term list spawns and kills one `rg` per remaining
+                    // term, churning processes and delaying the cooperative
+                    // cancel path. ripgrep() returns Err on cancel.
+                    if ctx.cancel.is_cancelled() {
+                        return ToolOutput::error("keyword_search cancelled");
+                    }
                     tracing::warn!(term = %term, error = %e, "Error checking term");
                 }
             }
