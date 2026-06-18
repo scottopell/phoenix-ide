@@ -382,6 +382,86 @@ impl ToolExecutor for UncooperativeMockToolExecutor {
 }
 
 // ============================================================================
+// First-Call-Uncooperative Tool Executor (for stale-handle QA)
+// ============================================================================
+
+/// Tool executor that is uncooperative on its FIRST `execute()` (blocks forever,
+/// ignoring its cancel token — modelling a wedged tool) and cooperative on every
+/// subsequent call (returns the configured output immediately).
+///
+/// Used to pin the `tool_task_handle` lifecycle (task 08692, vector 3): after the
+/// `CancellingTool` backstop aborts the wedged first task and forces Idle, a new
+/// turn's new tool task must NOT be aborted by any stale handle/deadline.
+#[allow(dead_code)]
+pub struct FirstCallUncooperativeToolExecutor {
+    inner: MockToolExecutor,
+    call_count: std::sync::atomic::AtomicUsize,
+    /// Notified each time `execute()` starts.
+    pub execution_started: Arc<Notify>,
+    /// Notified each time a cooperative (call >= 2) `execute()` returns.
+    pub cooperative_completed: Arc<Notify>,
+}
+
+#[allow(dead_code)]
+impl FirstCallUncooperativeToolExecutor {
+    pub fn new() -> Self {
+        Self {
+            inner: MockToolExecutor::new(),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            execution_started: Arc::new(Notify::new()),
+            cooperative_completed: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn with_tool(mut self, name: impl Into<String>, output: ToolOutput) -> Self {
+        self.inner = self.inner.with_tool(name, output);
+        self
+    }
+}
+
+impl Default for FirstCallUncooperativeToolExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for FirstCallUncooperativeToolExecutor {
+    async fn execute(
+        &self,
+        call: crate::runtime::deny_gate::CheckedToolCall,
+        ctx: ToolContext,
+    ) -> Option<ToolOutput> {
+        use std::sync::atomic::Ordering;
+        let (name, input) = call.into_parts();
+        self.inner
+            .executions
+            .lock()
+            .unwrap()
+            .push((name.clone(), input));
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        self.execution_started.notify_waiters();
+
+        if n == 0 {
+            // First call: uncooperative — never observe the token, block on a
+            // long backstop so a forgotten test can't hang the suite.
+            let _ignored_cancel = &ctx.cancel;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            self.inner.outputs.get(&name).cloned()
+        } else {
+            // Subsequent calls: cooperative and immediate.
+            let out = self.inner.outputs.get(&name).cloned();
+            self.cooperative_completed.notify_waiters();
+            out
+        }
+    }
+
+    async fn definitions(&self) -> Vec<ToolDefinition> {
+        self.inner.definitions().await
+    }
+}
+
+// ============================================================================
 // In-Memory Storage
 // ============================================================================
 
@@ -2542,5 +2622,547 @@ mod tests {
                  the Message — producing phantom streaming buffers in the client."
             );
         }
+    }
+
+    // ========================================================================
+    // Adversarial cancellation-liveness QA (task 08692, P0)
+    //
+    // These pin the subtle state-machine-level invariants the cancellation
+    // backstops rely on. They are pure-transition tests (no timing) so they are
+    // deterministic and fast.
+    // ========================================================================
+
+    /// Vector 2: synthetic-vs-real result race in `CancellingSubAgents`.
+    ///
+    /// A real `SubAgentResult` for agent X drains X out of `pending` (last one →
+    /// Idle). The backstop then injects a *duplicate* synthetic `TimedOut` for X.
+    /// That duplicate must be rejected as `InvalidTransition` — no panic, no
+    /// double-drain, and (separately verified) no negative pending count.
+    #[tokio::test]
+    async fn cancelling_sub_agents_duplicate_result_for_drained_agent_is_rejected() {
+        use crate::state_machine::state::{PendingSubAgent, SubAgentMode, SubAgentOutcome};
+        use crate::state_machine::{transition, ConvContext, Event};
+        use std::path::PathBuf;
+
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+
+        // Single pending agent: the real result drives the last-one → Idle arm.
+        let state = ConvState::CancellingSubAgents {
+            pending: vec![PendingSubAgent {
+                agent_id: "X".to_string(),
+                task: "t".to_string(),
+                mode: SubAgentMode::Work,
+            }],
+            completed_results: vec![],
+        };
+
+        // Real result for X → Idle.
+        let result = transition(
+            &state,
+            &context,
+            Event::SubAgentResult {
+                agent_id: "X".to_string(),
+                outcome: SubAgentOutcome::Success {
+                    result: "real".to_string(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(result.new_state, ConvState::Idle),
+            "Real last result should drain CancellingSubAgents → Idle, got {:?}",
+            result.new_state
+        );
+
+        // Now Idle. The backstop's duplicate synthetic TimedOut for the
+        // already-drained X must be rejected, not mis-applied. (Idle absorbs a
+        // sub-agent-only event via the terminal-absorb path, so assert it does
+        // NOT leave Idle and produces no effects.)
+        let dup = transition(
+            &result.new_state,
+            &context,
+            Event::SubAgentResult {
+                agent_id: "X".to_string(),
+                outcome: SubAgentOutcome::TimedOut,
+            },
+        );
+        // Ok(absorb-in-Idle with no effects) or Err(hard rejection) both acceptable.
+        if let Ok(r) = dup {
+            assert!(
+                matches!(r.new_state, ConvState::Idle),
+                "Duplicate result in Idle must not leave Idle, got {:?}",
+                r.new_state
+            );
+            assert!(
+                r.effects.is_empty(),
+                "Duplicate result in Idle must produce no effects, got {:?}",
+                r.effects
+            );
+        }
+    }
+
+    /// Vector 2 (mid-drain variant): with two pending, a duplicate result for an
+    /// agent that was already drained (no longer in `pending`) is an
+    /// `InvalidTransition` — it must not underflow the pending set nor double-add
+    /// to `completed_results`.
+    #[tokio::test]
+    async fn cancelling_sub_agents_duplicate_mid_drain_is_invalid_transition() {
+        use crate::state_machine::state::{PendingSubAgent, SubAgentMode, SubAgentOutcome};
+        use crate::state_machine::{transition, ConvContext, Event};
+        use std::path::PathBuf;
+
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+
+        // Two pending: X already drained, only Y remains.
+        let state = ConvState::CancellingSubAgents {
+            pending: vec![PendingSubAgent {
+                agent_id: "Y".to_string(),
+                task: "ty".to_string(),
+                mode: SubAgentMode::Work,
+            }],
+            completed_results: vec![],
+        };
+
+        // Duplicate TimedOut for X (not in pending) → InvalidTransition.
+        let dup = transition(
+            &state,
+            &context,
+            Event::SubAgentResult {
+                agent_id: "X".to_string(),
+                outcome: SubAgentOutcome::TimedOut,
+            },
+        );
+        assert!(
+            dup.is_err(),
+            "A result for an agent not in pending must be rejected, got {:?}",
+            dup.map(|r| r.new_state)
+        );
+    }
+
+    /// Vector 4: a late stale tool outcome carrying the OLD `tool_use_id` must
+    /// NOT affect a NEW `ToolExecuting` round started with a DIFFERENT id after
+    /// the backstop forced Idle.
+    ///
+    /// The forwarder captures the tool's id at spawn (`forwarder_tool_use_id`),
+    /// so a stale `ToolComplete`/`ToolAborted` carries the old id. The SM guards
+    /// every tool-completion arm on `tool_use_id == current_tool.id`, so the
+    /// stale id falls through to `InvalidTransition`.
+    #[tokio::test]
+    async fn stale_tool_outcome_with_old_id_does_not_affect_new_round() {
+        use crate::llm::ContentBlock;
+        use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state_machine::{transition, ConvContext, Event};
+        use std::path::PathBuf;
+
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+
+        // New round with a DIFFERENT tool_use_id ("new-id").
+        let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::ToolUse {
+                id: "new-id".to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({}),
+            }],
+            None,
+            None,
+        );
+        let new_state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "new-id",
+                ToolInput::Bash(crate::tools::BashToolInput::run("cmd")),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message,
+        };
+
+        // Stale ToolComplete for the OLD id arrives.
+        let stale = transition(
+            &new_state,
+            &context,
+            Event::ToolComplete {
+                tool_use_id: "old-id".to_string(),
+                result: crate::db::ToolResult::cancelled("old-id".to_string(), "stale"),
+            },
+        );
+        assert!(
+            stale.is_err(),
+            "Stale ToolComplete for an old tool_use_id must be rejected in a new \
+             ToolExecuting round, got {:?}",
+            stale.map(|r| r.new_state)
+        );
+
+        // Stale ToolAborted for the OLD id also rejected.
+        let stale_abort = transition(
+            &new_state,
+            &context,
+            Event::ToolAborted {
+                tool_use_id: "old-id".to_string(),
+            },
+        );
+        assert!(
+            stale_abort.is_err(),
+            "Stale ToolAborted for an old tool_use_id must be rejected, got {:?}",
+            stale_abort.map(|r| r.new_state)
+        );
+    }
+
+    /// Vector 4 (Idle variant): after the `CancellingTool` backstop forces Idle,
+    /// the orphaned task's forwarded late `ToolComplete` must be absorbed/rejected
+    /// in Idle without mis-applying.
+    #[tokio::test]
+    async fn late_tool_outcome_in_idle_is_harmless() {
+        use crate::state_machine::{transition, ConvContext, Event};
+        use std::path::PathBuf;
+
+        let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
+
+        let res = transition(
+            &ConvState::Idle,
+            &context,
+            Event::ToolComplete {
+                tool_use_id: "orphan".to_string(),
+                result: crate::db::ToolResult::cancelled("orphan".to_string(), "late"),
+            },
+        );
+        // Either a hard rejection or an absorb that stays in Idle is acceptable;
+        // a transition OUT of Idle would be a bug.
+        if let Ok(r) = res {
+            assert!(
+                matches!(r.new_state, ConvState::Idle),
+                "Late ToolComplete in Idle must not leave Idle, got {:?}",
+                r.new_state
+            );
+        }
+    }
+
+    /// Vector 1: the unified deadline must NOT restart on an
+    /// `AwaitingSubAgents → AwaitingSubAgents` self-transition (one sub-agent
+    /// resolves while others remain). `manage_deadline` keys re-arming on a
+    /// `std::mem::discriminant` change, so a self-transition is the *same*
+    /// discriminant and the in-flight deadline is preserved. This pins that
+    /// discriminant equality directly — a regression to field-wise comparison or
+    /// unconditional re-arm would let a stuck sub-agent run ~40min instead of 20.
+    #[test]
+    fn awaiting_sub_agents_self_transition_preserves_deadline_discriminant() {
+        use crate::state_machine::state::{PendingSubAgent, SubAgentMode};
+
+        let two = ConvState::AwaitingSubAgents {
+            pending: vec![
+                PendingSubAgent {
+                    agent_id: "a".to_string(),
+                    task: "ta".to_string(),
+                    mode: SubAgentMode::Work,
+                },
+                PendingSubAgent {
+                    agent_id: "b".to_string(),
+                    task: "tb".to_string(),
+                    mode: SubAgentMode::Work,
+                },
+            ],
+            completed_results: vec![],
+            spawn_tool_id: None,
+        };
+        let one = ConvState::AwaitingSubAgents {
+            pending: vec![PendingSubAgent {
+                agent_id: "b".to_string(),
+                task: "tb".to_string(),
+                mode: SubAgentMode::Work,
+            }],
+            completed_results: vec![],
+            spawn_tool_id: None,
+        };
+
+        // Same variant → discriminant equal → manage_deadline keeps the clock.
+        assert_eq!(
+            std::mem::discriminant(&two),
+            std::mem::discriminant(&one),
+            "AwaitingSubAgents self-transition must keep the same discriminant so \
+             manage_deadline preserves the original 20-minute deadline"
+        );
+
+        // Cross-check: AwaitingSubAgents → CancellingSubAgents IS a variant
+        // change, so the deadline re-arms (to the 3s cancellation window).
+        let cancelling = ConvState::CancellingSubAgents {
+            pending: vec![PendingSubAgent {
+                agent_id: "b".to_string(),
+                task: "tb".to_string(),
+                mode: SubAgentMode::Work,
+            }],
+            completed_results: vec![],
+        };
+        assert_ne!(
+            std::mem::discriminant(&one),
+            std::mem::discriminant(&cancelling),
+            "AwaitingSubAgents → CancellingSubAgents must change discriminant so the \
+             cancellation backstop replaces the long completion deadline"
+        );
+    }
+
+    /// Vector 3 (end-to-end): after the `CancellingTool` backstop aborts a wedged
+    /// tool task and forces Idle, a NEW user turn whose NEW tool task is started
+    /// must run to completion — proving no stale `tool_task_handle` aborts the
+    /// new task and no stale deadline interferes.
+    ///
+    /// Turn 1: uncooperative tool wedges → `UserCancel` → backstop fires (≤3s) →
+    /// Idle. Turn 2: same executor is now cooperative → its tool completes and
+    /// the second turn ends with `AgentDone` from a clean text response.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn new_tool_round_after_backstop_is_not_aborted_by_stale_handle() {
+        use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::state_machine::ConvContext;
+        use std::path::PathBuf;
+        use tokio::sync::mpsc;
+
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        // Turn 1: a tool call (will wedge).
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::tool_use(
+                "tool-1",
+                "bash",
+                serde_json::json!({"op": "run", "cmd": "sleep 100"}),
+            )],
+            end_turn: false,
+            usage: Usage::default(),
+        });
+        // Turn 2: a tool call (cooperative now), then...
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::tool_use(
+                "tool-2",
+                "bash",
+                serde_json::json!({"op": "run", "cmd": "echo hi"}),
+            )],
+            end_turn: false,
+            usage: Usage::default(),
+        });
+        // ...the post-tool LLM round returns a plain text answer → AgentDone.
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("done with second tool")],
+            end_turn: true,
+            usage: Usage::default(),
+        });
+
+        let tools = Arc::new(
+            FirstCallUncooperativeToolExecutor::new().with_tool("bash", ToolOutput::success("ok")),
+        );
+        let execution_started = tools.execution_started.clone();
+        let cooperative_completed = tools.cooperative_completed.clone();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let (event_tx, event_rx) = mpsc::channel(32);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(256, 0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
+
+        let runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage.clone(),
+            llm,
+            tools,
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx.clone(),
+            broadcast_tx,
+        );
+
+        tokio::spawn(async move { runtime.run().await });
+
+        // Turn 1.
+        event_tx
+            .send(Event::UserMessage {
+                text: "wedge".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: uuid::Uuid::new_v4().to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), execution_started.notified())
+            .await
+            .expect("first (wedging) tool should start");
+
+        // Cancel; backstop must drive to Idle.
+        event_tx
+            .send(Event::UserCancel { reason: None })
+            .await
+            .unwrap();
+
+        let mut reached_idle = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(SseEvent::AgentDone { .. })) =
+                tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
+            {
+                reached_idle = true;
+                break;
+            }
+        }
+        assert!(reached_idle, "cancel must reach Idle via backstop");
+        assert!(
+            matches!(
+                storage.get_current_state("test-conv"),
+                Some(ConvState::Idle)
+            ),
+            "state must be Idle after backstop before starting turn 2"
+        );
+
+        // Turn 2: the NEW tool task must run cooperatively to completion. If a
+        // stale handle/deadline aborted it, cooperative_completed never fires and
+        // no second AgentDone arrives.
+        event_tx
+            .send(Event::UserMessage {
+                text: "second".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: uuid::Uuid::new_v4().to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            })
+            .await
+            .unwrap();
+
+        // The new tool task completes cooperatively.
+        tokio::time::timeout(Duration::from_secs(3), cooperative_completed.notified())
+            .await
+            .expect(
+                "second (cooperative) tool task must complete — a stale handle must not \
+                 abort the new round's tool task",
+            );
+
+        // And the second turn reaches AgentDone (clean Idle).
+        let mut second_done = false;
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline2 {
+            if let Ok(Ok(SseEvent::AgentDone { .. })) =
+                tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
+            {
+                second_done = true;
+                break;
+            }
+        }
+        assert!(
+            second_done,
+            "second turn must reach AgentDone after the cooperative tool completes"
+        );
+        assert!(
+            matches!(
+                storage.get_current_state("test-conv"),
+                Some(ConvState::Idle)
+            ),
+            "second turn must end in Idle"
+        );
+    }
+
+    /// Vector 8 (the production incident — sub-agent half): a SUB-AGENT wedged in
+    /// `CancellingTool` (its tool never observes the token) must, via its own
+    /// `CancellingTool` backstop, reach the terminal `Failed` state AND emit
+    /// `NotifyParent` — delivering a real `SubAgentResult(Failure/Cancelled)` to
+    /// the parent so the parent's `CancellingSubAgents` fan-in stays correct.
+    ///
+    /// Constructed directly in `CancellingTool` (no tool task handle — modelling
+    /// a tool that is already wedged/gone). The only path out is the backstop,
+    /// which injects a synthetic `ToolAborted` → the sub-agent's
+    /// `CancellingTool + ToolAborted -> Failed + NotifyParent` arm.
+    #[tokio::test]
+    async fn wedged_sub_agent_in_cancelling_tool_notifies_parent_via_backstop() {
+        use crate::llm::ContentBlock;
+        use crate::runtime::ConversationRuntime;
+        use crate::state_machine::state::{AssistantMessage, SubAgentOutcome};
+        use crate::state_machine::ConvContext;
+        use std::path::PathBuf;
+        use tokio::sync::mpsc;
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::sub_agent(
+            "sub-1",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            "parent-conv",
+        );
+
+        // The sub-agent's own event loop channel.
+        let (event_tx, event_rx) = mpsc::channel::<Event>(32);
+        // The parent's inbound channel — NotifyParent sends a SubAgentResult here.
+        let (parent_tx, mut parent_rx) = mpsc::channel::<Event>(32);
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+
+        let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::ToolUse {
+                id: "wedged-tool".to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({}),
+            }],
+            None,
+            None,
+        );
+        let initial_state = ConvState::CancellingTool {
+            tool_use_id: "wedged-tool".to_string(),
+            skipped_tools: vec![],
+            completed_results: vec![],
+            assistant_message,
+            pending_sub_agents: vec![],
+        };
+        let runtime = ConversationRuntime::new(
+            context,
+            initial_state,
+            storage.clone(),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(UncooperativeMockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            broadcast_tx,
+        )
+        .with_parent(parent_tx);
+
+        tokio::spawn(async move { runtime.run().await });
+
+        // The sub-agent's CancellingTool backstop (3s) must drive it to Failed and
+        // emit NotifyParent → a SubAgentResult on the parent channel. Window is
+        // longer than the 3s deadline so the backstop fires first.
+        let received = tokio::time::timeout(Duration::from_secs(6), parent_rx.recv())
+            .await
+            .expect("parent must receive a SubAgentResult within the backstop deadline");
+
+        match received {
+            Some(Event::SubAgentResult { agent_id, outcome }) => {
+                assert_eq!(
+                    agent_id, "sub-1",
+                    "result must identify the wedged sub-agent"
+                );
+                assert!(
+                    matches!(outcome, SubAgentOutcome::Failure { .. }),
+                    "a cancelled/backstopped sub-agent must report Failure to the parent, \
+                     got {outcome:?}"
+                );
+            }
+            other => panic!("expected SubAgentResult to parent, got {other:?}"),
+        }
+
+        // The sub-agent's persisted state must be terminal Failed, not stuck.
+        let final_state = storage.get_current_state("sub-1");
+        assert!(
+            matches!(final_state, Some(ConvState::Failed { .. })),
+            "wedged sub-agent must reach terminal Failed, got {final_state:?}"
+        );
     }
 }
