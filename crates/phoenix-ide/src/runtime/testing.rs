@@ -1563,6 +1563,84 @@ mod tests {
         );
     }
 
+    /// REQ-BED-005a `CancellingSubAgentsDeadlineFires`: a parent wedged in
+    /// `CancellingSubAgents` because a cancelled sub-agent never reported back
+    /// must still reach `Idle` within the bounded cancellation deadline.
+    ///
+    /// This mirrors the incident: the parent enters `CancellingSubAgents` with a
+    /// pending sub-agent, but no `SubAgentResult` ever arrives. The runtime is
+    /// constructed directly in `CancellingSubAgents` (no event drives a result),
+    /// so the only path to Idle is the liveness backstop. The assertion window is
+    /// deliberately longer than the 3s `CANCELLATION_DEADLINE` so the backstop
+    /// fires strictly before the test gives up.
+    #[tokio::test]
+    async fn cancelling_sub_agents_with_silent_sub_agent_still_reaches_idle() {
+        use crate::runtime::{ConversationRuntime, SseEvent};
+        use crate::state_machine::state::{PendingSubAgent, SubAgentMode};
+        use crate::state_machine::ConvContext;
+        use std::path::PathBuf;
+        use tokio::sync::mpsc;
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000);
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx = mpsc::channel::<Event>(32).0;
+        let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+        let mut broadcast_rx = broadcast_tx.subscribe();
+
+        let initial_state = ConvState::CancellingSubAgents {
+            pending: vec![PendingSubAgent {
+                agent_id: "sub-1".to_string(),
+                task: "do thing".to_string(),
+                mode: SubAgentMode::Work,
+            }],
+            completed_results: vec![],
+        };
+
+        let runtime = ConversationRuntime::new(
+            context,
+            initial_state,
+            storage.clone(),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx,
+            broadcast_tx,
+        );
+
+        tokio::spawn(async move { runtime.run().await });
+
+        // Liveness assertion: AgentDone within a bounded deadline. The backstop
+        // is CANCELLATION_DEADLINE (3s); this window is longer so it fires first.
+        let mut agent_done = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(SseEvent::AgentDone { .. })) =
+                tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
+            {
+                agent_done = true;
+                break;
+            }
+        }
+
+        assert!(
+            agent_done,
+            "A parent wedged in CancellingSubAgents with a silent sub-agent must still \
+             reach Idle / emit AgentDone via the liveness backstop"
+        );
+
+        let final_state = storage.get_current_state("test-conv");
+        assert!(
+            matches!(final_state, Some(ConvState::Idle)),
+            "Conversation should return to Idle after the backstop fires, got {final_state:?}"
+        );
+    }
+
     /// Test that state machine cancel logic produces synthetic results
     /// (tests the state machine directly, not through runtime)
     #[tokio::test]

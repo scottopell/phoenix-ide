@@ -509,14 +509,21 @@ where
     /// Loaded from DB at executor startup; persisted back after each enqueue
     /// or dequeue.
     steering_queue: Vec<crate::state_machine::event::SteerEntry>,
-    /// Deadline for sub-agent completion — set when entering `AwaitingSubAgents` (REQ-SA-006)
-    sub_agent_deadline: Option<tokio::time::Instant>,
-    /// Backstop deadline for forced cancellation teardown — set when entering
-    /// `CancellingTool`, cleared when leaving it (REQ-BED-005a). When it fires,
-    /// `handle_cancelling_tool_timeout` aborts the (possibly wedged) tool task
-    /// and injects a synthetic `ToolAborted` to reach Idle without waiting for
-    /// the task to return. Phase 3 unifies this with `sub_agent_deadline`.
-    cancelling_tool_deadline: Option<tokio::time::Instant>,
+    /// Unified liveness deadline for every waiting state — the single backstop
+    /// that guarantees a waiting conversation cannot wedge forever. It is armed
+    /// on entering any waiting state (`AwaitingSubAgents`, `CancellingTool`,
+    /// `CancellingSubAgents`) with that state's duration (see `deadline_for`) and
+    /// cleared on leaving all of them. When it fires, the one select-loop arm
+    /// calls `handle_deadline_expiry`, which dispatches on the current state:
+    /// `AwaitingSubAgents` is the completion timeout (REQ-SA-006, inject
+    /// `TimedOut`); `CancellingTool` is forced teardown (REQ-BED-005a, inject
+    /// `ToolAborted`); `CancellingSubAgents` is forced teardown (REQ-BED-005a,
+    /// inject `TimedOut` per still-pending sub-agent so the parent drains to Idle
+    /// without waiting for stragglers).
+    /// Keeping this a single field + single arm + single dispatcher makes the
+    /// liveness backstop structural: adding a future waiting state means handling
+    /// it in `deadline_for` and `handle_deadline_expiry`, nowhere else.
+    deadline: Option<tokio::time::Instant>,
     /// Handle to the currently-spawned tool execution task. Retained so the
     /// cancellation backstop can abort an uncooperative tool task that never
     /// observes its token. Mirrors `llm_task_handle`. Replaced when a new tool
@@ -631,8 +638,7 @@ where
             sub_agent_result_buffer: Vec::new(),
             sub_agent_round_gen: 0,
             steering_queue: Vec::new(),
-            sub_agent_deadline: None,
-            cancelling_tool_deadline: None,
+            deadline: None,
             tool_task_handle: None,
             active_work_subagents: 0,
             llm_turn_count: 0,
@@ -774,16 +780,24 @@ where
             }
         }
 
+        // Arm the liveness deadline if the runtime starts directly in a waiting
+        // state. Production normally resets transient states to Idle on startup,
+        // so this only matters when a runtime is constructed straight into a
+        // waiting state — but arming here (not only on transition) is what makes
+        // the backstop structural rather than dependent on the entry path.
+        if let Some(d) = Self::deadline_for(&self.state) {
+            self.deadline = Some(tokio::time::Instant::now() + d);
+        }
+
         // Process events and outcomes in a loop - no recursion
         // Four input sources:
         //   event_rx    — user events + legacy executor events (continuation, sub-agent results)
         //   outcome_rx  — typed effect outcomes (LLM, tool, persist, retry)
-        //   deadline    — sub-agent timeout (REQ-SA-006, FM-6 prevention)
+        //   deadline    — liveness backstop for waiting states (REQ-SA-006, REQ-BED-005a)
         //   recovery    — credential helper settlement (REQ-BED-030)
         loop {
             // Copy deadline before select to avoid borrow conflict
-            let deadline = self.sub_agent_deadline;
-            let cancel_deadline = self.cancelling_tool_deadline;
+            let deadline = self.deadline;
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
@@ -892,35 +906,16 @@ where
                         return;
                     }
                 }
-                // REQ-SA-006: sub-agent deadline expired — cancel all pending agents
+                // Unified liveness backstop (REQ-SA-006, REQ-BED-005a): one arm
+                // for every waiting state's deadline. `handle_deadline_expiry`
+                // dispatches on the current state to the right teardown.
                 () = async {
                     match deadline {
                         Some(d) => tokio::time::sleep_until(d).await,
                         None => std::future::pending::<()>().await,
                     }
                 }, if deadline.is_some() => {
-                    self.handle_sub_agent_timeout().await;
-                    // FM-5 prevention: terminal states exit the loop explicitly.
-                    if let StepResult::Terminal(outcome) = self.state.step_result() {
-                        tracing::info!(
-                            conv_id = %self.context.conversation_id,
-                            ?outcome,
-                            "Conversation reached terminal state, exiting executor loop"
-                        );
-                        self.emit_terminal_lifecycle_event().await;
-                        return;
-                    }
-                }
-                // REQ-BED-005a: cancellation backstop fired — force CancellingTool
-                // to Idle even if the tool task never returned. Parallel to the
-                // sub-agent deadline arm above; Phase 3 merges them.
-                () = async {
-                    match cancel_deadline {
-                        Some(d) => tokio::time::sleep_until(d).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                }, if cancel_deadline.is_some() => {
-                    self.handle_cancelling_tool_timeout().await;
+                    self.handle_deadline_expiry().await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -1427,31 +1422,14 @@ where
             self.state,
             ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
         );
-        let leaving_awaiting = matches!(
-            old_state,
-            ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
-        ) && !matches!(
-            self.state,
-            ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
-        );
 
         // Drain buffer when entering AwaitingSubAgents.
         if entering_awaiting {
             generated_events.extend(self.drain_buffer_for_round());
-            // Set deadline (REQ-SA-006): timeout starts when parent enters AwaitingSubAgents
-            self.sub_agent_deadline = Some(tokio::time::Instant::now() + DEFAULT_SUBAGENT_TIMEOUT);
-            tracing::debug!(
-                timeout_secs = DEFAULT_SUBAGENT_TIMEOUT.as_secs(),
-                "Sub-agent deadline set"
-            );
         }
 
-        // Clear deadline when leaving AwaitingSubAgents/CancellingSubAgents
-        if leaving_awaiting {
-            self.sub_agent_deadline = None;
-        }
-
-        self.manage_cancellation_deadline(&old_state);
+        // Manage the unified liveness deadline for every waiting state.
+        self.manage_deadline(&old_state);
 
         // Steering-queue drain: process synchronously so persist effects land
         // BEFORE any RequestLlm in the current effect list. This eliminates a
@@ -1652,7 +1630,9 @@ where
 
     /// Handle sub-agent timeout: cancel all pending agents and inject `TimedOut` results.
     ///
-    /// Called from the executor select loop when `sub_agent_deadline` fires (REQ-SA-006).
+    /// Dispatched by `handle_deadline_expiry` when the liveness deadline fires in
+    /// `AwaitingSubAgents` (REQ-SA-006). The deadline is already cleared by the
+    /// dispatcher.
     ///
     // TODO(task 61004): timeout should follow the cancellation protocol, not
     // race it. Today this both (a) injects a synthetic `TimedOut` per pending
@@ -1667,14 +1647,13 @@ where
     // The correct shape is to inject a single `UserCancel` (→
     // `CancellingSubAgents`, which emits `Effect::CancelSubAgents`) and let the
     // real cancelled results drain through `CancellingSubAgents` to `Idle`,
-    // conserving fan-in. That rewrite is deferred because it must also (1)
-    // preserve the "timed out" vs "cancelled" semantic the LLM history renders
-    // and (2) add a backstop so a cancelled sub-agent that never reports back
-    // cannot wedge the drain — the exact guarantee the current
-    // synthetic-result approach provides.
+    // conserving fan-in. The backstop half of that rewrite now exists:
+    // `CancellingSubAgents` has its own liveness deadline
+    // (`handle_cancelling_sub_agents_timeout`), so a cancelled sub-agent that
+    // never reports back can no longer wedge the drain. The remaining work is
+    // routing the timeout through `UserCancel` while preserving the "timed out"
+    // vs "cancelled" semantic the LLM history renders.
     async fn handle_sub_agent_timeout(&mut self) {
-        self.sub_agent_deadline = None;
-
         let pending_ids: Vec<(String, String)> =
             if let ConvState::AwaitingSubAgents { pending, .. } = &self.state {
                 pending
@@ -1716,29 +1695,150 @@ where
         }
     }
 
-    /// Arm/clear the cancellation backstop (REQ-BED-005a): set the deadline when
-    /// entering `CancellingTool`, clear it (and drop the retained tool task
-    /// handle) when leaving `CancellingTool` to any state. Parallel to the
-    /// `sub_agent_deadline` management for `AwaitingSubAgents`; Phase 3 unifies
-    /// the two deadline fields.
-    fn manage_cancellation_deadline(&mut self, old_state: &ConvState) {
-        let entering_cancelling_tool = !matches!(old_state, ConvState::CancellingTool { .. })
-            && matches!(self.state, ConvState::CancellingTool { .. });
-        let leaving_cancelling_tool = matches!(old_state, ConvState::CancellingTool { .. })
-            && !matches!(self.state, ConvState::CancellingTool { .. });
-        if entering_cancelling_tool {
-            self.cancelling_tool_deadline =
-                Some(tokio::time::Instant::now() + CANCELLATION_DEADLINE);
-            tracing::debug!(
-                deadline_secs = CANCELLATION_DEADLINE.as_secs(),
-                "Cancellation backstop deadline armed"
-            );
+    /// The liveness-deadline duration for a state, or `None` if the state has no
+    /// deadline. This is the single place that maps a waiting state to its
+    /// backstop duration — `AwaitingSubAgents` gets the 20-minute completion
+    /// timeout (REQ-SA-006); `CancellingTool` and `CancellingSubAgents` get the
+    /// 3-second forced-teardown backstop (REQ-BED-005a).
+    fn deadline_for(state: &ConvState) -> Option<Duration> {
+        match state {
+            ConvState::AwaitingSubAgents { .. } => Some(DEFAULT_SUBAGENT_TIMEOUT),
+            ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. } => {
+                Some(CANCELLATION_DEADLINE)
+            }
+            _ => None,
         }
-        if leaving_cancelling_tool {
-            self.cancelling_tool_deadline = None;
-            // The tool round is over once we leave CancellingTool; drop the
-            // handle so a later backstop can never abort an unrelated task.
+    }
+
+    /// Manage the unified liveness deadline on every transition. Arm a fresh
+    /// deadline whenever the conversation changes into a (different) waiting
+    /// state, using that state's `deadline_for` duration; clear it when the new
+    /// state has no deadline.
+    ///
+    /// Keying re-arming on a *variant change* preserves the exact semantics of
+    /// the prior two-field design: an `AwaitingSubAgents → AwaitingSubAgents`
+    /// self-transition (a sub-agent resolving while others remain) keeps the
+    /// original 20-minute window rather than restarting it, and a
+    /// `CancellingSubAgents → CancellingSubAgents` drain keeps its 3-second
+    /// window. An `AwaitingSubAgents → CancellingSubAgents` cancel re-arms to the
+    /// 3-second backstop — the variant changed, so the cancellation window
+    /// replaces the long completion window.
+    fn manage_deadline(&mut self, old_state: &ConvState) {
+        // Leaving CancellingTool ends the tool round; drop the retained handle so
+        // a later backstop can never abort an unrelated task.
+        if matches!(old_state, ConvState::CancellingTool { .. })
+            && !matches!(self.state, ConvState::CancellingTool { .. })
+        {
             self.tool_task_handle = None;
+        }
+
+        let variant_changed =
+            std::mem::discriminant(old_state) != std::mem::discriminant(&self.state);
+        match Self::deadline_for(&self.state) {
+            Some(duration) if variant_changed => {
+                self.deadline = Some(tokio::time::Instant::now() + duration);
+                tracing::debug!(
+                    state = self.state.variant_name(),
+                    deadline_secs = duration.as_secs(),
+                    "Liveness deadline armed"
+                );
+            }
+            Some(_) => {
+                // Same waiting variant — keep the in-flight deadline running.
+            }
+            None => {
+                self.deadline = None;
+            }
+        }
+    }
+
+    /// Single entry point from the select-loop deadline arm. Clears the deadline,
+    /// then dispatches on the current state to the appropriate teardown. A
+    /// deadline that fires after the conversation has already moved on to a state
+    /// with no backstop is a no-op (the per-state handlers also guard this).
+    async fn handle_deadline_expiry(&mut self) {
+        self.deadline = None;
+        match &self.state {
+            ConvState::AwaitingSubAgents { .. } => self.handle_sub_agent_timeout().await,
+            ConvState::CancellingTool { .. } => self.handle_cancelling_tool_timeout().await,
+            ConvState::CancellingSubAgents { .. } => {
+                self.handle_cancelling_sub_agents_timeout().await;
+            }
+            other => {
+                tracing::debug!(
+                    state = other.variant_name(),
+                    "Liveness deadline fired but state has no backstop — ignoring"
+                );
+            }
+        }
+    }
+
+    /// Handle the cancellation backstop firing in `CancellingSubAgents`
+    /// (REQ-BED-005a `CancellingSubAgentsDeadlineFires`): a sub-agent that never
+    /// reported back after being cancelled has held the parent in
+    /// `CancellingSubAgents` past the bounded deadline. Force the drain to Idle
+    /// without waiting for stragglers by injecting a synthetic `TimedOut` result
+    /// per still-pending sub-agent — the same synthetic-injection approach
+    /// `handle_sub_agent_timeout` uses to drain `AwaitingSubAgents`. Draining the
+    /// last pending result reaches Idle via the
+    /// `CancellingSubAgents + SubAgentResult (last one) -> Idle` transition arm.
+    async fn handle_cancelling_sub_agents_timeout(&mut self) {
+        let pending_ids: Vec<String> =
+            if let ConvState::CancellingSubAgents { pending, .. } = &self.state {
+                pending.iter().map(|p| p.agent_id.clone()).collect()
+            } else {
+                // Deadline fired but state already moved on — nothing to do.
+                return;
+            };
+
+        tracing::warn!(
+            conv_id = %self.context.conversation_id,
+            count = pending_ids.len(),
+            deadline_secs = CANCELLATION_DEADLINE.as_secs(),
+            "Cancellation backstop fired — sub-agents did not report back within the \
+             deadline; forcing teardown to Idle without waiting for stragglers"
+        );
+
+        // User-visible system message keeps the user oriented: the conversation
+        // is now Idle even though background resource reclamation may still be in
+        // flight. Same string the CancellingTool backstop uses.
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let content = crate::db::MessageContent::system(
+            "Cancellation completed. Aborted work may still be reclaiming resources in the \
+             background."
+                .to_string(),
+        );
+        let seq = self.broadcast_tx.next_seq();
+        match self
+            .storage
+            .add_message_with_seq(
+                &msg_id,
+                &self.context.conversation_id,
+                seq,
+                &content,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(msg) => {
+                let _ = self.broadcast_tx.send_message(msg);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to persist cancellation backstop system message");
+            }
+        }
+
+        // Inject a synthetic TimedOut per pending sub-agent so the parent drains
+        // to Idle. The last one resolves CancellingSubAgents -> Idle.
+        for agent_id in pending_ids {
+            let event = Event::SubAgentResult {
+                agent_id,
+                outcome: SubAgentOutcome::TimedOut,
+            };
+            if let Err(e) = self.process_event(event).await {
+                tracing::warn!(error = %e, "Failed to process cancellation backstop SubAgentResult");
+            }
         }
     }
 
@@ -1748,16 +1848,15 @@ where
     /// `CancellingTool` past the bounded deadline. Force the cancellation to
     /// completion without waiting for the task.
     ///
-    /// Sequence: clear the deadline first (mirrors `handle_sub_agent_timeout`),
-    /// WARN, persist+broadcast the user-visible system message, abort the
-    /// retained tool task to stop the orphaned tokio task, then inject
-    /// `Event::ToolAborted { tool_use_id }` — the same synthetic-result path the
-    /// cooperative `CancellingTool + ToolAborted -> Idle` arm uses — to settle
-    /// to Idle. A late stale outcome from the aborted task is rejected by the
-    /// state machine once we have left `CancellingTool` (id/state mismatch).
+    /// Dispatched by `handle_deadline_expiry` (which has already cleared the
+    /// deadline). Sequence: WARN, persist+broadcast the user-visible system
+    /// message, abort the retained tool task to stop the orphaned tokio task,
+    /// then inject `Event::ToolAborted { tool_use_id }` — the same
+    /// synthetic-result path the cooperative `CancellingTool + ToolAborted ->
+    /// Idle` arm uses — to settle to Idle. A late stale outcome from the aborted
+    /// task is rejected by the state machine once we have left `CancellingTool`
+    /// (id/state mismatch).
     async fn handle_cancelling_tool_timeout(&mut self) {
-        self.cancelling_tool_deadline = None;
-
         let tool_use_id = if let ConvState::CancellingTool { tool_use_id, .. } = &self.state {
             tool_use_id.clone()
         } else {
