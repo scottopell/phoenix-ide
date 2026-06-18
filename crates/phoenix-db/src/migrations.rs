@@ -149,6 +149,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_steering_message_tables",
         sql: MIGRATION_027,
     },
+    Migration {
+        version: 28,
+        name: "add_conv_mode_columns",
+        sql: MIGRATION_028,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -887,6 +892,38 @@ SET steering_queue = '[]'
 WHERE steering_queue IS NOT NULL AND steering_queue <> '[]';
 ";
 
+/// Normalize `conversations.conv_mode` (the `ConvMode` tagged union) out of its
+/// JSON blob into columns (task 58037, the final JSON-in-TEXT audit item).
+///
+/// `cm_kind` is the discriminator (`explore` | `direct` | `work` | `branch`);
+/// the `cm_*` columns hold each variant's fields. The values are extracted out
+/// of the blob via `json_extract` — the legitimate move the "if a migration
+/// needs `json_extract`, the field wanted to be a column" rule points at. A row
+/// with malformed/absent `conv_mode` leaves `cm_kind` NULL, which the read path
+/// treats as the default `explore`. The invariant that the field columns match
+/// the kind is upheld by the `ConvMode` enum (the sole writer); the blob column
+/// itself is dropped in the following migration once the code reads the columns.
+const MIGRATION_028: &str = r"
+ALTER TABLE conversations ADD COLUMN cm_kind TEXT;
+ALTER TABLE conversations ADD COLUMN cm_branch_name TEXT;
+ALTER TABLE conversations ADD COLUMN cm_worktree_path TEXT;
+ALTER TABLE conversations ADD COLUMN cm_base_branch TEXT;
+ALTER TABLE conversations ADD COLUMN cm_task_id TEXT;
+ALTER TABLE conversations ADD COLUMN cm_task_title TEXT;
+ALTER TABLE conversations ADD COLUMN cm_next_taskmd_id_hint TEXT;
+
+UPDATE conversations
+SET cm_kind = lower(json_extract(conv_mode, '$.mode')),
+    cm_branch_name = json_extract(conv_mode, '$.branch_name'),
+    cm_worktree_path = json_extract(conv_mode, '$.worktree_path'),
+    cm_base_branch = json_extract(conv_mode, '$.base_branch'),
+    cm_task_id = json_extract(conv_mode, '$.task_id'),
+    cm_task_title = json_extract(conv_mode, '$.task_title'),
+    cm_next_taskmd_id_hint = json_extract(conv_mode, '$.next_taskmd_id_hint')
+WHERE json_valid(conv_mode)
+  AND json_extract(conv_mode, '$.mode') IS NOT NULL;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -1015,10 +1052,76 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 27);
+        assert_eq!(first, 28);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
+    }
+
+    /// Migration 028: the `conv_mode` JSON blob is projected into the `cm_*`
+    /// columns per variant; a malformed/absent blob leaves `cm_kind` NULL (read
+    /// path defaults to explore).
+    #[tokio::test]
+    async fn migration_028_projects_conv_mode_into_columns() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        let rows: &[(&str, &str)] = &[
+            ("c-explore", r#"{"mode":"Explore","worktree_path":"/wt/e","next_taskmd_id_hint":"42001"}"#),
+            ("c-direct", r#"{"mode":"Direct"}"#),
+            ("c-work", r#"{"mode":"Work","branch_name":"b","worktree_path":"/wt/w","base_branch":"main","task_id":"T1","task_title":"Fix it"}"#),
+            ("c-branch", r#"{"mode":"Branch","branch_name":"fix","worktree_path":"/wt/b","base_branch":"main"}"#),
+        ];
+        for (id, cm) in rows {
+            sqlx::query(
+                "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+                 VALUES (?1, ?2, '{\"type\":\"idle\"}', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(id)
+            .bind(cm)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let fetch = |id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "SELECT cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, \
+                            cm_task_id, cm_task_title, cm_next_taskmd_id_hint \
+                     FROM conversations WHERE id = ?1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let get = |row: &sqlx::sqlite::SqliteRow, c: &str| row.get::<Option<String>, _>(c);
+
+        let e = fetch("c-explore").await;
+        assert_eq!(get(&e, "cm_kind").as_deref(), Some("explore"));
+        assert_eq!(get(&e, "cm_worktree_path").as_deref(), Some("/wt/e"));
+        assert_eq!(get(&e, "cm_next_taskmd_id_hint").as_deref(), Some("42001"));
+        assert!(get(&e, "cm_branch_name").is_none());
+
+        let d = fetch("c-direct").await;
+        assert_eq!(get(&d, "cm_kind").as_deref(), Some("direct"));
+        assert!(get(&d, "cm_worktree_path").is_none());
+
+        let w = fetch("c-work").await;
+        assert_eq!(get(&w, "cm_kind").as_deref(), Some("work"));
+        assert_eq!(get(&w, "cm_branch_name").as_deref(), Some("b"));
+        assert_eq!(get(&w, "cm_base_branch").as_deref(), Some("main"));
+        assert_eq!(get(&w, "cm_task_id").as_deref(), Some("T1"));
+        assert_eq!(get(&w, "cm_task_title").as_deref(), Some("Fix it"));
+
+        let b = fetch("c-branch").await;
+        assert_eq!(get(&b, "cm_kind").as_deref(), Some("branch"));
+        assert_eq!(get(&b, "cm_branch_name").as_deref(), Some("fix"));
+        assert!(get(&b, "cm_task_id").is_none());
     }
 
     /// Migration 027: pending steering entries are extracted from the
