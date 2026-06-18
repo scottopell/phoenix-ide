@@ -1463,7 +1463,6 @@ mod tests {
     /// drive `advance` deterministically across that spawned task, which does
     /// not compose cleanly here. The real timeout fails fast (≤3s) against
     /// current code and never hangs the suite.
-    #[ignore = "pins P0 liveness invariant (task 08692); un-ignored in Phase 2 when the fix lands"]
     #[tokio::test]
     async fn cancel_with_uncooperative_tool_still_reaches_idle() {
         use crate::runtime::{ConversationRuntime, SseEvent};
@@ -1535,10 +1534,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Liveness assertion: AgentDone within a bounded deadline. Against
-        // current code this never arrives (wedged in CancellingTool).
+        // Liveness assertion: AgentDone within a bounded deadline. The executor's
+        // cancellation backstop (CANCELLATION_DEADLINE) is 3s; this assertion
+        // window is deliberately longer so the backstop fires strictly before the
+        // test gives up — the backstop deadline is the spec'd 3s, not this wait.
         let mut agent_done = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             if let Ok(Ok(SseEvent::AgentDone { .. })) =
                 tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await

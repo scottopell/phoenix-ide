@@ -39,6 +39,13 @@ use tokio_util::sync::CancellationToken;
 /// Primary enforcement is max turns (REQ-PROJ-008). This catches stuck tool execution.
 const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 
+/// Backstop deadline forcing `CancellingTool` to a terminal-direction state
+/// even when the tool task never observes its cancellation token and never
+/// returns (REQ-BED-005a, spec `config.cancellation_deadline`). The cooperative
+/// abort path (REQ-BED-005) is effectively immediate; this only fires for the
+/// pathological "task never returns" case.
+const CANCELLATION_DEADLINE: Duration = Duration::from_secs(3);
+
 /// Hard byte cap on the LLM-bound text of a single tool result.
 ///
 /// Per-tool caps are line-based (bash tail = 200 lines, `read_file` = 2000
@@ -504,6 +511,20 @@ where
     steering_queue: Vec<crate::state_machine::event::SteerEntry>,
     /// Deadline for sub-agent completion — set when entering `AwaitingSubAgents` (REQ-SA-006)
     sub_agent_deadline: Option<tokio::time::Instant>,
+    /// Backstop deadline for forced cancellation teardown — set when entering
+    /// `CancellingTool`, cleared when leaving it (REQ-BED-005a). When it fires,
+    /// `handle_cancelling_tool_timeout` aborts the (possibly wedged) tool task
+    /// and injects a synthetic `ToolAborted` to reach Idle without waiting for
+    /// the task to return. Phase 3 unifies this with `sub_agent_deadline`.
+    cancelling_tool_deadline: Option<tokio::time::Instant>,
+    /// Handle to the currently-spawned tool execution task. Retained so the
+    /// cancellation backstop can abort an uncooperative tool task that never
+    /// observes its token. Mirrors `llm_task_handle`. Replaced when a new tool
+    /// spawns; aborting it drops the tool's outcome sender, but a resulting
+    /// stale `Failed`/late `ToolComplete` is rejected by the state machine once
+    /// the conversation has already left `CancellingTool` (id/state mismatch ->
+    /// logged, harmless).
+    tool_task_handle: Option<tokio::task::JoinHandle<()>>,
     /// Count of active Work-mode sub-agents for one-writer constraint (REQ-PROJ-008)
     active_work_subagents: u32,
     /// LLM turn counter for sub-agents (REQ-PROJ-008 max turns enforcement)
@@ -611,6 +632,8 @@ where
             sub_agent_round_gen: 0,
             steering_queue: Vec::new(),
             sub_agent_deadline: None,
+            cancelling_tool_deadline: None,
+            tool_task_handle: None,
             active_work_subagents: 0,
             llm_turn_count: 0,
             grace_turn_granted: false,
@@ -760,6 +783,7 @@ where
         loop {
             // Copy deadline before select to avoid borrow conflict
             let deadline = self.sub_agent_deadline;
+            let cancel_deadline = self.cancelling_tool_deadline;
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
 
             tokio::select! {
@@ -876,6 +900,27 @@ where
                     }
                 }, if deadline.is_some() => {
                     self.handle_sub_agent_timeout().await;
+                    // FM-5 prevention: terminal states exit the loop explicitly.
+                    if let StepResult::Terminal(outcome) = self.state.step_result() {
+                        tracing::info!(
+                            conv_id = %self.context.conversation_id,
+                            ?outcome,
+                            "Conversation reached terminal state, exiting executor loop"
+                        );
+                        self.emit_terminal_lifecycle_event().await;
+                        return;
+                    }
+                }
+                // REQ-BED-005a: cancellation backstop fired — force CancellingTool
+                // to Idle even if the tool task never returned. Parallel to the
+                // sub-agent deadline arm above; Phase 3 merges them.
+                () = async {
+                    match cancel_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if cancel_deadline.is_some() => {
+                    self.handle_cancelling_tool_timeout().await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
                         tracing::info!(
@@ -1406,6 +1451,8 @@ where
             self.sub_agent_deadline = None;
         }
 
+        self.manage_cancellation_deadline(&old_state);
+
         // Steering-queue drain: process synchronously so persist effects land
         // BEFORE any RequestLlm in the current effect list. This eliminates a
         // race where a mid-turn drain would persist steers concurrently with
@@ -1666,6 +1713,107 @@ where
             if let Err(e) = self.process_event(event).await {
                 tracing::warn!(error = %e, "Failed to process timeout result for sub-agent");
             }
+        }
+    }
+
+    /// Arm/clear the cancellation backstop (REQ-BED-005a): set the deadline when
+    /// entering `CancellingTool`, clear it (and drop the retained tool task
+    /// handle) when leaving `CancellingTool` to any state. Parallel to the
+    /// `sub_agent_deadline` management for `AwaitingSubAgents`; Phase 3 unifies
+    /// the two deadline fields.
+    fn manage_cancellation_deadline(&mut self, old_state: &ConvState) {
+        let entering_cancelling_tool = !matches!(old_state, ConvState::CancellingTool { .. })
+            && matches!(self.state, ConvState::CancellingTool { .. });
+        let leaving_cancelling_tool = matches!(old_state, ConvState::CancellingTool { .. })
+            && !matches!(self.state, ConvState::CancellingTool { .. });
+        if entering_cancelling_tool {
+            self.cancelling_tool_deadline =
+                Some(tokio::time::Instant::now() + CANCELLATION_DEADLINE);
+            tracing::debug!(
+                deadline_secs = CANCELLATION_DEADLINE.as_secs(),
+                "Cancellation backstop deadline armed"
+            );
+        }
+        if leaving_cancelling_tool {
+            self.cancelling_tool_deadline = None;
+            // The tool round is over once we leave CancellingTool; drop the
+            // handle so a later backstop can never abort an unrelated task.
+            self.tool_task_handle = None;
+        }
+    }
+
+    /// Handle the cancellation backstop firing (REQ-BED-005a
+    /// `CancellingToolDeadlineFires`): a tool that never observed its
+    /// cancellation token and never returned has held the conversation in
+    /// `CancellingTool` past the bounded deadline. Force the cancellation to
+    /// completion without waiting for the task.
+    ///
+    /// Sequence: clear the deadline first (mirrors `handle_sub_agent_timeout`),
+    /// WARN, persist+broadcast the user-visible system message, abort the
+    /// retained tool task to stop the orphaned tokio task, then inject
+    /// `Event::ToolAborted { tool_use_id }` — the same synthetic-result path the
+    /// cooperative `CancellingTool + ToolAborted -> Idle` arm uses — to settle
+    /// to Idle. A late stale outcome from the aborted task is rejected by the
+    /// state machine once we have left `CancellingTool` (id/state mismatch).
+    async fn handle_cancelling_tool_timeout(&mut self) {
+        self.cancelling_tool_deadline = None;
+
+        let tool_use_id = if let ConvState::CancellingTool { tool_use_id, .. } = &self.state {
+            tool_use_id.clone()
+        } else {
+            // Deadline fired but state already moved on — nothing to do.
+            return;
+        };
+
+        tracing::warn!(
+            conv_id = %self.context.conversation_id,
+            tool_id = %tool_use_id,
+            deadline_secs = CANCELLATION_DEADLINE.as_secs(),
+            "Cancellation backstop fired — tool did not observe its token within the \
+             deadline; forcing teardown to Idle without waiting for the task"
+        );
+
+        // User-visible system message keeps the user oriented: the conversation
+        // is now Idle even though background resource reclamation may still be
+        // in flight. Reuse the persist+broadcast mechanism from
+        // `halt_parent_cycle_cap`.
+        let msg_id = uuid::Uuid::new_v4().to_string();
+        let content = crate::db::MessageContent::system(
+            "Cancellation completed. Aborted work may still be reclaiming resources in the \
+             background."
+                .to_string(),
+        );
+        let seq = self.broadcast_tx.next_seq();
+        match self
+            .storage
+            .add_message_with_seq(
+                &msg_id,
+                &self.context.conversation_id,
+                seq,
+                &content,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(msg) => {
+                let _ = self.broadcast_tx.send_message(msg);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to persist cancellation backstop system message");
+            }
+        }
+
+        // Abort the (possibly wedged) tool task so the orphaned tokio task stops.
+        // The OS child is reaped by the tool itself (kill_on_drop / cooperative
+        // reaping); this stops the in-process task that never returned.
+        if let Some(handle) = self.tool_task_handle.take() {
+            handle.abort();
+        }
+
+        // Drive the cooperative cancellation arm with a synthetic ToolAborted.
+        if let Err(e) = self.process_event(Event::ToolAborted { tool_use_id }).await {
+            tracing::warn!(error = %e, "Failed to process cancellation backstop ToolAborted");
         }
     }
 
@@ -2918,7 +3066,7 @@ where
                 }
             };
 
-        tokio::spawn(async move {
+        let tool_task = tokio::spawn(async move {
             tracing::info!(
                 conv_id = %conv_id,
                 tool = %tool_name,
@@ -2976,6 +3124,11 @@ where
             // Send typed outcome through oneshot channel
             let _ = tool_tx.send(tool_outcome);
         });
+        // Retain the handle so the cancellation backstop (REQ-BED-005a) can
+        // abort an uncooperative tool task that never observes its token.
+        // Replacing any prior handle is correct: only one tool executes at a
+        // time, and a prior completed task's handle is inert.
+        self.tool_task_handle = Some(tool_task);
 
         // Forward the typed outcome — a dropped sender becomes a typed Failed
         // outcome so a panicked/aborted tool task can never wedge the
