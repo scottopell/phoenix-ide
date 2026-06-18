@@ -167,19 +167,6 @@ fn provider_display(model_id: &str) -> String {
     )
 }
 
-/// Extract the worktree path from a `conv_mode` JSON blob, if it carries a
-/// non-empty `worktree_path`.
-fn worktree_from_conv_mode(conv_mode: Option<&str>) -> Option<String> {
-    let raw = conv_mode?;
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let path = v.get("worktree_path")?.as_str()?;
-    if path.is_empty() {
-        None
-    } else {
-        Some(path.to_string())
-    }
-}
-
 /// Fixed token-count bucket edges for the tokens-per-turn histogram. The final
 /// bucket is open-ended above the last edge.
 const HISTOGRAM_EDGES: &[i64] = &[
@@ -336,7 +323,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
                 label,
                 slug: row.slug.clone(),
                 project_id: row.project_id.clone(),
-                worktree: worktree_from_conv_mode(row.conv_mode.as_deref()),
+                worktree: row.worktree_path.clone(),
                 started_at: row.started_at.clone(),
                 totals: Totals::default(),
             });
@@ -465,20 +452,5 @@ mod tests {
         assert_eq!(t.output_tokens, 500_000.0);
         assert_eq!(t.total_tokens, 2_750_000.0);
         assert_eq!(t.turns, 2.0);
-    }
-
-    #[test]
-    fn worktree_extracted_from_conv_mode() {
-        let cm = r#"{"mode":"Work","worktree_path":"/wt/foo","task_id":"T1"}"#;
-        assert_eq!(
-            worktree_from_conv_mode(Some(cm)),
-            Some("/wt/foo".to_string())
-        );
-        assert_eq!(worktree_from_conv_mode(Some(r#"{"mode":"Direct"}"#)), None);
-        assert_eq!(
-            worktree_from_conv_mode(Some(r#"{"worktree_path":""}"#)),
-            None
-        );
-        assert_eq!(worktree_from_conv_mode(None), None);
     }
 }

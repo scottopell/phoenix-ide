@@ -26,6 +26,13 @@ CREATE TABLE IF NOT EXISTS conversations (
     -- llm_language column added by migration 010; not in SCHEMA so that
     -- migration 010's ALTER TABLE doesn't collide on a fresh DB.
 
+    -- conv_mode is the legacy ConvMode JSON blob. It is normalized into the
+    -- cm_* columns by migration 028 and DROPped by migration 029; it lives in
+    -- the base schema (rather than the idempotent legacy ALTER) so that on a
+    -- fresh DB the migrations 001/002/007/021/028 that read it still resolve
+    -- during replay, and migration 029's DROP is not resurrected on next boot.
+    conv_mode TEXT NOT NULL DEFAULT '{"mode":"Explore"}',
+
     FOREIGN KEY (parent_conversation_id)
         REFERENCES conversations(id) ON DELETE CASCADE
 );

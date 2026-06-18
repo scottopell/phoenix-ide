@@ -154,6 +154,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_conv_mode_columns",
         sql: MIGRATION_028,
     },
+    Migration {
+        version: 29,
+        name: "drop_conv_mode_blob",
+        sql: MIGRATION_029,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -924,6 +929,15 @@ WHERE json_valid(conv_mode)
   AND json_extract(conv_mode, '$.mode') IS NOT NULL;
 ";
 
+/// Drop the now-redundant `conv_mode` JSON blob column: the `cm_*` columns
+/// (migration 028) are the single source of truth and the code reads/writes
+/// them exclusively. The column is moved into the base schema and the idempotent
+/// legacy `ALTER` that used to add it is removed, so this `DROP COLUMN` is not
+/// resurrected on the next boot.
+const MIGRATION_029: &str = r"
+ALTER TABLE conversations DROP COLUMN conv_mode;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -1052,7 +1066,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 28);
+        assert_eq!(first, 29);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -1066,10 +1080,19 @@ mod tests {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
         let rows: &[(&str, &str)] = &[
-            ("c-explore", r#"{"mode":"Explore","worktree_path":"/wt/e","next_taskmd_id_hint":"42001"}"#),
+            (
+                "c-explore",
+                r#"{"mode":"Explore","worktree_path":"/wt/e","next_taskmd_id_hint":"42001"}"#,
+            ),
             ("c-direct", r#"{"mode":"Direct"}"#),
-            ("c-work", r#"{"mode":"Work","branch_name":"b","worktree_path":"/wt/w","base_branch":"main","task_id":"T1","task_title":"Fix it"}"#),
-            ("c-branch", r#"{"mode":"Branch","branch_name":"fix","worktree_path":"/wt/b","base_branch":"main"}"#),
+            (
+                "c-work",
+                r#"{"mode":"Work","branch_name":"b","worktree_path":"/wt/w","base_branch":"main","task_id":"T1","task_title":"Fix it"}"#,
+            ),
+            (
+                "c-branch",
+                r#"{"mode":"Branch","branch_name":"fix","worktree_path":"/wt/b","base_branch":"main"}"#,
+            ),
         ];
         for (id, cm) in rows {
             sqlx::query(
@@ -1474,13 +1497,15 @@ mod tests {
 
         run_pending_migrations(&pool).await.unwrap();
 
-        let conv_mode: String =
-            sqlx::query_scalar("SELECT conv_mode FROM conversations WHERE id = 'c-hint'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&conv_mode).unwrap();
-        assert!(value.get("next_taskmd_id_hint").is_none());
+        // After normalization (migration 028), the null hint lands as a NULL
+        // cm_next_taskmd_id_hint column.
+        let hint: Option<String> = sqlx::query_scalar(
+            "SELECT cm_next_taskmd_id_hint FROM conversations WHERE id = 'c-hint'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(hint.is_none());
     }
 
     #[tokio::test]
@@ -1499,16 +1524,14 @@ mod tests {
 
         run_pending_migrations(&pool).await.unwrap();
 
-        let row = sqlx::query("SELECT conv_mode FROM conversations WHERE id = 'c1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let mode: String = row.get("conv_mode");
-        assert!(mode.contains("\"Direct\""), "Expected Direct, got: {mode}");
-        assert!(
-            !mode.contains("Standalone"),
-            "Standalone should be gone: {mode}"
-        );
+        // 001 rewrites the blob Standalone -> Direct; 028 normalizes it to the
+        // cm_kind discriminator.
+        let kind: Option<String> =
+            sqlx::query_scalar("SELECT cm_kind FROM conversations WHERE id = 'c1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kind.as_deref(), Some("direct"));
     }
 
     #[tokio::test]
@@ -1528,19 +1551,23 @@ mod tests {
 
         run_pending_migrations(&pool).await.unwrap();
 
-        let row = sqlx::query("SELECT conv_mode, state FROM conversations WHERE id = 'c2'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let mode: String = row.get("conv_mode");
+        let row = sqlx::query(
+            "SELECT cm_kind, cm_worktree_path, state FROM conversations WHERE id = 'c2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let kind: Option<String> = row.get("cm_kind");
+        let worktree: Option<String> = row.get("cm_worktree_path");
         let state: String = row.get("state");
         // Migration 002 reverts to Explore. Migration 007 only backfills
         // `worktree_path` from cwd when cwd matches the canonical managed-
         // worktree layout `.phoenix/worktrees/{id}`; cwd `/tmp` does not
-        // match, so the row stays as bare `{"mode":"Explore"}`. This is
+        // match, so the row stays a bare Explore with no worktree. This is
         // load-bearing: backfilling `/tmp` here would let two demoted convs
         // share the same worktree-scoped tmux socket on cascade.
-        assert_eq!(mode, "{\"mode\":\"Explore\"}");
+        assert_eq!(kind.as_deref(), Some("explore"));
+        assert!(worktree.is_none());
         assert_eq!(state, "{\"type\":\"idle\"}");
     }
 
@@ -1561,12 +1588,12 @@ mod tests {
 
         run_pending_migrations(&pool).await.unwrap();
 
-        let row = sqlx::query("SELECT conv_mode FROM conversations WHERE id = 'c3'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let mode: String = row.get("conv_mode");
-        assert_eq!(mode, "{\"mode\":\"Direct\"}");
+        let kind: Option<String> =
+            sqlx::query_scalar("SELECT cm_kind FROM conversations WHERE id = 'c3'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kind.as_deref(), Some("direct"));
     }
 
     #[tokio::test]
@@ -1585,14 +1612,14 @@ mod tests {
 
         run_pending_migrations(&pool).await.unwrap();
 
-        let row = sqlx::query("SELECT conv_mode FROM conversations WHERE id = 'c4'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let mode: String = row.get("conv_mode");
         // 002 reverts to Explore; 007 leaves it alone (cwd `/tmp` is not
         // the canonical managed-worktree layout `.phoenix/worktrees/{id}`).
-        assert_eq!(mode, "{\"mode\":\"Explore\"}");
+        let kind: Option<String> =
+            sqlx::query_scalar("SELECT cm_kind FROM conversations WHERE id = 'c4'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(kind.as_deref(), Some("explore"));
     }
 
     #[tokio::test]
@@ -1611,16 +1638,20 @@ mod tests {
 
         run_pending_migrations(&pool).await.unwrap();
 
-        let row = sqlx::query("SELECT conv_mode, state FROM conversations WHERE id = 'c5'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let mode: String = row.get("conv_mode");
+        let row =
+            sqlx::query("SELECT cm_kind, cm_task_title, state FROM conversations WHERE id = 'c5'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let kind: Option<String> = row.get("cm_kind");
+        let task_title: Option<String> = row.get("cm_task_title");
         let state: String = row.get("state");
-        assert!(
-            mode.contains("\"Work\""),
-            "Valid Work should be preserved: {mode}"
+        assert_eq!(
+            kind.as_deref(),
+            Some("work"),
+            "Valid Work should be preserved"
         );
+        assert_eq!(task_title.as_deref(), Some("Fix it"));
         assert!(
             state.contains("tool_executing"),
             "State should be preserved: {state}"
