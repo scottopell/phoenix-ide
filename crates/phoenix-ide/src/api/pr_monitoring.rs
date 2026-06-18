@@ -12,7 +12,7 @@ use crate::db::{
 use crate::git_ops::run_git;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -1489,27 +1489,71 @@ pub(crate) fn coverage_health(feedback: &PrFeedbackSummary) -> Option<PrFeedback
 }
 
 fn dedupe_feedback(items: Vec<PrFeedbackItem>) -> Vec<PrFeedbackItem> {
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
+    let mut seen = HashMap::new();
+    let mut deduped: Vec<PrFeedbackItem> = Vec::new();
     for item in items {
-        let key = item
-            .id
-            .clone()
-            .or_else(|| item.url.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "{}|{}|{}|{}",
-                    item.author,
-                    item.path.clone().unwrap_or_default(),
-                    item.created_at.clone().unwrap_or_default(),
-                    item.body
-                )
-            });
-        if seen.insert(key) {
+        let keys = feedback_dedupe_keys(&item);
+        if let Some(index) = keys.iter().find_map(|key| seen.get(key).copied()) {
+            merge_duplicate_feedback(&mut deduped[index], item);
+            for key in keys {
+                seen.entry(key).or_insert(index);
+            }
+        } else {
+            let index = deduped.len();
+            for key in keys {
+                seen.insert(key, index);
+            }
             deduped.push(item);
         }
     }
     deduped
+}
+
+fn feedback_dedupe_keys(item: &PrFeedbackItem) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(id) = &item.id {
+        keys.push(format!("id:{id}"));
+    }
+    if let Some(url) = &item.url {
+        keys.push(format!("url:{url}"));
+    }
+    if matches!(
+        item.source,
+        PrFeedbackSource::ReviewComment | PrFeedbackSource::ReviewThread
+    ) {
+        keys.push(format!(
+            "line:{}|{}|{}|{}",
+            item.author,
+            item.path.clone().unwrap_or_default(),
+            item.created_at.clone().unwrap_or_default(),
+            item.body
+        ));
+    }
+    if keys.is_empty() {
+        keys.push(format!(
+            "fallback:{}|{}|{}|{}",
+            item.author,
+            item.path.clone().unwrap_or_default(),
+            item.created_at.clone().unwrap_or_default(),
+            item.body
+        ));
+    }
+    keys
+}
+
+fn merge_duplicate_feedback(existing: &mut PrFeedbackItem, duplicate: PrFeedbackItem) {
+    if duplicate.thread_id.is_some() {
+        existing.thread_id = duplicate.thread_id;
+        existing.source = duplicate.source;
+    }
+    if duplicate.resolved == Some(true) {
+        existing.resolved = Some(true);
+    } else if existing.resolved.is_none() {
+        existing.resolved = duplicate.resolved;
+    }
+    if existing.url.is_none() {
+        existing.url = duplicate.url;
+    }
 }
 
 fn choose_pr(mut prs: Vec<GhPrListItem>) -> Option<GhPrListItem> {
@@ -2073,6 +2117,68 @@ mod tests {
             .iter()
             .any(|c| c.surface == PrFeedbackCoverageSurface::ReviewThreads
                 && c.status == PrFeedbackCoverageStatus::Unavailable));
+    }
+
+    fn review_thread(
+        id: &str,
+        comment_id: &str,
+        body: &str,
+        path: &str,
+        is_resolved: bool,
+    ) -> GhReviewThread {
+        GhReviewThread {
+            id: Some(id.to_string()),
+            is_resolved,
+            path: Some(path.to_string()),
+            comments: GhReviewThreadComments {
+                nodes: vec![GhReviewThreadComment {
+                    id: Some(comment_id.to_string()),
+                    body: body.to_string(),
+                    url: Some(format!("https://c/{comment_id}")),
+                    created_at: Some("t".to_string()),
+                    author: Some(GhGraphqlAuthor {
+                        login: "u".to_string(),
+                    }),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn resolved_review_thread_dedupes_duplicate_rest_review_comment() {
+        let gh = FakeGh {
+            repo: Ok(repo()),
+            issue_comments: Ok(vec![]),
+            review_comments: Ok(vec![GhReviewComment {
+                id: Some(99),
+                user: Some(GhUser {
+                    login: "u".to_string(),
+                }),
+                body: Some("already fixed".to_string()),
+                path: Some("src/lib.rs".to_string()),
+                html_url: Some("https://c/rest".to_string()),
+                created_at: Some("t".to_string()),
+            }]),
+            review_summaries: Ok(vec![]),
+            review_threads: Ok(vec![review_thread(
+                "PRRT_resolved",
+                "PRRC_graphql",
+                "already fixed",
+                "src/lib.rs",
+                true,
+            )]),
+            ..FakeGh::default()
+        };
+
+        let feedback = fetch_pr_feedback(&gh, 7);
+
+        assert_eq!(feedback.total, 1);
+        assert_eq!(feedback.unresolved, 0);
+        assert_eq!(feedback.items[0].resolved, Some(true));
+        assert_eq!(
+            feedback.items[0].thread_id,
+            Some("PRRT_resolved".to_string())
+        );
     }
 
     fn feedback_item(id: &str, body: &str, resolved: Option<bool>) -> PrFeedbackItem {
