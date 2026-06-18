@@ -29,7 +29,7 @@
 --
 --   ConvState (the union of all states) remains as the serialization format.
 --
--- Requirement traceability: REQ-BED-001 through REQ-BED-030
+-- Requirement traceability: REQ-BED-001 through REQ-BED-030, plus REQ-BED-005a
 -- (3 deprecated: REQ-BED-014, REQ-BED-015, REQ-BED-016)
 
 ------------------------------------------------------------
@@ -299,6 +299,12 @@ config {
     context_warning_threshold: Decimal = 0.80
     context_continuation_threshold: Decimal = 0.90
     max_sub_agents_per_spawn: Integer = 10
+    -- Backstop deadline for forced cancellation teardown (REQ-BED-005a). The
+    -- cooperative interrupt (REQ-BED-005, within 100ms) is the happy path; this
+    -- deadline bounds the pathological case where a tool never observes its
+    -- cancellation token or never returns. Short by design: cancellation must
+    -- reach a terminal-direction state promptly regardless of tool cooperation.
+    cancellation_deadline: Duration = 3.seconds
 }
 
 -- Automatic LLM-error retries use exponential backoff with a fixed schedule,
@@ -488,6 +494,58 @@ rule SubAgentResultDuringCancellation {
     requires: conversation.core_status = cancelling_sub_agents
     requires: conversation.sub_agents_pending.count > 1
     ensures: conversation.sub_agents_completed.add(result)
+}
+
+-- REQ-BED-005a: Bounded cancellation liveness — forced teardown backstop.
+--
+-- cancelling_tool's only cooperative exits (ToolAbortConfirmed,
+-- ToolCompletesDuringCancellation) both require the tool task to return. A tool
+-- that never observes its cancellation token and never returns would otherwise
+-- wedge the conversation here forever. The deadline backstop forces the
+-- cancellation to completion without waiting for the task.
+rule CancellingToolDeadlineFires {
+    when: CancellationDeadlineExpires(conversation)
+    requires: conversation.core_status = cancelling_tool
+    ensures: CancellationCheckpointed(conversation)
+    ensures: conversation.core_status = idle
+    ensures: AgentDone(conversation)
+    ensures: CancellationDeadlineExceeded(conversation)
+    ensures: SystemMessageInjected(conversation,
+        "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
+
+    @guidance
+        -- Sequence on deadline expiry: abort the tool's executing task (do not
+        -- wait for it), reap any subprocesses it spawned (process-group kill),
+        -- synthesize cancelled results for the current and remaining tools,
+        -- checkpoint, then settle to idle. Reaching idle (not error) is
+        -- deliberate: a cancel the user requested and that succeeded from their
+        -- view must not be presented as a failure. CancellationDeadlineExceeded
+        -- is the executor's WARN-level liveness marker; SystemMessageInjected
+        -- keeps the user oriented — the conversation is idle even though
+        -- background resource reclamation may still be in flight. The OS child
+        -- process is reaped regardless of task cooperation (REQ-BED-005); this
+        -- backstop covers the in-process "task never returns" case.
+}
+
+-- cancelling_sub_agents's cooperative exit (LastSubAgentDuringCancellation)
+-- requires every pending sub-agent to report. A sub-agent that never reports
+-- (the same wedge class as REQ-SA-006) would otherwise hold the parent here
+-- forever. The deadline backstop forces completion without waiting.
+rule CancellingSubAgentsDeadlineFires {
+    when: CancellationDeadlineExpires(conversation)
+    requires: conversation.core_status = cancelling_sub_agents
+    ensures: conversation.core_status = idle
+    ensures: AgentDone(conversation)
+    ensures: CancellationDeadlineExceeded(conversation)
+    ensures: SystemMessageInjected(conversation,
+        "Cancellation completed. Aborted work may still be reclaiming resources in the background.")
+
+    @guidance
+        -- Mirror of CancellingToolDeadlineFires for the sub-agent fan-in:
+        -- abort still-pending sub-agents without waiting for them to report,
+        -- settle to idle, WARN via CancellationDeadlineExceeded, and inject the
+        -- user-visible message. Same liveness family as specs/subagents/
+        -- REQ-SA-006 (a wedged worker must not hold its supervisor indefinitely).
 }
 
 -- ===========================================================
@@ -1305,6 +1363,16 @@ invariant SpawnLimit {
         c.core_status = executing_tools
             implies c.accumulated_sub_agents.count <= config.max_sub_agents_per_spawn
 }
+
+-- REQ-BED-005a: Bounded cancellation liveness.
+-- cancelling_tool and cancelling_sub_agents are never livelocks: each has a
+-- deadline-driven exit to idle (CancellingToolDeadlineFires,
+-- CancellingSubAgentsDeadlineFires) that does not depend on the running task or
+-- a pending sub-agent ever returning. The time from a cancellation request to a
+-- terminal-direction state is bounded by config.cancellation_deadline regardless
+-- of tool cooperation. Enforced by construction: the deadline rules' `when:`
+-- (CancellationDeadlineExpires) fires unconditionally on every conversation in a
+-- cancellation status, so neither status can persist past the deadline.
 
 ------------------------------------------------------------
 -- Actor Declarations

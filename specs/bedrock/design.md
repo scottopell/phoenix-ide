@@ -352,6 +352,39 @@ Message chain remains valid:
 [tool: result id=3 (skipped)]
 ```
 
+### Two-Tier Cancellation: Cooperative Interrupt + Bounded Backstop (REQ-BED-005a)
+
+Cancellation has two tiers, distinguished by whether the tool cooperates:
+
+- **Cooperative interrupt (happy path).** The executor flips the tool's
+  cancellation token; a well-behaved tool observes it and returns within
+  ~100ms. `CancellingTool` exits via the tool task returning
+  (`ToolAbortConfirmed` / `ToolCompletesDuringCancellation`), synthetic results
+  are recorded, and the conversation settles to `Idle`. No warning, no
+  degraded-cancellation message — this is the expected case.
+
+- **Bounded forced-teardown backstop (pathological path).** `CancellingTool`
+  and `CancellingSubAgents` otherwise exit *only* when the running task returns
+  or every pending sub-agent reports. A tool that ignores its token and blocks,
+  or a sub-agent that never reports, would wedge the conversation in a
+  cancellation status forever — a liveness hole. A short deadline
+  (`config.cancellation_deadline`, ~2-3s) backstops this: on expiry the executor
+  aborts the tool task without waiting for it, synthesizes cancelled results,
+  logs a WARN (`CancellationDeadlineExceeded`), injects a user-visible system
+  message, and forces the transition to `Idle`.
+
+The OS child process is reaped regardless of cooperation (process-group kill /
+`kill_on_drop`); the deadline backstop covers only the in-process "task never
+returns" case. Forced teardown reaches `Idle`, **not** `Error`: the user asked
+to cancel and cancellation succeeded from their view, so presenting it as a
+failure would be wrong. The user-visible message notes that aborted work may
+still be reclaiming resources in the background, keeping the user oriented while
+the conversation is already idle.
+
+This is the same liveness family as the sub-agent deadline in
+`specs/subagents/` (REQ-SA-006): a wedged worker must never be able to hold its
+supervising conversation indefinitely.
+
 ## Error Handling and Retry (REQ-BED-006)
 
 Retry logic is embedded in state machine, visible to UI. The `handle_outcome` function
@@ -787,6 +820,8 @@ User events use `handle_user_event()`. Outcomes use `handle_outcome()`.
 | AwaitingSubAgents | SubAgentOutcome::TimedOut (last) | AwaitingLlm | PersistCheckpoint, RequestLlm |
 | CancellingSubAgents | SubAgentOutcome (more pending) | CancellingSubAgents | — |
 | CancellingSubAgents | SubAgentOutcome (last) | Idle | BroadcastState |
+| CancellingTool | CancellationDeadlineExpires (backstop, REQ-BED-005a) | Idle | AbortToolTask, ReapSubprocesses, PersistCheckpoint(ToolRound with synthetics), WARN, InjectSystemMessage, BroadcastState |
+| CancellingSubAgents | CancellationDeadlineExpires (backstop, REQ-BED-005a) | Idle | AbortPendingSubAgents, WARN, InjectSystemMessage, BroadcastState |
 | Cancelling | LlmOutcome::Response/Cancelled | Idle | BroadcastState |
 | AwaitingContinuation | ContinuationResponse | ContextExhausted | PersistCheckpoint(ContinuationSummary) |
 | AwaitingContinuation | ContinuationFailed | ContextExhausted | PersistCheckpoint(ContinuationSummary, fallback) |
