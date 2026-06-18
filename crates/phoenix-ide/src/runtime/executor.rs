@@ -3582,7 +3582,8 @@ where
         // terminal conversations without a state guard. Resetting to
         // repo_root gives them a valid directory rather than a deleted
         // worktree path.
-        let repo_root_cwd = crate::conversation_cwd::validate_conversation_cwd(&repo_root)?;
+        let repo_root_cwd = crate::conversation_cwd::validate_conversation_cwd(&repo_root)
+            .map_err(|e| e.to_string())?;
         self.storage
             .update_conversation_cwd_recovery_only(conv_id, repo_root_cwd.raw())
             .await?;
@@ -3711,7 +3712,8 @@ where
                         &self.context.conversation_id,
                         crate::conversation_cwd::validate_conversation_cwd(
                             &approval_result.worktree_path,
-                        )?
+                        )
+                        .map_err(|e| e.to_string())?
                         .raw(),
                     )
                     .await?;

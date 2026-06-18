@@ -1893,7 +1893,10 @@ impl RuntimeManager {
         let conv_cwd = crate::conversation_cwd::validate_conversation_cwd_for_runtime(
             conversation_id,
             &conv.cwd,
-        )?;
+        )
+        .map_err(|e| {
+            format!("Conversation '{conversation_id}' has an invalid working directory: {e}")
+        })?;
 
         // Check if this is a sub-agent being resumed (shouldn't happen normally)
         let is_sub_agent = conv.parent_conversation_id.is_some();

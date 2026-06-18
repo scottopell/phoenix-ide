@@ -1192,7 +1192,7 @@ async fn create_conversation_with_id(
     raw_files: Vec<RawAttachmentPart>,
 ) -> Result<Json<ConversationResponse>, AppError> {
     let valid_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
-        .map_err(AppError::BadRequest)?;
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let path = valid_cwd.as_path();
 
     // REQ-SEED-001: seeded conversations may be created empty so the UI can
@@ -1986,17 +1986,30 @@ async fn stream_conversation(
     // read messages last. If a persisted message races stream-open, it is
     // therefore either included in the final DB snapshot or has a sequence_id
     // above the init floor and survives the client's live-event replay guard.
-    let handle = state
-        .runtime
-        .get_or_create(&id)
-        .await
-        .map_err(AppError::Internal)?;
-    tracing::debug!(
-        conv_id = %id,
-        receivers_before = handle.broadcast_tx.receiver_count(),
-        "SSE client subscribing"
-    );
-    let broadcast_rx = handle.broadcast_tx.subscribe();
+    let (broadcast_tx, broadcast_rx) = match state.runtime.get_or_create(&id).await {
+        Ok(handle) => {
+            tracing::debug!(
+                conv_id = %id,
+                receivers_before = handle.broadcast_tx.receiver_count(),
+                "SSE client subscribing"
+            );
+            let broadcast_rx = handle.broadcast_tx.subscribe();
+            (handle.broadcast_tx, broadcast_rx)
+        }
+        Err(e) if is_invalid_runtime_cwd_error(&e) => {
+            tracing::warn!(conv_id = %id, error = %e, "Serving static SSE transcript without starting runtime because persisted cwd is invalid");
+            let last_sequence_id = state
+                .runtime
+                .db()
+                .get_last_sequence_id(&id)
+                .await
+                .unwrap_or(0);
+            let broadcaster = crate::runtime::SseBroadcaster::new(1, last_sequence_id);
+            let broadcast_rx = broadcaster.subscribe();
+            (broadcaster, broadcast_rx)
+        }
+        Err(e) => return Err(AppError::Internal(e)),
+    };
 
     let last_sequence_id = state
         .runtime
@@ -2009,7 +2022,7 @@ async fn stream_conversation(
     // the durable catch-up for any persisted Message that commits before init is
     // constructed; live SSE covers events that commit after that read.
     let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
-        handle.broadcast_tx.snapshot_pending();
+        broadcast_tx.snapshot_pending();
 
     let messages = state
         .runtime
@@ -2022,7 +2035,7 @@ async fn stream_conversation(
         std::cmp::max(last_sequence_id, highest_pending_seq),
         highest_message_seq,
     );
-    handle.broadcast_tx.observe_seq(init_seq);
+    broadcast_tx.observe_seq(init_seq);
 
     let context_window_size = messages
         .iter()
@@ -2057,6 +2070,10 @@ async fn stream_conversation(
     };
 
     Ok(sse_stream(id, init_event, broadcast_rx))
+}
+
+fn is_invalid_runtime_cwd_error(error: &str) -> bool {
+    error.contains("has an invalid working directory")
 }
 
 // ============================================================
@@ -3395,43 +3412,21 @@ async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdRespons
     // Normalize path: remove trailing slashes (except for root)
     let path_str = query.path.trim_end_matches('/');
     let path_str = if path_str.is_empty() { "/" } else { path_str };
-    let path = PathBuf::from(path_str);
-
-    if !path.exists() {
-        return Json(ValidateCwdResponse {
-            valid: false,
-            error: Some("Directory does not exist".to_string()),
-            is_git: false,
-        });
-    }
-
-    if !path.is_dir() {
-        return Json(ValidateCwdResponse {
-            valid: false,
-            error: Some("Path is not a directory".to_string()),
-            is_git: false,
-        });
-    }
-
-    // Check if this directory is inside a git repository by walking up to find .git
-    let is_git = {
-        let mut check = path.as_path();
-        loop {
-            if check.join(".git").exists() {
-                break true;
-            }
-            match check.parent() {
-                Some(parent) => check = parent,
-                None => break false,
-            }
+    match crate::conversation_cwd::validate_conversation_cwd(path_str) {
+        Ok(valid) => {
+            let is_git = phoenix_core::git::detect_git_repo_root(valid.as_path()).is_some();
+            Json(ValidateCwdResponse {
+                valid: true,
+                error: None,
+                is_git,
+            })
         }
-    };
-
-    Json(ValidateCwdResponse {
-        valid: true,
-        error: None,
-        is_git,
-    })
+        Err(error) => Json(ValidateCwdResponse {
+            valid: false,
+            error: Some(error.to_string()),
+            is_git: false,
+        }),
+    }
 }
 
 async fn list_directory(
@@ -4954,12 +4949,25 @@ async fn shared_sse_stream(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let handle = state
-        .runtime
-        .get_or_create(&conversation_id)
-        .await
-        .map_err(AppError::Internal)?;
-    let broadcast_rx = handle.broadcast_tx.subscribe();
+    let (broadcast_tx, broadcast_rx) = match state.runtime.get_or_create(&conversation_id).await {
+        Ok(handle) => {
+            let broadcast_rx = handle.broadcast_tx.subscribe();
+            (handle.broadcast_tx, broadcast_rx)
+        }
+        Err(e) if is_invalid_runtime_cwd_error(&e) => {
+            tracing::warn!(conv_id = %conversation_id, error = %e, "Serving static shared SSE transcript without starting runtime because persisted cwd is invalid");
+            let last_sequence_id = state
+                .runtime
+                .db()
+                .get_last_sequence_id(&conversation_id)
+                .await
+                .unwrap_or(0);
+            let broadcaster = crate::runtime::SseBroadcaster::new(1, last_sequence_id);
+            let broadcast_rx = broadcaster.subscribe();
+            (broadcaster, broadcast_rx)
+        }
+        Err(e) => return Err(AppError::Internal(e)),
+    };
 
     let last_sequence_id = state
         .runtime
@@ -4969,7 +4977,7 @@ async fn shared_sse_stream(
         .unwrap_or(0);
 
     let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
-        handle.broadcast_tx.snapshot_pending();
+        broadcast_tx.snapshot_pending();
 
     let messages = state
         .runtime
@@ -4982,7 +4990,7 @@ async fn shared_sse_stream(
         std::cmp::max(last_sequence_id, highest_pending_seq),
         highest_message_seq,
     );
-    handle.broadcast_tx.observe_seq(init_seq);
+    broadcast_tx.observe_seq(init_seq);
 
     let context_window_size = messages
         .iter()
@@ -5151,10 +5159,51 @@ mod conversation_cwd_validation_tests {
         .await
         .expect("deep cwd accepted");
 
+        let canonical = deep.canonicalize().unwrap();
         assert_eq!(
             response.conversation["cwd"].as_str(),
-            Some(deep.to_str().unwrap())
+            Some(canonical.to_str().unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn validate_cwd_rejects_filesystem_root() {
+        let Json(response) = validate_cwd(Query(PathQuery {
+            path: "/".to_string(),
+            cwd: None,
+        }))
+        .await;
+
+        assert!(!response.valid);
+        assert!(!response.is_git);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("filesystem root")),
+            "got: {:?}",
+            response.error
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_conversation_serves_transcript_when_cwd_is_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stale_cwd = tmp.path().to_string_lossy().to_string();
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        state
+            .db
+            .create_conversation("stale-cwd", "stale-cwd", &stale_cwd, true, None, None)
+            .await
+            .expect("create");
+        drop(tmp);
+
+        let response = stream_conversation(State(state), Path("stale-cwd".to_string()))
+            .await
+            .expect("stale cwd should still stream transcript")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
 
