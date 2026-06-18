@@ -3364,8 +3364,22 @@ async fn rename_conversation(
 /// persisted server-side.
 async fn suggest_handler(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SuggestRequest>,
 ) -> Result<Json<SuggestResponse>, AppError> {
+    // Capability-token gate: the endpoint is exempt from the password
+    // middleware, so authorization rests entirely on the scoped token the
+    // server injected into the PTY env (held by `phx`, never the password).
+    let provided = headers
+        .get("x-phoenix-suggest-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if provided.is_empty() || provided != state.suggest_token {
+        return Err(AppError::Forbidden(
+            "invalid or missing suggest token".to_string(),
+        ));
+    }
+
     let query = req.query.trim();
     if query.is_empty() {
         return Err(AppError::BadRequest("query must not be empty".to_string()));
@@ -5191,6 +5205,7 @@ mod hard_delete_cascade_tests {
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
         }
     }
 
@@ -7327,6 +7342,7 @@ mod upgrade_model_state_guard_tests {
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
         }
     }
 
@@ -7479,6 +7495,7 @@ mod file_read_tests {
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
         }
     }
 

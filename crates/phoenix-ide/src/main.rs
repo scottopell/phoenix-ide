@@ -10,6 +10,7 @@ pub(crate) mod git_ops;
 mod llm;
 mod mcp_oauth_store;
 mod message_expander;
+mod phx_cli;
 mod project_opportunistic_build_warm;
 mod resolution_root;
 mod runtime;
@@ -409,9 +410,77 @@ fn build_disk_locations(
     locations
 }
 
+/// Install the in-terminal `phx` companion and the PTY env injection it relies
+/// on, returning the minted suggest capability token.
+///
+/// Materializes `<data_dir>/bin/phx` as a symlink to this binary (refreshed
+/// each start so it tracks upgrades) and registers a [`PtyEnvInjection`] that
+/// prepends that bin dir to every terminal's `PATH` and injects
+/// `PHOENIX_API_URL` + `PHOENIX_SUGGEST_TOKEN`. Symlink failure is non-fatal
+/// (logged); `phx` simply won't be on PATH, but the token is still returned so
+/// the endpoint gate is consistent.
+fn setup_phx_companion(
+    runtime_env: &PhoenixRuntimeEnvironment,
+    bind_address: std::net::SocketAddr,
+    tls_loaded: bool,
+) -> String {
+    use base64::Engine as _;
+    use rand::Rng as _;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+
+    let scheme = if tls_loaded { "https" } else { "http" };
+    let api_url = format!("{scheme}://127.0.0.1:{}", bind_address.port());
+
+    let mut injection = phoenix_terminal::spawn::PtyEnvInjection {
+        path_prefix: None,
+        extra: vec![
+            ("PHOENIX_API_URL".to_string(), api_url),
+            ("PHOENIX_SUGGEST_TOKEN".to_string(), token.clone()),
+        ],
+    };
+
+    match install_phx_symlink(runtime_env) {
+        Ok(bin_dir) => injection.path_prefix = Some(bin_dir),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not install `phx` shim; in-terminal phx unavailable");
+        }
+    }
+
+    phoenix_terminal::spawn::set_pty_env_injection(injection);
+    token
+}
+
+/// Create `<data_dir>/bin/phx` as a symlink to the running binary, returning the
+/// bin directory. Replaces any existing link so the shim tracks binary upgrades.
+fn install_phx_symlink(
+    runtime_env: &PhoenixRuntimeEnvironment,
+) -> std::io::Result<std::path::PathBuf> {
+    let bin_dir = runtime_env.data_dir().join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let link = bin_dir.join("phx");
+    let target = std::env::current_exe()?;
+    match std::fs::symlink_metadata(&link) {
+        Ok(_) => std::fs::remove_file(&link)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::os::unix::fs::symlink(&target, &link)?;
+    Ok(bin_dir)
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // Startup sequence is inherently sequential; splitting would obscure the flow.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `phx` companion: when this binary is invoked through the PATH-injected
+    // `phx` symlink (or `phoenix_ide suggest …`), run the thin suggestion
+    // client and exit instead of starting the server. Branch before logging
+    // setup so the client's stdout stays clean (OSC 8 links only).
+    if phx_cli::is_cli_invocation() {
+        std::process::exit(phx_cli::run().await);
+    }
+
     // Initialize logging from the configured sinks (PHOENIX_LOG_STDOUT /
     // PHOENIX_LOG_FILE). The guard must outlive the program so the file
     // appender's worker flushes on shutdown; held until `main` returns.
@@ -720,6 +789,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let auth_enabled = password.is_some();
 
+    // Install the `phx` terminal companion: a symlink to this binary on the
+    // PTY PATH plus the env (API URL + capability token) it needs to call back.
+    let suggest_token = setup_phx_companion(&runtime_env, bind_address, loaded_tls.is_some());
+
     // Create application state
     let state = AppState::new(
         db,
@@ -730,6 +803,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         password,
         deployment,
         runtime_env,
+        suggest_token,
     )
     .await;
 

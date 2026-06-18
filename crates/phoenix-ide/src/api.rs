@@ -75,6 +75,11 @@ pub struct AppState {
     /// authority handlers read on-disk locations from. See
     /// [`PhoenixRuntimeEnvironment`].
     pub runtime_env: Arc<PhoenixRuntimeEnvironment>,
+    /// Scoped capability token authorizing `POST /api/suggest`. Minted at
+    /// startup and injected into every PTY's env as `PHOENIX_SUGGEST_TOKEN` so
+    /// the in-terminal `phx` can call the endpoint without the master password.
+    /// Not the password: possessing it grants only command suggestions.
+    pub suggest_token: String,
 }
 
 impl AppState {
@@ -93,6 +98,7 @@ impl AppState {
         password: Option<String>,
         deployment: Arc<DeploymentConfig>,
         runtime_env: Arc<PhoenixRuntimeEnvironment>,
+        suggest_token: String,
     ) -> Self {
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
@@ -160,6 +166,7 @@ impl AppState {
             codex_login,
             deployment,
             runtime_env,
+            suggest_token,
         }
     }
 }

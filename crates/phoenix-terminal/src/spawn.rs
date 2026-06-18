@@ -16,8 +16,33 @@ use std::{
     ffi::CString,
     os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
+
+/// Server-wide additions to every PTY child's environment, installed once at
+/// startup via [`set_pty_env_injection`]. Kept process-global (rather than
+/// threaded through `spawn_pty`) so it sits alongside `build_env`'s existing
+/// reads of ambient process state (`PATH`, `USER`, `runtime_env`), which is
+/// where the rest of the child env already comes from.
+#[derive(Debug, Clone, Default)]
+pub struct PtyEnvInjection {
+    /// Directory prepended to the child `PATH` — holds the `phx` shim so it is
+    /// guaranteed on `PATH` in every terminal session.
+    pub path_prefix: Option<PathBuf>,
+    /// Extra vars merged into the child env (e.g. `PHOENIX_API_URL` and the
+    /// scoped suggest capability token). These are deliberate, narrowly-scoped
+    /// additions — not the secret-leaking server-env inheritance `build_env`
+    /// otherwise forbids.
+    pub extra: Vec<(String, String)>,
+}
+
+static ENV_INJECTION: OnceLock<PtyEnvInjection> = OnceLock::new();
+
+/// Install the server-wide PTY env injection. First call wins; later calls are
+/// ignored (startup runs once).
+pub fn set_pty_env_injection(injection: PtyEnvInjection) {
+    let _ = ENV_INJECTION.set(injection);
+}
 
 /// What the PTY child should exec into.
 ///
@@ -273,11 +298,18 @@ pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "user".to_owned());
-    let path = std::env::var("PATH").unwrap_or_else(|_| {
+    let mut path = std::env::var("PATH").unwrap_or_else(|_| {
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
     });
 
-    vec![
+    let injection = ENV_INJECTION.get();
+    if let Some(prefix) = injection.and_then(|i| i.path_prefix.as_ref()) {
+        // Prepend so the Phoenix-managed `phx` shadows any same-named binary
+        // already on PATH (the "guaranteed available" contract).
+        path = format!("{}:{path}", prefix.display());
+    }
+
+    let mut env = vec![
         ("TERM".into(), "xterm-256color".into()),
         ("COLORTERM".into(), "truecolor".into()),
         ("HOME".into(), home),
@@ -294,7 +326,13 @@ pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
         // detect the host terminal by name rather than by env-var sniffing.
         ("ITERM_SHELL_INTEGRATION_INSTALLED".into(), "Yes".into()),
         ("TERM_PROGRAM".into(), "phoenix-ide".into()),
-    ]
+    ];
+
+    if let Some(inj) = injection {
+        env.extend(inj.extra.iter().cloned());
+    }
+
+    env
 }
 
 /// Same as [`build_env`] but explicitly omits `TMUX`. When Phoenix is

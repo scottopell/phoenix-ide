@@ -197,11 +197,20 @@ class PhoenixClient:
         resp.raise_for_status()
 
     def suggest(self, query: str, model: str | None = None) -> list[str]:
-        """One-shot shell-command suggestion. Stateless: no conversation."""
+        """One-shot shell-command suggestion. Stateless: no conversation.
+
+        /api/suggest is gated by the PHOENIX_SUGGEST_TOKEN capability token
+        (injected into Phoenix terminal sessions), not the master password —
+        so run this inside a Phoenix terminal, or export the token yourself.
+        """
         payload: dict = {"query": query}
         if model:
             payload["model"] = model
-        resp = self.http.post(f"{self.base_url}/api/suggest", json=payload)
+        headers = {}
+        token = os.environ.get("PHOENIX_SUGGEST_TOKEN")
+        if token:
+            headers["X-Phoenix-Suggest-Token"] = token
+        resp = self.http.post(f"{self.base_url}/api/suggest", json=payload, headers=headers)
         resp.raise_for_status()
         return resp.json().get("commands", [])
 

@@ -369,6 +369,14 @@ fn is_exempt_path(path: &str) -> bool {
         return true;
     }
 
+    // Command suggestion is gated by its own scoped capability token
+    // (PHOENIX_SUGGEST_TOKEN), checked inside the handler — not the master
+    // password. Exempt it from the password middleware so the in-terminal
+    // `phx`, which holds the token but not the password, can reach it.
+    if path == "/api/suggest" {
+        return true;
+    }
+
     // The MCP OAuth redirect arrives as a bare browser GET from the
     // authorization server and cannot carry Phoenix credentials. It is safe
     // unauthenticated: the only meaningful inputs are `code` + `state`, and
