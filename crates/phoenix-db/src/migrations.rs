@@ -919,12 +919,12 @@ ALTER TABLE conversations ADD COLUMN cm_next_taskmd_id_hint TEXT;
 
 UPDATE conversations
 SET cm_kind = lower(json_extract(conv_mode, '$.mode')),
-    cm_branch_name = json_extract(conv_mode, '$.branch_name'),
-    cm_worktree_path = json_extract(conv_mode, '$.worktree_path'),
-    cm_base_branch = json_extract(conv_mode, '$.base_branch'),
-    cm_task_id = json_extract(conv_mode, '$.task_id'),
-    cm_task_title = json_extract(conv_mode, '$.task_title'),
-    cm_next_taskmd_id_hint = json_extract(conv_mode, '$.next_taskmd_id_hint')
+    cm_branch_name = NULLIF(json_extract(conv_mode, '$.branch_name'), ''),
+    cm_worktree_path = NULLIF(json_extract(conv_mode, '$.worktree_path'), ''),
+    cm_base_branch = NULLIF(json_extract(conv_mode, '$.base_branch'), ''),
+    cm_task_id = NULLIF(json_extract(conv_mode, '$.task_id'), ''),
+    cm_task_title = NULLIF(json_extract(conv_mode, '$.task_title'), ''),
+    cm_next_taskmd_id_hint = NULLIF(json_extract(conv_mode, '$.next_taskmd_id_hint'), '')
 WHERE json_valid(conv_mode)
   AND json_extract(conv_mode, '$.mode') IS NOT NULL;
 ";

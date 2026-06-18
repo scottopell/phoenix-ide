@@ -4171,11 +4171,15 @@ fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
                 ConvMode::default()
             }
         }
-        // "explore", an unknown kind, or NULL (legacy/malformed) → Explore.
-        _ => ConvMode::Explore {
+        Some("explore") => ConvMode::Explore {
             worktree_path: ne("cm_worktree_path"),
             next_taskmd_id_hint: ne("cm_next_taskmd_id_hint"),
         },
+        // An unknown kind or NULL (legacy/malformed) → bare default Explore,
+        // discarding any stray field columns. This mirrors the prior blob
+        // parser, which fell back to ConvMode::default() for unrecognized modes
+        // rather than carrying their fields forward.
+        _ => ConvMode::default(),
     }
 }
 
@@ -5520,6 +5524,33 @@ mod tests {
         let after = db.get_messages_after("conv-1", 1).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].message_id, "msg-2");
+    }
+
+    /// A freshly-migrated DB (base SCHEMA + all versioned migrations, the path
+    /// `open_in_memory` exercises) ends with the normalized `cm_*` columns and
+    /// no `conv_mode` blob. This locks the migration-029 end state and proves
+    /// the `conv_mode`-referencing migrations resolve during fresh-DB replay
+    /// (`conv_mode` lives in the base schema until 029 drops it).
+    #[tokio::test]
+    async fn conversations_schema_is_normalized_after_migrations() {
+        let db = Database::open_in_memory().await.unwrap();
+        let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .map(|r: SqliteRow| r.get::<String, _>("name"))
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "cm_kind"),
+            "cm_kind present: {cols:?}"
+        );
+        assert!(
+            cols.iter().any(|c| c == "cm_worktree_path"),
+            "cm_worktree_path present: {cols:?}"
+        );
+        assert!(
+            !cols.iter().any(|c| c == "conv_mode"),
+            "conv_mode blob must be dropped after migration 029: {cols:?}"
+        );
     }
 
     /// User/skill attachments round-trip through the normalized child tables:
