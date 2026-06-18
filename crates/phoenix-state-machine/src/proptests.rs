@@ -5,6 +5,7 @@
 #![allow(clippy::collapsible_if)]
 #![allow(clippy::single_match_else)]
 
+use super::event::CancelCause;
 use super::state::*;
 use super::transition::*;
 use super::*;
@@ -380,7 +381,10 @@ pub(crate) fn arb_event() -> impl Strategy<Value = Event> {
         arb_tool_complete_event(),
         arb_llm_error_event(),
         arb_retry_timeout_event(),
-        Just(Event::UserCancel { reason: None }),
+        Just(Event::UserCancel {
+            reason: None,
+            cause: CancelCause::UserRequested
+        }),
         arb_task_approval_event(),
         arb_user_question_response_event(),
         Just(Event::UserQuestionDismissed),
@@ -503,7 +507,7 @@ proptest! {
     // Invariant 3: Cancel from any working state reaches a cancelling state
     #[test]
     fn prop_cancel_stops_work(state in arb_working_state()) {
-        let result = transition(&state, &test_context(), Event::UserCancel { reason: None });
+        let result = transition(&state, &test_context(), Event::UserCancel { reason: None, cause: CancelCause::UserRequested });
         prop_assert!(result.is_ok(), "Cancel failed: {:?}", result);
         let new_state = result.unwrap().new_state;
         prop_assert!(
@@ -858,7 +862,7 @@ proptest! {
     #[test]
     fn prop_llm_cancel_goes_to_idle(_dummy in Just(())) {
         let state = ConvState::LlmRequesting { attempt: 1 };
-        let result = transition(&state, &test_context(), Event::UserCancel { reason: None });
+        let result = transition(&state, &test_context(), Event::UserCancel { reason: None, cause: CancelCause::UserRequested });
         prop_assert!(result.is_ok());
 
         let tr = result.unwrap();
@@ -886,7 +890,7 @@ proptest! {
             assistant_message: AssistantMessage::default(),
         };
 
-        let result = transition(&state, &test_context(), Event::UserCancel { reason: None });
+        let result = transition(&state, &test_context(), Event::UserCancel { reason: None, cause: CancelCause::UserRequested });
         prop_assert!(result.is_ok());
 
         let tr = result.unwrap();
@@ -1421,7 +1425,15 @@ fn test_cancel_mid_tool_chain() {
     };
 
     // Phase 1: UserCancel -> CancellingTool + AbortTool effect
-    let result = transition(&state, &ctx, Event::UserCancel { reason: None }).unwrap();
+    let result = transition(
+        &state,
+        &ctx,
+        Event::UserCancel {
+            reason: None,
+            cause: CancelCause::UserRequested,
+        },
+    )
+    .unwrap();
 
     assert!(
         matches!(result.new_state, ConvState::CancellingTool { .. }),
@@ -1755,7 +1767,7 @@ proptest! {
         spawn_tool_id: None,
     };
 
-    let result = transition(&state, &test_context(), Event::UserCancel { reason: None }).unwrap();
+    let result = transition(&state, &test_context(), Event::UserCancel { reason: None, cause: CancelCause::UserRequested }).unwrap();
 
     // reason: only CancellingSubAgents is expected; every other ConvState variant is a
     // failure, so an explicit list of the ~16 remaining variants would obscure intent.
@@ -1789,6 +1801,7 @@ proptest! {
     let mut state = ConvState::CancellingSubAgents {
         pending,
         completed_results: vec![],
+        cause: CancelCause::UserRequested,
     };
 
     for (i, agent_id) in initial_ids.iter().enumerate() {

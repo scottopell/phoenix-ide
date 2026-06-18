@@ -47,6 +47,8 @@ pub enum Event {
     UserCancel {
         /// Why the cancel was issued. `None` means user-initiated or parent-propagated.
         reason: Option<String>,
+        /// Whether this cancel was human-requested or forced by a timeout (task 61004).
+        cause: CancelCause,
     },
 
     // LLM events
@@ -265,6 +267,17 @@ impl Event {
 // Split Event Types — CoreEvent, ParentOnlyEvent, SubAgentOnlyEvent
 // ============================================================================
 
+/// Why a `UserCancel` was issued — drives the recorded sub-agent outcome on
+/// forced teardown (task 61004). `UserRequested` is a human-initiated or
+/// parent-propagated cancel; `Timeout` is the parent's sub-agent completion
+/// timeout forcing teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelCause {
+    UserRequested,
+    Timeout,
+}
+
 /// Events handled by the core transition function (shared by both parent and sub-agent).
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
@@ -280,6 +293,7 @@ pub enum CoreEvent {
     },
     UserCancel {
         reason: Option<String>,
+        cause: CancelCause,
     },
     LlmResponse {
         content: Vec<ContentBlock>,
@@ -429,7 +443,9 @@ impl TryFrom<Event> for ParentEvent {
                 user_agent,
                 skill_invocation,
             })),
-            Event::UserCancel { reason } => Ok(ParentEvent::Core(CoreEvent::UserCancel { reason })),
+            Event::UserCancel { reason, cause } => {
+                Ok(ParentEvent::Core(CoreEvent::UserCancel { reason, cause }))
+            }
             Event::LlmResponse {
                 content,
                 tool_calls,
@@ -573,8 +589,8 @@ impl TryFrom<Event> for SubAgentEvent {
                 user_agent,
                 skill_invocation,
             })),
-            Event::UserCancel { reason } => {
-                Ok(SubAgentEvent::Core(CoreEvent::UserCancel { reason }))
+            Event::UserCancel { reason, cause } => {
+                Ok(SubAgentEvent::Core(CoreEvent::UserCancel { reason, cause }))
             }
             Event::LlmResponse {
                 content,

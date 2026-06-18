@@ -12,12 +12,14 @@
 //! REQ-BED-006: Error Recovery
 
 use super::effect::{compute_bash_display_data, CheckpointData};
-use super::event::{CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent};
+use super::event::{
+    CancelCause, CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent,
+};
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
     AssistantMessage, ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind,
-    ParentState, RecoveryKind, RecoveryResumeTarget, SubAgentResult, SubAgentState,
-    TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
+    ParentState, RecoveryKind, RecoveryResumeTarget, SubAgentOutcome, SubAgentResult,
+    SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -1056,12 +1058,13 @@ fn handle_core_cancellation(
                 completed_results,
                 ..
             },
-            CoreEvent::UserCancel { .. },
+            CoreEvent::UserCancel { cause, .. },
         ) => {
             let ids: Vec<String> = pending.iter().map(|p| p.agent_id.clone()).collect();
             Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                 pending: pending.clone(),
                 completed_results: completed_results.clone(),
+                cause,
             })
             .with_effect(Effect::CancelSubAgents { ids })
             .with_effect(Effect::PersistState))
@@ -1141,6 +1144,7 @@ fn handle_core_cancellation(
                 Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
+                    cause: CancelCause::UserRequested,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState))
@@ -1180,6 +1184,7 @@ fn handle_core_cancellation(
                 Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
+                    cause: CancelCause::UserRequested,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState))
@@ -1239,6 +1244,20 @@ fn build_cancellation_results(
         ));
     }
     all_results
+}
+
+/// Map a sub-agent's reported outcome to the outcome recorded when the parent
+/// is tearing the sub-agent down (task 61004). A real `Success` always wins
+/// (fidelity); a timeout-caused teardown records `TimedOut`; a user-requested
+/// cancel keeps the reported outcome (e.g. a `Failure { Cancelled }`).
+fn map_teardown_outcome(outcome: SubAgentOutcome, cause: CancelCause) -> SubAgentOutcome {
+    match (&outcome, cause) {
+        // A real success always wins (fidelity); a user-requested cancel keeps
+        // the reported outcome (e.g. Failure { Cancelled }).
+        (SubAgentOutcome::Success { .. }, _) | (_, CancelCause::UserRequested) => outcome,
+        // A timeout-caused teardown records TimedOut over any non-success outcome.
+        (_, CancelCause::Timeout) => SubAgentOutcome::TimedOut,
+    }
 }
 
 /// Handles `SubAgentResult` events in `AwaitingSubAgents` and `CancellingSubAgents` states.
@@ -1323,6 +1342,7 @@ fn handle_core_sub_agents(
             CoreState::CancellingSubAgents {
                 pending,
                 completed_results,
+                cause,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() > 1 => {
@@ -1336,26 +1356,49 @@ fn handle_core_sub_agents(
                 .filter(|p| p.agent_id != agent_id)
                 .cloned()
                 .collect();
+            let recorded = map_teardown_outcome(outcome, *cause);
             let mut new_results = completed_results.clone();
             new_results.push(SubAgentResult {
                 agent_id,
                 task,
-                outcome,
+                outcome: recorded,
             });
 
             Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                 pending: new_pending,
                 completed_results: new_results,
+                cause: *cause,
             })
             .with_effect(Effect::PersistState))
         }
 
         // CancellingSubAgents + SubAgentResult (last one) -> Idle
         (
-            CoreState::CancellingSubAgents { pending, .. },
-            CoreEvent::SubAgentResult { agent_id, .. },
+            CoreState::CancellingSubAgents {
+                pending,
+                completed_results,
+                cause,
+            },
+            CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() == 1 => {
+            let task = pending
+                .iter()
+                .find(|p| p.agent_id == agent_id)
+                .map(|p| p.task.clone())
+                .unwrap_or_default();
+            let recorded = map_teardown_outcome(outcome, *cause);
+            let mut new_results = completed_results.clone();
+            new_results.push(SubAgentResult {
+                agent_id,
+                task,
+                outcome: recorded,
+            });
+
             Ok(CoreTransitionResult::new(CoreState::Idle)
+                .with_effect(Effect::PersistSubAgentResults {
+                    results: new_results,
+                    spawn_tool_id: None,
+                })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -2531,7 +2574,7 @@ pub fn transition_sub_agent(
                 assistant_message,
                 pending_sub_agents,
             }),
-            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _ }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, .. }),
         ) => Ok(
             SubAgentTransitionResult::new(SubAgentState::Core(CoreState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
@@ -2593,13 +2636,13 @@ pub fn transition_sub_agent(
         // ToolAborted/ToolComplete settles the round (arm above).
         (
             cancelling @ SubAgentState::Core(CoreState::CancellingTool { .. }),
-            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _ }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, .. }),
         ) => Ok(SubAgentTransitionResult::new(cancelling.clone())),
 
         // ============================================================
         // Sub-agent UserCancel -> Failed (from any other non-terminal core state)
         // ============================================================
-        (SubAgentState::Core(_), SubAgentEvent::Core(CoreEvent::UserCancel { reason })) => {
+        (SubAgentState::Core(_), SubAgentEvent::Core(CoreEvent::UserCancel { reason, .. })) => {
             let error = reason
                 .clone()
                 .unwrap_or_else(|| "Cancelled by parent".to_string());
@@ -3511,8 +3554,15 @@ mod tests {
             attempt: 1,
         };
 
-        let err = transition(&state, &test_context(), Event::UserCancel { reason: None })
-            .expect_err("continuation generation is not user-cancellable");
+        let err = transition(
+            &state,
+            &test_context(),
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
+        )
+        .expect_err("continuation generation is not user-cancellable");
 
         assert!(matches!(
             err,
@@ -3742,7 +3792,10 @@ mod tests {
                 assistant_message,
             },
             &test_context(),
-            Event::UserCancel { reason: None },
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
         )
         .unwrap();
 
@@ -3971,7 +4024,10 @@ mod tests {
                 assistant_message,
             },
             &sub_agent_context(),
-            Event::UserCancel { reason: None },
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
         )
         .expect("sub-agent ToolExecuting + UserCancel must transition");
 
@@ -4017,6 +4073,7 @@ mod tests {
     /// goes to Idle to resume the user's turn — a sub-agent has no turn to
     /// resume, so it must end Failed instead.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_subagent_cancelling_tool_settles_to_failed_and_notifies_parent() {
         use crate::state::AssistantMessage;
         use phoenix_core::domain::llm_types::ContentBlock;
@@ -4115,6 +4172,7 @@ mod tests {
             &sub_agent_context(),
             Event::UserCancel {
                 reason: Some("second cancel".to_string()),
+                cause: CancelCause::UserRequested,
             },
         )
         .expect("sub-agent CancellingTool + UserCancel must be absorbed");
@@ -4140,7 +4198,10 @@ mod tests {
         let result = transition(
             &ConvState::LlmRequesting { attempt: 1 },
             &sub_agent_context(),
-            Event::UserCancel { reason: None },
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
         )
         .expect("sub-agent LlmRequesting + UserCancel must transition");
 

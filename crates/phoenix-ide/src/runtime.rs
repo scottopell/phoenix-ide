@@ -1785,6 +1785,7 @@ impl RuntimeManager {
                 let _ = event_tx
                     .send(Event::UserCancel {
                         reason: Some("Sub-agent timed out".to_string()),
+                        cause: crate::state_machine::event::CancelCause::UserRequested,
                     })
                     .await;
             })
@@ -1848,7 +1849,10 @@ impl RuntimeManager {
                 tracing::info!(agent_id = %agent_id, "Sending cancel to sub-agent");
                 let _ = handle
                     .event_tx
-                    .send(Event::UserCancel { reason: None })
+                    .send(Event::UserCancel {
+                        reason: None,
+                        cause: crate::state_machine::event::CancelCause::UserRequested,
+                    })
                     .await;
             } else {
                 // Runtime not found - synthesize failure result

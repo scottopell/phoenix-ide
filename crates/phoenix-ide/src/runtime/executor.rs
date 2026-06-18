@@ -50,6 +50,15 @@ const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 /// pathological "task never returns" case.
 const CANCELLATION_DEADLINE: Duration = Duration::from_secs(3);
 
+/// Last-resort backstop forcing `CancellingSubAgents` to drain to `Idle` when a
+/// cancelled sub-agent never reports back. Set to 2× `CANCELLATION_DEADLINE` (6s
+/// = 2 × 3s) deliberately: `CancellingSubAgents` is parent-only, so this only
+/// applies to a parent waiting for its sub-agents to drain. Each sub-agent has
+/// its own 3s `CancellingTool` backstop, so giving the parent 6s guarantees a
+/// real cancelled result wins the race in the common case, leaving this 6s as a
+/// true last resort for a sub-agent runtime that has genuinely vanished.
+const CANCELLING_SUBAGENTS_DEADLINE: Duration = Duration::from_secs(6);
+
 /// Hard byte cap on the LLM-bound text of a single tool result.
 ///
 /// Per-tool caps are line-based (bash tail = 200 lines, `read_file` = 2000
@@ -2113,84 +2122,56 @@ where
         )
     }
 
-    /// Handle sub-agent timeout: cancel all pending agents and inject `TimedOut` results.
+    /// Handle the `AwaitingSubAgents` completion timeout (REQ-SA-006) by routing
+    /// it through the cancellation protocol rather than racing it.
     ///
     /// Dispatched by `handle_deadline_expiry` when the liveness deadline fires in
-    /// `AwaitingSubAgents` (REQ-SA-006). The deadline is already cleared by the
-    /// dispatcher.
+    /// `AwaitingSubAgents`; the deadline is already cleared by the dispatcher.
     ///
-    // TODO(task 61004): timeout should follow the cancellation protocol, not
-    // race it. Today this both (a) injects a synthetic `TimedOut` per pending
-    // agent — draining the parent out of `AwaitingSubAgents` — and (b) sends a
-    // real cancel. The cancel later produces a *real* `SubAgentResult` that
-    // arrives after the parent has already left `AwaitingSubAgents`, so it is
-    // buffered (`sub_agent_result_buffer`). That late result no longer leaks
-    // into a later round: the buffer-drain on entering `AwaitingSubAgents`
-    // keeps only results whose agent is pending in the entering round and
-    // discards completed-round results. The remaining concern is that a real
-    // success already in flight can be overwritten by the synthetic `TimedOut`.
-    // The correct shape is to inject a single `UserCancel` (→
-    // `CancellingSubAgents`, which emits `Effect::CancelSubAgents`) and let the
-    // real cancelled results drain through `CancellingSubAgents` to `Idle`,
-    // conserving fan-in. The backstop half of that rewrite now exists:
-    // `CancellingSubAgents` has its own liveness deadline
-    // (`handle_cancelling_sub_agents_timeout`), so a cancelled sub-agent that
-    // never reports back can no longer wedge the drain. The remaining work is
-    // routing the timeout through `UserCancel` while preserving the "timed out"
-    // vs "cancelled" semantic the LLM history renders.
+    /// Injecting a single `UserCancel { cause: Timeout }` drives the
+    /// `AwaitingSubAgents + UserCancel -> CancellingSubAgents` transition, which
+    /// emits `Effect::CancelSubAgents` (the real cancel) and stamps
+    /// `cause: Timeout` on the state. Real cancelled results then drain through
+    /// `CancellingSubAgents` — each sub-agent terminates and reports within its
+    /// own 3s `CancellingTool` backstop — and the drain arm labels non-success
+    /// outcomes `TimedOut` per the state's cause. The 6s `CancellingSubAgents`
+    /// last-resort backstop (`handle_cancelling_sub_agents_timeout`) presumes any
+    /// still-pending agent dead after that. This handler no longer sends a direct
+    /// cancel or fabricates per-agent results; the transition owns the cancel.
     async fn handle_sub_agent_timeout(&mut self) {
-        let pending_ids: Vec<(String, String)> =
-            if let ConvState::AwaitingSubAgents { pending, .. } = &self.state {
-                pending
-                    .iter()
-                    .map(|p| (p.agent_id.clone(), p.task.clone()))
-                    .collect()
-            } else {
-                // Deadline fired but state already moved on — nothing to do
-                return;
-            };
+        let pending_count = if let ConvState::AwaitingSubAgents { pending, .. } = &self.state {
+            pending.len()
+        } else {
+            // Deadline fired but state already moved on — nothing to do.
+            return;
+        };
 
         tracing::warn!(
-            count = pending_ids.len(),
-            "Sub-agent timeout reached, cancelling pending agents"
+            count = pending_count,
+            "Sub-agent completion timeout reached, cancelling pending agents via cancel protocol"
         );
 
-        // Cancel the actual sub-agent runtimes
-        if let Some(cancel_tx) = &self.cancel_tx {
-            let ids: Vec<String> = pending_ids.iter().map(|(id, _)| id.clone()).collect();
-            let request = SubAgentCancelRequest {
-                ids,
-                parent_conversation_id: self.context.conversation_id.clone(),
-                parent_event_tx: self.event_tx.clone(),
-            };
-            if let Err(e) = cancel_tx.send(request).await {
-                tracing::error!(error = %e, "Failed to send cancel request for timed-out agents");
-            }
-        }
-
-        // Inject TimedOut results for each pending agent — transitions state normally
-        for (agent_id, _task) in pending_ids {
-            let event = Event::SubAgentResult {
-                agent_id,
-                outcome: SubAgentOutcome::TimedOut,
-            };
-            if let Err(e) = self.process_event(event).await {
-                tracing::warn!(error = %e, "Failed to process timeout result for sub-agent");
-            }
+        let event = Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::Timeout,
+        };
+        if let Err(e) = self.process_event(event).await {
+            tracing::warn!(error = %e, "Failed to process sub-agent timeout cancel");
         }
     }
 
     /// The liveness-deadline duration for a state, or `None` if the state has no
     /// deadline. This is the single place that maps a waiting state to its
     /// backstop duration — `AwaitingSubAgents` gets the 20-minute completion
-    /// timeout (REQ-SA-006); `CancellingTool` and `CancellingSubAgents` get the
-    /// 3-second forced-teardown backstop (REQ-BED-005a).
+    /// timeout (REQ-SA-006); `CancellingTool` gets the 3-second forced-teardown
+    /// backstop (REQ-BED-005a); `CancellingSubAgents` gets a 6-second last-resort
+    /// backstop (2× the 3s sub-agent `CancellingTool` deadline) so real cancelled
+    /// results win the drain before the parent presumes a vanished runtime dead.
     fn deadline_for(state: &ConvState) -> Option<Duration> {
         match state {
             ConvState::AwaitingSubAgents { .. } => Some(DEFAULT_SUBAGENT_TIMEOUT),
-            ConvState::CancellingTool { .. } | ConvState::CancellingSubAgents { .. } => {
-                Some(CANCELLATION_DEADLINE)
-            }
+            ConvState::CancellingTool { .. } => Some(CANCELLATION_DEADLINE),
+            ConvState::CancellingSubAgents { .. } => Some(CANCELLING_SUBAGENTS_DEADLINE),
             _ => None,
         }
     }
@@ -2204,9 +2185,9 @@ where
     /// the prior two-field design: an `AwaitingSubAgents → AwaitingSubAgents`
     /// self-transition (a sub-agent resolving while others remain) keeps the
     /// original 20-minute window rather than restarting it, and a
-    /// `CancellingSubAgents → CancellingSubAgents` drain keeps its 3-second
+    /// `CancellingSubAgents → CancellingSubAgents` drain keeps its 6-second
     /// window. An `AwaitingSubAgents → CancellingSubAgents` cancel re-arms to the
-    /// 3-second backstop — the variant changed, so the cancellation window
+    /// 6-second backstop — the variant changed, so the cancellation window
     /// replaces the long completion window.
     fn manage_deadline(&mut self, old_state: &ConvState) {
         // Leaving CancellingTool ends the tool round; drop the retained handle so
@@ -2258,15 +2239,17 @@ where
         }
     }
 
-    /// Handle the cancellation backstop firing in `CancellingSubAgents`
-    /// (REQ-BED-005a `CancellingSubAgentsDeadlineFires`): a sub-agent that never
-    /// reported back after being cancelled has held the parent in
-    /// `CancellingSubAgents` past the bounded deadline. Force the drain to Idle
-    /// without waiting for stragglers by injecting a synthetic `TimedOut` result
-    /// per still-pending sub-agent — the same synthetic-injection approach
-    /// `handle_sub_agent_timeout` uses to drain `AwaitingSubAgents`. Draining the
-    /// last pending result reaches Idle via the
-    /// `CancellingSubAgents + SubAgentResult (last one) -> Idle` transition arm.
+    /// Handle the 6-second last-resort backstop firing in `CancellingSubAgents`
+    /// (REQ-BED-005a `CancellingSubAgentsDeadlineFires`). By the time this fires,
+    /// real cancelled results have had 3s+ (the sub-agent's own `CancellingTool`
+    /// backstop) to arrive, so any still-pending sub-agent is presumed gone —
+    /// its runtime has genuinely vanished. Inject a generic `Failure { Cancelled
+    /// }` per still-pending agent; the `CancellingSubAgents + SubAgentResult`
+    /// drain arm maps that by the state's recorded `cause` (a timeout-caused
+    /// teardown renders `TimedOut`, a user cancel renders `Failure { Cancelled
+    /// }`), so this handler does not hardcode the label. Releasing the one-writer
+    /// reservation as each result drains is safe because the agent is presumed
+    /// dead. The last pending result resolves `CancellingSubAgents -> Idle`.
     async fn handle_cancelling_sub_agents_timeout(&mut self) {
         let pending_ids: Vec<String> =
             if let ConvState::CancellingSubAgents { pending, .. } = &self.state {
@@ -2279,17 +2262,24 @@ where
         tracing::warn!(
             conv_id = %self.context.conversation_id,
             count = pending_ids.len(),
-            deadline_secs = CANCELLATION_DEADLINE.as_secs(),
-            "Cancellation backstop fired — sub-agents did not report back within the \
-             deadline; forcing teardown to Idle without waiting for stragglers"
+            deadline_secs = CANCELLING_SUBAGENTS_DEADLINE.as_secs(),
+            "Cancellation last-resort backstop fired — sub-agents did not report back within the \
+             deadline; presuming them terminated and forcing teardown to Idle"
         );
 
-        // Inject a synthetic TimedOut per pending sub-agent so the parent drains
-        // to Idle. The last one resolves CancellingSubAgents -> Idle.
+        // Inject a generic Failure{Cancelled} per still-pending sub-agent so the
+        // parent drains to Idle. The drain arm relabels by the state's `cause`
+        // (Timeout -> TimedOut, UserRequested -> Failure{Cancelled}); the last
+        // one resolves CancellingSubAgents -> Idle.
         for agent_id in pending_ids {
             let event = Event::SubAgentResult {
                 agent_id,
-                outcome: SubAgentOutcome::TimedOut,
+                outcome: SubAgentOutcome::Failure {
+                    error: "sub-agent did not report within the cancellation deadline \
+                            (presumed terminated)"
+                        .to_string(),
+                    error_kind: crate::db::ErrorKind::Cancelled,
+                },
             };
             if let Err(e) = self.process_event(event).await {
                 tracing::warn!(error = %e, "Failed to process cancellation backstop SubAgentResult");
@@ -2502,6 +2492,7 @@ where
             .event_tx
             .send(Event::UserCancel {
                 reason: Some(format!("parent_tool_cycle_cap_exceeded ({cap})")),
+                cause: crate::state_machine::event::CancelCause::UserRequested,
             })
             .await;
     }
@@ -8632,9 +8623,12 @@ mod retry_timer_epoch_tests {
         );
         let scheduled_gen = rt.retry_generation;
 
-        rt.process_event(Event::UserCancel { reason: None })
-            .await
-            .expect("cancel transitions");
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("cancel transitions");
         assert!(
             matches!(rt.state, ConvState::Idle),
             "cancel from LlmRequesting goes to Idle, got {:?}",
@@ -8665,9 +8659,12 @@ mod retry_timer_epoch_tests {
             .await
             .expect("retryable error transitions");
         let stale_gen = rt.retry_generation;
-        rt.process_event(Event::UserCancel { reason: None })
-            .await
-            .expect("cancel transitions");
+        rt.process_event(Event::UserCancel {
+            reason: None,
+            cause: crate::state_machine::event::CancelCause::UserRequested,
+        })
+        .await
+        .expect("cancel transitions");
         assert!(matches!(rt.state, ConvState::Idle));
 
         // The stale timer fires attempt 2 after the turn was cancelled. Its

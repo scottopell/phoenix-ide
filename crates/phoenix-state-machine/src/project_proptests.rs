@@ -506,7 +506,7 @@ mod state_machine_props {
 #[cfg(test)]
 mod random_walk {
     use crate::effect::Effect;
-    use crate::event::Event;
+    use crate::event::{CancelCause, Event};
     use crate::proptests::{effects_are_valid, is_valid_state, test_context};
     use crate::state::{
         ConvContext, ConvState, SubAgentOutcome, TaskApprovalOutcome, ToolCall, ToolInput,
@@ -617,7 +617,10 @@ mod random_walk {
                             resets_at: None,
                         }
                     }
-                    2 => Event::UserCancel { reason: None },
+                    2 => Event::UserCancel {
+                        reason: None,
+                        cause: CancelCause::UserRequested,
+                    },
                     _ => {
                         // RetryTimeout matching the current attempt
                         Event::RetryTimeout { attempt: *attempt }
@@ -637,7 +640,10 @@ mod random_walk {
                             ),
                         }
                     }
-                    _ => Event::UserCancel { reason: None },
+                    _ => Event::UserCancel {
+                        reason: None,
+                        cause: CancelCause::UserRequested,
+                    },
                 }
             }
 
@@ -673,7 +679,10 @@ mod random_walk {
             ConvState::AwaitingSubAgents { pending, .. } => {
                 if pending.is_empty() {
                     // Shouldn't happen, but be defensive
-                    return Event::UserCancel { reason: None };
+                    return Event::UserCancel {
+                        reason: None,
+                        cause: CancelCause::UserRequested,
+                    };
                 }
                 match rng.random_range(0..2) {
                     0 => {
@@ -693,14 +702,20 @@ mod random_walk {
                             outcome,
                         }
                     }
-                    _ => Event::UserCancel { reason: None },
+                    _ => Event::UserCancel {
+                        reason: None,
+                        cause: CancelCause::UserRequested,
+                    },
                 }
             }
 
             ConvState::CancellingSubAgents { pending, .. } => {
                 if pending.is_empty() {
                     // Shouldn't happen, but defensive
-                    return Event::UserCancel { reason: None };
+                    return Event::UserCancel {
+                        reason: None,
+                        cause: CancelCause::UserRequested,
+                    };
                 }
                 let agent = &pending[rng.random_range(0..pending.len())];
                 Event::SubAgentResult {
@@ -727,7 +742,10 @@ mod random_walk {
                 1 => Event::CredentialHelperFailed {
                     message: random_string(rng, 15),
                 },
-                _ => Event::UserCancel { reason: None },
+                _ => Event::UserCancel {
+                    reason: None,
+                    cause: CancelCause::UserRequested,
+                },
             },
 
             ConvState::AwaitingContinuation { attempt, .. } => match rng.random_range(0..4) {
@@ -747,7 +765,10 @@ mod random_walk {
                         resets_at: None,
                     }
                 }
-                _ => Event::UserCancel { reason: None },
+                _ => Event::UserCancel {
+                    reason: None,
+                    cause: CancelCause::UserRequested,
+                },
             },
 
             ConvState::AwaitingTaskApproval { .. } => match rng.random_range(0..5) {
@@ -769,7 +790,10 @@ mod random_walk {
                         annotations: random_string(rng, 20),
                     },
                 },
-                _ => Event::UserCancel { reason: None },
+                _ => Event::UserCancel {
+                    reason: None,
+                    cause: CancelCause::UserRequested,
+                },
             },
 
             ConvState::AwaitingUserResponse { questions, .. } => {
@@ -803,7 +827,10 @@ mod random_walk {
             | ConvState::HandedOff { .. }
             | ConvState::Terminal
             | ConvState::Completed { .. }
-            | ConvState::Failed { .. } => Event::UserCancel { reason: None },
+            | ConvState::Failed { .. } => Event::UserCancel {
+                reason: None,
+                cause: CancelCause::UserRequested,
+            },
         }
     }
 

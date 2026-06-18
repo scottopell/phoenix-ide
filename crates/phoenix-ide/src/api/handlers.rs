@@ -2420,7 +2420,13 @@ async fn cancel_conversation(
 
     state
         .runtime
-        .send_event(&id, Event::UserCancel { reason: None })
+        .send_event(
+            &id,
+            Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            },
+        )
         .await
         .map_err(AppError::BadRequest)?;
 

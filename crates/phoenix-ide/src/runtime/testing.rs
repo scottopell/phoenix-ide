@@ -1059,7 +1059,10 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
     #[allow(dead_code)]
     pub async fn send_cancel(&self) {
         self.event_tx
-            .send(Event::UserCancel { reason: None })
+            .send(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
             .await
             .expect("Failed to send cancel");
     }
@@ -1350,7 +1353,10 @@ mod tests {
 
         // Cancel immediately after request starts
         event_tx
-            .send(Event::UserCancel { reason: None })
+            .send(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
             .await
             .unwrap();
 
@@ -1469,7 +1475,10 @@ mod tests {
 
         // Cancel immediately
         event_tx
-            .send(Event::UserCancel { reason: None })
+            .send(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
             .await
             .unwrap();
 
@@ -1575,7 +1584,10 @@ mod tests {
 
         // Send cancel
         event_tx
-            .send(Event::UserCancel { reason: None })
+            .send(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
             .await
             .unwrap();
 
@@ -1683,7 +1695,10 @@ mod tests {
 
         // Cancel while the tool is wedged.
         event_tx
-            .send(Event::UserCancel { reason: None })
+            .send(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
             .await
             .unwrap();
 
@@ -1748,6 +1763,7 @@ mod tests {
                 mode: SubAgentMode::Work,
             }],
             completed_results: vec![],
+            cause: crate::state_machine::event::CancelCause::UserRequested,
         };
 
         let runtime = ConversationRuntime::new(
@@ -1769,9 +1785,10 @@ mod tests {
         tokio::spawn(async move { runtime.run().await });
 
         // Liveness assertion: AgentDone within a bounded deadline. The backstop
-        // is CANCELLATION_DEADLINE (3s); this window is longer so it fires first.
+        // is CANCELLING_SUBAGENTS_DEADLINE (6s); this window is longer so it
+        // fires first.
         let mut agent_done = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         while tokio::time::Instant::now() < deadline {
             if let Ok(Ok(SseEvent::AgentDone { .. })) =
                 tokio::time::timeout(Duration::from_millis(50), broadcast_rx.recv()).await
@@ -1851,7 +1868,15 @@ mod tests {
         };
 
         // Phase 1: UserCancel -> CancellingTool with AbortTool
-        let result = transition(&state, &context, Event::UserCancel { reason: None }).unwrap();
+        let result = transition(
+            &state,
+            &context,
+            Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            },
+        )
+        .unwrap();
 
         assert!(
             matches!(result.new_state, ConvState::CancellingTool { .. }),
@@ -2028,7 +2053,15 @@ mod tests {
         let states = [ConvState::Idle, ConvState::LlmRequesting { attempt: 1 }];
 
         for state in states {
-            let result = transition(&state, &context, Event::UserCancel { reason: None }).unwrap();
+            let result = transition(
+                &state,
+                &context,
+                Event::UserCancel {
+                    reason: None,
+                    cause: crate::state_machine::event::CancelCause::UserRequested,
+                },
+            )
+            .unwrap();
 
             match &result.new_state {
                 ConvState::Failed { error, error_kind } => {
@@ -2727,6 +2760,7 @@ mod tests {
                 mode: SubAgentMode::Work,
             }],
             completed_results: vec![],
+            cause: crate::state_machine::event::CancelCause::UserRequested,
         };
 
         // Real result for X → Idle.
@@ -2794,6 +2828,7 @@ mod tests {
                 mode: SubAgentMode::Work,
             }],
             completed_results: vec![],
+            cause: crate::state_machine::event::CancelCause::UserRequested,
         };
 
         // Duplicate TimedOut for X (not in pending) → InvalidTransition.
@@ -2965,6 +3000,7 @@ mod tests {
                 mode: SubAgentMode::Work,
             }],
             completed_results: vec![],
+            cause: crate::state_machine::event::CancelCause::UserRequested,
         };
         assert_ne!(
             std::mem::discriminant(&one),
@@ -3068,7 +3104,10 @@ mod tests {
 
         // Cancel; backstop must drive to Idle.
         event_tx
-            .send(Event::UserCancel { reason: None })
+            .send(Event::UserCancel {
+                reason: None,
+                cause: crate::state_machine::event::CancelCause::UserRequested,
+            })
             .await
             .unwrap();
 
