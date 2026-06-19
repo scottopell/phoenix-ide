@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../api';
 import type { McpServerStatus } from '../api';
+import { GroundingSection, GroundingState } from './GroundingPanel';
+import { summarizeMcpStatus } from './groundingSummaries';
 import './McpStatusPanel.css';
-
 interface McpStatusPanelProps {
   /** Success / info path. Renders with the success / info styling
    *  (whatever the parent wires into this prop). */
@@ -188,94 +189,69 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
     });
   }, []);
 
-  const readyServers = servers.filter(s => s.state === 'ready');
-  const enabledReady = readyServers.filter(s => s.enabled);
-  const totalTools = enabledReady.reduce((sum, s) => sum + s.tool_count, 0);
-  const disabledCount = readyServers.filter(s => !s.enabled).length;
-
+  const summary = summarizeMcpStatus(servers);
   const pendingOAuth = servers.filter(s => s.state === 'unauthorized');
   const failedServers = servers.filter(s => s.state === 'failed');
 
-  if (servers.length === 0 && !expanded && !reloading) {
-    return null;
-  }
-
   return (
-    <div className={`mcp-panel${expanded ? ' is-expanded' : ''}`}>
-      {!reloading && pendingOAuth.map(s => (
-        <div key={s.name} className="mcp-oauth-banner">
-          <div className="mcp-banner-head">
-            <span className="mcp-oauth-label">Auth required</span>
-            <span className="mcp-banner-name">{s.name}</span>
-            <a
-              href={s.pending_oauth_url}
-              target="_blank"
-              rel="noreferrer"
-              className="mcp-oauth-link"
-            >
-              Sign in &rarr;
-            </a>
-          </div>
-          {s.auth_redirect_warning && (
-            <div className="mcp-oauth-warning">
-              &#9888; {s.auth_redirect_warning}
+    <GroundingSection
+      icon="◆"
+      title="MCP"
+      summary={reloading ? 'refreshing…' : summary.label}
+      count={summary.enabledReady > 0 ? summary.enabledReady : servers.length}
+      expanded={expanded}
+      attention={summary.attention}
+      onToggle={() => setExpanded(!expanded)}
+      action={(servers.length > 0 || pendingOAuth.length > 0) ? (
+        <button
+          type="button"
+          className={`mcp-panel-reload ${reloading ? 'reloading' : ''}`}
+          onClick={handleReload}
+          title="Reload MCP servers"
+          aria-label="Reload MCP servers"
+        >
+          &#8635;
+        </button>
+      ) : null}
+    >
+      <div className={`mcp-panel${expanded ? ' is-expanded' : ''}`}>
+        {!reloading && pendingOAuth.map(s => (
+          <div key={s.name} className="mcp-oauth-banner">
+            <div className="mcp-banner-head">
+              <span className="mcp-oauth-label">Auth required</span>
+              <span className="mcp-banner-name">{s.name}</span>
+              <a
+                href={s.pending_oauth_url}
+                target="_blank"
+                rel="noreferrer"
+                className="mcp-oauth-link"
+              >
+                Sign in &rarr;
+              </a>
             </div>
-          )}
-        </div>
-      ))}
-      {!reloading && failedServers.map(s => (
-        <div key={s.name} className="mcp-error-banner">
-          <div className="mcp-banner-head">
-            <span className="mcp-error-label">Failed</span>
-            <span className="mcp-banner-name">{s.name}</span>
+            {s.auth_redirect_warning && (
+              <div className="mcp-oauth-warning">
+                &#9888; {s.auth_redirect_warning}
+              </div>
+            )}
           </div>
-          <div className="mcp-error-text">
-            {s.last_error ?? 'connection failed'}
+        ))}
+        {!reloading && failedServers.map(s => (
+          <div key={s.name} className="mcp-error-banner">
+            <div className="mcp-banner-head">
+              <span className="mcp-error-label">Failed</span>
+              <span className="mcp-banner-name">{s.name}</span>
+            </div>
+            <div className="mcp-error-text">
+              {s.last_error ?? 'connection failed'}
+            </div>
           </div>
-        </div>
-      ))}
-      <button className="mcp-panel-header" onClick={() => setExpanded(!expanded)}>
-        <span className={`mcp-panel-chevron ${expanded ? 'expanded' : ''}`}>&#9654;</span>
-        <span className="mcp-panel-summary">
-          {servers.length === 0
-            ? 'No MCP servers'
-            : enabledReady.length === 0 && pendingOAuth.length > 0
-              ? <span className="mcp-auth-needed">MCP &middot; auth needed</span>
-              : enabledReady.length === 0 && failedServers.length > 0
-                ? <span className="mcp-failed-count">MCP &middot; {failedServers.length} failed</span>
-                : <>
-                    MCP &middot; {enabledReady.length} server{enabledReady.length !== 1 ? 's' : ''} &middot; {totalTools} tool{totalTools !== 1 ? 's' : ''} &middot; ~{Math.round(totalTools * 250 / 1000)}k tokens
-                    {disabledCount > 0 && (
-                      <span className="mcp-disabled-count"> ({disabledCount} off)</span>
-                    )}
-                    {failedServers.length > 0 && (
-                      <span className="mcp-failed-count"> &middot; {failedServers.length} failed</span>
-                    )}
-                    {pendingOAuth.length > 0 && (
-                      <span className="mcp-auth-needed"> &middot; auth needed</span>
-                    )}
-                  </>
-          }
-        </span>
-        {(servers.length > 0 || pendingOAuth.length > 0) && (
-          <span
-            className={`mcp-panel-reload ${reloading ? 'reloading' : ''}`}
-            role="button"
-            tabIndex={0}
-            onClick={handleReload}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleReload(e as unknown as React.MouseEvent); }}
-            title="Reload MCP servers"
-          >
-            &#8635;
-          </span>
-        )}
-      </button>
-      {expanded && (
-        <div className="mcp-panel-body">
-          {servers.length === 0 ? (
-            <div className="mcp-empty">No MCP servers connected</div>
-          ) : (
-            servers.map(server => (
+        ))}
+        {servers.length === 0 ? (
+          <GroundingState>No MCP servers connected for this conversation.</GroundingState>
+        ) : (
+          <div className="mcp-panel-body">
+            {servers.map(server => (
               <div key={server.name} className={`mcp-server-item ${!server.enabled ? 'mcp-server-disabled' : ''}`}>
                 <button
                   className="mcp-server-header"
@@ -332,10 +308,10 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
                   )
                 )}
               </div>
-            ))
-          )}
-        </div>
-      )}
-    </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </GroundingSection>
   );
 }

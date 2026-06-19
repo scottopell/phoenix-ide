@@ -36,6 +36,7 @@ import type {
 } from '../api';
 import { isLive, hasLiveResource, workScopeLiveCount } from './workScopeHelpers';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { GroundingSection } from './GroundingPanel';
 import './WorkScopePanel.css';
 
 /** Cadence of the running-handle inventory poll. `output_bytes` grows
@@ -480,6 +481,17 @@ function WorkScopeBody({
   );
 }
 
+function summarizeWorkScope(inv: WorkScopeInventory | null, count: number): string {
+  if (!inv) return 'loading…';
+  const terminal = inv.bash.filter((h) => !isLive(h.state)).length;
+  const parts: string[] = [];
+  if (count > 0) parts.push(`${count} live`);
+  if (terminal > 0) parts.push(`${terminal} done`);
+  if (inv.tmux?.status === 'live') parts.push('tmux');
+  if (inv.browser?.state === 'live') parts.push(inv.browser.idle_ms > BROWSER_IDLE_THRESHOLD_MS ? 'browser idle' : 'browser live');
+  return parts.join(' · ') || 'no live resources';
+}
+
 interface SectionProps {
   /** The scope key to query (`work_scope_key` on the conversation). */
   scopeKey: string;
@@ -506,16 +518,19 @@ export function WorkScopeSection({ scopeKey, liveInventory, expanded, onToggleEx
   const count = workScopeLiveCount(inventory);
 
   return (
-    <div className={`ws-section-panel${expanded ? ' is-expanded' : ''}`}>
-      <button className="ws-section-panel-header" onClick={() => onToggleExpanded(!expanded)}>
-        <span className={`ws-section-panel-chevron${expanded ? ' expanded' : ''}`}>&#9654;</span>
-        <span className="ws-section-panel-summary">Work scope</span>
-        <span className={`ws-count-badge${count > 0 ? ' ws-count-badge--active' : ''}`}>{count}</span>
-      </button>
-      {expanded && (
+    <GroundingSection
+      icon="●"
+      title="Work"
+      summary={error ? 'inventory unavailable' : summarizeWorkScope(inventory, count)}
+      count={count}
+      expanded={expanded}
+      attention={count > 0 || Boolean(error)}
+      onToggle={() => onToggleExpanded(!expanded)}
+    >
+      <div className={`ws-section-panel${expanded ? ' is-expanded' : ''}`}>
         <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} scopeKey={scopeKey} inspectable />
-      )}
-    </div>
+      </div>
+    </GroundingSection>
   );
 }
 

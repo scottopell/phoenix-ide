@@ -2,22 +2,22 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import type { TaskEntry } from '../api';
+import { GroundingSection, GroundingState } from './GroundingPanel';
+import { summarizeTasks } from './groundingSummaries';
 import './TasksPanel.css';
 
 interface TasksPanelProps {
   conversationId: string | undefined;
-  /** Task ID of the current conversation's task (for Work mode highlight) */
   currentTaskId?: string | undefined;
-  /** Called when a task is clicked for detail view */
   onTaskClick?: ((task: TaskEntry) => void) | undefined;
 }
 
 const STATUS_ORDER: Record<string, number> = {
   'in-progress': 0,
-  'ready': 1,
-  'blocked': 2,
-  'brainstorming': 3,
-  'done': 4,
+  ready: 1,
+  blocked: 2,
+  brainstorming: 3,
+  done: 4,
   'wont-do': 5,
 };
 
@@ -36,26 +36,21 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
   const [expanded, setExpanded] = useState(false);
   const [tasks, setTasks] = useState<TaskEntry[]>([]);
   const [loading, setLoading] = useState(false);
-
-  // Track which status groups are expanded (active groups default open, terminal closed)
   const [groupExpanded, setGroupExpanded] = useState<Record<string, boolean>>({
     'in-progress': true,
-    'ready': true,
-    'blocked': true,
-    'brainstorming': false,
-    'done': false,
+    ready: true,
+    blocked: true,
+    brainstorming: false,
+    done: false,
     'wont-do': false,
   });
 
-  // REQ-TASKS-UI-007: drop the prior conversation's tasks immediately on
-  // navigation so the collapsed-header count summary can't outlive the
-  // conversation it described.
   useEffect(() => {
     setTasks([]);
   }, [conversationId]);
 
   useEffect(() => {
-    if (!conversationId || !expanded) return;
+    if (!conversationId) return;
 
     const controller = new AbortController();
     setLoading(true);
@@ -68,9 +63,8 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
       .finally(() => setLoading(false));
 
     return () => controller.abort();
-  }, [conversationId, expanded]);
+  }, [conversationId]);
 
-  // Group tasks by status
   const grouped = new Map<string, TaskEntry[]>();
   for (const task of tasks) {
     const group = grouped.get(task.status) || [];
@@ -78,56 +72,44 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
     grouped.set(task.status, group);
   }
 
-  // Sort groups by STATUS_ORDER
   const sortedGroups = [...grouped.entries()].toSorted(
-    ([a], [b]) => (STATUS_ORDER[a] ?? 99) - (STATUS_ORDER[b] ?? 99)
+    ([a], [b]) => (STATUS_ORDER[a] ?? 99) - (STATUS_ORDER[b] ?? 99),
   );
-
-  const activeCount = tasks.filter((t) => !TERMINAL_STATUSES.has(t.status)).length;
-  const terminalCount = tasks.filter((t) => TERMINAL_STATUSES.has(t.status)).length;
 
   const toggleGroup = (status: string) => {
     setGroupExpanded((prev) => ({ ...prev, [status]: !prev[status] }));
   };
 
-  return (
-    <div className={`tasks-panel${expanded ? ' is-expanded' : ''}`}>
-      <button
-        className="tasks-panel-header"
-        onClick={() => setExpanded(!expanded)}
-      >
-        <span className={`tasks-panel-chevron${expanded ? ' expanded' : ''}`}>
-          &#9654;
-        </span>
-        <span className="tasks-panel-summary">
-          Tasks
-          {tasks.length > 0 && (
-            <>
-              {' '}&middot; {activeCount} active
-              {terminalCount > 0 && (
-                <span className="tasks-done-count"> &middot; {terminalCount} closed</span>
-              )}
-            </>
-          )}
-        </span>
-      </button>
+  const summary = summarizeTasks(tasks, currentTaskId);
 
-      {expanded && (
-        <div className="tasks-panel-body">
-          {loading && <div className="tasks-loading">Loading...</div>}
-          {!loading && tasks.length === 0 && (
-            <div className="tasks-empty">No tasks found</div>
-          )}
-          {!loading &&
-            sortedGroups.map(([status, groupTasks]) => {
+  return (
+    <GroundingSection
+      icon="☑"
+      title="Tasks"
+      summary={loading ? 'loading…' : summary.label}
+      count={tasks.length > 0 ? summary.active : undefined}
+      expanded={expanded}
+      attention={summary.current || summary.blocked > 0}
+      onToggle={() => setExpanded(!expanded)}
+    >
+      <div className={`tasks-panel${expanded ? ' is-expanded' : ''}`}>
+        {loading && <GroundingState tone="loading">Loading tasks…</GroundingState>}
+        {!loading && tasks.length === 0 && (
+          <GroundingState>No tasks found for this project.</GroundingState>
+        )}
+        {!loading && tasks.length > 0 && (
+          <div className="tasks-panel-body">
+            {sortedGroups.map(([status, groupTasks]) => {
               const isTerminal = TERMINAL_STATUSES.has(status);
               const isOpen = groupExpanded[status] ?? !isTerminal;
 
               return (
                 <div key={status} className="tasks-group">
                   <button
+                    type="button"
                     className={`tasks-group-header${isTerminal ? ' tasks-group-terminal' : ''}`}
                     onClick={() => toggleGroup(status)}
+                    aria-expanded={isOpen}
                   >
                     <span className={`tasks-group-chevron${isOpen ? ' expanded' : ''}`}>
                       &#9654;
@@ -142,6 +124,8 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
                         const isCurrent = currentTaskId === task.id;
                         return (
                           <div
+                            role="button"
+                            tabIndex={0}
                             key={task.id}
                             className={
                               'tasks-item'
@@ -150,6 +134,9 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
                             }
                             title={`${task.id}-${task.priority}-${task.status}--${task.slug}`}
                             onClick={() => onTaskClick?.(task)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') onTaskClick?.(task);
+                            }}
                           >
                             <span className={`tasks-pri ${PRIORITY_CLASS[task.priority] || 'tasks-pri-p3'}`}>
                               {task.priority}
@@ -159,6 +146,7 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
                             {isCurrent && <span className="tasks-current-badge">current</span>}
                             {task.conversation_slug && !isCurrent && (
                               <button
+                                type="button"
                                 className="tasks-conv-link"
                                 title="Go to conversation"
                                 onClick={(e) => {
@@ -177,8 +165,9 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
                 </div>
               );
             })}
-        </div>
-      )}
-    </div>
+          </div>
+        )}
+      </div>
+    </GroundingSection>
   );
 }

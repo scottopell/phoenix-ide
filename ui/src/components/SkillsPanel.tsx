@@ -1,6 +1,8 @@
 import { useState, useEffect, useMemo } from 'react';
 import { api } from '../api';
 import type { SkillEntry } from '../api';
+import { GroundingSection, GroundingState } from './GroundingPanel';
+import { summarizeSkills } from './groundingSummaries';
 import './SkillsPanel.css';
 
 interface SkillsPanelProps {
@@ -106,10 +108,6 @@ export function SkillsPanel({ conversationId, onSkillClick, expanded: controlled
 
   const grouped = useMemo(() => groupSkills(skills), [skills]);
 
-  if (skills.length === 0 && !expanded) {
-    return null;
-  }
-
   const handleSkillClick = (skill: SkillEntry) => {
     if (onSkillClick) {
       onSkillClick(skill);
@@ -129,22 +127,20 @@ export function SkillsPanel({ conversationId, onSkillClick, expanded: controlled
   };
 
   return (
-    <div className={`skills-panel${expanded ? ' is-expanded' : ''}`}>
-      <button className="skills-panel-header" onClick={() => setExpanded(!expanded)}>
-        <span className={`skills-panel-chevron ${expanded ? 'expanded' : ''}`}>&#9654;</span>
-        <span className="skills-panel-summary">
-          {skills.length === 0
-            ? 'No skills'
-            : <>Skills &middot; {skills.length} available</>
-          }
-        </span>
-      </button>
-      {expanded && (
-        <div className="skills-panel-body">
-          {skills.length === 0 ? (
-            <div className="skills-empty">No skills discovered</div>
-          ) : (
-            Array.from(grouped.entries()).map(([group, items]) => (
+    <GroundingSection
+      icon="/"
+      title="Skills"
+      summary={summarizeSkills(skills)}
+      count={skills.length}
+      expanded={expanded}
+      onToggle={() => setExpanded(!expanded)}
+    >
+      <div className={`skills-panel${expanded ? ' is-expanded' : ''}`}>
+        {skills.length === 0 ? (
+          <GroundingState>No skills discovered for this conversation.</GroundingState>
+        ) : (
+          <div className="skills-panel-body">
+            {Array.from(grouped.entries()).map(([group, items]) => (
               <div key={group} className="skill-group">
                 <div
                   className="skill-group-header"
@@ -175,10 +171,10 @@ export function SkillsPanel({ conversationId, onSkillClick, expanded: controlled
                   </div>
                 ))}
               </div>
-            ))
-          )}
-        </div>
-      )}
-    </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </GroundingSection>
   );
 }

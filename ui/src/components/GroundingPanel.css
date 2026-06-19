@@ -1,0 +1,120 @@
+.grounding-section {
+  position: relative;
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--bg-secondary) 42%, transparent);
+}
+
+.grounding-section.is-expanded {
+  background: color-mix(in srgb, var(--bg-secondary) 62%, transparent);
+}
+
+.grounding-section.has-attention::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--accent-yellow);
+}
+
+.grounding-section-header {
+  width: 100%;
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: 14px 18px minmax(48px, auto) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.grounding-section-header:hover,
+.grounding-section-header:focus-visible {
+  background: var(--bg-tertiary);
+  outline: none;
+}
+
+.grounding-chevron {
+  color: var(--text-muted);
+  font-size: 9px;
+  transition: transform 120ms ease;
+}
+
+.grounding-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.grounding-icon {
+  display: inline-flex;
+  width: 18px;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.grounding-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.45px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.grounding-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.grounding-count {
+  justify-self: end;
+  min-width: 20px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  text-align: center;
+}
+
+.grounding-header-action {
+  position: absolute;
+  top: 5px;
+  right: 7px;
+}
+
+.grounding-section-body {
+  max-height: min(42vh, 360px);
+  overflow: auto;
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
+  background: var(--bg-primary);
+}
+
+.grounding-state {
+  padding: 10px 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.grounding-state--attention {
+  color: var(--accent-yellow);
+}
+
+.grounding-state--error {
+  color: var(--accent-red);
+}
+
+.grounding-state--loading {
+  color: var(--text-secondary);
+}

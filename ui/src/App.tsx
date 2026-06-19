@@ -44,6 +44,9 @@ const UsagePage = lazy(() =>
 const TerminalPage = lazy(() =>
   import('./pages/TerminalPage').then((m) => ({ default: m.TerminalPage })),
 );
+const GroundingPanelFixturePage = import.meta.env.DEV
+  ? lazy(() => import('./pages/GroundingPanelFixturePage').then((m) => ({ default: m.GroundingPanelFixturePage })))
+  : null;
 
 /** Route loading fallback — blank div sized to the viewport to avoid CLS. */
 function RouteFallback() {
@@ -79,6 +82,9 @@ function AppRoutes() {
     <>
       <Suspense fallback={<RouteFallback />}>
         <Routes>
+          {GroundingPanelFixturePage && (
+            <Route path="/__qa/grounding-panel" element={<GroundingPanelFixturePage />} />
+          )}
           {/* Share view: minimal layout, no sidebar, no auth required */}
           <Route path="/s/:token" element={<SharePage />} />
           {/* Main app routes: full layout with sidebar */}
