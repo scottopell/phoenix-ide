@@ -67,8 +67,13 @@ Resolved design (non-destructive refresh + a one-time hint):
 
 2. Refresh-on-reuse (gated on a stale stamp, so a current server pays nothing):
    - `set -ag terminal-features ",*:hyperlinks"` — restores OSC-8 forwarding.
-   - `set-environment -g` the injection (PATH bin dir, PHOENIX_API_URL,
-     PHOENIX_SUGGEST_TOKEN) so new windows/panes get `phx`.
+   - `set -g default-command` to a wrapper that prepends the `phx` bin dir to
+     PATH before exec-ing the shell, so new windows/panes resolve `phx`.
+     (Implementation note, verified empirically: `set-environment -g PATH` is
+     silently ignored by tmux for new panes — they take PATH from the server
+     process — so it CANNOT inject phx; `default-command` is the seam that does.
+     Non-PATH vars below DO propagate via the global env.)
+   - `set-environment -g` PHOENIX_API_URL / PHOENIX_SUGGEST_TOKEN.
    - update the version stamp.
 
 3. Current-pane UX: print a one-time hint into the stale pane, e.g. "phx is now

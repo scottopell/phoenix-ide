@@ -44,6 +44,15 @@ pub fn set_pty_env_injection(injection: PtyEnvInjection) {
     let _ = ENV_INJECTION.set(injection);
 }
 
+/// The directory holding the `phx` shim, when an injection is installed. The
+/// tmux companion-refresh path needs it to prepend `phx` to a reused server's
+/// new panes via `default-command` (a `set-environment -g PATH` is silently
+/// ignored by tmux for new panes; `default-command` is honored).
+#[must_use]
+pub fn phx_bin_dir() -> Option<PathBuf> {
+    ENV_INJECTION.get().and_then(|i| i.path_prefix.clone())
+}
+
 /// What the PTY child should exec into.
 ///
 /// `Tmux` carries the conversation's resolved socket path and the

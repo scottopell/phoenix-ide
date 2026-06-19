@@ -324,6 +324,35 @@ and only the visible text reaches xterm.js — which would silently break the
 `phxrun:` click-to-run links (`specs/command-suggestion` REQ-CSUG-007,
 `specs/terminal-panel`).
 
+### Companion refresh on reuse
+
+The `phx` companion setup (the `phx` shim on PATH plus the `hyperlinks` feature)
+is established when a server is *spawned*. A server that predates the feature, or
+an Phoenix upgrade, is *reused* by `ensure_live` (probe → live) and never
+re-spawned, so its panes would otherwise lack both. A version stamp closes the
+gap: every spawned server carries `PHOENIX_COMPANION_VERSION` in its global
+environment, and on reuse `ensure_live` reads it back; a missing or older stamp
+triggers a one-time, non-destructive refresh:
+
+- `set -ag terminal-features ",*:hyperlinks"` — restores OSC-8 forwarding for the
+  next fresh attach (the relay re-attaches per panel open, so the user gets it
+  then).
+- `set -g default-command` to a wrapper that prepends the `phx` bin dir to
+  `PATH` before `exec`-ing the shell — so new windows/panes resolve `phx`. A
+  `set-environment -g PATH` does *not* work here: tmux takes a new pane's `PATH`
+  from the server process, ignoring the global-environment override (it does
+  honor the override for non-`PATH` vars). `default-command` is the seam that
+  reaches a new pane's `PATH` without restarting the server.
+- `set-environment -g` for `PHOENIX_API_URL` / `PHOENIX_SUGGEST_TOKEN` — these
+  *do* propagate to new panes via the global environment.
+- update the stamp; a one-time `display-message` tells the user a new window
+  picks up `phx`.
+
+Recreating the server would also fix the *current* pane (whose shell already
+exported its `PATH` and cannot be changed from outside), but would destroy the
+user's running panes and jobs — so the refresh is non-destructive and the
+current pane is handled by the hint instead.
+
 ## Tool Dispatch (REQ-TMUX-003, REQ-TMUX-010)
 
 ```rust
