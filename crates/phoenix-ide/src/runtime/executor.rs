@@ -380,6 +380,33 @@ struct ToolResultFacts {
     tool_use_id: String,
 }
 
+/// Per-round aggregates the sweep walks instead of re-scanning every result on
+/// each round: the highest `sequence_id` in the round (where the watermark lands
+/// when the round is swept) and the image-aware tokens its *clearable* results
+/// would free. `max_seq` is `None` for a round with no tool results.
+#[derive(Default, Clone)]
+struct RoundAgg {
+    max_seq: Option<i64>,
+    clearable_freed: usize,
+}
+
+/// Everything the clearing planner decides over, gathered in a single pass over
+/// the persisted history so the sweep neither re-renders the messages nor
+/// re-scans the results per round.
+struct ClearingFacts {
+    /// One entry per tool-result message, in history order.
+    results: Vec<ToolResultFacts>,
+    /// Indexed by round number (`0..=max_round`).
+    rounds: Vec<RoundAgg>,
+    max_round: usize,
+    /// Estimated tokens of everything whose weight does not depend on the
+    /// watermark: user/agent/skill text and images, non-clearable tool results,
+    /// and per-message overhead. A *clearable* result is deliberately absent —
+    /// the planner adds its weight per-watermark (full when kept, zero when
+    /// cleared) so the estimate tracks the request actually sent.
+    fixed_tokens: usize,
+}
+
 /// Image-aware token estimate for a persisted tool result: its text body plus a
 /// fixed cost per image block (REQ-STR-006, REQ-STR-011).
 fn estimate_tool_result_tokens(content: &str, image_count: usize) -> usize {
@@ -393,7 +420,7 @@ fn estimate_tool_result_tokens(content: &str, image_count: usize) -> usize {
 fn collect_tool_result_facts(
     db_messages: &[crate::db::Message],
     clearable_tool_names: &std::collections::HashSet<String>,
-) -> (Vec<ToolResultFacts>, usize) {
+) -> ClearingFacts {
     use crate::db::MessageContent;
     use crate::llm::ContentBlock as LlmContentBlock;
 
@@ -409,12 +436,26 @@ fn collect_tool_result_facts(
         }
     }
 
-    let mut facts: Vec<ToolResultFacts> = Vec::new();
+    let mut results: Vec<ToolResultFacts> = Vec::new();
+    let mut fixed_tokens: usize = 0;
     let mut current_round: usize = 0;
     let mut max_round: usize = 0;
     let mut opened_a_round = false;
     for m in db_messages {
         match &m.content {
+            // Watermark-independent weight: counted once into `fixed_tokens`,
+            // mirroring how `render_messages` lays out each message. Estimation
+            // is approximate by design (see design.md "Token estimation"), so an
+            // exact byte match with the renderer is unnecessary — only that
+            // image weight is never lost (REQ-STR-006, REQ-STR-011).
+            MessageContent::User(user_content) => {
+                fixed_tokens += MESSAGE_OVERHEAD_TOKENS
+                    + estimate_text_tokens(user_content.llm_text())
+                    + user_content.images.len() * IMAGE_TOKEN_ESTIMATE;
+                for file in &user_content.files {
+                    fixed_tokens += estimate_text_tokens(&file.llm_context_tag());
+                }
+            }
             MessageContent::Agent(blocks) => {
                 if blocks
                     .iter()
@@ -425,25 +466,67 @@ fn collect_tool_result_facts(
                     }
                     opened_a_round = true;
                 }
+                fixed_tokens += MESSAGE_OVERHEAD_TOKENS
+                    + blocks
+                        .iter()
+                        .map(|b| match b {
+                            LlmContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+                            other => estimate_text_tokens(&other.render_text()),
+                        })
+                        .sum::<usize>();
             }
             MessageContent::Tool(tc) => {
                 let name = tool_name_of
                     .get(tc.tool_use_id.as_str())
                     .copied()
                     .unwrap_or("");
-                facts.push(ToolResultFacts {
+                let clearable = clearable_tool_names.contains(name);
+                let token_estimate = estimate_tool_result_tokens(&tc.content, tc.images.len());
+                // Overhead is fixed; a non-clearable body is always sent so it is
+                // fixed too. A clearable body's weight is added per-watermark by
+                // the planner, never here.
+                fixed_tokens += MESSAGE_OVERHEAD_TOKENS;
+                if !clearable {
+                    fixed_tokens += token_estimate;
+                }
+                results.push(ToolResultFacts {
                     sequence_id: m.sequence_id,
                     round: current_round,
-                    clearable: clearable_tool_names.contains(name),
-                    token_estimate: estimate_tool_result_tokens(&tc.content, tc.images.len()),
+                    clearable,
+                    token_estimate,
                     tool_use_id: tc.tool_use_id.clone(),
                 });
                 max_round = current_round;
             }
-            _ => {}
+            MessageContent::Skill(skill_content) => {
+                fixed_tokens += MESSAGE_OVERHEAD_TOKENS + estimate_text_tokens(&skill_content.body);
+                for file in &skill_content.files {
+                    fixed_tokens += estimate_text_tokens(&file.llm_context_tag());
+                }
+            }
+            // Not rendered into the LLM request (see render_messages).
+            MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_) => {}
         }
     }
-    (facts, max_round)
+
+    // Bucket results by round in one pass so the sweep is a single O(rounds) walk.
+    let mut rounds = vec![RoundAgg::default(); max_round + 1];
+    for f in &results {
+        let agg = &mut rounds[f.round];
+        agg.max_seq = Some(agg.max_seq.map_or(f.sequence_id, |m| m.max(f.sequence_id)));
+        if f.clearable {
+            agg.clearable_freed += f.token_estimate;
+        }
+    }
+
+    ClearingFacts {
+        results,
+        rounds,
+        max_round,
+        fixed_tokens,
+    }
 }
 
 /// Plan a stale tool-result clearing sweep (specs/stale-tool-results.allium).
@@ -452,20 +535,43 @@ fn collect_tool_result_facts(
 /// full set of clearable results at or before it. The watermark advances only
 /// when usage is over the high-water mark, never into the recency floor, and
 /// only when the candidate sweep frees at least `CLEAR_AT_LEAST_TOKENS`.
+///
+/// The pressure estimate is derived from `prior_watermark`'s cleared set, not
+/// the full uncleared history, so it reflects the request actually sent. After a
+/// sweep the estimate genuinely drops below target and the next sweep is many
+/// turns away — the trigger does not re-fire every turn, keeping the cached
+/// prefix stable (REQ-STR-007).
 fn plan_tool_result_clearing(
     db_messages: &[crate::db::Message],
     clearable_tool_names: &std::collections::HashSet<String>,
     prior_watermark: i64,
-    estimated_input_tokens: usize,
     context_window: usize,
 ) -> ClearPlan {
-    let (facts, max_round) = collect_tool_result_facts(db_messages, clearable_tool_names);
+    let ClearingFacts {
+        results,
+        rounds,
+        max_round,
+        fixed_tokens,
+    } = collect_tool_result_facts(db_messages, clearable_tool_names);
 
     // Recency floor: rounds at or above `floor_first_round` are never cleared.
     let floor_first_round = (max_round + 1).saturating_sub(KEEP_RECENT_ROUNDS);
 
+    // Pressure estimate of the request actually sent: the watermark-independent
+    // weight plus every clearable result still kept under the prior watermark.
+    // Already-cleared results contribute nothing, so the estimate falls after a
+    // sweep rather than pinning the trigger high forever (REQ-STR-007).
+    let kept_clearable_tokens = |watermark: i64| -> usize {
+        results
+            .iter()
+            .filter(|f| f.clearable && f.sequence_id > watermark)
+            .map(|f| f.token_estimate)
+            .sum::<usize>()
+    };
+    let estimated_input_tokens = fixed_tokens + kept_clearable_tokens(prior_watermark);
+
     // Candidate sweep: clearable, not yet cleared, outside the floor.
-    let eligible_freed: usize = facts
+    let eligible_freed: usize = results
         .iter()
         .filter(|f| f.clearable && f.sequence_id > prior_watermark && f.round < floor_first_round)
         .map(|f| f.token_estimate)
@@ -478,25 +584,20 @@ fn plan_tool_result_clearing(
     if estimated_input_tokens > trigger && eligible_freed >= CLEAR_AT_LEAST_TOKENS {
         // Advance whole rounds from the oldest clearable round toward the floor,
         // stopping once usage falls under the target (and a worthwhile amount is
-        // freed) or the floor is reached.
+        // freed) or the floor is reached. A single O(rounds) walk over the
+        // per-round aggregates — no per-round rescan of the results.
         let mut running = estimated_input_tokens;
         let mut freed_so_far = 0usize;
-        for round in 0..floor_first_round {
-            let round_freed: usize = facts
-                .iter()
-                .filter(|f| f.round == round && f.clearable && f.sequence_id > new_watermark)
-                .map(|f| f.token_estimate)
-                .sum();
-            if let Some(round_max_seq) = facts
-                .iter()
-                .filter(|f| f.round == round)
-                .map(|f| f.sequence_id)
-                .max()
-            {
-                new_watermark = new_watermark.max(round_max_seq);
+        for agg in rounds.iter().take(floor_first_round) {
+            let Some(round_max_seq) = agg.max_seq else {
+                continue; // round with no tool results
+            };
+            if round_max_seq <= new_watermark {
+                continue; // already cleared under the prior watermark
             }
-            freed_so_far += round_freed;
-            running = running.saturating_sub(round_freed);
+            new_watermark = round_max_seq;
+            freed_so_far += agg.clearable_freed;
+            running = running.saturating_sub(agg.clearable_freed);
             if running <= target && freed_so_far >= CLEAR_AT_LEAST_TOKENS {
                 break;
             }
@@ -506,12 +607,12 @@ fn plan_tool_result_clearing(
     // The cleared set is every clearable result at or before the (advanced)
     // watermark — stable turn-over-turn. Freed/count cover only what *this*
     // advance newly cleared, for the log line (REQ-STR-008).
-    let cleared_tool_use_ids: std::collections::HashSet<String> = facts
+    let cleared_tool_use_ids: std::collections::HashSet<String> = results
         .iter()
         .filter(|f| f.clearable && f.sequence_id <= new_watermark)
         .map(|f| f.tool_use_id.clone())
         .collect();
-    let (freed_tokens, cleared_count) = facts
+    let (freed_tokens, cleared_count) = results
         .iter()
         .filter(|f| {
             f.clearable && f.sequence_id > prior_watermark && f.sequence_id <= new_watermark
@@ -526,6 +627,22 @@ fn plan_tool_result_clearing(
         freed_tokens,
         cleared_count,
     }
+}
+
+/// The clearable tool-result ids at or before `watermark` — the cleared set a
+/// given watermark implies. Used to render a turn consistently with what is
+/// durably persisted when a fresh sweep cannot be recorded (REQ-STR-007).
+fn clearable_ids_through_watermark(
+    db_messages: &[crate::db::Message],
+    clearable_tool_names: &std::collections::HashSet<String>,
+    watermark: i64,
+) -> std::collections::HashSet<String> {
+    collect_tool_result_facts(db_messages, clearable_tool_names)
+        .results
+        .into_iter()
+        .filter(|f| f.clearable && f.sequence_id <= watermark)
+        .map(|f| f.tool_use_id)
+        .collect()
 }
 
 /// Fold persisted messages into the provider-agnostic LLM message list.
@@ -3272,7 +3389,9 @@ where
 
             // Build messages from history, applying stale tool-result clearing
             // (specs/stale-tool-results). Plan a sweep against the persisted
-            // watermark; persist any advance; render the cleared history.
+            // watermark, persist any advance, then render the cleared history
+            // exactly once. The planner derives its pressure estimate from the
+            // watermark's cleared set, so no separate render is needed to size it.
             let db_messages = match storage.get_messages(&conv_id).await {
                 Ok(m) => m,
                 Err(e) => {
@@ -3282,35 +3401,65 @@ where
                 }
             };
             let clearable_names = tool_executor.clearable_tool_names();
-            let full_messages = render_messages(&db_messages, &std::collections::HashSet::new());
-            let estimated_input: usize = full_messages.iter().map(estimate_message_tokens).sum();
-            let prior_watermark = storage.get_clear_watermark(&conv_id).await.unwrap_or(0);
-            let plan = plan_tool_result_clearing(
-                &db_messages,
-                &clearable_names,
-                prior_watermark,
-                estimated_input,
-                context_window,
-            );
-            if plan.new_watermark != prior_watermark {
-                if let Err(e) = storage
-                    .set_clear_watermark(&conv_id, plan.new_watermark)
-                    .await
-                {
-                    tracing::warn!(conv_id = %conv_id, error = %e, "failed to persist clear watermark");
+            let messages = match storage.get_clear_watermark(&conv_id).await {
+                Ok(prior_watermark) => {
+                    let plan = plan_tool_result_clearing(
+                        &db_messages,
+                        &clearable_names,
+                        prior_watermark,
+                        context_window,
+                    );
+                    let cleared = if plan.new_watermark == prior_watermark {
+                        plan.cleared_tool_use_ids
+                    } else {
+                        match storage
+                            .set_clear_watermark(&conv_id, plan.new_watermark)
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::debug!(
+                                    conv_id = %conv_id,
+                                    cleared_results = plan.cleared_count,
+                                    freed_tokens = plan.freed_tokens,
+                                    watermark = plan.new_watermark,
+                                    "stale tool-result clearing swept old results",
+                                );
+                                plan.cleared_tool_use_ids
+                            }
+                            Err(e) => {
+                                // The advance did not durably persist. Render only
+                                // the prior watermark's set so this turn's
+                                // model-visible prefix matches what is recorded;
+                                // otherwise next turn — reading the lower
+                                // watermark — would un-clear these results, breaking
+                                // the grow-only guarantee and the cache (REQ-STR-007).
+                                tracing::warn!(
+                                    conv_id = %conv_id,
+                                    error = %e,
+                                    "failed to persist clear watermark; holding prior cleared set this turn",
+                                );
+                                clearable_ids_through_watermark(
+                                    &db_messages,
+                                    &clearable_names,
+                                    prior_watermark,
+                                )
+                            }
+                        }
+                    };
+                    render_messages(&db_messages, &cleared)
                 }
-                tracing::debug!(
-                    conv_id = %conv_id,
-                    cleared_results = plan.cleared_count,
-                    freed_tokens = plan.freed_tokens,
-                    watermark = plan.new_watermark,
-                    "stale tool-result clearing swept old results",
-                );
-            }
-            let messages = if plan.cleared_tool_use_ids.is_empty() {
-                full_messages
-            } else {
-                render_messages(&db_messages, &plan.cleared_tool_use_ids)
+                Err(e) => {
+                    // The durable watermark is unknown, so we cannot know which
+                    // results were already cleared. Send the uncleared history this
+                    // turn (a one-turn cache miss) rather than risk regressing the
+                    // watermark by re-planning from zero (REQ-STR-007).
+                    tracing::warn!(
+                        conv_id = %conv_id,
+                        error = %e,
+                        "failed to read clear watermark; sending uncleared history this turn",
+                    );
+                    render_messages(&db_messages, &std::collections::HashSet::new())
+                }
             };
 
             // Build system prompt with AGENTS.md content + mode context
@@ -8775,8 +8924,8 @@ mod stale_tool_result_clearing_tests {
 
         let db = storage.get_messages(conv).await.unwrap();
         // Small window so the trigger (0.7 * 1000 = 700) is well below the
-        // ~12k tokens of history.
-        let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 12_000, 1_000);
+        // history's image-aware token estimate.
+        let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 1_000);
 
         assert!(plan.new_watermark > 0, "watermark must advance");
         assert!(
@@ -8804,8 +8953,8 @@ mod stale_tool_result_clearing_tests {
         add_round(&storage, conv, "r3", "read_file", 1).await;
 
         let db = storage.get_messages(conv).await.unwrap();
-        // estimated (5000) below trigger (0.7 * 200_000).
-        let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 5_000, 200_000);
+        // Large window: the history's estimate sits far below trigger (0.7 * 200_000).
+        let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 200_000);
 
         assert_eq!(plan.new_watermark, 0);
         assert!(plan.cleared_tool_use_ids.is_empty());
@@ -8824,7 +8973,7 @@ mod stale_tool_result_clearing_tests {
 
         let db = storage.get_messages(conv).await.unwrap();
         // read_file is clearable; ask_user_question is not.
-        let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 12_000, 1_000);
+        let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 1_000);
 
         assert!(
             !plan.cleared_tool_use_ids.contains(&old),
@@ -8832,32 +8981,52 @@ mod stale_tool_result_clearing_tests {
         );
     }
 
-    /// Once advanced, a re-plan on the same history with the prior watermark set
-    /// to the advanced value keeps the result cleared and does not regress —
-    /// the structural witness for cross-turn stability (REQ-STR-007).
+    /// Cross-turn stability under the two conditions production actually faces —
+    /// a *growing* history and an estimate re-derived from it each turn, not a
+    /// pinned figure over identical history. After a sweep clears the oldest
+    /// round, the next turn (with a new round appended) must not advance the
+    /// watermark again: because the estimate is computed against the prior
+    /// watermark's cleared set, the cleared prefix no longer counts at full
+    /// weight, so the trigger does not re-fire every turn (REQ-STR-007).
     #[tokio::test]
     async fn cleared_set_is_stable_across_turns() {
         let storage = Arc::new(InMemoryStorage::new());
         let conv = "conv-stable";
+        let names = clearable(&["read_file"]);
+        // Two heavy rounds (6 images = 9000 tokens each) so a single round's
+        // weight straddles the trigger, plus two light recency-floor rounds.
         let old = add_round(&storage, conv, "old", "read_file", 6).await;
-        add_round(&storage, conv, "r1", "read_file", 1).await;
-        add_round(&storage, conv, "r2", "read_file", 1).await;
-        add_round(&storage, conv, "r3", "read_file", 1).await;
+        let r1 = add_round(&storage, conv, "r1", "read_file", 6).await;
+        add_round(&storage, conv, "r2", "read_file", 0).await;
+        add_round(&storage, conv, "r3", "read_file", 0).await;
 
+        // Window chosen so that with the oldest round still counted (uncleared)
+        // the estimate is above trigger (0.7 * 20_000 = 14_000), but once it is
+        // cleared the estimate drops below trigger.
+        let window = 20_000;
+
+        // Turn 1: sweeps the single pre-floor round (round 0).
         let db = storage.get_messages(conv).await.unwrap();
-        let first = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 12_000, 1_000);
-        // Next turn: prior watermark is the advanced value, same history.
-        let second = plan_tool_result_clearing(
-            &db,
-            &clearable(&["read_file"]),
-            first.new_watermark,
-            12_000,
-            1_000,
+        let first = plan_tool_result_clearing(&db, &names, 0, window);
+        assert!(
+            first.new_watermark > 0,
+            "first turn sweeps the oldest round"
         );
+        assert!(first.cleared_tool_use_ids.contains(&old));
+        assert!(
+            !first.cleared_tool_use_ids.contains(&r1),
+            "the recency floor keeps round 1 uncleared on turn 1",
+        );
+
+        // Turn 2: history grows by one round; the planner re-derives the estimate
+        // from the larger history and the prior (advanced) watermark.
+        add_round(&storage, conv, "r4", "read_file", 0).await;
+        let db2 = storage.get_messages(conv).await.unwrap();
+        let second = plan_tool_result_clearing(&db2, &names, first.new_watermark, window);
 
         assert_eq!(
             second.new_watermark, first.new_watermark,
-            "watermark must not regress or re-advance without new clearable output",
+            "watermark must not re-advance once the cleared prefix is under target",
         );
         assert!(
             second.cleared_tool_use_ids.contains(&old),
@@ -8866,6 +9035,17 @@ mod stale_tool_result_clearing_tests {
         assert_eq!(
             second.freed_tokens, 0,
             "no new tokens freed on a stable turn"
+        );
+
+        // Witness that the hold is *because* the estimate reflects prior
+        // clearing, not because nothing is left to clear: re-planning the same
+        // grown history from a zero watermark (as a full-history estimate would)
+        // still crosses the trigger and sweeps.
+        let from_zero = plan_tool_result_clearing(&db2, &names, 0, window);
+        assert!(
+            from_zero.new_watermark > 0,
+            "from a zero watermark the same history still sweeps — the prior \
+             watermark feeding the estimate is what holds the stable turn",
         );
     }
 
