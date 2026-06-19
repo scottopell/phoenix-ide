@@ -76,6 +76,7 @@ pub(crate) fn measure<R>(f: impl FnOnce() -> R) -> (R, AllocStats) {
     /// On drop, fold this scope's counts back into the saved parent totals and
     /// restore the parent's `ACTIVE` flag — runs on both normal return and
     /// unwind.
+    #[allow(clippy::struct_field_names)] // the `prev_` prefix marks saved parent state
     struct Restore {
         prev_active: bool,
         prev_allocs: u64,
