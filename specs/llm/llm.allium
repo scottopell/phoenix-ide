@@ -102,6 +102,7 @@ enum LlmErrorKind {
     | server_overloaded
     | auth
     | invalid_request
+    | invalid_response
     | content_filter
     | context_window_exceeded
 }
@@ -250,12 +251,12 @@ invariant QuotaBoundToUsageLimit {
 -- either bucket.
 invariant AutoRetryablePartition {
     for e in LlmErrors:
-        e.auto_retryable = (e.kind = network or e.kind = rate_limit or e.kind = server_error)
+        e.auto_retryable = (e.kind = network or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response)
 }
 
 invariant UserResumablePartition {
     for e in LlmErrors:
-        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = rate_limit or e.kind = server_error or e.kind = server_overloaded or e.kind = usage_limit_reached)
+        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = rate_limit or e.kind = server_error or e.kind = invalid_response or e.kind = server_overloaded or e.kind = usage_limit_reached)
 }
 
 -- Token accounting is non-negative. Each count is an unsigned quantity

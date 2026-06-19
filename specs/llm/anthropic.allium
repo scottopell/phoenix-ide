@@ -266,8 +266,9 @@ rule AnthropicCacheBreakpointsPlaced {
 ------------------------------------------------------------
 
 -- Normalize a non-streaming Anthropic response. Three outcomes:
---   1. A response-position image or tool_result block — a hard wire
---      violation — yields a terminal invalid_request error.
+--   1. A response-position image or tool_result block — a wire-shape we
+--      cannot represent — yields a RETRYABLE invalid_response error (the
+--      request was accepted; the response is at fault).
 --   2. No client content (text or tool_use) and stop_reason is not
 --      end_turn — most likely a gateway returning an empty stream —
 --      yields a RETRYABLE server_error.
@@ -282,7 +283,7 @@ rule AnthropicResponseNormalized {
     ensures:
         if raw.has_response_position_image_or_tool_result:
             llm/LlmError.created(
-                kind: invalid_request,
+                kind: invalid_response,
                 message: "Unexpected image or tool_result block in Anthropic response",
                 recovery_in_progress: false,
                 has_quota: false

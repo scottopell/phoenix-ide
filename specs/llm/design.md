@@ -84,6 +84,9 @@ pub enum LlmErrorKind {
     Auth,
     /// Bad request (400) - not retryable
     InvalidRequest,
+    /// Provider returned bytes we could not parse or understand (malformed SSE
+    /// event, unparseable body, unexpected content-block shape) - retryable
+    InvalidResponse,
     /// Content filter or safety block - not retryable
     ContentFilter,
     /// Context window exceeded - not retryable in current conversation
@@ -97,7 +100,9 @@ pub enum UserResumePolicy { Resumable, NotResumable }
 impl LlmErrorKind {
     pub fn auto_retry_policy(&self) -> AutoRetryPolicy {
         match self {
-            Self::Network | Self::RateLimit | Self::ServerError => AutoRetryPolicy::AutoRetryable,
+            Self::Network | Self::RateLimit | Self::ServerError | Self::InvalidResponse => {
+                AutoRetryPolicy::AutoRetryable
+            }
             Self::UsageLimitReached
             | Self::ServerOverloaded
             | Self::Auth
@@ -116,6 +121,7 @@ impl LlmErrorKind {
             | Self::Network
             | Self::RateLimit
             | Self::ServerError
+            | Self::InvalidResponse
             | Self::ServerOverloaded
             | Self::UsageLimitReached => UserResumePolicy::Resumable,
             Self::InvalidRequest
