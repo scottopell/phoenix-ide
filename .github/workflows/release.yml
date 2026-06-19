@@ -46,6 +46,9 @@ jobs:
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
             echo "Tagging $(git rev-parse --short HEAD) as $TAG"
+            # Annotated tags need a committer identity; the runner has none.
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git tag -a "$TAG" -m "$TAG"
             git push origin "$TAG"
             echo "release=true" >> "$GITHUB_OUTPUT"
