@@ -2,6 +2,8 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
+#[cfg(test)]
+mod alloc_guard;
 mod assets;
 pub mod auth;
 mod browser_view;
