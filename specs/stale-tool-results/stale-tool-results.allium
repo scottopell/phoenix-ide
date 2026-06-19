@@ -5,7 +5,8 @@
 --
 -- Scope: The retention pass applied while a conversation's persisted
 --        history is folded into the provider-agnostic LLM message list
---        in Executor::build_llm_messages_static. The pass maintains a
+--        on Executor::dispatch_llm_request's main request path. The pass
+--        maintains a
 --        monotonic per-conversation clear watermark and, from it, decides
 --        per tool-result message whether to send the result body
 --        verbatim or replace it with a placeholder — covering the
@@ -33,9 +34,9 @@
 --   specs/stale-tool-results/design.md       — watermark model, caching
 --
 -- Cross-references:
---   crates/phoenix-ide/src/runtime/executor.rs — build_llm_messages_static,
---       flatten_tool_blocks, cap_messages_to_token_budget,
---       estimate_text_tokens
+--   crates/phoenix-ide/src/runtime/executor.rs — dispatch_llm_request,
+--       plan_tool_result_clearing, collect_tool_result_facts,
+--       render_messages, estimate_tool_result_tokens
 --   crates/phoenix-tools/src/lib.rs            — Tool::clearable, ToolOutput
 --
 -- Self-contained: this spec does not `use` any other module. The
@@ -87,7 +88,7 @@ enum RetentionVerdict { kept | cleared }
 --
 -- `token_estimate` is the estimated tokens this result contributes —
 -- counting both its text body AND a per-image block cost, via the
--- image-aware estimator (estimate_message_tokens), not a text-only
+-- image-aware estimator (estimate_tool_result_tokens), not a text-only
 -- character count. Image-heavy results are the expensive context this
 -- feature exists to retire, so their image cost must drive the sweep
 -- decision; a text-only estimate would let a screenshot round contribute
@@ -125,6 +126,14 @@ value ToolResultRendering {
 -- this assembly; `new_watermark` is its value after this assembly's
 -- (possible) advance, persisted back to the conversation. Across turns,
 -- one assembly's new_watermark is the next assembly's prior_watermark.
+--
+-- `estimated_input_tokens` is the image-aware token estimate of the
+-- request this assembly would send *given prior_watermark's cleared set* —
+-- an already-cleared result counts as its placeholder, not its full body.
+-- Estimating against the prior cleared set (not the full uncleared history)
+-- is what makes the trigger stable: after a sweep the estimate falls under
+-- the target and stays under the trigger for many turns, so the watermark
+-- does not advance every turn (REQ-STR-007).
 --
 -- `clear_trigger_tokens` is the high-water mark above which a sweep is
 -- considered (REQ-STR-001); `target_after_clear_tokens` is the usage a

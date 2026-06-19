@@ -11,8 +11,9 @@ record in storage for the human. It lets sessions run far longer at full
 fidelity before summarization is forced, and bends the per-turn cost curve of a
 long session back from quadratic toward linear.
 
-The work is provider-agnostic and lives in the executor's history-assembly pass
-(`build_llm_messages_static`). It subsumes the existing aged-screenshot
+The work is provider-agnostic and lives on the executor's main request path
+(`dispatch_llm_request`), as history is assembled into the provider-agnostic
+message list. It subsumes the existing aged-screenshot
 retention: a single mechanism now governs each tool result's text and images
 together, replacing the image-only window whose tail-relative boundary rewrote
 recent context — and busted the prompt cache — every turn. Removal is governed by

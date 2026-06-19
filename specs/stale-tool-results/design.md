@@ -2,14 +2,20 @@
 
 ## Where this lives (REQ-STR-009)
 
-Tool-result clearing is a transform applied while the conversation history is
-assembled into the provider-agnostic message list, in
-`Executor::build_llm_messages_static`. That function reads the persisted messages
-for a conversation and folds them into `Vec<LlmMessage>`; clearing is a retention
-pass over that fold, before any provider translation
-(`anthropic.rs::translate_request`, the OpenAI Responses translation) runs. A
-single pass therefore governs every provider identically, and the persisted
-`db::ToolContent` it reads from is never mutated.
+Tool-result clearing happens on the main LLM request path, in
+`Executor::dispatch_llm_request`, as the persisted history is folded into the
+provider-agnostic message list (`render_messages`). The dispatch path reads the
+conversation's clear watermark, plans a sweep (`plan_tool_result_clearing`),
+persists any advance, and renders the history once with the resulting cleared
+set — before any provider translation (`anthropic.rs::translate_request`, the
+OpenAI Responses translation) runs. A single pass therefore governs every
+provider identically, and the persisted `db::ToolContent` it reads from is never
+mutated.
+
+Clearing is specific to the dispatch path. The continuation/summarization path
+(`build_llm_messages_static` → `flatten_tool_blocks`) renders every tool result
+to plain text and declares no tools, so a per-result clearing verdict has nothing
+to act on there.
 
 ## One mechanism for text and images (REQ-STR-011)
 
@@ -200,12 +206,15 @@ worthwhile moments rather than paying it every turn:
   lands on an uncleared block. Sweeps only ever touch the prefix *before* the
   floor; the current turn's reusable anchor is intact.
 
-- **A breakpoint behind the cleared region.** Placing a cache breakpoint at or
-  just after the watermark boundary lets the stable cleared prefix be cached and
-  reused across the many turns between sweeps, while the volatile recent tail sits
-  past it under its own trailing breakpoint. Anthropic's four-breakpoint budget
-  accommodates both; coordinating the watermark breakpoint with the existing
-  three is part of the implementation against the `llm` spec.
+- **The cleared prefix is already inside the cached region.** The cleared region
+  sits below the recency floor, ahead of the last-tool-entry and last-user
+  breakpoints, so it is part of the cached prefix without any dedicated
+  coordination — the three existing breakpoints already deliver the reuse. A
+  fourth breakpoint pinned at the watermark boundary would be a further
+  optimization, isolating the stable prefix from the volatile tail so the tail's
+  churn cannot force a re-read of the prefix; Anthropic's four-breakpoint budget
+  could accommodate it. It is an optimization, not a precondition for the caching
+  benefit.
 
 - **Cache key unchanged.** Requests keep using `PromptCacheKey::stable(conv_id)`.
   The cleared prefix is a property of message content, not the cache cohort;
@@ -214,18 +223,24 @@ worthwhile moments rather than paying it every turn:
 
 ## Token estimation (REQ-STR-001, REQ-STR-006)
 
-Pressure detection and the `clear_at_least` / target calculations estimate each
-result's token cost with the **image-aware** estimator — `estimate_message_tokens`,
-which adds a fixed per-block cost for each `ContentBlock::Image` on top of the
-text character count, the same accounting `cap_messages_to_token_budget` uses. A
-text-only estimator (`estimate_text_tokens`) must not be used for the sweep
-decision: a stale screenshot round would then contribute almost nothing to
-`estimated_input_tokens` and `clear_at_least`, so the very image-heavy context
-this feature exists to retire would never register as worth clearing — clearing
-would stall exactly where it is needed most. Estimation is otherwise approximate
-by design — the trigger sits below the true window, and the consequence of a
-slightly-off estimate is sweeping one round early or late, never a dropped result
-or a 400.
+Pressure detection and the `clear_at_least` / target calculations weigh each tool
+result with the **image-aware** per-result estimator `estimate_tool_result_tokens`
+— its text character count plus a fixed cost per image block — summed across the
+history by `collect_tool_result_facts`. A text-only estimate must not be used for
+the sweep decision: a stale screenshot round would then contribute almost nothing
+to the pressure signal and `clear_at_least`, so the very image-heavy context this
+feature exists to retire would never register as worth clearing — clearing would
+stall exactly where it is needed most.
+
+The pressure estimate is computed against the **prior watermark's cleared set**,
+not the full uncleared history: an already-cleared result contributes nothing,
+exactly as it is sent (a placeholder with no images). This is what keeps the
+trigger stable — after a sweep drops usage under the target, the estimate stays
+under the trigger for many turns, so the watermark does not advance one round per
+turn and the cached prefix is preserved (REQ-STR-007). Estimation is otherwise
+approximate by design — the trigger sits below the true window, and the
+consequence of a slightly-off estimate is sweeping one round early or late, never
+a dropped result or a 400.
 
 ## Retention ladder
 
