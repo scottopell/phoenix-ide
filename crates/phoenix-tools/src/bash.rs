@@ -45,7 +45,7 @@ pub struct BashTool;
 
 #[async_trait]
 impl Tool for BashTool {
-    // Re-queryable read: clearing drops only the stale output (never re-runs the command); the agent can re-query current state. Side-effect caveat is part of the accepted tradeoff (REQ-STR-002).
+    // clearable: re-queryable read (side effects aside) — see specs/stale-tool-results (REQ-STR-002).
     fn clearable(&self) -> bool {
         true
     }
