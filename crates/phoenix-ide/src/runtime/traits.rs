@@ -172,6 +172,11 @@ pub trait StateStore: Send + Sync {
     /// regressing it (specs/stale-tool-results, REQ-STR-007).
     async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String>;
 
+    /// The total prompt size of the most recent turn (input + cache-read +
+    /// cache-creation tokens), or `None` if the conversation has no turns yet.
+    /// The clearing pressure signal (specs/stale-tool-results, REQ-STR-001).
+    async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String>;
+
     /// Record token usage for one LLM turn. Fire-and-forget; errors are logged
     /// by the caller and do not affect the conversation.
     async fn insert_turn_usage(
@@ -433,6 +438,10 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
 
     async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String> {
         (**self).set_clear_watermark(conv_id, watermark).await
+    }
+
+    async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String> {
+        (**self).get_last_turn_prompt_tokens(conv_id).await
     }
 
     async fn insert_turn_usage(
@@ -728,6 +737,13 @@ impl StateStore for DatabaseStorage {
     async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String> {
         self.db
             .update_clear_watermark(conv_id, watermark)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String> {
+        self.db
+            .get_last_turn_prompt_tokens(conv_id)
             .await
             .map_err(|e| e.to_string())
     }

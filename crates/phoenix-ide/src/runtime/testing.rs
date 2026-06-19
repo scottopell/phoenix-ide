@@ -475,6 +475,10 @@ pub struct InMemoryStorage {
     steering_queues: Mutex<HashMap<String, Vec<crate::state_machine::event::SteerEntry>>>,
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
     clear_watermarks: Mutex<HashMap<String, i64>>,
+    last_prompt_tokens: Mutex<HashMap<String, i64>>,
+    // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
+    fail_watermark_read: Mutex<bool>,
+    fail_watermark_write: Mutex<bool>,
 }
 
 #[allow(dead_code)]
@@ -488,7 +492,28 @@ impl InMemoryStorage {
             steering_queues: Mutex::new(HashMap::new()),
             fork_proposals: Mutex::new(Vec::new()),
             clear_watermarks: Mutex::new(HashMap::new()),
+            last_prompt_tokens: Mutex::new(HashMap::new()),
+            fail_watermark_read: Mutex::new(false),
+            fail_watermark_write: Mutex::new(false),
         }
+    }
+
+    /// Seed the most-recent-turn prompt size (the clearing pressure signal).
+    pub fn set_last_prompt_tokens(&self, conv_id: &str, tokens: i64) {
+        self.last_prompt_tokens
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), tokens);
+    }
+
+    /// Make `get_clear_watermark` return an error (test the read-failure path).
+    pub fn set_fail_watermark_read(&self, fail: bool) {
+        *self.fail_watermark_read.lock().unwrap() = fail;
+    }
+
+    /// Make `set_clear_watermark` return an error (test the write-failure path).
+    pub fn set_fail_watermark_write(&self, fail: bool) {
+        *self.fail_watermark_write.lock().unwrap() = fail;
     }
 
     /// Read back the persisted fork proposals (test-only).
@@ -817,6 +842,9 @@ impl StateStore for InMemoryStorage {
     }
 
     async fn get_clear_watermark(&self, conv_id: &str) -> Result<i64, String> {
+        if *self.fail_watermark_read.lock().unwrap() {
+            return Err("injected watermark read failure".to_string());
+        }
         Ok(self
             .clear_watermarks
             .lock()
@@ -827,12 +855,24 @@ impl StateStore for InMemoryStorage {
     }
 
     async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String> {
+        if *self.fail_watermark_write.lock().unwrap() {
+            return Err("injected watermark write failure".to_string());
+        }
         // Structurally monotonic, mirroring the production `MAX(...)` write: a
         // value below the stored watermark never regresses it (REQ-STR-007).
         let mut map = self.clear_watermarks.lock().unwrap();
         let entry = map.entry(conv_id.to_string()).or_insert(0);
         *entry = (*entry).max(watermark);
         Ok(())
+    }
+
+    async fn get_last_turn_prompt_tokens(&self, conv_id: &str) -> Result<Option<i64>, String> {
+        Ok(self
+            .last_prompt_tokens
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .copied())
     }
 
     async fn insert_turn_usage(

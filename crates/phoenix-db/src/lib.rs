@@ -3889,7 +3889,34 @@ impl Database {
         Ok(())
     }
 
-    /// Return aggregated token usage for a conversation.
+    /// The total prompt size of the most recent turn for `conversation_id`:
+    /// `input_tokens + cache_read_tokens + cache_creation_tokens` (the full
+    /// context the model saw, cached portion included — the cached prefix still
+    /// counts against the window). `None` when the conversation has no turns yet.
+    ///
+    /// Used as the stale-tool-result clearing pressure signal (REQ-STR-001): the
+    /// provider's reported size is ground truth, so the trigger tracks reality
+    /// instead of a re-estimate that can drift below it (omitting system prompt
+    /// and tool schemas, undercounting on a well-cached turn).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_last_turn_prompt_tokens(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<i64>> {
+        let row: Option<i64> = sqlx::query_scalar(
+            "SELECT input_tokens + cache_read_tokens + cache_creation_tokens \
+             FROM turn_usage WHERE conversation_id = ?1 \
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     ///
     /// `own` covers only rows where `conversation_id` matches; `total` covers
     /// all rows under the same root (i.e. the top-level conversation plus all
