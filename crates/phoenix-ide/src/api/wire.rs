@@ -127,14 +127,12 @@ impl From<Message> for EnrichedMessage {
 /// Serialize `msg.content` and, for agent messages, merge
 /// `msg.display_data.bash[*].display` into matching `tool_use` blocks.
 ///
-/// Behaviour matches the legacy `enrich_message_for_api` helper exactly:
-/// the serialized JSON of the `Message` is produced via the existing
-/// `Serialize` impl, then the `content` sub-tree is mutated in place. Callers
-/// that only need the enriched content (as opposed to the whole message)
-/// get it without the surrounding envelope fields.
+/// `MessageContent` serializes transparently to its inner value, so
+/// `to_value(&msg.content)` is byte-for-byte identical to the `content`
+/// sub-tree of `to_value(msg)` — serializing the field directly avoids
+/// building (and discarding) the surrounding envelope on every message.
 fn enrich_content(msg: &Message) -> Value {
-    let full = serde_json::to_value(msg).unwrap_or(Value::Null);
-    let mut content = full.get("content").cloned().unwrap_or(Value::Null);
+    let mut content = serde_json::to_value(&msg.content).unwrap_or(Value::Null);
 
     if msg.message_type != MessageType::Agent {
         return content;

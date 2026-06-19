@@ -22,3 +22,4 @@ RESTful API with JSON request/response bodies. SSE streaming broadcasts conversa
 | **REQ-API-008:** Directory Browser | validate-cwd and list-directory |
 | **REQ-API-009:** Model Information | GET /api/models with default |
 | **REQ-API-010:** Static Assets | UI assets served from the binary (embedded), with a filesystem fallback |
+| **REQ-API-013:** One-Shot Command Suggestion | POST /api/suggest; capability-token gated, password-exempt (see `specs/command-suggestion`) |

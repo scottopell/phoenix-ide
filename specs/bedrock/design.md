@@ -1389,6 +1389,15 @@ cost. This makes the request structurally unable to overflow, so it cannot fail
 with a context-window error and then deterministically replay the same oversized
 request until it falls back.
 
+Dropping oldest-first can discard the conversation's original leading user
+message and expose an assistant message at the front. Because the provider
+requires the first message to be user-role, the capped window then has its
+leading non-user messages trimmed before the user-role continuation prompt is
+appended — otherwise the request would be rejected for a non-user first message,
+re-creating the same fallback loop the budget guard exists to prevent. Flattened
+history holds no tool-use/tool-result pairing, so trimming leading assistant
+narration is lossless to the request's validity.
+
 The handoff prompt promises the successor "the same tools you have now," not full
 access: a continuation inherits the exhausted conversation's mode verbatim, so an
 Explore continuation stays in Explore mode with its restricted tool registry and

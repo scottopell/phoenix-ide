@@ -42,8 +42,9 @@ Status is per user-visible outcome. Code anchors point at the implementation tha
 | **REQ-TPANEL-006:** Shell Integration Setup CTA | ✅ Complete | Detection + hint + snippet modal (`:123,365-387,472-478,904-913,933-999`); the "Let Phoenix set this up" hand-off (`:184-225,768-783`) surfaces failures via `showError` (red toast) in addition to `console.error` — see REQ-NOTIF-002 |
 | **REQ-TPANEL-007:** Theme Matches the App | ✅ Complete | `:70-81` (read CSS vars), `:343` (apply on mount), `:628-633` (re-apply on theme toggle, no PTY teardown) |
 | **REQ-TPANEL-008:** Conflict Resolution When Already Open Elsewhere | ❌ Not Started | Backend rejects duplicate connections with 409 (REQ-TERM-001 / -003); frontend folds this into a generic "Connection error" today (`:539-547`) with no reclaim path. Spec target: distinguish the 409 close code and offer a "Reclaim this terminal" action |
+| **REQ-TPANEL-009:** Click a Suggested Command to Run It | ✅ Complete | `TerminalPanel.tsx` `linkHandler`: `phxrun:<base64>` decode → PTY input via `dataFrame`, no trailing newline; ordinary `http(s)` links open in a new tab. See `specs/command-suggestion` |
 
-**Progress:** 7 of 8 complete, 1 not started. Remaining gap is the unmodelled conflict UX in REQ-TPANEL-008 (needs a backend reclaim endpoint coordinated with `specs/terminal/`).
+**Progress:** 8 of 9 complete, 1 not started. Remaining gap is the unmodelled conflict UX in REQ-TPANEL-008 (needs a backend reclaim endpoint coordinated with `specs/terminal/`).
 
 ## Behavioural Specification
 

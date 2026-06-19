@@ -256,36 +256,102 @@ async fn ensure_live(&self, conv: &ConversationId) -> Result<Arc<RwLock<TmuxServ
 }
 
 async fn spawn_session(socket_path: &Path) -> Result<(), TmuxError> {
-    let status = tokio::process::Command::new("tmux")
-        .args([
-            "-S", &socket_path.to_string_lossy(),
-            "new-session", "-d", "-s", "main",
-        ])
-        .env_remove("TMUX")  // see "TMUX env handling" below
-        .status()
-        .await?;
+    let mut cmd = tokio::process::Command::new("tmux");
+    cmd.args([
+        "-S", &socket_path.to_string_lossy(),
+        "new-session", "-d", "-s", "main",
+    ]);
+    set_tmux_server_env(&mut cmd);   // see "PTY env injection" below
+    let status = cmd.status().await?;
     if !status.success() {
         return Err(TmuxError::SpawnFailed);
     }
     Ok(())
 }
+
+// env_clear() + the explicit constructed env; env_clear also drops TMUX.
+fn set_tmux_server_env(cmd: &mut Command) {
+    cmd.env_clear();
+    cmd.envs(phoenix_terminal::spawn::build_env_for_tmux(&shell()));
+}
 ```
 
 ### TMUX env handling
 
-Phoenix MUST `env_remove("TMUX")` on every tmux subprocess invocation
-(spawn_session, the tool dispatch, and the in-app terminal's `tmux
-attach` exec). If the user launches Phoenix from inside an outer tmux
-session, the inherited `TMUX` env var causes the inner tmux to refuse
-to nest by default ("sessions should be nested with care; unset $TMUX
-to force"). Stripping `TMUX` from the subprocess environment removes
-the nesting check; Phoenix's own `-S` socket isolation is what keeps
-the conversation's server distinct from the outer one.
+Phoenix MUST ensure `TMUX` is absent from every tmux subprocess's
+environment (the tool dispatch and the in-app terminal's `tmux attach`
+exec strip it via `env_remove("TMUX")`; `spawn_session` clears the whole
+env, which subsumes it). If the user launches Phoenix from inside an
+outer tmux session, the inherited `TMUX` env var causes the inner tmux to
+refuse to nest by default ("sessions should be nested with care; unset
+$TMUX to force"). Removing `TMUX` from the subprocess environment lifts
+the nesting check; Phoenix's own `-S` socket isolation is what keeps the
+conversation's server distinct from the outer one.
 
 The probe-and-act sequence runs at every operation; it is cheap (one
 short-lived process spawn) and the only reliable way to detect both
 post-Phoenix-restart (probe → live, no in-memory entry needed) and
 post-system-reboot (probe → dead_socket, recreate).
+
+### PTY env injection
+
+A tmux pane's shell is a child of the tmux **server**, not of the
+`tmux attach` client the in-app terminal execs — so it inherits the
+server's environment, captured when the server is spawned. By default a
+`Command` inherits the parent (Phoenix) environment, which holds server
+secrets (LLM API keys, gateway config); inheriting it would leak those into
+every pane and diverge from the direct-shell path. The `new-session` command is
+therefore spawned from a **cleared** environment set to exactly the explicit
+construction `build_env_for_tmux` produces — the fixed base, the
+`PtyEnvInjection` (a `PATH` prefix for the `phx` shim plus `PHOENIX_API_URL` /
+`PHOENIX_SUGGEST_TOKEN`, see `specs/command-suggestion` REQ-CSUG-006), and the
+safe-var allowlist (`specs/terminal` REQ-TERM-002). This makes pane environments
+identical to the direct-shell path and keeps secrets out of panes — an
+enumerated set, never a blind copy of the server's environment.
+
+### Server config (server.conf)
+
+Phoenix ships a tmux server config, loaded with `-f` at server spawn. Beyond
+the screen/scrollback settings it advertises the `hyperlinks` terminal feature:
+
+```
+set -as terminal-features "*:hyperlinks"
+```
+
+tmux forwards OSC 8 hyperlinks to its client only when the client's terminal is
+known to support them. Without this directive tmux strips the hyperlink wrapper
+and only the visible text reaches xterm.js — which would silently break the
+`phxrun:` click-to-run links (`specs/command-suggestion` REQ-CSUG-007,
+`specs/terminal-panel`).
+
+### Companion refresh on reuse
+
+The `phx` companion setup (the `phx` shim on PATH plus the `hyperlinks` feature)
+is established when a server is *spawned*. A server that predates the feature, or
+an Phoenix upgrade, is *reused* by `ensure_live` (probe → live) and never
+re-spawned, so its panes would otherwise lack both. A version stamp closes the
+gap: every spawned server carries `PHOENIX_COMPANION_VERSION` in its global
+environment, and on reuse `ensure_live` reads it back; a missing or older stamp
+triggers a one-time, non-destructive refresh:
+
+- `set -ag terminal-features ",*:hyperlinks"` — restores OSC-8 forwarding for the
+  next fresh attach (the relay re-attaches per panel open, so the user gets it
+  then).
+- `set -g default-command` to a wrapper that prepends the `phx` bin dir to
+  `PATH` before `exec`-ing the shell — so new windows/panes resolve `phx`. A
+  `set-environment -g PATH` does *not* work here: tmux takes a new pane's `PATH`
+  from the server process, ignoring the global-environment override (it does
+  honor the override for non-`PATH` vars). `default-command` is the seam that
+  reaches a new pane's `PATH` without restarting the server.
+- `set-environment -g` for `PHOENIX_API_URL` / `PHOENIX_SUGGEST_TOKEN` — these
+  *do* propagate to new panes via the global environment.
+- update the stamp; a one-time `display-message` tells the user a new window
+  picks up `phx`.
+
+Recreating the server would also fix the *current* pane (whose shell already
+exported its `PATH` and cannot be changed from outside), but would destroy the
+user's running panes and jobs — so the refresh is non-destructive and the
+current pane is handled by the hint instead.
 
 ## Tool Dispatch (REQ-TMUX-003, REQ-TMUX-010)
 

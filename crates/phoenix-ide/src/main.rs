@@ -11,9 +11,11 @@ pub(crate) mod git_ops;
 mod llm;
 mod mcp_oauth_store;
 mod message_expander;
+mod phx_cli;
 mod project_opportunistic_build_warm;
 mod resolution_root;
 mod runtime;
+mod suggest;
 mod system_prompt;
 mod title_generator;
 mod tls;
@@ -409,9 +411,123 @@ fn build_disk_locations(
     locations
 }
 
+/// Resolve the suggest capability token, persisting it across restarts.
+///
+/// The token is stored in `app_settings` alongside the password fingerprint it
+/// was minted under (mirroring [`api::auth`]'s session binding). A persisted
+/// token is reused only when that fingerprint still matches the current
+/// password, so a normal restart keeps the same token — existing terminals
+/// stay authorized — while rotating `PHOENIX_PASSWORD` re-mints it. Persistence
+/// failures degrade to a fresh per-process token (logged), never fatal.
+async fn resolve_suggest_token(db: &crate::db::Database, password: Option<&str>) -> String {
+    const TOKEN_KEY: &str = "suggest_token";
+    const FINGERPRINT_KEY: &str = "suggest_token_password_fingerprint";
+
+    let current_fp = password
+        .map(api::auth::password_fingerprint)
+        .unwrap_or_default();
+
+    if let (Ok(Some(token)), Ok(Some(fp))) = (
+        db.get_app_setting(TOKEN_KEY).await,
+        db.get_app_setting(FINGERPRINT_KEY).await,
+    ) {
+        if !token.is_empty() && fp == current_fp {
+            return token;
+        }
+    }
+
+    let token = mint_suggest_token();
+    if let Err(e) = db.set_app_setting(TOKEN_KEY, &token).await {
+        tracing::warn!(error = %e, "failed to persist suggest token; phx will need a fresh token after restart");
+    } else if let Err(e) = db.set_app_setting(FINGERPRINT_KEY, &current_fp).await {
+        tracing::warn!(error = %e, "failed to persist suggest-token fingerprint");
+    }
+    token
+}
+
+/// Mint a fresh 256-bit suggest capability token (URL-safe base64).
+fn mint_suggest_token() -> String {
+    use base64::Engine as _;
+    use rand::Rng as _;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Install the in-terminal `phx` companion and the PTY env injection it relies
+/// on.
+///
+/// Materializes `<data_dir>/bin/phx` as a symlink to this binary (refreshed
+/// each start so it tracks upgrades) and registers a [`PtyEnvInjection`] that
+/// prepends that bin dir to every terminal's `PATH` and injects
+/// `PHOENIX_API_URL` + `PHOENIX_SUGGEST_TOKEN`. Symlink failure is non-fatal
+/// (logged); `phx` simply won't be on PATH.
+fn setup_phx_companion(
+    runtime_env: &PhoenixRuntimeEnvironment,
+    bind_address: std::net::SocketAddr,
+    tls_loaded: bool,
+    token: &str,
+) {
+    let scheme = if tls_loaded { "https" } else { "http" };
+    // Derive the loopback host phx should call from the actual bind address: a
+    // wildcard bind is reachable via the matching-family loopback, a specific
+    // address is used verbatim (IPv6 bracketed). Hardcoding 127.0.0.1 would
+    // break a `::1`/IPv6 or specific-interface bind.
+    let host = match bind_address.ip() {
+        std::net::IpAddr::V4(v4) if v4.is_unspecified() => "127.0.0.1".to_string(),
+        std::net::IpAddr::V6(v6) if v6.is_unspecified() => "[::1]".to_string(),
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    let api_url = format!("{scheme}://{host}:{}", bind_address.port());
+
+    let mut injection = phoenix_terminal::spawn::PtyEnvInjection {
+        path_prefix: None,
+        extra: vec![
+            ("PHOENIX_API_URL".to_string(), api_url),
+            ("PHOENIX_SUGGEST_TOKEN".to_string(), token.to_string()),
+        ],
+    };
+
+    match install_phx_symlink(runtime_env) {
+        Ok(bin_dir) => injection.path_prefix = Some(bin_dir),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not install `phx` shim; in-terminal phx unavailable");
+        }
+    }
+
+    phoenix_terminal::spawn::set_pty_env_injection(injection);
+}
+
+/// Create `<data_dir>/bin/phx` as a symlink to the running binary, returning the
+/// bin directory. Replaces any existing link so the shim tracks binary upgrades.
+fn install_phx_symlink(
+    runtime_env: &PhoenixRuntimeEnvironment,
+) -> std::io::Result<std::path::PathBuf> {
+    let bin_dir = runtime_env.data_dir().join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let link = bin_dir.join("phx");
+    let target = std::env::current_exe()?;
+    match std::fs::symlink_metadata(&link) {
+        Ok(_) => std::fs::remove_file(&link)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::os::unix::fs::symlink(&target, &link)?;
+    Ok(bin_dir)
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // Startup sequence is inherently sequential; splitting would obscure the flow.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `phx` companion: when this binary is invoked through the PATH-injected
+    // `phx` symlink (or `phoenix_ide suggest …`), run the thin suggestion
+    // client and exit instead of starting the server. Branch before logging
+    // setup so the client's stdout stays clean (OSC 8 links only).
+    if phx_cli::is_cli_invocation() {
+        std::process::exit(phx_cli::run().await);
+    }
+
     // Initialize logging from the configured sinks (PHOENIX_LOG_STDOUT /
     // PHOENIX_LOG_FILE). The guard must outlive the program so the file
     // appender's worker flushes on shutdown; held until `main` returns.
@@ -720,6 +836,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let auth_enabled = password.is_some();
 
+    // Install the `phx` terminal companion: a symlink to this binary on the
+    // PTY PATH plus the env (API URL + capability token) it needs to call back.
+    // The token persists across restarts (bound to the password fingerprint) so
+    // terminals opened before a restart stay authorized.
+    let suggest_token = resolve_suggest_token(&db, password.as_deref()).await;
+    setup_phx_companion(
+        &runtime_env,
+        bind_address,
+        loaded_tls.is_some(),
+        &suggest_token,
+    );
+
     // Create application state
     let state = AppState::new(
         db,
@@ -730,6 +858,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         password,
         deployment,
         runtime_env,
+        suggest_token,
     )
     .await;
 
@@ -1111,6 +1240,39 @@ async fn reconcile_project_main_refs(db: &Database) {
 ///
 /// These run against an on-disk `SQLite` DB (tempdir) so the project/
 /// conversation foreign keys resolve correctly through migrations.
+#[cfg(test)]
+mod suggest_token_tests {
+    use super::*;
+
+    /// The suggest token must survive a "restart" (a fresh resolve against the
+    /// same persisted DB and password) and must rotate when the password
+    /// changes — the two properties the persistence fix guarantees.
+    #[tokio::test]
+    async fn token_persists_across_restarts_and_rotates_on_password_change() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+
+        // First resolve mints + persists.
+        let first = resolve_suggest_token(&db, None).await;
+        assert!(!first.is_empty());
+
+        // A later resolve with the same (no-)password reuses it: a restart
+        // keeps existing terminals authorized.
+        let after_restart = resolve_suggest_token(&db, None).await;
+        assert_eq!(first, after_restart, "token must persist across restarts");
+
+        // Setting a password rotates the token (fingerprint changed).
+        let after_pw = resolve_suggest_token(&db, Some("hunter2")).await;
+        assert_ne!(
+            after_pw, first,
+            "token must rotate when the password changes"
+        );
+
+        // The rotated token is itself stable across a subsequent restart.
+        let after_pw_again = resolve_suggest_token(&db, Some("hunter2")).await;
+        assert_eq!(after_pw, after_pw_again);
+    }
+}
+
 #[cfg(test)]
 mod reconcile_worktrees_tests {
     use super::*;

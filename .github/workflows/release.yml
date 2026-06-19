@@ -1,15 +1,62 @@
 name: Release
 
+# Releases are triggered by a version bump landing on `main`, never by a
+# human pushing a tag. This makes two invariants structural rather than
+# disciplinary:
+#   - the release tag always points at a commit that is on `main` (the
+#     workflow only ever tags the commit that triggered it), and
+#   - the tag always carries the `v` prefix the build expects (the workflow
+#     generates it from Cargo.toml — it cannot be fat-fingered).
+# A bump PR merged into `main` is the entire release action.
+
 permissions:
   contents: write
 
 on:
   push:
-    tags:
-      - 'v[0-9]+.*'
+    branches: [main]
+    paths:
+      - 'crates/phoenix-ide/Cargo.toml'
+  # Manual re-trigger (e.g. to retry a failed build for the current version).
+  workflow_dispatch: {}
 
 jobs:
+  # Resolve the version from Cargo.toml and, if it has not been released yet,
+  # create + push the tag at this main commit. Idempotent: an unrelated edit to
+  # Cargo.toml whose version is already tagged is a no-op.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.ver.outputs.release }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need existing tags to test for prior release
+
+      - name: Resolve version, tag if new
+        id: ver
+        run: |
+          VERSION=$(grep -m1 '^version' crates/phoenix-ide/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          [ -n "$VERSION" ] || { echo "Could not read version from crates/phoenix-ide/Cargo.toml"; exit 1; }
+          TAG="v$VERSION"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists — nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tagging $(git rev-parse --short HEAD) as $TAG"
+            # Annotated tags need a committer identity; the runner has none.
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "$TAG"
+            git push origin "$TAG"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-release:
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -57,7 +104,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
+          gh release create "${{ needs.gate.outputs.tag }}" \
+            --title "${{ needs.gate.outputs.tag }}" \
             --generate-notes \
             phoenix_ide-x86_64-unknown-linux-musl

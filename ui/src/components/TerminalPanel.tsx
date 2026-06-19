@@ -207,6 +207,18 @@ function dataFrame(payload: Uint8Array): Uint8Array {
   return buf;
 }
 
+/** URI scheme for click-to-run command suggestions (emitted by `phx --suggest`
+ *  as OSC 8 hyperlinks). The decoded command is dropped onto the shell prompt
+ *  for the user to review and run — never auto-executed. */
+const PHXRUN_SCHEME = 'phxrun:';
+
+/** Decode a base64 string into UTF-8 text (atob yields a binary string). */
+function decodeBase64Utf8(b64: string): string {
+  const bin = atob(b64);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
 /** Truncate from the LEFT, preserving the tail (cwd + prompt glyph). */
 function truncateLeft(s: string, max: number): string {
   if (s.length <= max) return s;
@@ -425,6 +437,52 @@ export function TerminalPanel({
       // below); this is only for the modifier-drag path that yields an
       // xterm-side selection.
       macOptionClickForcesSelection: true,
+      // Intercept OSC 8 hyperlinks. `phxrun:` links are command suggestions
+      // (from `phx`): clicking drops the decoded command onto the shell prompt
+      // WITHOUT a trailing newline, so the user reviews it and presses Enter —
+      // suggestion, never auto-execution. Ordinary http(s) links keep the
+      // default open-in-new-tab behavior. allowNonHttpProtocols is required for
+      // xterm to surface the custom scheme to this handler.
+      linkHandler: {
+        allowNonHttpProtocols: true,
+        activate: (_event, uri) => {
+          if (uri.startsWith(PHXRUN_SCHEME)) {
+            let decoded: string;
+            try {
+              decoded = decodeBase64Utf8(uri.slice(PHXRUN_SCHEME.length));
+            } catch {
+              return;
+            }
+            // A phxrun link must only place printable command text on the
+            // prompt — never submit it or drive the terminal. The "review
+            // before run" guarantee can't depend on a well-formed payload: any
+            // process that writes to the terminal can emit a phxrun: link. So
+            // cut at the first CR/LF (a bare CR submits too, via the PTY's
+            // icrnl) and strip every other C0 control byte / DEL — ESC
+            // sequences, Ctrl-C/Ctrl-D, tab-completion triggers. Multibyte
+            // UTF-8 (>= U+0080) is preserved.
+            const cr = decoded.indexOf('\r');
+            const lf = decoded.indexOf('\n');
+            let end = decoded.length;
+            if (cr >= 0) end = Math.min(end, cr);
+            if (lf >= 0) end = Math.min(end, lf);
+            const command = Array.from(decoded.slice(0, end))
+              .filter((ch) => {
+                const c = ch.codePointAt(0) ?? 0;
+                return c >= 0x20 && c !== 0x7f;
+              })
+              .join('');
+            const ws = wsRef.current;
+            if (command && ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(dataFrame(new TextEncoder().encode(command)));
+            }
+            return;
+          }
+          if (uri.startsWith('http://') || uri.startsWith('https://')) {
+            window.open(uri, '_blank', 'noopener,noreferrer');
+          }
+        },
+      },
     });
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);

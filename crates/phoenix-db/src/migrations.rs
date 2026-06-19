@@ -3,6 +3,8 @@
 //! Each migration runs exactly once, tracked by the `_migrations` table.
 //! Migrations run at startup before any conversation is loaded.
 
+use std::collections::HashSet;
+
 use sqlx::SqlitePool;
 
 use super::DbResult;
@@ -971,17 +973,22 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
     .execute(pool)
     .await?;
 
-    // Find the highest version already applied
-    let current_version: u32 =
-        sqlx::query_scalar::<_, Option<u32>>("SELECT MAX(version) FROM _migrations")
-            .fetch_one(pool)
+    // Track applied migrations by membership, not by a high-water mark: a tool
+    // that builds a pre-migrated schema (the dev seeder) stamps a *sparse* set
+    // of versions and leaves gaps for the ones it does not reproduce, expecting
+    // those to run on first startup. A `MAX(version)` check would treat every
+    // gap below the highest stamp as already applied and skip it forever.
+    let applied_versions: HashSet<u32> =
+        sqlx::query_scalar::<_, u32>("SELECT version FROM _migrations")
+            .fetch_all(pool)
             .await?
-            .unwrap_or(0);
+            .into_iter()
+            .collect();
 
     let mut applied = 0u32;
 
     for migration in MIGRATIONS {
-        if migration.version <= current_version {
+        if applied_versions.contains(&migration.version) {
             continue;
         }
 
@@ -1084,6 +1091,65 @@ mod tests {
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
+    }
+
+    /// A pre-stamped *highest* version must not suppress lower, un-stamped
+    /// migrations. The dev seeder builds a partial schema and stamps a sparse
+    /// set of `_migrations` rows (including the latest version), leaving the
+    /// migrations it does not reproduce — e.g. 005 (`chain_name` + `chain_qa`)
+    /// — un-stamped so they run on first startup. A high-water-mark check would
+    /// see `MAX(version)` and skip every gap below it, leaving the schema
+    /// missing those columns and the conversation-list query failing with
+    /// `no such column: chain_name`.
+    #[tokio::test]
+    async fn sparse_stamp_does_not_suppress_lower_migrations() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        // Create the ledger and stamp only the *highest* version, mimicking a
+        // seeder that left every lower migration un-stamped.
+        sqlx::raw_sql(
+            "CREATE TABLE _migrations (\
+                version INTEGER PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (29, 'drop_conv_mode_blob')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Every version except the stamped 29 must run.
+        let applied = run_pending_migrations(&pool).await.unwrap();
+        assert_eq!(applied, 28);
+
+        // Migration 005's effects must be present.
+        let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+        assert!(
+            cols.iter().any(|c| c == "chain_name"),
+            "chain_name must be added by un-stamped migration 005, got: {cols:?}"
+        );
+        let chain_qa_exists: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='chain_qa'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(chain_qa_exists.as_deref(), Some("chain_qa"));
+
+        // Re-running is a no-op now that the ledger is complete.
+        let again = run_pending_migrations(&pool).await.unwrap();
+        assert_eq!(again, 0);
     }
 
     /// Migration 028: the `conv_mode` JSON blob is projected into the `cm_*`

@@ -288,20 +288,33 @@ rule ShellEnvironmentConstructed {
         HOME:      user_home_dir(),
         USER:      current_username(),
         SHELL:     user_shell(),
-        PATH:      user_path(),
+        PATH:      pty_injected_path(user_path()),
         LANG:      "en_US.UTF-8",
+        PHOENIX_API_URL:       pty_injected_api_url(),
+        PHOENIX_SUGGEST_TOKEN: pty_injected_token(),
     }
 
     @guidance
-        -- Do NOT inherit the API server's process environment.
-        -- The server env may contain secrets (API keys, tokens).
-        -- TERM=xterm-256color is the most critical variable:
+        -- The child env is constructed explicitly and never blindly inherits
+        -- the API server's process environment (which may hold secrets).
+        -- The non-base entries are a single enumerated injection, specified in
+        -- specs/command-suggestion (REQ-CSUG-006): a bin dir prepended to PATH
+        -- (the `phx` shim) plus PHOENIX_API_URL and the scoped
+        -- PHOENIX_SUGGEST_TOKEN; pty_injected_path/_api_url/_token return these
+        -- when the injection is installed, and the base value (empty for the two
+        -- vars) otherwise. build_env also copies through a fixed allowlist of
+        -- safe interactive session vars when present (SSH_AUTH_SOCK,
+        -- SSH_CONNECTION, XDG_RUNTIME_DIR, LC_ALL, LC_CTYPE, TZ) -- never any
+        -- secret-bearing var. The tmux path applies this same construction by
+        -- spawning the server with a cleared-then-rebuilt env (build_env_for_tmux),
+        -- because a pane inherits the tmux server's env (see specs/tmux-integration).
+        -- TERM=xterm-256color is the most critical base variable:
         -- wrong or missing causes readline degradation, broken arrow keys,
         -- and misbehaviour in vim, htop, and similar programs.
 }
 
 -- REQ-TERM-003: Duplicate connection reclaims the existing session.
--- Task 24691: the prior 409-rejection behaviour stranded sessions when the
+-- A 409-rejection behaviour would strand sessions when the
 -- browser-side WebSocket died silently (tab crash, network drop, laptop
 -- sleep); the shell was still healthy but no recovery was possible without a
 -- server-side kill. Reclaim evicts the sitting relay without tearing down

@@ -22,6 +22,7 @@ RESTful HTTP API for frontend clients to interact with PhoenixIDE. Designed for 
 | GET | `/api/validate-cwd` | Validate directory path |
 | GET | `/api/list-directory` | List directory contents |
 | GET | `/api/models` | Get available models |
+| POST | `/api/suggest` | One-shot shell-command suggestion (capability-token gated, password-exempt; see `specs/command-suggestion`) |
 | GET | `/version` | Get server version |
 
 ## Data Types

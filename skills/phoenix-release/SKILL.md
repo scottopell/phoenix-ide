@@ -1,13 +1,13 @@
 ---
 name: phoenix-release
-description: Cut a new phoenix-ide version, push the tag, let GitHub Actions build and publish the binary, and replace the auto-generated release notes with a sub-agent-drafted, human-reviewable changelog. Use when the user says "cut a release", "publish a version", "ship vX.Y.Z", "tag a new release", or asks how to publish.
+description: Cut a new phoenix-ide version by merging a version-bump PR, which triggers GitHub Actions to tag, build, and publish the binary, then replace the auto-generated release notes with a sub-agent-drafted, human-reviewable changelog. Use when the user says "cut a release", "publish a version", "ship vX.Y.Z", "tag a new release", or asks how to publish.
 ---
 
 # Phoenix IDE Release
 
-End-to-end: version bump → tag → CI build → polished release notes posted via `gh release edit`.
+End-to-end: open a version-bump PR → merge it → CI tags, builds, and publishes the binary → replace the auto-generated notes with a polished, human-reviewable changelog via `gh release edit`.
 
-The CI half is fully automated (`.github/workflows/release.yml` fires on `v[0-9]+.*` tag push). The interesting work is (1) the version bump and (2) writing notes that a human would actually read.
+The CI half is fully automated. `.github/workflows/release.yml` fires when a change to `crates/phoenix-ide/Cargo.toml` lands on `main`; it reads the version, creates the `vX.Y.Z` tag **at that main commit**, and builds + publishes. Nobody pushes a tag by hand — that makes "tag is `v`-prefixed" and "tag points to a main commit" structural, not disciplinary. The interesting work is (1) the version bump and (2) writing notes that a human would actually read.
 
 ## Preconditions
 
@@ -27,33 +27,23 @@ git rev-list <last-tag>..HEAD --count   # how much accumulated
 
 Default bump is minor (`0.X.0 → 0.X+1.0`). Confirm with the user — never auto-pick the major bump. The pre-1.0 convention here is: minor for features and breaking-but-low-impact changes; only call something a major bump if there's a deliberate compatibility break the user has named.
 
-## Step 2 — Bump version, commit, tag, push (requires user authorization)
+## Step 2 — Open the version-bump PR (requires user authorization)
 
-Push and tag operations affect shared state and trigger CI. Get explicit go-ahead before running.
+The release is triggered by a bump landing on `main`, so this step opens the PR; merging it (Step 3) is what actually ships. Get explicit go-ahead before opening it.
 
-The shortest path is the helper script, which does all four steps (bump `crates/phoenix-ide/Cargo.toml`, commit `chore: bump version to X.Y.Z`, annotate tag `vX.Y.Z`, push `main` + tag):
-
-```bash
-./scripts/tag-release.sh vX.Y.Z
-```
-
-Or, if you prefer to do it by hand for visibility:
+The helper script bumps `crates/phoenix-ide/Cargo.toml` on a fresh branch off `origin/main`, commits, pushes, and opens the PR. It does **not** create a tag — the workflow does that on merge.
 
 ```bash
-# Edit crates/phoenix-ide/Cargo.toml: version = "X.Y.Z"
-cargo update -p phoenix_ide --offline
-git add crates/phoenix-ide/Cargo.toml Cargo.lock
-git commit -m "chore: bump version to X.Y.Z"
-git push origin main
-git tag vX.Y.Z
-git push origin vX.Y.Z
+./scripts/tag-release.sh vX.Y.Z   # the v-prefix is optional here; the script normalizes it
 ```
 
-Either way, the tag push fires `.github/workflows/release.yml`.
+It refuses if `vX.Y.Z` already exists (that version already shipped) or if Cargo.toml is already at that version. `main` is branch-protected — never try to commit the bump straight to `main`; it will be rejected. The script always routes through a branch + PR for exactly this reason.
 
-Tag push fires `.github/workflows/release.yml` → ~7 minutes on the typical history.
+You do *not* hand-craft or push a tag. A tag pushed by a human is the historical source of two failures this flow now prevents by construction: a missing `v` prefix (silently no-ops the old `v[0-9]+.*` trigger) and a tag pointing off-`main`. The workflow generates the `v`-prefixed tag at the merged main commit instead.
 
-## Step 3 — Wait for the build, verify the release
+## Step 3 — Merge the PR, wait for the build, verify the release
+
+Merge the bump PR (any merge strategy is fine — the workflow tags whatever `main` HEAD is after the merge, so the tag lands on `main` regardless). The merge fires `.github/workflows/release.yml`, which tags `vX.Y.Z` and builds → ~7 minutes on the typical history.
 
 ```bash
 gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId') --exit-status
@@ -62,7 +52,7 @@ gh release view vX.Y.Z --json url,assets -q '{url, assets: [.assets[].name]}'
 
 Expect: status `success`, one asset `phoenix_ide-x86_64-unknown-linux-musl`. The release body at this point is GitHub's auto-generated "What's Changed" list — keep it as a fallback but replace it in the next step.
 
-If the build fails, do not retry blindly. Open the run, read the failed step, fix the underlying issue, push, and let the next tag re-trigger. Never `--force` a tag — cut a patch version instead.
+If the build fails, do not retry blindly. Open the run, read the failed step, fix the underlying issue, and merge a fix. Because the tag is created only when a *new* version reaches `main`, a re-run of the same version is a no-op (the gate sees the tag already exists); ship the fix as the next patch version instead. Never `--force` a tag.
 
 ## Step 4 — Draft polished release notes via sub-agent
 
@@ -107,7 +97,7 @@ Print the URL back to the user. Done.
 
 ## Anti-patterns
 
-- **Bumping the version in a separate PR before the tag.** The bump commit *is* the tagged commit — that's why every prior release matches the pattern `chore: bump version to X.Y.Z` → tag at HEAD.
+- **Pushing a tag by hand.** Tagging is the workflow's job now. A hand-pushed tag is how you get a missing `v` prefix or a tag that points off-`main`; the merge-triggered flow exists to make both impossible. Bump via PR (Step 2) and let the merge tag for you.
 - **Force-pushing a tag to "fix" notes.** Re-edit the release body via `gh release edit` — the tag and binary stay valid.
 - **Letting the sub-agent post directly.** It does not see the verification step. Always human-review then post.
 - **Dropping the AI banner because "this one's really good".** It's a structural marker, not a quality disclaimer.

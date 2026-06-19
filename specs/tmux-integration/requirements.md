@@ -488,3 +488,28 @@ Phoenix MUST key tmux server ownership by `WorkScope`, derived from the persiste
 Managed/Branch continuations that share a worktree MUST share the same tmux socket/session. Direct-mode conversations continue to use the conversation fallback scope.
 
 The cleanup cascade MUST decide preservation by whether the scope is still owned by a live conversation other than the one being torn down: skip the kill/unlink iff `inheritor_scope == Some(work_scope)`, where `inheritor_scope` is `Some(work_scope)` iff a live conversation other than the deleted one resolves to that scope — a continuation that inherits it, or a live sibling such as a Work-mode sub-agent that shares its parent's scope. A live conversation here is one that is BOTH non-terminal in state AND not `archived`, determined from the persisted conversation rows in the DATABASE — NOT from the set of live runtime handles. A non-terminal conversation with no runtime handle (after a server restart or runtime eviction) is still a live owner; enumerating handles would tear down a scope whose surviving owner is handle-less. An archived conversation does not count as a live owner even while its state row still reads non-terminal, because archiving a chain archives earlier members before the leaf's cascade runs — counting one as live would preserve the scope and leak the tmux server. The deleted conversation is excluded from that enumeration: the cascade runs before its terminal-state write, so it still reads non-terminal, and excluding it is what lets the server tear down when it is the last live owner. Conversation-scope continuations always resolve to a different scope (their own conversation id), so the rule subsumes the "Direct continuations cannot inherit" case structurally without per-kind case-analysis.
+
+### REQ-TMUX-015: Companion Refresh on Reuse
+
+THE SYSTEM SHALL stamp every spawned tmux server's global environment with a
+companion version (`PHOENIX_COMPANION_VERSION`).
+
+WHEN `ensure_live` reuses a live server whose stamp is missing or older than the
+current version
+THE SYSTEM SHALL bring it up to date once, non-destructively, by:
+- advertising the `hyperlinks` terminal feature (`set -ag terminal-features`),
+- prepending the `phx` bin directory to new panes' `PATH` via `default-command`
+  (a `set-environment -g PATH` is ignored by tmux for new panes),
+- setting `PHOENIX_API_URL` / `PHOENIX_SUGGEST_TOKEN` in the global environment,
+- updating the stamp, and
+- emitting a one-time hint that a new window picks up `phx`.
+
+THE SYSTEM SHALL NOT recreate a live server to remediate staleness, since that
+would destroy the user's running panes and jobs; the already-open pane's frozen
+environment is handled by the hint, not by force.
+
+**Rationale:** The companion setup is applied at spawn, but a server created
+before the feature (or before an upgrade) is reused, not re-spawned. The stamp
+distinguishes a current server (no-op) from a stale one, and the refresh
+restores `phx` + OSC-8 for new windows without disrupting running work. See
+`specs/command-suggestion` and `design.md` §"Companion refresh on reuse".

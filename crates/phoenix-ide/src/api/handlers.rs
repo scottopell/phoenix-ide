@@ -26,8 +26,8 @@ use super::types::{
     FileViewerKind, GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse,
     ModelsResponse, NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery,
     ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse,
-    SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
-    ValidateCwdResponse,
+    SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse, TaskEntry,
+    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -186,6 +186,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/system-prompt",
             get(get_system_prompt),
         )
+        // One-shot shell-command suggestion. Stateless: a single LLM
+        // completion with no conversation, no tools, no persistence. The
+        // terminal renders results as click-to-run affordances.
+        .route("/api/suggest", post(suggest_handler))
         // Slug resolution (REQ-API-007)
         .route("/api/conversations/by-slug/:slug", get(get_by_slug))
         // Phoenix Chains v1 (REQ-CHN-003 / 004 / 005 / 007)
@@ -3339,6 +3343,49 @@ async fn rename_conversation(
 }
 
 // ============================================================
+// One-shot command suggestion
+// ============================================================
+
+/// `POST /api/suggest` — return suggested shell commands for a natural-language
+/// query. Stateless and tool-less: a single LLM completion, nothing executed or
+/// persisted server-side.
+async fn suggest_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<SuggestRequest>,
+) -> Result<Json<SuggestResponse>, AppError> {
+    // Capability-token gate: the endpoint is exempt from the password
+    // middleware, so authorization rests entirely on the scoped token the
+    // server injected into the PTY env (held by `phx`, never the password).
+    let provided = headers
+        .get("x-phoenix-suggest-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if provided.is_empty() || provided != state.suggest_token {
+        return Err(AppError::Forbidden(
+            "invalid or missing suggest token".to_string(),
+        ));
+    }
+
+    let query = req.query.trim();
+    if query.is_empty() {
+        return Err(AppError::BadRequest("query must not be empty".to_string()));
+    }
+
+    let llm = match &req.model {
+        Some(id) => state.llm_registry.get(id),
+        None => state.llm_registry.get_cheap_model(),
+    }
+    .ok_or_else(|| AppError::Internal("no LLM model available".to_string()))?;
+
+    let commands = crate::suggest::suggest_commands(query, llm)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(SuggestResponse { commands }))
+}
+
+// ============================================================
 // Slug Resolution (REQ-API-007)
 // ============================================================
 
@@ -5259,6 +5306,7 @@ pub(crate) mod hard_delete_cascade_tests {
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
         }
     }
 
@@ -7395,6 +7443,7 @@ mod upgrade_model_state_guard_tests {
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
         }
     }
 
@@ -7547,6 +7596,7 @@ mod file_read_tests {
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
         }
     }
 
