@@ -513,6 +513,9 @@ pub enum ErrorKind {
     Network,
     /// Bad request (400) - not retryable
     InvalidRequest,
+    /// Provider returned bytes we could not parse or understand (malformed SSE
+    /// event, unparseable body, unexpected content-block shape) - retryable
+    InvalidResponse,
     /// Server error (5xx) - retryable
     ServerError,
     /// Selected model is at capacity (`server_is_overloaded` / `slow_down`) - not retryable
@@ -534,9 +537,11 @@ impl ErrorKind {
     #[must_use]
     pub fn auto_retry_policy(&self) -> AutoRetryPolicy {
         match self {
-            Self::Network | Self::RateLimit | Self::ServerError | Self::TimedOut => {
-                AutoRetryPolicy::AutoRetryable
-            }
+            Self::Network
+            | Self::RateLimit
+            | Self::ServerError
+            | Self::InvalidResponse
+            | Self::TimedOut => AutoRetryPolicy::AutoRetryable,
             Self::Auth
             | Self::UsageLimitReached
             | Self::ServerOverloaded
@@ -565,6 +570,7 @@ impl ErrorKind {
             | Self::RateLimit
             | Self::Network
             | Self::ServerError
+            | Self::InvalidResponse
             | Self::ServerOverloaded
             | Self::UsageLimitReached
             | Self::TimedOut => UserResumePolicy::Resumable,
@@ -1635,8 +1641,9 @@ mod error_kind_tests {
     fn all_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {
         use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
         use ErrorKind::{
-            Auth, Cancelled, ContentFilter, ContextExhausted, InvalidRequest, Network, RateLimit,
-            ServerError, ServerOverloaded, SubAgentError, TimedOut, UsageLimitReached,
+            Auth, Cancelled, ContentFilter, ContextExhausted, InvalidRequest, InvalidResponse,
+            Network, RateLimit, ServerError, ServerOverloaded, SubAgentError, TimedOut,
+            UsageLimitReached,
         };
 
         let cases = [
@@ -1657,6 +1664,11 @@ mod error_kind_tests {
             ),
             (
                 ServerError,
+                AutoRetryPolicy::AutoRetryable,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                InvalidResponse,
                 AutoRetryPolicy::AutoRetryable,
                 UserResumePolicy::Resumable,
             ),

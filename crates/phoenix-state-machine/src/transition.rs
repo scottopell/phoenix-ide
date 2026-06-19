@@ -251,7 +251,10 @@ fn stamp_retry_count(display_data: &mut Option<serde_json::Value>, final_attempt
 fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
     match kind {
         ErrorKind::RateLimit => LlmAttemptReason::RateLimit,
-        ErrorKind::ServerError => LlmAttemptReason::ServerError,
+        // A malformed response is retryable; its transient retry banner reuses
+        // the `server_error` reason rather than widening the spec'd
+        // `{rate_limit, server_error, network}` wire set.
+        ErrorKind::ServerError | ErrorKind::InvalidResponse => LlmAttemptReason::ServerError,
         ErrorKind::Network | ErrorKind::TimedOut => LlmAttemptReason::Network,
         // Non-retryable kinds. `db::ErrorKind::is_auto_retryable` admits
         // exactly the four kinds matched above, and every caller guards on it
@@ -2922,6 +2925,16 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::InvalidResponse { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::InvalidResponse,
+                attempt,
+                recovery_in_progress: false,
+                resets_at: None,
+            }
+        }
         LlmOutcome::ServerOverloaded { message } => {
             let attempt = current_attempt(state);
             Event::LlmError {
@@ -3164,6 +3177,9 @@ pub fn llm_error_to_db_error(
         phoenix_core::domain::llm_error_kind::LlmErrorKind::Network => ErrorKind::Network,
         phoenix_core::domain::llm_error_kind::LlmErrorKind::InvalidRequest => {
             ErrorKind::InvalidRequest
+        }
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::InvalidResponse => {
+            ErrorKind::InvalidResponse
         }
         phoenix_core::domain::llm_error_kind::LlmErrorKind::ServerError => ErrorKind::ServerError,
         phoenix_core::domain::llm_error_kind::LlmErrorKind::ServerOverloaded => {

@@ -29,6 +29,12 @@ pub enum LlmErrorKind {
     Auth,
     /// Bad request (400) - not retryable
     InvalidRequest,
+    /// Provider returned bytes we could not parse or understand (malformed SSE
+    /// event, unparseable body, unexpected content-block shape). The request
+    /// was accepted; the *response* is at fault — a transient server/transport
+    /// problem (often a transparent base-URL gateway), so it is retryable and
+    /// user-resumable.
+    InvalidResponse,
     /// Content filter or safety block - not retryable
     #[allow(dead_code)] // Will be used when providers detect content filter responses
     ContentFilter,
@@ -79,7 +85,11 @@ impl LlmAttemptReason {
         match kind {
             LlmErrorKind::Network => Some(Self::Network),
             LlmErrorKind::RateLimit => Some(Self::RateLimit),
-            LlmErrorKind::ServerError => Some(Self::ServerError),
+            // A malformed response is retryable; on the wire its transient
+            // retry banner reuses the `server_error` reason (it is a
+            // server/transport fault from the client's view) rather than
+            // widening the spec'd `{rate_limit, server_error, network}` set.
+            LlmErrorKind::ServerError | LlmErrorKind::InvalidResponse => Some(Self::ServerError),
             // Non-retryable kinds never reach Effect::ScheduleRetry.
             LlmErrorKind::UsageLimitReached
             | LlmErrorKind::ServerOverloaded
@@ -95,7 +105,9 @@ impl LlmErrorKind {
     #[must_use]
     pub fn auto_retry_policy(self) -> AutoRetryPolicy {
         match self {
-            Self::Network | Self::RateLimit | Self::ServerError => AutoRetryPolicy::AutoRetryable,
+            Self::Network | Self::RateLimit | Self::ServerError | Self::InvalidResponse => {
+                AutoRetryPolicy::AutoRetryable
+            }
             Self::UsageLimitReached
             | Self::ServerOverloaded
             | Self::Auth
@@ -121,6 +133,7 @@ impl LlmErrorKind {
             | Self::Network
             | Self::RateLimit
             | Self::ServerError
+            | Self::InvalidResponse
             | Self::ServerOverloaded
             | Self::UsageLimitReached => UserResumePolicy::Resumable,
             Self::InvalidRequest | Self::ContentFilter | Self::ContextWindowExceeded => {

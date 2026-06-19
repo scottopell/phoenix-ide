@@ -56,6 +56,9 @@ pub enum LlmOutcome {
     },
     /// Server error (5xx) — retryable
     ServerError { status: u16, body: String },
+    /// Provider returned bytes we could not parse or understand (malformed SSE
+    /// event, unparseable body, unexpected content-block shape) — retryable.
+    InvalidResponse { message: String },
     /// Selected model is at capacity (`server_is_overloaded` / `slow_down`) — terminal,
     /// suggest a different model.
     ServerOverloaded { message: String },

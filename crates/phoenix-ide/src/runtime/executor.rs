@@ -5039,6 +5039,7 @@ fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind
         crate::llm::LlmErrorKind::UsageLimitReached => crate::db::ErrorKind::UsageLimitReached,
         crate::llm::LlmErrorKind::Network => crate::db::ErrorKind::Network,
         crate::llm::LlmErrorKind::InvalidRequest => crate::db::ErrorKind::InvalidRequest,
+        crate::llm::LlmErrorKind::InvalidResponse => crate::db::ErrorKind::InvalidResponse,
         crate::llm::LlmErrorKind::ServerError => crate::db::ErrorKind::ServerError,
         crate::llm::LlmErrorKind::ServerOverloaded => crate::db::ErrorKind::ServerOverloaded,
         crate::llm::LlmErrorKind::ContentFilter => crate::db::ErrorKind::ContentFilter,
@@ -5084,6 +5085,9 @@ fn llm_error_to_outcome(error: crate::llm::LlmError) -> LlmOutcome {
         LlmErrorKind::ServerError => LlmOutcome::ServerError {
             status: 500,
             body: error.message,
+        },
+        LlmErrorKind::InvalidResponse => LlmOutcome::InvalidResponse {
+            message: error.message,
         },
         LlmErrorKind::ServerOverloaded => LlmOutcome::ServerOverloaded {
             message: error.message,
@@ -5181,6 +5185,10 @@ mod error_mapping_tests {
             "ServerError must map to ServerError"
         );
         assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::InvalidResponse),
+            crate::db::ErrorKind::InvalidResponse
+        );
+        assert_eq!(
             llm_error_to_db_error(LlmErrorKind::ContentFilter),
             crate::db::ErrorKind::ContentFilter
         );
@@ -5220,6 +5228,35 @@ mod error_mapping_tests {
         assert!(
             db_error.is_auto_retryable(),
             "ServerError must be retryable after mapping to db::ErrorKind"
+        );
+    }
+
+    #[test]
+    fn test_invalid_response_is_retryable_and_resumable_after_mapping() {
+        // A malformed *response* (parse failure, unexpected block shape) is a
+        // server/transport fault, not a bad request: it must stay both
+        // auto-retryable and user-resumable so a transient blip does not
+        // dead-end the conversation and discard already-billed output.
+        let db_error = llm_error_to_db_error(LlmErrorKind::InvalidResponse);
+        assert!(
+            db_error.is_auto_retryable(),
+            "InvalidResponse must be auto-retryable after mapping to db::ErrorKind"
+        );
+        assert!(
+            db_error.is_user_resumable(),
+            "InvalidResponse must be user-resumable after mapping to db::ErrorKind"
+        );
+    }
+
+    #[test]
+    fn test_invalid_response_outcome_is_not_request_rejected() {
+        // RequestRejected is terminal/non-resumable; InvalidResponse must take
+        // the retryable outcome path instead.
+        let outcome =
+            llm_error_to_outcome(crate::llm::LlmError::invalid_response("garbled SSE event"));
+        assert!(
+            matches!(outcome, LlmOutcome::InvalidResponse { .. }),
+            "invalid_response must map to LlmOutcome::InvalidResponse, got {outcome:?}"
         );
     }
 }

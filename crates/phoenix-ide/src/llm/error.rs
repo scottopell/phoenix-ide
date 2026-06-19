@@ -86,7 +86,7 @@ pub use phoenix_core::domain::llm_error_kind::{LlmAttemptReason, LlmErrorKind};
 
 impl LlmError {
     pub fn invalid_response(message: impl Into<String>) -> Self {
-        Self::new(LlmErrorKind::InvalidRequest, message)
+        Self::new(LlmErrorKind::InvalidResponse, message)
     }
 
     pub fn from_http_status(status: u16, body: &str) -> Self {
@@ -400,8 +400,8 @@ mod tests {
         use phoenix_core::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
         use AutoRetryPolicy::{AutoRetryable, NoAutoRetry};
         use LlmErrorKind::{
-            Auth, ContentFilter, ContextWindowExceeded, InvalidRequest, Network, RateLimit,
-            ServerError, ServerOverloaded, UsageLimitReached,
+            Auth, ContentFilter, ContextWindowExceeded, InvalidRequest, InvalidResponse, Network,
+            RateLimit, ServerError, ServerOverloaded, UsageLimitReached,
         };
         use UserResumePolicy::{NotResumable, Resumable};
 
@@ -410,6 +410,7 @@ mod tests {
             (RateLimit, AutoRetryable, Resumable),
             (UsageLimitReached, NoAutoRetry, Resumable),
             (ServerError, AutoRetryable, Resumable),
+            (InvalidResponse, AutoRetryable, Resumable),
             (ServerOverloaded, NoAutoRetry, Resumable),
             (Auth, NoAutoRetry, Resumable),
             (InvalidRequest, NoAutoRetry, NotResumable),
