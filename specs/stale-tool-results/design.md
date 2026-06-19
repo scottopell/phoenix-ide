@@ -100,27 +100,45 @@ within that reach may actually be cleared. The `Tool` trait gains the capability
 trait Tool {
     // ...
     /// Whether a stale result from this tool may be cleared from the model's
-    /// view. True only when re-invoking the tool reproduces the information —
-    /// the result carries no state that cannot be recovered.
+    /// view. True when the tool reads re-queryable state — the agent can
+    /// re-invoke it to re-obtain what it needs about the current state, so
+    /// dropping an old result loses only a stale snapshot, not irreplaceable
+    /// information.
     fn clearable(&self) -> bool { false }
 }
 ```
 
 The default is `false`: a newly added tool is never silently cleared. A tool opts
-in only when its output is reconstructable by re-invocation. The read-heavy tools
-whose output dominates a long session opt in — `read_file`, `bash`, `search`,
-`keyword_search`, `read_image`, the browser read tools, the tmux and terminal
-history tools, `process_inspection`. Tools whose result is unreproducible or
-consequential do not: `ask_user_question` (the human's typed answer cannot be
-regenerated), `think`, `propose_task`, the subagent `submit_result` /
-`submit_error` handoffs, and `patch` (its result records a mutation that
-re-invocation would not reproduce).
+in only when it *reads state the agent can query again*. Crucially, the test is
+not byte-reproducibility: in a workspace the agent mutates, re-reading a file
+yields its current content, not the earlier snapshot, so no read is
+byte-reproducible. The premise of clearing (REQ-STR-002) is that the *exact prior
+snapshot* of a re-queryable read is low-value once the agent has acted on it — if
+the agent needs current state it re-reads — so sacrificing that snapshot is
+acceptable. The read-heavy tools whose output dominates a long session opt in on
+that basis — `read_file`, `bash`, `search`, `keyword_search`, `read_image`, the
+browser read tools, the tmux and terminal history tools, `process_inspection`.
+
+Tools whose result is *not* a re-queryable read do not opt in, because their
+result is the sole record of something the agent cannot re-obtain:
+`ask_user_question` (the human's typed answer is gone if dropped), `think`,
+`propose_task`, the subagent `submit_result` / `submit_error` handoffs, and
+`patch` (its result records that a change was applied — an event, not a queryable
+state). For these, REQ-STR-002 forbids removal outright.
+
+`bash` carries a caveat folded into this tradeoff: it can have side effects, so
+re-invoking it to re-obtain state is not always free or safe. Clearing never
+re-runs `bash` — it only drops the old *output* from the model's view — and the
+accepted position is that a stale command's output is a low-value snapshot; if
+the agent needs the information it decides whether re-running is appropriate. A
+tool whose output must never be dropped even though it nominally "reads" should
+leave `clearable()` false.
 
 A `false` default plus an explicit per-tool opt-in makes "this tool was never
 considered for clearing" structurally distinct from "this tool's output is safe
-to clear" — the recoverability decision is in the type, not in a comment or an
-allowlist that drifts from the tool set. An unclearable result at or before the
-watermark is left intact; the watermark passing it by does not clear it.
+to clear" — the decision is in the type, not in a comment or an allowlist that
+drifts from the tool set. An unclearable result at or before the watermark is
+left intact; the watermark passing it by does not clear it.
 
 The pass needs the producing tool for each tool result to look up clearability.
 The tool name is carried on the assistant `ToolUse` block paired with each
