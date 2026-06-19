@@ -54,6 +54,7 @@ if [[ "$CURRENT" != "$VERSION" ]]; then
     fi
     git -C "$ROOT" add crates/phoenix-ide/Cargo.toml Cargo.lock
     git -C "$ROOT" commit -m "chore: bump version to $VERSION"
+    BUMP_COMMITTED=1
     ok "Version bumped"
 else
     info "Version already $VERSION — no bump needed"
@@ -62,6 +63,35 @@ fi
 SHA=$(git -C "$ROOT" rev-parse --short HEAD)
 info "Tagging $SHA as $TAG"
 git -C "$ROOT" tag -a "$TAG" -m "$TAG"
-git -C "$ROOT" push origin main "$TAG"
+
+# Push the TAG ONLY. `main` is branch-protected (changes must go through a
+# PR), so a direct `git push origin main` is rejected. The tag ref is not
+# covered by branch protection, and pushing it carries the bump commit's
+# objects to the remote — so CI checks out the tag and builds the binary
+# even though `main` has not advanced yet.
+git -C "$ROOT" push origin "$TAG"
 ok "Pushed $TAG — GitHub Actions will build and publish the release."
 printf '\033[0;90m  https://github.com/scottopell/phoenix-ide/releases/tag/%s\033[0m\n' "$TAG"
+
+# The bump commit still has to land on `main`. It is at local HEAD; move it
+# onto its own branch, restore local `main` to the remote, and open a PR.
+if [[ -z "${BUMP_COMMITTED:-}" ]]; then
+    info "Version was already $VERSION — no bump commit to land on main."
+    exit 0
+fi
+
+BRANCH="chore/bump-${VERSION}"
+info "Landing the bump on main via PR (branch protection blocks direct push)"
+git -C "$ROOT" branch "$BRANCH" HEAD
+git -C "$ROOT" reset --hard origin/main
+git -C "$ROOT" push -u origin "$BRANCH"
+
+if command -v gh >/dev/null 2>&1; then
+    (cd "$ROOT" && gh pr create --base main --head "$BRANCH" \
+        --title "chore: bump version to $VERSION" \
+        --body "Version bump for the $TAG release. Tag is already pushed and CI builds the binary from the bump commit; this PR lands the bump on \`main\` (direct push blocked by branch protection).") \
+        && ok "Opened bump PR — merge it to bring main's version up to $VERSION."
+else
+    info "gh not found — open the bump PR manually:"
+    printf '    https://github.com/scottopell/phoenix-ide/pull/new/%s\n' "$BRANCH"
+fi
