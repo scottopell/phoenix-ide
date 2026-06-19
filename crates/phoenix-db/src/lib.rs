@@ -1917,6 +1917,43 @@ impl Database {
         Ok(())
     }
 
+    /// Read the conversation's clear watermark (stale tool-result clearing,
+    /// specs/stale-tool-results). Returns 0 for a conversation with nothing
+    /// cleared yet, or one that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_clear_watermark(&self, id: &str) -> DbResult<i64> {
+        let watermark: Option<i64> =
+            sqlx::query_scalar("SELECT clear_watermark FROM conversations WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(watermark.unwrap_or(0))
+    }
+
+    /// Advance the conversation's clear watermark. The retention pass only ever
+    /// moves it forward; this method writes whatever value it is given, so the
+    /// monotonic invariant is the caller's responsibility (the sweep computes a
+    /// value >= the prior watermark).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the conversation does not exist or the
+    /// underlying database operation fails.
+    pub async fn update_clear_watermark(&self, id: &str, watermark: i64) -> DbResult<()> {
+        let result = sqlx::query("UPDATE conversations SET clear_watermark = ?1 WHERE id = ?2")
+            .bind(watermark)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     /// Create a fresh Work conversation for an approved-task handoff and link
     /// the Explore predecessor through `continued_in_conv_id`.
     ///

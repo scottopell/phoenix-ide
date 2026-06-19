@@ -70,13 +70,44 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 100 * 1024;
 /// error rather than a silently-trimmed batch.
 const MAX_SUB_AGENTS_PER_SPAWN: usize = 10;
 
-/// Number of most-recent tool rounds whose persisted screenshots are replayed
-/// to the LLM. Older tool rounds have their base64 images replaced with a short
-/// text placeholder when history is assembled, bounding the permanent image
-/// prefix (≈30k tokens for 20 screenshots otherwise). 2 keeps the current and
-/// immediately-prior round's visual context, which is what the model usually
-/// needs to reason about a just-taken screenshot.
-const IMAGE_HISTORY_ROUNDS: usize = 2;
+// ── Stale tool-result clearing (specs/stale-tool-results) ───────────────────
+// As a session grows, the bodies of old, re-queryable tool results (file
+// reads, command output, screenshots) become dead weight that is re-sent and
+// re-billed every turn. Clearing replaces them with a placeholder once the
+// request approaches the context window, governed by a monotonic per-conversation
+// watermark so the cleared prefix stays stable turn-over-turn and the prompt
+// cache is preserved (REQ-STR-007). This subsumes the former image-only
+// retirement window — one mechanism now governs a result's text and images.
+
+/// Recency floor: the most recent this-many tool rounds are always sent in full
+/// (REQ-STR-003). Covers the agent's working set and the trailing tool result
+/// the last cache breakpoint anchors on, and is >= the two rounds of visual
+/// context the prior image window preserved.
+const KEEP_RECENT_ROUNDS: usize = 3;
+
+/// Clearing activates once estimated input tokens exceed this fraction
+/// (numerator/denominator) of the model context window (REQ-STR-001).
+const CLEAR_TRIGGER_NUM: usize = 7;
+const CLEAR_TRIGGER_DEN: usize = 10;
+
+/// A sweep advances the watermark until estimated usage falls under this
+/// fraction of the context window, spacing sweeps several turns apart.
+const CLEAR_TARGET_NUM: usize = 5;
+const CLEAR_TARGET_DEN: usize = 10;
+
+/// Minimum tokens a sweep must free or the watermark holds this turn, bounding
+/// how often a sweep disturbs the cached prefix (REQ-STR-006).
+const CLEAR_AT_LEAST_TOKENS: usize = 8192;
+
+/// Placeholder body sent in place of a cleared tool result. The paired
+/// `tool_use` block is preserved, so this is never a silent gap (REQ-STR-004).
+const CLEARED_TOOL_RESULT_PLACEHOLDER: &str = "[tool result cleared to save context]";
+
+/// Approximate wire token cost of one image block. A flattened-and-replayed
+/// image still costs a fixed block of tokens; this drives both the budget
+/// estimator and the clearing sweep so image-heavy rounds register their true
+/// weight (REQ-STR-006, REQ-STR-011).
+const IMAGE_TOKEN_ESTIMATE: usize = 1500;
 
 /// Truncate `text` to at most [`MAX_TOOL_OUTPUT_BYTES`] bytes, keeping a head
 /// and tail slice joined by a marker that records how much was dropped.
@@ -324,72 +355,287 @@ async fn forward_llm_outcome(
     let _ = llm_outcome_tx.send((generation, llm_outcome)).await;
 }
 
-/// Indices into `db_messages` of the tool-result messages whose screenshots are
-/// retained when building the LLM message list.
-///
-/// Base64 images persisted in tool results replay in every LLM request forever
-/// (20 screenshots is ~30k permanent prefix tokens), so only the most recent
-/// `IMAGE_HISTORY_ROUNDS` tool *rounds* keep their images; older rounds are
-/// placeholdered by the caller.
-///
-/// Retention is counted by round, not by message. A round is one assistant
-/// tool-use turn plus the tool-result message(s) that answer it: a single
-/// assistant turn issuing several `tool_use` blocks produces several
-/// tool-result messages that all belong to one round. Counting messages would
-/// drop the earliest screenshots of a single recent multi-screenshot round; a
-/// kept round must retain all of its screenshots, and a round older than the
-/// window is fully placeholdered.
-///
-/// A new round opens at each `Agent` message that contains at least one
-/// `ToolUse` block; every tool-result message is attributed to the most
-/// recently opened round. The last `IMAGE_HISTORY_ROUNDS` distinct rounds that
-/// actually contain tool-result messages are kept.
-fn tool_msg_indices_keeping_images(
+/// The outcome of planning a stale tool-result clearing sweep over one
+/// conversation's history (specs/stale-tool-results).
+#[derive(Debug, Default, Clone)]
+struct ClearPlan {
+    /// The watermark after this turn's (possible) advance — persisted back to
+    /// the conversation. Monotonic: always >= the prior watermark.
+    new_watermark: i64,
+    /// All clearable tool-result `tool_use_id`s at or before `new_watermark` —
+    /// the full set to render as placeholders this turn (stable across turns).
+    cleared_tool_use_ids: std::collections::HashSet<String>,
+    /// Tokens freed by *this* turn's advance (newly cleared results only).
+    freed_tokens: usize,
+    /// Number of results newly cleared by this turn's advance.
+    cleared_count: usize,
+}
+
+/// A tool-result message reduced to the facts the clearing planner decides over.
+struct ToolResultFacts {
+    sequence_id: i64,
+    round: usize,
+    clearable: bool,
+    token_estimate: usize,
+    tool_use_id: String,
+}
+
+/// Image-aware token estimate for a persisted tool result: its text body plus a
+/// fixed cost per image block (REQ-STR-006, REQ-STR-011).
+fn estimate_tool_result_tokens(content: &str, image_count: usize) -> usize {
+    estimate_text_tokens(content) + image_count * IMAGE_TOKEN_ESTIMATE
+}
+
+/// Attribute each tool-result message to a round and gather the facts the
+/// planner needs. A round opens at each `Agent` message carrying a `ToolUse`
+/// block; every tool-result message belongs to the most recently opened round
+/// (the first round is numbered 0). `max_round` is the highest round seen.
+fn collect_tool_result_facts(
     db_messages: &[crate::db::Message],
-) -> std::collections::HashSet<usize> {
+    clearable_tool_names: &std::collections::HashSet<String>,
+) -> (Vec<ToolResultFacts>, usize) {
     use crate::db::MessageContent;
     use crate::llm::ContentBlock as LlmContentBlock;
 
-    // (message index, owning round number) for each tool-result message.
-    let mut tool_round_of: Vec<(usize, usize)> = Vec::new();
+    // tool_use_id -> producing tool name, from assistant tool_use blocks.
+    let mut tool_name_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for m in db_messages {
+        if let MessageContent::Agent(blocks) = &m.content {
+            for b in blocks {
+                if let LlmContentBlock::ToolUse { id, name, .. } = b {
+                    tool_name_of.insert(id.as_str(), name.as_str());
+                }
+            }
+        }
+    }
+
+    let mut facts: Vec<ToolResultFacts> = Vec::new();
     let mut current_round: usize = 0;
+    let mut max_round: usize = 0;
     let mut opened_a_round = false;
-    for (i, m) in db_messages.iter().enumerate() {
+    for m in db_messages {
         match &m.content {
             MessageContent::Agent(blocks) => {
                 if blocks
                     .iter()
                     .any(|b| matches!(b, LlmContentBlock::ToolUse { .. }))
                 {
-                    // Bump only after the first tool-use turn so the first round
-                    // is numbered 0.
                     if opened_a_round {
                         current_round += 1;
                     }
                     opened_a_round = true;
                 }
             }
-            MessageContent::Tool(_) => tool_round_of.push((i, current_round)),
+            MessageContent::Tool(tc) => {
+                let name = tool_name_of
+                    .get(tc.tool_use_id.as_str())
+                    .copied()
+                    .unwrap_or("");
+                facts.push(ToolResultFacts {
+                    sequence_id: m.sequence_id,
+                    round: current_round,
+                    clearable: clearable_tool_names.contains(name),
+                    token_estimate: estimate_tool_result_tokens(&tc.content, tc.images.len()),
+                    tool_use_id: tc.tool_use_id.clone(),
+                });
+                max_round = current_round;
+            }
             _ => {}
         }
     }
+    (facts, max_round)
+}
 
-    // Distinct rounds that contain tool-result messages, newest-first; keep the
-    // last `IMAGE_HISTORY_ROUNDS` so every message in a kept round survives.
-    let mut rounds_with_tools: Vec<usize> = tool_round_of.iter().map(|(_, r)| *r).collect();
-    rounds_with_tools.sort_unstable();
-    rounds_with_tools.dedup();
-    let kept_rounds: std::collections::HashSet<usize> = rounds_with_tools
+/// Plan a stale tool-result clearing sweep (specs/stale-tool-results.allium).
+///
+/// Returns the (monotonically non-decreasing) watermark for this turn and the
+/// full set of clearable results at or before it. The watermark advances only
+/// when usage is over the high-water mark, never into the recency floor, and
+/// only when the candidate sweep frees at least `CLEAR_AT_LEAST_TOKENS`.
+fn plan_tool_result_clearing(
+    db_messages: &[crate::db::Message],
+    clearable_tool_names: &std::collections::HashSet<String>,
+    prior_watermark: i64,
+    estimated_input_tokens: usize,
+    context_window: usize,
+) -> ClearPlan {
+    let (facts, max_round) = collect_tool_result_facts(db_messages, clearable_tool_names);
+
+    // Recency floor: rounds at or above `floor_first_round` are never cleared.
+    let floor_first_round = (max_round + 1).saturating_sub(KEEP_RECENT_ROUNDS);
+
+    // Candidate sweep: clearable, not yet cleared, outside the floor.
+    let eligible_freed: usize = facts
         .iter()
-        .rev()
-        .take(IMAGE_HISTORY_ROUNDS)
-        .copied()
+        .filter(|f| f.clearable && f.sequence_id > prior_watermark && f.round < floor_first_round)
+        .map(|f| f.token_estimate)
+        .sum();
+
+    let trigger = context_window * CLEAR_TRIGGER_NUM / CLEAR_TRIGGER_DEN;
+    let target = context_window * CLEAR_TARGET_NUM / CLEAR_TARGET_DEN;
+
+    let mut new_watermark = prior_watermark;
+    if estimated_input_tokens > trigger && eligible_freed >= CLEAR_AT_LEAST_TOKENS {
+        // Advance whole rounds from the oldest clearable round toward the floor,
+        // stopping once usage falls under the target (and a worthwhile amount is
+        // freed) or the floor is reached.
+        let mut running = estimated_input_tokens;
+        let mut freed_so_far = 0usize;
+        for round in 0..floor_first_round {
+            let round_freed: usize = facts
+                .iter()
+                .filter(|f| f.round == round && f.clearable && f.sequence_id > new_watermark)
+                .map(|f| f.token_estimate)
+                .sum();
+            if let Some(round_max_seq) = facts
+                .iter()
+                .filter(|f| f.round == round)
+                .map(|f| f.sequence_id)
+                .max()
+            {
+                new_watermark = new_watermark.max(round_max_seq);
+            }
+            freed_so_far += round_freed;
+            running = running.saturating_sub(round_freed);
+            if running <= target && freed_so_far >= CLEAR_AT_LEAST_TOKENS {
+                break;
+            }
+        }
+    }
+
+    // The cleared set is every clearable result at or before the (advanced)
+    // watermark — stable turn-over-turn. Freed/count cover only what *this*
+    // advance newly cleared, for the log line (REQ-STR-008).
+    let cleared_tool_use_ids: std::collections::HashSet<String> = facts
+        .iter()
+        .filter(|f| f.clearable && f.sequence_id <= new_watermark)
+        .map(|f| f.tool_use_id.clone())
         .collect();
-    tool_round_of
+    let (freed_tokens, cleared_count) = facts
         .iter()
-        .filter(|(_, round)| kept_rounds.contains(round))
-        .map(|(idx, _)| *idx)
-        .collect()
+        .filter(|f| {
+            f.clearable && f.sequence_id > prior_watermark && f.sequence_id <= new_watermark
+        })
+        .fold((0usize, 0usize), |(tok, cnt), f| {
+            (tok + f.token_estimate, cnt + 1)
+        });
+
+    ClearPlan {
+        new_watermark,
+        cleared_tool_use_ids,
+        freed_tokens,
+        cleared_count,
+    }
+}
+
+/// Fold persisted messages into the provider-agnostic LLM message list.
+///
+/// A tool result whose `tool_use_id` is in `cleared_tool_use_ids` is rendered
+/// as a fixed placeholder with no image blocks (stale tool-result clearing,
+/// specs/stale-tool-results); the paired `tool_use` block is left intact, so a
+/// cleared result is never a silent gap. Every other tool result is sent
+/// verbatim with its images. The persisted messages are never mutated — the
+/// cleared form exists only in the returned list for this one request.
+fn render_messages(
+    db_messages: &[crate::db::Message],
+    cleared_tool_use_ids: &std::collections::HashSet<String>,
+) -> Vec<LlmMessage> {
+    use crate::db::{MessageContent, ToolContent};
+    use crate::llm::ImageSource;
+
+    let mut messages = Vec::new();
+    for msg in db_messages {
+        match &msg.content {
+            MessageContent::User(user_content) => {
+                // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
+                // the model sees the fully resolved form while the DB stores the shorthand.
+                let mut text_for_llm = user_content.llm_text().to_string();
+                if !user_content.files.is_empty() {
+                    for file in &user_content.files {
+                        text_for_llm.push('\n');
+                        text_for_llm.push_str(&file.llm_context_tag());
+                    }
+                }
+                let mut content = vec![ContentBlock::text(text_for_llm)];
+
+                // Add images (REQ-BED-013)
+                for img in &user_content.images {
+                    content.push(ContentBlock::Image {
+                        source: img.to_image_source(),
+                    });
+                }
+
+                messages.push(LlmMessage {
+                    role: MessageRole::User,
+                    content,
+                });
+            }
+
+            MessageContent::Agent(blocks) => {
+                messages.push(LlmMessage {
+                    role: MessageRole::Assistant,
+                    content: blocks.clone(),
+                });
+            }
+
+            MessageContent::Tool(ToolContent {
+                tool_use_id,
+                content,
+                is_error,
+                images,
+            }) => {
+                // Cleared results render as a placeholder with no images; kept
+                // results carry their body and any images verbatim (REQ-STR-004,
+                // REQ-STR-011).
+                let (text, image_sources): (String, Vec<ImageSource>) =
+                    if cleared_tool_use_ids.contains(tool_use_id) {
+                        (CLEARED_TOOL_RESULT_PLACEHOLDER.to_string(), Vec::new())
+                    } else {
+                        let sources = images
+                            .iter()
+                            .map(|img| ImageSource::Base64 {
+                                media_type: img.media_type.clone(),
+                                data: img.data.clone(),
+                            })
+                            .collect();
+                        (content.clone(), sources)
+                    };
+
+                // Tool results go in user message
+                messages.push(LlmMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: text,
+                        images: image_sources,
+                        is_error: *is_error,
+                    }],
+                });
+            }
+
+            // Skill messages are delivered as user-role messages (REQ-SK-002)
+            MessageContent::Skill(skill_content) => {
+                let mut body = skill_content.body.clone();
+                for file in &skill_content.files {
+                    body.push('\n');
+                    body.push_str(&file.llm_context_tag());
+                }
+                messages.push(LlmMessage {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::text(body)],
+                });
+            }
+
+            // Ignore system, error, and continuation messages.
+            // System messages are UI-only bookkeeping (restart markers, task
+            // file renames, diff snapshots). LLM-directed messages use
+            // MessageContent::User with is_meta (e.g., grace turn prompt).
+            MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_) => {}
+        }
+    }
+    messages
 }
 
 /// Decide whether `path` is inside the worktree rooted at `root`.
@@ -2933,6 +3179,7 @@ where
         let tool_executor = self.tool_executor.clone();
         let storage = self.storage.clone();
         let conv_id = self.context.conversation_id.clone();
+        let context_window = self.context.context_window;
         let root_conv_id = self.context.root_conversation_id.clone();
         let model_id = self.context.model_id.clone();
         let working_dir = self.context.working_dir.clone();
@@ -3023,14 +3270,47 @@ where
                 );
             }
 
-            // Build messages from history
-            let messages = match Self::build_llm_messages_static(&storage, &conv_id).await {
+            // Build messages from history, applying stale tool-result clearing
+            // (specs/stale-tool-results). Plan a sweep against the persisted
+            // watermark; persist any advance; render the cleared history.
+            let db_messages = match storage.get_messages(&conv_id).await {
                 Ok(m) => m,
                 Err(e) => {
                     // Build error → treated as InvalidRequest
                     let _ = llm_tx.send(LlmOutcome::NetworkError { message: e });
                     return;
                 }
+            };
+            let clearable_names = tool_executor.clearable_tool_names();
+            let full_messages = render_messages(&db_messages, &std::collections::HashSet::new());
+            let estimated_input: usize = full_messages.iter().map(estimate_message_tokens).sum();
+            let prior_watermark = storage.get_clear_watermark(&conv_id).await.unwrap_or(0);
+            let plan = plan_tool_result_clearing(
+                &db_messages,
+                &clearable_names,
+                prior_watermark,
+                estimated_input,
+                context_window,
+            );
+            if plan.new_watermark != prior_watermark {
+                if let Err(e) = storage
+                    .set_clear_watermark(&conv_id, plan.new_watermark)
+                    .await
+                {
+                    tracing::warn!(conv_id = %conv_id, error = %e, "failed to persist clear watermark");
+                }
+                tracing::debug!(
+                    conv_id = %conv_id,
+                    cleared_results = plan.cleared_count,
+                    freed_tokens = plan.freed_tokens,
+                    watermark = plan.new_watermark,
+                    "stale tool-result clearing swept old results",
+                );
+            }
+            let messages = if plan.cleared_tool_use_ids.is_empty() {
+                full_messages
+            } else {
+                render_messages(&db_messages, &plan.cleared_tool_use_ids)
             };
 
             // Build system prompt with AGENTS.md content + mode context
@@ -3683,119 +3963,11 @@ where
         storage: &S,
         conv_id: &str,
     ) -> Result<Vec<LlmMessage>, String> {
-        use crate::db::{MessageContent, ToolContent};
-        use crate::llm::ImageSource;
-
         let db_messages = storage.get_messages(conv_id).await?;
-
-        // Prune aged screenshots from replayed history (token bound): keep
-        // images only for tool-result messages in the most recent
-        // `IMAGE_HISTORY_ROUNDS` tool rounds; older ones become placeholders.
-        // Retention is by round, not by message — see
-        // `tool_msg_indices_keeping_images`.
-        let kept_tool_msg_indices = tool_msg_indices_keeping_images(&db_messages);
-
-        let mut messages = Vec::new();
-
-        for (msg_idx, msg) in db_messages.into_iter().enumerate() {
-            match &msg.content {
-                MessageContent::User(user_content) => {
-                    // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
-                    // the model sees the fully resolved form while the DB stores the shorthand.
-                    let mut text_for_llm = user_content.llm_text().to_string();
-                    if !user_content.files.is_empty() {
-                        for file in &user_content.files {
-                            text_for_llm.push('\n');
-                            text_for_llm.push_str(&file.llm_context_tag());
-                        }
-                    }
-                    let mut content = vec![ContentBlock::text(text_for_llm)];
-
-                    // Add images (REQ-BED-013)
-                    for img in &user_content.images {
-                        content.push(ContentBlock::Image {
-                            source: img.to_image_source(),
-                        });
-                    }
-
-                    messages.push(LlmMessage {
-                        role: MessageRole::User,
-                        content,
-                    });
-                }
-
-                MessageContent::Agent(blocks) => {
-                    messages.push(LlmMessage {
-                        role: MessageRole::Assistant,
-                        content: blocks.clone(),
-                    });
-                }
-
-                MessageContent::Tool(ToolContent {
-                    tool_use_id,
-                    content,
-                    is_error,
-                    images,
-                }) => {
-                    // Aged tool rounds drop their images: replace each with a
-                    // text placeholder and send no image blocks. Tool messages
-                    // belonging to a kept round (within the last
-                    // `IMAGE_HISTORY_ROUNDS` rounds) keep their images verbatim.
-                    let keep_images = kept_tool_msg_indices.contains(&msg_idx);
-                    let (text, image_sources): (String, Vec<ImageSource>) =
-                        if keep_images || images.is_empty() {
-                            let sources = images
-                                .iter()
-                                .map(|img| ImageSource::Base64 {
-                                    media_type: img.media_type.clone(),
-                                    data: img.data.clone(),
-                                })
-                                .collect();
-                            (content.clone(), sources)
-                        } else {
-                            let mut text = content.clone();
-                            for _ in 0..images.len() {
-                                text.push_str("\n[screenshot omitted from history]");
-                            }
-                            (text, Vec::new())
-                        };
-
-                    // Tool results go in user message
-                    messages.push(LlmMessage {
-                        role: MessageRole::User,
-                        content: vec![ContentBlock::ToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            content: text,
-                            images: image_sources,
-                            is_error: *is_error,
-                        }],
-                    });
-                }
-
-                // Skill messages are delivered as user-role messages (REQ-SK-002)
-                MessageContent::Skill(skill_content) => {
-                    let mut body = skill_content.body.clone();
-                    for file in &skill_content.files {
-                        body.push('\n');
-                        body.push_str(&file.llm_context_tag());
-                    }
-                    messages.push(LlmMessage {
-                        role: MessageRole::User,
-                        content: vec![ContentBlock::text(body)],
-                    });
-                }
-
-                // Ignore system, error, and continuation messages.
-                // System messages are UI-only bookkeeping (restart markers, task
-                // file renames, diff snapshots). LLM-directed messages use
-                // MessageContent::User with is_meta (e.g., grace turn prompt).
-                MessageContent::System(_)
-                | MessageContent::Error(_)
-                | MessageContent::Continuation(_) => {}
-            }
-        }
-
-        Ok(messages)
+        Ok(render_messages(
+            &db_messages,
+            &std::collections::HashSet::new(),
+        ))
     }
 
     /// Request continuation summary from LLM (REQ-BED-020)
@@ -4460,7 +4632,6 @@ fn estimate_message_tokens(msg: &LlmMessage) -> usize {
     use crate::llm::ContentBlock;
     // A flattened-and-replayed image still costs a fixed block of tokens on the
     // wire; approximate rather than under-count it to zero.
-    const IMAGE_TOKEN_ESTIMATE: usize = 1500;
     let content: usize = msg
         .content
         .iter()
@@ -8517,27 +8688,30 @@ mod tool_output_cap_tests {
     }
 }
 
-/// Screenshot retention is counted by tool *round*, not by tool-result message.
-/// One assistant tool-use turn can produce several tool-result messages; all of
-/// them must survive together when the round is within the last
-/// `IMAGE_HISTORY_ROUNDS`, and an older round must be fully placeholdered.
+/// Stale tool-result clearing (specs/stale-tool-results): the planner advances a
+/// monotonic watermark under context pressure, never into the recency floor and
+/// only for re-queryable (clearable) results; the renderer placeholders cleared
+/// results and preserves kept ones with their images.
 #[cfg(test)]
-mod image_retention_by_round_tests {
+mod stale_tool_result_clearing_tests {
     use super::*;
     use crate::db::{MessageContent, ToolContentImage};
-    use crate::llm::{ContentBlock, ImageSource, MessageRole};
-    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::llm::{ContentBlock, MessageRole};
+    use crate::runtime::testing::InMemoryStorage;
     use crate::runtime::traits::MessageStore;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
-    type TestRuntime =
-        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
-
-    fn png(tag: &str) -> ToolContentImage {
-        ToolContentImage {
-            media_type: "image/png".to_string(),
-            data: format!("data-{tag}"),
-        }
+    // Each image is IMAGE_TOKEN_ESTIMATE (1500) tokens, divisor-independent — so
+    // a result's weight is exactly known. Six images = 9000 tokens, above
+    // CLEAR_AT_LEAST_TOKENS (8192).
+    fn pngs(tag: &str, n: usize) -> Vec<ToolContentImage> {
+        (0..n)
+            .map(|i| ToolContentImage {
+                media_type: "image/png".to_string(),
+                data: format!("data-{tag}-{i}"),
+            })
+            .collect()
     }
 
     async fn add(storage: &Arc<InMemoryStorage>, conv: &str, content: MessageContent) {
@@ -8553,167 +8727,189 @@ mod image_retention_by_round_tests {
             .expect("add_message");
     }
 
-    /// Append one tool round: an assistant message issuing `n` `tool_use` blocks
-    /// followed by `n` tool-result messages, each carrying one screenshot.
+    /// Append one tool round: an assistant `tool_use` for `tool_name` plus one
+    /// tool-result carrying `n_images` images. Returns the round's `tool_use_id`.
     async fn add_round(
         storage: &Arc<InMemoryStorage>,
         conv: &str,
-        round_tag: &str,
-        n: usize,
-    ) -> Vec<String> {
-        let tool_uses: Vec<ContentBlock> = (0..n)
-            .map(|i| ContentBlock::ToolUse {
-                id: format!("{round_tag}-tool-{i}"),
-                name: "browser".to_string(),
+        tag: &str,
+        tool_name: &str,
+        n_images: usize,
+    ) -> String {
+        let id = format!("{tag}-tool");
+        add(
+            storage,
+            conv,
+            MessageContent::agent(vec![ContentBlock::ToolUse {
+                id: id.clone(),
+                name: tool_name.to_string(),
                 input: serde_json::json!({}),
-            })
-            .collect();
-        add(storage, conv, MessageContent::agent(tool_uses)).await;
-
-        let mut ids = Vec::new();
-        for i in 0..n {
-            let id = format!("{round_tag}-tool-{i}");
-            add(
-                storage,
-                conv,
-                MessageContent::tool_with_images(
-                    &id,
-                    "screenshot taken",
-                    false,
-                    vec![png(&format!("{round_tag}-{i}"))],
-                ),
-            )
-            .await;
-            ids.push(id);
-        }
-        ids
+            }]),
+        )
+        .await;
+        add(
+            storage,
+            conv,
+            MessageContent::tool_with_images(&id, "result body", false, pngs(tag, n_images)),
+        )
+        .await;
+        id
     }
 
-    /// Count the image blocks in the tool-result message for `tool_use_id`.
-    fn images_for<'a>(msgs: &'a [crate::llm::LlmMessage], tool_use_id: &str) -> &'a [ImageSource] {
-        for m in msgs {
-            if m.role == MessageRole::User {
-                for block in &m.content {
-                    if let ContentBlock::ToolResult {
-                        tool_use_id: id,
-                        images,
-                        ..
-                    } = block
-                    {
-                        if id == tool_use_id {
-                            return images;
+    fn clearable(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Above the high-water mark, an old clearable round is swept: the watermark
+    /// advances, the round is in the cleared set, the recent floor is untouched,
+    /// and the freed-token / count figures are reported.
+    #[tokio::test]
+    async fn sweeps_old_clearable_round_under_pressure() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-sweep";
+        // Round 0 is the only round outside the KEEP_RECENT_ROUNDS=3 floor.
+        let old = add_round(&storage, conv, "old", "read_file", 6).await; // 9000 tokens
+        let r1 = add_round(&storage, conv, "r1", "read_file", 1).await;
+        let r2 = add_round(&storage, conv, "r2", "read_file", 1).await;
+        let r3 = add_round(&storage, conv, "r3", "read_file", 1).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        // Small window so the trigger (0.7 * 1000 = 700) is well below the
+        // ~12k tokens of history.
+        let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 12_000, 1_000);
+
+        assert!(plan.new_watermark > 0, "watermark must advance");
+        assert!(
+            plan.cleared_tool_use_ids.contains(&old),
+            "old clearable round must be cleared",
+        );
+        for kept in [&r1, &r2, &r3] {
+            assert!(
+                !plan.cleared_tool_use_ids.contains(kept),
+                "recency-floor round {kept} must never be cleared",
+            );
+        }
+        assert!(plan.freed_tokens >= CLEAR_AT_LEAST_TOKENS);
+        assert_eq!(plan.cleared_count, 1);
+    }
+
+    /// Below the high-water mark nothing is cleared, however old the rounds.
+    #[tokio::test]
+    async fn holds_below_high_water_mark() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-hold";
+        add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        // estimated (5000) below trigger (0.7 * 200_000).
+        let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 5_000, 200_000);
+
+        assert_eq!(plan.new_watermark, 0);
+        assert!(plan.cleared_tool_use_ids.is_empty());
+        assert_eq!(plan.freed_tokens, 0);
+    }
+
+    /// An unclearable tool's result is never cleared, even old and under pressure.
+    #[tokio::test]
+    async fn never_clears_unclearable_tool() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-unclearable";
+        let old = add_round(&storage, conv, "old", "ask_user_question", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        // read_file is clearable; ask_user_question is not.
+        let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 12_000, 1_000);
+
+        assert!(
+            !plan.cleared_tool_use_ids.contains(&old),
+            "unclearable result must never be cleared",
+        );
+    }
+
+    /// Once advanced, a re-plan on the same history with the prior watermark set
+    /// to the advanced value keeps the result cleared and does not regress —
+    /// the structural witness for cross-turn stability (REQ-STR-007).
+    #[tokio::test]
+    async fn cleared_set_is_stable_across_turns() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-stable";
+        let old = add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        let first = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, 12_000, 1_000);
+        // Next turn: prior watermark is the advanced value, same history.
+        let second = plan_tool_result_clearing(
+            &db,
+            &clearable(&["read_file"]),
+            first.new_watermark,
+            12_000,
+            1_000,
+        );
+
+        assert_eq!(
+            second.new_watermark, first.new_watermark,
+            "watermark must not regress or re-advance without new clearable output",
+        );
+        assert!(
+            second.cleared_tool_use_ids.contains(&old),
+            "a previously cleared result stays cleared",
+        );
+        assert_eq!(
+            second.freed_tokens, 0,
+            "no new tokens freed on a stable turn"
+        );
+    }
+
+    /// The renderer placeholders cleared results (no images) and sends kept
+    /// results verbatim with their images.
+    #[tokio::test]
+    async fn render_placeholders_cleared_keeps_rest() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-render";
+        let cleared_id = add_round(&storage, conv, "old", "read_file", 2).await;
+        let kept_id = add_round(&storage, conv, "new", "read_file", 2).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        let cleared: HashSet<String> = std::iter::once(cleared_id.clone()).collect();
+        let msgs = render_messages(&db, &cleared);
+
+        let find = |id: &str| -> (String, usize) {
+            for m in &msgs {
+                if m.role == MessageRole::User {
+                    for b in &m.content {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            images,
+                            ..
+                        } = b
+                        {
+                            if tool_use_id == id {
+                                return (content.clone(), images.len());
+                            }
                         }
                     }
                 }
             }
-        }
-        panic!("no tool result for {tool_use_id}");
-    }
+            panic!("no tool result for {id}");
+        };
 
-    fn placeholder_count(msgs: &[crate::llm::LlmMessage], tool_use_id: &str) -> usize {
-        for m in msgs {
-            if m.role == MessageRole::User {
-                for block in &m.content {
-                    if let ContentBlock::ToolResult {
-                        tool_use_id: id,
-                        content,
-                        ..
-                    } = block
-                    {
-                        if id == tool_use_id {
-                            return content.matches("[screenshot omitted from history]").count();
-                        }
-                    }
-                }
-            }
-        }
-        panic!("no tool result for {tool_use_id}");
-    }
+        let (cleared_body, cleared_imgs) = find(&cleared_id);
+        assert_eq!(cleared_body, CLEARED_TOOL_RESULT_PLACEHOLDER);
+        assert_eq!(cleared_imgs, 0, "cleared result emits no images");
 
-    /// A single recent round with three screenshot-producing tool results keeps
-    /// ALL three screenshots — retention must not count tool-result messages
-    /// (which would drop the first of the three with `IMAGE_HISTORY_ROUNDS` = 2).
-    #[tokio::test]
-    async fn single_round_with_three_screenshots_retains_all_three() {
-        let storage = Arc::new(InMemoryStorage::new());
-        let conv = "conv-round-3";
-
-        // Older round (round 0): two screenshots — must be placeholdered.
-        let old_ids = add_round(&storage, conv, "old", 2).await;
-        // Most recent round (round 1): three screenshots — must all survive.
-        let recent_ids = add_round(&storage, conv, "recent", 3).await;
-
-        let msgs = TestRuntime::build_llm_messages_static(&storage, conv)
-            .await
-            .expect("build messages");
-
-        // All three screenshots in the single most-recent round survive.
-        for id in &recent_ids {
-            assert_eq!(
-                images_for(&msgs, id).len(),
-                1,
-                "recent-round tool result {id} must keep its screenshot",
-            );
-            assert_eq!(
-                placeholder_count(&msgs, id),
-                0,
-                "recent-round tool result {id} must not be placeholdered",
-            );
-        }
-
-        // With IMAGE_HISTORY_ROUNDS = 2 and only two rounds, the older round is
-        // still within the window — confirm it is kept too (boundary sanity).
-        for id in &old_ids {
-            assert_eq!(
-                images_for(&msgs, id).len(),
-                1,
-                "round within the last IMAGE_HISTORY_ROUNDS must keep images: {id}",
-            );
-        }
-    }
-
-    /// A round older than the last `IMAGE_HISTORY_ROUNDS` is fully
-    /// placeholdered, even when a single recent round holds several
-    /// screenshots. Three rounds total, `IMAGE_HISTORY_ROUNDS` = 2 ⇒ the oldest
-    /// round drops its images while both newer rounds keep theirs.
-    #[tokio::test]
-    async fn round_older_than_window_is_placeholdered() {
-        let storage = Arc::new(InMemoryStorage::new());
-        let conv = "conv-round-old";
-
-        let r0 = add_round(&storage, conv, "r0", 1).await; // oldest — dropped
-        let r1 = add_round(&storage, conv, "r1", 3).await; // kept
-        let r2 = add_round(&storage, conv, "r2", 1).await; // kept
-
-        let msgs = TestRuntime::build_llm_messages_static(&storage, conv)
-            .await
-            .expect("build messages");
-
-        // Oldest round: images dropped, placeholder present.
-        for id in &r0 {
-            assert_eq!(
-                images_for(&msgs, id).len(),
-                0,
-                "round older than IMAGE_HISTORY_ROUNDS must drop images: {id}",
-            );
-            assert_eq!(
-                placeholder_count(&msgs, id),
-                1,
-                "dropped screenshot must leave a placeholder: {id}",
-            );
-        }
-
-        // The recent multi-screenshot round keeps all three.
-        for id in &r1 {
-            assert_eq!(
-                images_for(&msgs, id).len(),
-                1,
-                "kept recent round must retain every screenshot: {id}",
-            );
-        }
-        for id in &r2 {
-            assert_eq!(images_for(&msgs, id).len(), 1, "newest round kept: {id}");
-        }
+        let (kept_body, kept_imgs) = find(&kept_id);
+        assert_eq!(kept_body, "result body");
+        assert_eq!(kept_imgs, 2, "kept result preserves its images");
     }
 }
 

@@ -277,6 +277,11 @@ pub struct BrowserTakeScreenshotTool;
 
 #[async_trait]
 impl Tool for BrowserTakeScreenshotTool {
+    // Re-queryable read: re-invoking re-obtains current state, so a stale result is safe to clear (REQ-STR-002).
+    fn clearable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "browser_take_screenshot"
     }
@@ -403,6 +408,11 @@ pub struct BrowserRecentConsoleLogsTool;
 
 #[async_trait]
 impl Tool for BrowserRecentConsoleLogsTool {
+    // Re-queryable read: re-invoking re-obtains current state, so a stale result is safe to clear (REQ-STR-002).
+    fn clearable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "browser_recent_console_logs"
     }

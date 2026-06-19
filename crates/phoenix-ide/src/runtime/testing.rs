@@ -474,6 +474,7 @@ pub struct InMemoryStorage {
     next_msg_id: Mutex<u64>,
     steering_queues: Mutex<HashMap<String, Vec<crate::state_machine::event::SteerEntry>>>,
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
+    clear_watermarks: Mutex<HashMap<String, i64>>,
 }
 
 #[allow(dead_code)]
@@ -486,6 +487,7 @@ impl InMemoryStorage {
             next_msg_id: Mutex::new(1),
             steering_queues: Mutex::new(HashMap::new()),
             fork_proposals: Mutex::new(Vec::new()),
+            clear_watermarks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -811,6 +813,24 @@ impl StateStore for InMemoryStorage {
         _cwd: &str,
     ) -> Result<(), String> {
         // In-memory storage doesn't track cwd separately
+        Ok(())
+    }
+
+    async fn get_clear_watermark(&self, conv_id: &str) -> Result<i64, String> {
+        Ok(self
+            .clear_watermarks
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String> {
+        self.clear_watermarks
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), watermark);
         Ok(())
     }
 

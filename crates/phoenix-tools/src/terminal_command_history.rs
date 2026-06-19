@@ -24,6 +24,11 @@ fn default_count() -> usize {
 
 #[async_trait]
 impl Tool for TerminalCommandHistoryTool {
+    // Re-queryable read: re-invoking re-obtains current state, so a stale result is safe to clear (REQ-STR-002).
+    fn clearable(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "terminal_command_history"
     }

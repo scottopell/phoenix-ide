@@ -409,6 +409,23 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether a stale result from this tool may be cleared from the model's
+    /// view once a conversation approaches the context window (REQ-STR-002).
+    ///
+    /// True only when the tool *reads re-queryable state*: the agent can
+    /// re-invoke it to re-obtain what it needs about the current state, so
+    /// dropping an old result loses only a stale snapshot the agent has
+    /// already acted on, not irreplaceable information. The test is not
+    /// byte-reproducibility — in a mutated workspace a re-read yields current
+    /// content, not the old snapshot — but re-queryability.
+    ///
+    /// Defaults to `false` so a newly added tool is never silently cleared. A
+    /// tool whose result is the sole record of something not re-queryable (a
+    /// human answer, a state-changing effect) must leave this false.
+    fn clearable(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with all context provided via `ToolContext`
     ///
     /// Tools that spawn long-running subprocesses should monitor
@@ -693,6 +710,19 @@ impl ToolRegistry {
     #[must_use]
     pub fn find_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.name() == name).cloned()
+    }
+
+    /// Names of tools whose stale results may be cleared from the model-bound
+    /// history (`Tool::clearable()`). Derived from the live tool set so the set
+    /// cannot drift from the actual capabilities
+    /// (`specs/stale-tool-results`, REQ-STR-002).
+    #[must_use]
+    pub fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
+        self.tools
+            .iter()
+            .filter(|t| t.clearable())
+            .map(|t| t.name().to_string())
+            .collect()
     }
 }
 
