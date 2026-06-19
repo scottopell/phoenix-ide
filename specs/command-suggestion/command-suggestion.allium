@@ -141,10 +141,13 @@ rule RunLinkPlacesCommandOnPrompt {
 
     @guidance
         -- TerminalPanel's linkHandler decodes phxrun:<base64>, cuts the command
-        -- at the first CR/LF, and writes it to the PTY input WITHOUT a trailing
-        -- newline. The CR/LF cut keeps the never-auto-submit guarantee from
+        -- at the first CR/LF, drops every remaining control byte (C0/DEL), and
+        -- writes the printable remainder to the PTY input WITHOUT a trailing
+        -- newline. The sanitization keeps the never-auto-submit guarantee from
         -- depending on a well-formed link: any process that writes to the
-        -- terminal can emit a phxrun: link. The user reviews and presses Enter.
+        -- terminal can emit a phxrun: link, so a clicked link must place only
+        -- printable text -- never submit, signal the job, or drive readline.
+        -- The user reviews and presses Enter.
 }
 
 ------------------------------------------------------------

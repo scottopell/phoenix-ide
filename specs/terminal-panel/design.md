@@ -203,11 +203,13 @@ out-of-order.
 xterm's `linkHandler` option intercepts OSC 8 hyperlinks. The panel's handler
 (REQ-TPANEL-009) inspects the URI: a `phxrun:` scheme is a command suggestion
 emitted by `phx` (`specs/command-suggestion`), so the handler decodes the
-base64 command, cuts it at the first CR/LF, and writes it to the PTY via the
-same `dataFrame` input path the keyboard uses (REQ-TPANEL-001) — WITHOUT a
-trailing newline, leaving the command on the prompt for the user to submit. The
-CR/LF cut keeps the never-auto-submit guarantee from depending on a well-formed
-link (any process that writes to the terminal can emit one). Ordinary `http(s)` URIs fall
+base64 command, cuts it at the first CR/LF, drops any remaining control bytes
+(C0/DEL), and writes the printable remainder to the PTY via the same `dataFrame`
+input path the keyboard uses (REQ-TPANEL-001) — WITHOUT a trailing newline,
+leaving the command on the prompt for the user to submit. The sanitization keeps
+the never-auto-submit guarantee from depending on a well-formed link (any
+process that writes to the terminal can emit one, so a clicked link must place
+only printable text — never submit, signal the job, or drive readline). Ordinary `http(s)` URIs fall
 through to open-in-new-tab. `allowNonHttpProtocols: true` is required for xterm
 to surface the custom scheme to the handler.
 
