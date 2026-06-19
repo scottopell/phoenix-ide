@@ -3843,13 +3843,22 @@ where
                 + CONTINUATION_OUTPUT_RESERVE_TOKENS
                 + CONTINUATION_SAFETY_MARGIN_TOKENS;
             let input_budget = context_window.saturating_sub(fixed_tokens);
-            let (mut messages, dropped) = cap_messages_to_token_budget(messages, input_budget);
-            if dropped > 0 {
+            let (messages, dropped) = cap_messages_to_token_budget(messages, input_budget);
+            // The budget cap drops oldest-first, which can drop the original
+            // leading user task and expose an assistant message at the front.
+            // The Anthropic Messages API rejects a request whose first message
+            // is not user-role, so trim leading non-user messages — re-creating
+            // the exact ContextWindowExceeded→fallback loop this guard prevents
+            // otherwise. Flattened history carries no tool_use/tool_result
+            // pairing, so dropping leading assistant narration is safe.
+            let (mut messages, trimmed) = drop_leading_non_user(messages);
+            if dropped > 0 || trimmed > 0 {
                 tracing::debug!(
                     dropped,
+                    trimmed_for_user_first = trimmed,
                     context_window,
                     input_budget,
-                    "continuation: dropped oldest messages to fit token budget"
+                    "continuation: trimmed history to fit budget and start user-first"
                 );
             }
 
@@ -4504,6 +4513,19 @@ fn cap_messages_to_token_budget(
     (kept, dropped)
 }
 
+/// Drop leading non-user messages so the list starts with a user message (or is
+/// empty). The Anthropic Messages API requires the first message to be
+/// user-role; the budget cap drops oldest-first and can expose a leading
+/// assistant message. Returns the trimmed list and how many were dropped.
+fn drop_leading_non_user(messages: Vec<LlmMessage>) -> (Vec<LlmMessage>, usize) {
+    let trimmed = messages
+        .iter()
+        .take_while(|m| m.role != MessageRole::User)
+        .count();
+    let kept = messages.into_iter().skip(trimmed).collect();
+    (kept, trimmed)
+}
+
 /// Merge a `duration_ms` value into an existing `display_data` JSON blob.
 ///
 /// If `duration_ms` is `None`, returns a clone of the existing data unchanged.
@@ -4879,6 +4901,43 @@ mod strip_tool_blocks_tests {
         let (kept, dropped) = cap_messages_to_token_budget(msgs, 1);
         assert_eq!(kept.len(), 1, "the sole newest message is always kept");
         assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn drop_leading_non_user_trims_assistant_prefix() {
+        // The budget cap can drop the original leading user task, leaving an
+        // assistant message first — which the Anthropic API rejects.
+        let msgs = vec![
+            assistant(vec![ContentBlock::text("orphaned narration")]),
+            assistant(vec![ContentBlock::text("more narration")]),
+            user_text("tool result stand-in"),
+            assistant(vec![ContentBlock::text("latest")]),
+        ];
+        let (kept, trimmed) = drop_leading_non_user(msgs);
+        assert_eq!(trimmed, 2);
+        assert_eq!(kept.first().unwrap().role, MessageRole::User);
+    }
+
+    #[test]
+    fn drop_leading_non_user_noop_when_already_user_first() {
+        let msgs = vec![user_text("hi"), assistant(vec![ContentBlock::text("yo")])];
+        let (kept, trimmed) = drop_leading_non_user(msgs);
+        assert_eq!(trimmed, 0);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn drop_leading_non_user_empties_all_assistant_history() {
+        // Degenerate case: nothing but assistant messages. Trimming to empty is
+        // correct — request_continuation appends the user prompt afterward, so
+        // the sent request still starts user-first.
+        let msgs = vec![
+            assistant(vec![ContentBlock::text("a")]),
+            assistant(vec![ContentBlock::text("b")]),
+        ];
+        let (kept, trimmed) = drop_leading_non_user(msgs);
+        assert_eq!(trimmed, 2);
+        assert!(kept.is_empty());
     }
 
     #[test]
