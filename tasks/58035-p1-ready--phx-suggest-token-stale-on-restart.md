@@ -31,3 +31,27 @@ Handle gracefully (decide + implement before merge):
 
 Also covers: the same persist-vs-mint decision should make PHOENIX_API_URL
 robust to a port change across restarts, or document that the port is stable.
+
+---
+
+Token staleness is resolved: the token is persisted in app_settings and bound
+to the password fingerprint, so a restart keeps it stable (existing terminals
+stay authorized) and a password change re-mints it.
+
+Remaining (broader staleness of a pre-feature tmux server): the env/PATH/config
+injection runs only when spawn_session CREATES a server. When ensure_live finds
+an already-live server (created before this feature, or before an upgrade), it
+reuses it, so its panes lack `phx` on PATH and the OSC-8 hyperlinks
+terminal-feature until the server is recreated. This only affects terminals
+left open across the upgrade; a newly-opened terminal is fine.
+
+No fully-graceful auto-fix exists: an already-running pane's shell has already
+exported its PATH, so `tmux set-environment -g` / `set -ag` on the live server
+only reach NEW windows/panes, and kill+recreate would destroy the user's
+running panes and processes. Options to weigh:
+- Non-destructive partial refresh on reuse (set-environment -g + set -ag),
+  helping new windows only.
+- Detect a pre-feature server and recreate it behind explicit per-session
+  consent (destructive otherwise).
+- Surface a one-click "restart this terminal's tmux server" affordance in the
+  UI so the user opts in.
