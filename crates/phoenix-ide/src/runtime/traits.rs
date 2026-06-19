@@ -167,8 +167,9 @@ pub trait StateStore: Send + Sync {
     /// (specs/stale-tool-results). Returns 0 when nothing has been cleared yet.
     async fn get_clear_watermark(&self, conv_id: &str) -> Result<i64, String>;
 
-    /// Advance the conversation's clear watermark. The retention pass only ever
-    /// moves it forward.
+    /// Advance the conversation's clear watermark. The write is structurally
+    /// monotonic — a value below the persisted watermark is ignored, never
+    /// regressing it (specs/stale-tool-results, REQ-STR-007).
     async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String>;
 
     /// Record token usage for one LLM turn. Fire-and-forget; errors are logged

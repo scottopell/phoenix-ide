@@ -827,10 +827,11 @@ impl StateStore for InMemoryStorage {
     }
 
     async fn set_clear_watermark(&self, conv_id: &str, watermark: i64) -> Result<(), String> {
-        self.clear_watermarks
-            .lock()
-            .unwrap()
-            .insert(conv_id.to_string(), watermark);
+        // Structurally monotonic, mirroring the production `MAX(...)` write: a
+        // value below the stored watermark never regresses it (REQ-STR-007).
+        let mut map = self.clear_watermarks.lock().unwrap();
+        let entry = map.entry(conv_id.to_string()).or_insert(0);
+        *entry = (*entry).max(watermark);
         Ok(())
     }
 

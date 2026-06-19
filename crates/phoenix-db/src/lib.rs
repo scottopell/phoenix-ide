@@ -1933,21 +1933,25 @@ impl Database {
         Ok(watermark.unwrap_or(0))
     }
 
-    /// Advance the conversation's clear watermark. The retention pass only ever
-    /// moves it forward; this method writes whatever value it is given, so the
-    /// monotonic invariant is the caller's responsibility (the sweep computes a
-    /// value >= the prior watermark).
+    /// Advance the conversation's clear watermark. The write is structurally
+    /// monotonic: `MAX(clear_watermark, ?1)` can never move the persisted value
+    /// backward, so a caller that passes a stale-low value (e.g. after a failed
+    /// watermark read) cannot regress it and re-expose already-cleared results
+    /// (specs/stale-tool-results, REQ-STR-007). The column is `NOT NULL DEFAULT
+    /// 0`, so `MAX` never sees a NULL operand.
     ///
     /// # Errors
     ///
     /// Returns a [`DbError`] if the conversation does not exist or the
     /// underlying database operation fails.
     pub async fn update_clear_watermark(&self, id: &str, watermark: i64) -> DbResult<()> {
-        let result = sqlx::query("UPDATE conversations SET clear_watermark = ?1 WHERE id = ?2")
-            .bind(watermark)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE conversations SET clear_watermark = MAX(clear_watermark, ?1) WHERE id = ?2",
+        )
+        .bind(watermark)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
@@ -5465,6 +5469,37 @@ mod tests {
 
         let fetched = db.get_conversation("test-id").await.unwrap();
         assert_eq!(fetched.id, conv.id);
+    }
+
+    /// The clear watermark write is structurally monotonic: a value below the
+    /// persisted watermark is ignored, never regressing it (REQ-STR-007). A
+    /// transient stale-low write (e.g. after a failed read re-planning from 0)
+    /// therefore cannot re-expose already-cleared results.
+    #[tokio::test]
+    async fn update_clear_watermark_never_regresses() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("wm-1", "wm-slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(db.get_clear_watermark("wm-1").await.unwrap(), 0);
+
+        db.update_clear_watermark("wm-1", 500).await.unwrap();
+        assert_eq!(db.get_clear_watermark("wm-1").await.unwrap(), 500);
+
+        // A lower value is ignored — the watermark holds at 500.
+        db.update_clear_watermark("wm-1", 300).await.unwrap();
+        assert_eq!(db.get_clear_watermark("wm-1").await.unwrap(), 500);
+
+        // A higher value advances it.
+        db.update_clear_watermark("wm-1", 900).await.unwrap();
+        assert_eq!(db.get_clear_watermark("wm-1").await.unwrap(), 900);
+
+        // A write to a missing conversation still reports not-found.
+        assert!(matches!(
+            db.update_clear_watermark("nope", 10).await,
+            Err(DbError::ConversationNotFound(_))
+        ));
     }
 
     #[tokio::test]
