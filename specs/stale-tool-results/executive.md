@@ -61,16 +61,19 @@ conversations need no backfill. It removes the `IMAGE_HISTORY_ROUNDS` window and
 `tool_msg_indices_keeping_images`, folding image retirement into the
 watermark-governed verdict. The planner (`plan_tool_result_clearing`) and renderer
 (`render_messages`) live in the executor's history assembly; clearing is applied
-on the main LLM request path (`dispatch_llm_request`), which reads the watermark,
-plans a sweep, persists any advance, and logs the cleared count and freed tokens.
-`Tool::clearable()` sources the recoverable set, surfaced via
-`ToolRegistry::clearable_tool_names()`.
+on the main LLM request path via `assemble_cleared_messages` (called from
+`dispatch_llm_request`), which reads the watermark and the last turn's reported
+prompt size, plans a sweep, persists any advance, and logs the cleared count and
+freed tokens. A sweep is maximal — it clears the whole prefix outside the recency
+floor at once. `Tool::clearable()` sources the recoverable set, surfaced via
+`ToolRegistry::clearable_tool_names()` (cached per conversation, refreshed on the
+Explore→Work upgrade).
 
-REQ-STR-010 is partially met (🔄): the four retention parameters exist as named
-constants (`KEEP_RECENT_ROUNDS`, `CLEAR_TRIGGER_*`, `CLEAR_TARGET_*`,
-`CLEAR_AT_LEAST_TOKENS`), tunable by editing, but there is not yet a runtime or
-per-deployment configuration surface that overrides them. The remaining work is
-to thread these from deployment config.
+REQ-STR-010 is partially met (🔄): the three retention parameters exist as named
+constants (`KEEP_RECENT_ROUNDS`, `CLEAR_TRIGGER_*`, `CLEAR_AT_LEAST_TOKENS`),
+tunable by editing, but there is not yet a runtime or per-deployment configuration
+surface that overrides them. The remaining work is to thread these from deployment
+config.
 
 ## Default Parameters
 
@@ -83,8 +86,10 @@ initial values, to be tuned against benchmarks, not frozen constants; this note
 is the single place that records their status, so the config defaults and this
 document do not disagree.
 
-Two further parameters are derived per request rather than fixed config, so they
-carry no Allium default: `clear_trigger` (input-token high-water mark, a fraction
-of the model's context window) and `target_after_clear` (usage a sweep falls back
-under). Their fractions are set at implementation against the deployed models'
-windows and recorded here once benchmarked.
+One further parameter is derived per request rather than fixed config, so it
+carries no Allium default: `clear_trigger` (the high-water mark, a fraction of the
+model's context window, compared against the last turn's reported prompt size).
+Its fraction is set at implementation against the deployed models' windows and
+recorded here once benchmarked. There is no `target_after_clear`: a sweep always
+clears the whole prefix outside the recency floor, so `keep_recent_rounds` alone
+bounds retention.

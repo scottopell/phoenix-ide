@@ -3,19 +3,22 @@
 ## Where this lives (REQ-STR-009)
 
 Tool-result clearing happens on the main LLM request path, in
-`Executor::dispatch_llm_request`, as the persisted history is folded into the
-provider-agnostic message list (`render_messages`). The dispatch path reads the
-conversation's clear watermark, plans a sweep (`plan_tool_result_clearing`),
-persists any advance, and renders the history once with the resulting cleared
-set — before any provider translation (`anthropic.rs::translate_request`, the
-OpenAI Responses translation) runs. A single pass therefore governs every
-provider identically, and the persisted `db::ToolContent` it reads from is never
-mutated.
+`Executor::dispatch_llm_request`, which delegates history assembly to
+`assemble_cleared_messages`: it reads the conversation's clear watermark and the
+last turn's reported prompt size, plans a sweep (`plan_tool_result_clearing`),
+persists any advance, and renders the history once (`render_messages`) with the
+resulting cleared set — before any provider translation
+(`anthropic.rs::translate_request`, the OpenAI Responses translation) runs. A
+single pass therefore governs every provider identically, and the persisted
+`db::ToolContent` it reads from is never mutated. Extracting the policy from the
+dispatch closure keeps its watermark-failure handling (below) unit-testable apart
+from a live LLM client.
 
-Clearing is specific to the dispatch path. The continuation/summarization path
-(`build_llm_messages_static` → `flatten_tool_blocks`) renders every tool result
-to plain text and declares no tools, so a per-result clearing verdict has nothing
-to act on there.
+Clearing is specific to this path. The continuation/summarization path
+(`build_llm_messages_static` → `flatten_tool_blocks`) renders each tool result's
+body to text and bounds replayed screenshots to a recent window
+(`cap_replayed_images`), then declares no tools — so the per-result clearing
+verdict has nothing to act on there.
 
 ## One mechanism for text and images (REQ-STR-011)
 
@@ -192,10 +195,15 @@ worthwhile moments rather than paying it every turn:
   new content is appended past the trailing breakpoint, which is the cheap,
   expected growth.
 
-- **One-time per sweep, then re-warmed.** The turn a sweep advances the watermark
-  pays a cache write for the new, shorter prefix; subsequent turns reuse it. The
-  `clear_at_least` gate ensures each such invalidation frees enough tokens that
-  the one-time cost is recovered by the ongoing savings.
+- **One-time per sweep, then re-warmed.** A sweep is *maximal*: it clears the
+  whole prefix outside the recency floor in one move rather than nibbling one
+  round at a time, so the cache write it costs buys many turns of reuse — usage
+  drops to the floor and only gradually climbs back to the trigger. The
+  `clear_at_least` gate further ensures each invalidation frees enough that the
+  one-time cost is recovered. Clearing to the floor (rather than stopping at an
+  intermediate target) is what spaces sweeps apart: stopping early would leave
+  clearable rounds just below the trigger, and each new turn's inflow would
+  re-cross it, advancing the watermark every turn.
 
 - **The cached tail is never disturbed.** The Anthropic translation places three
   deterministic cache breakpoints (`AnthropicCacheBreakpointsPlaced` in
@@ -221,26 +229,45 @@ worthwhile moments rather than paying it every turn:
   keeping the key stable lets the re-warmed shorter prefix be reused by the same
   conversation's later turns.
 
-## Token estimation (REQ-STR-001, REQ-STR-006)
+- **Sustained pressure is a bounded exception (REQ-STR-007).** The "spaced
+  sweeps" property holds while pressure is intermittent — the common case. If
+  every turn adds enough new clearable context to stay over the trigger, one
+  round ages out of the recency floor and is swept each turn, so the watermark
+  advances each turn and the suffix from the newly-cleared round to the tail is
+  re-billed. This is unavoidable once inflow exceeds what a single sweep can
+  amortize: bounded usage, a preserved working set, and a perfectly stable cache
+  cannot all three hold, and the design keeps usage bounded and the recency floor
+  intact. Even then only the recent suffix — not the whole prefix — is re-billed,
+  and clearing the aged round is still a net token saving. When clearing
+  everything outside the floor still cannot get under the window, summarization
+  (the heavier tier) is the escape.
 
-Pressure detection and the `clear_at_least` / target calculations weigh each tool
-result with the **image-aware** per-result estimator `estimate_tool_result_tokens`
-— its text character count plus a fixed cost per image block — summed across the
-history by `collect_tool_result_facts`. A text-only estimate must not be used for
-the sweep decision: a stale screenshot round would then contribute almost nothing
-to the pressure signal and `clear_at_least`, so the very image-heavy context this
-feature exists to retire would never register as worth clearing — clearing would
-stall exactly where it is needed most.
+## Pressure signal and worthwhile-gain gate (REQ-STR-001, REQ-STR-006)
 
-The pressure estimate is computed against the **prior watermark's cleared set**,
-not the full uncleared history: an already-cleared result contributes nothing,
-exactly as it is sent (a placeholder with no images). This is what keeps the
-trigger stable — after a sweep drops usage under the target, the estimate stays
-under the trigger for many turns, so the watermark does not advance one round per
-turn and the cached prefix is preserved (REQ-STR-007). Estimation is otherwise
-approximate by design — the trigger sits below the true window, and the
-consequence of a slightly-off estimate is sweeping one round early or late, never
-a dropped result or a 400.
+The trigger is the **provider's reported prompt size for the previous turn** —
+`input_tokens + cache_read_tokens + cache_creation_tokens`, the full context the
+model saw, cached prefix included (the cache still counts against the window).
+This is ground truth: it captures the system prompt and tool-schema bulk that an
+independent re-estimate over conversation messages would omit, and it cannot
+drift below reality. A turn whose reported size exceeds the trigger fraction of
+the context window is under pressure. The first turn has no prior usage and is
+treated as not under pressure (history is small then). Because the signal is the
+*actual* size sent — which already reflects whatever was cleared last turn — it
+falls after a sweep with no separate "estimate against the prior cleared set"
+bookkeeping.
+
+Whether a sweep is *worthwhile* is a separate question, answered with the
+**image-aware** per-result estimator `estimate_tool_result_tokens` (text
+character count plus a fixed cost per image block). The tokens freeable by
+clearing every eligible result must reach `clear_at_least`, or the watermark
+holds — so a screenshot-heavy round registers its true weight and a sweep that
+would save little never disturbs the cache. A text-only estimate must not be used
+here: a stale screenshot round would contribute almost nothing and starve
+clearing in exactly the image-heavy sessions it exists for. This per-result
+estimate also produces the freed-token / cleared-count figures logged for an
+advance (REQ-STR-008). It is approximate by design — the consequence of a
+slightly-off estimate is sweeping one round early or late, never a dropped result
+or a 400.
 
 ## Retention ladder
 
@@ -273,11 +300,12 @@ context window and deployment configuration:
 
 | Parameter | Meaning | Default basis |
 |---|---|---|
-| `clear_trigger` | Input-token high-water mark that triggers a sweep | A fraction of `context_window`, leaving headroom for the reply |
-| `target_after_clear` | Usage a sweep aims to fall back under | Below `clear_trigger`, so sweeps are spaced many turns apart |
+| `clear_trigger` | Reported-prompt-size high-water mark that triggers a sweep | A fraction of `context_window`, leaving headroom for the reply |
 | `keep_recent_rounds` | Recency floor the watermark may not cross | Enough rounds to cover the working set and the trailing breakpoint |
 | `clear_at_least` | Minimum tokens a sweep must free, or it holds | Large enough that a cache write is recovered by the savings |
 
-The defaults are chosen so a short session clears nothing and a long session
-sweeps in spaced batches; a smaller-window model crosses `clear_trigger` sooner
-and sweeps earlier. Concrete default values are tracked in `executive.md`.
+A sweep always clears the entire prefix outside the recency floor, so there is no
+separate "target" parameter — `keep_recent_rounds` alone bounds how much is
+retained. The defaults are chosen so a short session clears nothing and a long
+session sweeps in spaced batches; a smaller-window model crosses `clear_trigger`
+sooner and sweeps earlier. Concrete default values are tracked in `executive.md`.

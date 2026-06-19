@@ -127,19 +127,19 @@ value ToolResultRendering {
 -- (possible) advance, persisted back to the conversation. Across turns,
 -- one assembly's new_watermark is the next assembly's prior_watermark.
 --
--- `estimated_input_tokens` is the image-aware token estimate of the
--- request this assembly would send *given prior_watermark's cleared set* —
--- an already-cleared result counts as its placeholder, not its full body.
--- Estimating against the prior cleared set (not the full uncleared history)
--- is what makes the trigger stable: after a sweep the estimate falls under
--- the target and stays under the trigger for many turns, so the watermark
--- does not advance every turn (REQ-STR-007).
+-- `reported_prompt_tokens` is the previous turn's actual prompt size as
+-- reported by the provider (input + cache-read + cache-creation tokens) —
+-- the pressure signal. It is ground truth, so it includes the system prompt
+-- and tool schemas an independent re-estimate would omit and cannot drift
+-- below reality. The first turn has no prior usage and is treated as not
+-- under pressure. Because it is the size actually sent — already reflecting
+-- last turn's clearing — it falls after a sweep with no extra bookkeeping
+-- (REQ-STR-001).
 --
 -- `clear_trigger_tokens` is the high-water mark above which a sweep is
--- considered (REQ-STR-001); `target_after_clear_tokens` is the usage a
--- sweep aims to fall back under. Both are derived upstream from the
--- model's context window and deployment config (REQ-STR-010), so only the
--- resulting integer thresholds appear here.
+-- considered (REQ-STR-001), derived upstream from the model's context
+-- window and deployment config (REQ-STR-010), so only the resulting integer
+-- threshold appears here.
 --
 -- `floor_sequence_id` is the highest round_sequence_id the watermark may
 -- reach: the boundary just before the most recent keep_recent_rounds
@@ -161,9 +161,8 @@ value ToolResultRendering {
 -- both how many results were removed and how many tokens were freed
 -- (REQ-STR-008). Zero on a turn that does not advance.
 entity HistoryAssembly {
-    estimated_input_tokens: Integer
+    reported_prompt_tokens: Integer
     clear_trigger_tokens: Integer
-    target_after_clear_tokens: Integer
     floor_sequence_id: Integer
     prior_watermark: Integer
     new_watermark: Integer
@@ -245,7 +244,7 @@ actor HistoryAssembler {
 rule WatermarkHeldBelowPressure {
     when: HistoryAssembled(assembly)
 
-    requires: assembly.estimated_input_tokens <= assembly.clear_trigger_tokens
+    requires: assembly.reported_prompt_tokens <= assembly.clear_trigger_tokens
 
     ensures: assembly.new_watermark = assembly.prior_watermark
     ensures: assembly.freed_tokens = 0
@@ -261,7 +260,7 @@ rule WatermarkHeldBelowPressure {
 rule WatermarkHeldInsufficientGain {
     when: HistoryAssembled(assembly)
 
-    requires: assembly.estimated_input_tokens > assembly.clear_trigger_tokens
+    requires: assembly.reported_prompt_tokens > assembly.clear_trigger_tokens
     requires: assembly.eligible_freed_tokens < clear_at_least_tokens
 
     ensures: assembly.new_watermark = assembly.prior_watermark
@@ -269,36 +268,34 @@ rule WatermarkHeldInsufficientGain {
     ensures: assembly.cleared_count = 0
 }
 
--- Over the high-water mark with a worthwhile sweep available: the
--- watermark advances forward over whole rounds, never past the recency
--- floor, freeing at least clear_at_least tokens. It moves far enough that
--- usage falls under the target (so the next sweep is many turns away), or
--- to the floor if the target cannot be reached without crossing it.
+-- Over the high-water mark with a worthwhile sweep available: the sweep is
+-- maximal. The watermark advances straight to the recency-floor boundary,
+-- clearing every clearable result outside the floor in one move. Clearing to
+-- the floor (rather than to an intermediate target) is what spaces sweeps
+-- many turns apart: a partial sweep would leave clearable rounds just below
+-- the trigger that next turn's inflow re-crosses, advancing the watermark
+-- every turn and defeating cache stability (REQ-STR-007).
 rule WatermarkAdvancedUnderPressure {
     when: HistoryAssembled(assembly)
 
-    requires: assembly.estimated_input_tokens > assembly.clear_trigger_tokens
+    requires: assembly.reported_prompt_tokens > assembly.clear_trigger_tokens
     requires: assembly.eligible_freed_tokens >= clear_at_least_tokens
 
-    ensures: assembly.new_watermark > assembly.prior_watermark
-    ensures: assembly.new_watermark <= assembly.floor_sequence_id
+    ensures: assembly.new_watermark = assembly.floor_sequence_id
     ensures: assembly.freed_tokens >= clear_at_least_tokens
     ensures: assembly.cleared_count > 0
 
     @guidance
-        -- Advance new_watermark to the highest round boundary R such that
-        -- R <= floor_sequence_id and clearing the clearable results in
-        -- (prior_watermark, R] brings estimated usage to <=
-        -- target_after_clear_tokens; if no such R reaches the target,
-        -- advance to floor_sequence_id. Advancement is by whole rounds so
-        -- a tool_use/tool_result pairing is never split. freed_tokens =
+        -- new_watermark = floor_sequence_id: the watermark advances to the
+        -- highest round boundary that does not cross the recency floor,
+        -- clearing every clearable result in (prior_watermark,
+        -- floor_sequence_id]. Advancement is by whole rounds so a
+        -- tool_use/tool_result pairing is never split. freed_tokens =
         -- sum_token_estimate_newly_cleared(assembly) and cleared_count =
-        -- count_newly_cleared(assembly) — the actual tokens and result
-        -- count this advance frees. Because the eligible candidate already
-        -- clears clear_at_least and a taken advance reaches at least the
-        -- first worthwhile round boundary, freed_tokens >= clear_at_least.
-        -- The watermark is persisted back to the conversation row; next
-        -- turn reads it as prior_watermark.
+        -- count_newly_cleared(assembly). The eligible candidate covers exactly
+        -- this range and already clears >= clear_at_least, so freed_tokens >=
+        -- clear_at_least. The watermark is persisted back to the conversation
+        -- row; next turn reads it as prior_watermark.
 }
 
 ------------------------------------------------------------
@@ -495,11 +492,14 @@ invariant ClearedCountMatchesNewlyCleared {
 -- One-time invalidation per sweep, then re-warm. Advancing the watermark
 --     rewrites the prefix from the earliest newly-cleared result forward,
 --     invalidating the cache there. This is inherent to any in-place
---     context reduction. The design pays it once per sweep (gated by
---     clear_at_least_tokens and spaced by target_after_clear) and relies
---     on the watermark holding between sweeps to re-warm: every
---     intervening turn sends the same cleared prefix and reads it from
---     cache.
+--     context reduction. A sweep is maximal (it clears to the recency
+--     floor), so usage drops far below the trigger and the watermark holds
+--     for many turns before the next sweep; the design pays the
+--     invalidation once per sweep (gated by clear_at_least_tokens) and
+--     re-warms between sweeps: every intervening turn sends the same cleared
+--     prefix and reads it from cache. Under sustained pressure, where each
+--     turn ages a fresh round past the floor, the watermark may instead
+--     advance every turn — the bounded exception described in design.md.
 --
 -- Non-destructive by construction. The only persisted state added is the
 --     watermark integer; the cleared body is recomputed from it on every
