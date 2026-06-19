@@ -140,9 +140,11 @@ rule RunLinkPlacesCommandOnPrompt {
     ensures: PromptPlacement.created(command: link.command, submitted: false)
 
     @guidance
-        -- TerminalPanel's linkHandler decodes phxrun:<base64> and writes the
-        -- command to the PTY input WITHOUT a trailing newline. The user reviews
-        -- and presses Enter; nothing auto-executes.
+        -- TerminalPanel's linkHandler decodes phxrun:<base64>, cuts the command
+        -- at the first CR/LF, and writes it to the PTY input WITHOUT a trailing
+        -- newline. The CR/LF cut keeps the never-auto-submit guarantee from
+        -- depending on a well-formed link: any process that writes to the
+        -- terminal can emit a phxrun: link. The user reviews and presses Enter.
 }
 
 ------------------------------------------------------------

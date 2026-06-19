@@ -468,7 +468,17 @@ fn setup_phx_companion(
     token: &str,
 ) {
     let scheme = if tls_loaded { "https" } else { "http" };
-    let api_url = format!("{scheme}://127.0.0.1:{}", bind_address.port());
+    // Derive the loopback host phx should call from the actual bind address: a
+    // wildcard bind is reachable via the matching-family loopback, a specific
+    // address is used verbatim (IPv6 bracketed). Hardcoding 127.0.0.1 would
+    // break a `::1`/IPv6 or specific-interface bind.
+    let host = match bind_address.ip() {
+        std::net::IpAddr::V4(v4) if v4.is_unspecified() => "127.0.0.1".to_string(),
+        std::net::IpAddr::V6(v6) if v6.is_unspecified() => "[::1]".to_string(),
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    let api_url = format!("{scheme}://{host}:{}", bind_address.port());
 
     let mut injection = phoenix_terminal::spawn::PtyEnvInjection {
         path_prefix: None,

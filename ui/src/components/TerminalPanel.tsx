@@ -431,23 +431,30 @@ export function TerminalPanel({
       // xterm-side selection.
       macOptionClickForcesSelection: true,
       // Intercept OSC 8 hyperlinks. `phxrun:` links are command suggestions
-      // (from `phx --suggest`): clicking drops the decoded command onto the
-      // shell prompt WITHOUT a trailing newline, so the user reviews it and
-      // presses Enter — suggestion, never auto-execution. Ordinary http(s)
-      // links keep the default open-in-new-tab behavior. allowNonHttpProtocols
-      // is required for xterm to surface the custom scheme to this handler.
+      // (from `phx`): clicking drops the decoded command onto the shell prompt
+      // WITHOUT a trailing newline, so the user reviews it and presses Enter —
+      // suggestion, never auto-execution. Ordinary http(s) links keep the
+      // default open-in-new-tab behavior. allowNonHttpProtocols is required for
+      // xterm to surface the custom scheme to this handler.
       linkHandler: {
         allowNonHttpProtocols: true,
         activate: (_event, uri) => {
           if (uri.startsWith(PHXRUN_SCHEME)) {
-            let command: string;
+            let decoded: string;
             try {
-              command = decodeBase64Utf8(uri.slice(PHXRUN_SCHEME.length));
+              decoded = decodeBase64Utf8(uri.slice(PHXRUN_SCHEME.length));
             } catch {
               return;
             }
+            // A phxrun link names a single command. Cut at the first CR/LF so an
+            // embedded newline can never submit the line: the "review before
+            // run" guarantee must not depend on the link payload being
+            // well-formed — any process that writes to the terminal can emit a
+            // phxrun: link. (The PTY's icrnl turns a bare CR into Enter too, so
+            // both are stripped.)
+            const command = decoded.split(/[\r\n]/, 1)[0] ?? '';
             const ws = wsRef.current;
-            if (ws && ws.readyState === WebSocket.OPEN) {
+            if (command && ws && ws.readyState === WebSocket.OPEN) {
               ws.send(dataFrame(new TextEncoder().encode(command)));
             }
             return;

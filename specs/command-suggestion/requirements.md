@@ -129,6 +129,10 @@ WHEN such a link is activated in the terminal UI
 THE SYSTEM SHALL decode the command and place it on the shell prompt WITHOUT a
 trailing newline — the user reviews it and presses Enter.
 
+WHEN the decoded command contains a CR or LF
+THE SYSTEM SHALL cut it at the first such character before placing it, so a
+malformed or hostile link cannot submit the line.
+
 THE SYSTEM SHALL NOT auto-execute a suggested command.
 
 **Rationale:** Suggestion, not execution. Placing the command on the prompt
