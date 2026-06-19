@@ -1080,7 +1080,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 29);
+        assert_eq!(first, 30);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
