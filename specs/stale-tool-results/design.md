@@ -117,7 +117,8 @@ snapshot* of a re-queryable read is low-value once the agent has acted on it —
 the agent needs current state it re-reads — so sacrificing that snapshot is
 acceptable. The read-heavy tools whose output dominates a long session opt in on
 that basis — `read_file`, `bash`, `search`, `keyword_search`, `read_image`, the
-browser read tools, the tmux and terminal history tools, `process_inspection`.
+browser read tools (screenshot, console logs), and the tmux and terminal history
+tools.
 
 Tools whose result is *not* a re-queryable read do not opt in, because their
 result is the sole record of something the agent cannot re-obtain:

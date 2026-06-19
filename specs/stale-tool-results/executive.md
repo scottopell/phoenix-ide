@@ -27,17 +27,17 @@ silently cleared.
 
 | ID | Title | Status |
 |---|---|---|
-| REQ-STR-001 | Sustain Long Sessions Without Losing Fidelity | ❌ Not Started |
-| REQ-STR-002 | Only Remove Recoverable Information | ❌ Not Started |
-| REQ-STR-003 | Preserve the Agent's Immediate Working Set | ❌ Not Started |
-| REQ-STR-004 | Leave a Marker, Never a Silent Gap | ❌ Not Started |
-| REQ-STR-005 | Never Lose the Record | ❌ Not Started |
-| REQ-STR-006 | Make Each Removal Pay for Itself | ❌ Not Started |
-| REQ-STR-007 | Keep Reuse Savings Stable Across Turns | ❌ Not Started |
-| REQ-STR-008 | Make Removal Observable | ❌ Not Started |
-| REQ-STR-009 | Apply Regardless of Model Provider | ❌ Not Started |
-| REQ-STR-010 | Tune Retention Per Deployment | ❌ Not Started |
-| REQ-STR-011 | Govern a Result's Images and Text Together | ❌ Not Started |
+| REQ-STR-001 | Sustain Long Sessions Without Losing Fidelity | ✅ Complete |
+| REQ-STR-002 | Only Remove Re-obtainable Information | ✅ Complete |
+| REQ-STR-003 | Preserve the Agent's Immediate Working Set | ✅ Complete |
+| REQ-STR-004 | Leave a Marker, Never a Silent Gap | ✅ Complete |
+| REQ-STR-005 | Never Lose the Record | ✅ Complete |
+| REQ-STR-006 | Make Each Removal Pay for Itself | ✅ Complete |
+| REQ-STR-007 | Keep Reuse Savings Stable Across Turns | ✅ Complete |
+| REQ-STR-008 | Make Removal Observable | ✅ Complete |
+| REQ-STR-009 | Apply Regardless of Model Provider | ✅ Complete |
+| REQ-STR-010 | Tune Retention Per Deployment | 🔄 In Progress |
+| REQ-STR-011 | Govern a Result's Images and Text Together | ✅ Complete |
 
 ## Scope Notes
 
@@ -58,7 +58,18 @@ The feature adds one persisted field, a monotonic `clear_watermark` integer
 (message sequence_id) on the conversation, defaulting to zero; existing
 conversations need no backfill. It removes the `IMAGE_HISTORY_ROUNDS` window and
 `tool_msg_indices_keeping_images`, folding image retirement into the
-watermark-governed verdict.
+watermark-governed verdict. The planner (`plan_tool_result_clearing`) and renderer
+(`render_messages`) live in the executor's history assembly; clearing is applied
+on the main LLM request path (`dispatch_llm_request`), which reads the watermark,
+plans a sweep, persists any advance, and logs the cleared count and freed tokens.
+`Tool::clearable()` sources the recoverable set, surfaced via
+`ToolRegistry::clearable_tool_names()`.
+
+REQ-STR-010 is partially met (🔄): the four retention parameters exist as named
+constants (`KEEP_RECENT_ROUNDS`, `CLEAR_TRIGGER_*`, `CLEAR_TARGET_*`,
+`CLEAR_AT_LEAST_TOKENS`), tunable by editing, but there is not yet a runtime or
+per-deployment configuration surface that overrides them. The remaining work is
+to thread these from deployment config.
 
 ## Default Parameters
 
