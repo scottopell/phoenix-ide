@@ -7,9 +7,12 @@ export function getErrorPresentation(errorKind?: ErrorKind): ErrorPresentation |
   switch (errorKind) {
     case 'auth':
       return { kind: errorKind, can_auto_retry: false, can_user_resume: true };
+    // invalid_response: the provider returned bytes we couldn't parse — a
+    // server/transport fault, retryable and resumable like server_error.
     case 'rate_limit':
     case 'network':
     case 'server_error':
+    case 'invalid_response':
     case 'timed_out':
       return { kind: errorKind, can_auto_retry: true, can_user_resume: true };
     // usage_limit_reached: a quota window resets on a clock boundary, so the

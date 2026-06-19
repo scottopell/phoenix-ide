@@ -217,6 +217,7 @@ const ERROR_KIND_OPTIONS = [
   'usage_limit_reached',
   'network',
   'invalid_request',
+  'invalid_response',
   'server_error',
   'server_overloaded',
   'timed_out',

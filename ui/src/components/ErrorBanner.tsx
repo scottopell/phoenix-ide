@@ -32,6 +32,14 @@ function humanizeError(
     return { title: 'Usage limit reached', details: message };
   }
 
+  if (errorKind === 'invalid_response') {
+    return {
+      title: 'Malformed response',
+      details:
+        'The provider returned a response we could not parse. This is usually temporary — retry.',
+    };
+  }
+
   // Try to parse as JSON (backend often wraps errors)
   try {
     const parsed = JSON.parse(message);
