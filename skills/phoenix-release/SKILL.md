@@ -31,27 +31,29 @@ Default bump is minor (`0.X.0 → 0.X+1.0`). Confirm with the user — never aut
 
 Push and tag operations affect shared state and trigger CI. Get explicit go-ahead before running.
 
-The shortest path is the helper script, which does all four steps (bump `crates/phoenix-ide/Cargo.toml`, commit `chore: bump version to X.Y.Z`, annotate tag `vX.Y.Z`, push `main` + tag):
+⚠️ **The tag MUST carry the `v` prefix — `vX.Y.Z`, never `X.Y.Z`.** The workflow trigger is `v[0-9]+.*`, so a tag without the `v` pushes silently, fires no CI, builds no binary, and publishes no release. This already happened: `0.8.0` and `0.8.1` were tagged without the prefix and became phantom versions — Cargo.toml advanced but nothing ever shipped, forcing v0.9.0 to absorb 179 commits. If you see a recent tag missing its `v`, that release never happened; don't trust the tag list alone — cross-check `gh release list`.
+
+⚠️ **`main` is branch-protected — a direct `git push origin main` is rejected** ("Changes must be made through a pull request"). The bump commit cannot be pushed straight to `main`. The flow that actually works:
+
+1. Make the bump commit locally (the helper script does this).
+2. Push the **tag** — tag refs are NOT covered by branch protection, and the push carries the bump commit's objects to the remote, so CI checks out the tag and builds correctly even though `main` hasn't moved yet.
+3. Land the bump on `main` via a PR (branch off the bump commit, open PR, merge). This is the *only* way `main`'s Cargo.toml catches up.
+
+The helper script bumps + commits + tags + pushes the tag, but its `git push origin main` step will fail under branch protection — that failure is expected and non-fatal (the tag still lands). After running it, open the PR for the bump:
 
 ```bash
-./scripts/tag-release.sh vX.Y.Z
+./scripts/tag-release.sh vX.Y.Z   # bumps, commits, tags, pushes tag; main push fails (expected)
+
+# Land the bump on main via PR (branch protection blocks direct push):
+git branch chore/bump-X.Y.Z HEAD          # bump commit is at local HEAD
+git reset --hard origin/main              # restore local main to remote
+git push -u origin chore/bump-X.Y.Z
+gh pr create --base main --head chore/bump-X.Y.Z \
+  --title "chore: bump version to X.Y.Z" \
+  --body "Version bump for the vX.Y.Z release. Tag already pushed; this lands the bump on main (direct push blocked by branch protection)."
 ```
 
-Or, if you prefer to do it by hand for visibility:
-
-```bash
-# Edit crates/phoenix-ide/Cargo.toml: version = "X.Y.Z"
-cargo update -p phoenix_ide --offline
-git add crates/phoenix-ide/Cargo.toml Cargo.lock
-git commit -m "chore: bump version to X.Y.Z"
-git push origin main
-git tag vX.Y.Z
-git push origin vX.Y.Z
-```
-
-Either way, the tag push fires `.github/workflows/release.yml`.
-
-Tag push fires `.github/workflows/release.yml` → ~7 minutes on the typical history.
+The tag push fires `.github/workflows/release.yml` → ~7 minutes on the typical history. The bump PR and the CI build proceed independently; the release binary does not wait on the PR merging.
 
 ## Step 3 — Wait for the build, verify the release
 
@@ -107,7 +109,7 @@ Print the URL back to the user. Done.
 
 ## Anti-patterns
 
-- **Bumping the version in a separate PR before the tag.** The bump commit *is* the tagged commit — that's why every prior release matches the pattern `chore: bump version to X.Y.Z` → tag at HEAD.
+- **Bumping the version in a PR *before* the tag.** The bump commit *is* the tagged commit — tag the bump commit, then land that same commit on `main` via PR (see Step 2). Don't merge a bump PR first and tag the merge result; the tag would point at a different commit than the one you bumped.
 - **Force-pushing a tag to "fix" notes.** Re-edit the release body via `gh release edit` — the tag and binary stay valid.
 - **Letting the sub-agent post directly.** It does not see the verification step. Always human-review then post.
 - **Dropping the AI banner because "this one's really good".** It's a structural marker, not a quality disclaimer.
