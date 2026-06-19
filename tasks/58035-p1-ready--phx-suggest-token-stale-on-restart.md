@@ -45,13 +45,40 @@ reuses it, so its panes lack `phx` on PATH and the OSC-8 hyperlinks
 terminal-feature until the server is recreated. This only affects terminals
 left open across the upgrade; a newly-opened terminal is fine.
 
-No fully-graceful auto-fix exists: an already-running pane's shell has already
-exported its PATH, so `tmux set-environment -g` / `set -ag` on the live server
-only reach NEW windows/panes, and kill+recreate would destroy the user's
-running panes and processes. Options to weigh:
-- Non-destructive partial refresh on reuse (set-environment -g + set -ag),
-  helping new windows only.
-- Detect a pre-feature server and recreate it behind explicit per-session
-  consent (destructive otherwise).
-- Surface a one-click "restart this terminal's tmux server" affordance in the
-  UI so the user opts in.
+No fully-graceful auto-fix exists for an already-running pane: its shell already
+exported its PATH, so it cannot pick up `phx` without a new window or
+`exec $SHELL`. But the two halves of the staleness differ in fixability, and an
+empirical check settled how much a live refresh recovers:
+
+- Hyperlinks (OSC-8 forwarding): FULLY fixable live. `tmux set -ag
+  terminal-features ",*:hyperlinks"` on a reused server restores forwarding for
+  the next fresh attach (verified: pre-feature server + live set -ag + fresh
+  attach forwards the phxrun link, identical to a config-loaded server). Phoenix
+  re-attaches on every panel open, so the user gets it on next open.
+- `phx` on PATH + injected env: NOT fixable for the current pane (frozen shell
+  env). `set-environment -g` reaches only NEW windows/panes.
+
+Resolved design (non-destructive refresh + a one-time hint):
+
+1. Detection: stamp the server's global env with a companion version
+   (`set-environment -g PHOENIX_COMPANION_VERSION <v>`) whenever it is created or
+   refreshed. On `ensure_live` reuse, read it back (`show-environment -g`); a
+   missing/older stamp means stale.
+
+2. Refresh-on-reuse (gated on a stale stamp, so a current server pays nothing):
+   - `set -ag terminal-features ",*:hyperlinks"` — restores OSC-8 forwarding.
+   - `set-environment -g` the injection (PATH bin dir, PHOENIX_API_URL,
+     PHOENIX_SUGGEST_TOKEN) so new windows/panes get `phx`.
+   - update the version stamp.
+
+3. Current-pane UX: print a one-time hint into the stale pane, e.g. "phx is now
+   available — open a new window or run `exec $SHELL` to use it in this shell."
+   Guides the user across the one-time gap without touching their running shell.
+
+Explicitly rejected: kill+recreate of a live server (destroys running panes/
+processes) — unnecessary, since the live refresh fixes hyperlinks and new
+windows fully.
+
+Out of scope (already done): token/API-URL staleness — the token is persisted
+in app_settings and fingerprint-bound; `PHOENIX_API_URL` is derived from the
+bind address.
