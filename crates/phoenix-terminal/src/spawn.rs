@@ -44,14 +44,6 @@ pub fn set_pty_env_injection(injection: PtyEnvInjection) {
     let _ = ENV_INJECTION.set(injection);
 }
 
-/// Read the server-wide PTY env injection, if one was installed. The tmux path
-/// needs this too: a pane shell is a child of the tmux *server*, not of the PTY
-/// child `build_env` dresses, so the same injection must be applied when the
-/// server is spawned (see `phoenix_tools::tmux` `spawn_session`).
-pub fn pty_env_injection() -> Option<&'static PtyEnvInjection> {
-    ENV_INJECTION.get()
-}
-
 /// What the PTY child should exec into.
 ///
 /// `Tmux` carries the conversation's resolved socket path and the
@@ -295,9 +287,13 @@ pub fn set_winsize_raw(fd: RawFd, dims: Dims) -> Result<(), String> {
     }
 }
 
-/// Construct an explicit minimal environment for the shell (REQ-TERM-002).
+/// Construct an explicit environment for the shell (REQ-TERM-002).
 ///
-/// Never inherits the API server's environment — prevents secret leakage.
+/// Never blindly inherits the API server's environment — prevents secret
+/// leakage. Beyond the fixed base it adds the enumerated `PtyEnvInjection` and a
+/// fixed allowlist of safe interactive session vars copied from the server
+/// process ([`PTY_ENV_ALLOWLIST`]). Secret-bearing vars (LLM API keys, gateway
+/// config, `PHOENIX_*`) are never on that list.
 pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
     let home = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
         .home()
@@ -340,15 +336,38 @@ pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
         env.extend(inj.extra.iter().cloned());
     }
 
+    // A fixed allowlist of safe interactive session vars, copied from the server
+    // process when present. These let a user's shell reach ssh-agent, the right
+    // locale, and the session runtime dir without inheriting the whole env.
+    // Nothing secret is listed (no LLM keys, gateway, or PHOENIX_* config).
+    for key in PTY_ENV_ALLOWLIST {
+        if let Ok(val) = std::env::var(key) {
+            env.push(((*key).to_owned(), val));
+        }
+    }
+
     env
 }
+
+/// Safe, non-secret interactive session vars passed through from the server
+/// process into the shell env (see [`build_env`]). Deliberately excludes every
+/// secret-bearing var (LLM API keys, gateway config, `PHOENIX_*`).
+const PTY_ENV_ALLOWLIST: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "SSH_CONNECTION",
+    "XDG_RUNTIME_DIR",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+];
 
 /// Same as [`build_env`] but explicitly omits `TMUX`. When Phoenix is
 /// launched from inside an outer tmux session, the inherited `TMUX`
 /// env var causes the inner tmux to refuse to nest by default
 /// ("sessions should be nested with care"). REQ-TMUX-004 / spec
 /// design.md §"TMUX env handling".
-pub(crate) fn build_env_for_tmux(shell_path: &str) -> Vec<(String, String)> {
+#[must_use]
+pub fn build_env_for_tmux(shell_path: &str) -> Vec<(String, String)> {
     // build_env() never includes TMUX in the first place — its caller
     // populates the env from a fixed list. We re-use it verbatim and
     // belt-and-braces drop any TMUX-prefixed key just in case the list

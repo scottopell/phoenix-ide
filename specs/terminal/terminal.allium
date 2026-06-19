@@ -297,12 +297,17 @@ rule ShellEnvironmentConstructed {
     @guidance
         -- The child env is constructed explicitly and never blindly inherits
         -- the API server's process environment (which may hold secrets).
-        -- The only non-base entries are a single enumerated injection,
-        -- specified in specs/command-suggestion (REQ-CSUG-006): a bin dir
-        -- prepended to PATH (the `phx` shim) plus PHOENIX_API_URL and the
-        -- scoped PHOENIX_SUGGEST_TOKEN. pty_injected_path/_api_url/_token return
-        -- these when the injection is installed, and the base value (empty for
-        -- the two vars) otherwise.
+        -- The non-base entries are a single enumerated injection, specified in
+        -- specs/command-suggestion (REQ-CSUG-006): a bin dir prepended to PATH
+        -- (the `phx` shim) plus PHOENIX_API_URL and the scoped
+        -- PHOENIX_SUGGEST_TOKEN; pty_injected_path/_api_url/_token return these
+        -- when the injection is installed, and the base value (empty for the two
+        -- vars) otherwise. build_env also copies through a fixed allowlist of
+        -- safe interactive session vars when present (SSH_AUTH_SOCK,
+        -- SSH_CONNECTION, XDG_RUNTIME_DIR, LC_ALL, LC_CTYPE, TZ) -- never any
+        -- secret-bearing var. The tmux path applies this same construction by
+        -- spawning the server with a cleared-then-rebuilt env (build_env_for_tmux),
+        -- because a pane inherits the tmux server's env (see specs/tmux-integration).
         -- TERM=xterm-256color is the most critical base variable:
         -- wrong or missing causes readline degradation, broken arrow keys,
         -- and misbehaviour in vim, htop, and similar programs.

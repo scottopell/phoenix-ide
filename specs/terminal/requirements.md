@@ -56,15 +56,27 @@ WHEN a Phoenix-managed PTY environment injection is installed
 THE SYSTEM SHALL augment the constructed environment with exactly that
 injection's enumerated entries — a bin directory prepended to `PATH` plus
 `PHOENIX_API_URL` and `PHOENIX_SUGGEST_TOKEN` (see `specs/command-suggestion`
-REQ-CSUG-006) — and nothing else.
+REQ-CSUG-006).
 
-**Rationale:** The API server environment may contain secrets (API keys,
-tokens). The guarantee is that nothing flows into the child except the
-variables listed above and the single enumerated injection — never a blind
-copy of the server's environment. The injection is a deliberate, named set, so
-it does not reopen the secret-leakage hole. `TERM=xterm-256color` is the most
-safety-critical base variable: wrong or missing causes readline degradation,
-broken arrow keys, and misbehaviour in vim, htop, and similar programs.
+THE SYSTEM SHALL additionally copy through a fixed allowlist of safe interactive
+session variables from the server process when present (`SSH_AUTH_SOCK`,
+`SSH_CONNECTION`, `XDG_RUNTIME_DIR`, `LC_ALL`, `LC_CTYPE`, `TZ`) — and nothing
+else.
+
+THE SYSTEM SHALL apply this same construction on the tmux-backed path: the tmux
+server is spawned with this explicit environment (a cleared env, then the
+constructed set), since its pane shells inherit the server's environment rather
+than the constructed one directly (see `specs/tmux-integration`).
+
+**Rationale:** The API server environment may contain secrets (LLM API keys,
+gateway config, `PHOENIX_*`). The guarantee is that nothing flows into the child
+except the base variables, the enumerated injection, and the fixed safe-var
+allowlist — never a blind copy of the server's environment. Each addition is a
+deliberate, named set, so none reopens the secret-leakage hole; the allowlist is
+chosen to exclude every secret-bearing variable. `TERM=xterm-256color` is the
+most safety-critical base variable: wrong or missing causes readline
+degradation, broken arrow keys, and misbehaviour in vim, htop, and similar
+programs.
 
 ---
 

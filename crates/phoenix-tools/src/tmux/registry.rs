@@ -783,21 +783,17 @@ pub async fn cascade_tmux_on_delete(
         .await
 }
 
-/// Apply the server-wide PTY env injection to a tmux command so the spawned
-/// server (and thus its pane shells) carry the `phx` shim on PATH plus
-/// `PHOENIX_API_URL` / `PHOENIX_SUGGEST_TOKEN`. No-op when no injection is
-/// installed (e.g. tests).
-fn apply_pty_env_injection(cmd: &mut tokio::process::Command) {
-    let Some(inj) = phoenix_terminal::spawn::pty_env_injection() else {
-        return;
-    };
-    if let Some(prefix) = &inj.path_prefix {
-        let base = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{base}", prefix.display()));
-    }
-    for (k, v) in &inj.extra {
-        cmd.env(k, v);
-    }
+/// Set an explicit environment on a tmux command so the spawned server (and
+/// thus its pane shells) match the direct-shell PTY contract: the fixed base
+/// env plus the `PtyEnvInjection` (the `phx` shim on PATH, `PHOENIX_API_URL`,
+/// `PHOENIX_SUGGEST_TOKEN`) and the safe-var allowlist — never a blind copy of
+/// the Phoenix process environment, which would leak server secrets (LLM API
+/// keys, gateway config) into every tmux-backed terminal. `build_env_for_tmux`
+/// is the single source for that env (`specs/terminal` REQ-TERM-002).
+fn set_tmux_server_env(cmd: &mut tokio::process::Command) {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
+    cmd.env_clear();
+    cmd.envs(phoenix_terminal::spawn::build_env_for_tmux(&shell));
 }
 
 /// Spawn a fresh detached tmux session named `main` against
@@ -833,14 +829,13 @@ pub async fn spawn_session(
         &cwd.to_string_lossy(),
         "-s",
         TMUX_DEFAULT_SESSION,
-    ])
-    .env_remove("TMUX");
-    // A tmux pane shell inherits the tmux *server's* environment, captured when
-    // the server is spawned here — not `build_env`'s, which only dresses the
-    // short-lived `tmux attach` client. Apply the same PTY env injection (PATH
-    // prefix for the `phx` shim + API URL + capability token) so terminal
-    // affordances work identically on the tmux and direct-shell paths.
-    apply_pty_env_injection(&mut cmd);
+    ]);
+    // A tmux pane shell inherits the tmux *server's* environment, captured here.
+    // Build it explicitly (base + PtyEnvInjection + safe-var allowlist) rather
+    // than inheriting Phoenix's env, which would leak server secrets into every
+    // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
+    // an outer-tmux invocation does not trip tmux's nesting refusal.
+    set_tmux_server_env(&mut cmd);
     let output = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
