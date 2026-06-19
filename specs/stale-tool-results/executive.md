@@ -12,12 +12,16 @@ fidelity before summarization is forced, and bends the per-turn cost curve of a
 long session back from quadratic toward linear.
 
 The work is provider-agnostic and lives in the executor's history-assembly pass
-(`build_llm_messages_static`), generalizing the existing aged-screenshot
-retention from images-only to full tool-result bodies. Clearing is anchored to
-recent tool rounds so it is stable across turns, which preserves the prompt-cache
-reuse that makes long sessions affordable; the cached tail of the current turn is
-never disturbed. Recoverability is a `Tool::clearable()` capability defaulting to
-false, so a new tool is never silently cleared.
+(`build_llm_messages_static`). It subsumes the existing aged-screenshot
+retention: a single mechanism now governs each tool result's text and images
+together, replacing the image-only window whose tail-relative boundary rewrote
+recent context — and busted the prompt cache — every turn. Removal is governed by
+a persisted, monotonic per-conversation clear watermark that advances only in
+spaced, worthwhile sweeps under context pressure, so the cleared prefix is
+identical between sweeps and the cache stays warm; the recency floor keeps the
+current turn's trailing-result breakpoint uncleared. Recoverability is a
+`Tool::clearable()` capability defaulting to false, so a new tool is never
+silently cleared.
 
 ## Status
 
@@ -33,23 +37,35 @@ false, so a new tool is never silently cleared.
 | REQ-STR-008 | Make Removal Observable | ❌ Not Started |
 | REQ-STR-009 | Apply Regardless of Model Provider | ❌ Not Started |
 | REQ-STR-010 | Tune Retention Per Deployment | ❌ Not Started |
+| REQ-STR-011 | Govern a Result's Images and Text Together | ❌ Not Started |
 
 ## Scope Notes
 
-The behavioural detail — the retention verdict per tool-result message, the
-activation / recoverability / worthwhile-gain conjunction, and the stability and
-cache-tail invariants — is specified in `stale-tool-results.allium`.
+The behavioural detail — the monotonic watermark and its advancement, the
+recency floor, the per-result verdict derived from watermark and tool
+clearability, the unified image/text treatment, and the stability and cache-tail
+invariants — is specified in `stale-tool-results.allium`.
 
-Clearing is the mid-weight member of a three-tier retention ladder already
-partly present in the executor: screenshot pruning (lightest, always on), this
-feature (mid, recoverable removal above a high-water mark), and
-continuation/summarization (heaviest, lossy, last resort). Clearing's job is to
-delay or eliminate the need for the heaviest tier.
+After unification the retention ladder has two tiers: this feature (recoverable,
+cache-aware removal above a high-water mark) and continuation/summarization
+(heaviest, lossy, last resort). Clearing's job is to delay or eliminate the need
+for the heaviest tier. The former lightest tier — the image-only window — is
+folded into this feature and removed.
+
+## Implementation Notes
+
+The feature adds one persisted field, a monotonic `clear_watermark` integer
+(message sequence_id) on the conversation, defaulting to zero; existing
+conversations need no backfill. It removes the `IMAGE_HISTORY_ROUNDS` window and
+`tool_msg_indices_keeping_images`, folding image retirement into the
+watermark-governed verdict.
 
 ## Default Parameters (to confirm at implementation)
 
 The retention parameters need concrete defaults set against the deployed models'
 context windows: `clear_trigger` (input-token high-water mark as a fraction of
-the context window), `keep_recent_rounds` (rounds always retained in full), and
-`clear_at_least` (minimum tokens a removal must free). These are deployment-tunable
+the context window), `target_after_clear` (usage a sweep falls back under),
+`keep_recent_rounds` (recency floor the watermark may not cross — at least the
+two rounds of visual context the prior image window preserved), and
+`clear_at_least` (minimum tokens a sweep must free). These are deployment-tunable
 per REQ-STR-010; the chosen defaults will be recorded here once benchmarked.

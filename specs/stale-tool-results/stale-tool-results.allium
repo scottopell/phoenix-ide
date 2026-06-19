@@ -5,40 +5,47 @@
 --
 -- Scope: The retention pass applied while a conversation's persisted
 --        history is folded into the provider-agnostic LLM message list
---        in Executor::build_llm_messages_static. The pass decides, per
---        tool-result message, whether to send the result body verbatim
---        or replace it with a placeholder to save context-window space
---        and input tokens on long sessions.
+--        in Executor::build_llm_messages_static. The pass maintains a
+--        monotonic per-conversation clear watermark and, from it, decides
+--        per tool-result message whether to send the result body
+--        verbatim or replace it with a placeholder — covering the
+--        result's text and images together — to save context-window
+--        space and input tokens on long sessions while keeping the
+--        cleared request prefix stable across turns for cache reuse.
 --
--- Includes: The per-result retention verdict; the activation
---           (high-water-mark), recoverability (clearable tool), and
---           worthwhile-gain (clear_at_least) conditions that gate
---           clearing; the round-from-end retained window; and the
---           invariants that make clearing recoverable, cache-stable,
---           and non-destructive.
+-- Includes: The clear watermark and its monotonic, pressure-gated,
+--           worthwhile-gain-gated advancement; the recency floor the
+--           watermark may not cross; the per-result verdict derived from
+--           watermark and tool clearability; the unified text+image
+--           treatment; and the invariants that make clearing recoverable,
+--           cache-stable, and non-destructive.
 --
 -- Excludes: Token estimation internals (estimate_text_tokens is treated
---           as an opaque input). Provider wire translation and the
---           placement of cache breakpoints (see specs/llm/anthropic.allium;
---           this spec only guarantees the retained window contains the
---           block those breakpoints anchor on). Screenshot-only image
---           pruning, and continuation/summarization — the lighter and
---           heavier retention tiers described in design.md.
+--           as an opaque input). Provider wire translation and cache
+--           breakpoint placement (see specs/llm/anthropic.allium; this
+--           spec only guarantees the recency floor keeps the trailing
+--           result — the block the last-user-message breakpoint anchors
+--           on — uncleared). Continuation/summarization, the heavier
+--           retention tier described in design.md.
 --
 -- Normative companions:
---   specs/stale-tool-results/requirements.md — REQ-STR-001..010
---   specs/stale-tool-results/design.md       — retention model, caching
+--   specs/stale-tool-results/requirements.md — REQ-STR-001..011
+--   specs/stale-tool-results/design.md       — watermark model, caching
 --
 -- Cross-references:
 --   crates/phoenix-ide/src/runtime/executor.rs — build_llm_messages_static,
---       tool_msg_indices_keeping_images, flatten_tool_blocks,
---       cap_messages_to_token_budget, estimate_text_tokens
+--       flatten_tool_blocks, cap_messages_to_token_budget,
+--       estimate_text_tokens
 --   crates/phoenix-tools/src/lib.rs            — Tool::clearable, ToolOutput
 --
 -- Self-contained: this spec does not `use` any other module. The
 -- persisted source of truth (db::ToolContent), the assembled
--- llm/LlmMessage list, and the producing tool are treated opaquely;
--- only the facts the retention decision branches on are modelled.
+-- llm/LlmMessage list, and the producing tool are treated opaquely; only
+-- the facts the retention decision branches on are modelled. The
+-- watermark's persistence across turns (the new_watermark of one
+-- assembly is the prior_watermark of the next) is a temporal fact noted
+-- in prose, not expressible in this dialect's entity-snapshot
+-- quantification.
 
 ------------------------------------------------------------
 -- Enumerations
@@ -59,24 +66,37 @@ enum RetentionVerdict { kept | cleared }
 -- persisted db::ToolContent joined to its producing tool-call by
 -- tool_use_id; the pass never mutates the persisted source.
 --
--- `rounds_from_end` is the result's tool-round distance from the most
--- recent round: 0 is the current turn's trailing result, growing as the
--- result ages. It only ever increases as the session grows — the basis
--- for clearing being stable across turns (REQ-STR-007).
+-- `round_sequence_id` is the message sequence position of the result's
+-- tool round — the same monotonic space the watermark lives in. A result
+-- is within the watermark's reach iff its round_sequence_id is at or
+-- below the watermark.
+--
+-- `within_recency_floor` is true iff the result is in the most recent
+-- keep_recent_rounds rounds. The watermark may never reach these
+-- (WatermarkBehindRecencyFloor), so a floored result is always kept;
+-- modelling it explicitly lets the trailing-result guarantee be stated
+-- directly (REQ-STR-003, REQ-STR-007).
 --
 -- `producing_tool_clearable` is the Tool::clearable() capability of the
 -- tool that produced the result: true iff re-invoking the tool would
 -- reproduce the information (REQ-STR-002). Defaulted false for any tool
 -- that has not opted in.
 --
--- `token_estimate` is estimate_text_tokens over the result body — the
--- tokens this result contributes, and the tokens freed if it is cleared.
+-- `token_estimate` is estimate_text_tokens over the result body (and its
+-- images) — the tokens this result contributes, and the tokens freed if
+-- it is cleared.
+--
+-- `images_sent` records whether image blocks are emitted for this result.
+-- It is coupled to the verdict (REQ-STR-011): kept results send images,
+-- cleared results do not — there is no separate image schedule.
 value ToolResultRendering {
     tool_use_id: String
-    rounds_from_end: Integer
+    round_sequence_id: Integer
+    within_recency_floor: Boolean
     producing_tool_clearable: Boolean
     token_estimate: Integer
     verdict: RetentionVerdict
+    images_sent: Boolean
 }
 
 ------------------------------------------------------------
@@ -86,25 +106,32 @@ value ToolResultRendering {
 -- One invocation of the history-assembly retention pass: the facts about
 -- a single request being built that the pass decides over.
 --
--- `clear_trigger_tokens` is the high-water mark above which clearing
--- activates (REQ-STR-001). It is derived upstream as a fraction of the
--- model's context window, leaving headroom for the reply; the fraction
--- and window are deployment inputs (REQ-STR-010), so only the resulting
--- integer threshold appears here.
+-- `prior_watermark` is the conversation's persisted clear watermark as of
+-- this assembly; `new_watermark` is its value after this assembly's
+-- (possible) advance, persisted back to the conversation. Across turns,
+-- one assembly's new_watermark is the next assembly's prior_watermark.
 --
--- `eligible_freed_tokens` is the sum of token_estimate over the
--- renderings that are clearable AND outside the retained window — the
--- tokens clearing *could* free this turn, used to gate worthwhile gain
--- (REQ-STR-006).
+-- `clear_trigger_tokens` is the high-water mark above which a sweep is
+-- considered (REQ-STR-001); `target_after_clear_tokens` is the usage a
+-- sweep aims to fall back under. Both are derived upstream from the
+-- model's context window and deployment config (REQ-STR-010), so only the
+-- resulting integer thresholds appear here.
 --
--- `tokens_freed` is the tokens actually freed: the sum of token_estimate
--- over renderings whose verdict is `cleared`.
+-- `floor_sequence_id` is the highest round_sequence_id the watermark may
+-- reach: the boundary just before the most recent keep_recent_rounds
+-- rounds. The watermark is capped at it (REQ-STR-003).
+--
+-- `freed_tokens` is the tokens this assembly's sweep frees: the sum of
+-- token_estimate over results newly cleared by advancing the watermark.
+-- Zero on a turn that does not advance.
 entity HistoryAssembly {
     estimated_input_tokens: Integer
     clear_trigger_tokens: Integer
-    clearing_active: Boolean
-    eligible_freed_tokens: Integer
-    tokens_freed: Integer
+    target_after_clear_tokens: Integer
+    floor_sequence_id: Integer
+    prior_watermark: Integer
+    new_watermark: Integer
+    freed_tokens: Integer
     renderings: List<ToolResultRendering>
 }
 
@@ -115,14 +142,15 @@ entity HistoryAssembly {
 config {
     -- Tool rounds whose results are always retained verbatim, counted
     -- from the most recent round. Covers the agent's active working set
-    -- (REQ-STR-003) and always includes round 0, the cache-anchoring
-    -- trailing result (REQ-STR-007). Deployment-tunable (REQ-STR-010).
+    -- (REQ-STR-003) and always includes the trailing result that anchors
+    -- the last cache breakpoint (REQ-STR-007). The watermark may not
+    -- reach these rounds. Deployment-tunable (REQ-STR-010).
     keep_recent_rounds: Integer = 3
 
-    -- Minimum tokens a clearing pass must free, or it clears nothing this
-    -- turn (REQ-STR-006). Bounds how often a removal disturbs the cached
-    -- prefix; sized so the one-time cache-write cost is recovered by the
-    -- ongoing savings. Deployment-tunable (REQ-STR-010).
+    -- Minimum tokens a sweep must free, or the watermark holds this turn
+    -- (REQ-STR-006). Bounds how often a sweep disturbs the cached prefix;
+    -- sized so the one-time cache-write cost is recovered by the ongoing
+    -- savings. Deployment-tunable (REQ-STR-010).
     clear_at_least_tokens: Integer = 8192
 }
 
@@ -138,101 +166,146 @@ actor HistoryAssembler {
 }
 
 ------------------------------------------------------------
--- Rules — activation
+-- Rules — watermark advancement
 ------------------------------------------------------------
 
--- Below the high-water mark the whole transcript fits comfortably, so
--- nothing is cleared: every tool result is sent verbatim (REQ-STR-001).
--- Within a conversation input-token usage only grows, so this is a
--- one-way transition — the trigger is crossed at most once per session.
-rule ClearingInactiveBelowHighWaterMark {
+-- Below the high-water mark the transcript fits comfortably: the
+-- watermark holds and nothing new is cleared this turn (REQ-STR-001).
+-- Within a conversation input usage only grows, so a held watermark below
+-- the trigger is a one-way condition until usage climbs past it.
+rule WatermarkHeldBelowPressure {
     when: HistoryAssembled(assembly)
 
     requires: assembly.estimated_input_tokens <= assembly.clear_trigger_tokens
 
-    ensures: assembly.clearing_active = false
-    ensures: assembly.tokens_freed = 0
-    ensures: for r in assembly.renderings:
-        r.verdict = kept
+    ensures: assembly.new_watermark = assembly.prior_watermark
+    ensures: assembly.freed_tokens = 0
 }
 
--- Above the high-water mark clearing activates. Whether any individual
--- result is actually cleared still depends on the worthwhile-gain gate
--- and the per-result conditions below.
-rule ClearingActivatedAboveHighWaterMark {
+-- Over the high-water mark, but advancing the watermark to the next round
+-- boundary that would help frees less than clear_at_least: the watermark
+-- holds rather than pay a cache invalidation too small to be worth it
+-- (REQ-STR-006). It waits for more clearable output to accumulate.
+rule WatermarkHeldInsufficientGain {
     when: HistoryAssembled(assembly)
 
     requires: assembly.estimated_input_tokens > assembly.clear_trigger_tokens
+    requires: assembly.freed_tokens < clear_at_least_tokens
 
-    ensures: assembly.clearing_active = true
+    ensures: assembly.new_watermark = assembly.prior_watermark
+    ensures: assembly.freed_tokens = 0
 }
 
--- Active clearing that would free less than clear_at_least_tokens clears
--- nothing: a removal too small to repay the cache invalidation it causes
--- is deferred until more clearable output accumulates (REQ-STR-006).
-rule ClearingSkippedInsufficientGain {
+-- Over the high-water mark with a worthwhile sweep available: the
+-- watermark advances forward over whole rounds, never past the recency
+-- floor, freeing at least clear_at_least tokens. It moves far enough that
+-- usage falls under the target (so the next sweep is many turns away), or
+-- to the floor if the target cannot be reached without crossing it.
+rule WatermarkAdvancedUnderPressure {
     when: HistoryAssembled(assembly)
 
-    requires: assembly.clearing_active = true
-    requires: assembly.eligible_freed_tokens < clear_at_least_tokens
+    requires: assembly.estimated_input_tokens > assembly.clear_trigger_tokens
+    requires: assembly.freed_tokens >= clear_at_least_tokens
 
-    ensures: assembly.tokens_freed = 0
-    ensures: for r in assembly.renderings:
-        r.verdict = kept
+    ensures: assembly.new_watermark > assembly.prior_watermark
+    ensures: assembly.new_watermark <= assembly.floor_sequence_id
+    ensures: assembly.freed_tokens >= clear_at_least_tokens
+
+    @guidance
+        -- Advance new_watermark to the highest round boundary R such that
+        -- R <= floor_sequence_id and clearing the clearable results in
+        -- (prior_watermark, R] brings estimated usage to <=
+        -- target_after_clear_tokens; if no such R reaches the target,
+        -- advance to floor_sequence_id. Advancement is by whole rounds so
+        -- a tool_use/tool_result pairing is never split. freed_tokens is
+        -- the sum of token_estimate over results in (prior_watermark,
+        -- new_watermark] whose producing tool is clearable. The watermark
+        -- is persisted back to the conversation row; next turn reads it as
+        -- prior_watermark.
 }
 
 ------------------------------------------------------------
--- Rules — per-result verdict (clearing active, gain sufficient)
+-- Rules — per-result verdict (derived from the watermark)
 ------------------------------------------------------------
 
--- A result is cleared only when clearing is active, the pass frees a
--- worthwhile amount, the result is outside the retained window, and its
--- producing tool is clearable. All four must hold; the rules below cover
--- the complementary cases that force `kept`.
+-- A result is cleared iff it is within the (post-advance) watermark's
+-- reach AND its producing tool is clearable. Clearing drops the body and
+-- the images together (REQ-STR-002, REQ-STR-011).
 rule ToolResultCleared {
     when: RenderingDecided(assembly, r)
 
-    requires: assembly.clearing_active = true
-    requires: assembly.eligible_freed_tokens >= clear_at_least_tokens
-    requires: r.rounds_from_end >= keep_recent_rounds
+    requires: r.round_sequence_id <= assembly.new_watermark
     requires: r.producing_tool_clearable = true
 
     ensures: r.verdict = cleared
+    ensures: r.images_sent = false
 
     @guidance
         -- Clearing replaces the rendered ToolResult body with the fixed
-        -- placeholder "[tool result cleared to save context]" and emits
-        -- no image blocks for it; the paired assistant ToolUse block is
-        -- left intact (REQ-STR-004). The persisted db::ToolContent is
-        -- read-only here — the cleared form exists only in the
-        -- Vec<LlmMessage> for this one request (REQ-STR-005).
+        -- placeholder "[tool result cleared to save context]" and emits no
+        -- image blocks; the paired assistant ToolUse block is left intact
+        -- (REQ-STR-004). The persisted db::ToolContent is read-only here —
+        -- the cleared form exists only in the Vec<LlmMessage> for this one
+        -- request (REQ-STR-005).
 }
 
--- Results inside the retained window are always kept: they are the
--- agent's immediate working set, and round 0 anchors the reusable cached
--- prefix (REQ-STR-003, REQ-STR-007).
-rule ToolResultKeptWithinRetainedWindow {
+-- A result beyond the watermark's reach is kept in full: it is recent
+-- enough that the watermark has not reached it (and, within the recency
+-- floor, never will). Text and images both sent (REQ-STR-003, REQ-STR-011).
+rule ToolResultKeptBeyondWatermark {
     when: RenderingDecided(assembly, r)
 
-    requires: r.rounds_from_end < keep_recent_rounds
+    requires: r.round_sequence_id > assembly.new_watermark
 
     ensures: r.verdict = kept
+    ensures: r.images_sent = true
 }
 
--- A result whose producing tool is not clearable is always kept: its
--- information could not be regenerated by re-invocation, so removal would
--- be unrecoverable data loss (REQ-STR-002).
+-- A result within the watermark's reach but whose producing tool is not
+-- clearable is kept: its information could not be regenerated by
+-- re-invocation, so removal would be unrecoverable data loss. The
+-- watermark passing it by does not clear it (REQ-STR-002).
 rule ToolResultKeptNotClearable {
     when: RenderingDecided(assembly, r)
 
+    requires: r.round_sequence_id <= assembly.new_watermark
     requires: r.producing_tool_clearable = false
 
     ensures: r.verdict = kept
+    ensures: r.images_sent = true
 }
 
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
+
+-- REQ-STR-007. The watermark never regresses within an assembly: every
+-- advancement rule leaves new_watermark >= prior_watermark. Combined with
+-- the temporal carry (one turn's new_watermark is the next's
+-- prior_watermark), the cleared set only ever grows — the basis for a
+-- byte-stable cleared prefix across turns and the cache reuse it buys.
+invariant WatermarkMonotonic {
+    for a in HistoryAssemblies:
+        a.new_watermark >= a.prior_watermark
+}
+
+-- REQ-STR-003 / REQ-STR-007. The watermark stays strictly behind the
+-- recency floor, so the most recent keep_recent_rounds rounds — including
+-- the trailing tool result the last-user-message cache breakpoint anchors
+-- on (specs/llm/anthropic.allium) — are never within its reach.
+invariant WatermarkBehindRecencyFloor {
+    for a in HistoryAssemblies:
+        a.new_watermark <= a.floor_sequence_id
+}
+
+-- REQ-STR-003. A result in the recency floor is always kept, whatever the
+-- watermark and whatever its producing tool. Its round sits above the
+-- floor boundary, hence above the watermark.
+invariant RecencyFloorAlwaysKept {
+    for a in HistoryAssemblies:
+        for r in a.renderings:
+            r.within_recency_floor = true implies r.verdict = kept
+}
 
 -- REQ-STR-002. A cleared result's producing tool is always clearable:
 -- unrecoverable output is never removed.
@@ -242,53 +315,41 @@ invariant ClearedImpliesRecoverable {
             r.verdict = cleared implies r.producing_tool_clearable = true
 }
 
--- REQ-STR-003 / REQ-STR-007. Nothing inside the retained window is ever
--- cleared. Because round 0 is always inside the window, this also keeps
--- the trailing tool result — the block the last-user-message cache
--- breakpoint anchors on (specs/llm/anthropic.allium) — uncleared, so
--- clearing never disturbs the current turn's reusable prefix.
-invariant RetainedWindowNeverCleared {
+-- REQ-STR-007. A cleared result is always within the watermark's reach.
+-- Since the watermark only advances (WatermarkMonotonic) and a floored
+-- result is never within reach (WatermarkBehindRecencyFloor), a result
+-- cleared on one turn stays within reach and stays cleared on every later
+-- turn — the structural witness for cross-turn stability, which the
+-- temporal carry of the watermark completes.
+invariant ClearedImpliesWithinWatermark {
     for a in HistoryAssemblies:
         for r in a.renderings:
-            r.rounds_from_end < keep_recent_rounds implies r.verdict = kept
+            r.verdict = cleared implies r.round_sequence_id <= a.new_watermark
 }
 
--- REQ-STR-007 (structural proxy for cross-turn stability). A cleared
--- result is always outside the retained window. Since rounds_from_end
--- only grows as the session lengthens, a result outside the window on one
--- turn stays outside it on every later turn — so a cleared result stays
--- cleared, and the cleared prefix is byte-identical turn over turn,
--- preserving cache reuse. The temporal claim itself (turn N+1 keeps turn
--- N's clears) is not expressible in entity-snapshot quantification; this
--- invariant plus the monotonicity of rounds_from_end witness it.
-invariant ClearedImpliesOutsideRetainedWindow {
+-- REQ-STR-011. Image emission is governed by the same verdict as the
+-- body: a kept result sends its images, a cleared result does not. There
+-- is no separate image-retirement schedule.
+invariant ImagesFollowVerdict {
     for a in HistoryAssemblies:
         for r in a.renderings:
-            r.verdict = cleared implies r.rounds_from_end >= keep_recent_rounds
+            r.images_sent = (r.verdict = kept)
 }
 
--- REQ-STR-006. When the pass clears anything, it frees at least the
--- worthwhile-gain minimum; a smaller removal is deferred to nothing.
-invariant ClearingFreesWorthwhileTokens {
+-- REQ-STR-006. When a sweep advances the watermark it frees at least the
+-- worthwhile-gain minimum; a smaller sweep is not taken (the watermark
+-- holds with freed_tokens = 0).
+invariant SweepFreesWorthwhileOrHolds {
     for a in HistoryAssemblies:
-        a.tokens_freed > 0 implies a.tokens_freed >= clear_at_least_tokens
+        a.freed_tokens > 0 implies a.freed_tokens >= clear_at_least_tokens
 }
 
--- REQ-STR-001. While clearing is inactive nothing is cleared — a short
--- session sends its full transcript.
-invariant InactiveClearsNothing {
+-- REQ-STR-008. The freed-token figure the pass logs equals the
+-- contribution of the results newly cleared by this turn's advance,
+-- never an estimate detached from the watermark move.
+invariant FreedTokensMatchNewlyCleared {
     for a in HistoryAssemblies:
-        a.clearing_active = false implies
-            for r in a.renderings:
-                r.verdict = kept
-}
-
--- REQ-STR-008. Tokens actually freed equals the contribution of the
--- cleared results; the freed-token figure the pass logs is exactly this
--- sum, never an estimate detached from the verdicts.
-invariant FreedTokensMatchClearedResults {
-    for a in HistoryAssemblies:
-        a.tokens_freed = sum_token_estimate_where_cleared(a.renderings)
+        a.freed_tokens = sum_token_estimate_newly_cleared(a)
 }
 
 ------------------------------------------------------------
@@ -297,30 +358,44 @@ invariant FreedTokensMatchClearedResults {
 -- Kept as prose rather than `open question` declarations so the file
 -- remains parseable.
 --
--- Recoverability is a tool capability, not a content heuristic. The
---     decision to clear keys on Tool::clearable() — a property of the
---     producing tool resolved via the result's tool_use_id — rather than
---     on inspecting the result body. A false default means a newly added
---     tool is never silently cleared; opting in is an explicit, reviewed
---     act. This makes "never considered for clearing" structurally
---     distinct from "safe to clear" (REQ-STR-002).
+-- A persisted monotonic watermark, not a stateless positional rule.
+--     Cache reuse holds only while the removed prefix is byte-identical
+--     turn to turn. A tail-relative rule ("keep the last N rounds") moves
+--     its boundary every turn and rewrites recent context every turn; a
+--     threshold-only rule un-clears what a sweep just cleared once usage
+--     drops back under the mark. Stability therefore requires remembering
+--     how far clearing has reached. The watermark is that memory — one
+--     monotonic integer (a message sequence_id) on the conversation row,
+--     a scalar column rather than a blob field, advanced only by a sweep
+--     and never regressed.
 --
--- Round-from-end anchoring over a recomputed token budget. Retention is
---     anchored to the most recent keep_recent_rounds rounds, not to a
---     token budget recomputed each turn. A budget that shifted with the
---     conversation could re-keep a previously-cleared result, changing the
---     prefix and busting the cache every turn. Round-from-end is monotonic
---     as history grows, so the cleared set only ever expands — the
---     property REQ-STR-007 needs.
+-- One mechanism for text and images. Image emission is coupled to the
+--     verdict (ImagesFollowVerdict), replacing the prior image-only
+--     retirement window. That window retired images a fixed two rounds
+--     behind the newest round — a tail-relative boundary that advanced
+--     every turn and rewrote recent context every turn, invalidating the
+--     cache from two rounds behind the tail through the tail. Folding
+--     images into the watermark-governed verdict removes that per-turn
+--     rewrite: images leave the context only when their round is swept,
+--     at a boundary that holds still between sweeps (REQ-STR-011).
 --
--- One-time invalidation, then re-warm. Clearing a result changes a
---     user-role message and invalidates the cached prefix from the
---     earliest cleared message forward. This is inherent to any in-place
---     context reduction. The design pays it once per batch (gated by
---     clear_at_least_tokens) and relies on stability to re-warm: every
---     later turn sends the same cleared prefix and reads it from cache.
+-- Recoverability is a tool capability, not a content heuristic. Clearing
+--     keys on Tool::clearable() — a property of the producing tool
+--     resolved via tool_use_id — not on inspecting the result body. A
+--     false default means a newly added tool is never silently cleared;
+--     opting in is an explicit, reviewed act. The watermark reaching an
+--     unclearable result does not clear it (REQ-STR-002).
 --
--- Non-destructive by construction. The cleared form is computed during
---     assembly and never persisted, so there is no serialized "cleared"
---     state to lose on a write or migrate. A UI rebuilding from storage,
---     or a rewind, sees every tool result in full (REQ-STR-005).
+-- One-time invalidation per sweep, then re-warm. Advancing the watermark
+--     rewrites the prefix from the earliest newly-cleared result forward,
+--     invalidating the cache there. This is inherent to any in-place
+--     context reduction. The design pays it once per sweep (gated by
+--     clear_at_least_tokens and spaced by target_after_clear) and relies
+--     on the watermark holding between sweeps to re-warm: every
+--     intervening turn sends the same cleared prefix and reads it from
+--     cache.
+--
+-- Non-destructive by construction. The only persisted state added is the
+--     watermark integer; the cleared body is recomputed from it on every
+--     assembly and never stored. A UI rebuilding from storage, or a
+--     rewind, sees every tool result in full (REQ-STR-005).

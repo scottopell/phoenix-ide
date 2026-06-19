@@ -92,13 +92,19 @@ nothing on that turn.
 
 ### REQ-STR-007 — Keep Reuse Savings Stable Across Turns
 
-**Rationale:** If the set of removed results changed from turn to turn, every
-turn would reprocess the conversation from the first changed point, defeating the
-reuse that makes long sessions affordable.
+**Rationale:** Reuse of previously-processed context is what makes a long
+session affordable, and reuse holds only while the early part of each request is
+identical to the previous request. If the set of removed results changed from
+turn to turn, the early part would differ and every turn would reprocess the
+conversation from the first changed point, defeating the reuse.
 
 ONCE a tool result has been removed from the model's view, THE SYSTEM SHALL keep
-it removed for the remainder of the session, and SHALL NOT remove results from
-the most recent round that anchors the reusable portion of the request.
+it removed for the remainder of the session; the set of removed results SHALL
+only ever grow, and SHALL change only when additional older results are removed,
+so that the removed portion presented to the model is identical from one turn to
+the next except on the turns that remove more. THE SYSTEM SHALL NOT remove
+results from the most recent rounds that anchor the reusable portion of the
+request.
 
 ### REQ-STR-008 — Make Removal Observable
 
@@ -125,3 +131,19 @@ high-water marks; an operator may want to keep more or fewer recent rounds.
 WHERE the high-water mark, the number of recent rounds retained, or the minimum
 tokens freed per removal are configured, THE SYSTEM SHALL honor the configured
 values.
+
+### REQ-STR-011 — Govern a Result's Images and Text Together
+
+**Rationale:** Images are the heaviest part of a tool result, so it is tempting
+to retire them on a tighter, separate schedule than text. But a second retention
+boundary that retires images a fixed number of rounds behind the newest one moves
+forward every turn, and each step rewrites a recent part of the conversation —
+which is exactly the rewrite that destroys reuse and re-bills the recent context.
+A single decision per result, covering text and images alike, keeps the removed
+portion stable.
+
+THE SYSTEM SHALL decide retention once per tool result, and that one decision
+SHALL govern both the result's text and its images: IF a result is retained its
+images are retained, and IF a result is removed its images are removed. THE
+SYSTEM SHALL NOT maintain a separate retirement schedule for images that removes
+them from a result still otherwise retained.
