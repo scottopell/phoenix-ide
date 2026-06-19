@@ -67,16 +67,45 @@ pub(crate) struct AllocStats {
 /// Run `f` with per-thread allocation counting enabled and return its result
 /// alongside the allocations it performed. Allocations on other threads (and
 /// the eventual drop of the returned value) are not counted.
+///
+/// Cleanup is unconditional (a `Drop` guard), so a panic inside `f` cannot
+/// leave the thread armed. Nesting composes: an inner `measure` restores the
+/// outer's prior counters and folds its own count back into them, so the outer
+/// still observes allocations made inside the inner closure.
 pub(crate) fn measure<R>(f: impl FnOnce() -> R) -> (R, AllocStats) {
+    /// On drop, fold this scope's counts back into the saved parent totals and
+    /// restore the parent's `ACTIVE` flag — runs on both normal return and
+    /// unwind.
+    struct Restore {
+        prev_active: bool,
+        prev_allocs: u64,
+        prev_bytes: u64,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let allocs = ALLOCS.with(Cell::get);
+            let bytes = BYTES.with(Cell::get);
+            ALLOCS.with(|c| c.set(self.prev_allocs.wrapping_add(allocs)));
+            BYTES.with(|c| c.set(self.prev_bytes.wrapping_add(bytes)));
+            ACTIVE.with(|a| a.set(self.prev_active));
+        }
+    }
+
+    let restore = Restore {
+        prev_active: ACTIVE.with(Cell::get),
+        prev_allocs: ALLOCS.with(Cell::get),
+        prev_bytes: BYTES.with(Cell::get),
+    };
     ACTIVE.with(|a| a.set(true));
     ALLOCS.with(|c| c.set(0));
     BYTES.with(|b| b.set(0));
+
     let result = f();
     let stats = AllocStats {
         allocations: ALLOCS.with(Cell::get),
         bytes: BYTES.with(Cell::get),
     };
-    ACTIVE.with(|a| a.set(false));
+    drop(restore);
     (result, stats)
 }
 
@@ -154,11 +183,12 @@ mod tests {
     }
 
     /// Per-message enrichment (`EnrichedMessage::from`) must not regress to
-    /// whole-`Message` serialization. The shipping content-only path measures
-    /// ~200 allocs on this fixture; the whole-`Message` content extraction
-    /// alone is ~319, and a reverted `from()` (which still clones
-    /// `display_data` and runs the bash merge on top) lands well above that.
-    /// The ceiling sits between current cost and a revert.
+    /// whole-`Message` serialization. The shipping content-only path sits well
+    /// below the whole-`Message` content extraction it replaced; a reverted
+    /// `from()` (which still clones `display_data` and runs the bash merge on
+    /// top) lands above the ceiling. The ceiling guards that relationship, not
+    /// an exact count — current measured values live in the ignored
+    /// `report_current_allocations` test, deliberately not duplicated here.
     #[test]
     fn enriched_message_from_stays_content_only() {
         let msg = agent_message_fixture();
@@ -168,9 +198,10 @@ mod tests {
         let (_enriched, stats) = measure(|| EnrichedMessage::from(&msg));
         assert!(
             stats.allocations <= 260,
-            "EnrichedMessage::from allocated {} times (>260); whole-Message \
-             serialization (~319 allocs just for content extraction) was likely \
-             reintroduced — enrich only msg.content, not the whole envelope",
+            "EnrichedMessage::from allocated {} times (ceiling 260); \
+             whole-Message serialization was likely reintroduced — enrich only \
+             msg.content, not the whole envelope (run report_current_allocations \
+             for current costs)",
             stats.allocations
         );
     }
@@ -210,6 +241,43 @@ mod tests {
         let (v, stats) = measure(|| vec![1u8, 2, 3]);
         assert_eq!(v, vec![1, 2, 3]);
         assert!(stats.allocations >= 1);
+    }
+
+    /// Nesting composes: the inner `measure` reports only its own allocations,
+    /// and the outer still observes the inner closure's allocations folded in.
+    #[test]
+    fn measure_nests_without_corrupting_outer() {
+        let mut inner_allocs = 0;
+        let (_unit, outer) = measure(|| {
+            std::hint::black_box(vec![0u8; 16]); // outer-only allocation
+            let (_v, inner) = measure(|| std::hint::black_box(vec![0u8; 16]));
+            inner_allocs = inner.allocations;
+        });
+        assert!(inner_allocs >= 1, "inner measured nothing");
+        assert!(
+            outer.allocations > inner_allocs,
+            "outer ({}) should include both its own and the inner closure's \
+             allocations ({})",
+            outer.allocations,
+            inner_allocs
+        );
+    }
+
+    /// Cleanup is unconditional: a panicking closure must not leave the thread
+    /// armed. Asserts `ACTIVE` is disarmed after the unwind.
+    #[test]
+    fn measure_disarms_after_panic() {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic
+        let caught =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| measure(|| panic!("boom"))));
+        std::panic::set_hook(prev_hook);
+
+        assert!(caught.is_err(), "closure was expected to panic");
+        assert!(
+            !ACTIVE.with(Cell::get),
+            "ACTIVE stayed armed after a panicking measure"
+        );
     }
 
     /// Print current allocation costs for tuning budgets. Ignored — run with:
