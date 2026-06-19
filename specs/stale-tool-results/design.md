@@ -195,11 +195,16 @@ worthwhile moments rather than paying it every turn:
 
 ## Token estimation (REQ-STR-001, REQ-STR-006)
 
-Pressure detection and the `clear_at_least` / target calculations reuse
-`estimate_text_tokens`, the same estimator `cap_messages_to_token_budget` and the
-continuation overflow guard use, so the high-water-mark decision is consistent
-with the executor's other token-budget logic. Estimation is approximate by
-design — the trigger sits below the true window, and the consequence of a
+Pressure detection and the `clear_at_least` / target calculations estimate each
+result's token cost with the **image-aware** estimator — `estimate_message_tokens`,
+which adds a fixed per-block cost for each `ContentBlock::Image` on top of the
+text character count, the same accounting `cap_messages_to_token_budget` uses. A
+text-only estimator (`estimate_text_tokens`) must not be used for the sweep
+decision: a stale screenshot round would then contribute almost nothing to
+`estimated_input_tokens` and `clear_at_least`, so the very image-heavy context
+this feature exists to retire would never register as worth clearing — clearing
+would stall exactly where it is needed most. Estimation is otherwise approximate
+by design — the trigger sits below the true window, and the consequence of a
 slightly-off estimate is sweeping one round early or late, never a dropped result
 or a 400.
 

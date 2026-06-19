@@ -82,19 +82,31 @@ enum RetentionVerdict { kept | cleared }
 -- reproduce the information (REQ-STR-002). Defaulted false for any tool
 -- that has not opted in.
 --
--- `token_estimate` is estimate_text_tokens over the result body (and its
--- images) — the tokens this result contributes, and the tokens freed if
--- it is cleared.
+-- `token_estimate` is the estimated tokens this result contributes —
+-- counting both its text body AND a per-image block cost, via the
+-- image-aware estimator (estimate_message_tokens), not a text-only
+-- character count. Image-heavy results are the expensive context this
+-- feature exists to retire, so their image cost must drive the sweep
+-- decision; a text-only estimate would let a screenshot round contribute
+-- almost nothing and starve clearing in image-heavy sessions. This is
+-- also the token figure freed if the result is cleared.
+--
+-- `has_images` is true iff the persisted result carries image blocks. It
+-- separates "this result has images to preserve" from "images were
+-- emitted": a kept result emits images only when it has them, a cleared
+-- result emits none regardless.
 --
 -- `images_sent` records whether image blocks are emitted for this result.
--- It is coupled to the verdict (REQ-STR-011): kept results send images,
--- cleared results do not — there is no separate image schedule.
+-- It is coupled to the verdict and to has_images (REQ-STR-011): a kept
+-- result sends its images iff it has any; a cleared result sends none.
+-- There is no separate image-retirement schedule.
 value ToolResultRendering {
     tool_use_id: String
     round_sequence_id: Integer
     within_recency_floor: Boolean
     producing_tool_clearable: Boolean
     token_estimate: Integer
+    has_images: Boolean
     verdict: RetentionVerdict
     images_sent: Boolean
 }
@@ -121,9 +133,21 @@ value ToolResultRendering {
 -- reach: the boundary just before the most recent keep_recent_rounds
 -- rounds. The watermark is capped at it (REQ-STR-003).
 --
--- `freed_tokens` is the tokens this assembly's sweep frees: the sum of
--- token_estimate over results newly cleared by advancing the watermark.
--- Zero on a turn that does not advance.
+-- `eligible_freed_tokens` is the *candidate* sweep size: the tokens that
+-- could be freed by advancing the watermark all the way to the floor —
+-- i.e. clearable_tokens_between(prior_watermark, floor_sequence_id). It is
+-- the quantity the worthwhile-gain gate tests, and it is independent of
+-- whether the watermark actually advances. Distinct from freed_tokens,
+-- which is what a taken sweep actually frees.
+--
+-- `freed_tokens` is the tokens this assembly's sweep actually frees: the
+-- sum of token_estimate over results newly cleared by advancing the
+-- watermark to new_watermark. Zero on a turn that does not advance.
+--
+-- `cleared_count` is the number of results newly cleared by this
+-- assembly's advance — logged alongside freed_tokens so an operator sees
+-- both how many results were removed and how many tokens were freed
+-- (REQ-STR-008). Zero on a turn that does not advance.
 entity HistoryAssembly {
     estimated_input_tokens: Integer
     clear_trigger_tokens: Integer
@@ -131,7 +155,9 @@ entity HistoryAssembly {
     floor_sequence_id: Integer
     prior_watermark: Integer
     new_watermark: Integer
+    eligible_freed_tokens: Integer
     freed_tokens: Integer
+    cleared_count: Integer
     renderings: List<ToolResultRendering>
 }
 
@@ -166,6 +192,37 @@ actor HistoryAssembler {
 }
 
 ------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+-- Allium has no formal helper-function construct; these are documented
+-- here so the identifiers the rules and invariants reference are not bare.
+--
+-- clearable_tokens_between(a, lo, hi): the sum of token_estimate over the
+--     renderings r of assembly a for which lo < r.round_sequence_id <= hi
+--     AND r.producing_tool_clearable = true. It counts only results in the
+--     half-open round range that are recoverable; it EXCLUDES results
+--     already cleared on a prior turn (round_sequence_id <= lo), results
+--     whose tool is not clearable, and floor-protected results
+--     (round_sequence_id > floor_sequence_id, since hi never exceeds the
+--     floor). token_estimate is image-aware, so image blocks count.
+--
+-- count_clearable_between(a, lo, hi): the same range and predicate as
+--     clearable_tokens_between, but counting renderings rather than
+--     summing their tokens.
+--
+-- sum_token_estimate_newly_cleared(a) = clearable_tokens_between(
+--     a, a.prior_watermark, a.new_watermark) — what this turn's advance
+--     actually frees.
+--
+-- count_newly_cleared(a) = count_clearable_between(
+--     a, a.prior_watermark, a.new_watermark) — how many results this
+--     turn's advance actually clears.
+--
+-- The candidate (eligible) sweep is the same helpers evaluated to the
+-- floor: eligible_freed_tokens = clearable_tokens_between(
+--     a, a.prior_watermark, a.floor_sequence_id).
+
+------------------------------------------------------------
 -- Rules — watermark advancement
 ------------------------------------------------------------
 
@@ -180,20 +237,24 @@ rule WatermarkHeldBelowPressure {
 
     ensures: assembly.new_watermark = assembly.prior_watermark
     ensures: assembly.freed_tokens = 0
+    ensures: assembly.cleared_count = 0
 }
 
--- Over the high-water mark, but advancing the watermark to the next round
--- boundary that would help frees less than clear_at_least: the watermark
--- holds rather than pay a cache invalidation too small to be worth it
--- (REQ-STR-006). It waits for more clearable output to accumulate.
+-- Over the high-water mark, but even sweeping every clearable result up to
+-- the recency floor (the candidate eligible_freed_tokens) would free less
+-- than clear_at_least: the watermark holds rather than pay a cache
+-- invalidation too small to be worth it (REQ-STR-006). It waits for more
+-- clearable output to accumulate. The gate is on the candidate, not on
+-- freed_tokens — no sweep is taken, so freed_tokens is zero.
 rule WatermarkHeldInsufficientGain {
     when: HistoryAssembled(assembly)
 
     requires: assembly.estimated_input_tokens > assembly.clear_trigger_tokens
-    requires: assembly.freed_tokens < clear_at_least_tokens
+    requires: assembly.eligible_freed_tokens < clear_at_least_tokens
 
     ensures: assembly.new_watermark = assembly.prior_watermark
     ensures: assembly.freed_tokens = 0
+    ensures: assembly.cleared_count = 0
 }
 
 -- Over the high-water mark with a worthwhile sweep available: the
@@ -205,11 +266,12 @@ rule WatermarkAdvancedUnderPressure {
     when: HistoryAssembled(assembly)
 
     requires: assembly.estimated_input_tokens > assembly.clear_trigger_tokens
-    requires: assembly.freed_tokens >= clear_at_least_tokens
+    requires: assembly.eligible_freed_tokens >= clear_at_least_tokens
 
     ensures: assembly.new_watermark > assembly.prior_watermark
     ensures: assembly.new_watermark <= assembly.floor_sequence_id
     ensures: assembly.freed_tokens >= clear_at_least_tokens
+    ensures: assembly.cleared_count > 0
 
     @guidance
         -- Advance new_watermark to the highest round boundary R such that
@@ -217,11 +279,14 @@ rule WatermarkAdvancedUnderPressure {
         -- (prior_watermark, R] brings estimated usage to <=
         -- target_after_clear_tokens; if no such R reaches the target,
         -- advance to floor_sequence_id. Advancement is by whole rounds so
-        -- a tool_use/tool_result pairing is never split. freed_tokens is
-        -- the sum of token_estimate over results in (prior_watermark,
-        -- new_watermark] whose producing tool is clearable. The watermark
-        -- is persisted back to the conversation row; next turn reads it as
-        -- prior_watermark.
+        -- a tool_use/tool_result pairing is never split. freed_tokens =
+        -- sum_token_estimate_newly_cleared(assembly) and cleared_count =
+        -- count_newly_cleared(assembly) — the actual tokens and result
+        -- count this advance frees. Because the eligible candidate already
+        -- clears clear_at_least and a taken advance reaches at least the
+        -- first worthwhile round boundary, freed_tokens >= clear_at_least.
+        -- The watermark is persisted back to the conversation row; next
+        -- turn reads it as prior_watermark.
 }
 
 ------------------------------------------------------------
@@ -251,20 +316,22 @@ rule ToolResultCleared {
 
 -- A result beyond the watermark's reach is kept in full: it is recent
 -- enough that the watermark has not reached it (and, within the recency
--- floor, never will). Text and images both sent (REQ-STR-003, REQ-STR-011).
+-- floor, never will). The body is sent, and images are sent iff the
+-- result has any (REQ-STR-003, REQ-STR-011).
 rule ToolResultKeptBeyondWatermark {
     when: RenderingDecided(assembly, r)
 
     requires: r.round_sequence_id > assembly.new_watermark
 
     ensures: r.verdict = kept
-    ensures: r.images_sent = true
+    ensures: r.images_sent = r.has_images
 }
 
 -- A result within the watermark's reach but whose producing tool is not
 -- clearable is kept: its information could not be regenerated by
 -- re-invocation, so removal would be unrecoverable data loss. The
--- watermark passing it by does not clear it (REQ-STR-002).
+-- watermark passing it by does not clear it (REQ-STR-002). Images are sent
+-- iff the result has any.
 rule ToolResultKeptNotClearable {
     when: RenderingDecided(assembly, r)
 
@@ -272,7 +339,7 @@ rule ToolResultKeptNotClearable {
     requires: r.producing_tool_clearable = false
 
     ensures: r.verdict = kept
-    ensures: r.images_sent = true
+    ensures: r.images_sent = r.has_images
 }
 
 ------------------------------------------------------------
@@ -327,13 +394,21 @@ invariant ClearedImpliesWithinWatermark {
             r.verdict = cleared implies r.round_sequence_id <= a.new_watermark
 }
 
--- REQ-STR-011. Image emission is governed by the same verdict as the
--- body: a kept result sends its images, a cleared result does not. There
--- is no separate image-retirement schedule.
-invariant ImagesFollowVerdict {
+-- REQ-STR-011. A cleared result emits no image blocks. Clearing drops the
+-- images with the body; there is no separate image-retirement schedule.
+invariant ClearedSendsNoImages {
     for a in HistoryAssemblies:
         for r in a.renderings:
-            r.images_sent = (r.verdict = kept)
+            r.verdict = cleared implies r.images_sent = false
+}
+
+-- REQ-STR-011. A kept result emits its images iff it has any — image
+-- emission tracks image presence, not a fixed flag. A kept text-only
+-- result (a typical bash or read_file result) sends no image blocks.
+invariant KeptPreservesImages {
+    for a in HistoryAssemblies:
+        for r in a.renderings:
+            r.verdict = kept implies r.images_sent = r.has_images
 }
 
 -- REQ-STR-006. When a sweep advances the watermark it frees at least the
@@ -350,6 +425,15 @@ invariant SweepFreesWorthwhileOrHolds {
 invariant FreedTokensMatchNewlyCleared {
     for a in HistoryAssemblies:
         a.freed_tokens = sum_token_estimate_newly_cleared(a)
+}
+
+-- REQ-STR-008. The logged removed-result count equals the number of
+-- results newly cleared by this turn's advance, so an operator sees both
+-- how many results were removed and how many tokens were freed — and the
+-- two figures cannot drift apart in the model.
+invariant ClearedCountMatchesNewlyCleared {
+    for a in HistoryAssemblies:
+        a.cleared_count = count_newly_cleared(a)
 }
 
 ------------------------------------------------------------

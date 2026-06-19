@@ -60,12 +60,19 @@ conversations need no backfill. It removes the `IMAGE_HISTORY_ROUNDS` window and
 `tool_msg_indices_keeping_images`, folding image retirement into the
 watermark-governed verdict.
 
-## Default Parameters (to confirm at implementation)
+## Default Parameters
 
-The retention parameters need concrete defaults set against the deployed models'
-context windows: `clear_trigger` (input-token high-water mark as a fraction of
-the context window), `target_after_clear` (usage a sweep falls back under),
-`keep_recent_rounds` (recency floor the watermark may not cross — at least the
-two rounds of visual context the prior image window preserved), and
-`clear_at_least` (minimum tokens a sweep must free). These are deployment-tunable
-per REQ-STR-010; the chosen defaults will be recorded here once benchmarked.
+The retention parameters are deployment-tunable per REQ-STR-010. Two have
+provisional starting values carried as config defaults in `stale-tool-results.allium`
+— `keep_recent_rounds = 3` and `clear_at_least_tokens = 8192` — chosen as
+reasonable starting points (the floor keeps at least the two rounds of visual
+context the prior image window preserved, plus one). They are the implementation's
+initial values, to be tuned against benchmarks, not frozen constants; this note
+is the single place that records their status, so the config defaults and this
+document do not disagree.
+
+Two further parameters are derived per request rather than fixed config, so they
+carry no Allium default: `clear_trigger` (input-token high-water mark, a fraction
+of the model's context window) and `target_after_clear` (usage a sweep falls back
+under). Their fractions are set at implementation against the deployed models'
+windows and recorded here once benchmarked.
