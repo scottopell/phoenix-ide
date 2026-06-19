@@ -1,0 +1,326 @@
+-- allium: 3
+-- stale-tool-results.allium
+--
+-- Stale Tool Result Clearing: Behavioural Specification
+--
+-- Scope: The retention pass applied while a conversation's persisted
+--        history is folded into the provider-agnostic LLM message list
+--        in Executor::build_llm_messages_static. The pass decides, per
+--        tool-result message, whether to send the result body verbatim
+--        or replace it with a placeholder to save context-window space
+--        and input tokens on long sessions.
+--
+-- Includes: The per-result retention verdict; the activation
+--           (high-water-mark), recoverability (clearable tool), and
+--           worthwhile-gain (clear_at_least) conditions that gate
+--           clearing; the round-from-end retained window; and the
+--           invariants that make clearing recoverable, cache-stable,
+--           and non-destructive.
+--
+-- Excludes: Token estimation internals (estimate_text_tokens is treated
+--           as an opaque input). Provider wire translation and the
+--           placement of cache breakpoints (see specs/llm/anthropic.allium;
+--           this spec only guarantees the retained window contains the
+--           block those breakpoints anchor on). Screenshot-only image
+--           pruning, and continuation/summarization — the lighter and
+--           heavier retention tiers described in design.md.
+--
+-- Normative companions:
+--   specs/stale-tool-results/requirements.md — REQ-STR-001..010
+--   specs/stale-tool-results/design.md       — retention model, caching
+--
+-- Cross-references:
+--   crates/phoenix-ide/src/runtime/executor.rs — build_llm_messages_static,
+--       tool_msg_indices_keeping_images, flatten_tool_blocks,
+--       cap_messages_to_token_budget, estimate_text_tokens
+--   crates/phoenix-tools/src/lib.rs            — Tool::clearable, ToolOutput
+--
+-- Self-contained: this spec does not `use` any other module. The
+-- persisted source of truth (db::ToolContent), the assembled
+-- llm/LlmMessage list, and the producing tool are treated opaquely;
+-- only the facts the retention decision branches on are modelled.
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The decision for one tool-result message in one assembled request.
+-- `kept` sends the persisted result body and images verbatim; `cleared`
+-- replaces the body with a fixed placeholder and sends no images. The
+-- paired tool-call block is always retained regardless of verdict, so a
+-- cleared result is never a silent gap (REQ-STR-004).
+enum RetentionVerdict { kept | cleared }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- One tool-result message as seen by the retention pass. Derived from a
+-- persisted db::ToolContent joined to its producing tool-call by
+-- tool_use_id; the pass never mutates the persisted source.
+--
+-- `rounds_from_end` is the result's tool-round distance from the most
+-- recent round: 0 is the current turn's trailing result, growing as the
+-- result ages. It only ever increases as the session grows — the basis
+-- for clearing being stable across turns (REQ-STR-007).
+--
+-- `producing_tool_clearable` is the Tool::clearable() capability of the
+-- tool that produced the result: true iff re-invoking the tool would
+-- reproduce the information (REQ-STR-002). Defaulted false for any tool
+-- that has not opted in.
+--
+-- `token_estimate` is estimate_text_tokens over the result body — the
+-- tokens this result contributes, and the tokens freed if it is cleared.
+value ToolResultRendering {
+    tool_use_id: String
+    rounds_from_end: Integer
+    producing_tool_clearable: Boolean
+    token_estimate: Integer
+    verdict: RetentionVerdict
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- One invocation of the history-assembly retention pass: the facts about
+-- a single request being built that the pass decides over.
+--
+-- `clear_trigger_tokens` is the high-water mark above which clearing
+-- activates (REQ-STR-001). It is derived upstream as a fraction of the
+-- model's context window, leaving headroom for the reply; the fraction
+-- and window are deployment inputs (REQ-STR-010), so only the resulting
+-- integer threshold appears here.
+--
+-- `eligible_freed_tokens` is the sum of token_estimate over the
+-- renderings that are clearable AND outside the retained window — the
+-- tokens clearing *could* free this turn, used to gate worthwhile gain
+-- (REQ-STR-006).
+--
+-- `tokens_freed` is the tokens actually freed: the sum of token_estimate
+-- over renderings whose verdict is `cleared`.
+entity HistoryAssembly {
+    estimated_input_tokens: Integer
+    clear_trigger_tokens: Integer
+    clearing_active: Boolean
+    eligible_freed_tokens: Integer
+    tokens_freed: Integer
+    renderings: List<ToolResultRendering>
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Tool rounds whose results are always retained verbatim, counted
+    -- from the most recent round. Covers the agent's active working set
+    -- (REQ-STR-003) and always includes round 0, the cache-anchoring
+    -- trailing result (REQ-STR-007). Deployment-tunable (REQ-STR-010).
+    keep_recent_rounds: Integer = 3
+
+    -- Minimum tokens a clearing pass must free, or it clears nothing this
+    -- turn (REQ-STR-006). Bounds how often a removal disturbs the cached
+    -- prefix; sized so the one-time cache-write cost is recovered by the
+    -- ongoing savings. Deployment-tunable (REQ-STR-010).
+    clear_at_least_tokens: Integer = 8192
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The history-assembly pass itself, one invocation per request built.
+-- Anchors HistoryAssembly to a concrete runtime consumer; rules below do
+-- not reference it by name.
+actor HistoryAssembler {
+    identified_by: HistoryAssembly
+}
+
+------------------------------------------------------------
+-- Rules — activation
+------------------------------------------------------------
+
+-- Below the high-water mark the whole transcript fits comfortably, so
+-- nothing is cleared: every tool result is sent verbatim (REQ-STR-001).
+-- Within a conversation input-token usage only grows, so this is a
+-- one-way transition — the trigger is crossed at most once per session.
+rule ClearingInactiveBelowHighWaterMark {
+    when: HistoryAssembled(assembly)
+
+    requires: assembly.estimated_input_tokens <= assembly.clear_trigger_tokens
+
+    ensures: assembly.clearing_active = false
+    ensures: assembly.tokens_freed = 0
+    ensures: for r in assembly.renderings:
+        r.verdict = kept
+}
+
+-- Above the high-water mark clearing activates. Whether any individual
+-- result is actually cleared still depends on the worthwhile-gain gate
+-- and the per-result conditions below.
+rule ClearingActivatedAboveHighWaterMark {
+    when: HistoryAssembled(assembly)
+
+    requires: assembly.estimated_input_tokens > assembly.clear_trigger_tokens
+
+    ensures: assembly.clearing_active = true
+}
+
+-- Active clearing that would free less than clear_at_least_tokens clears
+-- nothing: a removal too small to repay the cache invalidation it causes
+-- is deferred until more clearable output accumulates (REQ-STR-006).
+rule ClearingSkippedInsufficientGain {
+    when: HistoryAssembled(assembly)
+
+    requires: assembly.clearing_active = true
+    requires: assembly.eligible_freed_tokens < clear_at_least_tokens
+
+    ensures: assembly.tokens_freed = 0
+    ensures: for r in assembly.renderings:
+        r.verdict = kept
+}
+
+------------------------------------------------------------
+-- Rules — per-result verdict (clearing active, gain sufficient)
+------------------------------------------------------------
+
+-- A result is cleared only when clearing is active, the pass frees a
+-- worthwhile amount, the result is outside the retained window, and its
+-- producing tool is clearable. All four must hold; the rules below cover
+-- the complementary cases that force `kept`.
+rule ToolResultCleared {
+    when: RenderingDecided(assembly, r)
+
+    requires: assembly.clearing_active = true
+    requires: assembly.eligible_freed_tokens >= clear_at_least_tokens
+    requires: r.rounds_from_end >= keep_recent_rounds
+    requires: r.producing_tool_clearable = true
+
+    ensures: r.verdict = cleared
+
+    @guidance
+        -- Clearing replaces the rendered ToolResult body with the fixed
+        -- placeholder "[tool result cleared to save context]" and emits
+        -- no image blocks for it; the paired assistant ToolUse block is
+        -- left intact (REQ-STR-004). The persisted db::ToolContent is
+        -- read-only here — the cleared form exists only in the
+        -- Vec<LlmMessage> for this one request (REQ-STR-005).
+}
+
+-- Results inside the retained window are always kept: they are the
+-- agent's immediate working set, and round 0 anchors the reusable cached
+-- prefix (REQ-STR-003, REQ-STR-007).
+rule ToolResultKeptWithinRetainedWindow {
+    when: RenderingDecided(assembly, r)
+
+    requires: r.rounds_from_end < keep_recent_rounds
+
+    ensures: r.verdict = kept
+}
+
+-- A result whose producing tool is not clearable is always kept: its
+-- information could not be regenerated by re-invocation, so removal would
+-- be unrecoverable data loss (REQ-STR-002).
+rule ToolResultKeptNotClearable {
+    when: RenderingDecided(assembly, r)
+
+    requires: r.producing_tool_clearable = false
+
+    ensures: r.verdict = kept
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-STR-002. A cleared result's producing tool is always clearable:
+-- unrecoverable output is never removed.
+invariant ClearedImpliesRecoverable {
+    for a in HistoryAssemblies:
+        for r in a.renderings:
+            r.verdict = cleared implies r.producing_tool_clearable = true
+}
+
+-- REQ-STR-003 / REQ-STR-007. Nothing inside the retained window is ever
+-- cleared. Because round 0 is always inside the window, this also keeps
+-- the trailing tool result — the block the last-user-message cache
+-- breakpoint anchors on (specs/llm/anthropic.allium) — uncleared, so
+-- clearing never disturbs the current turn's reusable prefix.
+invariant RetainedWindowNeverCleared {
+    for a in HistoryAssemblies:
+        for r in a.renderings:
+            r.rounds_from_end < keep_recent_rounds implies r.verdict = kept
+}
+
+-- REQ-STR-007 (structural proxy for cross-turn stability). A cleared
+-- result is always outside the retained window. Since rounds_from_end
+-- only grows as the session lengthens, a result outside the window on one
+-- turn stays outside it on every later turn — so a cleared result stays
+-- cleared, and the cleared prefix is byte-identical turn over turn,
+-- preserving cache reuse. The temporal claim itself (turn N+1 keeps turn
+-- N's clears) is not expressible in entity-snapshot quantification; this
+-- invariant plus the monotonicity of rounds_from_end witness it.
+invariant ClearedImpliesOutsideRetainedWindow {
+    for a in HistoryAssemblies:
+        for r in a.renderings:
+            r.verdict = cleared implies r.rounds_from_end >= keep_recent_rounds
+}
+
+-- REQ-STR-006. When the pass clears anything, it frees at least the
+-- worthwhile-gain minimum; a smaller removal is deferred to nothing.
+invariant ClearingFreesWorthwhileTokens {
+    for a in HistoryAssemblies:
+        a.tokens_freed > 0 implies a.tokens_freed >= clear_at_least_tokens
+}
+
+-- REQ-STR-001. While clearing is inactive nothing is cleared — a short
+-- session sends its full transcript.
+invariant InactiveClearsNothing {
+    for a in HistoryAssemblies:
+        a.clearing_active = false implies
+            for r in a.renderings:
+                r.verdict = kept
+}
+
+-- REQ-STR-008. Tokens actually freed equals the contribution of the
+-- cleared results; the freed-token figure the pass logs is exactly this
+-- sum, never an estimate detached from the verdicts.
+invariant FreedTokensMatchClearedResults {
+    for a in HistoryAssemblies:
+        a.tokens_freed = sum_token_estimate_where_cleared(a.renderings)
+}
+
+------------------------------------------------------------
+-- Design Decisions
+------------------------------------------------------------
+-- Kept as prose rather than `open question` declarations so the file
+-- remains parseable.
+--
+-- Recoverability is a tool capability, not a content heuristic. The
+--     decision to clear keys on Tool::clearable() — a property of the
+--     producing tool resolved via the result's tool_use_id — rather than
+--     on inspecting the result body. A false default means a newly added
+--     tool is never silently cleared; opting in is an explicit, reviewed
+--     act. This makes "never considered for clearing" structurally
+--     distinct from "safe to clear" (REQ-STR-002).
+--
+-- Round-from-end anchoring over a recomputed token budget. Retention is
+--     anchored to the most recent keep_recent_rounds rounds, not to a
+--     token budget recomputed each turn. A budget that shifted with the
+--     conversation could re-keep a previously-cleared result, changing the
+--     prefix and busting the cache every turn. Round-from-end is monotonic
+--     as history grows, so the cleared set only ever expands — the
+--     property REQ-STR-007 needs.
+--
+-- One-time invalidation, then re-warm. Clearing a result changes a
+--     user-role message and invalidates the cached prefix from the
+--     earliest cleared message forward. This is inherent to any in-place
+--     context reduction. The design pays it once per batch (gated by
+--     clear_at_least_tokens) and relies on stability to re-warm: every
+--     later turn sends the same cleared prefix and reads it from cache.
+--
+-- Non-destructive by construction. The cleared form is computed during
+--     assembly and never persisted, so there is no serialized "cleared"
+--     state to lose on a write or migrate. A UI rebuilding from storage,
+--     or a rewind, sees every tool result in full (REQ-STR-005).
