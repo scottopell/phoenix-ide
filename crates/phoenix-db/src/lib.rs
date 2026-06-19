@@ -639,18 +639,17 @@ impl Database {
             .execute(&self.pool)
             .await;
 
-        // Add project_id and conv_mode columns to conversations
+        // Add project_id column to conversations
         // Each ALTER TABLE is independent; ignore errors if columns already exist
         let _ = sqlx::raw_sql(
             "ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id)",
         )
         .execute(&self.pool)
         .await;
-        let _ = sqlx::raw_sql(
-            "ALTER TABLE conversations ADD COLUMN conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}'",
-        )
-        .execute(&self.pool)
-        .await;
+        // NOTE: conv_mode (the legacy ConvMode JSON blob) is intentionally not
+        // ADDed here. It lives in the base schema and is DROPped by migration
+        // 029 after being normalized into the cm_* columns; re-adding it via
+        // this idempotent bootstrap would resurrect the dropped column.
 
         // Add title column for human-readable conversation names
         let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN title TEXT")
@@ -1355,7 +1354,7 @@ impl Database {
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
-        let conv_mode_json = serde_json::to_string(conv_mode).unwrap();
+        let cm = conv_mode_columns(conv_mode);
         let now_str = now.to_rfc3339();
 
         // Retry with a random suffix on slug collision (UNIQUE constraint).
@@ -1364,8 +1363,8 @@ impl Database {
         loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, llm_language)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -1377,11 +1376,17 @@ impl Database {
             .bind(&now_str)
             .bind(model)
             .bind(project_id)
-            .bind(&conv_mode_json)
             .bind(desired_base_branch)
             .bind(seed_parent_id)
             .bind(seed_label)
             .bind(llm_language.as_str())
+            .bind(cm.kind)
+            .bind(cm.branch_name)
+            .bind(cm.worktree_path)
+            .bind(cm.base_branch)
+            .bind(cm.task_id)
+            .bind(cm.task_title)
+            .bind(cm.next_taskmd_id_hint)
             .execute(&self.pool)
             .await;
 
@@ -1439,7 +1444,8 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
@@ -1466,7 +1472,8 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
@@ -1493,7 +1500,8 @@ impl Database {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -1521,9 +1529,9 @@ impl Database {
         let rows = sqlx::query_scalar::<_, Option<String>>(
             "SELECT cwd FROM conversations WHERE cwd IS NOT NULL AND cwd != ''
              UNION
-             SELECT json_extract(conv_mode, '$.worktree_path') FROM conversations
-               WHERE json_extract(conv_mode, '$.worktree_path') IS NOT NULL
-                 AND json_extract(conv_mode, '$.worktree_path') != ''",
+             SELECT cm_worktree_path FROM conversations
+               WHERE cm_worktree_path IS NOT NULL
+                 AND cm_worktree_path != ''",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1540,7 +1548,8 @@ impl Database {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
@@ -1783,15 +1792,25 @@ impl Database {
     /// Panics if persisted JSON columns cannot be (de)serialized.
     pub async fn update_conversation_mode(&self, id: &str, mode: &ConvMode) -> DbResult<()> {
         let now = Utc::now();
-        let mode_json = serde_json::to_string(mode).unwrap();
+        let cm = conv_mode_columns(mode);
 
-        let result =
-            sqlx::query("UPDATE conversations SET conv_mode = ?1, updated_at = ?2 WHERE id = ?3")
-                .bind(&mode_json)
-                .bind(now.to_rfc3339())
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE conversations
+             SET cm_kind = ?1, cm_branch_name = ?2, cm_worktree_path = ?3, cm_base_branch = ?4,
+                 cm_task_id = ?5, cm_task_title = ?6, cm_next_taskmd_id_hint = ?7, updated_at = ?8
+             WHERE id = ?9",
+        )
+        .bind(cm.kind)
+        .bind(cm.branch_name)
+        .bind(cm.worktree_path)
+        .bind(cm.base_branch)
+        .bind(cm.task_id)
+        .bind(cm.task_title)
+        .bind(cm.next_taskmd_id_hint)
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
@@ -1809,7 +1828,7 @@ impl Database {
         let row = sqlx::query(
             "SELECT COUNT(*) FROM conversations
              WHERE project_id = ?1 AND archived = 0
-             AND json_extract(conv_mode, '$.mode') = 'Work'",
+             AND cm_kind = 'work'",
         )
         .bind(project_id)
         .fetch_one(&self.pool)
@@ -1842,12 +1861,13 @@ impl Database {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
-               AND json_extract(c.conv_mode, '$.worktree_path') = ?1",
+               AND c.cm_worktree_path = ?1",
         )
         .bind(worktree_path)
         .try_map(parse_conversation_row)
@@ -1946,7 +1966,7 @@ impl Database {
             task_title: schema::NonEmptyString::new(approval.task_title.clone())
                 .expect("approved task title is non-empty"),
         };
-        let work_mode_json = serde_json::to_string(&work_mode).unwrap();
+        let cm = conv_mode_columns(&work_mode);
         let seed_message_id = uuid::Uuid::new_v4().to_string();
         let seeded_state = serde_json::to_string(&ConvState::SeededLlmRequesting {
             seed_message_id: seed_message_id.clone(),
@@ -1965,8 +1985,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language)
-                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, NULL, NULL, NULL, ?11)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, NULL, NULL, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -1976,9 +1996,15 @@ impl Database {
             .bind(&now_str)
             .bind(parent.model.as_deref())
             .bind(parent.project_id.as_deref())
-            .bind(&work_mode_json)
             .bind(parent.desired_base_branch.as_deref())
             .bind(parent.llm_language.as_str())
+            .bind(cm.kind)
+            .bind(cm.branch_name)
+            .bind(cm.worktree_path)
+            .bind(cm.base_branch)
+            .bind(cm.task_id)
+            .bind(cm.task_title)
+            .bind(cm.next_taskmd_id_hint)
             .execute(&mut *tx)
             .await;
 
@@ -2195,7 +2221,7 @@ impl Database {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
-        let conv_mode_json = serde_json::to_string(&parent.conv_mode).unwrap();
+        let cm = conv_mode_columns(&parent.conv_mode);
 
         // Atomic INSERT + UPDATE. On any error before `commit()`, the
         // transaction guard drops and SQLite rolls back.
@@ -2207,8 +2233,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language)
-                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -2218,13 +2244,19 @@ impl Database {
             .bind(&now_str)
             .bind(parent.model.as_deref())
             .bind(parent.project_id.as_deref())
-            .bind(&conv_mode_json)
             .bind(parent.desired_base_branch.as_deref())
             // Continuations do not inherit the parent's seed fields — those are
             // decorative UI metadata for a different concept (REQ-SEED-003/004).
             .bind::<Option<&str>>(None)
             .bind::<Option<&str>>(None)
             .bind(parent.llm_language.as_str())
+            .bind(cm.kind)
+            .bind(cm.branch_name)
+            .bind(cm.worktree_path)
+            .bind(cm.base_branch)
+            .bind(cm.task_id)
+            .bind(cm.task_title)
+            .bind(cm.next_taskmd_id_hint)
             .execute(&mut *tx)
             .await;
 
@@ -2371,7 +2403,8 @@ impl Database {
             )
             SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                   c.project_id, c.conv_mode, c.desired_base_branch,
+                   c.project_id, c.desired_base_branch,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
             FROM conversations c
@@ -2978,12 +3011,13 @@ impl Database {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
-                    c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.project_id, c.desired_base_branch,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
-               AND json_extract(c.conv_mode, '$.mode') IN ('Work', 'Branch')",
+               AND c.cm_kind IN ('work', 'branch')",
         )
         .try_map(parse_conversation_row)
         .fetch_all(&self.pool)
@@ -3934,7 +3968,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT tu.root_conversation_id AS rid, tu.model AS model, \
              c.slug AS slug, c.title AS title, c.project_id AS project_id, \
-             c.conv_mode AS conv_mode, MIN(tu.created_at) AS started_at, \
+             c.cm_worktree_path AS worktree_path, MIN(tu.created_at) AS started_at, \
              COALESCE(SUM(tu.input_tokens), 0) AS input_tokens, \
              COALESCE(SUM(tu.output_tokens), 0) AS output_tokens, \
              COALESCE(SUM(tu.cache_creation_tokens), 0) AS cache_creation_tokens, \
@@ -3955,7 +3989,7 @@ impl Database {
                     slug: r.try_get("slug").ok().flatten(),
                     title: r.try_get("title").ok().flatten(),
                     project_id: r.try_get("project_id").ok().flatten(),
-                    conv_mode: r.try_get("conv_mode").ok().flatten(),
+                    worktree_path: r.try_get("worktree_path").ok().flatten(),
                     started_at: r.try_get("started_at")?,
                     input_tokens: r.try_get("input_tokens")?,
                     output_tokens: r.try_get("output_tokens")?,
@@ -4016,6 +4050,139 @@ impl Database {
     }
 }
 
+/// The `cm_*` column values projected from a [`ConvMode`]. `kind` is the
+/// discriminator; the rest are the variant's fields (NULL where the variant
+/// does not carry them). The `ConvMode` enum is the sole writer, so only valid
+/// per-variant combinations are ever produced.
+struct ConvModeCols<'a> {
+    kind: &'static str,
+    branch_name: Option<&'a str>,
+    worktree_path: Option<&'a str>,
+    base_branch: Option<&'a str>,
+    task_id: Option<&'a str>,
+    task_title: Option<&'a str>,
+    next_taskmd_id_hint: Option<&'a str>,
+}
+
+/// Project a [`ConvMode`] into its persisted `cm_*` column values.
+fn conv_mode_columns(mode: &ConvMode) -> ConvModeCols<'_> {
+    match mode {
+        ConvMode::Explore {
+            worktree_path,
+            next_taskmd_id_hint,
+        } => ConvModeCols {
+            kind: "explore",
+            branch_name: None,
+            worktree_path: worktree_path.as_ref().map(NonEmptyString::as_str),
+            base_branch: None,
+            task_id: None,
+            task_title: None,
+            next_taskmd_id_hint: next_taskmd_id_hint.as_ref().map(NonEmptyString::as_str),
+        },
+        ConvMode::Direct => ConvModeCols {
+            kind: "direct",
+            branch_name: None,
+            worktree_path: None,
+            base_branch: None,
+            task_id: None,
+            task_title: None,
+            next_taskmd_id_hint: None,
+        },
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            base_branch,
+            task_id,
+            task_title,
+        } => ConvModeCols {
+            kind: "work",
+            branch_name: Some(branch_name.as_str()),
+            worktree_path: Some(worktree_path.as_str()),
+            base_branch: Some(base_branch.as_str()),
+            task_id: Some(task_id.as_str()),
+            task_title: Some(task_title.as_str()),
+            next_taskmd_id_hint: None,
+        },
+        ConvMode::Branch {
+            branch_name,
+            worktree_path,
+            base_branch,
+        } => ConvModeCols {
+            kind: "branch",
+            branch_name: Some(branch_name.as_str()),
+            worktree_path: Some(worktree_path.as_str()),
+            base_branch: Some(base_branch.as_str()),
+            task_id: None,
+            task_title: None,
+            next_taskmd_id_hint: None,
+        },
+    }
+}
+
+/// Reconstruct a [`ConvMode`] from a conversation row's `cm_*` columns. An
+/// unknown/NULL `cm_kind`, or a Work/Branch row missing a required field
+/// (structurally impossible from the `ConvMode` writer, but defended for
+/// hand-edited rows), falls back to the default `Explore` with a warning —
+/// mirroring the prior tolerant blob-deserialization behavior.
+fn conv_mode_from_row(row: &SqliteRow, conv_id: &str) -> ConvMode {
+    let col = |c: &str| row.try_get::<Option<String>, _>(c).ok().flatten();
+    let ne = |c: &str| col(c).and_then(|v| NonEmptyString::new(v).ok());
+    match col("cm_kind").as_deref() {
+        Some("direct") => ConvMode::Direct,
+        Some("work") => {
+            if let (
+                Some(branch_name),
+                Some(worktree_path),
+                Some(base_branch),
+                Some(task_id),
+                Some(task_title),
+            ) = (
+                ne("cm_branch_name"),
+                ne("cm_worktree_path"),
+                ne("cm_base_branch"),
+                ne("cm_task_id"),
+                ne("cm_task_title"),
+            ) {
+                ConvMode::Work {
+                    branch_name,
+                    worktree_path,
+                    base_branch,
+                    task_id,
+                    task_title,
+                }
+            } else {
+                tracing::warn!(conv_id = %conv_id, "work conv_mode row missing required fields, defaulting to Explore");
+                ConvMode::default()
+            }
+        }
+        Some("branch") => {
+            if let (Some(branch_name), Some(worktree_path), Some(base_branch)) = (
+                ne("cm_branch_name"),
+                ne("cm_worktree_path"),
+                ne("cm_base_branch"),
+            ) {
+                ConvMode::Branch {
+                    branch_name,
+                    worktree_path,
+                    base_branch,
+                }
+            } else {
+                tracing::warn!(conv_id = %conv_id, "branch conv_mode row missing required fields, defaulting to Explore");
+                ConvMode::default()
+            }
+        }
+        Some("explore") => ConvMode::Explore {
+            worktree_path: ne("cm_worktree_path"),
+            next_taskmd_id_hint: ne("cm_next_taskmd_id_hint"),
+        },
+        // An unknown kind or NULL (legacy/malformed) → bare default Explore,
+        // discarding any stray field columns. This mirrors the prior blob
+        // parser, which fell back to ConvMode::default() for unrecognized modes
+        // rather than carrying their fields forward.
+        _ => ConvMode::default(),
+    }
+}
+
 /// Parse a conversation row from the database
 #[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
 fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
@@ -4030,19 +4197,8 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         }
     };
 
-    // conv_mode: parse from JSON, default to Explore for old rows without the column
-    let conv_mode_raw: Option<String> =
-        row.try_get::<Option<String>, _>("conv_mode").ok().flatten();
-    let conv_mode: ConvMode = match &conv_mode_raw {
-        Some(s) => match serde_json::from_str(s) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(conv_id = %id, error = %e, raw = %s, "Failed to deserialize ConvMode, defaulting to Explore");
-                ConvMode::default()
-            }
-        },
-        None => ConvMode::default(),
-    };
+    // conv_mode: reconstruct from the normalized cm_* columns.
+    let conv_mode: ConvMode = conv_mode_from_row(&row, &id);
 
     let slug: Option<String> = row.try_get("slug")?;
     let title: Option<String> = row
@@ -4251,8 +4407,7 @@ async fn insert_conversation_tx(
 ) -> DbResult<()> {
     let state_json =
         serde_json::to_string(&conv.state).map_err(|e| DbError::Serialization(e.to_string()))?;
-    let conv_mode_json = serde_json::to_string(&conv.conv_mode)
-        .map_err(|e| DbError::Serialization(e.to_string()))?;
+    let cm = conv_mode_columns(&conv.conv_mode);
 
     // A forked/copied conversation starts with an empty steering queue (pending
     // steers are not inherited), so the steering_messages tables are not written
@@ -4261,10 +4416,12 @@ async fn insert_conversation_tx(
         "INSERT INTO conversations (
             id, slug, title, cwd, parent_conversation_id, user_initiated, state,
             state_updated_at, created_at, updated_at, archived, model, project_id,
-            conv_mode, desired_base_branch, seed_parent_id, seed_label,
+            desired_base_branch, seed_parent_id, seed_label,
             continued_in_conv_id, chain_name, llm_language,
-            spawned_from_conversation_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+            spawned_from_conversation_id,
+            cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch,
+            cm_task_id, cm_task_title, cm_next_taskmd_id_hint
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -4280,7 +4437,6 @@ async fn insert_conversation_tx(
     .bind(conv.archived)
     .bind(&conv.model)
     .bind(&conv.project_id)
-    .bind(&conv_mode_json)
     .bind(&conv.desired_base_branch)
     .bind(&conv.seed_parent_id)
     .bind(&conv.seed_label)
@@ -4288,6 +4444,13 @@ async fn insert_conversation_tx(
     .bind(&conv.chain_name)
     .bind(conv.llm_language.as_str())
     .bind(&conv.spawned_from_conversation_id)
+    .bind(cm.kind)
+    .bind(cm.branch_name)
+    .bind(cm.worktree_path)
+    .bind(cm.base_branch)
+    .bind(cm.task_id)
+    .bind(cm.task_title)
+    .bind(cm.next_taskmd_id_hint)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -5361,6 +5524,33 @@ mod tests {
         let after = db.get_messages_after("conv-1", 1).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].message_id, "msg-2");
+    }
+
+    /// A freshly-migrated DB (base SCHEMA + all versioned migrations, the path
+    /// `open_in_memory` exercises) ends with the normalized `cm_*` columns and
+    /// no `conv_mode` blob. This locks the migration-029 end state and proves
+    /// the `conv_mode`-referencing migrations resolve during fresh-DB replay
+    /// (`conv_mode` lives in the base schema until 029 drops it).
+    #[tokio::test]
+    async fn conversations_schema_is_normalized_after_migrations() {
+        let db = Database::open_in_memory().await.unwrap();
+        let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .map(|r: SqliteRow| r.get::<String, _>("name"))
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "cm_kind"),
+            "cm_kind present: {cols:?}"
+        );
+        assert!(
+            cols.iter().any(|c| c == "cm_worktree_path"),
+            "cm_worktree_path present: {cols:?}"
+        );
+        assert!(
+            !cols.iter().any(|c| c == "conv_mode"),
+            "conv_mode blob must be dropped after migration 029: {cols:?}"
+        );
     }
 
     /// User/skill attachments round-trip through the normalized child tables:

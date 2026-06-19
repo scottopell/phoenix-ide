@@ -1435,9 +1435,9 @@ pub struct UsageConversationModelRow {
     pub slug: Option<String>,
     pub title: Option<String>,
     pub project_id: Option<String>,
-    /// Raw `conv_mode` JSON, for extracting the worktree path. `None` for
-    /// pre-mode rows.
-    pub conv_mode: Option<String>,
+    /// The conversation's worktree path (from the normalized `cm_worktree_path`
+    /// column). `None` for modes without a worktree (Direct, sub-agent Explore).
+    pub worktree_path: Option<String>,
     pub started_at: String,
     pub input_tokens: i64,
     pub output_tokens: i64,

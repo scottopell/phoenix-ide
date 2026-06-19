@@ -945,8 +945,8 @@ pub struct PrIdentity {
 pub enum PrFeedbackFreshness {
     /// `count` feedback items are present that were not in the baseline.
     New { count: u32 },
-    /// `count` baseline feedback items changed content (e.g. a reviewer edited
-    /// an existing comment) with no net-new items.
+    /// `count` baseline feedback items changed actionable content with no
+    /// net-new actionable items.
     Edited { count: u32 },
 }
 

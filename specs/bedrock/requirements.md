@@ -106,6 +106,32 @@ THE SYSTEM SHALL preserve all conversation history including synthetic results
 
 ---
 
+### REQ-BED-005a: Bounded Cancellation Liveness
+
+WHEN cancellation is requested during tool execution
+THE SYSTEM SHALL abort the tool's executing task rather than relying solely on a cooperative interrupt token
+AND SHALL reap any subprocesses spawned by that tool (process-group kill)
+
+WHEN a tool observes its cancellation and returns within the cooperative window (REQ-BED-005, within 100ms)
+THE SYSTEM SHALL record synthetic results and transition to idle by the cooperative path
+AND SHALL NOT surface any warning or degraded-cancellation message
+
+WHEN a tool neither observes its cancellation token nor returns within a bounded cancellation deadline
+THE SYSTEM SHALL force the cancellation to completion without waiting for the tool task
+AND SHALL record synthetic cancelled results for the current and remaining tools
+AND SHALL transition the conversation to idle (parent) — the same terminal-direction state a cooperative cancel reaches
+AND SHALL log a warning recording that the deadline backstop fired
+AND SHALL inject a user-visible system message noting that cancellation completed and that aborted work may still be reclaiming resources in the background
+
+THE SYSTEM SHALL bound the time from a cancellation request to a terminal-direction state, and this bound SHALL NOT depend on tool cooperation
+
+WHEN forced teardown reaches idle via the deadline backstop
+THE SYSTEM SHALL NOT transition to error state — a cancellation the user requested and that succeeded from their view must not be presented as a failure
+
+**Rationale:** `CancellingTool` and `CancellingSubAgents` are otherwise states whose only exit is the running task returning; a tool that ignores its cancellation token and blocks would wedge the conversation in cancellation forever — a liveness hole. Cooperative interrupt (REQ-BED-005) is the happy path and is effectively immediate; the bounded deadline backstop covers only the pathological case where a tool never observes its token or never returns. Reaching idle (not error) preserves the user's mental model: they asked to cancel, cancellation happened. The OS child process is reaped regardless of task cooperation; the deadline backstop covers the in-process "task never returns" case. The user-visible message keeps the user oriented — work may still be releasing resources after the conversation has already returned to idle. This is the same liveness family as the sub-agent deadline in `specs/subagents/` REQ-SA-006: a wedged worker must not be able to hold its supervising conversation indefinitely.
+
+---
+
 ### REQ-BED-006: Error Recovery
 
 WHEN LLM request fails with retryable error (network, rate limit, 5xx)

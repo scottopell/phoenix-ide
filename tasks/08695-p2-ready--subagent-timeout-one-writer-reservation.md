@@ -1,0 +1,9 @@
+A forced sub-agent teardown (the cancellation backstop in `handle_cancelling_sub_agents_timeout`, and the pre-existing 20-minute timeout in `handle_sub_agent_timeout`) injects a synthetic `SubAgentOutcome::TimedOut` per still-pending sub-agent to drain the parent to Idle without waiting. For a **Work-mode** sub-agent that misses the deadline because it is still running/cancelling, that synthetic result flows through the normal `SubAgentResult` path, which decrements `active_work_subagents` (the REQ-PROJ-008 one-writer counter) BEFORE the real sub-agent runtime has actually stopped or reported.
+
+Consequence: during the straggler window (after the backstop returns the parent to Idle but before the real runtime dies), the parent can admit another Work sub-agent on the same worktree — two writers on one worktree, breaking the one-writer guard.
+
+Surfaced by Codex review of PR #324 (executor.rs `handle_cancelling_sub_agents_timeout` / synthetic-result path). The cancellation backstop (REQ-BED-005a) extended this shape into the cancel path; the same defect pre-exists in the 20-minute `AwaitingSubAgents` timeout.
+
+This is the same family as `task 61004` ("timeout should follow the cancellation protocol, not race it"). The correct fix is to NOT release the Work one-writer reservation on a synthetic forced-teardown result — keep the worktree reserved until the real runtime confirms termination (or is reaped), so a straggler cannot be double-booked. Likely folds into the 61004 rework (route timeout/backstop through the real cancel protocol; release reservation only on confirmed stop).
+
+Severity: correctness (one-writer invariant) but narrow window — Work sub-agent + missed deadline + immediate respawn onto the same worktree. Liveness of the shipped 08692 fix is unaffected (the parent still reaches Idle).

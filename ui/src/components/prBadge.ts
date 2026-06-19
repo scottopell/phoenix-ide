@@ -51,7 +51,7 @@ State: ${state}
 Checks: ${checks}${freshness}`;
 }
 
-/** Short feedback-freshness tag (`"3 new"`, `"1 comment updated"`), or null
+/** Short feedback-freshness tag (`"3 new"`, `"1 updated"`), or null
  *  when there is no freshness signal to show. When the fetch was degraded
  *  (`feedback_coverage` present) the count is a lower bound, so it's prefixed
  *  with "at least". */
@@ -62,9 +62,7 @@ export function prFeedbackFreshnessLabel(pr: PrStatusResponse): string | null {
   if (freshness.state === 'new') {
     return `${floor}${freshness.count} new`;
   }
-  const noun =
-    freshness.count === 1 ? '1 comment updated' : `${freshness.count} comments updated`;
-  return `${floor}${noun}`;
+  return `${floor}${freshness.count} updated`;
 }
 
 export interface PrFeedbackCoverageMarker {

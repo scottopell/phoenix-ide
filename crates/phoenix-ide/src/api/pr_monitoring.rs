@@ -12,7 +12,7 @@ use crate::db::{
 use crate::git_ops::run_git;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -690,6 +690,12 @@ fn capture_pr_auto_fix_context_for_pr_item(
     let snippets = capture_log_snippets(client, &raw_checks);
     let checks = capture_checks(&raw_checks, snippets);
     let feedback = fetch_pr_feedback(client, pr.number);
+    let actionable_items: Vec<_> = feedback
+        .items
+        .into_iter()
+        .filter(is_actionable_feedback)
+        .collect();
+    let actionable_total = u32::try_from(actionable_items.len()).unwrap_or(u32::MAX);
     let fetched_at = Utc::now().to_rfc3339();
     let artifact = PrAutoFixContextArtifact {
         manifest_version: ARTIFACT_VERSION,
@@ -710,7 +716,12 @@ fn capture_pr_auto_fix_context_for_pr_item(
             details: checks.details,
             log_snippets: checks.log_snippets,
         },
-        feedback,
+        feedback: PrFeedbackSummary {
+            total: actionable_total,
+            unresolved: actionable_total,
+            items: actionable_items,
+            coverage: feedback.coverage,
+        },
     };
 
     let dir = worktree.join(".phoenix").join("pr-context");
@@ -1049,24 +1060,26 @@ pub(crate) struct PrAutoFixContextArtifact {
     feedback: PrFeedbackSummary,
 }
 
+fn is_actionable_feedback(item: &PrFeedbackItem) -> bool {
+    item.resolved != Some(true)
+}
+
+fn actionable_feedback_items(items: &[PrFeedbackItem]) -> impl Iterator<Item = &PrFeedbackItem> {
+    items.iter().filter(|item| is_actionable_feedback(item))
+}
+
 impl PrAutoFixContextArtifact {
     pub(crate) fn baseline(&self) -> WorkScopePrFeedbackBaselineInput {
         WorkScopePrFeedbackBaselineInput {
             pr_number: self.pr.number,
             captured_at: self.fetched_at.clone(),
             github_updated_at: self.pr.updated_at.clone(),
-            feedback_identities: self
-                .feedback
-                .items
-                .iter()
+            feedback_identities: actionable_feedback_items(&self.feedback.items)
                 .map(feedback_identity)
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect(),
-            feedback_fingerprints: self
-                .feedback
-                .items
-                .iter()
+            feedback_fingerprints: actionable_feedback_items(&self.feedback.items)
                 .map(feedback_fingerprint)
                 .collect::<HashSet<_>>()
                 .into_iter()
@@ -1276,13 +1289,7 @@ fn fetch_pr_feedback(client: &dyn GhClient, number: u64) -> PrFeedbackSummary {
     );
 
     let items = dedupe_feedback(items);
-    let unresolved = u32::try_from(
-        items
-            .iter()
-            .filter(|item| item.resolved != Some(true))
-            .count(),
-    )
-    .unwrap_or(u32::MAX);
+    let unresolved = u32::try_from(actionable_feedback_items(&items).count()).unwrap_or(u32::MAX);
     PrFeedbackSummary {
         total: u32::try_from(items.len()).unwrap_or(u32::MAX),
         unresolved,
@@ -1361,6 +1368,19 @@ fn feedback_identity(item: &PrFeedbackItem) -> String {
 
 fn feedback_fingerprint(item: &PrFeedbackItem) -> String {
     format!(
+        "{:?}:{}:{}:{}:{}:{}|{}",
+        item.source,
+        item.id.clone().unwrap_or_default(),
+        item.url.clone().unwrap_or_default(),
+        item.author,
+        item.path.clone().unwrap_or_default(),
+        item.created_at.clone().unwrap_or_default(),
+        item.body
+    )
+}
+
+fn legacy_feedback_fingerprint_with_resolution(item: &PrFeedbackItem) -> String {
+    format!(
         "{:?}:{}:{}:{}:{}:{}:{}|{}",
         item.source,
         item.id.clone().unwrap_or_default(),
@@ -1391,7 +1411,7 @@ pub(crate) fn pr_updated_after_baseline(
     }
 }
 
-pub(crate) fn feedback_freshness_from_baseline(
+pub(crate) fn actionable_feedback_freshness_from_baseline(
     baseline: &WorkScopePrFeedbackBaseline,
     current_feedback: Option<&PrFeedbackSummary>,
 ) -> Option<PrFeedbackFreshness> {
@@ -1404,9 +1424,7 @@ pub(crate) fn feedback_freshness_from_baseline(
         .iter()
         .map(String::as_str)
         .collect();
-    let new_count = feedback
-        .items
-        .iter()
+    let new_count = actionable_feedback_items(&feedback.items)
         .map(feedback_identity)
         .filter(|identity| !baseline_ids.contains(identity.as_str()))
         .count();
@@ -1416,19 +1434,18 @@ pub(crate) fn feedback_freshness_from_baseline(
         });
     }
 
-    // No net-new items, so every current identity is already in the baseline.
-    // Any item whose fingerprint is absent from the baseline is an edit of
-    // existing content.
     let baseline_fingerprints: HashSet<&str> = baseline
         .feedback_fingerprints
         .iter()
         .map(String::as_str)
         .collect();
-    let edited_count = feedback
-        .items
-        .iter()
-        .map(feedback_fingerprint)
-        .filter(|fingerprint| !baseline_fingerprints.contains(fingerprint.as_str()))
+    let edited_count = actionable_feedback_items(&feedback.items)
+        .filter(|item| {
+            let fingerprint = feedback_fingerprint(item);
+            let legacy_fingerprint = legacy_feedback_fingerprint_with_resolution(item);
+            !baseline_fingerprints.contains(fingerprint.as_str())
+                && !baseline_fingerprints.contains(legacy_fingerprint.as_str())
+        })
         .count();
     if edited_count > 0 {
         return Some(PrFeedbackFreshness::Edited {
@@ -1437,6 +1454,14 @@ pub(crate) fn feedback_freshness_from_baseline(
     }
 
     None
+}
+
+#[cfg(test)]
+fn feedback_freshness_from_baseline(
+    baseline: &WorkScopePrFeedbackBaseline,
+    current_feedback: Option<&PrFeedbackSummary>,
+) -> Option<PrFeedbackFreshness> {
+    actionable_feedback_freshness_from_baseline(baseline, current_feedback)
 }
 
 /// Coverage health of a feedback fetch, derived from its per-surface coverage.
@@ -1467,27 +1492,71 @@ pub(crate) fn coverage_health(feedback: &PrFeedbackSummary) -> Option<PrFeedback
 }
 
 fn dedupe_feedback(items: Vec<PrFeedbackItem>) -> Vec<PrFeedbackItem> {
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
+    let mut seen = HashMap::new();
+    let mut deduped: Vec<PrFeedbackItem> = Vec::new();
     for item in items {
-        let key = item
-            .id
-            .clone()
-            .or_else(|| item.url.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "{}|{}|{}|{}",
-                    item.author,
-                    item.path.clone().unwrap_or_default(),
-                    item.created_at.clone().unwrap_or_default(),
-                    item.body
-                )
-            });
-        if seen.insert(key) {
+        let keys = feedback_dedupe_keys(&item);
+        if let Some(index) = keys.iter().find_map(|key| seen.get(key).copied()) {
+            merge_duplicate_feedback(&mut deduped[index], item);
+            for key in keys {
+                seen.entry(key).or_insert(index);
+            }
+        } else {
+            let index = deduped.len();
+            for key in keys {
+                seen.insert(key, index);
+            }
             deduped.push(item);
         }
     }
     deduped
+}
+
+fn feedback_dedupe_keys(item: &PrFeedbackItem) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(id) = &item.id {
+        keys.push(format!("id:{id}"));
+    }
+    if let Some(url) = &item.url {
+        keys.push(format!("url:{url}"));
+    }
+    if matches!(
+        item.source,
+        PrFeedbackSource::ReviewComment | PrFeedbackSource::ReviewThread
+    ) {
+        keys.push(format!(
+            "line:{}|{}|{}|{}",
+            item.author,
+            item.path.clone().unwrap_or_default(),
+            item.created_at.clone().unwrap_or_default(),
+            item.body
+        ));
+    }
+    if keys.is_empty() {
+        keys.push(format!(
+            "fallback:{}|{}|{}|{}",
+            item.author,
+            item.path.clone().unwrap_or_default(),
+            item.created_at.clone().unwrap_or_default(),
+            item.body
+        ));
+    }
+    keys
+}
+
+fn merge_duplicate_feedback(existing: &mut PrFeedbackItem, duplicate: PrFeedbackItem) {
+    if duplicate.thread_id.is_some() {
+        existing.thread_id = duplicate.thread_id;
+        existing.source = duplicate.source;
+    }
+    if duplicate.resolved == Some(true) {
+        existing.resolved = Some(true);
+    } else if existing.resolved.is_none() {
+        existing.resolved = duplicate.resolved;
+    }
+    if existing.url.is_none() {
+        existing.url = duplicate.url;
+    }
 }
 
 fn choose_pr(mut prs: Vec<GhPrListItem>) -> Option<GhPrListItem> {
@@ -2053,49 +2122,125 @@ mod tests {
                 && c.status == PrFeedbackCoverageStatus::Unavailable));
     }
 
+    fn review_thread(
+        id: &str,
+        comment_id: &str,
+        body: &str,
+        path: &str,
+        is_resolved: bool,
+    ) -> GhReviewThread {
+        GhReviewThread {
+            id: Some(id.to_string()),
+            is_resolved,
+            path: Some(path.to_string()),
+            comments: GhReviewThreadComments {
+                nodes: vec![GhReviewThreadComment {
+                    id: Some(comment_id.to_string()),
+                    body: body.to_string(),
+                    url: Some(format!("https://c/{comment_id}")),
+                    created_at: Some("t".to_string()),
+                    author: Some(GhGraphqlAuthor {
+                        login: "u".to_string(),
+                    }),
+                }],
+            },
+        }
+    }
+
     #[test]
-    fn feedback_freshness_counts_unseen_identities() {
+    fn resolved_review_thread_dedupes_duplicate_rest_review_comment() {
+        let gh = FakeGh {
+            repo: Ok(repo()),
+            issue_comments: Ok(vec![]),
+            review_comments: Ok(vec![GhReviewComment {
+                id: Some(99),
+                user: Some(GhUser {
+                    login: "u".to_string(),
+                }),
+                body: Some("already fixed".to_string()),
+                path: Some("src/lib.rs".to_string()),
+                html_url: Some("https://c/rest".to_string()),
+                created_at: Some("t".to_string()),
+            }]),
+            review_summaries: Ok(vec![]),
+            review_threads: Ok(vec![review_thread(
+                "PRRT_resolved",
+                "PRRC_graphql",
+                "already fixed",
+                "src/lib.rs",
+                true,
+            )]),
+            ..FakeGh::default()
+        };
+
+        let feedback = fetch_pr_feedback(&gh, 7);
+
+        assert_eq!(feedback.total, 1);
+        assert_eq!(feedback.unresolved, 0);
+        assert_eq!(feedback.items[0].resolved, Some(true));
+        assert_eq!(
+            feedback.items[0].thread_id,
+            Some("PRRT_resolved".to_string())
+        );
+    }
+
+    fn feedback_item(id: &str, body: &str, resolved: Option<bool>) -> PrFeedbackItem {
+        PrFeedbackItem {
+            id: Some(id.to_string()),
+            thread_id: None,
+            source: PrFeedbackSource::IssueComment,
+            author: "u".to_string(),
+            body: body.to_string(),
+            path: None,
+            url: None,
+            created_at: None,
+            resolved,
+        }
+    }
+
+    fn feedback_summary(items: Vec<PrFeedbackItem>) -> PrFeedbackSummary {
+        let unresolved = u32::try_from(actionable_feedback_items(&items).count()).unwrap();
+        PrFeedbackSummary {
+            total: u32::try_from(items.len()).unwrap(),
+            unresolved,
+            coverage: vec![PrFeedbackCoverage {
+                surface: PrFeedbackCoverageSurface::IssueComments,
+                status: PrFeedbackCoverageStatus::Fetched,
+                detail: None,
+            }],
+            items,
+        }
+    }
+
+    #[test]
+    fn actionable_feedback_helper_keeps_unknown_resolution_actionable() {
+        assert!(is_actionable_feedback(&feedback_item("1", "body", None)));
+        assert!(is_actionable_feedback(&feedback_item(
+            "1",
+            "body",
+            Some(false)
+        )));
+        assert!(!is_actionable_feedback(&feedback_item(
+            "1",
+            "body",
+            Some(true)
+        )));
+    }
+
+    #[test]
+    fn feedback_freshness_counts_unseen_actionable_identities() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
             feedback_identities: vec!["IssueComment:1".to_string()],
-            feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::u::|old".to_string()],
         };
-        let feedback = PrFeedbackSummary {
-            total: 2,
-            unresolved: 2,
-            coverage: vec![PrFeedbackCoverage {
-                surface: PrFeedbackCoverageSurface::IssueComments,
-                status: PrFeedbackCoverageStatus::Fetched,
-                detail: None,
-            }],
-            items: vec![
-                PrFeedbackItem {
-                    id: Some("1".to_string()),
-                    thread_id: None,
-                    source: PrFeedbackSource::IssueComment,
-                    author: "u".to_string(),
-                    body: "old".to_string(),
-                    path: None,
-                    url: None,
-                    created_at: None,
-                    resolved: None,
-                },
-                PrFeedbackItem {
-                    id: Some("2".to_string()),
-                    thread_id: None,
-                    source: PrFeedbackSource::IssueComment,
-                    author: "u".to_string(),
-                    body: "new".to_string(),
-                    path: None,
-                    url: None,
-                    created_at: None,
-                    resolved: None,
-                },
-            ],
-        };
+        let feedback = feedback_summary(vec![
+            feedback_item("1", "old", None),
+            feedback_item("2", "new", None),
+        ]);
 
         let freshness = feedback_freshness_from_baseline(&baseline, Some(&feedback)).unwrap();
         assert_eq!(freshness, PrFeedbackFreshness::New { count: 1 });
@@ -2109,71 +2254,125 @@ mod tests {
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
             feedback_identities: vec!["IssueComment:1".to_string()],
-            // Matches the item below exactly (see feedback_fingerprint format),
-            // so the only signal that could fire is the degraded coverage.
-            feedback_fingerprints: vec!["IssueComment:1::u:::|old".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::u::|old".to_string()],
         };
-        let feedback = PrFeedbackSummary {
-            total: 1,
-            unresolved: 1,
-            coverage: vec![PrFeedbackCoverage {
-                surface: PrFeedbackCoverageSurface::ReviewThreads,
-                status: PrFeedbackCoverageStatus::Unavailable,
-                detail: None,
-            }],
-            items: vec![PrFeedbackItem {
-                id: Some("1".to_string()),
-                thread_id: None,
-                source: PrFeedbackSource::IssueComment,
-                author: "u".to_string(),
-                body: "old".to_string(),
-                path: None,
-                url: None,
-                created_at: None,
-                resolved: None,
-            }],
-        };
+        let mut feedback = feedback_summary(vec![feedback_item("1", "old", None)]);
+        feedback.coverage = vec![PrFeedbackCoverage {
+            surface: PrFeedbackCoverageSurface::ReviewThreads,
+            status: PrFeedbackCoverageStatus::Unavailable,
+            detail: None,
+        }];
 
-        // An unfetchable surface is an error condition, not a content change:
-        // the only item is unchanged, so there is no freshness signal. (The
-        // "feedback incomplete" error state is tracked separately.)
         let freshness = feedback_freshness_from_baseline(&baseline, Some(&feedback));
         assert_eq!(freshness, None);
     }
 
     #[test]
-    fn feedback_freshness_marks_existing_feedback_edits_as_edited() {
+    fn feedback_freshness_marks_existing_actionable_feedback_edits_as_edited() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,
             pr_number: 7,
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
             feedback_identities: vec!["IssueComment:1".to_string()],
-            feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::u::|old".to_string()],
         };
-        let feedback = PrFeedbackSummary {
-            total: 1,
-            unresolved: 1,
-            coverage: vec![PrFeedbackCoverage {
-                surface: PrFeedbackCoverageSurface::IssueComments,
-                status: PrFeedbackCoverageStatus::Fetched,
-                detail: None,
-            }],
-            items: vec![PrFeedbackItem {
-                id: Some("1".to_string()),
-                thread_id: None,
-                source: PrFeedbackSource::IssueComment,
-                author: "u".to_string(),
-                body: "edited".to_string(),
-                path: None,
-                url: None,
-                created_at: None,
-                resolved: None,
-            }],
-        };
+        let feedback = feedback_summary(vec![feedback_item("1", "edited", None)]);
 
         let freshness = feedback_freshness_from_baseline(&baseline, Some(&feedback)).unwrap();
         assert_eq!(freshness, PrFeedbackFreshness::Edited { count: 1 });
+    }
+
+    #[test]
+    fn resolved_only_transition_yields_no_freshness() {
+        let baseline = WorkScopePrFeedbackBaseline {
+            work_scope_id: 1,
+            pr_number: 7,
+            captured_at: "2026-01-01T00:00:00Z".to_string(),
+            github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            feedback_identities: vec!["IssueComment:1".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::u::|body".to_string()],
+        };
+        let feedback = feedback_summary(vec![feedback_item("1", "body", Some(true))]);
+
+        assert_eq!(
+            feedback_freshness_from_baseline(&baseline, Some(&feedback)),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_is_excluded_from_actionable_content_fingerprint() {
+        let baseline = WorkScopePrFeedbackBaseline {
+            work_scope_id: 1,
+            pr_number: 7,
+            captured_at: "2026-01-01T00:00:00Z".to_string(),
+            github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            feedback_identities: vec!["IssueComment:1".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::u::|body".to_string()],
+        };
+        let feedback = feedback_summary(vec![feedback_item("1", "body", Some(false))]);
+
+        assert_eq!(
+            feedback_freshness_from_baseline(&baseline, Some(&feedback)),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_resolution_fingerprint_still_matches_unchanged_actionable_feedback() {
+        let baseline = WorkScopePrFeedbackBaseline {
+            work_scope_id: 1,
+            pr_number: 7,
+            captured_at: "2026-01-01T00:00:00Z".to_string(),
+            github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            feedback_identities: vec!["IssueComment:1".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::u:::false|body".to_string()],
+        };
+        let feedback = feedback_summary(vec![feedback_item("1", "body", Some(false))]);
+
+        assert_eq!(
+            feedback_freshness_from_baseline(&baseline, Some(&feedback)),
+            None
+        );
+    }
+
+    #[test]
+    fn artifact_baseline_uses_only_actionable_feedback() {
+        let artifact = PrAutoFixContextArtifact {
+            manifest_version: ARTIFACT_VERSION,
+            fetched_at: "2026-01-02T00:00:00Z".to_string(),
+            pr: PrArtifactMetadata {
+                number: 7,
+                title: "PR".to_string(),
+                url: "https://example.test/pr/7".to_string(),
+                state: "OPEN".to_string(),
+                draft: false,
+                base: "main".to_string(),
+                head: "branch".to_string(),
+                updated_at: Some("2026-01-02T00:00:00Z".to_string()),
+            },
+            checks: PrArtifactChecks {
+                state: PrCheckState::Passing,
+                summary: PrCheckSummary::default(),
+                details: Vec::new(),
+                log_snippets: Vec::new(),
+            },
+            feedback: feedback_summary(vec![
+                feedback_item("1", "todo", None),
+                feedback_item("2", "done", Some(true)),
+            ]),
+        };
+
+        let baseline = artifact.baseline();
+        assert_eq!(
+            baseline.feedback_identities,
+            vec!["IssueComment:1".to_string()]
+        );
+        assert_eq!(
+            baseline.feedback_fingerprints,
+            vec!["IssueComment:1::u::|todo".to_string()]
+        );
     }
 
     #[test]
@@ -2184,7 +2383,7 @@ mod tests {
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
             feedback_identities: vec!["IssueComment:1".to_string()],
-            feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::u::|old".to_string()],
         };
         assert_eq!(feedback_freshness_from_baseline(&baseline, None), None);
     }
@@ -2268,7 +2467,22 @@ mod tests {
             issue_comments: Ok(vec![]),
             review_comments: Ok(vec![]),
             review_summaries: Ok(vec![]),
-            review_threads: Ok(vec![]),
+            review_threads: Ok(vec![GhReviewThread {
+                id: Some("PRRT_resolved".to_string()),
+                is_resolved: true,
+                path: Some("src/lib.rs".to_string()),
+                comments: GhReviewThreadComments {
+                    nodes: vec![GhReviewThreadComment {
+                        id: Some("resolved-comment".to_string()),
+                        body: "already fixed".to_string(),
+                        url: Some("https://example.test/resolved".to_string()),
+                        created_at: Some("2026-01-01T00:00:00Z".to_string()),
+                        author: Some(GhGraphqlAuthor {
+                            login: "reviewer".to_string(),
+                        }),
+                    }],
+                },
+            }]),
         };
         let response = capture_pr_auto_fix_context_for_branch_with_client(
             temp.path(),
@@ -2300,6 +2514,9 @@ mod tests {
             "failure log"
         );
         assert!(artifact["feedback"]["coverage"].is_array());
+        assert_eq!(artifact["feedback"]["total"], 0);
+        assert_eq!(artifact["feedback"]["unresolved"], 0);
+        assert_eq!(artifact["feedback"]["items"].as_array().unwrap().len(), 0);
     }
 
     #[test]

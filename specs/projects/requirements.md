@@ -26,6 +26,23 @@ The user must be able to confidently answer these questions:
 
 ## Requirements
 
+### REQ-PROJ-000: Conversation Working Directory Root Floor
+
+WHEN a conversation is created or resumed with a working directory
+THE SYSTEM SHALL resolve symlinks and parent-directory traversal before accepting the path
+AND reject the working directory if it resolves to the filesystem root
+AND reject the working directory if the system cannot prove it is an existing directory
+
+WHEN a sub-agent working directory is inherited from its parent or supplied as an override
+THE SYSTEM SHALL apply the same validation before the sub-agent conversation is persisted or run
+
+**Rationale:** A system-root working directory makes relative tool paths resolve from the
+entire filesystem. Even read-only tools can consume unbounded resources when search or
+listing operations start at the filesystem root, so the root floor is independent of
+conversation mode and write permissions.
+
+---
+
 ### REQ-PROJ-001: Open a Git Repository as a Project
 
 WHEN user creates a new conversation by providing a directory path

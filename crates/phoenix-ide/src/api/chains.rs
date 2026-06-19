@@ -747,14 +747,18 @@ mod tests {
         add_continuation_summary(&db, "wi-a", "approved").await;
         // The continuation member owns the worktree (managed Explore approved
         // into a fresh Work conversation).
-        sqlx::query("UPDATE conversations SET conv_mode = ?1 WHERE id = ?2")
-            .bind(
-                r#"{"mode":"Work","branch_name":"feat-x","worktree_path":"/tmp/wt-x","base_branch":"main","task_id":"42","task_title":"Build the thing"}"#,
-            )
-            .bind("wi-b")
-            .execute(db.pool())
-            .await
-            .unwrap();
+        db.update_conversation_mode(
+            "wi-b",
+            &ConvMode::Work {
+                branch_name: NonEmptyString::new("feat-x").unwrap(),
+                worktree_path: NonEmptyString::new("/tmp/wt-x").unwrap(),
+                base_branch: NonEmptyString::new("main").unwrap(),
+                task_id: NonEmptyString::new("42").unwrap(),
+                task_title: NonEmptyString::new("Build the thing").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
 
         let chain_qa = crate::chain_qa::ChainQa::new(
             db.clone(),

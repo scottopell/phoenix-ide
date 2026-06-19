@@ -1279,6 +1279,16 @@ CREATE TABLE IF NOT EXISTS projects (
 # run normally on first startup.)
 _SEED_PRESTAMPED_MIGRATIONS = [
     (3, "add_continued_in_conv_id_column"),
+    # conv_mode-touching migrations: the seed builds clean normalized cm_*
+    # columns and drops the conv_mode blob itself, so these must be skipped on
+    # the next startup (they reference the now-absent conv_mode column, and
+    # their legacy-data cleanups have nothing to do on pristine seed rows).
+    (1, "rewrite_standalone_to_direct"),
+    (2, "backfill_empty_convmode_fields"),
+    (7, "backfill_explore_worktree_path"),
+    (21, "normalize_explore_taskmd_id_hint"),
+    (28, "add_conv_mode_columns"),
+    (29, "drop_conv_mode_blob"),
 ]
 
 # Each ALTER TABLE may already be applied by a prior Phoenix startup. We catch
@@ -1300,6 +1310,17 @@ _SEED_SCHEMA_ALTERS = [
     "ALTER TABLE conversations ADD COLUMN seed_label TEXT",
     "ALTER TABLE conversations ADD COLUMN continued_in_conv_id TEXT",
     "ALTER TABLE conversations ADD COLUMN steering_queue TEXT NOT NULL DEFAULT '[]'",
+    # Normalized conv_mode columns (migration 028). The seed rows are inserted
+    # with the legacy conv_mode blob (above), then projected into these columns
+    # and the blob is DROPped at the end of seeding — matching the post-migration
+    # production schema (the blob does not exist after migration 029).
+    "ALTER TABLE conversations ADD COLUMN cm_kind TEXT",
+    "ALTER TABLE conversations ADD COLUMN cm_branch_name TEXT",
+    "ALTER TABLE conversations ADD COLUMN cm_worktree_path TEXT",
+    "ALTER TABLE conversations ADD COLUMN cm_base_branch TEXT",
+    "ALTER TABLE conversations ADD COLUMN cm_task_id TEXT",
+    "ALTER TABLE conversations ADD COLUMN cm_task_title TEXT",
+    "ALTER TABLE conversations ADD COLUMN cm_next_taskmd_id_hint TEXT",
 ]
 
 
@@ -2070,6 +2091,24 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             conv_mode=direct_mode,
             cwd=str(ROOT),
         )
+
+        # Project the seeded conv_mode blob into the normalized cm_* columns
+        # (mirrors migration 028, including the empty-string -> NULL clean-up),
+        # then drop the blob so the seeded DB matches the post-migration-029
+        # production schema. The conv_mode migrations are pre-stamped above, so
+        # the app will not try to re-run 028/029 against the dropped column.
+        conn.execute(
+            "UPDATE conversations SET"
+            " cm_kind = lower(json_extract(conv_mode, '$.mode')),"
+            " cm_branch_name = NULLIF(json_extract(conv_mode, '$.branch_name'), ''),"
+            " cm_worktree_path = NULLIF(json_extract(conv_mode, '$.worktree_path'), ''),"
+            " cm_base_branch = NULLIF(json_extract(conv_mode, '$.base_branch'), ''),"
+            " cm_task_id = NULLIF(json_extract(conv_mode, '$.task_id'), ''),"
+            " cm_task_title = NULLIF(json_extract(conv_mode, '$.task_title'), ''),"
+            " cm_next_taskmd_id_hint = NULLIF(json_extract(conv_mode, '$.next_taskmd_id_hint'), '')"
+            " WHERE json_valid(conv_mode) AND json_extract(conv_mode, '$.mode') IS NOT NULL"
+        )
+        conn.execute("ALTER TABLE conversations DROP COLUMN conv_mode")
 
         conn.commit()
 
