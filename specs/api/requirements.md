@@ -230,6 +230,19 @@ WHEN the ring transitions to truncated (overflow detected on append)
 THE SYSTEM SHALL emit a warn-level tracing event including the aggregate serialised byte size of the entries discarded at that transition
 SO THAT operators get a useful "what was in the ring when it overflowed?" data point without paying a per-event serialisation cost on the hot path
 
+---
+
+### REQ-API-013: One-Shot Command Suggestion
+
+WHEN a client POSTs `{ query, model? }` to `/api/suggest` with a valid `X-Phoenix-Suggest-Token` header
+THE SYSTEM SHALL perform a single stateless, tool-less LLM completion and return `{ commands: [...] }`
+AND SHALL NOT create a conversation, message, or any persisted record
+
+WHEN the request lacks a valid capability token
+THE SYSTEM SHALL reject it with `403` (the endpoint is exempt from the password middleware; the token is the sole gate)
+
+The endpoint's behaviour, auth model, and token lifecycle are specified in `specs/command-suggestion` (REQ-CSUG-001/002/003/004); this requirement records its place in the HTTP surface.
+
 WHEN an operator queries the per-conversation aggregate serialised byte size
 THE SYSTEM SHALL compute it on demand by iterating the ring entries
 WHERE the metric is observability-only (the cap is enforced by entry count, not bytes)

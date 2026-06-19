@@ -358,7 +358,10 @@ stack concrete and understandable.
   can generate bytes faster than the WebSocket drains.
 
 ### Environment
-- **Secret leakage**: construct env explicitly; never inherit the API server's
-  full environment.
+- **Secret leakage**: construct env explicitly; never blindly inherit the API
+  server's full environment. The only non-base entries are a single enumerated
+  `PtyEnvInjection` (a `PATH` prefix plus `PHOENIX_API_URL` /
+  `PHOENIX_SUGGEST_TOKEN`; see `specs/command-suggestion`) — a named set, not a
+  copy of the server's env.
 - **macOS**: PTY master fds have historically had kqueue quirks. macOS support
   is deferred to a follow-on task — test on macOS before shipping there.

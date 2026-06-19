@@ -47,7 +47,7 @@ canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 | Max terminals per conversation | 1 (reject 409 if active) | Simple lifecycle, no ambiguity |
 | WebSocket frame type | Binary only | PTY output is arbitrary bytes, not UTF-8 |
 | Shell invocation | `$SHELL -i` | Interactive mode, sources rc files |
-| Environment | Explicit construction | No secret leakage from API server env |
+| Environment | Explicit construction + enumerated injection | No blind inheritance; only listed vars + the named `PtyEnvInjection` reach the child |
 | Output persistence | Ephemeral | No DB writes; tmux integration deferred |
 | Agent access | `read_terminal` tool | vt100 parser-backed, available in v1 |
 | PTY crate | `nix` (not `portable-pty`) | Preserves learning value of each syscall |
@@ -69,7 +69,7 @@ canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 | Requirement | Status | Notes |
 |---|---|---|
 | REQ-TERM-001: PTY-backed terminal per conversation | ✅ Done | src/terminal/spawn.rs |
-| REQ-TERM-002: Explicit shell environment construction | ✅ Done | src/terminal/spawn.rs:build_env() |
+| REQ-TERM-002: Explicit shell environment construction | ✅ Done | `phoenix-terminal/src/spawn.rs` `build_env`; injection via `PtyEnvInjection` (see `specs/command-suggestion`) |
 | REQ-TERM-003: Exactly one terminal per WorkScope | ✅ Done | src/terminal/session.rs:ActiveTerminals (HashMap<WorkScope, …>) |
 | REQ-TERM-004: Binary WebSocket framing | ✅ Done | src/terminal/ws.rs |
 | REQ-TERM-005: Initial resize before first prompt | ✅ Done | src/terminal/ws.rs:wait_for_resize() |

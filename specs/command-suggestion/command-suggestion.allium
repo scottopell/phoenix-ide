@@ -1,0 +1,164 @@
+-- allium: 3
+-- Command Suggestion Specification
+--
+-- `phx` turns a natural-language request typed in a Phoenix terminal into
+-- shell commands rendered as click-to-run links, backed by a stateless
+-- one-shot LLM call gated by a scoped capability token.
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The master password. When set, most endpoints require auth; /api/suggest
+    -- is exempt and gated by the capability token instead (see specs/auth).
+    password: String?
+    auth_enabled: password != null
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- An inbound POST /api/suggest. `suggest_token` is the X-Phoenix-Suggest-Token
+-- header; `model` overrides the default cheap model when present.
+external entity SuggestRequest {
+    query: String
+    model: String?
+    suggest_token: String?
+}
+
+-- A phxrun: run-link the terminal UI activated. `command` is the shell command
+-- decoded from the link's phxrun:<base64> URI.
+external entity RunLink {
+    command: String
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The single capability token authorizing /api/suggest, persisted in
+-- app_settings together with the password fingerprint it was minted under. It
+-- has no expiry: stable configuration, revoked only by a password change (a
+-- changed fingerprint) or an explicit re-mint. Bound exactly as specs/auth's
+-- SessionToken is.
+entity SuggestToken {
+    token: String
+    password_fingerprint: String
+
+    -- Authorizes only while minted under the current password.
+    is_valid: password_fingerprint = fingerprint(config.password)
+}
+
+-- A produced suggestion: the runnable command lines returned to phx. It is
+-- stateless -- creating one writes no conversation, message, or other
+-- persisted record.
+entity SuggestionResponse {
+    request: SuggestRequest
+}
+
+-- A suggested command placed on the shell prompt by activating a run-link. It
+-- is placed, not submitted: the user reviews it and presses Enter.
+entity PromptPlacement {
+    command: String
+    submitted: Boolean
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The authorized suggester: a request carrying the active capability token.
+-- Possession of the token is the authorization; the master password is never
+-- consulted for this endpoint.
+--   token_authorizes(request) => request.suggest_token names the active
+--                                SuggestToken and that token is_valid.
+actor Suggester {
+    identified_by: SuggestRequest where
+        request.suggest_token != null
+        and token_authorizes(request)
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- At startup a valid capability token exists: the persisted token is reused
+-- when its stored fingerprint matches the current password, otherwise a fresh
+-- token is minted and persisted.
+rule SuggestTokenResolvedOnStartup {
+    when: ServerStarts()
+
+    ensures: exists SuggestToken{password_fingerprint: fingerprint(config.password)}
+
+    @guidance
+        -- resolve_suggest_token: read suggest_token + fingerprint from
+        -- app_settings; reuse when the stored fingerprint equals
+        -- fingerprint(config.password); otherwise mint a 256-bit token and
+        -- persist it with the current fingerprint. Persistence failure degrades
+        -- to a per-process token, logged, never fatal.
+}
+
+-- An authorized request with a non-empty query yields suggested commands and
+-- persists nothing.
+rule SuggestionAnswered {
+    when: SuggestionRequested(request)
+
+    requires: token_authorizes(request)
+    requires: request.query != ""
+
+    ensures: SuggestionResponse.created(request: request)
+
+    @guidance
+        -- suggest_handler authorizes via X-Phoenix-Suggest-Token, resolves the
+        -- model (get_cheap_model or request.model), then crate::suggest runs a
+        -- single tool-less complete() and parses the output into command lines
+        -- (dropping blank, comment, and fence lines). No conversation or
+        -- message is written.
+}
+
+-- A request without the active token is rejected; no suggestion is produced.
+rule UnauthorizedSuggestionRejected {
+    when: SuggestionRequested(request)
+
+    requires: not token_authorizes(request)
+
+    ensures: not exists SuggestionResponse{request: request}
+
+    @guidance
+        -- The endpoint is exempt from the password middleware, so the token is
+        -- the sole gate: a missing or non-matching X-Phoenix-Suggest-Token is a
+        -- 403.
+}
+
+-- Activating a phxrun: run-link places the decoded command on the prompt
+-- without submitting it.
+rule RunLinkPlacesCommandOnPrompt {
+    when: RunLinkActivated(link)
+
+    ensures: PromptPlacement.created(command: link.command, submitted: false)
+
+    @guidance
+        -- TerminalPanel's linkHandler decodes phxrun:<base64> and writes the
+        -- command to the PTY input WITHOUT a trailing newline. The user reviews
+        -- and presses Enter; nothing auto-executes.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- At most one capability token is active at a time.
+invariant SingleActiveToken {
+    for a in SuggestTokens:
+        for b in SuggestTokens:
+            (a.is_valid and b.is_valid) implies a = b
+}
+
+-- A suggested command is never auto-executed: activation only places it on the
+-- prompt, leaving submission to the user.
+invariant SuggestionsNeverAutoSubmitted {
+    for placement in PromptPlacements:
+        placement.submitted = false
+}

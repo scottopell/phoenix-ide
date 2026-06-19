@@ -256,14 +256,14 @@ async fn ensure_live(&self, conv: &ConversationId) -> Result<Arc<RwLock<TmuxServ
 }
 
 async fn spawn_session(socket_path: &Path) -> Result<(), TmuxError> {
-    let status = tokio::process::Command::new("tmux")
-        .args([
+    let mut cmd = tokio::process::Command::new("tmux");
+    cmd.args([
             "-S", &socket_path.to_string_lossy(),
             "new-session", "-d", "-s", "main",
         ])
-        .env_remove("TMUX")  // see "TMUX env handling" below
-        .status()
-        .await?;
+        .env_remove("TMUX");          // see "TMUX env handling" below
+    apply_pty_env_injection(&mut cmd); // see "PTY env injection" below
+    let status = cmd.status().await?;
     if !status.success() {
         return Err(TmuxError::SpawnFailed);
     }
@@ -286,6 +286,34 @@ The probe-and-act sequence runs at every operation; it is cheap (one
 short-lived process spawn) and the only reliable way to detect both
 post-Phoenix-restart (probe → live, no in-memory entry needed) and
 post-system-reboot (probe → dead_socket, recreate).
+
+### PTY env injection
+
+A tmux pane's shell is a child of the tmux **server**, not of the
+`tmux attach` client the in-app terminal execs — so it inherits the
+server's environment, captured when the server is spawned. The
+Phoenix-managed PTY environment injection (`PtyEnvInjection`: a `PATH`
+prefix for the `phx` shim plus `PHOENIX_API_URL` / `PHOENIX_SUGGEST_TOKEN`,
+see `specs/command-suggestion` REQ-CSUG-006) is therefore applied to the
+`new-session` command via `apply_pty_env_injection`, not via the attach
+client's `build_env` (`specs/terminal` REQ-TERM-002). This keeps pane
+environments identical to the direct-shell path. The injection is an
+enumerated set, not blind inheritance of the server's environment.
+
+### Server config (server.conf)
+
+Phoenix ships a tmux server config, loaded with `-f` at server spawn. Beyond
+the screen/scrollback settings it advertises the `hyperlinks` terminal feature:
+
+```
+set -as terminal-features "*:hyperlinks"
+```
+
+tmux forwards OSC 8 hyperlinks to its client only when the client's terminal is
+known to support them. Without this directive tmux strips the hyperlink wrapper
+and only the visible text reaches xterm.js — which would silently break the
+`phxrun:` click-to-run links (`specs/command-suggestion` REQ-CSUG-007,
+`specs/terminal-panel`).
 
 ## Tool Dispatch (REQ-TMUX-003, REQ-TMUX-010)
 
