@@ -217,15 +217,16 @@ entity LlmError {
     -- snapshots, credits) is attached to this error.
     has_quota: Boolean
 
-    -- Automatic runtime retry decision. Exactly three kinds are auto-retryable;
-    -- every other kind requires stopping the in-flight turn.
-    auto_retryable: kind = network or kind = rate_limit or kind = server_error
+    -- Automatic runtime retry decision. A malformed response is a
+    -- server/transport fault, so it joins the transient-failure kinds; every
+    -- other kind requires stopping the in-flight turn.
+    auto_retryable: kind = network or kind = rate_limit or kind = server_error or kind = invalid_response
 
     -- User-triggered resume from a persisted conversation error. Auth is not
     -- auto-retryable, but is resumable after credentials are fixed.
     -- usage_limit_reached is never auto-retried, but its quota window resets
     -- on a clock boundary, so the user can resume once the window clears.
-    user_resumable: kind = auth or kind = network or kind = rate_limit or kind = server_error or kind = server_overloaded or kind = usage_limit_reached
+    user_resumable: kind = auth or kind = network or kind = rate_limit or kind = server_error or kind = invalid_response or kind = server_overloaded or kind = usage_limit_reached
 }
 
 ------------------------------------------------------------
@@ -244,7 +245,8 @@ invariant QuotaBoundToUsageLimit {
         (e.kind = usage_limit_reached) implies e.has_quota
 }
 
--- The auto-retryable set is exactly {network, rate_limit, server_error}.
+-- The auto-retryable set is exactly {network, rate_limit, server_error,
+-- invalid_response}.
 -- Because `auto_retryable` is a derived field this holds by construction; the
 -- invariant is the place a future taxonomy change is forced to restate
 -- the partition deliberately rather than let a new kind default into
