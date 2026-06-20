@@ -34,6 +34,19 @@ export function installGroundingPanelFixtureFetch(
       if (scenario.kind === 'errors') return json({ error: 'skills unavailable' }, { status: 500 });
       return json({ skills: scenario.kind === 'empty' ? [] : data.skills });
     }
+    if (url.startsWith(`/api/conversations/${scenario.conversationId}/tasks/count`)) {
+      if (scenario.kind === 'errors') return json({ error: 'task counts unavailable' }, { status: 500 });
+      const tasks = scenario.kind === 'empty' ? [] : data.tasks;
+      const currentId = new URL(url, window.location.origin).searchParams.get('current_task_id');
+      const terminal = new Set(['done', 'wont-do']);
+      const active = tasks.filter((t) => !terminal.has(t.status)).length;
+      return json({
+        active,
+        closed: tasks.length - active,
+        blocked: tasks.filter((t) => t.status === 'blocked').length,
+        current: currentId != null && tasks.some((t) => t.id === currentId),
+      });
+    }
     if (url === `/api/conversations/${scenario.conversationId}/tasks`) {
       if (scenario.kind === 'errors') return json({ error: 'tasks unavailable' }, { status: 500 });
       return json({ tasks: scenario.kind === 'empty' ? [] : data.tasks });

@@ -21,6 +21,7 @@ const stories = [
 const expectedConsoleErrors = new Map([
   ['errors-dark', [
     'Failed to list tasks',
+    'Failed to fetch task counts',
     'Failed to list skills',
     'Failed to fetch MCP status',
     'Failed to load work scope',
