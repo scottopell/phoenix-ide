@@ -324,6 +324,16 @@ def _port_is_available(port: int) -> bool:
     free. The forward-walk in `_select_available_port` then never fired and the
     server died on EADDRINUSE. Binding each interface without REUSEADDR makes the
     probe fail iff a server already holds the port on either one.
+
+    SO_REUSEADDR cannot be reinstated to soften the TIME_WAIT case below: an
+    empirical check shows a loopback bind *with* REUSEADDR coexists with a live
+    *wildcard* listener (it simply moves the coexistence false-positive from the
+    loopback axis to the wildcard one), so a 0.0.0.0 squatter would again probe
+    free. The accepted cost of no REUSEADDR: a port still in TIME_WAIT from a
+    just-exited dev server probes unavailable, so a rapid down→up that re-runs
+    selection forward-walks to the next deterministic port until TIME_WAIT drains
+    (~30-60s). Self-healing, and the stored per-worktree port short-circuits the
+    common restart path before selection runs.
     """
     for host in ("0.0.0.0", "127.0.0.1"):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -334,16 +344,57 @@ def _port_is_available(port: int) -> bool:
     return True
 
 
+def _listening_pids(port: int) -> list[int]:
+    """PIDs holding a LISTEN socket on the TCP port ([] on lsof failure)."""
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(x) for x in out.split() if x.strip().isdigit()]
+
+
+def _is_descendant_of(pid: int, ancestor: int) -> bool:
+    """True if `pid` is `ancestor` itself or anywhere below it in the process tree."""
+    seen: set[int] = set()
+    cur = pid
+    while cur and cur > 1 and cur not in seen:
+        if cur == ancestor:
+            return True
+        seen.add(cur)
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(cur)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return False
+        cur = int(out) if out.isdigit() else 0
+    return cur == ancestor
+
+
 def _wait_for_port(
     host: str, port: int, proc: "subprocess.Popen", timeout: float = 15.0
 ) -> bool:
-    """Poll until host:port accepts a TCP connection, or proc dies, or timeout.
+    """Poll until *our* server bound host:port, or proc dies, or timeout.
 
     A `--strictPort` dev server that loses a port race exits on EADDRINUSE.
     Checking the spawned PID alone misses this when that PID is a wrapper (pnpm)
-    whose child Vite died but who lingers: the wrapper looks alive, so the launch
-    is reported as success while an orphan keeps serving stale code. A successful
-    connect proves the server actually bound the port.
+    whose child died but who lingers: the wrapper looks alive, so the launch is
+    reported as success while an orphan keeps serving stale code.
+
+    A bare connect is not enough either: if an orphan already squats the port,
+    our child dies on EADDRINUSE while the wrapper lingers (`proc.poll()` is
+    None) and the connect reaches the *squatter*, returning 0 — proving only that
+    *a* server bound, not ours. So on a successful connect we additionally require
+    a process listening on the port to be within `proc`'s tree (the wrapper's
+    child server), which the squatter cannot satisfy.
     """
     probe_host = "127.0.0.1" if host == "0.0.0.0" else host
     deadline = time.monotonic() + timeout
@@ -352,8 +403,11 @@ def _wait_for_port(
             return False
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(0.5)
-            if sock.connect_ex((probe_host, port)) == 0:
-                return True
+            connected = sock.connect_ex((probe_host, port)) == 0
+        if connected and any(
+            _is_descendant_of(p, proc.pid) for p in _listening_pids(port)
+        ):
+            return True
         time.sleep(0.2)
     return False
 
@@ -799,11 +853,7 @@ def prune_orphan_dbs(
         if not m or m.group(1) not in prunable_hashes:
             continue
         h = m.group(1)
-        sidecars = sorted(DB_DIR.glob(f"phoenix-{h}.*"))
-        size = sum(f.stat().st_size for f in sidecars if f.exists())
-        if not dry_run:
-            for f in sidecars:
-                f.unlink(missing_ok=True)
+        _files, size = _unlink_db_sidecars(h, dry_run=dry_run)
         pruned += 1
         freed += size
         if verbose:
@@ -811,6 +861,20 @@ def prune_orphan_dbs(
     if pruned and not verbose:
         print(f"{verb} {pruned} orphaned dev database(s), {freed / 1e6:.1f} MB.")
     return pruned
+
+
+def _unlink_db_sidecars(h: str, dry_run: bool = False) -> tuple[int, int]:
+    """Delete the `phoenix-<h>.*` dev DB and its sidecars. Returns (files, bytes).
+
+    Single owner of dev-DB sidecar globbing/sizing so `prune_orphan_dbs` and
+    `_reclaim_worktree_db` cannot drift on which suffixes count as a sidecar.
+    """
+    sidecars = sorted(DB_DIR.glob(f"phoenix-{h}.*"))
+    size = sum(f.stat().st_size for f in sidecars if f.exists())
+    if not dry_run:
+        for f in sidecars:
+            f.unlink(missing_ok=True)
+    return (len(sidecars), size)
 
 
 def _reclaim_worktree_db(worktree_path: Path, verbose: bool = True) -> None:
@@ -822,11 +886,9 @@ def _reclaim_worktree_db(worktree_path: Path, verbose: bool = True) -> None:
     nor (usually) a registry record, so its hash never enters the gone-set.
     """
     h = _path_hash(str(worktree_path))
-    sidecars = sorted(DB_DIR.glob(f"phoenix-{h}.*"))
-    for f in sidecars:
-        f.unlink(missing_ok=True)
-    if verbose and sidecars:
-        print(f"    + reclaimed dev DB phoenix-{h} ({len(sidecars)} files)")
+    files, _bytes = _unlink_db_sidecars(h)
+    if verbose and files:
+        print(f"    + reclaimed dev DB phoenix-{h} ({files} files)")
 
 
 def reclaim_deregistered_worktrees(
@@ -859,13 +921,21 @@ def reclaim_deregistered_worktrees(
 
     # Predicate 3: a live dev server rooted in a directory protects it. Scoped to
     # the Phoenix/Vite processes reap owns, not every process on the machine.
-    rooted = [
-        cwd
-        for pid, _cmd in _list_dev_processes()
-        if (cwd := _process_cwd(pid)) is not None
-    ]
+    # Resolve every cwd so symlinks in the chain (a symlinked worktrees base,
+    # /var→/private/var) can't make the containment test miss and delete a live
+    # tree. If any live server's cwd can't be read (lsof timeout/error), fail
+    # safe: skip reclamation entirely rather than risk deleting an unprotected
+    # but live worktree.
+    rooted: list[Path] = []
+    for pid, _cmd in _list_dev_processes():
+        cwd = _process_cwd(pid)
+        if cwd is None:
+            if verbose:
+                print("  Skipping worktree reclaim: a live dev server's cwd "
+                      "could not be read; failing safe.")
+            return (0, 0)
+        rooted.append(cwd.resolve())
 
-    verb = "Would reclaim" if dry_run else "Reclaimed"
     count = 0
     freed = 0
     for base in _git_worktree_bases():
@@ -876,29 +946,44 @@ def reclaim_deregistered_worktrees(
             if child.is_symlink() or not child.is_dir():
                 continue
             rp = child.resolve()
+            # Never delete the tree this interpreter runs from. ROOT is resolved
+            # at import; `rp in ROOT.parents` covers `up`/`reap` invoked from
+            # inside a husk worktree (ROOT below rp), which predicate 3 misses
+            # because the controlling python is not a spawned dev server.
+            if rp == ROOT or rp in ROOT.parents:
+                continue
             if str(rp) in tracked:
                 continue  # predicate 2: still a tracked worktree
             if any(c == rp or rp in c.parents for c in rooted):
                 if verbose:
                     print(f"  Skipping {child.name}: a dev server is still rooted there")
                 continue  # predicate 3
+            if dry_run:
+                count += 1
+                if verbose:
+                    print(f"  Would reclaim deregistered worktree {child.name}")
+                continue
+            # du only on the real path, right before removal — never on dry-run,
+            # where it would block `up`/`reap` for seconds over multi-GB husks
+            # purely for a log line.
             size = _dir_size_bytes(rp)
-            if not dry_run:
-                try:
-                    shutil.rmtree(rp)
-                except OSError as e:
-                    if verbose:
-                        print(f"  Failed to remove {child}: {e}")
-                    continue
-                _reclaim_worktree_db(rp, verbose=verbose)
+            try:
+                shutil.rmtree(rp)
+            except OSError as e:
+                if verbose:
+                    print(f"  Failed to remove {child}: {e}")
+                continue
+            _reclaim_worktree_db(rp, verbose=verbose)
             count += 1
             freed += size
             if verbose:
-                print(f"  {verb} deregistered worktree {child.name} ({size / 1e9:.2f} GB)")
+                print(f"  Reclaimed deregistered worktree {child.name} ({size / 1e9:.2f} GB)")
     return (count, freed)
 
 
-def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
+def reap_orphans(
+    verbose: bool = True, dry_run: bool = False, reclaim_dirs: bool = False
+) -> int:
     """Kill dev servers orphaned when their worktree was deleted without `down`.
 
     A process is reaped only when its live cwd resolves to a directory that no
@@ -908,6 +993,11 @@ def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
     before the registry existed). Servers whose worktree still exists, including
     the current one, are never touched. With dry_run, reports what would be
     killed and mutates nothing (no kills, no registry-record removal).
+
+    `reclaim_dirs` additionally deletes deregistered worktree *directories*. It is
+    opt-in (explicit `./dev.py reap` only) and off for the auto-reap on `up`:
+    killing a stray process is cheap and reversible, but `rmtree` is neither, so
+    the startup path must never trigger it.
     """
     verb = "Would reap" if dry_run else "Reaped"
     reaped = 0
@@ -968,9 +1058,13 @@ def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
             print(f"  {verb} orphan (PID {pid}) — cwd {cwd}")
 
     # Remove worktree directories git has forgotten (the husk a worktree leaves
-    # when it is deleted without `down` first). Runs after the process reap so a
-    # server just killed above no longer roots its directory.
-    reclaimed, freed = reclaim_deregistered_worktrees(verbose=verbose, dry_run=dry_run)
+    # when it is deleted without `down` first). Opt-in (explicit `reap` only) and
+    # after the process reap so a server just killed above no longer roots its dir.
+    reclaimed, freed = (
+        reclaim_deregistered_worktrees(verbose=verbose, dry_run=dry_run)
+        if reclaim_dirs
+        else (0, 0)
+    )
 
     # Reclaim DB files of deleted worktrees. Runs after the process reap so a
     # server just killed above has its DB collected in the same pass.
@@ -985,8 +1079,8 @@ def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
 
 
 def cmd_reap(dry_run: bool = False) -> None:
-    """Kill dev servers orphaned by deleted worktrees."""
-    n = reap_orphans(verbose=True, dry_run=dry_run)
+    """Kill dev servers orphaned by deleted worktrees and reclaim their dirs."""
+    n = reap_orphans(verbose=True, dry_run=dry_run, reclaim_dirs=True)
     if n and not dry_run:
         print(f"Reaped {n} orphaned dev process group(s).")
 
@@ -1283,7 +1377,13 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
             "try './dev.py reap' or './dev.py up --vite-port <free>'.",
             file=sys.stderr,
         )
-        VITE_PID_FILE.unlink()
+        # Don't leave the orphan this check exists to detect: the wrapper may
+        # still be alive (its child died on EADDRINUSE), so kill the group and
+        # clear every record we wrote above before bailing.
+        kill_process_group(proc.pid)
+        unregister_dev_process("vite")
+        VITE_PID_FILE.unlink(missing_ok=True)
+        VITE_PORT_FILE.unlink(missing_ok=True)
         sys.exit(1)
 
     print(f"Started Vite dev server (PID {proc.pid}, port {port})")
