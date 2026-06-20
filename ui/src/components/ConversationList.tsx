@@ -316,12 +316,11 @@ export const ChainBlock = memo(function ChainBlock({
                 onClick={(e) => {
                   e.stopPropagation();
                   onCloseChainMenu();
-                  // Per-conversation rename on the root: chain "rename" =
-                  // setting the chain_name override on the root via
-                  // /api/chains/:rootId/name. Chains are renamed from the
-                  // ChainPage header today; surfacing it here would mean
-                  // duplicating that input. Open the chain page instead.
-                  navigate(`/chains/${item.rootId}`);
+                  // The chain name is edited on the ChainPage header (the single
+                  // chain_name input). `?rename=1` opens that editor directly so
+                  // the menu item lands on an actionable state instead of a bare
+                  // page (a no-op when already on the chain page).
+                  navigate(`/chains/${item.rootId}?rename=1`);
                 }}
               title={`Open chain "${item.displayName}" to rename it`}
               >
