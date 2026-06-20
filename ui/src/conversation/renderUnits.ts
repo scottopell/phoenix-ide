@@ -40,7 +40,7 @@ export type HistoricalUnit =
 
 export type TailUnit =
   | { kind: 'sub_agent_status'; key: string; state: AwaitingSubAgentsState }
-  | { kind: 'streaming_agent'; key: string };
+  | { kind: 'streaming_agent'; key: string; isFirstInTurn: boolean };
 
 export type RenderUnit = HistoricalUnit | TailUnit;
 
@@ -198,9 +198,15 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
   }
 
   if (streamingHandle !== null) {
+    // First in turn when no finalized agent message has appeared yet this run:
+    // the live stream then renders the same `message-header` the finalized first
+    // message will, so the header row doesn't pop in on finalize. A continuation
+    // stream (after a tool result, inAgentRun still set) gets no header, matching
+    // its finalized continuation message.
     tailUnits.push({
       kind: 'streaming_agent',
       key: streamingHandle.key,
+      isFirstInTurn: !inAgentRun,
     });
   }
 

@@ -176,7 +176,7 @@ function renderTailUnit(
       if (!slug) return null;
       return (
         <RenderProfiler id="StreamingMessage">
-          <StreamingMessage slug={slug} />
+          <StreamingMessage slug={slug} isFirstInTurn={unit.isFirstInTurn} />
         </RenderProfiler>
       );
   }
