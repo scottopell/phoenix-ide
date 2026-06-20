@@ -31,9 +31,7 @@ use super::types::{
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
-use crate::db::{
-    ConvMode, Conversation, ConversationUsage, ImageData, Message, NotificationSettings,
-};
+use crate::db::{ConvMode, Conversation, ConversationUsage, ImageData, NotificationSettings};
 use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
     GitOpError, PhoenixIgnoreStrategy,
@@ -372,17 +370,16 @@ pub fn create_router(state: AppState) -> Router {
 // Message Transformation
 // ============================================================
 
-/// Transform a message for API output by merging `display_data` into content blocks.
+/// Render a message to its API `Value` shape by going through
+/// [`crate::api::wire::EnrichedMessage`].
 ///
-/// For agent messages with bash `tool_use` blocks, the `display` field shows a
-/// simplified command (with cd prefixes stripped when they match cwd).
-/// The `display_data` is pre-computed at message creation time and stored in DB.
-///
-/// This helper exists for non-SSE REST endpoints (conversation fetch, archived
-/// list, etc.). The SSE path goes through [`crate::api::wire::EnrichedMessage`]
-/// directly; both routes produce byte-for-byte identical output — there's a
-/// parity test for every `SseEvent` variant in `src/api/sse.rs`.
-pub(crate) fn enrich_message_for_api(msg: &Message) -> Value {
+/// Production paths — both SSE and REST — carry the typed `EnrichedMessage`
+/// and let serde serialize it once at the response boundary. This helper
+/// exists only for the legacy `json!()` gold-standard reference in
+/// `src/api/sse.rs`, which builds events as `Value` to byte-for-byte
+/// cross-check the typed wire path.
+#[cfg(test)]
+pub(crate) fn enrich_message_for_api(msg: &crate::db::Message) -> Value {
     let enriched = super::wire::EnrichedMessage::from(msg);
     serde_json::to_value(&enriched).unwrap_or(Value::Null)
 }
@@ -1819,7 +1816,10 @@ async fn get_conversation(
     }
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_msgs: Vec<Value> = messages.iter().map(enrich_message_for_api).collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
+        .iter()
+        .map(super::wire::EnrichedMessage::from)
+        .collect();
 
     // Calculate context window from last usage
     let context_window_size = messages
@@ -1830,7 +1830,7 @@ async fn get_conversation(
 
     Ok(Json(ConversationWithMessagesResponse {
         conversation: conversation_to_json_with_seed(&state, &conversation).await,
-        messages: json_msgs,
+        messages: enriched_msgs,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         context_window_size,
@@ -3407,7 +3407,10 @@ async fn get_by_slug(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_msgs: Vec<Value> = messages.iter().map(enrich_message_for_api).collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
+        .iter()
+        .map(super::wire::EnrichedMessage::from)
+        .collect();
 
     let context_window_size = messages
         .iter()
@@ -3417,7 +3420,7 @@ async fn get_by_slug(
 
     Ok(Json(ConversationWithMessagesResponse {
         conversation: conversation_to_json_with_seed(&state, &conversation).await,
-        messages: json_msgs,
+        messages: enriched_msgs,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         context_window_size,
@@ -4958,7 +4961,10 @@ async fn get_shared_conversation(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_msgs: Vec<Value> = messages.iter().map(enrich_message_for_api).collect();
+    let enriched_msgs: Vec<super::wire::EnrichedMessage> = messages
+        .iter()
+        .map(super::wire::EnrichedMessage::from)
+        .collect();
 
     let context_window_size = messages
         .iter()
@@ -4968,7 +4974,7 @@ async fn get_shared_conversation(
 
     Ok(Json(ConversationWithMessagesResponse {
         conversation: conversation_to_json_with_seed(&state, &conversation).await,
-        messages: json_msgs,
+        messages: enriched_msgs,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
         context_window_size,

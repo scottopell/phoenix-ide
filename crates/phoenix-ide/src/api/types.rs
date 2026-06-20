@@ -147,7 +147,7 @@ pub struct ConversationResponse {
 #[derive(Debug, Serialize)]
 pub struct ConversationWithMessagesResponse {
     pub conversation: serde_json::Value,
-    pub messages: Vec<serde_json::Value>,
+    pub messages: Vec<crate::api::wire::EnrichedMessage>,
     pub agent_working: bool,
     /// Presentation mode: `idle`, `working`, `needs_action`, `error`, `done`
     pub presentation_mode: String,
