@@ -45,16 +45,53 @@ export function GroundingPanelFixture({ scenario, showToolbar = true }: Props) {
     return () => window.clearTimeout(timer);
   }, [scenario, ready]);
 
+  // Signal capture-readiness off the scenario's settled DOM, not a wall-clock
+  // timer: the detail scenarios open their viewer via an async click→fetch→render
+  // chain, so a fixed delay can flip "ready" while the list is still showing and
+  // produce a silently-wrong screenshot. Poll for the settled marker; if it
+  // never arrives, mark ready anyway but warn (a non-fatal console.warn, so the
+  // miss is visible without failing the run).
   useEffect(() => {
     if (!ready) return;
-    const timer = window.setTimeout(() => {
-      document.documentElement.dataset['groundingFixtureReady'] = scenario.id;
-    }, 700);
+    let cancelled = false;
+
+    const isSettled = (): boolean => {
+      switch (scenario.kind) {
+        case 'skill-detail':
+          return document.querySelector('.skill-viewer') != null;
+        case 'task-detail':
+          return document.querySelector('.task-viewer') != null;
+        case 'full':
+        case 'empty':
+        case 'errors':
+          return document.querySelector('.grounding-section-body') != null;
+        default:
+          return document.querySelector('.grounding-section') != null;
+      }
+    };
+
+    const deadline = Date.now() + 6000;
+    const markReady = () => {
+      if (!cancelled) document.documentElement.dataset['groundingFixtureReady'] = scenario.id;
+    };
+    let timer = 0;
+    const poll = () => {
+      if (cancelled) return;
+      if (isSettled()) return markReady();
+      if (Date.now() >= deadline) {
+        console.warn(`grounding fixture "${scenario.id}" did not reach its settled state before deadline; capturing as-is`);
+        return markReady();
+      }
+      timer = window.setTimeout(poll, 50);
+    };
+    timer = window.setTimeout(poll, 50);
+
     return () => {
+      cancelled = true;
       window.clearTimeout(timer);
       delete document.documentElement.dataset['groundingFixtureReady'];
     };
-  }, [scenario.id, ready]);
+  }, [scenario, ready]);
 
   if (!ready) return null;
 

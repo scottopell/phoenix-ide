@@ -1,19 +1,32 @@
 import type { McpServerStatus, SkillEntry, TaskEntry, WorkScopeInventory } from '../../api';
 import type { FileItem } from '../../components/FileExplorer/FileTree';
 
-export type GroundingPanelScenarioId =
-  | 'full-dark'
-  | 'full-light'
-  | 'empty-dark'
-  | 'errors-dark'
-  | 'collapsed-dark'
-  | 'narrow-dark'
-  | 'skill-detail-dark'
-  | 'task-detail-dark';
-
 export type GroundingPanelScenarioKind = 'full' | 'empty' | 'errors' | 'collapsed' | 'skill-detail' | 'task-detail' | 'narrow';
 
 export type GroundingPanelTheme = 'dark' | 'light';
+
+/** Canonical scenario list — the single source the id union, the built
+ *  scenarios, and (transitively, via the stories and Ladle's manifest) the
+ *  screenshot capture set all derive from. Add/remove a scenario here only. */
+export const groundingPanelScenarioDefinitions = [
+  { id: 'full-dark', title: 'Full / dark', kind: 'full', theme: 'dark', width: 360, collapsed: false },
+  { id: 'full-light', title: 'Full / light', kind: 'full', theme: 'light', width: 360, collapsed: false },
+  { id: 'empty-dark', title: 'Empty states', kind: 'empty', theme: 'dark', width: 360, collapsed: false },
+  { id: 'errors-dark', title: 'Error states', kind: 'errors', theme: 'dark', width: 360, collapsed: false },
+  { id: 'collapsed-dark', title: 'Collapsed rail', kind: 'collapsed', theme: 'dark', width: 360, collapsed: true },
+  { id: 'narrow-dark', title: 'Narrow panel', kind: 'narrow', theme: 'dark', width: 248, collapsed: false },
+  { id: 'skill-detail-dark', title: 'Selected skill detail', kind: 'skill-detail', theme: 'dark', width: 360, collapsed: false },
+  { id: 'task-detail-dark', title: 'Selected task detail', kind: 'task-detail', theme: 'dark', width: 360, collapsed: false },
+] as const satisfies readonly {
+  id: string;
+  title: string;
+  kind: GroundingPanelScenarioKind;
+  theme: GroundingPanelTheme;
+  width: number;
+  collapsed: boolean;
+}[];
+
+export type GroundingPanelScenarioId = (typeof groundingPanelScenarioDefinitions)[number]['id'];
 
 export interface GroundingPanelScenario {
   id: GroundingPanelScenarioId;

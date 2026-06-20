@@ -1861,6 +1861,12 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
 
     def _ensure_grounding_panel_fixture_worktree() -> Path:
         fixture = ROOT / ".phoenix" / "seed-worktrees" / "grounding-panel-qa"
+        # Reuse an already-built worktree: rebuilding on every seed wastes a full
+        # git init + commits for no DB change, and clobbers any manual edits a
+        # developer made while reviewing. A `.git` dir is the "already built"
+        # signal; only a partial/corrupt leftover is torn down and rebuilt.
+        if (fixture / ".git").is_dir():
+            return fixture
         if fixture.exists():
             shutil.rmtree(fixture)
         fixture.mkdir(parents=True, exist_ok=True)
@@ -1988,6 +1994,34 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             ),
         )
         return True
+
+    def _project_and_drop_conv_mode(conn: sqlite3.Connection) -> None:
+        """Project the seeded conv_mode blob into the normalized cm_* columns
+        (mirrors migration 028, including the empty-string -> NULL clean-up),
+        then drop the blob so the seeded DB matches the post-migration-029
+        production schema. The conv_mode migrations are pre-stamped, so the app
+        will not re-run 028/029 against the dropped column.
+
+        Runs in BOTH the full-seed and repair paths. Fixtures created in the
+        repair branch carry a conv_mode blob too; without this projection their
+        cm_* columns stay NULL and they hydrate as Explore instead of Work — so
+        the very Work-mode grounding (task/branch/worktree) the fixture exists to
+        demonstrate would never appear."""
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)")}
+        if "conv_mode" not in cols:
+            return
+        conn.execute(
+            "UPDATE conversations SET"
+            " cm_kind = lower(json_extract(conv_mode, '$.mode')),"
+            " cm_branch_name = NULLIF(json_extract(conv_mode, '$.branch_name'), ''),"
+            " cm_worktree_path = NULLIF(json_extract(conv_mode, '$.worktree_path'), ''),"
+            " cm_base_branch = NULLIF(json_extract(conv_mode, '$.base_branch'), ''),"
+            " cm_task_id = NULLIF(json_extract(conv_mode, '$.task_id'), ''),"
+            " cm_task_title = NULLIF(json_extract(conv_mode, '$.task_title'), ''),"
+            " cm_next_taskmd_id_hint = NULLIF(json_extract(conv_mode, '$.next_taskmd_id_hint'), '')"
+            " WHERE json_valid(conv_mode) AND json_extract(conv_mode, '$.mode') IS NOT NULL"
+        )
+        conn.execute("ALTER TABLE conversations DROP COLUMN conv_mode")
 
     def _insert_conv(
         conn: sqlite3.Connection,
@@ -2412,6 +2446,9 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
                 project_id=project_id,
             )
             created_grounding_fixture = _ensure_grounding_panel_qa_fixture(conn)
+            # Repaired fixtures carry a conv_mode blob; project it to cm_* (and
+            # drop the blob) so they hydrate as Work, not Explore.
+            _project_and_drop_conv_mode(conn)
             conn.commit()
             if not quiet_if_populated:
                 count = _existing_active_count(conn)
@@ -2504,23 +2541,9 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             cwd=str(ROOT),
         )
 
-        # Project the seeded conv_mode blob into the normalized cm_* columns
-        # (mirrors migration 028, including the empty-string -> NULL clean-up),
-        # then drop the blob so the seeded DB matches the post-migration-029
-        # production schema. The conv_mode migrations are pre-stamped above, so
-        # the app will not try to re-run 028/029 against the dropped column.
-        conn.execute(
-            "UPDATE conversations SET"
-            " cm_kind = lower(json_extract(conv_mode, '$.mode')),"
-            " cm_branch_name = NULLIF(json_extract(conv_mode, '$.branch_name'), ''),"
-            " cm_worktree_path = NULLIF(json_extract(conv_mode, '$.worktree_path'), ''),"
-            " cm_base_branch = NULLIF(json_extract(conv_mode, '$.base_branch'), ''),"
-            " cm_task_id = NULLIF(json_extract(conv_mode, '$.task_id'), ''),"
-            " cm_task_title = NULLIF(json_extract(conv_mode, '$.task_title'), ''),"
-            " cm_next_taskmd_id_hint = NULLIF(json_extract(conv_mode, '$.next_taskmd_id_hint'), '')"
-            " WHERE json_valid(conv_mode) AND json_extract(conv_mode, '$.mode') IS NOT NULL"
-        )
-        conn.execute("ALTER TABLE conversations DROP COLUMN conv_mode")
+        # Match the post-migration-029 production schema: project conv_mode into
+        # the normalized cm_* columns and drop the blob.
+        _project_and_drop_conv_mode(conn)
 
         conn.commit()
 
@@ -2531,6 +2554,7 @@ def cmd_qa_grounding_panel() -> None:
         ["pnpm", "qa:grounding-panel"],
         cwd=ROOT / "ui",
         check=True,
+        env=node_env(),
     )
 
 

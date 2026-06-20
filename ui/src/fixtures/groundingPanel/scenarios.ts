@@ -1,8 +1,14 @@
 import type { McpServerStatus, SkillEntry, TaskEntry, WorkScopeInventory } from '../../api';
 import type { FileItem } from '../../components/FileExplorer/FileTree';
+import { groundingPanelScenarioDefinitions } from './types';
 import type { GroundingPanelFixtureData, GroundingPanelScenario, GroundingPanelScenarioId } from './types';
 
-export const GROUNDING_PANEL_ROOT = '/Users/scottopell/dev/phoenix-ide/.phoenix/seed-worktrees/grounding-panel-qa';
+// Synthetic, author-neutral paths for the visual fixture — not a real machine.
+// The seeded integration conversation derives its real worktree path from the
+// repo root (dev.py); this visual story only needs self-consistent, portable
+// paths, so it must not pin one developer's home directory.
+const FIXTURE_HOME = '/home/dev';
+export const GROUNDING_PANEL_ROOT = `${FIXTURE_HOME}/phoenix-ide/.phoenix/seed-worktrees/grounding-panel-qa`;
 export const GROUNDING_PANEL_CONVERSATION_ID = 'qa-grounding-conversation';
 export const GROUNDING_PANEL_SCOPE_KEY = `worktree:${GROUNDING_PANEL_ROOT}`;
 
@@ -48,8 +54,8 @@ const mcp: McpServerStatus[] = [
 ];
 
 const skills: SkillEntry[] = [
-  { name: 'rust-dev', description: 'Rust workflow, test targeting, clippy triage, and ergonomic code review for backend changes.', argument_hint: '[crate-or-test-filter]', source: 'builtin', path: '/Users/scottopell/.phoenix-ide/builtin-skills/rust-dev/SKILL.md' },
-  { name: 'agent-browser', description: 'Drive a real browser for screenshots, repro steps, and exploratory UI testing with deterministic evidence.', argument_hint: '<url> [goal]', source: '/Users/scottopell/.agents/skills', path: '/Users/scottopell/.agents/skills/agent-browser/SKILL.md' },
+  { name: 'rust-dev', description: 'Rust workflow, test targeting, clippy triage, and ergonomic code review for backend changes.', argument_hint: '[crate-or-test-filter]', source: 'builtin', path: `${FIXTURE_HOME}/.phoenix-ide/builtin-skills/rust-dev/SKILL.md` },
+  { name: 'agent-browser', description: 'Drive a real browser for screenshots, repro steps, and exploratory UI testing with deterministic evidence.', argument_hint: '<url> [goal]', source: `${FIXTURE_HOME}/.agents/skills`, path: `${FIXTURE_HOME}/.agents/skills/agent-browser/SKILL.md` },
   { name: 'phoenix-perf-hunt', description: 'Profiles Phoenix React scenarios with raw samples and coordinates one focused performance attempt.', source: `${GROUNDING_PANEL_ROOT}/.agents/skills`, path: `${GROUNDING_PANEL_ROOT}/.agents/skills/phoenix-perf-hunt/SKILL.md` },
   { name: 'very-long-project-specific-skill-name-for-truncation-review', description: 'Project skill with a deliberately long description that should wrap or truncate consistently without pushing counts and status metadata off screen.', argument_hint: '--scenario <name> --evidence <path>', source: `${GROUNDING_PANEL_ROOT}/.claude/skills`, path: `${GROUNDING_PANEL_ROOT}/.claude/skills/very-long-project-specific-skill-name-for-truncation-review/SKILL.md` },
 ];
@@ -85,18 +91,7 @@ export const groundingPanelFixtureData: GroundingPanelFixtureData = {
   skillDetailMarkdown: '# Skill: fixture detail\n\nUse this skill when a grounding panel screenshot needs long markdown content, argument hints, and enough prose to validate scrolling.\n\n## Arguments\n\n`--scenario <name> --evidence <path>`\n\n## Guidance\n\nPrefer deterministic fixtures over ad-hoc data. Capture screenshots after async sections settle and inspect console output for render errors.',
 };
 
-const scenarioDefinitions = [
-  { id: 'full-dark', title: 'Full / dark', kind: 'full', theme: 'dark', width: 360, collapsed: false },
-  { id: 'full-light', title: 'Full / light', kind: 'full', theme: 'light', width: 360, collapsed: false },
-  { id: 'empty-dark', title: 'Empty states', kind: 'empty', theme: 'dark', width: 360, collapsed: false },
-  { id: 'errors-dark', title: 'Error states', kind: 'errors', theme: 'dark', width: 360, collapsed: false },
-  { id: 'collapsed-dark', title: 'Collapsed rail', kind: 'collapsed', theme: 'dark', width: 360, collapsed: true },
-  { id: 'narrow-dark', title: 'Narrow panel', kind: 'narrow', theme: 'dark', width: 248, collapsed: false },
-  { id: 'skill-detail-dark', title: 'Selected skill detail', kind: 'skill-detail', theme: 'dark', width: 360, collapsed: false },
-  { id: 'task-detail-dark', title: 'Selected task detail', kind: 'task-detail', theme: 'dark', width: 360, collapsed: false },
-] as const;
-
-export const groundingPanelScenarios: GroundingPanelScenario[] = scenarioDefinitions.map((scenario) => ({
+export const groundingPanelScenarios: GroundingPanelScenario[] = groundingPanelScenarioDefinitions.map((scenario) => ({
   rootPath: GROUNDING_PANEL_ROOT,
   conversationId: GROUNDING_PANEL_CONVERSATION_ID,
   scopeKey: GROUNDING_PANEL_SCOPE_KEY,

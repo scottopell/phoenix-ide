@@ -7,16 +7,10 @@ import process from 'node:process';
 const port = Number(process.env.LADLE_PORT ?? 61123);
 const baseUrl = process.env.LADLE_URL ?? `http://127.0.0.1:${port}`;
 const outDir = path.resolve(process.env.GROUNDING_PANEL_QA_OUT ?? 'qa-artifacts/grounding-panel');
-const stories = [
-  ['full-dark', 'full-dark'],
-  ['full-light', 'full-light'],
-  ['empty-dark', 'empty-dark'],
-  ['errors-dark', 'errors-dark'],
-  ['collapsed-dark', 'collapsed-dark'],
-  ['narrow-dark', 'narrow-dark'],
-  ['skill-detail-dark', 'skill-detail-dark'],
-  ['task-detail-dark', 'task-detail-dark'],
-];
+
+// Ladle keys each story `<kebab-filename>--<kebab-storyName>`. The suffix is the
+// scenario id, which is also the fixture's ready-attribute value.
+const STORY_PREFIX = 'grounding-panel--';
 
 const expectedConsoleErrors = new Map([
   ['errors-dark', [
@@ -41,6 +35,25 @@ async function waitForLadle() {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`Timed out waiting for Ladle at ${baseUrl}`);
+}
+
+// Derive the capture set from Ladle's own story manifest so it tracks the
+// stories (and through them the shared scenarios) as the single source of
+// truth — a scenario added or removed can't silently fall out of capture.
+async function discoverGroundingStories() {
+  const response = await fetch(`${baseUrl}/meta.json`);
+  if (!response.ok) {
+    throw new Error(`Could not fetch Ladle story manifest at ${baseUrl}/meta.json (${response.status})`);
+  }
+  const meta = await response.json();
+  const stories = Object.keys(meta.stories ?? {})
+    .filter((key) => key.startsWith(STORY_PREFIX))
+    .map((storyKey) => ({ storyKey, id: storyKey.slice(STORY_PREFIX.length) }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  if (stories.length === 0) {
+    throw new Error(`No '${STORY_PREFIX}*' stories in Ladle manifest — grounding-panel stories missing?`);
+  }
+  return stories;
 }
 
 async function main() {
@@ -73,6 +86,8 @@ async function main() {
   process.on('SIGTERM', () => { stopLadle(); process.exit(143); });
 
   await waitForLadle();
+  const stories = await discoverGroundingStories();
+  console.log(`Capturing ${stories.length} grounding-panel stories`);
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 960, height: 900 }, deviceScaleFactor: 1 });
   const consoleErrors = [];
@@ -82,20 +97,20 @@ async function main() {
   page.on('pageerror', (error) => consoleErrors.push(error.message));
 
   try {
-    for (const [story, name] of stories) {
+    for (const { storyKey, id } of stories) {
       consoleErrors.length = 0;
-      const url = `${baseUrl}/?story=grounding-panel--${story}`;
+      const url = `${baseUrl}/?story=${storyKey}`;
       await page.goto(url, { waitUntil: 'networkidle' });
-      await page.waitForSelector(`[data-grounding-fixture-ready="${name}"]`, { timeout: 10_000 });
-      await page.screenshot({ path: path.join(outDir, `${name}.png`), fullPage: true });
+      await page.waitForSelector(`[data-grounding-fixture-ready="${id}"]`, { timeout: 10_000 });
+      await page.screenshot({ path: path.join(outDir, `${id}.png`), fullPage: true });
       const unexpectedErrors = consoleErrors.filter((error) => {
-        const expected = expectedConsoleErrors.get(name) ?? [];
+        const expected = expectedConsoleErrors.get(id) ?? [];
         return !expected.some((item) => error.includes(item));
       });
       if (unexpectedErrors.length > 0) {
-        throw new Error(`Console errors while capturing ${name}:\n${unexpectedErrors.join('\n')}`);
+        throw new Error(`Console errors while capturing ${id}:\n${unexpectedErrors.join('\n')}`);
       }
-      console.log(`✓ captured ${name}`);
+      console.log(`✓ captured ${id}`);
     }
   } finally {
     await browser.close();

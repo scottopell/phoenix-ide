@@ -16,6 +16,13 @@ export function installGroundingPanelFixtureFetch(
   const originalFetch = window.fetch.bind(window);
   window.fetch = async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.pathname + input.search : input.url;
+    // ConversationProvider's refresh driver fetches the conversation lists on
+    // mount. They're irrelevant to the panel fixture, but unmocked they fall
+    // through to the (absent) backend; an empty list keeps the capture from
+    // depending on a Vite SPA-fallback masking the 404 as a console error.
+    if (url === '/api/conversations' || url === '/api/conversations/archived') {
+      return json({ conversations: [] });
+    }
     if (url.startsWith('/api/files/read')) {
       const path = new URL(url, window.location.origin).searchParams.get('path') ?? '';
       const isTask = path.includes('/tasks/');
