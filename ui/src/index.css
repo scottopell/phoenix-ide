@@ -10589,6 +10589,31 @@ html * {
   min-width: 200px;
 }
 
+.chain-page-regenerate {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  padding: 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  align-self: center;
+  transition: background-color 200ms ease, border-color 200ms ease, color 200ms ease;
+}
+
+.chain-page-regenerate:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.chain-page-regenerate:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  border-color: var(--border-color);
+  color: var(--text-primary);
+}
+
 .chain-page-meta {
   font-size: 12px;
   color: var(--text-muted);

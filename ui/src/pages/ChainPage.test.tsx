@@ -56,6 +56,7 @@ vi.mock('../api', async () => {
       getChain: vi.fn(),
       submitChainQuestion: vi.fn(),
       setChainName: vi.fn(),
+      regenerateChainName: vi.fn(),
       // The work-scope dock resolves the active member's scope key via
       // getConversation, then polls getWorkScopeInventory. Defaults below are
       // overridden per-test where the dock behaviour is under test.
@@ -597,6 +598,75 @@ describe('ChainPage — inline name edit (REQ-CHN-007)', () => {
     await waitFor(() => {
       expect(api.setChainName).toHaveBeenCalledWith(ROOT_ID, null);
     });
+  });
+});
+
+describe('ChainPage — regenerate name (REQ-CHN-010)', () => {
+  it('clicking regenerate calls regenerateChainName and applies the returned name', async () => {
+    const { api } = await import('../api');
+    const initial = makeChain({ chain_name: 'old-name', display_name: 'old-name' });
+    const regenerated = makeChain({
+      chain_name: 'fresh-name',
+      display_name: 'fresh-name',
+    });
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(initial);
+    (api.regenerateChainName as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      regenerated,
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /old-name/ }),
+      ).toBeInTheDocument();
+    });
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Regenerate name from chain content' }),
+    );
+
+    await waitFor(() => {
+      expect(api.regenerateChainName).toHaveBeenCalledWith(ROOT_ID);
+    });
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /fresh-name/ }),
+      ).toBeInTheDocument();
+    });
+    // Manual-only (REQ-CHN-010): exactly one call from the explicit click, no
+    // auto-trigger on mount.
+    expect(api.regenerateChainName).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the displayed name and surfaces an error toast when regeneration fails', async () => {
+    const { api } = await import('../api');
+    const initial = makeChain({ chain_name: 'keep-me', display_name: 'keep-me' });
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(initial);
+    (api.regenerateChainName as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error('LLM unavailable'),
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /keep-me/ }),
+      ).toBeInTheDocument();
+    });
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Regenerate name from chain content' }),
+    );
+
+    // The failure surfaces via the app toast mechanism.
+    await waitFor(() => {
+      expect(screen.getByText('LLM unavailable')).toBeInTheDocument();
+    });
+    // The displayed name is unchanged (server left it untouched on failure).
+    expect(
+      screen.getByRole('button', { name: /keep-me/ }),
+    ).toBeInTheDocument();
   });
 });
 

@@ -32,6 +32,7 @@
 
 import { memo, useEffect, useMemo, useRef, useCallback, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
+import { RefreshCw, Loader2 } from 'lucide-react';
 import { useParams, useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -47,8 +48,10 @@ import {
 import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 import { WorkScopePanel } from '../components/WorkScopePanel';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
+import { Toast } from '../components/Toast';
 import { useChainAtom, type InflightQa } from '../chain';
 import { useScopedState, useResizablePane } from '../hooks';
+import { useToast } from '../hooks/useToast';
 
 // Markdown plugin set, hoisted so the array identity is stable across
 // renders (matches the pattern in StreamingMessage.tsx).
@@ -77,6 +80,11 @@ export function ChainPage() {
   // affordance, not chain state. It does not need to survive navigation
   // (in fact: it should *not* — dialog open across nav would be a bug).
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useScopedState(rootConvId, false);
+
+  // Transient error surface — the app-wide toast mechanism (same as
+  // ConversationPage / ConversationListPage). Used for name-regeneration
+  // failures, which must not clobber the displayed name.
+  const { toasts, dismissToast, showError } = useToast();
 
   // Imperative handle to the active pair's textarea so we can refocus it
   // immediately after submit (the user agreed they should be able to type the
@@ -399,6 +407,23 @@ export function ChainPage() {
             });
           }
         }}
+        onRegenerate={async () => {
+          if (!rootConvId) return;
+          // Success applies the refreshed view exactly like onRename's success
+          // path. Failure surfaces a toast and leaves the displayed name as-is
+          // — the server guarantees the name is unchanged on any failure, so we
+          // do not touch chain state. LOAD_FAIL is intentionally not used here:
+          // the page only renders loadError when there is no chain, so it would
+          // be invisible while a chain is loaded.
+          try {
+            const updated = await api.regenerateChainName(rootConvId);
+            dispatch({ type: 'LOAD_OK', view: updated });
+          } catch (err) {
+            showError(
+              err instanceof Error ? err.message : 'Failed to regenerate name',
+            );
+          }
+        }}
         onArchive={async () => {
           if (!rootConvId) return;
           try {
@@ -474,6 +499,7 @@ export function ChainPage() {
         }}
         onCancel={() => setDeleteConfirmOpen(false)}
       />
+      <Toast messages={toasts} onDismiss={dismissToast} />
     </div>
   );
 }
@@ -552,19 +578,39 @@ function ChainWorkScopeDock({
 interface ChainPageHeaderProps {
   chain: ChainView;
   onRename: (name: string | null) => Promise<void>;
+  /** Re-summarizes the chain into a fresh name and applies the refreshed
+   *  view. Manual-only (REQ-CHN-010): fires on explicit button click. Rejects
+   *  on failure so the header can surface an inline error; the server leaves
+   *  the name unchanged. */
+  onRegenerate: () => Promise<void>;
   /** Archives the chain. Archive is a terminal lifecycle transition; there
    *  is no unarchive (archived chain roots 404 on the chain route). */
   onArchive: () => void | Promise<void>;
   onDelete: () => void;
 }
 
-function ChainPageHeader({ chain, onRename, onArchive, onDelete }: ChainPageHeaderProps) {
+function ChainPageHeader({ chain, onRename, onRegenerate, onArchive, onDelete }: ChainPageHeaderProps) {
   const [editing, setEditing] = useScopedState(chain.root_conv_id, false);
   // The text input is pre-populated with the actual override (`chain_name`),
   // not the resolved `display_name` — REQ-CHN-007 spec note: an empty input
   // means "clear the override and fall back to title."
   const [value, setValue] = useScopedState(chain.root_conv_id, chain.chain_name ?? '');
   const inputRef = useRef<HTMLInputElement | null>(null);
+
+  // Manual name regeneration (REQ-CHN-010). In-flight disables the button and
+  // shows a spinner. Success/failure are handled by the parent's onRegenerate
+  // (LOAD_OK / toast); the header only owns the in-flight affordance.
+  const [regenerating, setRegenerating] = useScopedState(chain.root_conv_id, false);
+
+  const regenerate = async () => {
+    if (regenerating) return;
+    setRegenerating(true);
+    try {
+      await onRegenerate();
+    } finally {
+      setRegenerating(false);
+    }
+  };
 
   // Keep the local value in sync if the prop changes while we're not editing
   // (e.g., after a successful PATCH refresh).
@@ -631,6 +677,21 @@ function ChainPageHeader({ chain, onRename, onArchive, onDelete }: ChainPageHead
           {chain.display_name}
         </button>
       )}
+      <button
+        type="button"
+        className="chain-page-regenerate"
+        onClick={() => void regenerate()}
+        disabled={regenerating}
+        title="Regenerate name from chain content"
+        aria-label="Regenerate name from chain content"
+        aria-busy={regenerating}
+      >
+        {regenerating ? (
+          <Loader2 size={15} className="spinning" />
+        ) : (
+          <RefreshCw size={15} />
+        )}
+      </button>
       <span className="chain-page-meta">
         {chain.current_member_count}{' '}
         {chain.current_member_count === 1 ? 'conversation' : 'conversations'}

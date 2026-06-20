@@ -1598,6 +1598,23 @@ export const api = {
     return resp.json();
   },
 
+  /** POST /api/chains/:rootId/regenerate-name — re-summarize the chain's
+   *  content into a fresh name and persist it. No request body; the root id
+   *  is the only input. Returns the refreshed `ChainView` (same shape as
+   *  `setChainName`). On any failure the server leaves the name unchanged. */
+  async regenerateChainName(rootId: string): Promise<ChainViewType> {
+    const resp = await fetch(
+      `/api/chains/${encodeURIComponent(rootId)}/regenerate-name`,
+      { method: 'POST' },
+    );
+    if (resp.status === 404) throw new Error('Chain not found');
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to regenerate chain name');
+    }
+    return resp.json();
+  },
+
   /** POST /api/chains/:rootId/archive — archive every member of the chain
    *  atomically. Mirrors `archiveConversation` for chain-scope. */
   async archiveChain(rootId: string): Promise<void> {
