@@ -19,6 +19,24 @@ Request:"#;
 const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TITLE_LENGTH: usize = 60;
 
+/// Prompt for the prose chain-name summary (REQ-CHN-010). Distinct from
+/// `TITLE_PROMPT`: it summarizes *every* chain member's first user message into
+/// one short prose display name, and the output is Title-Case prose, not a slug.
+const CHAIN_NAME_PROMPT: &str = r"Below are the opening messages of a sequence of related coding conversations, in order. Generate a single very short (3-6 words) human-readable name that summarizes the whole sequence as a unit. Output only the name in Title Case prose, no quotes, no punctuation, no kebab-case. Examples:
+- Auth Refactor And Tests
+- CSV Parser And Cleanup
+- Database Migration Rollout
+
+Conversations:";
+
+/// Per-message input cap for chain-name generation — mirrors `generate_title`'s
+/// 500-char truncation so a few huge first-messages don't dominate the prompt.
+const CHAIN_NAME_PER_MESSAGE_CHARS: usize = 500;
+
+/// Total joined-input cap for chain-name generation — bounds the prompt for
+/// long chains regardless of per-message length.
+const CHAIN_NAME_TOTAL_CHARS: usize = 4000;
+
 /// Generate a title for a conversation based on the initial message.
 ///
 /// Returns None if title generation fails (timeout, error, etc.)
@@ -66,6 +84,104 @@ pub async fn generate_title(
             None
         }
     }
+}
+
+/// Generate a prose display name for a continuation chain by summarizing the
+/// first user message of each member (in chain order) via a cheap LLM
+/// (REQ-CHN-010).
+///
+/// Unlike [`generate_title`] this returns a human-readable Title-Case prose
+/// string, NOT a kebab slug, and it does NOT length-truncate the output — the
+/// caller normalizes against the single chain-name length authority
+/// (`CHAIN_NAME_MAX_CHARS` in `api::chains`). The only output cleanup here is
+/// stripping control characters and collapsing whitespace, so there is exactly
+/// one length authority.
+///
+/// `first_messages` is each member's first user message in chain order. Empty
+/// members should already be dropped by the caller; an empty slice yields
+/// `None` (nothing to summarize).
+///
+/// Returns `None` on timeout, LLM error, empty input, or an empty model
+/// response. The caller leaves the existing name untouched on `None`
+/// (REQ-CHN-010 — no partial/empty name written).
+pub async fn generate_chain_name(
+    first_messages: &[String],
+    llm_service: Arc<dyn LlmService>,
+) -> Option<String> {
+    if first_messages.is_empty() {
+        return None;
+    }
+
+    // Defensive truncation: cap each message, then cap the joined total so a
+    // long chain doesn't blow the prompt. Numbered for the model's orientation.
+    let mut joined = String::new();
+    for (idx, msg) in first_messages.iter().enumerate() {
+        let truncated = truncate_chars(msg.trim(), CHAIN_NAME_PER_MESSAGE_CHARS);
+        if truncated.is_empty() {
+            continue;
+        }
+        let line = format!("{}. {}\n", idx + 1, truncated);
+        if joined.len() + line.len() > CHAIN_NAME_TOTAL_CHARS {
+            break;
+        }
+        joined.push_str(&line);
+    }
+
+    if joined.trim().is_empty() {
+        return None;
+    }
+
+    let prompt = format!("{CHAIN_NAME_PROMPT}\n{joined}");
+
+    let request = LlmRequest {
+        system: vec![],
+        messages: vec![LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::text(prompt)],
+        }],
+        tools: vec![],
+        max_tokens: Some(50), // Name should be very short
+        // Distinct key from the title generator so the two prompts cache
+        // independently — they have different prefixes and output shapes.
+        cache_key: PromptCacheKey::stable("chain-name-generator"),
+    };
+
+    let result = timeout(TITLE_TIMEOUT, llm_service.complete(&request)).await;
+
+    match result {
+        Ok(Ok(response)) => extract_title_from_response(&response)
+            .map(|t| clean_prose_name(&t))
+            .filter(|s| !s.is_empty()),
+        Ok(Err(e)) => {
+            tracing::warn!("Chain name generation LLM error: {}", e.message);
+            None
+        }
+        Err(_) => {
+            tracing::warn!("Chain name generation timed out");
+            None
+        }
+    }
+}
+
+/// Truncate `s` to at most `max_chars` characters (char-safe, not byte-safe).
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
+/// Clean a model-produced prose display name: drop control characters and
+/// collapse internal whitespace to single spaces. Does NOT kebab-case or
+/// length-truncate — that is the caller's normalization (single length
+/// authority, REQ-CHN-010).
+fn clean_prose_name(name: &str) -> String {
+    name.split_whitespace()
+        .map(|word| word.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Extract the title text from the LLM response
@@ -135,5 +251,37 @@ mod tests {
         let long_title = "This is a very long title that should be truncated at some point";
         let result = sanitize_title(long_title);
         assert!(result.len() <= MAX_TITLE_LENGTH);
+    }
+
+    #[test]
+    fn clean_prose_name_collapses_whitespace_and_keeps_case() {
+        // Prose name is NOT kebab-cased and NOT lowercased.
+        assert_eq!(
+            clean_prose_name("  Auth   Refactor\tAnd Tests  "),
+            "Auth Refactor And Tests"
+        );
+    }
+
+    #[test]
+    fn clean_prose_name_strips_control_chars() {
+        assert_eq!(clean_prose_name("Auth\u{0007}Refactor"), "AuthRefactor");
+        // Newlines are whitespace, so they collapse to a single space.
+        assert_eq!(clean_prose_name("Auth\nRefactor"), "Auth Refactor");
+    }
+
+    #[test]
+    fn clean_prose_name_does_not_length_truncate() {
+        // The generator imposes no length cap; that is the caller's authority.
+        let long = "Word ".repeat(100);
+        let cleaned = clean_prose_name(&long);
+        assert!(cleaned.chars().count() > 100);
+    }
+
+    #[test]
+    fn truncate_chars_is_char_safe() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("hello", 3), "hel");
+        // Multibyte chars are counted, not bytes — no panic on a boundary.
+        assert_eq!(truncate_chars("héllo", 2), "hé");
     }
 }

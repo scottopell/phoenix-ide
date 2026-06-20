@@ -5,8 +5,8 @@
 
 use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
 use super::chains::{
-    archive_chain_handler, delete_chain_handler, get_chain, set_chain_name, stream_chain,
-    submit_chain_question,
+    archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
+    stream_chain, submit_chain_question,
 };
 use super::git_handlers::{
     create_pr_auto_fix_context, get_conversation_diff, get_conversation_pr_status,
@@ -213,6 +213,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/chains/:rootId/name",
             axum::routing::patch(set_chain_name),
+        )
+        .route(
+            "/api/chains/:rootId/regenerate-name",
+            post(regenerate_chain_name),
         )
         .route("/api/chains/:rootId/stream", get(stream_chain))
         .route("/api/chains/:rootId/archive", post(archive_chain_handler))
