@@ -90,21 +90,35 @@ jobs:
         run: pnpm install --frozen-lockfile && pnpm run build
         working-directory: ui
 
-      - name: Build binary
+      # Two artifacts from one tag:
+      #   - `release-min` (LTO + opt-z + stripped) is the primary download.
+      #   - `release` (full debug symbols) is the `-debug` variant for users who
+      #     want core-dump symbolication of a running instance.
+      # Only release.yml pays this 2x build cost, and it fires only on a version
+      # bump — never on a routine CI push.
+      - name: Build main (stripped) binary
+        run: cargo build --profile release-min --target x86_64-unknown-linux-musl
+        env:
+          CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
+
+      - name: Build debug (symbol-rich) binary
         run: cargo build --release --target x86_64-unknown-linux-musl
         env:
           CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
 
-      - name: Rename binary
+      - name: Rename binaries
         run: |
-          cp target/x86_64-unknown-linux-musl/release/phoenix_ide \
+          cp target/x86_64-unknown-linux-musl/release-min/phoenix_ide \
              phoenix_ide-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/phoenix_ide \
+             phoenix_ide-x86_64-unknown-linux-musl-debug
 
-      - name: Create release and upload binary
+      - name: Create release and upload binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ needs.gate.outputs.tag }}" \
             --title "${{ needs.gate.outputs.tag }}" \
             --generate-notes \
-            phoenix_ide-x86_64-unknown-linux-musl
+            phoenix_ide-x86_64-unknown-linux-musl \
+            phoenix_ide-x86_64-unknown-linux-musl-debug

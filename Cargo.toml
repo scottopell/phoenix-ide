@@ -24,6 +24,20 @@ unused_comparisons = "deny"
 [profile.release]
 debug = true  # Include debug symbols for production debugging
 
+# Size-optimized profile for the primary distributed binary. The `release`
+# profile keeps full debug symbols (for core-dump symbolication of a running
+# instance); `release-min` is what end users download. panic stays unwinding
+# (the default): Phoenix is a long-running server where a panicking request
+# handler must be isolated to its tokio task, not abort the process — the
+# ~4MB of unwind tables that buys back is not worth losing that isolation.
+[profile.release-min]
+inherits = "release"
+debug = false
+strip = true
+lto = "fat"
+opt-level = "z"
+codegen-units = 1
+
 # Cold-compile + link-time reduction for `./dev.py check` and dev builds.
 # `line-tables-only` keeps file:line info (so panics + backtraces still
 # resolve) but drops full DWARF type info, which is the bulk of what slows
