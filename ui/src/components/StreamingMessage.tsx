@@ -65,8 +65,8 @@ interface StreamingMessageViewProps {
 export function StreamingMessageView({ buffer }: StreamingMessageViewProps) {
   if (!buffer) return null;
   return (
-    <div className="streaming-message agent-message">
-      <div className="streaming-message-content">
+    <div className="message agent">
+      <div className="message-content">
         <StreamingBlocks text={buffer.text ?? ''} />
       </div>
       <span className="streaming-cursor" aria-hidden="true" />
