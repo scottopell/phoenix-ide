@@ -260,13 +260,14 @@ pub async fn regenerate_chain_name(
         .await
         .map_err(db_to_app)?;
 
-    // Collect each member's first user message in chain order, dropping members
+    // Collect each member's opening message in chain order, dropping members
     // that have none (a member may have only agent/tool/continuation content).
+    // An opening is a user message or a skill invocation (its trigger text).
     let mut first_messages: Vec<String> = Vec::with_capacity(member_ids.len());
     for id in &member_ids {
         if let Some(text) = state
             .db
-            .first_user_message_text(id)
+            .first_opening_message_text(id)
             .await
             .map_err(db_to_app)?
         {
@@ -275,15 +276,16 @@ pub async fn regenerate_chain_name(
     }
 
     if first_messages.is_empty() {
-        // Nothing to summarize — every member lacked a usable first user
-        // message. Leave the name untouched (REQ-CHN-010).
+        // Nothing to summarize — every member lacked a usable opening message.
+        // Leave the name untouched (REQ-CHN-010).
         tracing::debug!(
             root_conv_id = %root_id,
             members = member_ids.len(),
-            "regenerate-name: no member had a first user message; leaving name unchanged"
+            "regenerate-name: no member had an opening message; leaving name unchanged"
         );
         return Err(AppError::Internal(
-            "cannot regenerate chain name: no member has a user message to summarize".to_string(),
+            "cannot regenerate chain name: no member has an opening message to summarize"
+                .to_string(),
         ));
     }
 

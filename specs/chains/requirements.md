@@ -369,9 +369,11 @@ for it.
 
 WHEN the user invokes a regenerate-name action on a chain
 THE SYSTEM SHALL derive a short human-readable name by summarizing the
-first user message of each member conversation (in chain order) via a
+opening message of each member conversation (in chain order) via a
 cheap LLM, and persist it as the chain's name (the `chain_name` override
-on the root)
+on the root). A member's opening message is its earliest user-initiated
+message — a plain user message, or a skill invocation (whose original
+trigger text is the opening intent) — since a member may open either way
 
 THE regenerate action SHALL be manual and user-initiated only; THE
 SYSTEM SHALL NOT rename chains automatically or in the background.

@@ -238,7 +238,11 @@ fabricated one). The generator has two modes:
 1. Walk the chain's members forward from the root via the existing
    `continued_in_conv_id` recursive CTE (the same walk used for membership
    and freshness).
-2. Take each member's first user message, in chain order.
+2. Take each member's opening message, in chain order — its earliest
+   user-initiated message: a plain user message, or a skill invocation
+   (using its original trigger text, not the expanded skill body, since a
+   skill-invoking prompt persists as `message_type = 'skill'`). Members
+   with no such opening are dropped.
 3. Generate a prose display name summarizing those messages via
    `title_generator`.
 4. On success, persist the name through the existing chain-name write path

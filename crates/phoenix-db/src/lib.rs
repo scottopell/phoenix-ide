@@ -2495,23 +2495,27 @@ impl Database {
         Ok(())
     }
 
-    /// Return the display text of the earliest user-role message in a
-    /// conversation, or `None` when the conversation has no user message
-    /// (REQ-CHN-010).
+    /// Return the display text of the earliest *opening* message in a
+    /// conversation, or `None` when there is none (REQ-CHN-010).
+    ///
+    /// An opening is a user-initiated message: a plain `user` message, or a
+    /// `skill` invocation (a user action whose original trigger text is the
+    /// opening intent — Phoenix persists a skill-invoking prompt as
+    /// `message_type = 'skill'`, not `'user'`). System-generated user messages
+    /// (task-approval seeds, `is_meta`) count too; agent/tool/continuation
+    /// messages do not.
     ///
     /// "Earliest" is by `sequence_id` (the messages table's append order).
     /// Used by chain-name regeneration to summarize each member's opening
-    /// intent. System-generated user messages (task-approval seeds, `is_meta`)
-    /// count — they carry the member's opening intent for a Work handoff — but
-    /// agent/tool/continuation messages do not.
+    /// intent.
     ///
     /// # Errors
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn first_user_message_text(&self, conv_id: &str) -> DbResult<Option<String>> {
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT content FROM messages
-             WHERE conversation_id = ?1 AND message_type = 'user'
+    pub async fn first_opening_message_text(&self, conv_id: &str) -> DbResult<Option<String>> {
+        let row = sqlx::query(
+            "SELECT message_type, content FROM messages
+             WHERE conversation_id = ?1 AND message_type IN ('user', 'skill')
              ORDER BY sequence_id ASC
              LIMIT 1",
         )
@@ -2519,21 +2523,38 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
 
-        let Some(content_str) = row else {
+        let Some(row) = row else {
             return Ok(None);
         };
-
+        let message_type: String = row.try_get("message_type")?;
+        let content_str: String = row.try_get("content")?;
         let value: serde_json::Value = serde_json::from_str(&content_str).unwrap_or_default();
-        let Ok(MessageContent::User(user)) =
-            MessageContent::from_stored_json(MessageType::User, value)
-        else {
-            // A row tagged `user` whose content fails to parse as user content
-            // is corrupt; treat it as "no usable first message" rather than
-            // surfacing a parse error to the naming flow.
-            return Ok(None);
+
+        // A row whose content fails to parse as its tagged type is corrupt;
+        // treat it as "no usable opening" rather than surfacing a parse error
+        // to the naming flow.
+        let text = match message_type.as_str() {
+            "user" => match MessageContent::from_stored_json(MessageType::User, value) {
+                Ok(MessageContent::User(user)) => user.text,
+                _ => return Ok(None),
+            },
+            // The trigger is the user's original text that invoked the skill —
+            // the opening intent. The expanded body is the wrong thing to name
+            // from. Fall back to the skill name if the trigger is empty.
+            "skill" => match MessageContent::from_stored_json(MessageType::Skill, value) {
+                Ok(MessageContent::Skill(skill)) => {
+                    if skill.trigger.trim().is_empty() {
+                        skill.name
+                    } else {
+                        skill.trigger
+                    }
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
         };
 
-        let text = user.text.trim();
+        let text = text.trim();
         if text.is_empty() {
             Ok(None)
         } else {
@@ -7722,10 +7743,11 @@ mod tests {
         matches!(err, DbError::ConversationNotFound(_));
     }
 
-    /// REQ-CHN-010: `first_user_message_text` returns the earliest user message
-    /// and skips non-user (agent/tool/continuation) messages.
+    /// REQ-CHN-010: `first_opening_message_text` returns the earliest opening
+    /// message — a `user` message OR a `skill` invocation (its trigger text) —
+    /// and skips agent/tool/continuation messages.
     #[tokio::test]
-    async fn test_first_user_message_text() {
+    async fn test_first_opening_message_text() {
         use phoenix_core::domain::llm_types::ContentBlock;
 
         let db = Database::open_in_memory().await.unwrap();
@@ -7733,8 +7755,8 @@ mod tests {
             .await
             .unwrap();
 
-        // No user message yet → None.
-        assert_eq!(db.first_user_message_text("fum").await.unwrap(), None);
+        // No opening yet → None.
+        assert_eq!(db.first_opening_message_text("fum").await.unwrap(), None);
 
         // Add an agent message first (lower sequence) — must be skipped.
         db.add_message(
@@ -7746,8 +7768,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // Still no user message.
-        assert_eq!(db.first_user_message_text("fum").await.unwrap(), None);
+        // Still no opening.
+        assert_eq!(db.first_opening_message_text("fum").await.unwrap(), None);
 
         // First user message.
         db.add_message(
@@ -7771,12 +7793,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            db.first_user_message_text("fum").await.unwrap(),
+            db.first_opening_message_text("fum").await.unwrap(),
             Some("Refactor the auth module".to_string())
         );
 
         // Unknown conversation → None (no rows match), not an error.
-        assert_eq!(db.first_user_message_text("ghost").await.unwrap(), None);
+        assert_eq!(db.first_opening_message_text("ghost").await.unwrap(), None);
+
+        // A member whose opening is a SKILL invocation: the user's trigger text
+        // is the opening intent — not the expanded skill body.
+        db.create_conversation("skillconv", "slug-skill", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message(
+            "skill-open",
+            "skillconv",
+            &MessageContent::Skill(phoenix_core::domain::db_schema::SkillContent {
+                name: "build".to_string(),
+                body: "EXPANDED SKILL BODY — must not be the chain name".to_string(),
+                trigger: "Ship the release build".to_string(),
+                files: vec![],
+            }),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.first_opening_message_text("skillconv").await.unwrap(),
+            Some("Ship the release build".to_string())
+        );
     }
 
     // ==================== rename_conversation Tests ====================
