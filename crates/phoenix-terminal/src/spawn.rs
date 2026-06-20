@@ -16,8 +16,42 @@ use std::{
     ffi::CString,
     os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
+
+/// Server-wide additions to every PTY child's environment, installed once at
+/// startup via [`set_pty_env_injection`]. Kept process-global (rather than
+/// threaded through `spawn_pty`) so it sits alongside `build_env`'s existing
+/// reads of ambient process state (`PATH`, `USER`, `runtime_env`), which is
+/// where the rest of the child env already comes from.
+#[derive(Debug, Clone, Default)]
+pub struct PtyEnvInjection {
+    /// Directory prepended to the child `PATH` — holds the `phx` shim so it is
+    /// guaranteed on `PATH` in every terminal session.
+    pub path_prefix: Option<PathBuf>,
+    /// Extra vars merged into the child env (e.g. `PHOENIX_API_URL` and the
+    /// scoped suggest capability token). These are deliberate, narrowly-scoped
+    /// additions — not the secret-leaking server-env inheritance `build_env`
+    /// otherwise forbids.
+    pub extra: Vec<(String, String)>,
+}
+
+static ENV_INJECTION: OnceLock<PtyEnvInjection> = OnceLock::new();
+
+/// Install the server-wide PTY env injection. First call wins; later calls are
+/// ignored (startup runs once).
+pub fn set_pty_env_injection(injection: PtyEnvInjection) {
+    let _ = ENV_INJECTION.set(injection);
+}
+
+/// The directory holding the `phx` shim, when an injection is installed. The
+/// tmux companion-refresh path needs it to prepend `phx` to a reused server's
+/// new panes via `default-command` (a `set-environment -g PATH` is silently
+/// ignored by tmux for new panes; `default-command` is honored).
+#[must_use]
+pub fn phx_bin_dir() -> Option<PathBuf> {
+    ENV_INJECTION.get().and_then(|i| i.path_prefix.clone())
+}
 
 /// What the PTY child should exec into.
 ///
@@ -262,9 +296,13 @@ pub fn set_winsize_raw(fd: RawFd, dims: Dims) -> Result<(), String> {
     }
 }
 
-/// Construct an explicit minimal environment for the shell (REQ-TERM-002).
+/// Construct an explicit environment for the shell (REQ-TERM-002).
 ///
-/// Never inherits the API server's environment — prevents secret leakage.
+/// Never blindly inherits the API server's environment — prevents secret
+/// leakage. Beyond the fixed base it adds the enumerated `PtyEnvInjection` and a
+/// fixed allowlist of safe interactive session vars copied from the server
+/// process ([`PTY_ENV_ALLOWLIST`]). Secret-bearing vars (LLM API keys, gateway
+/// config, `PHOENIX_*`) are never on that list.
 pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
     let home = phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
         .home()
@@ -273,11 +311,18 @@ pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "user".to_owned());
-    let path = std::env::var("PATH").unwrap_or_else(|_| {
+    let mut path = std::env::var("PATH").unwrap_or_else(|_| {
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned()
     });
 
-    vec![
+    let injection = ENV_INJECTION.get();
+    if let Some(prefix) = injection.and_then(|i| i.path_prefix.as_ref()) {
+        // Prepend so the Phoenix-managed `phx` shadows any same-named binary
+        // already on PATH (the "guaranteed available" contract).
+        path = format!("{}:{path}", prefix.display());
+    }
+
+    let mut env = vec![
         ("TERM".into(), "xterm-256color".into()),
         ("COLORTERM".into(), "truecolor".into()),
         ("HOME".into(), home),
@@ -294,15 +339,44 @@ pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
         // detect the host terminal by name rather than by env-var sniffing.
         ("ITERM_SHELL_INTEGRATION_INSTALLED".into(), "Yes".into()),
         ("TERM_PROGRAM".into(), "phoenix-ide".into()),
-    ]
+    ];
+
+    if let Some(inj) = injection {
+        env.extend(inj.extra.iter().cloned());
+    }
+
+    // A fixed allowlist of safe interactive session vars, copied from the server
+    // process when present. These let a user's shell reach ssh-agent, the right
+    // locale, and the session runtime dir without inheriting the whole env.
+    // Nothing secret is listed (no LLM keys, gateway, or PHOENIX_* config).
+    for key in PTY_ENV_ALLOWLIST {
+        if let Ok(val) = std::env::var(key) {
+            env.push(((*key).to_owned(), val));
+        }
+    }
+
+    env
 }
+
+/// Safe, non-secret interactive session vars passed through from the server
+/// process into the shell env (see [`build_env`]). Deliberately excludes every
+/// secret-bearing var (LLM API keys, gateway config, `PHOENIX_*`).
+const PTY_ENV_ALLOWLIST: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "SSH_CONNECTION",
+    "XDG_RUNTIME_DIR",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+];
 
 /// Same as [`build_env`] but explicitly omits `TMUX`. When Phoenix is
 /// launched from inside an outer tmux session, the inherited `TMUX`
 /// env var causes the inner tmux to refuse to nest by default
 /// ("sessions should be nested with care"). REQ-TMUX-004 / spec
 /// design.md §"TMUX env handling".
-pub(crate) fn build_env_for_tmux(shell_path: &str) -> Vec<(String, String)> {
+#[must_use]
+pub fn build_env_for_tmux(shell_path: &str) -> Vec<(String, String)> {
     // build_env() never includes TMUX in the first place — its caller
     // populates the env from a fixed list. We re-use it verbatim and
     // belt-and-braces drop any TMUX-prefixed key just in case the list

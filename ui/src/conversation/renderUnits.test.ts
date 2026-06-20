@@ -551,7 +551,7 @@ describe('buildRenderUnits', () => {
       expect(out.tailUnits.filter((u) => u.kind === 'sub_agent_status')).toEqual([]);
     });
 
-    it('appends a streaming_agent tail unit (tag only) when streamingHandle is present', () => {
+    it('appends a streaming_agent tail unit (first in turn) when streamingHandle is present', () => {
       const out = buildRenderUnits({
         messages: [],
         pendingMessages: [],
@@ -559,7 +559,21 @@ describe('buildRenderUnits', () => {
         streamingHandle: { key: 'stream-c1-12345' },
       });
       expect(out.tailUnits).toEqual([
-        { kind: 'streaming_agent', key: 'stream-c1-12345' },
+        { kind: 'streaming_agent', key: 'stream-c1-12345', isFirstInTurn: true },
+      ]);
+    });
+
+    it('marks the streaming_agent tail not-first-in-turn when an agent message already exists this run', () => {
+      // user → finalized agent message → now streaming a continuation: the
+      // finalized continuation would carry no header, so neither does the stream.
+      const out = buildRenderUnits({
+        messages: [userMsg('u1'), agentMsg('a1')],
+        pendingMessages: [],
+        convState: { type: 'llm_requesting', attempt: 1 },
+        streamingHandle: { key: 'stream-c1-67890' },
+      });
+      expect(out.tailUnits).toEqual([
+        { kind: 'streaming_agent', key: 'stream-c1-67890', isFirstInTurn: false },
       ]);
     });
 

@@ -8,6 +8,7 @@ import { useStreamingBuffer } from '../conversation/useConversationAtom';
 import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
 import { ConversationMarkdownAnchor } from './conversationMarkdown';
 import { MermaidDiagram } from './MermaidDiagram';
+import { formatMessageTime } from './MessageComponents';
 
 // Stable markdown configuration — avoids creating new references on every render
 const REMARK_PLUGINS = [remarkGfm];
@@ -34,13 +35,17 @@ const MARKDOWN_COMPONENTS = {
  * re-render only this component — `<MessageList>` and its
  * `<MessageListBody>` are untouched by token churn (REQ-MLRU-010).
  */
-export function StreamingMessage({ slug }: { slug: string }) {
+export function StreamingMessage({ slug, isFirstInTurn }: { slug: string; isFirstInTurn: boolean }) {
   const buffer = useStreamingBuffer(slug);
-  return <StreamingMessageView buffer={buffer} />;
+  return <StreamingMessageView buffer={buffer} isFirstInTurn={isFirstInTurn} />;
 }
 
 interface StreamingMessageViewProps {
   buffer: StreamingBuffer | null;
+  // Render the Phoenix/timestamp header iff this stream is the turn's first agent
+  // message, so the header row is present during streaming and does not pop in
+  // (shifting content down) on finalize. Defaults true for tests/standalone use.
+  isFirstInTurn?: boolean;
 }
 
 /**
@@ -62,11 +67,20 @@ interface StreamingMessageViewProps {
  * - Open code fence → <pre><code className="streaming-code"> with matching
  *   dimensions so the swap to SyntaxHighlighter causes no layout shift.
  */
-export function StreamingMessageView({ buffer }: StreamingMessageViewProps) {
+export function StreamingMessageView({ buffer, isFirstInTurn = true }: StreamingMessageViewProps) {
   if (!buffer) return null;
+  const startedAtIso = new Date(buffer.startedAt).toISOString();
   return (
-    <div className="streaming-message agent-message">
-      <div className="streaming-message-content">
+    <div className="message agent">
+      {isFirstInTurn && (
+        <div className="message-header">
+          <span className="message-sender">Phoenix</span>
+          <span className="message-time" title={new Date(buffer.startedAt).toLocaleString()}>
+            {formatMessageTime(startedAtIso)}
+          </span>
+        </div>
+      )}
+      <div className="message-content">
         <StreamingBlocks text={buffer.text ?? ''} />
       </div>
       <span className="streaming-cursor" aria-hidden="true" />

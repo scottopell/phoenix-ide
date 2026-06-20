@@ -127,6 +127,11 @@ AND validate only the share token itself
 the password. The share token is the authorization -- it grants read-only
 access to one specific conversation.
 
+The same shape -- exempt from the password middleware, gated by its own scoped
+token -- backs `/api/suggest`'s capability token (`specs/command-suggestion`
+REQ-CSUG-003). That token additionally binds to the password fingerprint (like
+a session token), so rotating `PHOENIX_PASSWORD` revokes it.
+
 ---
 
 ### REQ-AUTH-007: Multiple Simultaneous Viewers

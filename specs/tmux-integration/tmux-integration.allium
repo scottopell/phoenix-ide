@@ -322,6 +322,15 @@ rule ServerProbedLive {
         -- entry that references the existing server. No reattach
         -- handshake is needed: tmux's protocol is stateless from the
         -- client side.
+        --
+        -- REQ-TMUX-015 (companion refresh): a reused server that predates
+        -- the `phx` companion setup is brought up to date on this reuse
+        -- edge, once and non-destructively — restore the `hyperlinks`
+        -- feature, prepend the `phx` bin dir to new panes' PATH via
+        -- default-command, set the suggest token/URL in the global env,
+        -- and stamp PHOENIX_COMPANION_VERSION. This is an operational
+        -- sequence (not a state of TmuxServer); see design.md
+        -- §"Companion refresh on reuse".
 }
 
 ------------------------------------------------------------

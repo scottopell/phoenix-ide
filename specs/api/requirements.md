@@ -251,3 +251,16 @@ WHERE clients reconnecting after a restart receive DB-only state in the init pay
 Overflow behaviour is clear-and-truncate rather than evict-oldest because partial replay was deemed misleading: a user reconnecting to a long-running turn would see only the tail of the in-flight stream filling in, with no indication that earlier content was lost. A clean force-resync is honest about the gap and the next persisted message restores authoritative state.
 
 Bytes-based capping is deferred to observability-only: a debug-level metric exposes aggregate ring byte size so pathological large-event-dominated rings can be detected, but the enforcement cap remains entry-count-based for simplicity.
+
+---
+
+### REQ-API-013: One-Shot Command Suggestion
+
+WHEN a client POSTs `{ query, model? }` to `/api/suggest` with a valid `X-Phoenix-Suggest-Token` header
+THE SYSTEM SHALL perform a single stateless, tool-less LLM completion and return `{ commands: [...] }`
+AND SHALL NOT create a conversation, message, or any persisted record
+
+WHEN the request lacks a valid capability token
+THE SYSTEM SHALL reject it with `403` (the endpoint is exempt from the password middleware; the token is the sole gate)
+
+The endpoint's behaviour, auth model, and token lifecycle are specified in `specs/command-suggestion` (REQ-CSUG-001/002/003/004); this requirement records its place in the HTTP surface.

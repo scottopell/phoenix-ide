@@ -63,6 +63,15 @@ const SERVER_CONFIG_FILENAME: &str = "_phoenix.tmux.conf";
 /// directory at registry-init time (see [`TmuxRegistry::ensure_runtime_assets`]).
 pub const SERVER_CONFIG_TEXT: &str = include_str!("server.conf");
 
+/// The `phx`-companion setup version stamped into a tmux server's global
+/// environment under [`COMPANION_VERSION_VAR`]. Bump it whenever the PTY env
+/// injection or the terminal-features that `phx` / OSC-8 run-links depend on
+/// change, so a server spawned under an older version is brought up to date on
+/// reuse (see `refresh_companion_if_stale`). A server with the current stamp is
+/// left untouched.
+const COMPANION_ENV_VERSION: &str = "1";
+const COMPANION_VERSION_VAR: &str = "PHOENIX_COMPANION_VERSION";
+
 /// Errors surfaced by the tmux registry. The tmux tool translates these
 /// into the stable error envelope on the agent's response.
 #[derive(Debug, Error)]
@@ -471,9 +480,11 @@ impl TmuxRegistry {
                     source,
                 })?;
 
+        let mut reused_live = false;
         match probe_result {
             ProbeResult::Live => {
                 server.status = ServerStatus::Live;
+                reused_live = true;
             }
             ProbeResult::NoSocket => {
                 spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
@@ -493,7 +504,18 @@ impl TmuxRegistry {
             }
         }
         let status_changed = server.status != prev_status;
+        let socket_path = server.socket_path.clone();
         drop(server);
+
+        // A reused live server may predate the current companion setup (a
+        // Phoenix upgrade, or a server created before `phx` existed). Bring it
+        // up to date non-destructively — restore OSC-8 forwarding and inject the
+        // `phx` env for new windows. Gated on the version stamp, so a current
+        // server costs only one `show-environment` probe. Freshly spawned
+        // servers (NoSocket / DeadSocket) already carry the current setup.
+        if reused_live {
+            refresh_companion_if_stale(&socket_path).await;
+        }
         // Emit on the work-scope inventory edge once the status has
         // SETTLED. Two cases collapse to the same rule:
         //   - First materialization (`created`): the freshly inserted entry
@@ -783,6 +805,143 @@ pub async fn cascade_tmux_on_delete(
         .await
 }
 
+/// Set an explicit environment on a tmux command so the spawned server (and
+/// thus its pane shells) match the direct-shell PTY contract: the fixed base
+/// env plus the `PtyEnvInjection` (the `phx` shim on PATH, `PHOENIX_API_URL`,
+/// `PHOENIX_SUGGEST_TOKEN`) and the safe-var allowlist — never a blind copy of
+/// the Phoenix process environment, which would leak server secrets (LLM API
+/// keys, gateway config) into every tmux-backed terminal. `build_env_for_tmux`
+/// is the single source for that env (`specs/terminal` REQ-TERM-002).
+fn set_tmux_server_env(cmd: &mut tokio::process::Command) {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
+    cmd.env_clear();
+    cmd.envs(phoenix_terminal::spawn::build_env_for_tmux(&shell));
+    // Stamp the companion version so a later reuse can tell a current server
+    // (no-op) from a pre-feature/older one that needs a refresh.
+    cmd.env(COMPANION_VERSION_VAR, COMPANION_ENV_VERSION);
+}
+
+/// Run a tmux command against an existing server, discarding output.
+/// Best-effort: errors are ignored, because a companion refresh must never
+/// block or fail a terminal attach.
+async fn run_tmux_quiet(socket_path: &Path, args: &[&str]) {
+    let sock = socket_path.to_string_lossy().into_owned();
+    let mut full: Vec<&str> = vec!["-S", &sock];
+    full.extend_from_slice(args);
+    let _ = tokio::process::Command::new("tmux")
+        .args(&full)
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+/// Read one variable from a server's global environment, or `None` if unset.
+/// `tmux show-environment -g VAR` prints `VAR=value` when set and `-VAR` when
+/// not.
+async fn tmux_global_env(socket_path: &Path, var: &str) -> Option<String> {
+    let sock = socket_path.to_string_lossy().into_owned();
+    let out = tokio::process::Command::new("tmux")
+        .args(["-S", &sock, "show-environment", "-g", var])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let prefix = format!("{var}=");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+}
+
+/// Bring a reused tmux server up to the current companion version,
+/// non-destructively. Gated on the version stamp, so a current server is a
+/// no-op. A pre-feature/older live server otherwise reuses panes whose
+/// environment and loaded config predate `phx`, so:
+///
+/// - `set -ag terminal-features ",*:hyperlinks"` restores OSC-8 hyperlink
+///   forwarding for the next fresh attach (the relay re-attaches on every panel
+///   open, so the user gets it then);
+/// - `set-environment -g` injects the `phx` env (PATH prefix, API URL, token)
+///   for new windows/panes;
+/// - a one-time status hint tells the user how to reach `phx` in the *current*
+///   pane, whose shell already exported its PATH and cannot be changed from
+///   outside.
+///
+/// Recreating the server would fix the current pane too but destroy the user's
+/// running panes and jobs — rejected. Best-effort throughout.
+async fn refresh_companion_if_stale(socket_path: &Path) {
+    if tmux_global_env(socket_path, COMPANION_VERSION_VAR)
+        .await
+        .as_deref()
+        == Some(COMPANION_ENV_VERSION)
+    {
+        return;
+    }
+
+    run_tmux_quiet(
+        socket_path,
+        &["set", "-ag", "terminal-features", ",*:hyperlinks"],
+    )
+    .await;
+
+    // Put `phx` on new panes' PATH. A `set-environment -g PATH` is silently
+    // ignored by tmux for new panes (they take PATH from the server process),
+    // so instead wrap the pane shell via default-command to prepend the bin dir
+    // before exec — honored for every new window/pane, non-destructive to
+    // existing ones.
+    if let Some(bin) = phoenix_terminal::spawn::phx_bin_dir() {
+        let wrapper = format!(
+            r#"PATH="{}:$PATH"; export PATH; exec "${{SHELL:-/bin/sh}}""#,
+            bin.display()
+        );
+        run_tmux_quiet(socket_path, &["set", "-g", "default-command", &wrapper]).await;
+    }
+
+    // The suggest token and API URL DO propagate to new panes via the global
+    // environment (unlike PATH), so set them there.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
+    for (k, v) in phoenix_terminal::spawn::build_env_for_tmux(&shell) {
+        if k == "PHOENIX_API_URL" || k == "PHOENIX_SUGGEST_TOKEN" {
+            run_tmux_quiet(
+                socket_path,
+                &["set-environment", "-g", k.as_str(), v.as_str()],
+            )
+            .await;
+        }
+    }
+
+    run_tmux_quiet(
+        socket_path,
+        &[
+            "set-environment",
+            "-g",
+            COMPANION_VERSION_VAR,
+            COMPANION_ENV_VERSION,
+        ],
+    )
+    .await;
+
+    // The current pane's shell already exported its PATH and can't pick up
+    // `phx` retroactively; a new window (which the wrapper above dresses) can.
+    run_tmux_quiet(
+        socket_path,
+        &[
+            "display-message",
+            "-d",
+            "5000",
+            "phx now available in new windows — open one (prefix + c) to use it",
+        ],
+    )
+    .await;
+}
+
 /// Spawn a fresh detached tmux session named `main` against
 /// `socket_path` with `cwd` as the pane's start directory
 /// (REQ-TMUX-002 / `tmux_default_session`). This is the only place
@@ -804,20 +963,26 @@ pub async fn spawn_session(
     config_path: &Path,
     cwd: &Path,
 ) -> Result<(), TmuxError> {
-    let output = tokio::process::Command::new("tmux")
-        .args([
-            "-f",
-            &config_path.to_string_lossy(),
-            "-S",
-            &socket_path.to_string_lossy(),
-            "new-session",
-            "-d",
-            "-c",
-            &cwd.to_string_lossy(),
-            "-s",
-            TMUX_DEFAULT_SESSION,
-        ])
-        .env_remove("TMUX")
+    let mut cmd = tokio::process::Command::new("tmux");
+    cmd.args([
+        "-f",
+        &config_path.to_string_lossy(),
+        "-S",
+        &socket_path.to_string_lossy(),
+        "new-session",
+        "-d",
+        "-c",
+        &cwd.to_string_lossy(),
+        "-s",
+        TMUX_DEFAULT_SESSION,
+    ]);
+    // A tmux pane shell inherits the tmux *server's* environment, captured here.
+    // Build it explicitly (base + PtyEnvInjection + safe-var allowlist) rather
+    // than inheriting Phoenix's env, which would leak server secrets into every
+    // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
+    // an outer-tmux invocation does not trip tmux's nesting refusal.
+    set_tmux_server_env(&mut cmd);
+    let output = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

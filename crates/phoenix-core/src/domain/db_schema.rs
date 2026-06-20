@@ -412,6 +412,54 @@ pub fn title_from_slug(slug: &str) -> String {
         .join(" ")
 }
 
+/// Derive a kebab-case slug from a human-readable title — the inverse of
+/// [`title_from_slug`]. E.g., "Fix Login Bug!" -> "fix-login-bug".
+/// Any run of non-alphanumeric characters becomes a single hyphen. Returns
+/// an empty string when the title has no slug-able characters; callers
+/// supply their own fallback.
+#[must_use]
+pub fn slug_from_title(title: &str) -> String {
+    title
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase()
+}
+
+#[cfg(test)]
+mod slug_title_tests {
+    use super::{slug_from_title, title_from_slug};
+
+    #[test]
+    fn slug_from_title_kebabs_and_lowercases() {
+        assert_eq!(slug_from_title("Fix Login Bug!"), "fix-login-bug");
+        assert_eq!(slug_from_title("Approve Fresh"), "approve-fresh");
+        assert_eq!(
+            slug_from_title("  Refactor   Auth Layer  "),
+            "refactor-auth-layer"
+        );
+    }
+
+    #[test]
+    fn slug_from_title_empty_when_no_slugable_chars() {
+        assert_eq!(slug_from_title("!!! ---"), "");
+        assert_eq!(slug_from_title(""), "");
+    }
+
+    #[test]
+    fn slug_and_title_round_trip_for_simple_titles() {
+        // A clean lowercase prose title survives the slug -> title round trip
+        // (title-casing is the only transformation).
+        assert_eq!(
+            title_from_slug(&slug_from_title("fix login bug")),
+            "Fix Login Bug"
+        );
+    }
+}
+
 impl Conversation {
     /// Check if the agent is currently working (derived from `display_state`)
     #[must_use]

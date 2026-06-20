@@ -256,3 +256,27 @@ happened, give me a way to reclaim if I really want to. Currently NOT
 implemented (the close path treats every failure as generic
 "Connection error"); this requirement is the spec target. See the
 executive's status table.
+
+---
+
+### REQ-TPANEL-009: Click a Suggested Command to Run It
+
+WHEN the terminal renders an OSC 8 hyperlink whose URI uses the `phxrun:`
+scheme (emitted by `phx`, see `specs/command-suggestion` REQ-CSUG-007)
+THE SYSTEM SHALL treat it as a runnable command suggestion, not a web link
+
+WHEN I activate such a link
+THE SYSTEM SHALL decode the command from the link's `phxrun:<base64>` URI
+AND write it to the PTY via the input path (REQ-TPANEL-001) WITHOUT a trailing
+newline — the command lands on my prompt for me to review and submit
+
+THE SYSTEM SHALL NOT auto-execute the command.
+
+WHEN the link is an ordinary `http(s)` OSC 8 hyperlink
+THE SYSTEM SHALL retain default open-in-new-tab behaviour.
+
+**Rationale:** Suggestion, not execution. Placing the command on the prompt
+keeps a human review beat in the loop and runs it in my own shell. The
+`linkHandler` reuses the existing PTY input path, so no new transport is
+introduced; `allowNonHttpProtocols` is required for xterm to surface the custom
+scheme to the handler.

@@ -35,6 +35,23 @@ pub struct CreateConversationRequest {
     pub seed_label: Option<String>,
 }
 
+/// Request body for one-shot shell-command suggestion (`POST /api/suggest`).
+/// Stateless: no conversation, no tools, no persistence.
+#[derive(Debug, Deserialize)]
+pub struct SuggestRequest {
+    /// Natural-language description of what the user wants to do.
+    pub query: String,
+    /// Optional model id; defaults to a cheap/fast model when omitted.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Response for `POST /api/suggest`: the suggested command lines in model order.
+#[derive(Debug, Serialize)]
+pub struct SuggestResponse {
+    pub commands: Vec<String>,
+}
+
 /// Request body for persisted desktop notification preferences (REQ-NOTIF-006/009).
 #[derive(Debug, Deserialize)]
 pub struct NotificationSettingsRequest {

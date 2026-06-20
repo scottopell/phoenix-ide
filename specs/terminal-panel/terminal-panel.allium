@@ -36,6 +36,9 @@
 -- detection + CTA), and REQ-TPANEL-008 (conflict resolution target).
 -- REQ-TPANEL-005 (collapse + unread) and REQ-TPANEL-007 (theme) are
 -- render/lifecycle requirements with no state machine to model.
+-- REQ-TPANEL-009 (click a phxrun: suggestion to run it) is an
+-- event->effect with no panel state; its behaviour is modelled in
+-- specs/command-suggestion (RunLinkPlacesCommandOnPrompt).
 
 ------------------------------------------------------------
 -- Config

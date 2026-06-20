@@ -718,10 +718,32 @@ async fn stream_text_with_optional_stall(
     }
 }
 
+/// True when the request carries the command-suggester system prompt, i.e.
+/// it came from `POST /api/suggest`. The suggest path uses `complete()` only,
+/// so this trigger lives there. Dev-only.
+fn request_is_suggest(request: &LlmRequest) -> bool {
+    request
+        .system
+        .iter()
+        .any(|s| s.text.contains("shell-command suggester"))
+}
+
+/// Deterministic, safe, runnable commands the mock returns for a suggestion
+/// request — so the whole suggest path (endpoint → OSC 8 run-links → click →
+/// execute) can be exercised end-to-end without a live model. One command per
+/// line, matching the suggester output contract.
+fn mock_suggest_commands() -> String {
+    "echo \"hello from phx — suggestion path works\"\npwd\ndate".to_string()
+}
+
 #[async_trait]
 impl LlmService for MockLlmService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let content = if let Some(seconds) = parse_slow_tool(request) {
+        let content = if request_is_suggest(request) {
+            vec![ContentBlock::Text {
+                text: mock_suggest_commands(),
+            }]
+        } else if let Some(seconds) = parse_slow_tool(request) {
             build_slow_tool_response(seconds).0
         } else if let Some(n) = parse_perf_words(request) {
             vec![ContentBlock::Text { text: perf_text(n) }]
