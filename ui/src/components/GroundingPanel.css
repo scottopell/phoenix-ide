@@ -93,6 +93,14 @@
   right: 7px;
 }
 
+/* The action overlays the header's top-right corner, where the count pill is
+ * also right-aligned. Reserve a right gutter so a section carrying both (MCP:
+ * reload + ready-count) lays them side by side instead of stacking the icon
+ * over the number. */
+.grounding-section.has-action .grounding-section-header {
+  padding-right: 30px;
+}
+
 .grounding-section-body {
   max-height: min(42vh, 360px);
   overflow: auto;

@@ -198,7 +198,7 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
       icon="◆"
       title="MCP"
       summary={reloading ? 'refreshing…' : summary.label}
-      count={summary.enabledReady > 0 ? summary.enabledReady : servers.length}
+      count={summary.enabledReady}
       expanded={expanded}
       attention={summary.attention}
       onToggle={() => setExpanded(!expanded)}

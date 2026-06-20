@@ -3,7 +3,14 @@ import type { McpServerStatus, SkillEntry, TaskEntry } from '../api';
 const TERMINAL_STATUSES = new Set(['done', 'wont-do']);
 const BUILTIN_GROUP = 'Built-in';
 
-function groupLabel(skill: SkillEntry): string {
+/**
+ * Group label for a skill. Built-in skills are pulled into a dedicated
+ * "Built-in" group; filesystem skills derive their label from the directory
+ * above `.claude/skills` / `.agents/skills`. Single source for both the
+ * collapsed-header group count (`summarizeSkills`) and the expanded body's
+ * group headers (`SkillsPanel`), so the two never disagree.
+ */
+export function groupLabel(skill: SkillEntry): string {
   if (skill.source === 'builtin') return BUILTIN_GROUP;
   const markers = ['.claude/skills', '.agents/skills'];
   for (const marker of markers) {
@@ -20,6 +27,33 @@ function groupLabel(skill: SkillEntry): string {
     }
   }
   return 'Other';
+}
+
+/**
+ * Group skills by {@link groupLabel}. The "Built-in" group is pulled to the
+ * front of the resulting Map (Maps preserve insertion order) so phoenix-bundled
+ * skills render above filesystem ones.
+ */
+export function groupSkills(skills: SkillEntry[]): Map<string, SkillEntry[]> {
+  const groups = new Map<string, SkillEntry[]>();
+  for (const skill of skills) {
+    const label = groupLabel(skill);
+    const existing = groups.get(label);
+    if (existing) {
+      existing.push(skill);
+    } else {
+      groups.set(label, [skill]);
+    }
+  }
+  if (groups.has(BUILTIN_GROUP)) {
+    const builtins = groups.get(BUILTIN_GROUP)!;
+    groups.delete(BUILTIN_GROUP);
+    const reordered = new Map<string, SkillEntry[]>();
+    reordered.set(BUILTIN_GROUP, builtins);
+    for (const [k, v] of groups) reordered.set(k, v);
+    return reordered;
+  }
+  return groups;
 }
 
 export function summarizeMcpStatus(servers: McpServerStatus[]): {
@@ -55,22 +89,37 @@ export function summarizeMcpStatus(servers: McpServerStatus[]): {
   };
 }
 
-export function summarizeTasks(tasks: TaskEntry[], currentTaskId?: string): {
+/** Status counts behind the Tasks header. Produced either by reducing the full
+ *  task list (expanded) or by the lightweight count endpoint (collapsed); both
+ *  render through {@link taskCountsLabel} so the header reads identically. */
+export interface TaskCounts {
   active: number;
   closed: number;
   blocked: number;
   current: boolean;
-  label: string;
-} {
+}
+
+/** Header summary string for a set of task counts. `loaded` is false before any
+ *  counts have arrived, so the header shows a placeholder rather than "0 active". */
+export function taskCountsLabel(counts: TaskCounts, loaded: boolean): string {
+  if (!loaded) return 'not loaded';
+  const parts = [`${counts.active} active`];
+  if (counts.current) parts.push('current set');
+  if (counts.blocked > 0) parts.push(`${counts.blocked} blocked`);
+  if (counts.closed > 0) parts.push(`${counts.closed} closed`);
+  return parts.join(' · ');
+}
+
+export function summarizeTasks(
+  tasks: TaskEntry[],
+  currentTaskId?: string,
+): TaskCounts & { label: string } {
   const active = tasks.filter((t) => !TERMINAL_STATUSES.has(t.status)).length;
   const closed = tasks.length - active;
   const blocked = tasks.filter((t) => t.status === 'blocked').length;
   const current = currentTaskId != null && tasks.some((t) => t.id === currentTaskId);
-  const parts = [`${active} active`];
-  if (current) parts.push('current set');
-  if (blocked > 0) parts.push(`${blocked} blocked`);
-  if (closed > 0) parts.push(`${closed} closed`);
-  return { active, closed, blocked, current, label: tasks.length === 0 ? 'not loaded' : parts.join(' · ') };
+  const counts = { active, closed, blocked, current };
+  return { ...counts, label: taskCountsLabel(counts, tasks.length > 0) };
 }
 
 export function summarizeSkills(skills: SkillEntry[]): string {

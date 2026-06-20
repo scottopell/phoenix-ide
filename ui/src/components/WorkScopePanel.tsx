@@ -34,7 +34,13 @@ import type {
   WorkScopeInventory,
   BashHandleInventory,
 } from '../api';
-import { isLive, hasLiveResource, workScopeLiveCount } from './workScopeHelpers';
+import {
+  isLive,
+  hasLiveResource,
+  workScopeLiveCount,
+  isBrowserIdle,
+  BROWSER_IDLE_THRESHOLD_MS,
+} from './workScopeHelpers';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import { GroundingSection } from './GroundingPanel';
 import './WorkScopePanel.css';
@@ -44,12 +50,6 @@ import './WorkScopePanel.css';
  *  is edge-triggered on bash state transitions only — between transitions the
  *  byte count would otherwise stay frozen. */
 const RUNNING_POLL_INTERVAL_MS = 2000;
-
-/** A `live` browser session whose last activity is older than this reads as
- *  "idle" — a purely client-side presentation over `idle_ms`, distinct from
- *  the wire `state` which is only `live` | `torn_down` (REQ-WSUI-004 /
- *  REQ-WSUI-010). */
-const BROWSER_IDLE_THRESHOLD_MS = 60_000;
 
 interface Props {
   /** The scope key to query (`work_scope_key` on the conversation, or the
@@ -488,7 +488,7 @@ function summarizeWorkScope(inv: WorkScopeInventory | null, count: number): stri
   if (count > 0) parts.push(`${count} live`);
   if (terminal > 0) parts.push(`${terminal} done`);
   if (inv.tmux?.status === 'live') parts.push('tmux');
-  if (inv.browser?.state === 'live') parts.push(inv.browser.idle_ms > BROWSER_IDLE_THRESHOLD_MS ? 'browser idle' : 'browser live');
+  if (inv.browser?.state === 'live') parts.push(isBrowserIdle(inv.browser) ? 'browser idle' : 'browser live');
   return parts.join(' · ') || 'no live resources';
 }
 

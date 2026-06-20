@@ -551,6 +551,33 @@ pub struct ProjectTasksQuery {
     pub cwd: String,
 }
 
+/// Lightweight status counts for the Tasks panel's collapsed header. Lets the
+/// header carry its count summary without fetching the full task list (and its
+/// per-conversation slug mapping) on every conversation mount — the full list
+/// is fetched only on expand.
+#[derive(Debug, Serialize)]
+pub struct TaskCountResponse {
+    /// Tasks in a non-terminal status (anything but `done`/`wont-do`).
+    pub active: u32,
+    /// Tasks in a terminal status (`done`/`wont-do`).
+    pub closed: u32,
+    /// Tasks in the `blocked` status.
+    pub blocked: u32,
+    /// Whether `current_task_id` (the branch-derived task the UI considers
+    /// current) is present among the listed tasks.
+    pub current: bool,
+}
+
+/// Query parameters for the task-count endpoint.
+#[derive(Debug, Deserialize)]
+pub struct TaskCountQuery {
+    /// The task the caller considers "current" (derived UI-side from the branch
+    /// name), so the collapsed header's "current set" indicator matches the
+    /// expanded list's. Absent ⇒ no current task.
+    #[serde(default)]
+    pub current_task_id: Option<String>,
+}
+
 /// Expansion error detail returned to the frontend (REQ-IR-007)
 #[derive(Debug, Clone, Serialize)]
 pub struct ExpansionErrorResponse {

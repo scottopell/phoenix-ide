@@ -548,6 +548,15 @@ export interface TaskEntry {
   conversation_slug?: string;
 }
 
+/** Lightweight task status counts for the Tasks panel's collapsed header. */
+export interface TaskCountResponse {
+  active: number;
+  closed: number;
+  blocked: number;
+  /** Whether the branch-derived current task is present among the tasks. */
+  current: boolean;
+}
+
 /** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */
 export interface ExpansionErrorDetail {
   error: string;
@@ -1297,6 +1306,24 @@ export const api = {
       signal ? { signal } : {},
     );
     if (!resp.ok) throw new Error('Failed to list tasks');
+    return resp.json();
+  },
+
+  /** Lightweight task status counts for the conversation's project, for the
+   *  collapsed Tasks header without fetching the full list. */
+  async getConversationTaskCount(
+    convId: string,
+    currentTaskId?: string,
+    signal?: AbortSignal,
+  ): Promise<TaskCountResponse> {
+    const params = currentTaskId
+      ? `?current_task_id=${encodeURIComponent(currentTaskId)}`
+      : '';
+    const resp = await fetch(
+      `/api/conversations/${convId}/tasks/count${params}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to fetch task counts');
     return resp.json();
   },
 

@@ -26,8 +26,8 @@ use super::types::{
     FileViewerKind, GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse,
     ModelsResponse, NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery,
     ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse,
-    SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
-    ValidateCwdResponse,
+    SuccessResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
+    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -246,6 +246,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/skills", get(list_project_skills))
         // Task listing
         .route("/api/conversations/:id/tasks", get(list_conversation_tasks))
+        .route(
+            "/api/conversations/:id/tasks/count",
+            get(get_conversation_task_count),
+        )
         // Projects (REQ-PROJ-014)
         .route("/api/projects", get(list_projects))
         // Model info (REQ-API-009)
@@ -4438,6 +4442,63 @@ async fn list_conversation_tasks(
     Ok(Json(TasksResponse {
         tasks: task_entries_for_cwd(&state, &cwd).await,
     }))
+}
+
+/// Status counts for a project's tasks/ directory. Scans the task files but
+/// skips the conversation/project DB queries and slug mapping that
+/// `task_entries_for_cwd` does — the collapsed header needs only the counts.
+fn task_counts_for_cwd(cwd: &std::path::Path, current_task_id: Option<&str>) -> TaskCountResponse {
+    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = cwd.join(&tasks_dir_name);
+
+    let mut active = 0u32;
+    let mut closed = 0u32;
+    let mut blocked = 0u32;
+    let mut current = false;
+    for task in taskmd_core::tasks::list_tasks(&tasks_dir) {
+        let status = task.status.to_string();
+        if status == "done" || status == "wont-do" {
+            closed += 1;
+        } else {
+            active += 1;
+        }
+        if status == "blocked" {
+            blocked += 1;
+        }
+        if current_task_id.is_some_and(|id| id == task.id) {
+            current = true;
+        }
+    }
+
+    TaskCountResponse {
+        active,
+        closed,
+        blocked,
+        current,
+    }
+}
+
+/// Lightweight task status counts for the conversation's project, for the Tasks
+/// panel's collapsed header (full list fetched only on expand).
+async fn get_conversation_task_count(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<TaskCountQuery>,
+) -> Result<Json<TaskCountResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let cwd = std::path::PathBuf::from(&conversation.cwd);
+    Ok(Json(task_counts_for_cwd(
+        &cwd,
+        query.current_task_id.as_deref(),
+    )))
 }
 
 /// Token usage totals for a conversation (own turns + root rollup including sub-agents).

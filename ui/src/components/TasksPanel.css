@@ -17,47 +17,6 @@
   flex: 1 1 auto;
 }
 
-.tasks-panel-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 12px;
-  width: 100%;
-  border: none;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-  user-select: none;
-  transition: background 150ms ease;
-
-  /* Keep header visible during browser auto-scroll on sibling expand.
-   * Task 13002. */
-  scroll-margin-top: 8px;
-}
-
-.tasks-panel-header:hover {
-  background: var(--bg-hover);
-}
-
-.tasks-panel-chevron {
-  font-size: 10px;
-  transition: transform 200ms ease;
-  flex-shrink: 0;
-}
-
-.tasks-panel-chevron.expanded {
-  transform: rotate(90deg);
-}
-
-.tasks-panel-summary {
-  flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .tasks-done-count {
   color: var(--text-muted);
   opacity: 0.7;
@@ -70,13 +29,6 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-}
-
-.tasks-loading,
-.tasks-empty {
-  padding: 8px 12px;
-  color: var(--text-muted);
-  font-style: italic;
 }
 
 /* Status groups */
@@ -162,20 +114,18 @@
   padding-left: 8px;
 }
 
-.tasks-item {
+/* Row wrapper holds the primary task button and the optional conv-link as
+ * sibling buttons (never nested — button-in-button is invalid interactive
+ * ARIA). The row carries the hover/current/terminal presentation; the buttons
+ * are transparent activators. */
+.tasks-item-row {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 4px;
   border-radius: 3px;
-  font-family: var(--font-mono, monospace);
-  font-size: 11px;
-  min-height: 20px;
-  cursor: pointer;
   transition: background 60ms;
 }
 
-.tasks-item:hover {
+.tasks-item-row:hover {
   background: var(--bg-hover);
 }
 
@@ -183,15 +133,37 @@
   opacity: 0.4;
 }
 
-/* ISSUE-004 fix: highlight current conversation's task */
+/* highlight the current conversation's task */
 .tasks-item-current {
   background: color-mix(in srgb, var(--accent-blue, #58a6ff) 12%, transparent);
   border-left: 2px solid var(--accent-blue, #58a6ff);
-  padding-left: 2px;
 }
 
 .tasks-item-current:hover {
   background: color-mix(in srgb, var(--accent-blue, #58a6ff) 18%, transparent);
+}
+
+.tasks-item {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  min-height: 20px;
+  cursor: pointer;
+}
+
+/* Compensate the row's 2px accent border so the current row's content stays
+ * aligned with non-current rows. */
+.tasks-item-current .tasks-item {
+  padding-left: 2px;
 }
 
 .tasks-current-badge {
@@ -266,6 +238,6 @@
   transition: opacity 150ms ease;
 }
 
-.tasks-item:hover .tasks-conv-link {
+.tasks-item-row:hover .tasks-conv-link {
   opacity: 1;
 }

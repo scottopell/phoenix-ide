@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
-import type { TaskEntry } from '../api';
+import type { TaskEntry, TaskCountResponse } from '../api';
 import { GroundingSection, GroundingState } from './GroundingPanel';
-import { summarizeTasks } from './groundingSummaries';
+import { summarizeTasks, taskCountsLabel } from './groundingSummaries';
 import './TasksPanel.css';
 
 interface TasksPanelProps {
@@ -35,6 +35,7 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
   const navigate = useNavigate();
   const [expanded, setExpanded] = useState(false);
   const [tasks, setTasks] = useState<TaskEntry[]>([]);
+  const [counts, setCounts] = useState<TaskCountResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [groupExpanded, setGroupExpanded] = useState<Record<string, boolean>>({
     'in-progress': true,
@@ -45,12 +46,34 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
     'wont-do': false,
   });
 
+  // Clear both representations on conversation change so a stale count/list from
+  // the prior conversation never bleeds across navigation (REQ-TASKS-UI-007).
   useEffect(() => {
     setTasks([]);
+    setCounts(null);
   }, [conversationId]);
 
+  // Collapsed-header counts: the lightweight count endpoint, fetched on mount so
+  // the header carries its summary without the full list. Re-fetches when the
+  // branch-derived current task changes so "current set" stays accurate.
   useEffect(() => {
     if (!conversationId) return;
+
+    const controller = new AbortController();
+    api
+      .getConversationTaskCount(conversationId, currentTaskId, controller.signal)
+      .then(setCounts)
+      .catch((err) => {
+        if (err.name !== 'AbortError') console.error('Failed to load task counts:', err);
+      });
+
+    return () => controller.abort();
+  }, [conversationId, currentTaskId]);
+
+  // Full task list: the expensive read (per-task slug mapping) is paid only when
+  // the user expands the panel (REQ-TASKS-UI-007).
+  useEffect(() => {
+    if (!conversationId || !expanded) return;
 
     const controller = new AbortController();
     setLoading(true);
@@ -63,7 +86,7 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
       .finally(() => setLoading(false));
 
     return () => controller.abort();
-  }, [conversationId]);
+  }, [conversationId, expanded]);
 
   const grouped = new Map<string, TaskEntry[]>();
   for (const task of tasks) {
@@ -80,16 +103,26 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
     setGroupExpanded((prev) => ({ ...prev, [status]: !prev[status] }));
   };
 
-  const summary = summarizeTasks(tasks, currentTaskId);
+  // Once the full list is loaded (expanded), it is authoritative for the header;
+  // otherwise the lightweight counts drive it. Both carry the same shape and
+  // render through the same `taskCountsLabel`, so collapsing/expanding never
+  // changes the wording.
+  const fullSummary = summarizeTasks(tasks, currentTaskId);
+  const headerCounts = expanded && tasks.length > 0 ? fullSummary : counts;
+  const headerSummary = headerCounts
+    ? taskCountsLabel(headerCounts, true)
+    : conversationId
+      ? 'loading…'
+      : 'not loaded';
 
   return (
     <GroundingSection
       icon="☑"
       title="Tasks"
-      summary={loading ? 'loading…' : summary.label}
-      count={tasks.length > 0 ? summary.active : undefined}
+      summary={headerSummary}
+      count={headerCounts?.active ?? 0}
       expanded={expanded}
-      attention={summary.current || summary.blocked > 0}
+      attention={(headerCounts?.current ?? false) || (headerCounts?.blocked ?? 0) > 0}
       onToggle={() => setExpanded(!expanded)}
     >
       <div className={`tasks-panel${expanded ? ' is-expanded' : ''}`}>
@@ -124,35 +157,32 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
                         const isCurrent = currentTaskId === task.id;
                         return (
                           <div
-                            role="button"
-                            tabIndex={0}
                             key={task.id}
                             className={
-                              'tasks-item'
+                              'tasks-item-row'
                               + (isTerminal ? ' tasks-item-terminal' : '')
                               + (isCurrent ? ' tasks-item-current' : '')
                             }
-                            title={`${task.id}-${task.priority}-${task.status}--${task.slug}`}
-                            onClick={() => onTaskClick?.(task)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter' || e.key === ' ') onTaskClick?.(task);
-                            }}
                           >
-                            <span className={`tasks-pri ${PRIORITY_CLASS[task.priority] || 'tasks-pri-p3'}`}>
-                              {task.priority}
-                            </span>
-                            <span className="tasks-id">{task.id}</span>
-                            <span className="tasks-slug">{task.slug}</span>
-                            {isCurrent && <span className="tasks-current-badge">current</span>}
+                            <button
+                              type="button"
+                              className="tasks-item"
+                              title={`${task.id}-${task.priority}-${task.status}--${task.slug}`}
+                              onClick={() => onTaskClick?.(task)}
+                            >
+                              <span className={`tasks-pri ${PRIORITY_CLASS[task.priority] || 'tasks-pri-p3'}`}>
+                                {task.priority}
+                              </span>
+                              <span className="tasks-id">{task.id}</span>
+                              <span className="tasks-slug">{task.slug}</span>
+                              {isCurrent && <span className="tasks-current-badge">current</span>}
+                            </button>
                             {task.conversation_slug && !isCurrent && (
                               <button
                                 type="button"
                                 className="tasks-conv-link"
                                 title="Go to conversation"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  navigate(`/c/${task.conversation_slug}`);
-                                }}
+                                onClick={() => navigate(`/c/${task.conversation_slug}`)}
                               >
                                 &rarr;
                               </button>

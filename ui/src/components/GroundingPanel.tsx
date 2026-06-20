@@ -5,7 +5,11 @@ interface SectionProps {
   icon: string;
   title: string;
   summary?: ReactNode;
-  count?: ReactNode;
+  /** Headline count for the section. A count of 0 renders no pill — empty
+   *  sections are presented identically across the panel (the summary label
+   *  carries the "nothing here" state). Typed as a number, not ReactNode, so
+   *  "0" can be suppressed structurally rather than per-caller. */
+  count?: number;
   expanded: boolean;
   attention?: boolean;
   action?: ReactNode;
@@ -25,7 +29,7 @@ export function GroundingSection({
   onToggle,
 }: SectionProps) {
   return (
-    <section className={`grounding-section${expanded ? ' is-expanded' : ''}${attention ? ' has-attention' : ''}`}>
+    <section className={`grounding-section${expanded ? ' is-expanded' : ''}${attention ? ' has-attention' : ''}${action ? ' has-action' : ''}`}>
       <button
         type="button"
         className="grounding-section-header"
@@ -36,7 +40,7 @@ export function GroundingSection({
         <span className="grounding-icon" aria-hidden="true">{icon}</span>
         <span className="grounding-title">{title}</span>
         {summary && <span className="grounding-summary">{summary}</span>}
-        {count != null && <span className="grounding-count">{count}</span>}
+        {count ? <span className="grounding-count">{count}</span> : null}
       </button>
       {action && <div className="grounding-header-action">{action}</div>}
       {expanded && <div className="grounding-section-body">{children}</div>}
