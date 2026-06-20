@@ -668,6 +668,31 @@ describe('ChainPage — regenerate name (REQ-CHN-010)', () => {
       screen.getByRole('button', { name: /keep-me/ }),
     ).toBeInTheDocument();
   });
+
+  it('disables regenerate while the name editor is open (avoids the commit/regenerate race)', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({ chain_name: 'old-name', display_name: 'old-name' }),
+    );
+
+    renderAt(ROOT_ID);
+
+    const nameBtn = await screen.findByRole('button', { name: /old-name/ });
+    // Enabled before editing.
+    expect(
+      screen.getByRole('button', { name: 'Regenerate name from chain content' }),
+    ).toBeEnabled();
+
+    // Open the inline editor.
+    fireEvent.click(nameBtn);
+    await screen.findByRole('textbox', { name: 'Chain name' });
+
+    // Now disabled, so a click can't race the blur-commit PATCH.
+    expect(
+      screen.getByRole('button', { name: 'Regenerate name from chain content' }),
+    ).toBeDisabled();
+    expect(api.regenerateChainName).not.toHaveBeenCalled();
+  });
 });
 
 describe('ChainPage — rename intent from sidebar (REQ-CHN-007)', () => {

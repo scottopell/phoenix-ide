@@ -719,7 +719,11 @@ function ChainPageHeader({
         type="button"
         className="chain-page-regenerate"
         onClick={() => void regenerate()}
-        disabled={regenerating}
+        // Disabled while the name editor is open: otherwise clicking this would
+        // blur-commit the typed draft (PATCH /name) and fire POST
+        // /regenerate-name concurrently — both write chain_name, last-writer
+        // wins. Editing must be committed/cancelled before regenerating.
+        disabled={regenerating || editing}
         title="Regenerate the chain name from its conversations"
         aria-label="Regenerate name from chain content"
         aria-busy={regenerating}
