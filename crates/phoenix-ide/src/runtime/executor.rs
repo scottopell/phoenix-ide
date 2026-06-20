@@ -353,9 +353,12 @@ struct ClearPlan {
     /// The watermark after this turn's (possible) advance, persisted back to
     /// the conversation.
     new_watermark: i64,
-    /// All clearable tool-result `tool_use_id`s at or before `new_watermark` —
-    /// the full set to render as placeholders this turn (stable across turns).
-    cleared_tool_use_ids: std::collections::HashSet<String>,
+    /// Message `sequence_id`s of all clearable tool results at or before
+    /// `new_watermark` — the full set to render as placeholders this turn (stable
+    /// across turns). Keyed by `sequence_id`, not `tool_use_id`: the latter can be
+    /// reused across turns (provider-dependent), which would otherwise clear a
+    /// recent floor result that happens to share an old id.
+    cleared_sequence_ids: std::collections::HashSet<i64>,
     /// Tokens freed by *this* turn's advance (newly cleared results only).
     freed_tokens: usize,
     /// Number of results newly cleared by this turn's advance.
@@ -368,7 +371,6 @@ struct ToolResultFacts {
     round: usize,
     clearable: bool,
     token_estimate: usize,
-    tool_use_id: String,
 }
 
 /// Image-aware token estimate for a persisted tool result: its text body plus a
@@ -422,7 +424,6 @@ fn collect_tool_result_facts(
                     round: current_round,
                     clearable: clearable_tool_names.contains(name),
                     token_estimate: estimate_tool_result_tokens(&tc.content, tc.images.len()),
-                    tool_use_id: tc.tool_use_id.clone(),
                 });
                 max_round = current_round;
             }
@@ -477,10 +478,10 @@ fn plan_tool_result_clearing(
         }
     }
 
-    let cleared_tool_use_ids: std::collections::HashSet<String> = results
+    let cleared_sequence_ids: std::collections::HashSet<i64> = results
         .iter()
         .filter(|f| f.clearable && f.sequence_id <= new_watermark)
-        .map(|f| f.tool_use_id.clone())
+        .map(|f| f.sequence_id)
         .collect();
     let (freed_tokens, cleared_count) = results
         .iter()
@@ -493,25 +494,25 @@ fn plan_tool_result_clearing(
 
     ClearPlan {
         new_watermark,
-        cleared_tool_use_ids,
+        cleared_sequence_ids,
         freed_tokens,
         cleared_count,
     }
 }
 
-/// The clearable tool-result ids at or before `watermark`. Renders a turn
-/// consistently with the durably-persisted watermark when a fresh sweep cannot be
-/// recorded (REQ-STR-007).
-fn clearable_ids_through_watermark(
+/// Message `sequence_id`s of the clearable tool results at or before `watermark`.
+/// Renders a turn consistently with the durably-persisted watermark when a fresh
+/// sweep cannot be recorded (REQ-STR-007).
+fn clearable_sequence_ids_through_watermark(
     db_messages: &[crate::db::Message],
     clearable_tool_names: &std::collections::HashSet<String>,
     watermark: i64,
-) -> std::collections::HashSet<String> {
+) -> std::collections::HashSet<i64> {
     collect_tool_result_facts(db_messages, clearable_tool_names)
         .0
         .into_iter()
         .filter(|f| f.clearable && f.sequence_id <= watermark)
-        .map(|f| f.tool_use_id)
+        .map(|f| f.sequence_id)
         .collect()
 }
 
@@ -552,7 +553,8 @@ async fn assemble_cleared_messages<S: StateStore>(
                     conv_id = %conv_id, error = %e, watermark = w,
                     "failed to read clear watermark; rendering last known cleared set",
                 );
-                let cleared = clearable_ids_through_watermark(db_messages, clearable_names, w);
+                let cleared =
+                    clearable_sequence_ids_through_watermark(db_messages, clearable_names, w);
                 render_messages(db_messages, &cleared)
             } else {
                 tracing::warn!(
@@ -584,7 +586,7 @@ async fn assemble_cleared_messages<S: StateStore>(
     );
 
     let cleared = if plan.new_watermark == prior_watermark {
-        plan.cleared_tool_use_ids
+        plan.cleared_sequence_ids
     } else {
         match storage
             .set_clear_watermark(conv_id, plan.new_watermark)
@@ -599,14 +601,18 @@ async fn assemble_cleared_messages<S: StateStore>(
                     watermark = plan.new_watermark,
                     "stale tool-result clearing swept old results",
                 );
-                plan.cleared_tool_use_ids
+                plan.cleared_sequence_ids
             }
             Err(e) => {
                 tracing::warn!(
                     conv_id = %conv_id, error = %e,
                     "failed to persist clear watermark; holding prior cleared set this turn",
                 );
-                clearable_ids_through_watermark(db_messages, clearable_names, prior_watermark)
+                clearable_sequence_ids_through_watermark(
+                    db_messages,
+                    clearable_names,
+                    prior_watermark,
+                )
             }
         }
     };
@@ -616,15 +622,15 @@ async fn assemble_cleared_messages<S: StateStore>(
 
 /// Fold persisted messages into the provider-agnostic LLM message list.
 ///
-/// A tool result whose `tool_use_id` is in `cleared_tool_use_ids` is rendered
-/// as a fixed placeholder with no image blocks (stale tool-result clearing,
-/// specs/stale-tool-results); the paired `tool_use` block is left intact, so a
-/// cleared result is never a silent gap. Every other tool result is sent
-/// verbatim with its images. The persisted messages are never mutated — the
+/// A tool result whose message `sequence_id` is in `cleared_sequence_ids` is
+/// rendered as a fixed placeholder with no image blocks (stale tool-result
+/// clearing, specs/stale-tool-results); the paired `tool_use` block is left
+/// intact, so a cleared result is never a silent gap. Every other tool result is
+/// sent verbatim with its images. The persisted messages are never mutated — the
 /// cleared form exists only in the returned list for this one request.
 fn render_messages(
     db_messages: &[crate::db::Message],
-    cleared_tool_use_ids: &std::collections::HashSet<String>,
+    cleared_sequence_ids: &std::collections::HashSet<i64>,
 ) -> Vec<LlmMessage> {
     use crate::db::{MessageContent, ToolContent};
     use crate::llm::ImageSource;
@@ -674,7 +680,7 @@ fn render_messages(
                 // results carry their body and any images verbatim (REQ-STR-004,
                 // REQ-STR-011).
                 let (text, image_sources): (String, Vec<ImageSource>) =
-                    if cleared_tool_use_ids.contains(tool_use_id) {
+                    if cleared_sequence_ids.contains(&msg.sequence_id) {
                         (CLEARED_TOOL_RESULT_PLACEHOLDER.to_string(), Vec::new())
                     } else {
                         let sources = images
@@ -8930,7 +8936,8 @@ mod stale_tool_result_clearing_tests {
             .collect()
     }
 
-    async fn add(storage: &Arc<InMemoryStorage>, conv: &str, content: MessageContent) {
+    /// Persist a message and return its assigned `sequence_id`.
+    async fn add(storage: &Arc<InMemoryStorage>, conv: &str, content: MessageContent) -> i64 {
         storage
             .add_message(
                 &uuid::Uuid::new_v4().to_string(),
@@ -8940,18 +8947,20 @@ mod stale_tool_result_clearing_tests {
                 None,
             )
             .await
-            .expect("add_message");
+            .expect("add_message")
+            .sequence_id
     }
 
     /// Append one tool round: an assistant `tool_use` for `tool_name` plus one
-    /// tool-result carrying `n_images` images. Returns the round's `tool_use_id`.
+    /// tool-result carrying `n_images` images. The `tool_use_id` is `{tag}-tool`;
+    /// returns the tool-result message's `sequence_id` (the cleared-set key).
     async fn add_round(
         storage: &Arc<InMemoryStorage>,
         conv: &str,
         tag: &str,
         tool_name: &str,
         n_images: usize,
-    ) -> String {
+    ) -> i64 {
         let id = format!("{tag}-tool");
         add(
             storage,
@@ -8968,8 +8977,7 @@ mod stale_tool_result_clearing_tests {
             conv,
             MessageContent::tool_with_images(&id, "result body", false, pngs(tag, n_images)),
         )
-        .await;
-        id
+        .await
     }
 
     fn clearable(names: &[&str]) -> HashSet<String> {
@@ -8996,12 +9004,12 @@ mod stale_tool_result_clearing_tests {
 
         assert!(plan.new_watermark > 0, "watermark must advance");
         assert!(
-            plan.cleared_tool_use_ids.contains(&old),
+            plan.cleared_sequence_ids.contains(&old),
             "old clearable round must be cleared",
         );
         for kept in [&r1, &r2, &r3] {
             assert!(
-                !plan.cleared_tool_use_ids.contains(kept),
+                !plan.cleared_sequence_ids.contains(kept),
                 "recency-floor round {kept} must never be cleared",
             );
         }
@@ -9025,7 +9033,7 @@ mod stale_tool_result_clearing_tests {
             plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, Some(5_000), 200_000);
 
         assert_eq!(plan.new_watermark, 0);
-        assert!(plan.cleared_tool_use_ids.is_empty());
+        assert!(plan.cleared_sequence_ids.is_empty());
         assert_eq!(plan.freed_tokens, 0);
     }
 
@@ -9045,7 +9053,7 @@ mod stale_tool_result_clearing_tests {
             plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, Some(12_000), 1_000);
 
         assert!(
-            !plan.cleared_tool_use_ids.contains(&old),
+            !plan.cleared_sequence_ids.contains(&old),
             "unclearable result must never be cleared",
         );
     }
@@ -9073,13 +9081,13 @@ mod stale_tool_result_clearing_tests {
 
         // Turn 1, over pressure: both pre-floor rounds are cleared in one sweep.
         let first = plan_tool_result_clearing(&db, &names, 0, Some(18_000), window);
-        assert!(first.cleared_tool_use_ids.contains(&old0));
+        assert!(first.cleared_sequence_ids.contains(&old0));
         assert!(
-            first.cleared_tool_use_ids.contains(&old1),
+            first.cleared_sequence_ids.contains(&old1),
             "maximal sweep clears the whole pre-floor prefix, not just the oldest",
         );
         assert!(
-            !first.cleared_tool_use_ids.contains(&r2),
+            !first.cleared_sequence_ids.contains(&r2),
             "the recency floor is never cleared",
         );
         assert_eq!(first.cleared_count, 2);
@@ -9092,8 +9100,8 @@ mod stale_tool_result_clearing_tests {
             second.new_watermark, first.new_watermark,
             "watermark holds once the pre-floor prefix is cleared, even under pressure",
         );
-        assert!(second.cleared_tool_use_ids.contains(&old0));
-        assert!(second.cleared_tool_use_ids.contains(&old1));
+        assert!(second.cleared_sequence_ids.contains(&old0));
+        assert!(second.cleared_sequence_ids.contains(&old1));
         assert_eq!(
             second.freed_tokens, 0,
             "no new tokens freed on a stable turn"
@@ -9115,7 +9123,7 @@ mod stale_tool_result_clearing_tests {
         let plan = plan_tool_result_clearing(&db, &clearable(&["read_file"]), 0, None, 1_000);
 
         assert_eq!(plan.new_watermark, 0);
-        assert!(plan.cleared_tool_use_ids.is_empty());
+        assert!(plan.cleared_sequence_ids.is_empty());
     }
 
     /// Production wraps the tool registry in `Arc`, and the runtime caches the
@@ -9155,7 +9163,7 @@ mod stale_tool_result_clearing_tests {
         let storage = Arc::new(InMemoryStorage::new());
         let conv = "asm-happy";
         let names = clearable(&["read_file"]);
-        let old = add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "old", "read_file", 6).await;
         add_round(&storage, conv, "r1", "read_file", 1).await;
         add_round(&storage, conv, "r2", "read_file", 1).await;
         add_round(&storage, conv, "r3", "read_file", 1).await;
@@ -9165,7 +9173,7 @@ mod stale_tool_result_clearing_tests {
 
         let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
         assert!(
-            is_rendered_cleared(&messages, &old),
+            is_rendered_cleared(&messages, "old-tool"),
             "old round rendered as placeholder"
         );
         assert!(
@@ -9181,7 +9189,7 @@ mod stale_tool_result_clearing_tests {
         let storage = Arc::new(InMemoryStorage::new());
         let conv = "asm-readfail";
         let names = clearable(&["read_file"]);
-        let old = add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "old", "read_file", 6).await;
         add_round(&storage, conv, "r1", "read_file", 1).await;
         add_round(&storage, conv, "r2", "read_file", 1).await;
         add_round(&storage, conv, "r3", "read_file", 1).await;
@@ -9192,7 +9200,7 @@ mod stale_tool_result_clearing_tests {
 
         let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
         assert!(
-            !is_rendered_cleared(&messages, &old),
+            !is_rendered_cleared(&messages, "old-tool"),
             "read failure with empty cache → nothing cleared this turn",
         );
     }
@@ -9205,7 +9213,7 @@ mod stale_tool_result_clearing_tests {
         let storage = Arc::new(InMemoryStorage::new());
         let conv = "asm-readfail-cached";
         let names = clearable(&["read_file"]);
-        let old = add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "old", "read_file", 6).await;
         add_round(&storage, conv, "r1", "read_file", 1).await;
         add_round(&storage, conv, "r2", "read_file", 1).await;
         add_round(&storage, conv, "r3", "read_file", 1).await;
@@ -9215,14 +9223,14 @@ mod stale_tool_result_clearing_tests {
 
         // Turn 1: a real sweep advances and caches the watermark; `old` is cleared.
         let first = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
-        assert!(is_rendered_cleared(&first, &old));
+        assert!(is_rendered_cleared(&first, "old-tool"));
 
         // Turn 2: the watermark read fails, but the cache holds the advanced
         // value, so the previously-cleared result stays cleared.
         storage.set_fail_watermark_read(true);
         let second = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
         assert!(
-            is_rendered_cleared(&second, &old),
+            is_rendered_cleared(&second, "old-tool"),
             "read failure must preserve the cached cleared set, not un-clear it",
         );
     }
@@ -9234,7 +9242,7 @@ mod stale_tool_result_clearing_tests {
         let storage = Arc::new(InMemoryStorage::new());
         let conv = "asm-writefail";
         let names = clearable(&["read_file"]);
-        let old = add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "old", "read_file", 6).await;
         add_round(&storage, conv, "r1", "read_file", 1).await;
         add_round(&storage, conv, "r2", "read_file", 1).await;
         add_round(&storage, conv, "r3", "read_file", 1).await;
@@ -9245,7 +9253,7 @@ mod stale_tool_result_clearing_tests {
 
         let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
         assert!(
-            !is_rendered_cleared(&messages, &old),
+            !is_rendered_cleared(&messages, "old-tool"),
             "write failure → prior (empty) cleared set rendered, not the failed advance",
         );
         assert_eq!(
@@ -9261,11 +9269,11 @@ mod stale_tool_result_clearing_tests {
     async fn render_placeholders_cleared_keeps_rest() {
         let storage = Arc::new(InMemoryStorage::new());
         let conv = "conv-render";
-        let cleared_id = add_round(&storage, conv, "old", "read_file", 2).await;
-        let kept_id = add_round(&storage, conv, "new", "read_file", 2).await;
+        let cleared_seq = add_round(&storage, conv, "old", "read_file", 2).await;
+        add_round(&storage, conv, "new", "read_file", 2).await;
 
         let db = storage.get_messages(conv).await.unwrap();
-        let cleared: HashSet<String> = std::iter::once(cleared_id.clone()).collect();
+        let cleared: HashSet<i64> = std::iter::once(cleared_seq).collect();
         let msgs = render_messages(&db, &cleared);
 
         let find = |id: &str| -> (String, usize) {
@@ -9289,11 +9297,11 @@ mod stale_tool_result_clearing_tests {
             panic!("no tool result for {id}");
         };
 
-        let (cleared_body, cleared_imgs) = find(&cleared_id);
+        let (cleared_body, cleared_imgs) = find("old-tool");
         assert_eq!(cleared_body, CLEARED_TOOL_RESULT_PLACEHOLDER);
         assert_eq!(cleared_imgs, 0, "cleared result emits no images");
 
-        let (kept_body, kept_imgs) = find(&kept_id);
+        let (kept_body, kept_imgs) = find("new-tool");
         assert_eq!(kept_body, "result body");
         assert_eq!(kept_imgs, 2, "kept result preserves its images");
     }
