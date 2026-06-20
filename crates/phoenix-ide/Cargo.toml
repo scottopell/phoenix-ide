@@ -81,7 +81,11 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 
 # Static file embedding
-rust-embed = "8"
+# `compression` (include-flate/DEFLATE) stores embedded UI assets compressed
+# in the binary and transparently inflates them on `.data` access. Shrinks the
+# release binary by ~15MB with no functional change — debug builds still serve
+# from the filesystem (no `debug-embed`), so this only affects release embeds.
+rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
 
 # Utilities
