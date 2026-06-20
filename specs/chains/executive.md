@@ -55,8 +55,10 @@ mid-tier model balanced for cost and accuracy.
 | **REQ-CHN-007:** Chain Has a User-Editable Name | ✅ Complete | Nullable `chain_name` column (`db.rs:2737`, `db.rs:3041`); whitespace clears the name (`api/chains.rs:182`) |
 | **REQ-CHN-008:** Chain Page Surfaces Work Identity Alongside Runtime Resources | ✅ Complete | `ChainView.work_identity` (`api/chains.rs` `resolve_work_identity`) carries worktree/branch/base/task from the worktree-owning member's `ConvMode`; the `ChainWorkIdentityBlock` dock facet reuses the per-conversation PR-status pipeline for PR health, so nothing is added to `WorkScopeInventory` |
 | **REQ-CHN-009:** Chain Q&A Is a Read-Only Agentic Loop | ✅ Complete | Read-only agent loop (`ChainQa` in `chain_qa.rs`) driving scope-bound `search_conversations` + `read_conversation` tools over `specs/conversation-retrieval/`; replaced summary bundling; reframes REQ-CHN-005 staleness as an age-of-answer freshness tag |
+| **REQ-CHN-010:** Regenerate Chain Name From Member Content | 🚧 In progress | Manual regenerate action; reuses `title_generator` to summarize each member's first user message into the `chain_name` override |
 
-**Progress:** All requirements have shipped. REQ-CHN-009 (read-only agentic
+**Progress:** REQ-CHN-001 through REQ-CHN-009 have shipped; REQ-CHN-010
+(regenerate chain name) is in progress. REQ-CHN-009 (read-only agentic
 Q&A) is built on the `specs/conversation-retrieval/` primitive exposed to the
 Q&A agent as scope-bound tools; REQ-CHN-008 (work-identity facet) reuses the
 chain dock + `work_scope_key` from `specs/work-scope-ui/` and the

@@ -210,6 +210,10 @@ WHEN the user invokes a name-edit action on the chain page header
 THE SYSTEM SHALL allow inline editing of the chain name and persist
 the new value when the user commits (Enter, blur, or explicit confirm)
 
+THE SYSTEM SHALL allow the user to populate the chain name either by
+typing it inline (above) or by invoking a regenerate action that derives
+a name from the chain's member content (REQ-CHN-010)
+
 THE SYSTEM SHALL display the user-set name (when present) consistently
 in every place the chain is identified — sidebar header, chain page
 header, and any other UI surface that names the chain
@@ -358,6 +362,42 @@ no-cross-question-drift guarantee; the cost/latency now varies with
 question difficulty rather than chain size, which is the intended
 trade — a pointed question stays cheap, a deep one is allowed to work
 for it.
+
+---
+
+### REQ-CHN-010: Regenerate Chain Name From Member Content
+
+WHEN the user invokes a regenerate-name action on a chain
+THE SYSTEM SHALL derive a short human-readable name by summarizing the
+first user message of each member conversation (in chain order) via a
+cheap LLM, and persist it as the chain's name (the `chain_name` override
+on the root)
+
+THE regenerate action SHALL be manual and user-initiated only; THE
+SYSTEM SHALL NOT rename chains automatically or in the background.
+Because the user explicitly requests each regeneration, the action may
+overwrite the current name without a separate clobber-guard — the
+overwrite is the user's own request, not a silent process competing with
+a deliberately-chosen name.
+
+WHEN LLM generation fails or times out
+THE SYSTEM SHALL leave the existing name unchanged and surface that
+regeneration did not succeed, writing no partial or empty name
+
+THE regenerate action SHALL apply only to actual chains (members ≥ 2),
+consistent with REQ-CHN-002 — a single conversation is not a chain and
+has no chain name to regenerate
+
+**Rationale:** A chain's content drifts over time — an "auth refactor"
+chain may grow into broader work whose first member no longer
+characterizes the whole. A one-shot regenerate lets the name catch up to
+the chain's current content on demand, summarizing every member rather
+than just the root. Keeping it manual rather than automatic means it
+never surprises the user or fights a name they deliberately chose: the
+name only changes when the user asks for it, whether by typing
+(REQ-CHN-007) or by regenerating. Leaving the existing name untouched on
+failure preserves the prior name rather than degrading it to an empty or
+partial string.
 
 ---
 

@@ -196,9 +196,14 @@ ALTER TABLE conversations ADD COLUMN chain_name TEXT;
 ```
 
 Set only when the conversation is the root of a chain AND the user has
-explicitly named it. NULL means "use the conversation's title as the
-displayed chain name." This keeps naming derived-from-title by default
-while letting the user override.
+explicitly named it — either by typing a name inline (REQ-CHN-007) or by
+invoking the regenerate action (REQ-CHN-010), both of which are explicit
+naming acts initiated by the user. NULL means "use the conversation's
+title as the displayed chain name." This keeps naming derived-from-title
+by default while letting the user override. `chain_name` holds whatever
+the user last committed, typed or regenerated; there is no
+source-discriminator column distinguishing the two, because nothing reads
+the name's provenance — both paths write the same field.
 
 **Why on `conversations` rather than a new `chains` table:** the chain
 root conv ID already serves as the chain's identity. Adding a column
@@ -210,6 +215,48 @@ membership-vs-conversations integrity surface to maintain.
 For non-root conversations (continuation members), `chain_name` is
 ignored at read time. Setting it on a non-root conversation has no UI
 effect; the API enforces `chain_name` writes only on the chain root.
+
+## Chain Name Regeneration (REQ-CHN-010)
+
+**Shared naming mechanism.** Both LLM-driven names in Phoenix come from
+`crate::title_generator`: it calls a cheap model under a short timeout
+(seconds, not the full request budget) with a stable prompt-cache key, so
+repeated calls reuse the cached prompt prefix, and falls back gracefully
+when the model errors or times out (returning no name rather than a
+fabricated one). The generator has two modes:
+
+- **Create-time conversation slug** — a kebab-case, lowercase slug derived
+  from a single conversation's first user message. Conversation
+  create-time naming reuses this same generator; that path is not
+  otherwise specified under chains, but it is named here so a reader knows
+  the mechanism's home.
+- **Chain-name regeneration** — a prose display name summarizing the first
+  user message of *every* chain member, used as the `chain_name` override.
+
+**Regenerate flow.** When the user invokes regenerate on a chain:
+
+1. Walk the chain's members forward from the root via the existing
+   `continued_in_conv_id` recursive CTE (the same walk used for membership
+   and freshness).
+2. Take each member's first user message, in chain order.
+3. Generate a prose display name summarizing those messages via
+   `title_generator`.
+4. On success, persist the name through the existing chain-name write path
+   (the same `conversations.chain_name`-on-root update REQ-CHN-007 uses)
+   and return the updated chain view.
+5. On generation failure or timeout, the stored name is left untouched —
+   no partial or empty name is written — and the caller surfaces that
+   regeneration did not succeed.
+
+The action gates on chain membership (members ≥ 2): a single conversation
+is not a chain (REQ-CHN-002) and has no chain name to regenerate.
+
+**Format distinction.** The create-time slug and the regenerated chain
+name are different fields with different validity rules. The slug is
+kebab-case/lowercase because it *is* a slug; the regenerated chain name is
+a prose display string subject to the same length cap as a typed chain
+name (REQ-CHN-007), not slugified. They share only the generator, not the
+output shape.
 
 ## Q&A Backend (REQ-CHN-001, REQ-CHN-004, REQ-CHN-006, REQ-CHN-009)
 
