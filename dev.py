@@ -4483,6 +4483,493 @@ def cmd_taskmd(taskmd_args: list[str]) -> None:
 
 
 # =============================================================================
+# Build Graph (./dev.py graph)
+# =============================================================================
+# Renders the project's complete build dependency graph as a self-contained
+# HTML page laid out in topological layers (sources at the top, the final
+# artifact at the bottom). Three real, data-derived subgraphs:
+#
+#   1. Cargo workspace crate DAG     — live from `cargo metadata`
+#   2. cross-language build pipeline — toolchain → ui-deps / ts-rs codegen →
+#                                      vite bundle → RustEmbed release binary
+#   3. `./dev.py check` lane graph   — input categories → lanes (from _LANE_DEFS)
+#
+# Layer index is the longest path from a source, so a node sits below every
+# input it depends on. Output is dependency-free (inline SVG + CSS + JS), so the
+# snapshot opens anywhere and the --serve mode needs no assets.
+
+_GRAPH_KIND_COLORS = {
+    # kind     -> (stroke, fill)
+    "tool":     ("#475569", "#e2e8f0"),
+    "crate":    ("#2563eb", "#dbeafe"),
+    "codegen":  ("#7c3aed", "#ede9fe"),
+    "ui":       ("#d97706", "#fef3c7"),
+    "artifact": ("#059669", "#d1fae5"),
+    "category": ("#0d9488", "#ccfbf1"),
+    "lane":     ("#4f46e5", "#e0e7ff"),
+    "always":   ("#6b7280", "#f3f4f6"),
+}
+_GRAPH_KIND_LABELS = {
+    "tool": "toolchain",
+    "crate": "workspace crate",
+    "codegen": "codegen",
+    "ui": "UI build",
+    "artifact": "release artifact",
+    "category": "check trigger (changed path)",
+    "lane": "check lane",
+    "always": "always-on lane",
+}
+
+
+def _workspace_forward_deps():
+    """Intra-workspace forward dependency edges from `cargo metadata`.
+
+    Returns (crates_sorted, edges) where each edge is a (dep, dependent) tuple
+    oriented in build order — dep is compiled before dependent — or None if
+    cargo metadata is unavailable (caller renders the pipeline without crates).
+    """
+    try:
+        out = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=ROOT, capture_output=True, text=True, timeout=60,
+        )
+        if out.returncode != 0:
+            return None
+        meta = json.loads(out.stdout)
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        return None
+    ws = {p["name"] for p in meta["packages"]}
+    edges = set()
+    for p in meta["packages"]:
+        for d in p["dependencies"]:
+            if d["name"] in ws and d["name"] != p["name"]:
+                edges.add((d["name"], p["name"]))
+    return sorted(ws), sorted(edges)
+
+
+def _build_pipeline_model():
+    """Nodes + edges for the build-artifact graph (toolchain, crate DAG,
+    codegen, UI bundle, embedded release binary). Returns (nodes, edges, warn)."""
+    nodes: dict = {}
+    edges: list = []
+
+    def add(nid, label, kind, sub="", tip=""):
+        nodes[nid] = {"id": nid, "label": label, "kind": kind, "sub": sub, "tip": tip}
+
+    add("corepack", "corepack + pnpm", "tool", sub="toolchain pin",
+        tip="ensure_corepack_pnpm(): pins pnpm via Corepack from "
+            "ui/package.json#packageManager")
+    add("ui-deps", "pnpm install", "ui", sub="ui/node_modules/",
+        tip="ensure_ui_deps(): pnpm install. Success marker: "
+            "node_modules/.modules.yaml")
+
+    fwd = _workspace_forward_deps()
+    warn = None
+    top_crate = None
+    if fwd:
+        crates, cedges = fwd
+        for c in crates:
+            add(f"crate:{c}", c, "crate", sub="cargo crate")
+        for dep, dependent in cedges:
+            edges.append((f"crate:{dep}", f"crate:{dependent}"))
+        # The root binary crate — nothing depends on it; it transitively pulls
+        # the whole workspace, so codegen/release hang off it.
+        for cand in ("phoenix_ide", "phoenix-ide"):
+            if cand in crates:
+                top_crate = f"crate:{cand}"
+                break
+        if top_crate is None:
+            depcount: dict = {}
+            for _dep, dependent in cedges:
+                depcount[dependent] = depcount.get(dependent, 0) + 1
+            top_crate = f"crate:{max(crates, key=lambda c: depcount.get(c, 0))}"
+    else:
+        warn = "cargo metadata unavailable — workspace crate DAG omitted"
+
+    add("codegen", "ts-rs codegen", "codegen", sub="ui/src/generated/",
+        tip="cmd_codegen(): cargo test export_bindings — exports TS types from "
+            "Rust ts-rs derives into ui/src/generated/")
+    add("ui-build", "vite build", "ui", sub="ui/dist/",
+        tip="pnpm run build → ui/dist/. Consumes node_modules + generated TS")
+    add("release-bin", "cargo build --release", "artifact", sub="phoenix_ide binary",
+        tip="RustEmbed embeds ui/dist/ into the static binary "
+            "(crates/phoenix-ide/src/api/assets.rs)")
+
+    edges.append(("corepack", "ui-deps"))
+    if top_crate:
+        edges.append((top_crate, "codegen"))
+        edges.append((top_crate, "release-bin"))
+    edges.append(("codegen", "ui-build"))
+    edges.append(("ui-deps", "ui-build"))
+    edges.append(("ui-build", "release-bin"))
+    return nodes, edges, warn
+
+
+# Per-lane step lists mirror the lane_* / check_* functions in cmd_check; shown
+# in node tooltips. Kept beside _LANE_DEFS conceptually — update both together.
+_GRAPH_LANE_STEPS = {
+    "rust": ["cargo test (compile)", "codegen export", "codegen-stale diff",
+             "cargo test (run)", "cargo check musl (macOS, optional)"],
+    "clippy": ["cargo clippy --all-targets -D warnings"],
+    "tsc": ["tsc -b --noEmit"],
+    "ui-lint": ["eslint", "stylelint"],
+    "vitest": ["vitest run"],
+    "ast-grep": ["structural rules over ui/src/ + crates/"],
+    "allium": ["allium check specs/*/*.allium"],
+    "spec-anchors": ["REQ-* anchor cross-validation"],
+    "e2e": ["uv run tests/e2e/run.py (real binary)"],
+    "fast": ["cargo fmt --check", "task validation"],
+    "pkglock": ["pnpm-lock drift tripwire"],
+}
+_GRAPH_CATEGORY_LABELS = {
+    "RUST": "RUST · crates/ Cargo.*",
+    "UI": "UI · ui/",
+    "SPECS": "SPECS · specs/",
+    "ASTGREP": "ASTGREP · ast-grep-rules/",
+    "E2E": "E2E · tests/e2e/",
+}
+
+
+def _check_graph_model():
+    """Nodes + edges for the `./dev.py check` gating graph: changed-path input
+    categories (plus an always-on trigger) → lanes. Sourced from _LANE_DEFS."""
+    nodes: dict = {}
+    edges: list = []
+    nodes["__always__"] = {
+        "id": "__always__", "label": "always-on", "kind": "always",
+        "sub": "every check run",
+        "tip": "Sub-second, correctness-sensitive lanes that run on every "
+               "invocation regardless of which paths changed.",
+    }
+    cats: set = set()
+    for _name, inputs, _desc in _LANE_DEFS:
+        if inputs:
+            cats |= inputs
+    for c in sorted(cats):
+        nodes[f"cat:{c}"] = {
+            "id": f"cat:{c}", "label": _GRAPH_CATEGORY_LABELS.get(c, c),
+            "kind": "category", "sub": "changed-path trigger",
+            "tip": f"Touching {c} paths activates the dependent lanes "
+                   "(incremental gating).",
+        }
+    for name, inputs, desc in _LANE_DEFS:
+        steps = _GRAPH_LANE_STEPS.get(name, [])
+        tip = desc + ("\n• " + "\n• ".join(steps) if steps else "")
+        nodes[f"lane:{name}"] = {
+            "id": f"lane:{name}", "label": name, "kind": "lane",
+            "sub": (desc[:40] + "…") if len(desc) > 41 else desc, "tip": tip,
+        }
+        if inputs:
+            for c in sorted(inputs):
+                edges.append((f"cat:{c}", f"lane:{name}"))
+        else:
+            edges.append(("__always__", f"lane:{name}"))
+    return nodes, edges
+
+
+def _topo_layout(nodes, edges):
+    """Assign each node a topological layer (longest path from a source) and an
+    intra-layer order chosen by a barycenter heuristic to reduce edge crossings.
+
+    Returns (layer: dict[id->int], rows: dict[int->list[id]], depth: int).
+    A cycle (not expected for a build DAG) drops its residual nodes onto a
+    trailing layer rather than failing, so rendering always succeeds.
+    """
+    from collections import deque
+
+    ids = list(nodes)
+    succ = {i: [] for i in ids}
+    indeg = {i: 0 for i in ids}
+    for a, b in edges:
+        if a in succ and b in succ:
+            succ[a].append(b)
+            indeg[b] += 1
+
+    layer = {i: 0 for i in ids}
+    residual = dict(indeg)
+    q = deque(i for i in ids if indeg[i] == 0)
+    seen = 0
+    while q:
+        n = q.popleft()
+        seen += 1
+        for m in succ[n]:
+            if layer[n] + 1 > layer[m]:
+                layer[m] = layer[n] + 1
+            residual[m] -= 1
+            if residual[m] == 0:
+                q.append(m)
+    if seen != len(ids):  # cycle fallback
+        trailing = max(layer.values(), default=0) + 1
+        for i in ids:
+            if residual[i] > 0:
+                layer[i] = trailing
+
+    depth = max(layer.values(), default=0) + 1
+    rows = {k: [] for k in range(depth)}
+    for i in ids:
+        rows[layer[i]].append(i)
+
+    preds = {i: [] for i in ids}
+    for a, b in edges:
+        if a in succ and b in succ:
+            preds[b].append(a)
+
+    for sweep in range(6):
+        downward = sweep % 2 == 0
+        klist = range(1, depth) if downward else range(depth - 2, -1, -1)
+        for k in klist:
+            adj = preds if downward else succ
+            ref = rows[k - 1] if downward else rows[k + 1]
+            ref_pos = {n: idx for idx, n in enumerate(ref)}
+            cur_pos = {n: idx for idx, n in enumerate(rows[k])}
+
+            def bary(n, _adj=adj, _ref=ref_pos, _cur=cur_pos):
+                ns = [_ref[p] for p in _adj[n] if p in _ref]
+                return (sum(ns) / len(ns)) if ns else _cur[n]
+
+            rows[k].sort(key=bary)
+    return layer, rows, depth
+
+
+def _svg_for_graph(nodes, edges):
+    """Render one graph model to an inline SVG string (topologically layered,
+    top→bottom; edges point from a dependency down to its dependent)."""
+    import html
+
+    _layer, rows, depth = _topo_layout(nodes, edges)
+    NODE_H, V_GAP, H_GAP, TOP, SIDE, CHAR = 48, 64, 30, 30, 44, 7.3
+
+    width = {}
+    for nid, n in nodes.items():
+        chars = max(len(n["label"]), len(n.get("sub", "")))
+        width[nid] = max(150, int(chars * CHAR) + 30)
+
+    row_w = {}
+    for k in range(depth):
+        ns = rows[k]
+        row_w[k] = sum(width[n] for n in ns) + H_GAP * max(0, len(ns) - 1)
+    canvas_w = max(row_w.values(), default=200) + 2 * SIDE
+    canvas_h = TOP * 2 + depth * NODE_H + max(0, depth - 1) * V_GAP
+
+    x, y = {}, {}
+    for k in range(depth):
+        cx = (canvas_w - row_w[k]) / 2
+        for n in rows[k]:
+            x[n] = cx
+            y[n] = TOP + k * (NODE_H + V_GAP)
+            cx += width[n] + H_GAP
+
+    def eid(s):
+        return re.sub(r"[^A-Za-z0-9_-]", "-", s)
+
+    out = [
+        f'<svg viewBox="0 0 {int(canvas_w)} {int(canvas_h)}" '
+        f'width="{int(canvas_w)}" height="{int(canvas_h)}" class="graph">',
+        '<defs><marker id="arr" markerWidth="9" markerHeight="9" refX="7.5" '
+        'refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#64748b"/>'
+        "</marker></defs>",
+    ]
+    for a, b in edges:
+        if a not in x or b not in x:
+            continue
+        sx, sy = x[a] + width[a] / 2, y[a] + NODE_H
+        tx, ty = x[b] + width[b] / 2, y[b]
+        my = (sy + ty) / 2
+        out.append(
+            f'<path class="edge" data-a="{eid(a)}" data-b="{eid(b)}" '
+            f'd="M {sx:.1f} {sy:.1f} C {sx:.1f} {my:.1f} {tx:.1f} {my:.1f} '
+            f'{tx:.1f} {ty:.1f}" marker-end="url(#arr)"/>'
+        )
+    for nid, n in nodes.items():
+        if nid not in x:
+            continue
+        stroke, fill = _GRAPH_KIND_COLORS.get(n["kind"], ("#334155", "#e2e8f0"))
+        w, gx, gy = width[nid], x[nid], y[nid]
+        sub = n.get("sub", "")
+        lbl_y = gy + 19 if sub else gy + 29
+        out.append(f'<g class="node" data-id="{eid(nid)}">')
+        out.append(f"<title>{html.escape(n.get('tip') or n['label'])}</title>")
+        out.append(
+            f'<rect x="{gx:.1f}" y="{gy:.1f}" rx="8" width="{w}" '
+            f'height="{NODE_H}" fill="{fill}" stroke="{stroke}"/>'
+        )
+        out.append(
+            f'<text class="lbl" x="{gx + w / 2:.1f}" y="{lbl_y:.1f}" '
+            f'fill="{stroke}">{html.escape(n["label"])}</text>'
+        )
+        if sub:
+            out.append(
+                f'<text class="sub" x="{gx + w / 2:.1f}" y="{gy + 35:.1f}">'
+                f"{html.escape(sub)}</text>"
+            )
+        out.append("</g>")
+    out.append("</svg>")
+    return "".join(out)
+
+
+_GRAPH_CSS = """
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0;
+       background: #0b1220; color: #e2e8f0; }
+header { padding: 18px 24px; border-bottom: 1px solid #1e293b; }
+h1 { margin: 0; font-size: 18px; }
+.meta { color: #94a3b8; font-size: 12px; margin-top: 5px; }
+section { padding: 16px 24px 28px; }
+h2 { font-size: 15px; color: #cbd5e1; border-left: 3px solid #38bdf8;
+     padding-left: 9px; margin: 4px 0 6px; }
+.hint { color: #94a3b8; font-size: 12px; margin: 0 0 10px; }
+.warn { color: #fbbf24; font-size: 12px; margin: 0 0 10px; }
+.scroll { overflow: auto; border: 1px solid #1e293b; border-radius: 10px;
+          background: #0f172a; padding: 8px; }
+svg.graph { display: block; }
+text.lbl { font-size: 12.5px; font-weight: 600; text-anchor: middle; }
+text.sub { font-size: 10px; fill: #64748b; text-anchor: middle; }
+.node rect { transition: opacity .12s; }
+.node { cursor: default; }
+path.edge { fill: none; stroke: #475569; stroke-width: 1.4;
+            transition: stroke .12s, opacity .12s; }
+.dim { opacity: .12; }
+.hot { stroke: #38bdf8 !important; stroke-width: 2.3 !important; opacity: 1 !important; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 4px 0 12px;
+          font-size: 12px; color: #94a3b8; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 13px; height: 13px; border-radius: 3px; display: inline-block;
+            border: 1px solid #0b1220; }
+"""
+
+_GRAPH_JS = """
+document.querySelectorAll('svg.graph').forEach(function (svg) {
+  var nodes = Array.prototype.slice.call(svg.querySelectorAll('.node'));
+  var edges = Array.prototype.slice.call(svg.querySelectorAll('.edge'));
+  function clear() {
+    nodes.forEach(function (n) { n.classList.remove('dim'); });
+    edges.forEach(function (e) { e.classList.remove('dim', 'hot'); });
+  }
+  nodes.forEach(function (n) {
+    n.addEventListener('mouseenter', function () {
+      var id = n.dataset.id;
+      var inc = {};
+      inc[id] = true;
+      edges.forEach(function (e) {
+        if (e.dataset.a === id || e.dataset.b === id) {
+          inc[e.dataset.a] = true; inc[e.dataset.b] = true;
+        }
+      });
+      nodes.forEach(function (m) { m.classList.toggle('dim', !inc[m.dataset.id]); });
+      edges.forEach(function (e) {
+        var hit = e.dataset.a === id || e.dataset.b === id;
+        e.classList.toggle('hot', hit);
+        e.classList.toggle('dim', !hit);
+      });
+    });
+    n.addEventListener('mouseleave', clear);
+  });
+});
+"""
+
+
+def _render_graph_html(build_svg, build_warn, check_svg, kinds_used, meta_line):
+    import html
+
+    legend_items = []
+    for kind in ("tool", "crate", "codegen", "ui", "artifact",
+                 "category", "lane", "always"):
+        if kind not in kinds_used:
+            continue
+        _stroke, fill = _GRAPH_KIND_COLORS[kind]
+        legend_items.append(
+            f'<span><i style="background:{fill};border-color:{_stroke}"></i>'
+            f"{html.escape(_GRAPH_KIND_LABELS[kind])}</span>"
+        )
+    legend = '<div class="legend">' + "".join(legend_items) + "</div>"
+    warn_html = (
+        f'<p class="warn">⚠ {html.escape(build_warn)}</p>' if build_warn else ""
+    )
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>phoenix-ide build graph</title><style>" + _GRAPH_CSS
+        + "</style></head><body>"
+        "<header><h1>phoenix-ide · build graph</h1>"
+        f'<div class="meta">{html.escape(meta_line)} · hover a node to trace its edges</div>'
+        "</header>" + legend
+        + '<section><h2>Build pipeline &amp; workspace crate DAG</h2>'
+        '<p class="hint">Topological: each node sits below every input it '
+        "depends on. Edges point from a dependency down to its dependent; the "
+        "release binary at the bottom embeds the UI bundle.</p>"
+        + warn_html
+        + '<div class="scroll">' + build_svg + "</div></section>"
+        + '<section><h2><code>./dev.py check</code> lane graph</h2>'
+        '<p class="hint">Which changed-path categories activate which lanes '
+        "(incremental gating). Hover a lane to see its steps.</p>"
+        '<div class="scroll">' + check_svg + "</div></section>"
+        "<script>" + _GRAPH_JS + "</script></body></html>"
+    )
+
+
+def cmd_graph(out: "Path | None" = None, serve: bool = False,
+              port: "int | None" = None, open_browser: bool = False) -> None:
+    """Emit the project build graph as a self-contained HTML page."""
+    bnodes, bedges, bwarn = _build_pipeline_model()
+    cnodes, cedges = _check_graph_model()
+    build_svg = _svg_for_graph(bnodes, bedges)
+    check_svg = _svg_for_graph(cnodes, cedges)
+
+    sha = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=ROOT, capture_output=True, text=True,
+    ).stdout.strip() or "unknown"
+    when = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    meta_line = f"HEAD {sha} · generated {when}"
+    kinds_used = {n["kind"] for n in {**bnodes, **cnodes}.values()}
+    page = _render_graph_html(build_svg, bwarn, check_svg, kinds_used, meta_line)
+    page_bytes = page.encode("utf-8")
+
+    if serve:
+        import http.server
+        import webbrowser
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page_bytes)))
+                self.end_headers()
+                self.wfile.write(page_bytes)
+
+            def log_message(self, *a):
+                pass
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port or 0), _Handler)
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+        print(f"✓ serving build graph at {url}  (Ctrl-C to stop)")
+        print(f"  {len(bnodes)} build nodes, {len(cnodes)} check nodes")
+        if bwarn:
+            print(f"  ⚠ {bwarn}")
+        if open_browser:
+            webbrowser.open(url)
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nstopped")
+        finally:
+            httpd.server_close()
+        return
+
+    out = out or (ROOT / "target" / "build-graph.html")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(page, encoding="utf-8")
+    print(f"✓ build graph → {out}")
+    print(f"  {len(bnodes)} build nodes, {len(cnodes)} check nodes")
+    if bwarn:
+        print(f"  ⚠ {bwarn}")
+    if open_browser:
+        import webbrowser
+        webbrowser.open(out.as_uri())
+
+
+# =============================================================================
 # Production Commands
 # =============================================================================
 
@@ -6217,6 +6704,28 @@ def main():
     # codegen
     sub.add_parser("codegen", help="Regenerate ui/src/generated/ from Rust types (task 02677)")
 
+    # graph
+    graph_parser = sub.add_parser(
+        "graph",
+        help="Emit an HTML view of the project build graph (topologically layered)",
+    )
+    graph_parser.add_argument(
+        "--out", type=Path, default=None,
+        help="Output HTML path (default: target/build-graph.html)",
+    )
+    graph_parser.add_argument(
+        "--serve", action="store_true",
+        help="Host the graph over HTTP on localhost instead of writing a file",
+    )
+    graph_parser.add_argument(
+        "--port", type=int, default=None,
+        help="Port for --serve (default: ephemeral)",
+    )
+    graph_parser.add_argument(
+        "--open", dest="open_browser", action="store_true",
+        help="Open the result in a browser",
+    )
+
     # seed (offline)
     sub.add_parser("seed", help="Populate dev DB with representative conversations (offline; refuses if Phoenix is running)")
 
@@ -6297,6 +6806,11 @@ def main():
     elif args.command == "codegen":
         if not cmd_codegen():
             sys.exit(1)
+    elif args.command == "graph":
+        cmd_graph(
+            out=args.out, serve=args.serve, port=args.port,
+            open_browser=args.open_browser,
+        )
     elif args.command == "seed":
         cmd_seed()
     elif args.command == "tls":
