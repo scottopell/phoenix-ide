@@ -44,15 +44,28 @@ async function waitForLadle() {
 
 async function main() {
   await mkdir(outDir, { recursive: true });
+  // detached: `pnpm exec ladle serve` runs ladle/vite as a grandchild. Signalling
+  // the pnpm wrapper alone leaves the vite server alive holding the inherited
+  // stdio pipes open, which keeps this process's event loop from draining and
+  // hangs the wrapper forever. Putting it in its own process group lets us signal
+  // the whole tree by negating the pid.
   const ladle = spawn('pnpm', ['exec', 'ladle', 'serve', '--port', String(port), '--host', '127.0.0.1'], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env,
+    detached: true,
   });
   ladle.stdout.on('data', (chunk) => process.stdout.write(chunk));
   ladle.stderr.on('data', (chunk) => process.stderr.write(chunk));
 
+  let ladleStopped = false;
   const stopLadle = () => {
-    if (!ladle.killed) ladle.kill('SIGTERM');
+    if (ladleStopped || ladle.pid === undefined) return;
+    ladleStopped = true;
+    try {
+      process.kill(-ladle.pid, 'SIGTERM');
+    } catch {
+      // group already gone
+    }
   };
   process.on('exit', stopLadle);
   process.on('SIGINT', () => { stopLadle(); process.exit(130); });
@@ -89,7 +102,15 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+main().then(
+  () => {
+    // Captures done and the ladle group signalled. Exit explicitly rather than
+    // waiting for the event loop to drain: vite can take seconds to die, and its
+    // lingering handles would otherwise stall the wrapper after work is complete.
+    process.exit(0);
+  },
+  (error) => {
+    console.error(error);
+    process.exit(1);
+  },
+);
