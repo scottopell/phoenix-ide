@@ -29,15 +29,15 @@ Each numbered question maps to one or more requirements below.
 ### REQ-TASKS-UI-001: See My Tasks Without Leaving the Conversation
 
 WHEN I'm inside a conversation
-THE SYSTEM SHALL show a collapsed "Tasks" panel header in the conversation's chrome
+THE SYSTEM SHALL show a collapsed "Tasks" panel header in the conversation's chrome, carrying a count summary (e.g. "Tasks · 3 active · 7 closed") from first paint
 
 WHEN I click the header
-THE SYSTEM SHALL expand the panel and load the task list, and SHALL display a count summary alongside the header (e.g. "Tasks · 3 active · 7 closed") for the rest of the panel's lifetime
+THE SYSTEM SHALL expand the panel and load the full task list
 
 WHEN the response is empty (no tasks found, OR `tasks/` doesn't exist, OR the request errored)
 THE SYSTEM SHALL show a brief, non-alarming empty-state message rather than a loud error banner
 
-**Rationale:** The task list is reference data, not a control surface I'm always interacting with. The current behaviour delivers the count after first expansion (the load is gated on expansion to avoid paying the round-trip cost on every conversation mount — see REQ-TASKS-UI-007). A future improvement could add a lightweight `count` endpoint that lets the collapsed header carry the summary on first paint without fetching the full list; the present REQ does not require it.
+**Rationale:** The task list is reference data, not a control surface I'm always interacting with. The collapsed header carries its count summary on first paint via a lightweight count endpoint — just the status tallies, no full list — so the summary is visible without expanding while the expensive full-list read stays deferred until I look (see REQ-TASKS-UI-007).
 
 The empty-state condition is deliberately broad. The UI shows neutral `"No tasks found"` copy whenever the response is empty (`TasksPanel.tsx:117`) — covering all three situations: (a) the directory doesn't exist, (b) it exists and is empty, (c) the request failed and the error was logged to console without surfacing. The REQ accepts this ambiguity: empty-state-as-non-error is the right baseline, and a future tightening could differentiate the three only if the API starts distinguishing them.
 
@@ -124,15 +124,15 @@ THE SYSTEM SHALL NOT render the → button on the row (the "current" badge alrea
 
 ---
 
-### REQ-TASKS-UI-007: Pay the Load Cost Only When I Look
+### REQ-TASKS-UI-007: Pay the Full-List Cost Only When I Look
 
 WHEN the Tasks panel is collapsed
-THE SYSTEM SHALL NOT fetch the task list — collapse means "I don't care right now"
+THE SYSTEM SHALL NOT fetch the full task list, and SHALL instead fetch only the lightweight status counts the collapsed header summary needs (active / closed / blocked, and whether the current task is present)
 
 WHEN I expand the panel for the first time
-THE SYSTEM SHALL fetch the list, with a brief "Loading..." indicator while the request is in flight
+THE SYSTEM SHALL fetch the full list, with a brief "Loading..." indicator while the request is in flight
 
 WHEN I navigate to a different conversation
-THE SYSTEM SHALL clear any previously-displayed task list (so the count summary doesn't lie about which conversation it represents) and re-fetch the new conversation's list when next expanded
+THE SYSTEM SHALL clear the previously-displayed counts and task list (so the header summary doesn't lie about which conversation it represents), re-fetch the new conversation's counts immediately, and re-fetch its full list when next expanded
 
-**Rationale:** Task lists can grow to hundreds of files; eagerly fetching on every conversation mount would waste round-trips and give the user nothing they asked to see. Defer-until-expanded is the right cost model. The "clear on conversation change" rule is the partner: if the user navigates from conversation A (with 5 active tasks) to conversation B with the panel collapsed, the lingering "5 active" count from A would be misleading. Both halves are now in `TasksPanel.tsx` — the load effect is gated on `expanded`, and a separate effect resets `tasks` to `[]` on every `conversationId` change.
+**Rationale:** The expensive read is the full list — it maps each task to the conversation working on it, which touches the conversation/project tables on top of the directory scan, and grows with task count. That stays deferred until the user expands the panel. The collapsed header still legitimately wants a count, so a dedicated count endpoint returns only the status tallies from a single directory scan, with no slug mapping — cheap enough to pay on mount. The "clear on conversation change" rule is the partner: navigating from conversation A (5 active tasks) to conversation B with the panel collapsed must not leave A's "5 active" lingering, so both the counts and the list are reset on `conversationId` change. The collapsed and expanded header read identically because both the count endpoint's tallies and the full list's reduction render through one shared label builder.

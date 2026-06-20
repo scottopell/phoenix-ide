@@ -8136,7 +8136,7 @@ html * {
   border-right: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
-  background: var(--bg-primary);
+  background: color-mix(in srgb, var(--bg-primary) 92%, var(--bg-secondary));
   overflow: hidden;
 }
 
@@ -8148,7 +8148,7 @@ html * {
   display: flex;
   flex-direction: column;
   align-items: center;
-  background: var(--bg-primary);
+  background: color-mix(in srgb, var(--bg-primary) 92%, var(--bg-secondary));
   transition: width 0.2s ease;
   padding-top: 8px;
   gap: 4px;
@@ -8159,9 +8159,18 @@ html * {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 8px;
+  padding: 7px 8px;
   border-bottom: 1px solid var(--border-color);
   flex-shrink: 0;
+  background: var(--bg-secondary);
+}
+
+.fe-title-stack {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
 }
 
 .fe-title {
@@ -8170,6 +8179,16 @@ html * {
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--text-secondary);
+}
+
+.fe-subtitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
 }
 
 .fe-toggle {
@@ -8199,7 +8218,18 @@ html * {
   flex-shrink: 0;
 }
 
-/* Collapsed panel badges for MCP / Skills */
+.fe-collapsed-title {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  margin-top: 8px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+/* Collapsed panel badges for grounding sections */
 .fe-collapsed-badges {
   margin-top: auto;
   display: flex;
@@ -8213,14 +8243,15 @@ html * {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
-  height: 24px;
+  width: 40px;
+  min-height: 26px;
+  padding: 2px 3px;
   background: none;
   border: 1px solid var(--border-color);
   border-radius: 4px;
   color: var(--text-muted);
   cursor: pointer;
-  font-size: 9px;
+  font-size: 8px;
   font-weight: 600;
   letter-spacing: 0.3px;
   text-transform: uppercase;
@@ -8271,6 +8302,7 @@ html * {
   text-overflow: ellipsis;
   border-bottom: 1px solid var(--border-color);
   margin-bottom: 2px;
+  background: var(--bg-secondary);
 }
 
 .ft-item {
@@ -12959,4 +12991,34 @@ button.keyword-search-filepath:hover {
 
 .fork-proposal-affordance__link:hover:not(:disabled) {
   text-decoration: underline;
+}
+
+/* Grounding panel fixture */
+.fixture-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.fixture-toolbar {
+  height: 40px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.fixture-panel-stage {
+  min-height: calc(100vh - 40px);
+  display: flex;
+  align-items: stretch;
+  background:
+    linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent-blue) 5%, transparent)),
+    var(--bg-primary);
 }

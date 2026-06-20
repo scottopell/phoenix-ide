@@ -19,44 +19,6 @@
   flex: 1 1 auto;
 }
 
-.ws-section-panel-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 12px;
-  width: 100%;
-  border: none;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-  user-select: none;
-  transition: background 150ms ease;
-  scroll-margin-top: 8px;
-}
-
-.ws-section-panel-header:hover {
-  background: var(--bg-hover);
-}
-
-.ws-section-panel-chevron {
-  font-size: 10px;
-  transition: transform 200ms ease;
-  flex-shrink: 0;
-}
-
-.ws-section-panel-chevron.expanded {
-  transform: rotate(90deg);
-}
-
-.ws-section-panel-summary {
-  flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 /* --- Standalone dock (chain page) --- */
 .ws-panel {
   display: flex;

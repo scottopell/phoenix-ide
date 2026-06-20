@@ -7,6 +7,20 @@
 
 import type { WorkScopeInventory, BashHandleState } from '../api';
 
+type BrowserSession = NonNullable<WorkScopeInventory['browser']>;
+
+/** A live browser session is "idle" once it has gone this long without
+ *  activity. The single definition of the idle cutoff — the collapsed summary,
+ *  the live count, and the expanded browser row all read it, so they cannot
+ *  disagree at the boundary (an off-by-one `>` vs `>=` once split them). */
+export const BROWSER_IDLE_THRESHOLD_MS = 60_000;
+
+/** Whether a browser session reads as idle: live on the wire but quiet past the
+ *  threshold. "idle" is a purely client-side presentation over `idle_ms`. */
+export function isBrowserIdle(browser: BrowserSession): boolean {
+  return browser.state === 'live' && browser.idle_ms >= BROWSER_IDLE_THRESHOLD_MS;
+}
+
 /** A bash handle that reads as "running right now". */
 export function isLive(state: BashHandleState): boolean {
   return state === 'running' || state === 'kill_pending_kernel';
@@ -20,12 +34,14 @@ export function hasRunningBash(inv: WorkScopeInventory | null): boolean {
 }
 
 /** Count of resources that read as "running right now": live bash handles
- *  (running + kill_pending_kernel) plus a live (non-idle) browser session.
- *  Drives the collapsed-rail badge. */
+ *  (running + kill_pending_kernel) plus a live, non-idle browser session.
+ *  Drives the collapsed-rail badge. An idle browser is excluded so it is not
+ *  both counted as "live" and separately labelled "browser idle" in the
+ *  summary — it appears only as the idle label. */
 export function workScopeLiveCount(inv: WorkScopeInventory | null): number {
   if (!inv) return 0;
   const liveBash = inv.bash.filter((h) => isLive(h.state)).length;
-  const liveBrowser = inv.browser && inv.browser.state === 'live' ? 1 : 0;
+  const liveBrowser = inv.browser && inv.browser.state === 'live' && !isBrowserIdle(inv.browser) ? 1 : 0;
   return liveBash + liveBrowser;
 }
 

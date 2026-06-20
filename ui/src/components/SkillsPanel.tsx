@@ -1,6 +1,8 @@
 import { useState, useEffect, useMemo } from 'react';
 import { api } from '../api';
 import type { SkillEntry } from '../api';
+import { GroundingSection, GroundingState } from './GroundingPanel';
+import { summarizeSkills, groupSkills } from './groundingSummaries';
 import './SkillsPanel.css';
 
 interface SkillsPanelProps {
@@ -8,63 +10,6 @@ interface SkillsPanelProps {
   onSkillClick?: (skill: SkillEntry) => void;
   expanded?: boolean;
   onToggleExpanded?: (expanded: boolean) => void;
-}
-
-const BUILTIN_GROUP = 'Built-in';
-
-/**
- * Group label for a skill. Built-in skills are pulled into a dedicated
- * "Built-in" group; filesystem skills derive their label from the directory
- * above `.claude/skills` / `.agents/skills`.
- */
-function groupLabel(skill: SkillEntry): string {
-  if (skill.source === 'builtin') return BUILTIN_GROUP;
-  const skillPath = skill.path;
-  const markers = ['.claude/skills', '.agents/skills'];
-  for (const marker of markers) {
-    const idx = skillPath.indexOf(marker);
-    if (idx !== -1) {
-      const prefix = skillPath.substring(0, idx).replace(/\/$/, '');
-      const lastSlash = prefix.lastIndexOf('/');
-      const dirName = lastSlash >= 0 ? prefix.substring(lastSlash + 1) : prefix;
-      if (!dirName || dirName === '~' || dirName === '') return 'User';
-      const home = prefix;
-      if (/^\/Users\/[^/]+$/.test(home) || /^\/home\/[^/]+$/.test(home) || home === '~') {
-        return 'User';
-      }
-      return dirName;
-    }
-  }
-  return 'Other';
-}
-
-/**
- * Group skills by source. The "Built-in" group is pulled to the front of the
- * resulting Map (Maps preserve insertion order) so phoenix-bundled skills
- * render above filesystem ones in the panel.
- */
-function groupSkills(skills: SkillEntry[]): Map<string, SkillEntry[]> {
-  const groups = new Map<string, SkillEntry[]>();
-  for (const skill of skills) {
-    const label = groupLabel(skill);
-    const existing = groups.get(label);
-    if (existing) {
-      existing.push(skill);
-    } else {
-      groups.set(label, [skill]);
-    }
-  }
-  // Reorder so Built-in is first. Without this the group lands wherever the
-  // first built-in skill appeared in the source array.
-  if (groups.has(BUILTIN_GROUP)) {
-    const builtins = groups.get(BUILTIN_GROUP)!;
-    groups.delete(BUILTIN_GROUP);
-    const reordered = new Map<string, SkillEntry[]>();
-    reordered.set(BUILTIN_GROUP, builtins);
-    for (const [k, v] of groups) reordered.set(k, v);
-    return reordered;
-  }
-  return groups;
 }
 
 export function SkillsPanel({ conversationId, onSkillClick, expanded: controlledExpanded, onToggleExpanded }: SkillsPanelProps) {
@@ -106,10 +51,6 @@ export function SkillsPanel({ conversationId, onSkillClick, expanded: controlled
 
   const grouped = useMemo(() => groupSkills(skills), [skills]);
 
-  if (skills.length === 0 && !expanded) {
-    return null;
-  }
-
   const handleSkillClick = (skill: SkillEntry) => {
     if (onSkillClick) {
       onSkillClick(skill);
@@ -129,22 +70,20 @@ export function SkillsPanel({ conversationId, onSkillClick, expanded: controlled
   };
 
   return (
-    <div className={`skills-panel${expanded ? ' is-expanded' : ''}`}>
-      <button className="skills-panel-header" onClick={() => setExpanded(!expanded)}>
-        <span className={`skills-panel-chevron ${expanded ? 'expanded' : ''}`}>&#9654;</span>
-        <span className="skills-panel-summary">
-          {skills.length === 0
-            ? 'No skills'
-            : <>Skills &middot; {skills.length} available</>
-          }
-        </span>
-      </button>
-      {expanded && (
-        <div className="skills-panel-body">
-          {skills.length === 0 ? (
-            <div className="skills-empty">No skills discovered</div>
-          ) : (
-            Array.from(grouped.entries()).map(([group, items]) => (
+    <GroundingSection
+      icon="/"
+      title="Skills"
+      summary={summarizeSkills(skills)}
+      count={skills.length}
+      expanded={expanded}
+      onToggle={() => setExpanded(!expanded)}
+    >
+      <div className={`skills-panel${expanded ? ' is-expanded' : ''}`}>
+        {skills.length === 0 ? (
+          <GroundingState>No skills discovered for this conversation.</GroundingState>
+        ) : (
+          <div className="skills-panel-body">
+            {Array.from(grouped.entries()).map(([group, items]) => (
               <div key={group} className="skill-group">
                 <div
                   className="skill-group-header"
@@ -175,10 +114,10 @@ export function SkillsPanel({ conversationId, onSkillClick, expanded: controlled
                   </div>
                 ))}
               </div>
-            ))
-          )}
-        </div>
-      )}
-    </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </GroundingSection>
   );
 }

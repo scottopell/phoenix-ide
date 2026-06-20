@@ -12,6 +12,7 @@ import { TasksPanel } from '../TasksPanel';
 import { TaskViewer } from '../TaskViewer';
 import { WorkScopeSection } from '../WorkScopePanel';
 import { useSeededLiveCount } from '../useWorkScopeSeed';
+import { workScopeLiveCount } from '../workScopeHelpers';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import type { SkillEntry, TaskEntry, WorkScopeInventory } from '../../api';
 
@@ -69,6 +70,8 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   // forever when the spawn `work_scope_update` fell outside the replay window.
   // One fetch per scope (no poll); SSE stays authoritative once it arrives.
   const workScopeCount = useSeededLiveCount(workScopeKey, liveWorkScope);
+  const liveAttentionCount = liveWorkScope ? workScopeLiveCount(liveWorkScope) : workScopeCount;
+  const projectName = rootPath.split('/').filter(Boolean).slice(-1)[0] || rootPath;
 
   const handleFileSelect = useCallback((filePath: string, rootDir: string) => {
     openFile(filePath, rootDir);
@@ -76,30 +79,31 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
 
   if (collapsed) {
     return (
-      <aside className="fe-panel fe-panel--collapsed">
-        <button className="fe-toggle" onClick={onToggle} title="Expand file explorer">
+      <aside className="fe-panel fe-panel--collapsed" aria-label="Conversation grounding panel collapsed">
+        <button className="fe-toggle" onClick={onToggle} title="Expand grounding panel" aria-label="Expand grounding panel">
           &#9654;
         </button>
-        <div className="fe-collapsed-badges">
-          <button className="fe-collapsed-badge" onClick={onToggle} title="Files">
+        <div className="fe-collapsed-title" title="Grounding">G</div>
+        <div className="fe-collapsed-badges" aria-label="Grounding sections">
+          <button className="fe-collapsed-badge" onClick={onToggle} title="Project files">
             Files
           </button>
-          <button className="fe-collapsed-badge" onClick={onToggle} title="MCP Servers">
+          <button className="fe-collapsed-badge" onClick={onToggle} title="MCP capabilities">
             MCP
           </button>
           <button className="fe-collapsed-badge" onClick={onToggle} title="Skills">
-            /
+            Skills
           </button>
           <button className="fe-collapsed-badge" onClick={onToggle} title="Tasks">
-            T
+            Tasks
           </button>
           {workScopeKey && (
             <button
-              className={`fe-collapsed-badge${workScopeCount > 0 ? ' fe-collapsed-badge--active' : ''}`}
+              className={`fe-collapsed-badge${liveAttentionCount > 0 ? ' fe-collapsed-badge--active' : ''}`}
               onClick={onToggle}
-              title={`Work scope · ${workScopeCount} running`}
+              title={`Work scope · ${liveAttentionCount} live`}
             >
-              {workScopeCount}
+              Work {liveAttentionCount}
             </button>
           )}
         </div>
@@ -125,9 +129,12 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
       style={width !== undefined ? { width: `${width}px` } : undefined}
     >
       <div className="fe-header">
-        <button className="fe-toggle" onClick={onToggle} title="Collapse">&#9666;</button>
-        <span className="fe-title">Files</span>
-        <button className="fe-refresh" onClick={handleRefresh} title="Refresh file tree">&#8635;</button>
+        <button className="fe-toggle" onClick={onToggle} title="Collapse grounding panel" aria-label="Collapse grounding panel">&#9666;</button>
+        <div className="fe-title-stack">
+          <span className="fe-title">Grounding</span>
+          <span className="fe-subtitle" title={rootPath}>{projectName} · {branchName ?? 'no branch'}</span>
+        </div>
+        <button className="fe-refresh" onClick={handleRefresh} title="Refresh file tree" aria-label="Refresh file tree">&#8635;</button>
       </div>
       {detailViewer || (
         <>
