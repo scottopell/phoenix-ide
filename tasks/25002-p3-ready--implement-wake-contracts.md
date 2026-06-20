@@ -24,4 +24,12 @@ SCOPE (deferred — its own PR, a substantial new subsystem):
 Verify the spec is still current before starting (the bash WorkScope re-key it
 depends on must have merged). Abandon the old feat/wake-contracts-spec branch —
 this branch's reconciled spec supersedes it.
-EOF2
+
+CONVERGENCE (avoid a parallel representation):
+`crates/phoenix-ide/src/runtime/usage_limit_sweep.rs` already does a degenerate,
+wall-clock-only version of a wake: it returns a conversation stuck on a
+usage-limit error to Idle once the error's `resets_at` passes. If wake contracts
+grow a wall-clock / deadline condition kind (see specs/wake-contracts/design.md
+"Out of Scope"), fold that sweep into it rather than running two schedulers.
+Note the structural difference: a deadline wake has no watched handle, so it does
+not fit the `handle_owned_by` authorization or the `forgotten` cause.

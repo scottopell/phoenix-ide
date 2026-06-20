@@ -201,6 +201,14 @@ The LLM-facing surface is the unified `wait_until` tool
 - Wake against external systems (GitHub API, Slack)
 - File-watcher conditions
 - Regex/content-match conditions
+- Wall-clock / deadline conditions — fire at an absolute timestamp,
+  independent of any watched handle. Structurally distinct from the
+  handle-owned conditions above: there is no handle to authorize against
+  (`handle_owned_by` does not apply) and nothing to fire `forgotten`,
+  so it would relax the handle-ownership precondition rather than add an
+  evaluator on the same edge. A degenerate form of this — returning a
+  conversation stuck on a quota-window error to Idle once its reported
+  reset time passes — is served standalone today, outside this subsystem.
 
 Each of these is a separate condition-kind or contract-shape governed
 by its own spec revision. The foundation — persistence, delivery,
