@@ -150,9 +150,12 @@ const httpsServer =
   httpsCert && httpsKey
     ? { cert: readFileSync(httpsCert), key: readFileSync(httpsKey) }
     : undefined;
+const isLadle = process.env.PHOENIX_LADLE === '1';
 
 // https://vitejs.dev/config/
-export default defineConfig({
+export default defineConfig(isLadle ? {
+  plugins: [gitkeep()],
+} : {
   plugins: [react(), shikiLangPrune(), gitkeep()],
   server: {
     allowedHosts: true,

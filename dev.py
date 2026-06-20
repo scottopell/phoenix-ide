@@ -1859,6 +1859,136 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
         )
         return True
 
+    def _ensure_grounding_panel_fixture_worktree() -> Path:
+        fixture = ROOT / ".phoenix" / "seed-worktrees" / "grounding-panel-qa"
+        if fixture.exists():
+            shutil.rmtree(fixture)
+        fixture.mkdir(parents=True, exist_ok=True)
+
+        _run_seed_git(fixture, ["init", "-q", "-b", "main"])
+        for key, value in [
+            ("user.email", "seed@example.invalid"),
+            ("user.name", "Phoenix Seed"),
+            ("commit.gpgsign", "false"),
+        ]:
+            _run_seed_git(fixture, ["config", key, value])
+
+        _write_text(
+            fixture / "README-with-a-very-long-name-that-still-needs-to-truncate.md",
+            "# Grounding Panel QA Fixture\n\n"
+            "This seeded repository exercises the real conversation grounding panel "
+            "through Phoenix navigation instead of a mocked visual story.\n",
+        )
+        for path, content in [
+            ("crates/phoenix-ide/src/main.rs", "fn main() { println!(\"grounding qa\"); }\n"),
+            ("crates/phoenix-ide/src/runtime/very_deep_module_name_for_grounding_panel_review.rs", "pub fn fixture() {}\n"),
+            ("ui/src/components/GroundingPanelQaIntegrationReviewSurface.tsx", "export function Fixture() { return null; }\n"),
+            ("specs/grounding-panel/requirements.md", "# Grounding panel QA requirements\n"),
+            ("docs/reference/architecture/very/deep/tree/with/long/names/notes.md", "# Deep tree\n"),
+        ]:
+            _write_text(fixture / path, content)
+
+        task_bodies = {
+            "22001-p2-in-progress--redesign-conversation-grounding-side-panel.md": "# Redesign conversation grounding side panel\n\nCurrent seeded task linked to the QA conversation.\n",
+            "22002-p0-ready--fix-critical-mcp-auth-refresh-loop-with-long-slug.md": "# Fix critical MCP auth refresh loop with long slug\n",
+            "22003-p1-blocked--blocked-on-github-token-scope-decision.md": "# Blocked on GitHub token scope decision\n",
+            "22004-p3-brainstorming--explore-grounding-panel-information-architecture.md": "# Explore grounding panel information architecture\n",
+            "22005-p4-done--archive-old-panel-screenshot-notes.md": "# Archive old panel screenshot notes\n",
+            "22006-p2-wont-do--replace-panel-with-floating-modal.md": "# Replace panel with floating modal\n",
+        }
+        for filename, body in task_bodies.items():
+            _write_text(fixture / "tasks" / filename, body)
+        _write_text(fixture / "tasks" / ".taskmd", "")
+
+        for base, name, description in [
+            (".agents/skills", "phoenix-perf-hunt", "Profiles Phoenix React scenarios and coordinates focused performance attempts."),
+            (".claude/skills", "very-long-project-specific-skill-name-for-truncation-review", "Project skill with deliberately long metadata for grounding-panel truncation review."),
+            ("service/.agents/skills", "service-review", "Service-local skill discovered from an immediate child project."),
+        ]:
+            _write_text(
+                fixture / base / name / "SKILL.md",
+                f"# {name}\n\n{description}\n\n## Arguments\n\n`--scenario <name>`\n",
+            )
+
+        _run_seed_git(fixture, ["add", "."])
+        _run_seed_git(fixture, ["commit", "-q", "-m", "seed grounding panel qa baseline"])
+        _run_seed_git(fixture, ["checkout", "-q", "-b", "task-22001-redesign-conversation-grounding-side-panel"])
+        _write_text(
+            fixture / "ui/src/components/GroundingPanelQaIntegrationReviewSurface.tsx",
+            "export function Fixture() { return <aside>Grounding QA branch change</aside>; }\n",
+        )
+        _run_seed_git(fixture, ["add", "."])
+        _run_seed_git(fixture, ["commit", "-q", "-m", "seed grounding panel branch"])
+        return fixture
+
+    def _ensure_grounding_panel_qa_fixture(conn: sqlite3.Connection) -> bool:
+        worktree = _ensure_grounding_panel_fixture_worktree()
+        project_id = _find_or_create_project(conn, str(worktree))
+        slug = "fixture-grounding-panel-qa"
+        existing = conn.execute(
+            "SELECT id, archived FROM conversations WHERE slug = ?",
+            (slug,),
+        ).fetchone()
+        if existing is not None:
+            conv_id, archived = existing
+            message_count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+                (conv_id,),
+            ).fetchone()[0]
+            if archived == 0 and message_count >= 1:
+                return False
+            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+            conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+
+        conv_id = str(_uuid.uuid4())
+        state_json = json.dumps({"type": "idle"})
+        mode_json = json.dumps({
+            "mode": "Work",
+            "branch_name": "task-22001-redesign-conversation-grounding-side-panel",
+            "worktree_path": str(worktree),
+            "base_branch": "main",
+            "task_id": "22001",
+            "task_title": "Redesign conversation grounding side panel",
+        })
+        conn.execute(
+            "INSERT INTO conversations ("
+            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
+            " state, state_updated_at, created_at, updated_at, archived,"
+            " model, project_id, conv_mode, desired_base_branch,"
+            " seed_parent_id, seed_label"
+            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, ?)",
+            (
+                conv_id,
+                slug,
+                "Fixture Grounding Panel QA",
+                str(worktree),
+                state_json,
+                now,
+                now,
+                now,
+                project_id,
+                mode_json,
+                "qa:grounding-panel",
+            ),
+        )
+        msg_id = str(_uuid.uuid4())
+        conn.execute(
+            "INSERT INTO messages ("
+            " message_id, conversation_id, sequence_id, message_type,"
+            " content, created_at"
+            ") VALUES (?, ?, 0, 'user', ?, ?)",
+            (
+                msg_id,
+                conv_id,
+                json.dumps({
+                    "text": "Review the seeded Grounding Panel QA integration conversation",
+                    "images": [],
+                }),
+                now,
+            ),
+        )
+        return True
+
     def _insert_conv(
         conn: sqlite3.Connection,
         *,
@@ -2281,6 +2411,7 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
                 conn,
                 project_id=project_id,
             )
+            created_grounding_fixture = _ensure_grounding_panel_qa_fixture(conn)
             conn.commit()
             if not quiet_if_populated:
                 count = _existing_active_count(conn)
@@ -2291,14 +2422,16 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
                     suffixes.append("repaired heavy fixture")
                 if created_diff_fixture:
                     suffixes.append("repaired diff fixture")
+                if created_grounding_fixture:
+                    suffixes.append("repaired grounding panel fixture")
                 suffix = f" + {', '.join(suffixes)}" if suffixes else ""
                 print(f"✓ Dev DB already populated ({count} conversations) — skipping seed{suffix}.")
             return
 
         print("Seeding dev DB with representative conversations...")
 
-        # [1/4] Direct standalones
-        print("  [1/4] Direct standalones")
+        # [1/5] Direct standalones
+        print("  [1/5] Direct standalones")
         for text in _SEED_DIRECT_STANDALONES:
             _insert_conv(
                 conn,
@@ -2308,8 +2441,8 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
                 project_id=project_id,
             )
 
-        # [2/4] Direct chains (3-member + 2-member)
-        print("  [2/4] Direct chains (3-member + 2-member)")
+        # [2/5] Direct chains (3-member + 2-member)
+        print("  [2/5] Direct chains (3-member + 2-member)")
         id1, slug1 = _insert_conv(
             conn, text=_SEED_CHAIN_3_TEXT, conv_mode=direct_mode,
             cwd=str(ROOT), project_id=project_id,
@@ -2335,8 +2468,8 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             conv_mode=direct_mode, cwd=str(ROOT), project_id=project_id,
         )
 
-        # [3/4] Explore mode chain
-        print("  [3/4] Explore mode chain (2-member)")
+        # [3/5] Explore mode chain
+        print("  [3/5] Explore mode chain (2-member)")
         eid1, eslug1 = _insert_conv(
             conn, text=_SEED_EXPLORE_TEXT, conv_mode=explore_mode,
             cwd=str(ROOT), project_id=project_id,
@@ -2347,12 +2480,16 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             conv_mode=explore_mode, cwd=str(ROOT), project_id=project_id,
         )
 
-        # [4/4] Branch diff fixture
-        print("  [4/4] Branch diff fixture")
+        # [4/5] Branch diff fixture
+        print("  [4/5] Branch diff fixture")
         _ensure_diff_review_fixture(
             conn,
             project_id=project_id,
         )
+
+        # [5/5] Grounding panel QA integration fixture
+        print("  [5/5] Grounding panel QA fixture")
+        _ensure_grounding_panel_qa_fixture(conn)
 
         _ensure_conversation_load_fixture(
             conn,
@@ -2386,6 +2523,15 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
         conn.execute("ALTER TABLE conversations DROP COLUMN conv_mode")
 
         conn.commit()
+
+
+def cmd_qa_grounding_panel() -> None:
+    """Capture grounding panel Ladle screenshots into ignored local artifacts."""
+    subprocess.run(
+        ["pnpm", "qa:grounding-panel"],
+        cwd=ROOT / "ui",
+        check=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6220,6 +6366,11 @@ def main():
     # seed (offline)
     sub.add_parser("seed", help="Populate dev DB with representative conversations (offline; refuses if Phoenix is running)")
 
+    # qa
+    qa_parser = sub.add_parser("qa", help="Run local QA capture workflows")
+    qa_sub = qa_parser.add_subparsers(dest="qa_command", required=True)
+    qa_sub.add_parser("grounding-panel", help="Capture grounding panel Ladle screenshots")
+
     # tls
     tls_parser = sub.add_parser("tls", help="Manage Phoenix HTTPS certificates")
     tls_sub = tls_parser.add_subparsers(dest="tls_command", required=True)
@@ -6299,6 +6450,9 @@ def main():
             sys.exit(1)
     elif args.command == "seed":
         cmd_seed()
+    elif args.command == "qa":
+        if args.qa_command == "grounding-panel":
+            cmd_qa_grounding_panel()
     elif args.command == "tls":
         if args.tls_command == "ca":
             cmd_tls_ca(args.dir)
