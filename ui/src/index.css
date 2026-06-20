@@ -10593,13 +10593,16 @@ html * {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 5px;
   background: transparent;
-  border: 1px solid transparent;
+  border: 1px solid var(--border-color);
   color: var(--text-muted);
-  padding: 4px;
+  padding: 3px 9px;
+  font-size: 0.8125rem;
   border-radius: 4px;
   cursor: pointer;
   align-self: center;
+  white-space: nowrap;
   transition: background-color 200ms ease, border-color 200ms ease, color 200ms ease;
 }
 

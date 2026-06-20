@@ -142,10 +142,10 @@ const makeChain = (overrides: Partial<ChainView> = {}): ChainView => ({
   ...overrides,
 });
 
-function renderAt(rootId: string) {
+function renderAt(rootId: string, search = '') {
   return render(
     <ChainProvider>
-      <MemoryRouter initialEntries={[`/chains/${rootId}`]}>
+      <MemoryRouter initialEntries={[`/chains/${rootId}${search}`]}>
         <Routes>
           <Route path="/chains/:rootConvId" element={<ChainPage />} />
           <Route path="/c/:slug" element={<div data-testid="conv-page">conv</div>} />
@@ -667,6 +667,38 @@ describe('ChainPage — regenerate name (REQ-CHN-010)', () => {
     expect(
       screen.getByRole('button', { name: /keep-me/ }),
     ).toBeInTheDocument();
+  });
+});
+
+describe('ChainPage — rename intent from sidebar (REQ-CHN-007)', () => {
+  it('opens directly in name-edit mode when navigated with ?rename=1', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({ chain_name: 'old-name', display_name: 'old-name' }),
+    );
+
+    // The sidebar "Rename chain…" action lands here with ?rename=1; the editor
+    // must open without any further click (otherwise the menu item is a no-op).
+    renderAt(ROOT_ID, '?rename=1');
+
+    const input = await screen.findByRole('textbox', { name: 'Chain name' });
+    expect(input).toHaveValue('old-name');
+  });
+
+  it('does not open the editor on a normal visit (no ?rename)', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({ chain_name: 'old-name', display_name: 'old-name' }),
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /old-name/ })).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByRole('textbox', { name: 'Chain name' }),
+    ).not.toBeInTheDocument();
   });
 });
 

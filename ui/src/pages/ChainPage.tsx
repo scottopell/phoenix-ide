@@ -32,8 +32,8 @@
 
 import { memo, useEffect, useMemo, useRef, useCallback, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
-import { RefreshCw, Loader2 } from 'lucide-react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { Sparkles, Loader2 } from 'lucide-react';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -61,6 +61,21 @@ import { formatShortDateTime } from '../utils';
 export function ChainPage() {
   const { rootConvId } = useParams<{ rootConvId: string }>();
   const navigate = useNavigate();
+  // The sidebar "Rename chain…" action navigates here with `?rename=1` so the
+  // header opens directly in edit mode — otherwise the menu item would just
+  // land on the page with nothing to do (a literal no-op when already here).
+  // Consumed once, then stripped from the URL so a refresh/back doesn't re-arm.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const wantsRename = searchParams.get('rename') === '1';
+  const consumeRenameIntent = useCallback(() => {
+    setSearchParams(
+      (prev) => {
+        prev.delete('rename');
+        return prev;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
 
   // ---------------------------------------------------------------------------
   // Chain-scoped state lives in ChainStore (task 08682). Migrating off plain
@@ -437,6 +452,8 @@ export function ChainPage() {
           }
         }}
         onDelete={() => setDeleteConfirmOpen(true)}
+        autoEdit={wantsRename}
+        onAutoEditConsumed={consumeRenameIntent}
       />
       <div className="chain-page-main">
         <div className="chain-page-body">
@@ -587,9 +604,21 @@ interface ChainPageHeaderProps {
    *  is no unarchive (archived chain roots 404 on the chain route). */
   onArchive: () => void | Promise<void>;
   onDelete: () => void;
+  /** When true, open directly in name-edit mode (sidebar "Rename chain…"
+   *  navigates here with `?rename=1`). Consumed once via onAutoEditConsumed. */
+  autoEdit: boolean;
+  onAutoEditConsumed: () => void;
 }
 
-function ChainPageHeader({ chain, onRename, onRegenerate, onArchive, onDelete }: ChainPageHeaderProps) {
+function ChainPageHeader({
+  chain,
+  onRename,
+  onRegenerate,
+  onArchive,
+  onDelete,
+  autoEdit,
+  onAutoEditConsumed,
+}: ChainPageHeaderProps) {
   const [editing, setEditing] = useScopedState(chain.root_conv_id, false);
   // The text input is pre-populated with the actual override (`chain_name`),
   // not the resolved `display_name` — REQ-CHN-007 spec note: an empty input
@@ -624,6 +653,15 @@ function ChainPageHeader({ chain, onRename, onRegenerate, onArchive, onDelete }:
       inputRef.current?.select();
     }
   }, [editing]);
+
+  // Honor the sidebar "Rename chain…" intent: open in edit mode, then clear
+  // the one-shot URL flag so a later refresh doesn't re-open the editor.
+  useEffect(() => {
+    if (autoEdit) {
+      setEditing(true);
+      onAutoEditConsumed();
+    }
+  }, [autoEdit, setEditing, onAutoEditConsumed]);
 
   const commit = async () => {
     const trimmed = value.trim();
@@ -682,15 +720,16 @@ function ChainPageHeader({ chain, onRename, onRegenerate, onArchive, onDelete }:
         className="chain-page-regenerate"
         onClick={() => void regenerate()}
         disabled={regenerating}
-        title="Regenerate name from chain content"
+        title="Regenerate the chain name from its conversations"
         aria-label="Regenerate name from chain content"
         aria-busy={regenerating}
       >
         {regenerating ? (
-          <Loader2 size={15} className="spinning" />
+          <Loader2 size={14} className="spinning" />
         ) : (
-          <RefreshCw size={15} />
+          <Sparkles size={14} />
         )}
+        <span>{regenerating ? 'Regenerating…' : 'Regenerate'}</span>
       </button>
       <span className="chain-page-meta">
         {chain.current_member_count}{' '}
