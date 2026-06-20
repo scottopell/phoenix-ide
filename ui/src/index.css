@@ -3,7 +3,7 @@
 /* SauceCodePro Nerd Font Mono — bundled under SIL Open Font License */
 @font-face {
   font-family: 'SauceCodePro NF Mono';
-  src: url('./assets/fonts/SauceCodeProNerdFontMono-Regular.ttf') format('truetype');
+  src: url('./assets/fonts/SauceCodeProNerdFontMono-Regular.woff2') format('woff2');
   font-weight: 400;
   font-style: normal;
   font-display: swap;
@@ -11,7 +11,7 @@
 
 @font-face {
   font-family: 'SauceCodePro NF Mono';
-  src: url('./assets/fonts/SauceCodeProNerdFontMono-Bold.ttf') format('truetype');
+  src: url('./assets/fonts/SauceCodeProNerdFontMono-Bold.woff2') format('woff2');
   font-weight: 700;
   font-style: normal;
   font-display: swap;
@@ -19,7 +19,7 @@
 
 @font-face {
   font-family: 'SauceCodePro NF Mono';
-  src: url('./assets/fonts/SauceCodeProNerdFontMono-Italic.ttf') format('truetype');
+  src: url('./assets/fonts/SauceCodeProNerdFontMono-Italic.woff2') format('woff2');
   font-weight: 400;
   font-style: italic;
   font-display: swap;
@@ -27,7 +27,7 @@
 
 @font-face {
   font-family: 'SauceCodePro NF Mono';
-  src: url('./assets/fonts/SauceCodeProNerdFontMono-BoldItalic.ttf') format('truetype');
+  src: url('./assets/fonts/SauceCodeProNerdFontMono-BoldItalic.woff2') format('woff2');
   font-weight: 700;
   font-style: italic;
   font-display: swap;
