@@ -512,6 +512,10 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
     fn upgrade_to_work_mode(&self) {
         (**self).upgrade_to_work_mode();
     }
+
+    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
+        (**self).clearable_tool_names()
+    }
 }
 
 // ============================================================================

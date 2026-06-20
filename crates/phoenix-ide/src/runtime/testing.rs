@@ -139,6 +139,7 @@ impl LlmClient for StreamingMockLlmClient {
 pub struct MockToolExecutor {
     outputs: HashMap<String, ToolOutput>,
     definitions: Vec<ToolDefinition>,
+    clearable: std::collections::HashSet<String>,
     /// Record of tool executions
     pub executions: Mutex<Vec<(String, Value)>>,
 }
@@ -149,6 +150,7 @@ impl MockToolExecutor {
         Self {
             outputs: HashMap::new(),
             definitions: Vec::new(),
+            clearable: std::collections::HashSet::new(),
             executions: Mutex::new(Vec::new()),
         }
     }
@@ -163,6 +165,12 @@ impl MockToolExecutor {
             defer_loading: false,
         });
         self.outputs.insert(name, output);
+        self
+    }
+
+    /// Mark `name` as a clearable tool (its stale results may be cleared).
+    pub fn with_clearable_tool(mut self, name: impl Into<String>) -> Self {
+        self.clearable.insert(name.into());
         self
     }
 
@@ -192,6 +200,10 @@ impl ToolExecutor for MockToolExecutor {
 
     async fn definitions(&self) -> Vec<ToolDefinition> {
         self.definitions.clone()
+    }
+
+    fn clearable_tool_names(&self) -> std::collections::HashSet<String> {
+        self.clearable.clone()
     }
 }
 
