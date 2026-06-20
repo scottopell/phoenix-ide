@@ -1106,8 +1106,8 @@ mod tests {
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
 
-        // Create the ledger and stamp only the *highest* version, mimicking a
-        // seeder that left every lower migration un-stamped.
+        // Create the ledger and stamp a single high version, mimicking a
+        // seeder that left every other migration un-stamped.
         sqlx::raw_sql(
             "CREATE TABLE _migrations (\
                 version INTEGER PRIMARY KEY, \
@@ -1123,9 +1123,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Every version except the stamped 29 must run.
+        // Every version except the stamped 29 must run: 1–28 below the stamp
+        // and 30 (add_clear_watermark_to_conversations) above it.
         let applied = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(applied, 28);
+        assert_eq!(applied, 29);
 
         // Migration 005's effects must be present.
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
