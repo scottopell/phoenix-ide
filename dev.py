@@ -4521,12 +4521,93 @@ _GRAPH_KIND_LABELS = {
 }
 
 
-def _workspace_forward_deps():
-    """Intra-workspace forward dependency edges from `cargo metadata`.
+def _human_loc(n: int) -> str:
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
-    Returns (crates_sorted, edges) where each edge is a (dep, dependent) tuple
-    oriented in build order — dep is compiled before dependent — or None if
-    cargo metadata is unavailable (caller renders the pipeline without crates).
+
+def _count_rust_source(dirpath: "Path") -> "tuple[int, int]":
+    """(lines, files) across *.rs under dirpath, skipping any target/ subtree."""
+    loc = files = 0
+    for root, dirs, names in os.walk(dirpath):
+        dirs[:] = [d for d in dirs if d != "target"]
+        for nm in names:
+            if nm.endswith(".rs"):
+                files += 1
+                try:
+                    with open(Path(root) / nm, encoding="utf-8", errors="ignore") as fh:
+                        loc += sum(1 for _ in fh)
+                except OSError:
+                    pass
+    return loc, files
+
+
+def _parse_cargo_timings() -> "dict | None":
+    """Parse the newest target/cargo-timings/*.html into {crate_name: seconds}.
+
+    Sums per-package compile durations (every unit except run-custom-build,
+    which is build-script *execution*, not compilation). Names are normalized
+    to underscore form so callers can match either spelling. Returns None when
+    no report is present or it can't be parsed.
+    """
+    tdir = ROOT / "target" / "cargo-timings"
+    if not tdir.is_dir():
+        return None
+    htmls = sorted(tdir.glob("cargo-timing*.html"), key=lambda p: p.stat().st_mtime)
+    if not htmls:
+        return None
+    m = re.search(
+        r"UNIT_DATA\s*=\s*(\[.*?\]);",
+        htmls[-1].read_text(encoding="utf-8", errors="ignore"), re.S,
+    )
+    if not m:
+        return None
+    try:
+        units = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    out: dict = {}
+    for u in units:
+        if u.get("mode") == "run-custom-build":
+            continue
+        name = str(u.get("name", "")).replace("-", "_")
+        dur = u.get("duration")
+        if name and isinstance(dur, (int, float)):
+            out[name] = out.get(name, 0.0) + float(dur)
+    return out or None
+
+
+def _collect_crate_timings(crates: "list[str]") -> "dict | None":
+    """Force a from-scratch recompile of the workspace crates under --timings,
+    then read back per-crate compile seconds. Dependency artifacts are kept
+    (only `-p <crate>` is cleaned) so the rebuild is workspace-only, but a cold
+    target still pays the full external-dependency compile first."""
+    clean = ["cargo", "clean"]
+    for c in crates:
+        clean += ["-p", c]
+    subprocess.run(clean, cwd=ROOT, capture_output=True)
+    print("  building workspace with --timings (recompiles every crate)…")
+    build = subprocess.run(
+        ["cargo", "build", "--timings"], cwd=ROOT, capture_output=True, text=True,
+    )
+    if build.returncode != 0:
+        sys.stderr.write(build.stderr[-2000:])
+        print("  ⚠ cargo build --timings failed; compile times omitted",
+              file=sys.stderr)
+        return None
+    return _parse_cargo_timings()
+
+
+def _crate_graph_info(with_timings: bool = False):
+    """One `cargo metadata` pass → workspace crate graph plus per-crate metrics.
+
+    Returns (crates_sorted, edges, info) or None if cargo metadata is
+    unavailable. `edges` are (dep, dependent) tuples in build order. `info[name]`
+    carries: dir, kind, ws_deps, ext_deps, rebuilds (crates recompiled on a
+    change, incl. self), loc, files, and compile_s (None unless with_timings).
+
+    Dependency edges count normal + build deps only (compile-relevant); dev-deps
+    are excluded so the build DAG reflects what a release build links, not what
+    the test harness pulls in.
     """
     try:
         out = subprocess.run(
@@ -4538,23 +4619,69 @@ def _workspace_forward_deps():
         meta = json.loads(out.stdout)
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
         return None
+
     ws = {p["name"] for p in meta["packages"]}
-    edges = set()
+    edges: set = set()
+    info: dict = {}
     for p in meta["packages"]:
-        for d in p["dependencies"]:
-            if d["name"] in ws and d["name"] != p["name"]:
-                edges.add((d["name"], p["name"]))
-    return sorted(ws), sorted(edges)
+        name = p["name"]
+        compile_deps = [
+            d for d in p["dependencies"] if d.get("kind") in (None, "build")
+        ]
+        ws_deps = {d["name"] for d in compile_deps if d["name"] in ws and d["name"] != name}
+        ext_deps = {d["name"] for d in compile_deps if d["name"] not in ws}
+        for dep in ws_deps:
+            edges.add((dep, name))
+        target_kinds = {k for t in p["targets"] for k in t["kind"]
+                        if k in ("lib", "bin", "proc-macro")}
+        kind = "+".join(sorted(target_kinds)) or "lib"
+        try:
+            rel = str(Path(p["manifest_path"]).parent.relative_to(ROOT))
+        except ValueError:
+            rel = ""
+        loc, files = _count_rust_source(ROOT / rel) if rel else (0, 0)
+        info[name] = {
+            "dir": rel, "kind": kind,
+            "ws_deps": len(ws_deps), "ext_deps": len(ext_deps),
+            "loc": loc, "files": files, "rebuilds": 1, "compile_s": None,
+        }
+
+    # Blast radius: crates whose build transitively depends on `c` (incl. self).
+    succ: dict = {c: set() for c in ws}
+    for dep, dependent in edges:
+        succ[dep].add(dependent)
+    for c in ws:
+        seen = {c}
+        stack = [c]
+        while stack:
+            for nxt in succ[stack.pop()]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        info[c]["rebuilds"] = len(seen)
+
+    if with_timings:
+        timings = _collect_crate_timings(sorted(ws))
+        if timings:
+            for name in ws:
+                info[name]["compile_s"] = timings.get(name.replace("-", "_"))
+
+    return sorted(ws), sorted(edges), info
 
 
-def _build_pipeline_model():
+def _build_pipeline_model(with_timings: bool = False):
     """Nodes + edges for the build-artifact graph (toolchain, crate DAG,
-    codegen, UI bundle, embedded release binary). Returns (nodes, edges, warn)."""
+    codegen, UI bundle, embedded release binary). Returns (nodes, edges, warn).
+
+    Crate nodes carry per-crate metrics (LoC, deps, blast radius, optional
+    compile time) in their tooltip, and a `meter` (0..1) encoding relative
+    weight — compile time when --timings ran, else lines of code."""
     nodes: dict = {}
     edges: list = []
 
-    def add(nid, label, kind, sub="", tip=""):
-        nodes[nid] = {"id": nid, "label": label, "kind": kind, "sub": sub, "tip": tip}
+    def add(nid, label, kind, sub="", tip="", **extra):
+        nodes[nid] = {"id": nid, "label": label, "kind": kind, "sub": sub,
+                      "tip": tip, **extra}
 
     add("corepack", "corepack + pnpm", "tool", sub="toolchain pin",
         tip="ensure_corepack_pnpm(): pins pnpm via Corepack from "
@@ -4563,13 +4690,37 @@ def _build_pipeline_model():
         tip="ensure_ui_deps(): pnpm install. Success marker: "
             "node_modules/.modules.yaml")
 
-    fwd = _workspace_forward_deps()
+    cg = _crate_graph_info(with_timings)
     warn = None
     top_crate = None
-    if fwd:
-        crates, cedges = fwd
+    weight_basis = "lines of code"
+    if cg:
+        crates, cedges, info = cg
+        has_timings = any(info[c]["compile_s"] is not None for c in crates)
+        weight_basis = "compile time" if has_timings else "lines of code"
+
+        def weight(c):
+            cs = info[c]["compile_s"]
+            return cs if (has_timings and cs is not None) else info[c]["loc"]
+
+        maxw = max((weight(c) for c in crates), default=1) or 1
         for c in crates:
-            add(f"crate:{c}", c, "crate", sub="cargo crate")
+            i = info[c]
+            loc_h = _human_loc(i["loc"])
+            if has_timings and i["compile_s"] is not None:
+                sub = f"{i['compile_s']:.1f}s · {loc_h} loc"
+            else:
+                sub = f"{loc_h} loc · {i['ext_deps']} deps"
+            tip_lines = [
+                f"{c}  ({i['kind']})",
+                f"{i['loc']:,} LoC across {i['files']} files",
+                f"deps: {i['ws_deps']} workspace · {i['ext_deps']} external",
+                f"rebuilds {i['rebuilds']} crate(s) on change",
+            ]
+            if i["compile_s"] is not None:
+                tip_lines.append(f"compile: {i['compile_s']:.1f}s (debug, full rebuild)")
+            add(f"crate:{c}", c, "crate", sub=sub, tip="\n".join(tip_lines),
+                meter=weight(c) / maxw)
         for dep, dependent in cedges:
             edges.append((f"crate:{dep}", f"crate:{dependent}"))
         # The root binary crate — nothing depends on it; it transitively pulls
@@ -4579,10 +4730,7 @@ def _build_pipeline_model():
                 top_crate = f"crate:{cand}"
                 break
         if top_crate is None:
-            depcount: dict = {}
-            for _dep, dependent in cedges:
-                depcount[dependent] = depcount.get(dependent, 0) + 1
-            top_crate = f"crate:{max(crates, key=lambda c: depcount.get(c, 0))}"
+            top_crate = f"crate:{max(crates, key=lambda c: info[c]['rebuilds'])}"
     else:
         warn = "cargo metadata unavailable — workspace crate DAG omitted"
 
@@ -4602,7 +4750,7 @@ def _build_pipeline_model():
     edges.append(("codegen", "ui-build"))
     edges.append(("ui-deps", "ui-build"))
     edges.append(("ui-build", "release-bin"))
-    return nodes, edges, warn
+    return nodes, edges, warn, weight_basis
 
 
 # Per-lane step lists mirror the lane_* / check_* functions in cmd_check; shown
@@ -4737,7 +4885,7 @@ def _svg_for_graph(nodes, edges):
     import html
 
     _layer, rows, depth = _topo_layout(nodes, edges)
-    NODE_H, V_GAP, H_GAP, TOP, SIDE, CHAR = 48, 64, 30, 30, 44, 7.3
+    NODE_H, V_GAP, H_GAP, TOP, SIDE, CHAR = 52, 64, 30, 30, 44, 7.3
 
     width = {}
     for nid, n in nodes.items():
@@ -4786,7 +4934,8 @@ def _svg_for_graph(nodes, edges):
         stroke, fill = _GRAPH_KIND_COLORS.get(n["kind"], ("#334155", "#e2e8f0"))
         w, gx, gy = width[nid], x[nid], y[nid]
         sub = n.get("sub", "")
-        lbl_y = gy + 19 if sub else gy + 29
+        meter = n.get("meter")
+        lbl_y = gy + 19 if sub else gy + 30
         out.append(f'<g class="node" data-id="{eid(nid)}">')
         out.append(f"<title>{html.escape(n.get('tip') or n['label'])}</title>")
         out.append(
@@ -4799,8 +4948,19 @@ def _svg_for_graph(nodes, edges):
         )
         if sub:
             out.append(
-                f'<text class="sub" x="{gx + w / 2:.1f}" y="{gy + 35:.1f}">'
+                f'<text class="sub" x="{gx + w / 2:.1f}" y="{gy + 34:.1f}">'
                 f"{html.escape(sub)}</text>"
+            )
+        if meter is not None:
+            mx, mw, my = gx + 12, w - 24, gy + NODE_H - 9
+            fillw = max(2.0, mw * max(0.0, min(1.0, meter)))
+            out.append(
+                f'<rect class="meter-bg" x="{mx:.1f}" y="{my:.1f}" width="{mw:.1f}" '
+                f'height="3.5" rx="1.75" fill="#0b1220" opacity="0.35"/>'
+            )
+            out.append(
+                f'<rect class="meter" x="{mx:.1f}" y="{my:.1f}" width="{fillw:.1f}" '
+                f'height="3.5" rx="1.75" fill="{stroke}"/>'
             )
         out.append("</g>")
     out.append("</svg>")
@@ -4869,7 +5029,8 @@ document.querySelectorAll('svg.graph').forEach(function (svg) {
 """
 
 
-def _render_graph_html(build_svg, build_warn, check_svg, kinds_used, meta_line):
+def _render_graph_html(build_svg, build_warn, check_svg, kinds_used, meta_line,
+                       weight_basis="lines of code"):
     import html
 
     legend_items = []
@@ -4897,7 +5058,9 @@ def _render_graph_html(build_svg, build_warn, check_svg, kinds_used, meta_line):
         + '<section><h2>Build pipeline &amp; workspace crate DAG</h2>'
         '<p class="hint">Topological: each node sits below every input it '
         "depends on. Edges point from a dependency down to its dependent; the "
-        "release binary at the bottom embeds the UI bundle.</p>"
+        "release binary at the bottom embeds the UI bundle. The bar under each "
+        f"crate scales with its {html.escape(weight_basis)} — hover for LoC, "
+        "deps, blast radius, and compile time.</p>"
         + warn_html
         + '<div class="scroll">' + build_svg + "</div></section>"
         + '<section><h2><code>./dev.py check</code> lane graph</h2>'
@@ -4909,9 +5072,10 @@ def _render_graph_html(build_svg, build_warn, check_svg, kinds_used, meta_line):
 
 
 def cmd_graph(out: "Path | None" = None, serve: bool = False,
-              port: "int | None" = None, open_browser: bool = False) -> None:
+              port: "int | None" = None, open_browser: bool = False,
+              timings: bool = False) -> None:
     """Emit the project build graph as a self-contained HTML page."""
-    bnodes, bedges, bwarn = _build_pipeline_model()
+    bnodes, bedges, bwarn, weight_basis = _build_pipeline_model(with_timings=timings)
     cnodes, cedges = _check_graph_model()
     build_svg = _svg_for_graph(bnodes, bedges)
     check_svg = _svg_for_graph(cnodes, cedges)
@@ -4923,7 +5087,8 @@ def cmd_graph(out: "Path | None" = None, serve: bool = False,
     when = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     meta_line = f"HEAD {sha} · generated {when}"
     kinds_used = {n["kind"] for n in {**bnodes, **cnodes}.values()}
-    page = _render_graph_html(build_svg, bwarn, check_svg, kinds_used, meta_line)
+    page = _render_graph_html(build_svg, bwarn, check_svg, kinds_used,
+                              meta_line, weight_basis)
     page_bytes = page.encode("utf-8")
 
     if serve:
@@ -6725,6 +6890,11 @@ def main():
         "--open", dest="open_browser", action="store_true",
         help="Open the result in a browser",
     )
+    graph_parser.add_argument(
+        "--timings", action="store_true",
+        help="Measure real per-crate compile time (recompiles the workspace "
+             "with cargo --timings; slow). Default weight is lines of code.",
+    )
 
     # seed (offline)
     sub.add_parser("seed", help="Populate dev DB with representative conversations (offline; refuses if Phoenix is running)")
@@ -6809,7 +6979,7 @@ def main():
     elif args.command == "graph":
         cmd_graph(
             out=args.out, serve=args.serve, port=args.port,
-            open_browser=args.open_browser,
+            open_browser=args.open_browser, timings=args.timings,
         )
     elif args.command == "seed":
         cmd_seed()
