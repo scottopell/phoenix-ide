@@ -566,6 +566,7 @@ mod tests {
             ConvState::Error {
                 message: "overloaded".into(),
                 error_kind: ErrorKind::ServerOverloaded,
+                resets_at: None,
             }
         }
         fn tool_call() -> ToolCall {
@@ -911,6 +912,14 @@ pub enum ConvState {
     Error {
         message: String,
         error_kind: ErrorKind,
+        /// Upstream quota-window reset time, when known. Populated only for an
+        /// `error_kind == UsageLimitReached` whose 429 carried a `resets_at`;
+        /// the auto-clear sweep returns the conversation to Idle once this
+        /// instant has passed. `None` for every other error.
+        // owned: pre-feature error rows had no reset time; None is correct,
+        // no migration owed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
 
     /// Recovery mechanism active — waiting for external resolution (REQ-BED-030).
@@ -1020,6 +1029,11 @@ pub enum CoreState {
     Error {
         message: String,
         error_kind: ErrorKind,
+        /// See `ConvState::Error::resets_at`. Threaded through the
+        /// Core↔Conv mappings so the persisted state carries the
+        /// usage-limit reset time the auto-clear sweep reads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     AwaitingContinuation {
         rejected_tool_calls: Vec<ToolCall>,
@@ -1179,9 +1193,11 @@ impl From<CoreState> for ConvState {
             CoreState::Error {
                 message,
                 error_kind,
+                resets_at,
             } => ConvState::Error {
                 message,
                 error_kind,
+                resets_at,
             },
             CoreState::AwaitingContinuation {
                 rejected_tool_calls,
@@ -1270,9 +1286,11 @@ impl TryFrom<ConvState> for ParentState {
             ConvState::Error {
                 message,
                 error_kind,
+                resets_at,
             } => Ok(ParentState::Core(CoreState::Error {
                 message,
                 error_kind,
+                resets_at,
             })),
             ConvState::AwaitingContinuation {
                 rejected_tool_calls,
@@ -1383,9 +1401,11 @@ impl TryFrom<ConvState> for SubAgentState {
             ConvState::Error {
                 message,
                 error_kind,
+                resets_at,
             } => Ok(SubAgentState::Core(CoreState::Error {
                 message,
                 error_kind,
+                resets_at,
             })),
             ConvState::AwaitingContinuation {
                 rejected_tool_calls,

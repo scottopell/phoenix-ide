@@ -132,6 +132,7 @@ fn arb_error_state() -> impl Strategy<Value = ConvState> {
     ("[a-zA-Z ]{1,30}", arb_error_kind()).prop_map(|(message, error_kind)| ConvState::Error {
         message,
         error_kind,
+        resets_at: None,
     })
 }
 
@@ -479,6 +480,7 @@ proptest! {
         let state = ConvState::Error {
             message,
             error_kind: kind,
+            resets_at: None,
         };
         let event = Event::UserMessage {
             text: "retry".to_string(),

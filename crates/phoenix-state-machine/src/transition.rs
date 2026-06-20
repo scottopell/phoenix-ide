@@ -1402,6 +1402,7 @@ fn handle_core_error_retry(
             CoreEvent::LlmError {
                 message,
                 error_kind,
+                resets_at,
                 ..
             },
         ) => {
@@ -1414,6 +1415,10 @@ fn handle_core_error_retry(
             Ok(CoreTransitionResult::new(CoreState::Error {
                 message: error_message.clone(),
                 error_kind,
+                // Carry the quota-window reset time so the auto-clear sweep can
+                // return the conversation to Idle once the window passes. Only
+                // a usage-limit 429 populates this; None for every other error.
+                resets_at,
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change()))
@@ -1773,6 +1778,7 @@ pub fn transition_parent(
             ParentTransitionResult::new(ParentState::Core(CoreState::Error {
                 message: message.clone(),
                 error_kind: error_kind.clone(),
+                resets_at: None,
             }))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change()),
@@ -2898,18 +2904,19 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at,
             }
         }
-        LlmOutcome::UsageLimitReached {
-            details: _,
-            message,
-        } => {
+        LlmOutcome::UsageLimitReached { details, message } => {
             let attempt = current_attempt(state);
             Event::LlmError {
                 message,
                 error_kind: ErrorKind::UsageLimitReached,
                 attempt,
                 recovery_in_progress: false,
-                // Non-retryable: never reaches Effect::ScheduleRetry.
-                resets_at: None,
+                // Carry the quota-window reset time through to
+                // `ConvState::Error.resets_at` so the auto-clear sweep returns
+                // the conversation to Idle once the window passes. Not used for
+                // retry — usage-limit is non-retryable and never reaches
+                // `Effect::ScheduleRetry`.
+                resets_at: details.resets_at,
             }
         }
         LlmOutcome::ServerError { status, body } => {
@@ -3198,6 +3205,74 @@ mod tests {
         )
     }
 
+    // A usage-limit 429's `resets_at` must survive the outcome→event
+    // conversion. It was previously hardcoded to None here (only retry
+    // scheduling consumed it, and usage-limit is non-retryable); the
+    // auto-clear sweep is the second consumer that depends on it.
+    #[test]
+    fn usage_limit_outcome_threads_resets_at_into_event() {
+        let resets = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let details = phoenix_core::domain::quota_details::QuotaDetails {
+            plan_type: Some("plus".to_string()),
+            resets_at: Some(resets),
+            limit_id: None,
+            limit_name: None,
+            primary: None,
+            secondary: None,
+            credits: None,
+            promo_message: None,
+        };
+        let event = llm_outcome_to_event(
+            LlmOutcome::UsageLimitReached {
+                details,
+                message: "You've hit your usage limit.".to_string(),
+            },
+            &ConvState::LlmRequesting { attempt: 1 },
+        );
+        assert!(
+            matches!(
+                event,
+                Event::LlmError {
+                    error_kind: ErrorKind::UsageLimitReached,
+                    resets_at: Some(t),
+                    ..
+                } if t == resets
+            ),
+            "usage-limit outcome must carry resets_at into the event"
+        );
+    }
+
+    // The reset time must land in the persisted Error state so the sweep can
+    // read it later.
+    #[test]
+    fn usage_limit_error_persists_resets_at_in_error_state() {
+        let resets = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            Event::LlmError {
+                message: "You've hit your usage limit.".to_string(),
+                error_kind: ErrorKind::UsageLimitReached,
+                attempt: 1,
+                recovery_in_progress: false,
+                resets_at: Some(resets),
+            },
+        )
+        .expect("usage-limit LlmError must transition to Error");
+        assert!(
+            matches!(
+                result.new_state,
+                ConvState::Error {
+                    error_kind: ErrorKind::UsageLimitReached,
+                    resets_at: Some(t),
+                    ..
+                } if t == resets
+            ),
+            "usage-limit Error must persist resets_at, got {:?}",
+            result.new_state
+        );
+    }
+
     #[test]
     fn ordinary_llm_auth_recovery_resumes_main_turn() {
         let result = transition(
@@ -3358,6 +3433,7 @@ mod tests {
             ConvState::Error {
                 message,
                 error_kind: ErrorKind::Auth,
+                ..
             } if message == "sign-in failed"
         ));
         assert!(!result
@@ -3573,6 +3649,7 @@ mod tests {
             &ConvState::Error {
                 message: "Previous error".to_string(),
                 error_kind: ErrorKind::Network,
+                resets_at: None,
             },
             &test_context(),
             Event::UserMessage {
@@ -5426,6 +5503,7 @@ mod tests {
         let state = ConvState::Error {
             message: "You've hit your usage limit.".to_string(),
             error_kind: ErrorKind::UsageLimitReached,
+            resets_at: None,
         };
         let result = transition(
             &state,
@@ -5480,6 +5558,7 @@ mod tests {
         let state = ConvState::Error {
             message: "boom".to_string(),
             error_kind: ErrorKind::UsageLimitReached,
+            resets_at: None,
         };
         let result = transition(&state, &test_context(), Event::DismissError)
             .expect("DismissError must be accepted from a resumable Error");
@@ -5502,6 +5581,7 @@ mod tests {
         let state = ConvState::Error {
             message: "bad request".to_string(),
             error_kind: ErrorKind::InvalidRequest,
+            resets_at: None,
         };
         let err = transition(&state, &test_context(), Event::DismissError)
             .expect_err("DismissError must be rejected for a non-resumable Error");

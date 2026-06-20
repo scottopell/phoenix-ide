@@ -918,6 +918,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::DEBUG))
         .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::ERROR));
 
+    // Clear-to-ready sweep: once a usage-limit window elapses, return the
+    // errored conversation to Idle so it is usable again without a manual
+    // dismiss. Detached for the process lifetime; the first tick fires
+    // immediately, clearing any windows already elapsed at startup.
+    tokio::spawn(crate::runtime::usage_limit_sweep::run(
+        state.runtime.clone(),
+    ));
+
     // Hold an Arc to the bash handle registry so the shutdown kill-tree
     // pass (REQ-BASH-007) can reach it after `state` moves into the router.
     let bash_handles_for_shutdown = state.runtime.bash_handles().clone();

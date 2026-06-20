@@ -14,6 +14,7 @@ pub(crate) mod executor;
 pub(crate) mod fork_resolve;
 mod recovery;
 pub mod traits;
+pub mod usage_limit_sweep;
 pub mod user_facing_error;
 
 #[cfg(test)]
