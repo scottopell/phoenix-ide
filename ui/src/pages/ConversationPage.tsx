@@ -1290,6 +1290,34 @@ function ConversationPageContent() {
             });
           }}
         />
+        {/* A resumable error accepts a fresh user message (backend transitions
+            Error -> LlmRequesting). Offer the real composer alongside the
+            banner's quick "retry/continue" so the user is not forced into the
+            canned "continue" turn. Gated on can_user_resume to match the
+            banner: a non-resumable error stays a dead end. */}
+        {(convStateForChildren.error?.can_user_resume ?? false) && (
+          <RenderProfiler id="InputArea">
+          <ConnectedInputArea
+            ref={inputRef}
+            slug={slug!}
+            cwd={conversation.cwd}
+            scopeKey={conversationId}
+            convState={convStateForChildren}
+            images={images}
+            setImages={setImages}
+            files={files}
+            setFiles={setFiles}
+            isOffline={isOffline}
+            failedMessages={failedMessages}
+            convModeLabel={conversation.conv_mode_label}
+            focusToken={focusToken}
+            onSend={handleSend}
+            onCancel={handleCancel}
+            onRetry={handleRetry}
+            onDismissError={dismiss}
+          />
+          </RenderProfiler>
+        )}
         </>
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
