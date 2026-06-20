@@ -1939,14 +1939,22 @@ impl Database {
         }
 
         let new_id = uuid::Uuid::new_v4().to_string();
-        let root_id = self
-            .chain_root_of(parent_id)
-            .await?
-            .unwrap_or_else(|| parent_id.to_string());
-        let root = self.get_conversation(&root_id).await?;
-        let chain_len = self.chain_members_forward(&root_id).await?.len();
-        let root_slug = root.slug.as_deref().unwrap_or("conversation");
-        let mut candidate_slug = format!("{root_slug}-{}", chain_len + 1);
+        // A propose_task handoff spins up a distinct task, so the new
+        // conversation is named after that task's title — not a
+        // "{parent-slug}-N" sequence, which is the context-continuation
+        // scheme and yields a meaningless name here. The agent-authored task
+        // title already carries the intent; reusing it avoids re-deriving a
+        // name (no LLM call needed). The collision loop below appends a
+        // numeric suffix only on slug clash.
+        let base_slug = {
+            let s = schema::slug_from_title(&approval.task_title);
+            if s.is_empty() {
+                "conversation".to_string()
+            } else {
+                s
+            }
+        };
+        let mut candidate_slug = base_slug.clone();
         let mut slug_offset = 0usize;
         let now = Utc::now();
         let now_str = now.to_rfc3339();
@@ -2013,14 +2021,10 @@ impl Database {
                 Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
                     slug_offset += 1;
                     candidate_slug = if slug_offset <= 20 {
-                        format!("{root_slug}-{}", chain_len + 1 + slug_offset)
+                        format!("{base_slug}-{}", slug_offset + 1)
                     } else {
                         let uid = uuid::Uuid::new_v4().to_string();
-                        format!(
-                            "{root_slug}-{}-{}",
-                            chain_len + 1,
-                            uid.get(..8).unwrap_or(&uid)
-                        )
+                        format!("{base_slug}-{}", uid.get(..8).unwrap_or(&uid))
                     };
                 }
                 Err(e) => return Err(DbError::Sqlx(e)),
@@ -7274,6 +7278,10 @@ mod tests {
             successor.state,
             ConvState::SeededLlmRequesting { ref seed_message_id, attempt: 1 } if !seed_message_id.is_empty()
         ));
+        // The successor is named after the approved task, not the parent chain
+        // ("handoff-parent-2" would be the old context-continuation scheme).
+        assert_eq!(successor.slug.as_deref(), Some("approve-fresh"));
+        assert_eq!(successor.title.as_deref(), Some("Approve Fresh"));
         assert_eq!(successor.message_count, 1);
         let successor_messages = db.get_messages(&successor.id).await.unwrap();
         assert_eq!(successor_messages.len(), 1);
@@ -7314,6 +7322,41 @@ mod tests {
                 panic!("successor should be Work mode, got {other:?}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_task_handoff_conversation_name_disambiguates_on_slug_collision() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("collide-parent", "collide-parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        // An unrelated conversation already owns the task title's slug.
+        db.create_conversation("squatter", "refactor-auth-layer", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
+            task_id: "27003".to_string(),
+            task_title: "Refactor Auth Layer".to_string(),
+            branch_name: "task-27003-refactor-auth-layer".to_string(),
+            worktree_path: "/tmp/.phoenix/worktrees/collide-parent".to_string(),
+            base_branch: "main".to_string(),
+            title: "Refactor Auth Layer".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            plan: "Do the work".to_string(),
+            task_file: "tasks/27003-p1-ready--refactor-auth-layer.md".to_string(),
+        };
+
+        let successor = db
+            .create_task_approval_handoff_conversation("collide-parent", &approval)
+            .await
+            .unwrap();
+
+        // Still named off the task title (not the parent), with a numeric
+        // suffix to dodge the occupied slug — never falls back to the
+        // "{parent-slug}-N" scheme.
+        assert_eq!(successor.slug.as_deref(), Some("refactor-auth-layer-2"));
+        assert_eq!(successor.title.as_deref(), Some("Refactor Auth Layer 2"));
     }
 
     /// REQ-CHN-007: a `chain_name` set on the root round-trips through
