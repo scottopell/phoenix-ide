@@ -253,13 +253,16 @@ treated as not under pressure (history is small then). Because the signal is the
 falls after a sweep with no separate "estimate against the prior cleared set"
 bookkeeping.
 
-The signal lags by one turn: a single tool result large enough to jump usage from
-below the trigger to over the window in one turn is not reflected until the next
-turn's reported size. That next turn clears it; the turn that first exceeds the
-window is not recovered by clearing. This is acceptable because clearing exists to
-bend the *gradual* growth curve, and the sudden-jump case is caught by the heavier
-tier — a `ContextWindowExceeded` response drives continuation/summarization, which
-does not depend on the reported-size signal.
+The signal lags by one turn: a single tool result large enough to jump usage
+from below the trigger to over the window in one turn is not reflected until the
+next turn's reported size, so clearing does not fire before that turn's request
+is sent. The over-window request then reaches the same context-exhaustion path a
+gradually-grown conversation reaches — surfaced for compaction/summarization —
+rather than being headed off here. This is not a regression: that path is the
+pre-existing backstop, and before any clearing the gradual case reached it too;
+clearing's contribution is to keep the gradual curve below the wall, not to catch
+a single oversized result — which, landing in the never-cleared recency floor,
+clearing could not remove in any case.
 
 Whether a sweep is *worthwhile* is a separate question, answered with the
 **image-aware** per-result estimator `estimate_tool_result_tokens` (text
