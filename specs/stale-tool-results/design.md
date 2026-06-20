@@ -23,22 +23,19 @@ verdict has nothing to act on there.
 ## One mechanism for text and images (REQ-STR-011)
 
 This pass is the single retention mechanism for tool-result bodies — text and
-images alike. It subsumes the narrower image-only retirement that
-`build_llm_messages_static` performs today via `tool_msg_indices_keeping_images`
-and the `IMAGE_HISTORY_ROUNDS` window, which is removed. Every tool result gets
-one verdict; that verdict governs the result's text and its images together. A
-retained result keeps both; a cleared result replaces its text with a placeholder
-and sends no images.
+images alike. One verdict per tool result governs its text and its images
+together: a retained result keeps both; a cleared result replaces its text with a
+placeholder and sends no images. There is no separate, tighter schedule for
+images.
 
-The image-only window had to go, not just for tidiness, but because it was the
-core cache pathology. It retired images a fixed two rounds behind the newest
-round — a boundary measured *from the tail*, so it advanced by one round every
-turn. Each advance rewrote the tool result two rounds back, and because prompt
-caches reuse only a byte-identical request prefix, that rewrite invalidated the
-cache from two rounds behind the tail through the tail — re-billing the most
-recent, most expensive context on every single turn. The unified mechanism
-removes content only at a boundary that holds still across turns (below), so the
-rewrite happens rarely instead of every turn.
+A separate image-only window would be a cache pathology, which is why retention
+is unified. Retiring images a fixed number of rounds behind the newest round
+measures the boundary *from the tail*, so it advances by one round every turn;
+each advance rewrites a tool result a few rounds back, and because prompt caches
+reuse only a byte-identical request prefix, that rewrite invalidates the cache
+from there through the tail — re-billing the most recent, most expensive context
+every single turn. The watermark removes content only at a boundary that holds
+still across turns (below), so a rewrite happens rarely instead of every turn.
 
 ## The clear watermark (REQ-STR-007)
 
@@ -255,6 +252,14 @@ treated as not under pressure (history is small then). Because the signal is the
 *actual* size sent — which already reflects whatever was cleared last turn — it
 falls after a sweep with no separate "estimate against the prior cleared set"
 bookkeeping.
+
+The signal lags by one turn: a single tool result large enough to jump usage from
+below the trigger to over the window in one turn is not reflected until the next
+turn's reported size. That next turn clears it; the turn that first exceeds the
+window is not recovered by clearing. This is acceptable because clearing exists to
+bend the *gradual* growth curve, and the sudden-jump case is caught by the heavier
+tier — a `ContextWindowExceeded` response drives continuation/summarization, which
+does not depend on the reported-size signal.
 
 Whether a sweep is *worthwhile* is a separate question, answered with the
 **image-aware** per-result estimator `estimate_tool_result_tokens` (text

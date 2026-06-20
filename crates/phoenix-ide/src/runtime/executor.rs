@@ -521,26 +521,46 @@ fn clearable_ids_through_watermark(
 /// history once with the resulting cleared set.
 ///
 /// The failure paths preserve the grow-only guarantee (REQ-STR-007):
-/// - watermark read error → send the uncleared history this turn (a one-turn
-///   cache miss) rather than re-plan from an unknown baseline;
+/// - watermark read error → fall back to `watermark_cache`, the last value this
+///   runtime durably read or wrote, so the cleared set never shrinks and
+///   previously-cleared results are not re-exposed; only if it was never read
+///   (cache empty) is the uncleared history sent;
 /// - usage read error → treat as not under pressure (hold the watermark);
 /// - watermark write error → render the prior watermark's set, matching what is
 ///   durably recorded so the next turn cannot un-clear it.
+///
+/// `watermark_cache` mirrors the durable watermark in memory; it is the runtime's
+/// own state (the runtime is the sole writer for its conversation), so it can
+/// never be staler than the database after a successful read or write.
 async fn assemble_cleared_messages<S: StateStore>(
     storage: &S,
     conv_id: &str,
     db_messages: &[crate::db::Message],
     clearable_names: &std::collections::HashSet<String>,
     context_window: usize,
+    watermark_cache: &std::sync::Mutex<Option<i64>>,
 ) -> Vec<LlmMessage> {
     let prior_watermark = match storage.get_clear_watermark(conv_id).await {
-        Ok(w) => w,
+        Ok(w) => {
+            *watermark_cache.lock().unwrap() = Some(w);
+            w
+        }
         Err(e) => {
-            tracing::warn!(
-                conv_id = %conv_id, error = %e,
-                "failed to read clear watermark; sending uncleared history this turn",
-            );
-            return render_messages(db_messages, &std::collections::HashSet::new());
+            let cached = *watermark_cache.lock().unwrap();
+            return if let Some(w) = cached {
+                tracing::warn!(
+                    conv_id = %conv_id, error = %e, watermark = w,
+                    "failed to read clear watermark; rendering last known cleared set",
+                );
+                let cleared = clearable_ids_through_watermark(db_messages, clearable_names, w);
+                render_messages(db_messages, &cleared)
+            } else {
+                tracing::warn!(
+                    conv_id = %conv_id, error = %e,
+                    "failed to read clear watermark with none cached; sending uncleared history",
+                );
+                render_messages(db_messages, &std::collections::HashSet::new())
+            };
         }
     };
 
@@ -571,6 +591,7 @@ async fn assemble_cleared_messages<S: StateStore>(
             .await
         {
             Ok(()) => {
+                *watermark_cache.lock().unwrap() = Some(plan.new_watermark);
                 tracing::debug!(
                     conv_id = %conv_id,
                     cleared_results = plan.cleared_count,
@@ -799,6 +820,11 @@ where
     /// recomputed on the Explore→Work upgrade, avoiding a registry lock +
     /// `HashSet` rebuild on every LLM dispatch.
     clearable_names: Arc<std::collections::HashSet<String>>,
+    /// In-memory mirror of the durable clear watermark (specs/stale-tool-results).
+    /// This runtime is the sole writer of its conversation's watermark, so the
+    /// cache is authoritative after any successful read/write; a transient
+    /// watermark read failure falls back to it instead of un-clearing history.
+    clear_watermark_cache: Arc<std::sync::Mutex<Option<i64>>>,
     /// Browser session manager for `ToolContext`
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
@@ -1035,6 +1061,7 @@ where
             llm_client: Arc::new(llm_client),
             tool_executor,
             clearable_names,
+            clear_watermark_cache: Arc::new(std::sync::Mutex::new(None)),
             browser_sessions,
             bash_handles,
             tmux_registry,
@@ -3252,6 +3279,7 @@ where
         let llm_client = self.llm_client.clone();
         let tool_executor = self.tool_executor.clone();
         let clearable_names = self.clearable_names.clone();
+        let clear_watermark_cache = self.clear_watermark_cache.clone();
         let storage = self.storage.clone();
         let conv_id = self.context.conversation_id.clone();
         let context_window = self.context.context_window;
@@ -3363,6 +3391,7 @@ where
                 &db_messages,
                 &clearable_names,
                 context_window,
+                &clear_watermark_cache,
             )
             .await;
 
@@ -9089,6 +9118,24 @@ mod stale_tool_result_clearing_tests {
         assert!(plan.cleared_tool_use_ids.is_empty());
     }
 
+    /// Production wraps the tool registry in `Arc`, and the runtime caches the
+    /// clearable set from it. The `Arc<T>` blanket impl must forward
+    /// `clearable_tool_names` — falling back to the empty default would silently
+    /// make nothing clearable, disabling the whole feature in production while
+    /// the planner unit tests (which pass the set directly) stay green.
+    #[tokio::test]
+    async fn arc_tool_executor_forwards_clearable_tool_names() {
+        use crate::runtime::testing::MockToolExecutor;
+        use crate::runtime::traits::ToolExecutor;
+
+        let arc: Arc<MockToolExecutor> =
+            Arc::new(MockToolExecutor::new().with_clearable_tool("bash"));
+        assert!(
+            arc.clearable_tool_names().contains("bash"),
+            "Arc<T> must forward clearable_tool_names, not use the empty default",
+        );
+    }
+
     /// True if `tool_use_id` is rendered as a cleared placeholder (no images).
     fn is_rendered_cleared(messages: &[LlmMessage], tool_use_id: &str) -> bool {
         messages.iter().any(|m| {
@@ -9114,8 +9161,9 @@ mod stale_tool_result_clearing_tests {
         add_round(&storage, conv, "r3", "read_file", 1).await;
         storage.set_last_prompt_tokens(conv, 12_000); // > trigger (0.7 * 1000)
         let db = storage.get_messages(conv).await.unwrap();
+        let cache = std::sync::Mutex::new(None);
 
-        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000).await;
+        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
         assert!(
             is_rendered_cleared(&messages, &old),
             "old round rendered as placeholder"
@@ -9126,10 +9174,10 @@ mod stale_tool_result_clearing_tests {
         );
     }
 
-    /// assemble path, watermark read failure: send uncleared history this turn
-    /// rather than re-plan from an unknown baseline (REQ-STR-007).
+    /// assemble path, watermark read failure with nothing cached: send the
+    /// uncleared history rather than re-plan from an unknown baseline (REQ-STR-007).
     #[tokio::test]
-    async fn assemble_read_failure_sends_uncleared() {
+    async fn assemble_read_failure_with_empty_cache_sends_uncleared() {
         let storage = Arc::new(InMemoryStorage::new());
         let conv = "asm-readfail";
         let names = clearable(&["read_file"]);
@@ -9140,11 +9188,42 @@ mod stale_tool_result_clearing_tests {
         storage.set_last_prompt_tokens(conv, 12_000);
         storage.set_fail_watermark_read(true);
         let db = storage.get_messages(conv).await.unwrap();
+        let cache = std::sync::Mutex::new(None);
 
-        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000).await;
+        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
         assert!(
             !is_rendered_cleared(&messages, &old),
-            "read failure → nothing cleared this turn",
+            "read failure with empty cache → nothing cleared this turn",
+        );
+    }
+
+    /// assemble path, watermark read failure *after* a prior successful turn: the
+    /// in-memory cache holds the advanced watermark, so previously-cleared
+    /// results stay cleared rather than being re-exposed (REQ-STR-007).
+    #[tokio::test]
+    async fn assemble_read_failure_preserves_cached_cleared_set() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "asm-readfail-cached";
+        let names = clearable(&["read_file"]);
+        let old = add_round(&storage, conv, "old", "read_file", 6).await;
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+        storage.set_last_prompt_tokens(conv, 12_000);
+        let db = storage.get_messages(conv).await.unwrap();
+        let cache = std::sync::Mutex::new(None);
+
+        // Turn 1: a real sweep advances and caches the watermark; `old` is cleared.
+        let first = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        assert!(is_rendered_cleared(&first, &old));
+
+        // Turn 2: the watermark read fails, but the cache holds the advanced
+        // value, so the previously-cleared result stays cleared.
+        storage.set_fail_watermark_read(true);
+        let second = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
+        assert!(
+            is_rendered_cleared(&second, &old),
+            "read failure must preserve the cached cleared set, not un-clear it",
         );
     }
 
@@ -9162,8 +9241,9 @@ mod stale_tool_result_clearing_tests {
         storage.set_last_prompt_tokens(conv, 12_000);
         storage.set_fail_watermark_write(true);
         let db = storage.get_messages(conv).await.unwrap();
+        let cache = std::sync::Mutex::new(None);
 
-        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000).await;
+        let messages = assemble_cleared_messages(&*storage, conv, &db, &names, 1_000, &cache).await;
         assert!(
             !is_rendered_cleared(&messages, &old),
             "write failure → prior (empty) cleared set rendered, not the failed advance",
