@@ -148,24 +148,15 @@ fn enrich_content(msg: &Message) -> Value {
 
 /// `display_data` shape: `{ "bash": [{ "tool_use_id": "...", "display": "..." }] }`.
 /// Mutates `content` to set `display` on matching bash `tool_use` blocks.
+///
+/// The `bash` array is small (one entry per bash tool call in the turn), so a
+/// linear scan per block is cheaper than building a lookup map and avoids the
+/// per-message `HashMap` plus its key/value `String` allocations.
 fn merge_bash_displays_into_content(content: &mut Value, display_data: &Value) {
-    use std::collections::HashMap;
-
-    let bash_displays: HashMap<String, String> = display_data
-        .get("bash")
-        .and_then(|b| b.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    let id = item.get("tool_use_id")?.as_str()?;
-                    let display = item.get("display")?.as_str()?;
-                    Some((id.to_string(), display.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if bash_displays.is_empty() {
+    let Some(bash) = display_data.get("bash").and_then(Value::as_array) else {
+        return;
+    };
+    if bash.is_empty() {
         return;
     }
 
@@ -179,12 +170,22 @@ fn merge_bash_displays_into_content(content: &mut Value, display_data: &Value) {
         if !is_bash_tool_use {
             continue;
         }
-        let Some(id) = block.get("id").and_then(|i| i.as_str()).map(String::from) else {
-            continue;
-        };
-        if let Some(display) = bash_displays.get(&id) {
+        // Resolve the display string while `block` is borrowed immutably; the
+        // borrow ends before the mutable `as_object_mut` below. `next_back()`
+        // preserves the prior map-based last-wins behaviour for the (data-bug)
+        // case of a duplicated `tool_use_id`.
+        let display = block.get("id").and_then(Value::as_str).and_then(|id| {
+            bash.iter()
+                .filter_map(|item| {
+                    let tid = item.get("tool_use_id")?.as_str()?;
+                    (tid == id).then(|| item.get("display")?.as_str()).flatten()
+                })
+                .next_back()
+                .map(str::to_string)
+        });
+        if let Some(display) = display {
             if let Some(obj) = block.as_object_mut() {
-                obj.insert("display".to_string(), Value::String(display.clone()));
+                obj.insert("display".to_string(), Value::String(display));
             }
         }
     }
