@@ -348,18 +348,21 @@ fn is_exempt_path(path: &str) -> bool {
         return true;
     }
 
-    // Static assets: SPA routes, JS/CSS bundles, images, service worker, favicon
-    if path == "/"
-        || path == "/new"
-        || path == "/codex/login"
-        || path == "/about"
-        || path == "/usage"
-        || path.starts_with("/c/")
-        || path.starts_with("/assets/")
+    // Public static assets — the same bundle for every user, no secrets.
+    if path.starts_with("/assets/")
         || path == "/service-worker.js"
         || path == "/phoenix.svg"
         || path == "/version"
     {
+        return true;
+    }
+
+    // SPA client routes (`/`, `/new`, `/c/:slug`, …). Exempting them serves the
+    // public shell so a direct load / refresh / bookmark renders the in-app
+    // login screen instead of 401ing before React mounts. The set comes from
+    // the same `SPA_ROUTES` the router registers (see `api::spa_routes`), so the
+    // router and this exemption cannot drift — the recurring 404/401 bug class.
+    if super::spa_routes::is_spa_route(path) {
         return true;
     }
 
@@ -577,6 +580,10 @@ mod tests {
     fn exempt_paths_are_correct() {
         assert!(is_exempt_path("/"));
         assert!(is_exempt_path("/new"));
+        // Direct loads of the home terminal and chain deep links must serve the
+        // SPA shell, not 401 — these mirror the serve_spa routes in handlers.rs.
+        assert!(is_exempt_path("/terminal"));
+        assert!(is_exempt_path("/chains/root-conv-id"));
         assert!(is_exempt_path("/codex/login"));
         assert!(is_exempt_path("/about"));
         assert!(is_exempt_path("/usage"));
@@ -596,6 +603,26 @@ mod tests {
         // Preview is NOT auth-exempt: it serves on-disk files and must sit
         // behind auth. The same-origin sandboxed iframe carries the cookie.
         assert!(!is_exempt_path("/preview/some/file.html"));
+    }
+
+    /// CBC guard: every route the router serves as the SPA shell must also be
+    /// auth-exempt, so a direct load renders the login screen rather than
+    /// 401ing. Both derive from `SPA_ROUTES`; this pins that the auth side
+    /// actually consumes it (a refactor dropping the `is_spa_route` call fails
+    /// here, not in production behind a password).
+    #[test]
+    fn every_spa_route_is_auth_exempt() {
+        use super::super::spa_routes::{SpaRoute, SPA_ROUTES};
+        for route in SPA_ROUTES {
+            let sample = match route {
+                SpaRoute::Exact(p) => (*p).to_string(),
+                SpaRoute::Param { prefix, .. } => format!("{prefix}sample-param"),
+            };
+            assert!(
+                is_exempt_path(&sample),
+                "SPA route {sample} is served by the router but not auth-exempt"
+            );
+        }
     }
 
     async fn test_store() -> SessionStore {

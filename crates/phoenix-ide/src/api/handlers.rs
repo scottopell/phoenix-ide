@@ -64,21 +64,11 @@ use tokio::io::AsyncWriteExt;
 
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
-        // Root serves the SPA
-        .route("/", get(serve_spa))
-        // Deep links to conversations
-        .route("/c/:slug", get(serve_spa))
-        // New conversation page
-        .route("/new", get(serve_spa))
-        // Dedicated home-terminal page (SPA-rendered)
-        .route("/terminal", get(serve_spa))
-        // Codex/ChatGPT login page (SPA-rendered)
-        .route("/codex/login", get(serve_spa))
-        // About this deployment page (SPA-rendered)
-        .route("/about", get(serve_spa))
-        // Usage analytics page (SPA-rendered)
-        .route("/usage", get(serve_spa))
+    // The SPA client routes (`/`, `/new`, `/c/:slug`, …) are registered below
+    // from `spa_routes::SPA_ROUTES` — the single source of truth shared with the
+    // auth exemption (`auth::is_exempt_path`) so the two cannot drift. Adding a
+    // React route means adding one entry there, not here.
+    let router = Router::new()
         // Service worker
         .route("/service-worker.js", get(serve_service_worker))
         // Favicon (referenced from index.html)
@@ -361,7 +351,18 @@ pub fn create_router(state: AppState) -> Router {
             "/api/share/:token/conversation",
             get(get_shared_conversation),
         )
-        .route("/api/share/:token/events", get(shared_sse_stream))
+        .route("/api/share/:token/events", get(shared_sse_stream));
+
+    // Register every SPA client route to serve the index.html shell, from the
+    // single source of truth. These must be added before the auth layer below
+    // so the middleware (which exempts them via the same SPA_ROUTES) wraps them.
+    let router = super::spa_routes::SPA_ROUTES
+        .iter()
+        .fold(router, |router, route| {
+            router.route(route.pattern(), get(serve_spa))
+        });
+
+    router
         // Auth middleware — runs before all route handlers (REQ-AUTH-001)
         .layer(middleware::from_fn_with_state(
             state.clone(),

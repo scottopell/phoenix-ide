@@ -16,6 +16,7 @@ mod lifecycle_handlers;
 mod local_reveal;
 mod pr_monitoring;
 mod process_sample;
+mod spa_routes;
 mod sse;
 mod terminal_ws;
 mod types;
