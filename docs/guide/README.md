@@ -34,20 +34,26 @@ unwritten page would 404 on GitHub.)
 - [Conversations](concepts/conversations.md) — the primary unit of work
 - [Modes](concepts/modes.md) — Direct, Explore, Work, Branch
 - [Tasks](concepts/tasks.md) — the plan that gates Explore → Work
+- [Sub-agents](concepts/sub-agents.md) — child conversations, run in parallel
+- [Workspace](concepts/workspace.md) — the worktree and its live resources
 - [Chains](concepts/chains.md) — continuation runs, queryable as a unit
-- Overview, Sub-agents, Skills, Workspace, Permissions, Providers — *(planned)*
+- Overview, Skills, Permissions, Providers — *(planned)*
 
 ## How-to
 
+- [Getting started](howto/getting-started.md) — your first conversation
 - [Run a managed task](howto/run-a-managed-task.md) — Explore → approve → Work → PR
-- Getting started, Spawn sub-agents, Use the terminal, Review changes, Share read-only, Steer a running agent, Compose with references, Search conversations, Voice input — *(planned)*
+- [Spawn sub-agents](howto/spawn-sub-agents.md) — fan work out in parallel
+- [Compose with references](howto/compose-with-references.md) — `@file` `/skill` `./path`
+- Use the terminal, Review changes, Share read-only, Steer a running agent, Search conversations, Voice input — *(planned)*
 
 ## Reference
 
 - [Managed lifecycle states](reference/managed-lifecycle-states.md) — approval & Done? bar states
 - [Glossary](reference/glossary.md) — canonical term registry
+- [Input grammar](reference/input-grammar.md) — `@file` `/skill` `./path`
 - [bash](reference/tools/bash.md) — and more tool cards *(planned)*
-- Keyboard shortcuts, Input grammar, Modes matrix, Conversation states, Command palette — *(planned)*
+- Keyboard shortcuts, Modes matrix, Conversation states, Command palette — *(planned)*
 
 ---
 

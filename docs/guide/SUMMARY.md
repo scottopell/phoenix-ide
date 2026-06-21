@@ -15,23 +15,23 @@ written.
 - [Conversations](concepts/conversations.md)
 - [Modes](concepts/modes.md)
 - [Tasks](concepts/tasks.md)
-- Sub-agents — `concepts/sub-agents.md` *(planned)*
+- [Sub-agents](concepts/sub-agents.md)
 - Skills — `concepts/skills.md` *(planned)*
 - [Chains](concepts/chains.md)
-- Workspace — `concepts/workspace.md` *(planned)*
+- [Workspace](concepts/workspace.md)
 - Permissions — `concepts/permissions.md` *(planned)*
 - Providers & models — `concepts/providers.md` *(planned)*
 
 # How-to
 
-- Getting started — `howto/getting-started.md` *(planned)*
+- [Getting started](howto/getting-started.md)
 - [Run a managed task](howto/run-a-managed-task.md)
-- Spawn sub-agents — `howto/spawn-sub-agents.md` *(planned)*
+- [Spawn sub-agents](howto/spawn-sub-agents.md)
 - Use the terminal — `howto/use-the-terminal.md` *(planned)*
 - Review changes — `howto/review-changes.md` *(planned)*
 - Share read-only — `howto/share-read-only.md` *(planned)*
 - Steer a running agent — `howto/steer-a-running-agent.md` *(planned)*
-- Compose with references — `howto/compose-with-references.md` *(planned)*
+- [Compose with references](howto/compose-with-references.md)
 - Search conversations — `howto/search-conversations.md` *(planned)*
 - Voice input — `howto/voice-input.md` *(planned)*
 
@@ -41,8 +41,8 @@ written.
 - [Glossary](reference/glossary.md) — canonical term registry
 - [bash](reference/tools/bash.md)
 - Tool cards (patch, keyword_search, browse, tmux, spawn_agents, ask_user_question, skill, propose_task, …) — `reference/tools/` *(planned)*
+- [Input grammar](reference/input-grammar.md)
 - Keyboard shortcuts — `reference/keyboard.md` *(planned)*
-- Input grammar — `reference/input-grammar.md` *(planned)*
 - Modes matrix — `reference/modes-matrix.md` *(planned)*
 - Conversation states — `reference/states.md` *(planned)*
 - Command palette — `reference/command-palette.md` *(planned)*

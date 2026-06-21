@@ -67,5 +67,6 @@ follow live output (and resource usage) in the **process inspector** panel.
 
 ## Related
 
+- [Workspace](../../concepts/workspace.md) — what "per workspace" means for the handle cap
 - [Modes](../../concepts/modes.md) — why bash is read-only in Explore
 - [Glossary](../glossary.md) — canonical terms (handle, WorkScope)
