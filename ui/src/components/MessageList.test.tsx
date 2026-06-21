@@ -2,7 +2,7 @@ import '../index.css';
 import { readFileSync } from 'node:fs';
 import { createRef, forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react';
 import { describe, expect, it, vi } from 'vitest';
-import { render, waitFor, act } from '@testing-library/react';
+import { render, waitFor, act, fireEvent } from '@testing-library/react';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
 import { ConversationContext } from '../conversation/ConversationContext';
@@ -59,16 +59,19 @@ vi.mock('./MessageContextMenu', () => ({
 //   - per-unit component dispatch
 //   - keyed in-place reconciliation across the pending → sent transition
 vi.mock('react-virtuoso', () => ({
-  Virtuoso: forwardRef(<T,>({
+  Virtuoso: forwardRef(<T, C>({
     data,
+    context,
     itemContent,
     components,
     computeItemKey,
     scrollerRef,
   }: {
     data: T[];
-    itemContent: (index: number, data: T) => React.ReactNode;
-    components?: { Header?: React.ComponentType };
+    context?: C;
+    itemContent: (index: number, data: T, context: C) => React.ReactNode;
+    // Mirror the real component's typing: slot components receive `context`.
+    components?: { Header?: React.ComponentType<{ context: C }> };
     computeItemKey?: (index: number, data: T) => React.Key;
     scrollerRef?: (ref: HTMLElement | Window | null) => void;
   }, ref: React.Ref<{ scrollToIndex: (options: unknown) => void }>) => {
@@ -85,10 +88,10 @@ vi.mock('react-virtuoso', () => ({
         ref={containerRef}
         style={{ overflowY: 'auto', height: '100%' }}
       >
-        {Header && <Header />}
+        {Header && <Header context={context as C} />}
         {data.map((item, i) => {
           const key = computeItemKey ? computeItemKey(i, item) : i;
-          return <div key={key}>{itemContent(i, item)}</div>;
+          return <div key={key}>{itemContent(i, item, context as C)}</div>;
         })}
       </div>
     );
@@ -387,5 +390,42 @@ describe('MessageList', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // Toggling the system prompt must not change the Virtuoso Header slot's
+  // component *type*, only its props. A type swap forces Virtuoso to
+  // unmount/remount the slot and recompute total list height — a visible
+  // scroll hitch. We prove the absence of a remount by stamping a marker on
+  // the live header node and asserting it survives the expand toggle.
+  it('keeps the system-prompt Header slot mounted across expansion toggles', () => {
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-sysprompt"
+          systemPrompt="SENTINEL SYSTEM PROMPT"
+        />,
+      ),
+    );
+
+    const block = container.querySelector<HTMLElement>('.system-prompt-block');
+    expect(block).not.toBeNull();
+    // Collapsed initially: the prompt body is not in the DOM.
+    expect(container.querySelector('.system-prompt-content')).toBeNull();
+
+    // Stamp the live node; a remount would discard this DOM element.
+    block!.dataset['persistMarker'] = 'kept';
+
+    fireEvent.click(container.querySelector('.system-prompt-header')!);
+
+    const afterToggle = container.querySelector<HTMLElement>('.system-prompt-block');
+    expect(afterToggle?.dataset['persistMarker']).toBe('kept');
+    expect(container.querySelector('.system-prompt-content')).toHaveTextContent(
+      'SENTINEL SYSTEM PROMPT',
+    );
   });
 });

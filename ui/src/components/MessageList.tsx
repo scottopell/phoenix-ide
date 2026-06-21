@@ -227,6 +227,53 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
   );
 });
 
+// Per-conversation data the Virtuoso slot components need. Threaded through
+// virtuoso's `context` prop so the slot *component types* can stay stable —
+// see `VIRTUOSO_COMPONENTS`.
+interface MessageListContext {
+  systemPrompt: string | undefined;
+  systemPromptExpanded: boolean;
+  toggleSystemPrompt: () => void;
+}
+
+// Virtuoso slot component types are defined once at module scope so their
+// identity never changes across renders. A slot whose component *type* is
+// recreated per render (e.g. a closure built inside a render-time useMemo that
+// depends on system-prompt expansion) forces virtuoso to unmount/remount that
+// slot and recompute total list height — a visible scroll hitch. The
+// per-conversation data instead arrives via virtuoso's `context` prop, which
+// changes the slot's props without changing its type.
+function VirtuosoHeaderSlot({ context }: { context?: MessageListContext }) {
+  if (!context?.systemPrompt) return null;
+  return (
+    <SystemPromptHeader
+      systemPrompt={context.systemPrompt}
+      expanded={context.systemPromptExpanded}
+      onToggle={context.toggleSystemPrompt}
+    />
+  );
+}
+
+// Empty-state UI lives in virtuoso's `EmptyPlaceholder` slot rather than a
+// parallel branch, so that a systemPrompt (rendered as virtuoso's Header) stays
+// visible alongside the "Start a conversation" affordance for a freshly-opened
+// conversation with a system prompt and no messages yet.
+function VirtuosoEmptySlot() {
+  return (
+    <div className="empty-state">
+      <div className="empty-state-icon"><MessageSquareIcon /></div>
+      <p>Start a conversation</p>
+    </div>
+  );
+}
+
+const VIRTUOSO_COMPONENTS: NonNullable<
+  VirtuosoProps<RenderUnit, MessageListContext>['components']
+> = {
+  Header: VirtuosoHeaderSlot,
+  EmptyPlaceholder: VirtuosoEmptySlot,
+};
+
 function MessageListImpl({
   messages,
   pendingMessages,
@@ -580,17 +627,13 @@ function MessageListImpl({
     setSystemPromptExpanded((v) => !v);
   }, []);
 
-  const SystemPromptHeaderSlot = useMemo(() => {
-    if (!systemPrompt) return undefined;
-    const Header = () => (
-      <SystemPromptHeader
-        systemPrompt={systemPrompt}
-        expanded={systemPromptExpanded}
-        onToggle={toggleSystemPrompt}
-      />
-    );
-    return Header;
-  }, [systemPrompt, systemPromptExpanded, toggleSystemPrompt]);
+  // Per-conversation data for the stable Virtuoso slot component types
+  // (`VIRTUOSO_COMPONENTS`). Only its *reference* changes when expansion
+  // toggles — the slot types do not, so no slot remount / list-height recompute.
+  const virtuosoContext = useMemo<MessageListContext>(
+    () => ({ systemPrompt, systemPromptExpanded, toggleSystemPrompt }),
+    [systemPrompt, systemPromptExpanded, toggleSystemPrompt],
+  );
 
   const itemContent = useCallback(
     (_index: number, unit: RenderUnit) => (
@@ -606,33 +649,6 @@ function MessageListImpl({
     [],
   );
 
-  // Empty-state UI lives in virtuoso's `EmptyPlaceholder` slot rather than
-  // a parallel branch, so that systemPrompt (rendered as virtuoso's
-  // Header) stays visible alongside the "Start a conversation" affordance
-  // for a freshly-opened conversation with a system prompt and no
-  // messages yet. The previous parallel-branch approach hid the empty
-  // state once a system prompt loaded, which surprised users opening a
-  // new conversation.
-  const EmptyPlaceholder = useMemo(() => {
-    const Component = () => (
-      <div className="empty-state">
-        <div className="empty-state-icon"><MessageSquareIcon /></div>
-        <p>Start a conversation</p>
-      </div>
-    );
-    return Component;
-  }, []);
-
-  const virtuosoComponents = useMemo<NonNullable<VirtuosoProps<RenderUnit, unknown>['components']>>(() => {
-    const components: NonNullable<VirtuosoProps<RenderUnit, unknown>['components']> = {
-      EmptyPlaceholder,
-    };
-    if (SystemPromptHeaderSlot) {
-      components.Header = SystemPromptHeaderSlot;
-    }
-    return components;
-  }, [EmptyPlaceholder, SystemPromptHeaderSlot]);
-
   return (
     <main id="main-area" className="chat-main-area">
       <section id="chat-view" className="view active">
@@ -641,6 +657,7 @@ function MessageListImpl({
           ref={virtuosoRef}
           scrollerRef={handleScrollerRef}
           data={allUnits}
+          context={virtuosoContext}
           itemContent={itemContent}
           computeItemKey={computeItemKey}
           followOutput="auto"
@@ -659,7 +676,7 @@ function MessageListImpl({
             : {})}
           alignToBottom
           increaseViewportBy={{ top: 600, bottom: 600 }}
-          components={virtuosoComponents}
+          components={VIRTUOSO_COMPONENTS}
           className="message-virtuoso"
         />
       </section>
