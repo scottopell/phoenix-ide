@@ -61,6 +61,7 @@ pub const SPA_ROUTES: &[SpaRoute] = &[
     SpaRoute::Exact("/about"),
     SpaRoute::Exact("/usage"),
     SpaRoute::Exact("/settings/llm-language"),
+    SpaRoute::Exact("/help"),
     SpaRoute::Exact("/codex/login"),
     SpaRoute::Param {
         prefix: "/c/",
@@ -89,6 +90,7 @@ mod tests {
         assert!(is_spa_route("/about"));
         assert!(is_spa_route("/usage"));
         assert!(is_spa_route("/settings/llm-language"));
+        assert!(is_spa_route("/help"));
         assert!(is_spa_route("/codex/login"));
         assert!(is_spa_route("/c/some-slug"));
         assert!(is_spa_route("/chains/root-conv-id"));

@@ -48,6 +48,9 @@ const TerminalPage = lazy(() =>
 const LlmLanguagePage = lazy(() =>
   import('./pages/LlmLanguagePage').then((m) => ({ default: m.LlmLanguagePage })),
 );
+const HelpPage = lazy(() =>
+  import('./pages/HelpPage').then((m) => ({ default: m.HelpPage })),
+);
 const GroundingPanelFixturePage = import.meta.env.DEV
   ? lazy(() => import('./pages/GroundingPanelFixturePage').then((m) => ({ default: m.GroundingPanelFixturePage })))
   : null;
@@ -104,6 +107,7 @@ function AppRoutes() {
                 <Route path="/about" element={<AboutDeploymentPage />} />
                 <Route path="/usage" element={<UsagePage />} />
                 <Route path="/settings/llm-language" element={<LlmLanguagePage />} />
+                <Route path="/help" element={<HelpPage />} />
               </Routes>
             </DesktopLayout>
           } />

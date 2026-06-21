@@ -14,6 +14,12 @@ use std::path::PathBuf;
 #[folder = "../../ui/dist"]
 struct Assets;
 
+/// The user guide (`docs/guide/`), embedded so the in-app `/help` page can render
+/// it without a checkout. Read-only markdown + the `SUMMARY.md` manifest.
+#[derive(Embed)]
+#[folder = "../../docs/guide"]
+struct DocsGuide;
+
 /// Serve embedded static files, with filesystem fallback for development
 pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
@@ -33,6 +39,48 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
     if fs_path.exists() {
         if let Ok(content) = std::fs::read(&fs_path) {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime.as_ref())
+                .body(Body::from(content))
+                .unwrap();
+        }
+    }
+
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::from("Not found"))
+        .unwrap()
+}
+
+/// Serve an embedded user-guide doc (`docs/guide/<path>`) for the in-app help
+/// page. Read-only: `DocsGuide::get` only resolves files baked in at build time,
+/// so unknown paths 404 and there is no path-traversal surface; the `..` guard
+/// covers the dev filesystem fallback below.
+pub async fn serve_help_file(req: Request<Body>) -> impl IntoResponse {
+    let rel = req.uri().path().trim_start_matches("/api/help/");
+    if rel.is_empty() || rel.contains("..") {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("Not found"))
+            .unwrap();
+    }
+
+    // Embedded (production / release build)
+    if let Some(content) = DocsGuide::get(rel) {
+        let mime = mime_guess::from_path(rel).first_or_octet_stream();
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, mime.as_ref())
+            .body(Body::from(content.data.to_vec()))
+            .unwrap();
+    }
+
+    // Filesystem fallback (development, server run from the repo root)
+    let fs_path = PathBuf::from("docs/guide").join(rel);
+    if fs_path.exists() {
+        if let Ok(content) = std::fs::read(&fs_path) {
+            let mime = mime_guess::from_path(rel).first_or_octet_stream();
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime.as_ref())

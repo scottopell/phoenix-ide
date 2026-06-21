@@ -18,6 +18,12 @@ export function createBuiltInActions(opts: {
       category: 'Navigation',
       handler: () => opts.navigate('/'),
     },
+    {
+      id: 'open-user-guide',
+      title: 'Open User Guide',
+      category: 'Help',
+      handler: () => opts.navigate('/help'),
+    },
   ];
 
   if (opts.currentSlug && opts.archiveCurrent) {

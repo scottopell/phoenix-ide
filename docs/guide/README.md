@@ -20,10 +20,10 @@ It is organized in three layers. Start wherever your question lives:
 - **[Reference](#reference)** — *exact flags, keys, states, and limits.* Dense
   lookup cards for when you already know what you want.
 
-> This page and every page under it render both on GitHub and inside Phoenix
-> (`?` for the quick overlay, or open the full Help page from the command
-> palette). The [`SUMMARY.md`](SUMMARY.md) manifest is the table of contents
-> both renderers read.
+> This page and every page under it render both on GitHub and inside Phoenix —
+> open the in-app guide from the command palette (**Open User Guide**) or
+> **Settings → User guide**. The [`SUMMARY.md`](SUMMARY.md) manifest is the table
+> of contents both renderers read.
 
 Linked entries are written; the rest are `*(planned)*` and listed in
 [`SUMMARY.md`](SUMMARY.md). (Planned pages aren't linked here — a link to an

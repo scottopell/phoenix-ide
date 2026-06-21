@@ -3,7 +3,9 @@
 //!
 //! REQ-API-001 through REQ-API-010
 
-use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
+use super::assets::{
+    get_index_html, serve_favicon, serve_help_file, serve_service_worker, serve_static,
+};
 use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, regenerate_chain_name, set_chain_name,
     stream_chain, submit_chain_question,
@@ -88,6 +90,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/phoenix.svg", get(serve_favicon))
         // Static assets (embedded or filesystem fallback)
         .route("/assets/*path", get(serve_static))
+        // User guide markdown (docs/guide/) for the in-app /help page
+        .route("/api/help/*path", get(serve_help_file))
         // Preview: serves files from absolute paths so relative references work
         .route("/preview/*filepath", get(serve_preview_file))
         // Conversation listing (REQ-API-001)

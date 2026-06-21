@@ -174,6 +174,14 @@ export function SettingsDropdown({
             <button
               type="button"
               className="settings-inline-btn settings-about-link"
+              onClick={() => { setOpen(false); navigate('/help'); }}
+              title="User guide and documentation"
+            >
+              User guide →
+            </button>
+            <button
+              type="button"
+              className="settings-inline-btn settings-about-link"
               onClick={() => { setOpen(false); navigate('/usage'); }}
               title="Token usage and cost"
             >
