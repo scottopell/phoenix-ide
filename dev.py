@@ -4585,7 +4585,9 @@ def _collect_crate_timings(crates: "list[str]") -> "dict | None":
     for c in crates:
         clean += ["-p", c]
     subprocess.run(clean, cwd=ROOT, capture_output=True)
-    print("  building workspace with --timings (recompiles every crate)…")
+    # stderr: keeps a `graph --format json --timings` stdout pipe pure JSON.
+    print("  building workspace with --timings (recompiles every crate)…",
+          file=sys.stderr)
     build = subprocess.run(
         ["cargo", "build", "--timings"], cwd=ROOT, capture_output=True, text=True,
     )
@@ -4781,6 +4783,7 @@ _GRAPH_CATEGORY_LABELS = {
     "SPECS": "SPECS · specs/",
     "ASTGREP": "ASTGREP · ast-grep-rules/",
     "E2E": "E2E · tests/e2e/",
+    "SELF": "SELF · dev.py",
 }
 
 
@@ -4794,6 +4797,15 @@ def _check_graph_model():
         "sub": "every check run",
         "tip": "Sub-second, correctness-sensitive lanes that run on every "
                "invocation regardless of which paths changed.",
+    }
+    # SELF (dev.py) is not a _LANE_DEFS input: _gate_lanes short-circuits a
+    # dev.py change to run *every* lane (the gating logic itself may have
+    # changed), so it fans out to all lanes rather than a subset.
+    nodes["cat:SELF"] = {
+        "id": "cat:SELF", "label": _GRAPH_CATEGORY_LABELS["SELF"],
+        "kind": "category", "sub": "runs all lanes", "category": "SELF",
+        "tip": "Editing dev.py changes the gating logic itself, so every lane "
+               "runs regardless of what else changed.",
     }
     cats: set = set()
     for _name, inputs, _desc in _LANE_DEFS:
@@ -4821,6 +4833,8 @@ def _check_graph_model():
                 edges.append((f"cat:{c}", f"lane:{name}"))
         else:
             edges.append(("__always__", f"lane:{name}"))
+        # A dev.py change runs every lane, gated or always-on alike.
+        edges.append(("cat:SELF", f"lane:{name}"))
     return nodes, edges
 
 
@@ -5198,7 +5212,9 @@ def cmd_graph(out: "Path | None" = None, serve: bool = False,
     if fmt == "json" and out is None:
         sys.stdout.write(payload + "\n")
     else:
-        out = out or (ROOT / "target" / default_name)
+        # resolve() so a relative --out still yields an absolute path for both
+        # the printed location and as_uri() below (which rejects relative paths).
+        out = (out or (ROOT / "target" / default_name)).resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(payload, encoding="utf-8")
         print(f"✓ build graph ({fmt}) → {out}", file=log)
