@@ -265,9 +265,14 @@ interface ChainBlockProps {
   item: Extract<SidebarItem, { kind: 'chain' }>;
   collapsed: boolean;
   isMenuOpen: boolean;
+  /** Chain-scoped, not global. The parent passes the expanded/keyboard-selected
+   *  row id only when it belongs to THIS chain, else null — so a global id change
+   *  that lands on a different chain produces referentially-identical props here
+   *  and the `memo` bails out. The member list still gets the precise id it needs
+   *  to highlight one row. */
   expandedRowId: string | null;
-  keyboardSelectedId: string | null | undefined;
-  activeSlug: string | null | undefined;
+  keyboardSelectedId: string | null;
+  activeSlug: string | null;
   sidebarMode: boolean;
   showArchived: boolean;
   onToggleCollapsed: (rootId: string) => void;
@@ -662,15 +667,31 @@ export function ConversationList({
             const isCompleted = getConvDisplayState(latestMember) === 'terminal';
             // Completed chains default collapsed; the toggle set tracks non-default state.
             const collapsed = isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
+            // Narrow the global ids to this chain before they cross the memo
+            // boundary: a chain that doesn't contain the expanded/selected/active
+            // row sees null, so a global id change lands as identical props on
+            // every chain but the one that gained or lost the row.
+            const chainExpandedRowId =
+              expandedId !== null && item.members.some((m) => m.id === expandedId)
+                ? expandedId
+                : null;
+            const chainKeyboardSelectedId =
+              selectedId != null && item.members.some((m) => m.id === selectedId)
+                ? selectedId
+                : null;
+            const chainActiveSlug =
+              activeSlug != null && item.members.some((m) => m.slug === activeSlug)
+                ? activeSlug
+                : null;
             return (
               <ChainBlock
                 key={`chain:${item.rootId}`}
                 item={item}
                 collapsed={collapsed}
                 isMenuOpen={expandedChainId === item.rootId}
-                expandedRowId={expandedId}
-                keyboardSelectedId={selectedId}
-                activeSlug={activeSlug}
+                expandedRowId={chainExpandedRowId}
+                keyboardSelectedId={chainKeyboardSelectedId}
+                activeSlug={chainActiveSlug}
                 sidebarMode={!!sidebarMode}
                 showArchived={showArchived}
                 onToggleCollapsed={toggleChainCollapsed}

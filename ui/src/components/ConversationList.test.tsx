@@ -928,6 +928,69 @@ describe('ChainBlock — React.memo behaviour', () => {
   });
 });
 
+// C5 render-isolation regression (task 51001): ChainBlock is memoized, but it
+// used to receive the GLOBAL expanded/keyboard-selected/active ids, so changing
+// any one of them re-rendered every chain. The parent now narrows those ids to
+// each chain before crossing the memo boundary, so a global id change that
+// lands in chain A leaves chain B's props referentially identical → B bails out.
+describe('ConversationList — chain render isolation (C5)', () => {
+  beforeEach(() => {
+    formatRelativeTimeSpy.mockClear();
+    formatShortDateTimeSpy.mockClear();
+  });
+
+  // Two independent chains, A (rootA → leafA) and B (rootB → leafB).
+  const twoChains = () => {
+    const rootA = makeConv('rootA', 'rootA-slug', {
+      updated_at: '2024-01-01T00:00:00Z',
+      continued_in_conv_id: 'leafA',
+      chain_name: 'chain A',
+    });
+    const leafA = makeConv('leafA', 'leafA-slug', { updated_at: '2024-02-01T00:00:00Z' });
+    const rootB = makeConv('rootB', 'rootB-slug', {
+      updated_at: '2024-03-01T00:00:00Z',
+      continued_in_conv_id: 'leafB',
+      chain_name: 'chain B',
+    });
+    const leafB = makeConv('leafB', 'leafB-slug', { updated_at: '2024-04-01T00:00:00Z' });
+    return [leafA, rootA, leafB, rootB];
+  };
+
+  it('activeSlug pointing into chain A does not re-render chain B', () => {
+    const convs = twoChains();
+
+    const { rerender, container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} sidebarMode conversations={convs} activeSlug={null} />
+      </MemoryRouter>,
+    );
+    // Both chains rendered on mount (2 members each → spy called).
+    expect(formatRelativeTimeSpy).toHaveBeenCalled();
+
+    formatRelativeTimeSpy.mockClear();
+    // Active conversation becomes a member of chain A only.
+    rerender(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} sidebarMode conversations={convs} activeSlug="leafA-slug" />
+      </MemoryRouter>,
+    );
+
+    // Chain B's members must NOT have re-rendered (props referentially identical).
+    // Chain A's members DID re-render to apply/remove the .active highlight, so
+    // the spy is called — but only for chain A's 2 rows, never chain B's.
+    const calledSlugs = new Set(
+      formatRelativeTimeSpy.mock.calls.map((c) => c[0] as string),
+    );
+    expect(calledSlugs.has('2024-04-01T00:00:00Z')).toBe(false); // leafB updated_at
+    expect(calledSlugs.has('2024-03-01T00:00:00Z')).toBe(false); // rootB updated_at
+
+    // Sanity: chain A's active member actually got the highlight.
+    expect(
+      container.querySelector('[data-id="leafA"]')!.classList.contains('active'),
+    ).toBe(true);
+  });
+});
+
 describe('ConversationList — keyboard navigation behaviour', () => {
   it('arrow-down moves keyboard-selected from c1 to c2', () => {
     const conversations = [
