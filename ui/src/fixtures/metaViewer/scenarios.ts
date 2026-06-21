@@ -1,4 +1,5 @@
 import type {
+  CodeViewerPayload,
   HtmlViewerPayload,
   ImageViewerPayload,
   TextViewerPayload,
@@ -50,6 +51,30 @@ const NOTES_FILE = [
   '  const parts = trimmed.split(/\\s+/);',
   '  const head = parts.shift();',
   '  return { head, rest: parts };',
+  '}',
+].join('\n');
+
+// Lines deliberately far wider than the viewport — including unbreakable tokens
+// — to establish the horizontal-overflow user story (does a long line wrap, get
+// a horizontal scrollbar, or clip?). Mix of normal lines for contrast.
+const LONG_LINES_TEXT = [
+  'Build log — long lines, no wrapping.',
+  `GET /api/v1/conversations/abcdef0123/grounding?include=tasks,skills,mcp,workscope&fields=${'name,status,priority,'.repeat(18)}end`,
+  'short normal line',
+  `unbreakable_token_${'x'.repeat(260)}`,
+  `A long prose sentence ${'that keeps going and going '.repeat(14)}past the right edge of the viewport.`,
+  'tail',
+].join('\n');
+
+const LONG_LINES_CODE = [
+  "import { resolveScope, classifyInput, normalizePath } from '../../utils/scope';",
+  '',
+  `const endpoint = 'https://example.com/api/v1/resource?${'param=value&'.repeat(40)}end=1';`,
+  '',
+  `export const ids = items.filter((i) => i.active).map((i) => i.id)${'.concat(extra)'.repeat(20)};`,
+  '',
+  'export function describe(input: string): string {',
+  `  return input + '${'-'.repeat(300)}'; // trailing comment forced well beyond the viewport width`,
   '}',
 ].join('\n');
 
@@ -110,6 +135,20 @@ function textPayload(
   };
 }
 
+function codePayload(filePath: string, content: string, language: string): CodeViewerPayload {
+  return {
+    kind: 'code',
+    title: filePath.split('/').pop() ?? filePath,
+    absolutePath: absPath(filePath),
+    onClose: noop,
+    onSendNotes: noop,
+    filePath,
+    rootDir: ROOT,
+    content,
+    language,
+  };
+}
+
 function htmlPayload(filePath: string, content: string): HtmlViewerPayload {
   return {
     kind: 'html',
@@ -157,6 +196,17 @@ const byId: Record<MetaViewerScenarioId, Omit<MetaViewerScenario, 'id' | 'title'
     payload: textPayload('config/service.yaml', PATCH_FILE, {
       patchContext: { modifiedLines: new Set([3, 4, 5]), firstModifiedLine: 3 },
     }),
+  },
+  'long-lines-text-dark': {
+    // Per-line text body; horizontal overflow is governed by .viewer-text CSS.
+    settleSelector: '.viewer-text',
+    payload: textPayload('logs/long-lines.txt', LONG_LINES_TEXT),
+  },
+  'long-lines-code-dark': {
+    // Code routes through Pierre's virtualized CodeView, which owns its own
+    // horizontal scroll; wait for a rendered line, not just the wrapper.
+    settleSelector: '.phoenix-file-codeview [data-line]',
+    payload: codePayload('src/longLines.ts', LONG_LINES_CODE, 'typescript'),
   },
   'html-source-dark': {
     settleSelector: '.viewer-code',

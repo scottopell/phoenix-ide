@@ -40,6 +40,10 @@ Payload-driven (`<MetaViewer payload>`, zero network):
   and the "N changes from patch" banner. Uses a `text` payload because that path
   is MetaViewer-owned; `code` patch context is handled inside Pierre's CodeView
   and is out of scope here.
+- `long-lines-text-dark` / `long-lines-code-dark` — lines (including unbreakable
+  tokens) far wider than the viewport, in the plain-text body and the Pierre code
+  body respectively. Establishes the horizontal-overflow user story: does a long
+  line wrap, get a horizontal scrollbar, or clip?
 - `html-source-dark` — HTML source mode (highlighted, annotatable) with the
   Preview / Open-in-browser header toggles.
 - `html-preview-dark` — the sandboxed-preview iframe (`sandbox="allow-same-origin"`,
