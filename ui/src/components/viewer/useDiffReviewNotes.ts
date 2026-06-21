@@ -1,5 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useReviewNotes } from '../../contexts/ReviewNotesContext';
+import { useCallback, useEffect, useState } from 'react';
+import {
+  useDiffReviewNotesData,
+  useReviewNotesCommands,
+} from '../../contexts/ReviewNotesContext';
 import type { DiffSection, NoteAnchor, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { formatNotesForSend } from './formatNotes';
 
@@ -60,12 +63,12 @@ export interface DiffReviewNotes {
 }
 
 export function useDiffReviewNotes(onSendNotes: (notes: string) => void): DiffReviewNotes {
-  const reviewNotes = useReviewNotes();
+  const commands = useReviewNotesCommands();
   const [annotating, setAnnotating] = useState<AnnotateTarget | null>(null);
   const [showPanel, setShowPanel] = useState(false);
   const [highlightedNoteId, setHighlightedNoteId] = useState<string | null>(null);
 
-  const diffNotes = useMemo(() => reviewNotes.notesForDiff(), [reviewNotes]);
+  const diffNotes = useDiffReviewNotesData();
 
   useEffect(() => {
     if (highlightedNoteId === null) return undefined;
@@ -105,10 +108,10 @@ export function useDiffReviewNotes(onSendNotes: (notes: string) => void): DiffRe
         };
         lineContent = '';
       }
-      reviewNotes.addNote(anchor, lineContent, body);
+      commands.addNote(anchor, lineContent, body);
       setAnnotating(null);
     },
-    [annotating, reviewNotes],
+    [annotating, commands],
   );
 
   const togglePanel = useCallback(() => setShowPanel((v) => !v), []);
@@ -116,18 +119,18 @@ export function useDiffReviewNotes(onSendNotes: (notes: string) => void): DiffRe
   const highlight = useCallback((noteId: string) => setHighlightedNoteId(noteId), []);
 
   const send = useCallback(() => {
-    const formatted = formatNotesForSend(reviewNotes.notes);
+    const formatted = formatNotesForSend(commands.getSnapshot());
     if (formatted) {
       onSendNotes(formatted);
-      reviewNotes.clear();
+      commands.clear();
       setShowPanel(false);
     }
-  }, [reviewNotes, onSendNotes]);
+  }, [commands, onSendNotes]);
 
   const clearAll = useCallback(() => {
-    reviewNotes.clear();
+    commands.clear();
     setShowPanel(false);
-  }, [reviewNotes]);
+  }, [commands]);
 
   return {
     diffNotes,
@@ -143,6 +146,6 @@ export function useDiffReviewNotes(onSendNotes: (notes: string) => void): DiffRe
     highlight,
     send,
     clearAll,
-    removeNote: reviewNotes.removeNote,
+    removeNote: commands.removeNote,
   };
 }

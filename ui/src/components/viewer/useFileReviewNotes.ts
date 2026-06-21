@@ -1,5 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useReviewNotes } from '../../contexts/ReviewNotesContext';
+import { useCallback, useEffect, useState } from 'react';
+import {
+  useFileReviewNotesData,
+  useReviewNotesCommands,
+} from '../../contexts/ReviewNotesContext';
 import type { ReviewNote } from '../../contexts/ReviewNotesContext';
 import { formatNotesForSend } from './formatNotes';
 import type { PatchContext } from './metaViewerTypes';
@@ -44,17 +47,14 @@ export function useFileReviewNotes(
   onSendNotes: (notes: string) => void,
   patchContext?: PatchContext | undefined,
 ): FileReviewNotes {
-  const reviewNotes = useReviewNotes();
+  const commands = useReviewNotesCommands();
   const [annotating, setAnnotating] = useState<
     { lineNumber: number; lineContent: string } | null
   >(null);
   const [showPanel, setShowPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
 
-  const fileNotes = useMemo(
-    () => reviewNotes.notesForFile(absolutePath),
-    [reviewNotes, absolutePath],
-  );
+  const fileNotes = useFileReviewNotesData(absolutePath);
 
   // Clear the jump highlight after the flash animation.
   useEffect(() => {
@@ -78,14 +78,14 @@ export function useFileReviewNotes(
       const finalBody = isModified && !body.startsWith('[Changed line]')
         ? `[Changed line] ${body}`
         : body;
-      reviewNotes.addNote(
+      commands.addNote(
         { kind: 'file', filePath: absolutePath, lineNumber: annotating.lineNumber },
         annotating.lineContent,
         finalBody,
       );
       setAnnotating(null);
     },
-    [annotating, absolutePath, patchContext?.modifiedLines, reviewNotes],
+    [annotating, absolutePath, patchContext?.modifiedLines, commands],
   );
 
   const togglePanel = useCallback(() => setShowPanel((v) => !v), []);
@@ -93,18 +93,18 @@ export function useFileReviewNotes(
   const highlight = useCallback((lineNumber: number) => setHighlightedLine(lineNumber), []);
 
   const send = useCallback(() => {
-    const formatted = formatNotesForSend(reviewNotes.notes);
+    const formatted = formatNotesForSend(commands.getSnapshot());
     if (formatted) {
       onSendNotes(formatted);
-      reviewNotes.clear();
+      commands.clear();
       setShowPanel(false);
     }
-  }, [reviewNotes, onSendNotes]);
+  }, [commands, onSendNotes]);
 
   const clearAll = useCallback(() => {
-    reviewNotes.clear();
+    commands.clear();
     setShowPanel(false);
-  }, [reviewNotes]);
+  }, [commands]);
 
   return {
     fileNotes,
@@ -119,6 +119,6 @@ export function useFileReviewNotes(
     highlight,
     send,
     clearAll,
-    removeNote: reviewNotes.removeNote,
+    removeNote: commands.removeNote,
   };
 }

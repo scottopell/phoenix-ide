@@ -10,65 +10,84 @@
 import { describe, it, expect } from 'vitest';
 import { render, act } from '@testing-library/react';
 import { useEffect } from 'react';
-import { ReviewNotesProvider, useReviewNotes } from './ReviewNotesContext';
+import {
+  ReviewNotesProvider,
+  useFileReviewNotesData,
+  useReviewNotesCommands,
+} from './ReviewNotesContext';
+import type { ReviewNote, ReviewNotesCommands } from './ReviewNotesContext';
 
-function NotesConsumer({ onCtx }: { onCtx: (ctx: ReturnType<typeof useReviewNotes>) => void }) {
-  const ctx = useReviewNotes();
-  useEffect(() => { onCtx(ctx); }, [ctx, onCtx]);
+const PATH = '/repo/x.ts';
+
+function NotesConsumer({
+  onCommands,
+  onNotes,
+}: {
+  onCommands: (commands: ReviewNotesCommands) => void;
+  onNotes: (notes: ReviewNote[]) => void;
+}) {
+  const commands = useReviewNotesCommands();
+  const fileNotes = useFileReviewNotesData(PATH);
+  useEffect(() => { onCommands(commands); }, [commands, onCommands]);
+  useEffect(() => { onNotes(fileNotes); }, [fileNotes, onNotes]);
   return null;
 }
 
 describe('ReviewNotesProvider scopeKey reset (task 02703)', () => {
   it('clears the notes pile when scopeKey changes', () => {
-    let latest: ReturnType<typeof useReviewNotes> | null = null;
-    const onCtx = (ctx: ReturnType<typeof useReviewNotes>) => { latest = ctx; };
+    let commands: ReviewNotesCommands | null = null;
+    let notes: ReviewNote[] = [];
+    const onCommands = (c: ReviewNotesCommands) => { commands = c; };
+    const onNotes = (n: ReviewNote[]) => { notes = n; };
 
     const { rerender } = render(
       <ReviewNotesProvider scopeKey="conv-A">
-        <NotesConsumer onCtx={onCtx} />
+        <NotesConsumer onCommands={onCommands} onNotes={onNotes} />
       </ReviewNotesProvider>,
     );
 
     act(() => {
-      latest!.addNote(
-        { kind: 'file', filePath: '/repo/x.ts', lineNumber: 7 },
+      commands!.addNote(
+        { kind: 'file', filePath: PATH, lineNumber: 7 },
         '  const x = 1;',
         'rename to count',
       );
     });
-    expect(latest!.notes).toHaveLength(1);
+    expect(notes).toHaveLength(1);
 
     rerender(
       <ReviewNotesProvider scopeKey="conv-B">
-        <NotesConsumer onCtx={onCtx} />
+        <NotesConsumer onCommands={onCommands} onNotes={onNotes} />
       </ReviewNotesProvider>,
     );
-    expect(latest!.notes).toHaveLength(0);
+    expect(notes).toHaveLength(0);
   });
 
   it('preserves notes on re-render with the same scopeKey', () => {
-    let latest: ReturnType<typeof useReviewNotes> | null = null;
-    const onCtx = (ctx: ReturnType<typeof useReviewNotes>) => { latest = ctx; };
+    let commands: ReviewNotesCommands | null = null;
+    let notes: ReviewNote[] = [];
+    const onCommands = (c: ReviewNotesCommands) => { commands = c; };
+    const onNotes = (n: ReviewNote[]) => { notes = n; };
 
     const { rerender } = render(
       <ReviewNotesProvider scopeKey="conv-A">
-        <NotesConsumer onCtx={onCtx} />
+        <NotesConsumer onCommands={onCommands} onNotes={onNotes} />
       </ReviewNotesProvider>,
     );
     act(() => {
-      latest!.addNote(
-        { kind: 'file', filePath: '/repo/x.ts', lineNumber: 1 },
+      commands!.addNote(
+        { kind: 'file', filePath: PATH, lineNumber: 1 },
         '',
         'note',
       );
     });
-    expect(latest!.notes).toHaveLength(1);
+    expect(notes).toHaveLength(1);
 
     rerender(
       <ReviewNotesProvider scopeKey="conv-A">
-        <NotesConsumer onCtx={onCtx} />
+        <NotesConsumer onCommands={onCommands} onNotes={onNotes} />
       </ReviewNotesProvider>,
     );
-    expect(latest!.notes).toHaveLength(1);
+    expect(notes).toHaveLength(1);
   });
 });
