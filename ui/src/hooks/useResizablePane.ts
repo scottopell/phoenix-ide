@@ -20,8 +20,22 @@ export interface UseResizablePaneResult {
   size: number;
   /** True when the pane is in its collapsed state */
   collapsed: boolean;
-  /** Pointer-down handler to wire to PaneDivider */
-  startDrag: (e: React.PointerEvent, axis: 'x' | 'y', invert?: boolean) => void;
+  /** Pointer-down handler to wire to PaneDivider.
+   *
+   *  `onLiveResize`, when supplied, is the transient live-drag channel: the hook
+   *  calls it (coalesced to one call per animation frame) with the in-progress
+   *  size/collapsed on every pointer move and does NOT commit React state during
+   *  the drag. The consumer applies the value straight to the DOM (e.g. a CSS
+   *  variable), so dragging the divider does not re-render the owning component
+   *  subtree. React `size`/`collapsed` state is committed once, on pointer-up.
+   *  Omit it to keep the legacy behaviour where state is committed during the
+   *  drag (still frame-capped via rAF). */
+  startDrag: (
+    e: React.PointerEvent,
+    axis: 'x' | 'y',
+    invert?: boolean,
+    onLiveResize?: (size: number, collapsed: boolean) => void,
+  ) => void;
   /** Imperative collapse control (used by toggle buttons) */
   setCollapsed: (value: boolean) => void;
   /** Restore to last remembered non-collapsed size */
@@ -124,10 +138,30 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
     axis: 'x' | 'y';
     invert: boolean;
     pointerId: number;
+    onLiveResize: ((size: number, collapsed: boolean) => void) | undefined;
   } | null>(null);
+  // Latest drag target awaiting a frame, and the pending rAF handle. Pointer
+  // moves arrive faster than the display refresh (and faster than React can
+  // usefully render); coalescing to one flush per frame caps the work at the
+  // refresh rate whether the flush commits React state or drives the live
+  // channel.
+  const dragPendingRef = useRef<{ size: number; collapsed: boolean } | null>(null);
+  const dragRafRef = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (dragRafRef.current !== null) cancelAnimationFrame(dragRafRef.current);
+    },
+    [],
+  );
 
   const startDrag = useCallback(
-    (e: React.PointerEvent, axis: 'x' | 'y', invert = false) => {
+    (
+      e: React.PointerEvent,
+      axis: 'x' | 'y',
+      invert = false,
+      onLiveResize?: (size: number, collapsed: boolean) => void,
+    ) => {
       const target = e.currentTarget as HTMLElement;
       try {
         target.setPointerCapture(e.pointerId);
@@ -145,32 +179,68 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
         axis,
         invert,
         pointerId: e.pointerId,
+        onLiveResize,
       };
       document.body.style.userSelect = 'none';
       document.body.style.cursor = axis === 'x' ? 'col-resize' : 'row-resize';
+
+      // Resolve the (size, collapsed) a proposed pixel delta maps to. Collapse
+      // pins the remembered size at `min` so a later expand restores sensibly.
+      const resolve = (proposed: number): { size: number; collapsed: boolean } =>
+        collapseThreshold !== undefined && proposed < collapseThreshold
+          ? { size: clamp(min), collapsed: true }
+          : { size: clamp(proposed), collapsed: false };
+
+      const flushFrame = () => {
+        dragRafRef.current = null;
+        const pending = dragPendingRef.current;
+        const drag = dragRef.current;
+        if (!pending || !drag) return;
+        if (drag.onLiveResize) {
+          drag.onLiveResize(pending.size, pending.collapsed);
+        } else {
+          setCollapsedState(pending.collapsed);
+          setSize(pending.size);
+        }
+      };
 
       const onMove = (ev: PointerEvent) => {
         const drag = dragRef.current;
         if (!drag || ev.pointerId !== drag.pointerId) return;
         const delta = (drag.axis === 'x' ? ev.clientX : ev.clientY) - drag.startCoord;
         const signedDelta = drag.invert ? -delta : delta;
-        const proposed = drag.startSize + signedDelta;
-
-        sizeInteracted.current = true;
-        collapsedInteracted.current = true;
-        if (collapseThreshold !== undefined && proposed < collapseThreshold) {
-          setCollapsedState(true);
-          // Keep last good size at min so expand restores to a sensible value.
-          setSize(clamp(min));
-        } else {
-          setCollapsedState(false);
-          setSize(clamp(proposed));
+        dragPendingRef.current = resolve(drag.startSize + signedDelta);
+        if (!drag.onLiveResize) {
+          // Legacy path commits React state — record the interaction so the
+          // persistence effects fire for the dragged value.
+          sizeInteracted.current = true;
+          collapsedInteracted.current = true;
+        }
+        if (dragRafRef.current === null) {
+          dragRafRef.current = requestAnimationFrame(flushFrame);
         }
       };
 
       const onUp = (ev: PointerEvent) => {
         const drag = dragRef.current;
         if (!drag || ev.pointerId !== drag.pointerId) return;
+        if (dragRafRef.current !== null) {
+          cancelAnimationFrame(dragRafRef.current);
+          dragRafRef.current = null;
+        }
+        // Commit the release position to React state synchronously — this is the
+        // single state write for an `onLiveResize` drag (syncing the live DOM
+        // channel back to the source of truth) and the final write for the
+        // legacy path. Synchronous so callers can read the settled size right
+        // after pointer-up.
+        const pending = dragPendingRef.current;
+        dragPendingRef.current = null;
+        if (pending) {
+          sizeInteracted.current = true;
+          collapsedInteracted.current = true;
+          setCollapsedState(pending.collapsed);
+          setSize(pending.size);
+        }
         try {
           target.releasePointerCapture(drag.pointerId);
         } catch {

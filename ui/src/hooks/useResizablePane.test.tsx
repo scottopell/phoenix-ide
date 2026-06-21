@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { fireEvent, render, screen, act } from '@testing-library/react';
 import { useResizablePane } from './useResizablePane';
 
@@ -90,6 +90,69 @@ describe('useResizablePane key switching', () => {
       rerender(<KeyedPaneHarness paneKey="terminal-height:a" />);
     });
     expect(screen.getByTestId('keyed-pane-state')).toHaveTextContent('300');
+  });
+});
+
+function LivePaneHarness({
+  onRender,
+  liveCalls,
+}: {
+  onRender: () => void;
+  liveCalls: Array<[number, boolean]>;
+}) {
+  const pane = useResizablePane({
+    key: 'test-live-pane-width',
+    min: 360,
+    max: 1200,
+    defaultSize: 600,
+    collapseThreshold: 280,
+  });
+  onRender();
+  return (
+    <>
+      <div data-testid="pane-state">{pane.collapsed ? 'collapsed' : String(pane.size)}</div>
+      <div
+        role="separator"
+        aria-label="Resize viewer pane"
+        tabIndex={0}
+        onPointerDown={(e) =>
+          pane.startDrag(e, 'x', true, (size, collapsed) => liveCalls.push([size, collapsed]))
+        }
+      />
+    </>
+  );
+}
+
+describe('useResizablePane live-drag channel', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('drives onLiveResize during the drag without committing React state until pointer-up', () => {
+    const raf = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+    try {
+      const liveCalls: Array<[number, boolean]> = [];
+      let renders = 0;
+      render(<LivePaneHarness onRender={() => { renders += 1; }} liveCalls={liveCalls} />);
+      const rendersAfterMount = renders;
+
+      const divider = screen.getByRole('separator', { name: 'Resize viewer pane' });
+      fireEvent.pointerDown(divider, { clientX: 500, pointerId: 1 });
+      fireEvent.pointerMove(divider, { clientX: 300, pointerId: 1 });
+
+      expect(liveCalls.at(-1)).toEqual([800, false]);
+      expect(screen.getByTestId('pane-state')).toHaveTextContent('600');
+      expect(renders).toBe(rendersAfterMount);
+
+      fireEvent.pointerUp(divider, { clientX: 300, pointerId: 1 });
+      expect(screen.getByTestId('pane-state')).toHaveTextContent('800');
+      expect(renders).toBe(rendersAfterMount + 1);
+    } finally {
+      raf.mockRestore();
+    }
   });
 });
 

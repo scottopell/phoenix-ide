@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
+import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
@@ -183,6 +183,34 @@ function ConversationPageContent() {
     defaultSize: 600,
     collapseThreshold: 280,
   });
+
+  // The split-pane layout (`.app-split-pane`) sizes the viewer from the
+  // `--viewer-pane-width` CSS variable on `#app`. The variable is owned
+  // imperatively (not via the React `style` prop) by exactly two writers that
+  // never run concurrently: this layout effect, which syncs it to committed pane
+  // state, and the divider's live-drag channel below. Driving it from the style
+  // prop instead would let an unrelated re-render mid-drag (streaming,
+  // heartbeat) clobber the live width and snap the pane back; the effect's deps
+  // are frozen during a drag, so it cannot fire until the drag commits on
+  // pointer-up. (When the split pane is hidden the variable is simply unread.)
+  const appElementRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    appElementRef.current?.style.setProperty(
+      '--viewer-pane-width',
+      `${viewerPane.collapsed ? 0 : viewerPane.size}px`,
+    );
+  }, [viewerPane.collapsed, viewerPane.size]);
+
+  // Live-drag channel for the viewer divider: write the width straight to the
+  // CSS variable so dragging resizes the pane without re-rendering this page
+  // (and the conversation subtree below it) on every pointer move. React state
+  // catches up once, on pointer-up — see `useResizablePane`'s `onLiveResize`.
+  const handleViewerLiveResize = useCallback((size: number, collapsed: boolean) => {
+    appElementRef.current?.style.setProperty(
+      '--viewer-pane-width',
+      `${collapsed ? 0 : size}px`,
+    );
+  }, []);
 
   // Mobile-only file browser overlay. The prose reader itself reads its
   // open-file state from `fileExplorer.openFileState` (URL-driven), so
@@ -1068,12 +1096,8 @@ function ConversationPageContent() {
     >
     <div
       id="app"
+      ref={appElementRef}
       className={showSplitPaneViewer ? 'app-split-pane' : undefined}
-      style={
-        showSplitPaneViewer
-          ? ({ ['--viewer-pane-width' as string]: `${viewerPane.collapsed ? 0 : viewerPane.size}px` } as React.CSSProperties)
-          : undefined
-      }
     >
       <div className="conversation-column">
       {seedBreadcrumb}
@@ -1545,7 +1569,7 @@ function ConversationPageContent() {
             aria-valuemax={VIEWER_PANE_MAX}
             aria-valuenow={viewerPane.collapsed ? 0 : viewerPane.size}
             tabIndex={0}
-            onPointerDown={(e) => viewerPane.startDrag(e, 'x', true)}
+            onPointerDown={(e) => viewerPane.startDrag(e, 'x', true, handleViewerLiveResize)}
             onDoubleClick={() => viewerPane.setCollapsed(!viewerPane.collapsed)}
             onKeyDown={(e) => {
               // Keyboard resize for the WAI-ARIA `separator` pattern.
