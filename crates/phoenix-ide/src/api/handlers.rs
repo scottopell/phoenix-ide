@@ -36,9 +36,9 @@ use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
     GitOpError, PhoenixIgnoreStrategy,
 };
-use crate::llm::GatewayStatus;
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
+use phoenix_llm::GatewayStatus;
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -4638,7 +4638,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
         || state.llm_registry.gateway_status != GatewayStatus::NotConfigured;
 
     let credential_status = if let Some(ref hs) = state.credential_helper {
-        use crate::llm::CredentialStatus;
+        use phoenix_llm::CredentialStatus;
         match hs.credential_status().await {
             CredentialStatus::Idle => CredentialStatusApi::Required,
             CredentialStatus::Running => CredentialStatusApi::Running,
@@ -4680,13 +4680,13 @@ async fn run_credential_helper(State(state): State<AppState>) -> impl IntoRespon
 
     let event_stream = Arc::clone(hs).run_and_stream().await.map(|ev| {
         let data = match &ev {
-            crate::llm::credential_helper::HelperEvent::Line(text) => {
+            phoenix_llm::credential_helper::HelperEvent::Line(text) => {
                 serde_json::json!({ "type": "line", "text": text })
             }
-            crate::llm::credential_helper::HelperEvent::Complete => {
+            phoenix_llm::credential_helper::HelperEvent::Complete => {
                 serde_json::json!({ "type": "complete" })
             }
-            crate::llm::credential_helper::HelperEvent::Error { exit_code, stderr } => {
+            phoenix_llm::credential_helper::HelperEvent::Error { exit_code, stderr } => {
                 serde_json::json!({ "type": "error", "exit_code": exit_code, "stderr": stderr })
             }
         };
@@ -4708,7 +4708,7 @@ async fn run_credential_helper(State(state): State<AppState>) -> impl IntoRespon
 }
 
 async fn invalidate_credential(State(state): State<AppState>) -> impl IntoResponse {
-    use crate::llm::CredentialSource;
+    use phoenix_llm::CredentialSource;
 
     let Some(ref hs) = state.credential_helper else {
         return (
@@ -5389,11 +5389,11 @@ pub(crate) mod hard_delete_cascade_tests {
     use super::*;
     use crate::chain_qa::ChainQa;
     use crate::db::{Database, MessageContent};
-    use crate::llm::ModelRegistry;
     use crate::platform::PlatformCapability;
     use crate::runtime::RuntimeManager;
     use crate::state_machine::ConvState;
     use crate::tools::mcp::McpClientManager;
+    use phoenix_llm::ModelRegistry;
     use std::sync::Arc;
 
     /// Construct a minimal `AppState` backed by an in-memory database.
@@ -7502,14 +7502,14 @@ mod upgrade_model_state_guard_tests {
     use super::*;
     use crate::chain_qa::ChainQa;
     use crate::db::Database;
-    use crate::llm::{
-        ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
-    };
     use crate::platform::PlatformCapability;
     use crate::runtime::RuntimeManager;
     use crate::state_machine::ConvState;
     use crate::tools::mcp::McpClientManager;
     use async_trait::async_trait;
+    use phoenix_llm::{
+        ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
+    };
     use std::sync::Arc;
     use tokio::sync::broadcast;
 
@@ -7527,7 +7527,7 @@ mod upgrade_model_state_guard_tests {
         async fn complete_streaming(
             &self,
             r: &LlmRequest,
-            _: &broadcast::Sender<crate::llm::TokenChunk>,
+            _: &broadcast::Sender<phoenix_llm::TokenChunk>,
         ) -> Result<LlmResponse, LlmError> {
             self.complete(r).await
         }
@@ -7786,10 +7786,10 @@ mod file_read_tests {
     use super::*;
     use crate::chain_qa::ChainQa;
     use crate::db::Database;
-    use crate::llm::ModelRegistry;
     use crate::platform::PlatformCapability;
     use crate::runtime::RuntimeManager;
     use crate::tools::mcp::McpClientManager;
+    use phoenix_llm::ModelRegistry;
     use std::sync::Arc;
 
     /// Minimal `AppState` whose `preview_roots()` contains `cwd`, so the

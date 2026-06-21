@@ -1,0 +1,59 @@
+[package]
+name = "phoenix-llm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "LLM provider abstraction for Phoenix IDE: the LlmService trait plus Anthropic, OpenAI, codex-bridge, and mock providers, the model registry, credential/gateway resolution, and SSE stream parsing. Depends only on phoenix-core — no axum/HTTP handler glue beyond the self-contained codex OAuth callback server."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Exposes the registry's test-only constructors (new_empty,
+# for_test_with_sonnet) across the crate boundary. A `#[cfg(test)]` item is
+# invisible to a downstream crate's tests; this feature makes them visible to
+# phoenix-ide's integration-flavoured tests without leaking into production.
+test-support = []
+
+[dependencies]
+# Shared domain vocabulary: ContentBlock/Usage (llm_types), runtime env probe,
+# retry/quota policy, and the persisted error-kind schema.
+phoenix-core = { path = "../phoenix-core" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Loopback OAuth callback server for the ChatGPT/codex login flow
+# (llm/codex_login). Self-contained — not wired into the phoenix-ide router.
+axum = { version = "0.7" }
+
+# HTTP client for provider requests + SSE streaming
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async utilities
+async-trait = "0.1"
+futures = "0.3"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+base64 = "0.22"
+sha2 = "0.11"
+rand = "0.10"
+
+[dev-dependencies]
+# test-support exposes phoenix-core's #[cfg(test)] constructors
+# (PhoenixRuntimeEnvironment::with_root, ContentBlock::tool_use, …) across the
+# crate boundary. Dev-only: production builds never enable the feature.
+phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+proptest = "1"
+tempfile = "3"
+
+[lints]
+workspace = true

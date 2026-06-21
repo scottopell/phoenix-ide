@@ -112,6 +112,7 @@ pub struct PkceCodes {
     pub code_challenge: String,
 }
 
+#[must_use]
 pub fn generate_pkce() -> PkceCodes {
     let mut bytes = [0u8; 64];
     rand::rng().fill_bytes(&mut bytes);
@@ -124,6 +125,7 @@ pub fn generate_pkce() -> PkceCodes {
     }
 }
 
+#[must_use]
 pub fn generate_state() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -134,6 +136,10 @@ pub fn generate_state() -> String {
 /// sent in the authorize URL. A mismatch is treated as a CSRF signal; the
 /// caller must NOT proceed to exchange the code. Extracted as a helper so the
 /// guarantee can be unit-tested without standing up a real loopback server.
+///
+/// # Errors
+/// Returns [`LoginError::StateMismatch`] when `returned` does not equal
+/// `expected` (a possible CSRF signal; the caller must not exchange the code).
 pub fn validate_state(expected: &str, returned: &str) -> Result<(), LoginError> {
     if expected == returned {
         Ok(())
@@ -154,10 +160,12 @@ pub struct PkceSession {
     pub redirect_uri: String,
 }
 
+#[must_use]
 pub fn build_pkce_session() -> PkceSession {
     build_pkce_session_with(ISSUER_BASE, CLIENT_ID, REDIRECT_URI)
 }
 
+#[must_use]
 pub fn build_pkce_session_with(issuer: &str, client_id: &str, redirect_uri: &str) -> PkceSession {
     let pkce = generate_pkce();
     let state = generate_state();
@@ -233,6 +241,11 @@ pub struct TokenResponse {
 /// `redirect_uri` must match the value used in the authorize URL. For the
 /// browser flow this is [`REDIRECT_URI`]; for the device-code flow it is
 /// `{issuer}/deviceauth/callback`.
+///
+/// # Errors
+/// Returns [`LoginError::Network`] on a transport failure, or
+/// [`LoginError::OAuth`] on a non-success token-endpoint status or an
+/// unparseable token response.
 pub async fn exchange_pkce_code(
     issuer: &str,
     client_id: &str,
@@ -315,10 +328,21 @@ struct UserCodeResponse {
 
 /// Request a device code from the issuer. Returns immediately with the
 /// `user_code` (to display to the user) and the polling parameters.
+///
+/// # Errors
+/// Returns [`LoginError::DeviceCodeNotEnabled`] when the issuer has no
+/// device-code endpoint, [`LoginError::Network`] on a transport failure, or
+/// [`LoginError::OAuth`] on a non-success status or unparseable response.
 pub async fn request_device_code() -> Result<DeviceCode, LoginError> {
     request_device_code_with(ISSUER_BASE, CLIENT_ID).await
 }
 
+/// Request a device code from an explicit `issuer` / `client_id`.
+///
+/// # Errors
+/// Returns [`LoginError::DeviceCodeNotEnabled`] when the issuer has no
+/// device-code endpoint, [`LoginError::Network`] on a transport failure, or
+/// [`LoginError::OAuth`] on a non-success status or unparseable response.
 pub async fn request_device_code_with(
     issuer: &str,
     client_id: &str,
@@ -396,6 +420,13 @@ struct DevicePollResponse {
 /// code_verifier}` rather than tokens directly, and the caller still has to
 /// exchange the code at `/oauth/token` with the special device-code redirect
 /// URI. We bundle that step here so callers get a single `Result<TokenResponse>`.
+///
+/// # Errors
+/// Returns [`LoginError::DeviceCodeTimeout`] when the authorization window
+/// elapses, [`LoginError::Network`] on a transport failure, or
+/// [`LoginError::OAuth`] on an unexpected poll status or unparseable response.
+/// Errors from the final code exchange are propagated from
+/// [`exchange_pkce_code`].
 pub async fn poll_device_code(device: &DeviceCode) -> Result<TokenResponse, LoginError> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -519,6 +550,10 @@ struct OnDiskAuthFile<'a> {
 
 /// Atomically persist login result to `auth_path`. Format is byte-compatible
 /// with what `CodexCredential::load()` (and Codex CLI) reads.
+///
+/// # Errors
+/// Returns [`LoginError::Write`] when serialization fails, the parent
+/// directory cannot be created, or the temp-file write/sync/rename fails.
 pub fn write_auth_file(auth_path: &Path, result: &LoginResult) -> Result<(), LoginError> {
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S+00:00")
@@ -572,6 +607,10 @@ pub fn write_auth_file(auth_path: &Path, result: &LoginResult) -> Result<(), Log
 
 /// Convenience: take a [`TokenResponse`] from either flow, extract the
 /// account id, write the file, and return a [`LoginResult`].
+///
+/// # Errors
+/// Returns [`LoginError::Write`] when persisting the auth file fails
+/// (serialization, directory creation, or the atomic write/rename).
 pub fn finalize_login(auth_path: &Path, tokens: TokenResponse) -> Result<LoginResult, LoginError> {
     let account_id = extract_account_id(&tokens.id_token);
     let result = LoginResult {
@@ -650,10 +689,21 @@ impl LoopbackServer {
     /// use on either loopback (typical: a previous Codex CLI login left
     /// something listening), returns `PortInUse`. If only one family is
     /// unavailable on the host (e.g. no IPv6 stack), the other is enough.
+    ///
+    /// # Errors
+    /// Returns [`LoginError::PortInUse`] when the callback port is already
+    /// bound, or [`LoginError::Loopback`] when neither loopback family could
+    /// be bound.
     pub async fn start(expected_state: String) -> Result<Self, LoginError> {
         Self::start_on_port(CALLBACK_PORT, expected_state).await
     }
 
+    /// Bind the loopback callback server to an explicit `port`.
+    ///
+    /// # Errors
+    /// Returns [`LoginError::PortInUse`] when `port` is already bound on a
+    /// loopback family, or [`LoginError::Loopback`] when neither `127.0.0.1`
+    /// nor `[::1]` could be bound at all.
     pub async fn start_on_port(port: u16, expected_state: String) -> Result<Self, LoginError> {
         let v4_addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         let v6_addr = std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port));
@@ -911,8 +961,7 @@ mod tests {
         assert!(parsed["last_refresh"].is_string());
 
         // CodexCredential::load() must accept this file.
-        let (_cred, account_id) =
-            crate::llm::codex_credential::CodexCredential::load(path).unwrap();
+        let (_cred, account_id) = crate::codex_credential::CodexCredential::load(path).unwrap();
         assert_eq!(account_id.as_deref(), Some("acc-1"));
     }
 

@@ -1574,10 +1574,10 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
 mod tests {
     use super::*;
     use crate::db::{Database, ForkProposal, ForkProposalStatus};
-    use crate::llm::ModelRegistry;
     use crate::platform::PlatformCapability;
     use crate::runtime::RuntimeManager;
     use crate::tools::mcp::McpClientManager;
+    use phoenix_llm::ModelRegistry;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::Arc;

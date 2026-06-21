@@ -3,10 +3,10 @@
 //! These traits enable testing the executor with mock implementations.
 
 use crate::db::{ConvMode, Message, MessageContent, UsageData};
-use crate::llm::{LlmError, LlmRequest, LlmResponse};
 use crate::state_machine::ConvState;
 use crate::tools::ToolOutput;
 use async_trait::async_trait;
+use phoenix_llm::{LlmError, LlmRequest, LlmResponse};
 use serde_json::Value;
 
 /// Storage for conversation messages
@@ -184,7 +184,7 @@ pub trait StateStore: Send + Sync {
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
-        usage: &crate::llm::Usage,
+        usage: &phoenix_llm::Usage,
     ) -> Result<(), String>;
 
     /// Update the steering queue for a conversation. Persists the FIFO queue
@@ -218,7 +218,7 @@ pub trait LlmClient: Send + Sync {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &tokio::sync::broadcast::Sender<crate::llm::TokenChunk>,
+        chunk_tx: &tokio::sync::broadcast::Sender<phoenix_llm::TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let _ = chunk_tx;
         self.complete(request).await
@@ -241,7 +241,7 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, call: CheckedToolCall, ctx: ToolContext) -> Option<ToolOutput>;
 
     /// Get tool definitions for LLM (phoenix-native).
-    async fn definitions(&self) -> Vec<crate::llm::ToolDefinition>;
+    async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition>;
 
     /// Get tool definitions in the requested LLM language. Default impl
     /// delegates to `definitions()` (phoenix-native); production overrides
@@ -249,7 +249,7 @@ pub trait ToolExecutor: Send + Sync {
     async fn definitions_for_language(
         &self,
         _language: crate::llm_language::LlmLanguage,
-    ) -> Vec<crate::llm::ToolDefinition> {
+    ) -> Vec<phoenix_llm::ToolDefinition> {
         self.definitions().await
     }
 
@@ -449,7 +449,7 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
-        usage: &crate::llm::Usage,
+        usage: &phoenix_llm::Usage,
     ) -> Result<(), String> {
         (**self)
             .insert_turn_usage(conversation_id, root_conversation_id, model, usage)
@@ -482,7 +482,7 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &tokio::sync::broadcast::Sender<crate::llm::TokenChunk>,
+        chunk_tx: &tokio::sync::broadcast::Sender<phoenix_llm::TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         (**self).complete_streaming(request, chunk_tx).await
     }
@@ -498,14 +498,14 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
         (**self).execute(call, ctx).await
     }
 
-    async fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
+    async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
         (**self).definitions().await
     }
 
     async fn definitions_for_language(
         &self,
         language: crate::llm_language::LlmLanguage,
-    ) -> Vec<crate::llm::ToolDefinition> {
+    ) -> Vec<phoenix_llm::ToolDefinition> {
         (**self).definitions_for_language(language).await
     }
 
@@ -523,8 +523,8 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 // ============================================================================
 
 use crate::db::Database;
-use crate::llm::ModelRegistry;
 use crate::tools::ToolRegistry;
+use phoenix_llm::ModelRegistry;
 use std::sync::Arc;
 
 /// Adapter to use Database as Storage
@@ -757,7 +757,7 @@ impl StateStore for DatabaseStorage {
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
-        usage: &crate::llm::Usage,
+        usage: &phoenix_llm::Usage,
     ) -> Result<(), String> {
         self.db
             .insert_turn_usage(conversation_id, root_conversation_id, model, usage)
@@ -815,7 +815,7 @@ impl LlmClient for RegistryLlmClient {
     async fn complete_streaming(
         &self,
         request: &LlmRequest,
-        chunk_tx: &tokio::sync::broadcast::Sender<crate::llm::TokenChunk>,
+        chunk_tx: &tokio::sync::broadcast::Sender<phoenix_llm::TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         let llm = self.registry.get(&self.model_id).ok_or_else(|| {
             LlmError::network(format!(
@@ -918,7 +918,7 @@ impl ToolExecutor for ToolRegistryExecutor {
         None
     }
 
-    async fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
+    async fn definitions(&self) -> Vec<phoenix_llm::ToolDefinition> {
         self.definitions_for_language(crate::llm_language::LlmLanguage::default())
             .await
     }
@@ -933,7 +933,7 @@ impl ToolExecutor for ToolRegistryExecutor {
     async fn definitions_for_language(
         &self,
         language: crate::llm_language::LlmLanguage,
-    ) -> Vec<crate::llm::ToolDefinition> {
+    ) -> Vec<phoenix_llm::ToolDefinition> {
         let mut defs = {
             let registry = self
                 .registry
@@ -959,7 +959,7 @@ impl ToolExecutor for ToolRegistryExecutor {
                     continue;
                 }
                 seen_names.insert(full_name.clone());
-                defs.push(crate::llm::ToolDefinition {
+                defs.push(phoenix_llm::ToolDefinition {
                     name: full_name,
                     description: tool_def.description,
                     input_schema: tool_def.input_schema,

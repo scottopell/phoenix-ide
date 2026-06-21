@@ -669,7 +669,7 @@ mod codex_request_shape {
     /// User-provided system instructions take precedence over the codex default.
     #[test]
     fn codex_path_preserves_user_instructions() {
-        use crate::llm::types::SystemContent;
+        use crate::types::SystemContent;
         let mut req = make_llm_request(vec![user_msg("hi")]);
         req.system = vec![SystemContent::new("be terse")];
         let r = openai::test_helpers::translate_to_responses_request_codex("gpt-5.5", &req);
@@ -681,7 +681,7 @@ mod codex_request_shape {
     /// Responses request body — both platform and codex paths.
     #[test]
     fn prompt_cache_key_reaches_wire_on_both_paths() {
-        use crate::llm::types::PromptCacheKey;
+        use crate::types::PromptCacheKey;
         let mut req = make_llm_request(vec![user_msg("hi")]);
         req.cache_key = PromptCacheKey::stable("conv-abc-123");
 
@@ -695,7 +695,7 @@ mod codex_request_shape {
     /// `ephemeral()` produces distinct keys per call (UUID-shaped).
     #[test]
     fn ephemeral_produces_distinct_keys() {
-        use crate::llm::types::PromptCacheKey;
+        use crate::types::PromptCacheKey;
         let a = PromptCacheKey::ephemeral();
         let b = PromptCacheKey::ephemeral();
         assert_ne!(a.as_str(), b.as_str());
@@ -719,7 +719,7 @@ mod codex_request_shape {
     /// tools array.
     #[test]
     fn tool_choice_and_parallel_only_sent_with_tools() {
-        use crate::llm::types::ToolDefinition;
+        use crate::types::ToolDefinition;
 
         // No tools → both fields omitted
         let no_tools = make_llm_request(vec![user_msg("hi")]);

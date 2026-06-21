@@ -402,7 +402,7 @@ mod tests {
     }
 
     fn fixture_agent_message_with_bash() -> Message {
-        use crate::llm::ContentBlock;
+        use phoenix_llm::ContentBlock;
         let blocks = vec![
             ContentBlock::Text {
                 text: "Running the command".to_string(),
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn parity_message_updated_with_content() {
-        use crate::llm::ContentBlock;
+        use phoenix_llm::ContentBlock;
         let event = SseEvent::MessageUpdated {
             sequence_id: 9,
             message_id: "msg-def".to_string(),
@@ -690,7 +690,7 @@ mod tests {
             sequence_id: 30,
             attempt: 2,
             max_attempts: 3,
-            reason: crate::llm::LlmAttemptReason::RateLimit,
+            reason: phoenix_llm::LlmAttemptReason::RateLimit,
             backing_off_ms: 2000,
             resets_at: Some(ts()),
         };
@@ -706,7 +706,7 @@ mod tests {
             sequence_id: 31,
             attempt: 1,
             max_attempts: 3,
-            reason: crate::llm::LlmAttemptReason::Network,
+            reason: phoenix_llm::LlmAttemptReason::Network,
             backing_off_ms: 1000,
             resets_at: None,
         };
@@ -979,7 +979,7 @@ mod tests {
                 conversation_id: "c".to_string(),
                 sequence_id: 5,
                 message_type: MessageType::Agent,
-                content: MessageContent::agent(vec![crate::llm::ContentBlock::text("hi")]),
+                content: MessageContent::agent(vec![phoenix_llm::ContentBlock::text("hi")]),
                 display_data: None,
                 usage_data: None,
                 created_at: Utc::now(),

@@ -76,12 +76,12 @@ pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
 pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // AutoRetryPolicy / UserResumePolicy live in phoenix-core
 // (phoenix_core::domain::retry_policy) and are not re-exported here: nothing
-// imports them via a `crate::llm::` path. Their only consumer is the persisted
+// imports them via a `phoenix_llm::` path. Their only consumer is the persisted
 // error-kind schema, which references the domain crate directly.
 // Re-exported types: QuotaDetails is consumed by `LlmOutcome::UsageLimitReached`
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.
-pub use models::{all_models, ModelSpec, Provider};
+pub use models::{all_models, ModelInfo, ModelSpec, Provider};
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
 #[allow(unused_imports)]
@@ -90,9 +90,9 @@ pub use registry::{
     AuthStyle, CredentialSource, GatewayStatus, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth,
 };
 pub use service::LlmServiceImpl;
-// `types` (ContentBlock, Usage, ImageSource, …) moved to phoenix-core. Alias
-// the module back as `types` and glob-re-export so both `crate::llm::types::X`
-// and `crate::llm::X` paths resolve unchanged.
+// `types` (ContentBlock, Usage, ImageSource, …) live in phoenix-core. Alias
+// the module back as `types` and glob-re-export so both `phoenix_llm::types::X`
+// and `phoenix_llm::X` paths resolve for downstream consumers.
 pub use phoenix_core::domain::llm_types::{self as types, *};
 
 use async_trait::async_trait;
@@ -134,7 +134,7 @@ pub trait LlmService: Send + Sync {
     fn model_id(&self) -> &str;
 
     /// True if this service routes through the ChatGPT-backend codex bridge.
-    /// Consumed by [`crate::llm::ModelSpec::context_window_for`] to apply the
+    /// Consumed by [`crate::ModelSpec::context_window_for`] to apply the
     /// bridge's 272K cap regardless of the model's platform-API ceiling.
     /// Default `false` covers Anthropic, mock, and gateway/direct `OpenAI`.
     fn uses_codex_bridge(&self) -> bool {

@@ -2,7 +2,7 @@
 //!
 //! Generates short, meaningful titles based on the initial user message.
 
-use crate::llm::{
+use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, LlmResponse, LlmService, MessageRole, PromptCacheKey,
 };
 use std::sync::Arc;

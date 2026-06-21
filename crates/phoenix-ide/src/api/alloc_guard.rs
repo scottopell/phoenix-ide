@@ -115,9 +115,9 @@ mod tests {
     use super::*;
     use crate::api::wire::{EnrichedMessage, SseWireEvent};
     use crate::db::{Message, MessageContent, MessageType, UsageData};
-    use crate::llm::ContentBlock;
     use crate::runtime::SseEvent;
     use chrono::Utc;
+    use phoenix_llm::ContentBlock;
     use serde_json::json;
 
     /// A representative mid-length agent turn: interleaved text and bash

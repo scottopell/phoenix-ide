@@ -3,7 +3,7 @@
 //! `CredentialHelper` manages the full lifecycle of a shell-based credential helper:
 //! idle → running → valid/failed, with SSE fan-out to multiple concurrent subscribers.
 
-use crate::llm::registry::CredentialSource;
+use crate::registry::CredentialSource;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
@@ -71,6 +71,7 @@ impl std::fmt::Debug for CredentialHelper {
 }
 
 impl CredentialHelper {
+    #[must_use]
     pub fn new(command: String, ttl: Duration) -> Arc<Self> {
         let this = Arc::new(Self {
             command,

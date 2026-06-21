@@ -20,9 +20,6 @@ use super::{
 };
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
-use crate::llm::{
-    ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
-};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{
     SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
@@ -34,6 +31,9 @@ use crate::state_machine::{
 use crate::system_prompt::{build_system_prompt, ModeContext};
 use crate::tools::{BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
+use phoenix_llm::{
+    ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -390,7 +390,7 @@ fn collect_tool_result_facts(
     clearable_tool_names: &std::collections::HashSet<String>,
 ) -> (Vec<ToolResultFacts>, usize) {
     use crate::db::MessageContent;
-    use crate::llm::ContentBlock as LlmContentBlock;
+    use phoenix_llm::ContentBlock as LlmContentBlock;
 
     let mut tool_name_of: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     let mut results: Vec<ToolResultFacts> = Vec::new();
@@ -633,7 +633,7 @@ fn render_messages(
     cleared_sequence_ids: &std::collections::HashSet<i64>,
 ) -> Vec<LlmMessage> {
     use crate::db::{MessageContent, ToolContent};
-    use crate::llm::ImageSource;
+    use phoenix_llm::ImageSource;
 
     let mut messages = Vec::new();
     for msg in db_messages {
@@ -1007,7 +1007,7 @@ where
     parent_tool_cycle_cap: u32,
     /// Credential helper for recovery settlement (REQ-BED-030).
     /// When the state is `AwaitingRecovery`, the select loop awaits `settled.notified()`.
-    credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+    credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     /// Named-agent catalog frozen at conversation start (parent conversations
     /// only). The same catalog renders the `spawn_agents` `agent_type` enum and
     /// resolves `agent_type` at spawn time, so the advertised choice and the
@@ -1123,7 +1123,7 @@ where
     /// Set the credential helper for recovery settlement (REQ-BED-030).
     pub fn with_credential_helper(
         mut self,
-        helper: Option<Arc<crate::llm::CredentialHelper>>,
+        helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     ) -> Self {
         self.credential_helper = helper;
         self
@@ -1218,7 +1218,7 @@ where
                 let status = helper.credential_status().await;
                 if !matches!(
                     status,
-                    crate::llm::credential_helper::CredentialStatus::Running
+                    phoenix_llm::credential_helper::CredentialStatus::Running
                 ) {
                     self.handle_credential_settlement().await;
                 }
@@ -1433,7 +1433,7 @@ where
             return;
         };
         let status = helper.credential_status().await;
-        let event = if status == crate::llm::credential_helper::CredentialStatus::Valid {
+        let event = if status == phoenix_llm::credential_helper::CredentialStatus::Valid {
             tracing::info!("Credential helper succeeded, retrying LLM request");
             Event::CredentialBecameAvailable
         } else {
@@ -3314,7 +3314,7 @@ where
         // trailing Token could land on the SSE channel after its
         // Message, producing a phantom streaming buffer on the
         // client (the "repeated message" bug).
-        let (chunk_tx, chunk_rx) = broadcast::channel::<crate::llm::TokenChunk>(256);
+        let (chunk_tx, chunk_rx) = broadcast::channel::<phoenix_llm::TokenChunk>(256);
         let request_id = uuid::Uuid::new_v4().to_string();
 
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
@@ -3332,7 +3332,7 @@ where
             let mut first_text_seen = false;
             loop {
                 match rx.recv().await {
-                    Ok(crate::llm::TokenChunk::Text(text)) => {
+                    Ok(phoenix_llm::TokenChunk::Text(text)) => {
                         if !first_text_seen {
                             first_text_seen = true;
                             let request_id_for_first = request_id_for_fwd.clone();
@@ -3348,7 +3348,7 @@ where
                             request_id: request_id_for_fwd.clone(),
                         });
                     }
-                    Ok(crate::llm::TokenChunk::RateLimitSnapshot(snapshot)) => {
+                    Ok(phoenix_llm::TokenChunk::RateLimitSnapshot(snapshot)) => {
                         let _ =
                             broadcast_tx_for_tokens.send_seq(|seq| SseEvent::RateLimitSnapshot {
                                 sequence_id: seq,
@@ -3494,7 +3494,7 @@ where
             // same store to render reset/credits/promo alongside the
             // plan-aware message.
             if let LlmOutcome::UsageLimitReached { ref details, .. } = llm_outcome {
-                let _ = chunk_tx.send(crate::llm::TokenChunk::RateLimitSnapshot(details.clone()));
+                let _ = chunk_tx.send(phoenix_llm::TokenChunk::RateLimitSnapshot(details.clone()));
             }
 
             // Happens-before barrier for task 24683: close the chunk
@@ -4683,7 +4683,7 @@ fn estimate_text_tokens(text: &str) -> usize {
 /// `Text` and `Image` blocks pass through untouched; a tool result's images are
 /// preserved as image blocks so screenshots remain available to the summary.
 fn flatten_tool_blocks(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
-    use crate::llm::ContentBlock;
+    use phoenix_llm::ContentBlock;
 
     messages
         .into_iter()
@@ -4765,7 +4765,7 @@ fn cap_block_text(text: String) -> String {
 
 /// Estimate the token cost of a single message for the proactive budget.
 fn estimate_message_tokens(msg: &LlmMessage) -> usize {
-    use crate::llm::ContentBlock;
+    use phoenix_llm::ContentBlock;
     // A flattened-and-replayed image still costs a fixed block of tokens on the
     // wire; approximate rather than under-count it to zero.
     let content: usize = msg
@@ -4911,7 +4911,7 @@ fn strip_unavailable_tool_blocks(
     messages: Vec<LlmMessage>,
     available_tools: &std::collections::HashSet<&str>,
 ) -> Vec<LlmMessage> {
-    use crate::llm::ContentBlock;
+    use phoenix_llm::ContentBlock;
 
     // First pass: collect IDs of tool_use blocks we're going to strip
     let mut stripped_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4990,7 +4990,7 @@ fn strip_unavailable_tool_blocks(
 #[cfg(test)]
 mod strip_tool_blocks_tests {
     use super::*;
-    use crate::llm::{
+    use phoenix_llm::{
         ContentBlock, ImageSource, LlmMessage, MessageRole, ToolReference, ToolSearchResultContent,
     };
 
@@ -5812,26 +5812,26 @@ fn render_rejected_tool_call(tool: &ToolCall) -> String {
     }
 }
 
-fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind {
+fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKind {
     // Explicit match arms — no catch-all. The compiler enforces exhaustiveness.
     match kind {
-        crate::llm::LlmErrorKind::Auth => crate::db::ErrorKind::Auth,
-        crate::llm::LlmErrorKind::RateLimit => crate::db::ErrorKind::RateLimit,
-        crate::llm::LlmErrorKind::UsageLimitReached => crate::db::ErrorKind::UsageLimitReached,
-        crate::llm::LlmErrorKind::Network => crate::db::ErrorKind::Network,
-        crate::llm::LlmErrorKind::InvalidRequest => crate::db::ErrorKind::InvalidRequest,
-        crate::llm::LlmErrorKind::InvalidResponse => crate::db::ErrorKind::InvalidResponse,
-        crate::llm::LlmErrorKind::ServerError => crate::db::ErrorKind::ServerError,
-        crate::llm::LlmErrorKind::ServerOverloaded => crate::db::ErrorKind::ServerOverloaded,
-        crate::llm::LlmErrorKind::ContentFilter => crate::db::ErrorKind::ContentFilter,
-        crate::llm::LlmErrorKind::ContextWindowExceeded => crate::db::ErrorKind::ContextExhausted,
+        phoenix_llm::LlmErrorKind::Auth => crate::db::ErrorKind::Auth,
+        phoenix_llm::LlmErrorKind::RateLimit => crate::db::ErrorKind::RateLimit,
+        phoenix_llm::LlmErrorKind::UsageLimitReached => crate::db::ErrorKind::UsageLimitReached,
+        phoenix_llm::LlmErrorKind::Network => crate::db::ErrorKind::Network,
+        phoenix_llm::LlmErrorKind::InvalidRequest => crate::db::ErrorKind::InvalidRequest,
+        phoenix_llm::LlmErrorKind::InvalidResponse => crate::db::ErrorKind::InvalidResponse,
+        phoenix_llm::LlmErrorKind::ServerError => crate::db::ErrorKind::ServerError,
+        phoenix_llm::LlmErrorKind::ServerOverloaded => crate::db::ErrorKind::ServerOverloaded,
+        phoenix_llm::LlmErrorKind::ContentFilter => crate::db::ErrorKind::ContentFilter,
+        phoenix_llm::LlmErrorKind::ContextWindowExceeded => crate::db::ErrorKind::ContextExhausted,
     }
 }
 
 /// Convert an LLM error into a typed `LlmOutcome`.
 /// Explicit match arms — the compiler enforces exhaustiveness.
-fn llm_error_to_outcome(error: crate::llm::LlmError) -> LlmOutcome {
-    use crate::llm::LlmErrorKind;
+fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
+    use phoenix_llm::LlmErrorKind;
     match error.kind {
         LlmErrorKind::RateLimit => LlmOutcome::RateLimited {
             retry_after: None,
@@ -5846,7 +5846,7 @@ fn llm_error_to_outcome(error: crate::llm::LlmError) -> LlmOutcome {
             // errors; fall back to an empty payload only as a defensive measure
             // in case a future caller forgets to populate it.
             let details = error.quota.map_or(
-                crate::llm::QuotaDetails {
+                phoenix_llm::QuotaDetails {
                     plan_type: None,
                     resets_at: None,
                     limit_id: None,
@@ -5939,7 +5939,7 @@ mod continuation_prompt_tests {
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
-    use crate::llm::LlmErrorKind;
+    use phoenix_llm::LlmErrorKind;
 
     #[test]
     fn test_llm_error_to_db_error_mapping() {
@@ -6034,7 +6034,7 @@ mod error_mapping_tests {
         // RequestRejected is terminal/non-resumable; InvalidResponse must take
         // the retryable outcome path instead.
         let outcome =
-            llm_error_to_outcome(crate::llm::LlmError::invalid_response("garbled SSE event"));
+            llm_error_to_outcome(phoenix_llm::LlmError::invalid_response("garbled SSE event"));
         assert!(
             matches!(outcome, LlmOutcome::InvalidResponse { .. }),
             "invalid_response must map to LlmOutcome::InvalidResponse, got {outcome:?}"
@@ -6159,10 +6159,10 @@ mod context_exhausted_preserves_worktree_tests {
     use super::test_git_helpers::{add_worktree, branch_exists, init_repo};
     use super::*;
     use crate::db::{ConvMode, NonEmptyString};
-    use crate::llm::ModelRegistry;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::{ConvContext, Effect};
     use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
@@ -6697,13 +6697,13 @@ mod plain_markdown_approval_tests {
 #[cfg(test)]
 mod explore_prompt_cache_shape_tests {
     use super::*;
-    use crate::llm::{ContentBlock, LlmResponse, ModelRegistry, ToolDefinition, Usage};
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient};
     use crate::runtime::traits::ToolExecutor;
     use crate::state_machine::{ConvContext, Event};
     use crate::system_prompt::{snapshot_next_taskmd_id_hint, ModeContext};
     use crate::tools::{BrowserSessionManager, ToolContext, ToolOutput};
     use async_trait::async_trait;
+    use phoenix_llm::{ContentBlock, LlmResponse, ModelRegistry, ToolDefinition, Usage};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -6857,11 +6857,11 @@ mod explore_prompt_cache_shape_tests {
 mod approve_task_refreshes_mode_context_tests {
     use super::test_git_helpers::{add_explore_worktree, init_repo};
     use super::*;
-    use crate::llm::ModelRegistry;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::{ConvContext, ConvState, Effect};
     use crate::system_prompt::ModeContext;
     use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -7023,7 +7023,6 @@ mod approve_task_refreshes_mode_context_tests {
 #[cfg(test)]
 mod steer_drain_detector_tests {
     use super::*;
-    use crate::llm::ModelRegistry;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::event::SteerEntry;
     use crate::state_machine::state::{
@@ -7032,6 +7031,7 @@ mod steer_drain_detector_tests {
     use crate::state_machine::transition::TransitionResult;
     use crate::state_machine::ConvContext;
     use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -7242,10 +7242,10 @@ mod steer_drain_detector_tests {
         // Queue an LLM response so dispatch_llm_request can complete cleanly.
         // We don't assert on the response — just that the pipeline doesn't panic
         // and the persists landed before RequestLlm was dispatched.
-        rt.llm_client.queue_response(crate::llm::LlmResponse {
+        rt.llm_client.queue_response(phoenix_llm::LlmResponse {
             content: vec![],
             end_turn: true,
-            usage: crate::llm::Usage {
+            usage: phoenix_llm::Usage {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_creation_tokens: 0,
@@ -7738,8 +7738,8 @@ mod steer_drain_detector_tests {
     #[tokio::test]
     async fn persist_checkpoint_preserves_tool_result_images() {
         use crate::db::{MessageContent, ToolContentImage, ToolOutcome, ToolResult};
-        use crate::llm::ContentBlock;
         use crate::state_machine::{AssistantMessage, CheckpointData};
+        use phoenix_llm::ContentBlock;
 
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-img",
@@ -7808,12 +7808,12 @@ mod steer_drain_detector_tests {
 mod work_subagent_cwd_guard_tests {
     use super::*;
     use crate::db::ToolOutcome;
-    use crate::llm::ModelRegistry;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::state::{SpawnAgentsInput, SubAgentMode, SubAgentTask, ToolInput};
     use crate::state_machine::ConvContext;
     use crate::system_prompt::ModeContext;
     use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -8510,9 +8510,9 @@ mod sender_drop_forwarder_tests {
 #[cfg(test)]
 mod retry_timer_epoch_tests {
     use super::*;
-    use crate::llm::ModelRegistry;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -8756,11 +8756,11 @@ mod fork_proposal_persist_tests {
     use super::test_git_helpers::init_repo;
     use super::*;
     use crate::db::MessageContent;
-    use crate::llm::ModelRegistry;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::state::AssistantMessage;
     use crate::state_machine::{CheckpointData, ConvContext};
     use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -8795,7 +8795,7 @@ mod fork_proposal_persist_tests {
     fn fork_effect(proposal_id: &str, task_file: &str) -> Effect {
         let assistant = AssistantMessage::new(
             "asst-fork".to_string(),
-            vec![crate::llm::ContentBlock::ToolUse {
+            vec![phoenix_llm::ContentBlock::ToolUse {
                 id: "tool-fork-1".to_string(),
                 name: "propose_task".to_string(),
                 input: serde_json::json!({ "task_file": task_file }),
@@ -8955,9 +8955,9 @@ mod tool_output_cap_tests {
 mod stale_tool_result_clearing_tests {
     use super::*;
     use crate::db::{MessageContent, ToolContentImage};
-    use crate::llm::{ContentBlock, MessageRole};
     use crate::runtime::testing::InMemoryStorage;
     use crate::runtime::traits::{MessageStore, StateStore};
+    use phoenix_llm::{ContentBlock, MessageRole};
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -9354,10 +9354,10 @@ mod stale_tool_result_clearing_tests {
 #[cfg(test)]
 mod llm_generation_guard_tests {
     use super::*;
-    use crate::llm::ModelRegistry;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::outcome::LlmOutcome;
     use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ModelRegistry;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -9480,11 +9480,11 @@ mod llm_generation_guard_tests {
 #[cfg(test)]
 mod tool_generation_guard_tests {
     use super::*;
-    use crate::llm::ContentBlock;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::outcome::ToolExecOutcome;
     use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
     use crate::tools::BrowserSessionManager;
+    use phoenix_llm::ContentBlock;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::mpsc;

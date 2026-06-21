@@ -49,6 +49,7 @@ pub struct LlmServiceImpl {
 }
 
 impl LlmServiceImpl {
+    #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         spec: ModelSpec,
@@ -308,8 +309,8 @@ impl LlmServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::all_models;
-    use crate::llm::registry::{AuthStyle, StaticCredential};
+    use crate::all_models;
+    use crate::registry::{AuthStyle, StaticCredential};
 
     fn make_service(
         gateway: Option<&str>,

@@ -37,10 +37,10 @@ pub type ProductionRuntime =
     ConversationRuntime<DatabaseStorage, RegistryLlmClient, ToolRegistryExecutor>;
 
 use crate::db::{ConvMode, Database};
-use crate::llm::ModelRegistry;
 use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
 use chrono::{DateTime, Utc};
+use phoenix_llm::ModelRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -147,7 +147,7 @@ pub struct RuntimeManager {
     fork_cmd_tx: mpsc::Sender<fork_resolve::ForkCommand>,
     fork_cmd_rx: RwLock<Option<mpsc::Receiver<fork_resolve::ForkCommand>>>,
     /// Credential helper for recovery settlement (REQ-BED-030).
-    credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+    credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     /// Receiver for browser session lifecycle edges. Taken once by
     /// [`RuntimeManager::start_browser_lifecycle_bridge`] which spawns a
     /// task that resolves `conversation_id` to its `SseBroadcaster` and
@@ -819,7 +819,7 @@ pub enum SseEvent {
         max_attempts: u32,
         /// Classified reason — one of `rate_limit`, `server_error`,
         /// `network` (the retryable subset of `LlmErrorKind`).
-        reason: crate::llm::LlmAttemptReason,
+        reason: phoenix_llm::LlmAttemptReason,
         /// `delay` from `Effect::ScheduleRetry`, in milliseconds.
         /// Informational at v1 (the client doesn't count down); the
         /// field exists so a future "backing off Ns" sub-display can be
@@ -892,7 +892,7 @@ pub enum SseEvent {
     /// invalidate the snapshot — the account is unchanged across reconnects).
     RateLimitSnapshot {
         sequence_id: i64,
-        snapshot: crate::llm::QuotaDetails,
+        snapshot: phoenix_llm::QuotaDetails,
     },
     /// A work-affine resource in this conversation's `WorkScope` changed
     /// state (bash handle spawned / went terminal / was killed, or a browser
@@ -931,7 +931,7 @@ impl RuntimeManager {
         llm_registry: Arc<ModelRegistry>,
         platform: PlatformCapability,
         mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
-        credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+        credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
@@ -2812,7 +2812,7 @@ mod broadcaster_tests {
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
             message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![crate::llm::ContentBlock::text("hi")]),
+            content: MessageContent::agent(vec![phoenix_llm::ContentBlock::text("hi")]),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
@@ -3162,11 +3162,11 @@ mod scope_liveness_tests {
     //!   archived member as live would preserve the shared `WorkScope` and
     //!   leak its bash/tmux/browser/terminal resources.
     use super::*;
-    use crate::llm::ModelRegistry;
     use crate::platform::PlatformCapability;
     use crate::tools::mcp::McpClientManager;
     use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
     use phoenix_core::domain::sm_state::ConvState;
+    use phoenix_llm::ModelRegistry;
 
     fn work_mode(worktree_path: &str) -> ConvMode {
         ConvMode::Work {

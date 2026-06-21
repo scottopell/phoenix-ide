@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::db::{ChainQaStatus, Database, MessageContent};
-use crate::llm::{LlmError, LlmResponse, TokenChunk, Usage};
 use async_trait::async_trait;
+use phoenix_llm::{LlmError, LlmResponse, TokenChunk, Usage};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;

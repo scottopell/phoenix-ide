@@ -1122,7 +1122,7 @@ pub(crate) struct ResponsesApiUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::{LlmRequest, PromptCacheKey};
+    use crate::types::{LlmRequest, PromptCacheKey};
 
     fn empty_request() -> LlmRequest {
         LlmRequest {
@@ -1140,7 +1140,7 @@ mod tests {
     /// Chat-Completions-style `text` / `image_url` types with HTTP 400.
     #[test]
     fn tool_result_image_serialises_with_responses_api_part_types() {
-        use crate::llm::types::{ContentBlock, ImageSource, LlmMessage, MessageRole};
+        use crate::types::{ContentBlock, ImageSource, LlmMessage, MessageRole};
 
         let mut req = empty_request();
         req.messages = vec![LlmMessage {
@@ -1180,7 +1180,7 @@ mod tests {
     // codex-rs/codex-api/src/api_bridge_tests.rs.
     mod codex_errors {
         use super::super::parse_codex_error;
-        use crate::llm::LlmErrorKind;
+        use crate::LlmErrorKind;
         use reqwest::header::{HeaderMap, HeaderValue};
 
         #[test]
@@ -1591,7 +1591,7 @@ mod tests {
             },
         })
         .expect_err("empty content with billed output tokens must fail");
-        assert_eq!(err.kind, crate::llm::LlmErrorKind::ServerError);
+        assert_eq!(err.kind, crate::LlmErrorKind::ServerError);
         assert!(
             err.kind.is_auto_retryable(),
             "a lost-message response must be retryable so the executor retries"
@@ -1676,14 +1676,14 @@ pub(crate) mod test_helpers {
 
     pub fn translate_to_responses_request(
         api_name: &str,
-        request: &crate::llm::types::LlmRequest,
+        request: &crate::types::LlmRequest,
     ) -> ResponsesApiRequest {
         super::translate_to_responses_request(api_name, request, false)
     }
 
     pub fn translate_to_responses_request_codex(
         api_name: &str,
-        request: &crate::llm::types::LlmRequest,
+        request: &crate::types::LlmRequest,
     ) -> ResponsesApiRequest {
         super::translate_to_responses_request(api_name, request, true)
     }

@@ -4,8 +4,8 @@
 //! Handles detection of interrupted conversations that need auto-continuation.
 
 use crate::db::{Message, MessageContent, MessageType};
-use crate::llm::ContentBlock;
 use crate::state_machine::ConvState;
+use phoenix_llm::ContentBlock;
 
 /// Result of analyzing messages for recovery
 #[derive(Debug, Clone, PartialEq)]

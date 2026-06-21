@@ -306,7 +306,7 @@ fn active_codex_credentials_location(
     runtime_env: &phoenix_core::runtime_env::PhoenixRuntimeEnvironment,
 ) -> DiskLocation {
     let path = absolutize(
-        &crate::llm::codex_credential::resolve_active_auth_path(runtime_env)
+        &phoenix_llm::codex_credential::resolve_active_auth_path(runtime_env)
             .unwrap_or_else(|| runtime_env.codex_auth_path()),
     );
     DiskLocation {

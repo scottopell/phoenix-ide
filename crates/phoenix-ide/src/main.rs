@@ -8,7 +8,6 @@ mod chain_qa;
 mod chain_runtime;
 mod conversation_cwd;
 pub(crate) mod git_ops;
-mod llm;
 mod mcp_oauth_store;
 mod message_expander;
 mod phx_cli;
@@ -60,7 +59,7 @@ use phoenix_db as db;
 
 use api::{create_router, AppState};
 use db::Database;
-use llm::{LlmConfig, ModelRegistry};
+use phoenix_llm::{LlmConfig, ModelRegistry};
 use std::future::IntoFuture;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;

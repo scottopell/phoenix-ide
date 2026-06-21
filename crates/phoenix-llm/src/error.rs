@@ -49,6 +49,7 @@ impl LlmError {
         Self::new(LlmErrorKind::ServerOverloaded, message)
     }
 
+    #[must_use]
     pub fn usage_limit_reached(quota: QuotaDetails) -> Self {
         let message = render_usage_limit_message(&quota);
         Self {
@@ -81,7 +82,7 @@ impl LlmError {
 // LlmErrorKind / LlmAttemptReason are co-owned by the llm layer (producer),
 // the runtime/state-machine (retry classification), and api/wire
 // (serialization). They live in the base crate; re-export so
-// `crate::llm::error::…` and `crate::llm::…` paths are unchanged.
+// `crate::error::…` and `crate::…` paths are unchanged.
 pub use phoenix_core::domain::llm_error_kind::{LlmAttemptReason, LlmErrorKind};
 
 impl LlmError {
@@ -89,6 +90,7 @@ impl LlmError {
         Self::new(LlmErrorKind::InvalidResponse, message)
     }
 
+    #[must_use]
     pub fn from_http_status(status: u16, body: &str) -> Self {
         match status {
             401 | 403 => Self::auth(format!("Authentication failed: {body}")),
@@ -229,7 +231,7 @@ pub(crate) fn set_now_override(now: Option<DateTime<Utc>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::rate_limit::QuotaDetails;
+    use crate::rate_limit::QuotaDetails;
     use chrono::TimeZone;
 
     fn quota(plan: Option<&str>, resets_at: Option<DateTime<Utc>>) -> QuotaDetails {

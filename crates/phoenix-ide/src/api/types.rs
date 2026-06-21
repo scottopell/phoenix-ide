@@ -365,15 +365,11 @@ pub struct FileErrorResponse {
     pub is_binary: bool,
 }
 
-/// Model information with metadata
-#[derive(Debug, Serialize)]
-pub struct ModelInfo {
-    pub id: String,
-    pub provider: String,
-    pub description: String,
-    pub context_window: usize,
-    pub recommended: bool,
-}
+// Per-model metadata is owned by the LLM layer (it is built from a ModelSpec +
+// the live service's effective context window). Re-exported here so the
+// `/api/models` response type and its `crate::api::ModelInfo` consumers resolve
+// against the same struct the registry produces.
+pub use phoenix_llm::ModelInfo;
 
 /// Gateway reachability status surfaced to the frontend
 #[derive(Debug, Serialize)]

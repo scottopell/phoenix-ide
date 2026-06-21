@@ -1,7 +1,7 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 //! HTTP API for the native `ChatGPT`/Codex login flows.
 //!
-//! Two flows are exposed (matching `crate::llm::codex_login`):
+//! Two flows are exposed (matching `phoenix_llm::codex_login`):
 //!
 //! * **PKCE/loopback** — `POST /api/codex/login/pkce/start` returns the
 //!   `authorize_url` and a session id; the user follows the URL in their
@@ -19,12 +19,12 @@
 //! to be in piggyback mode. Two distinct sources, two distinct lifecycles.
 //!
 //! Status is read via `GET /api/codex/login/{kind}/{id}/status`. The Codex
-//! credential ([`crate::llm::codex_credential::CodexCredential`]) mtime-watches
+//! credential ([`phoenix_llm::codex_credential::CodexCredential`]) mtime-watches
 //! its file, so an *already-loaded* credential picks up new tokens on next use.
 //! On a first-time login (no credential constructed at startup), or when
 //! switching accounts from a piggyback-loaded credential to a Phoenix-own
 //! one, the `settle_*` handlers call
-//! [`crate::llm::ModelRegistry::reload_codex_credential`] *before* publishing
+//! [`phoenix_llm::ModelRegistry::reload_codex_credential`] *before* publishing
 //! the success status. That hot-reload swaps the `OpenAI` bridge services in
 //! atomically, so the next `OpenAI` request after login uses the new credential
 //! without a Phoenix restart (task 13005).
@@ -55,8 +55,8 @@ const PKCE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// clients that crash, navigate away, or never poll back.
 const SETTLED_SESSION_RETENTION: Duration = Duration::from_secs(60);
 
-use crate::llm::codex_credential;
-use crate::llm::codex_login::{
+use phoenix_llm::codex_credential;
+use phoenix_llm::codex_login::{
     self, build_pkce_session, exchange_pkce_code, finalize_login, poll_device_code,
     request_device_code, validate_state, CallbackPayload, DeviceCode, LoginError, LoginResult,
     LoopbackServer, CALLBACK_PORT, CLIENT_ID, ISSUER_BASE,
@@ -416,7 +416,7 @@ async fn drive_pkce(
 
 async fn settle_pkce(
     mgr: &Arc<CodexLoginManager>,
-    llm_registry: &Arc<crate::llm::ModelRegistry>,
+    llm_registry: &Arc<phoenix_llm::ModelRegistry>,
     session_id: &str,
     outcome: Result<LoginResult, LoginError>,
 ) {
@@ -735,7 +735,7 @@ async fn drive_device_code(
 
 async fn settle_device(
     mgr: &Arc<CodexLoginManager>,
-    llm_registry: &Arc<crate::llm::ModelRegistry>,
+    llm_registry: &Arc<phoenix_llm::ModelRegistry>,
     session_id: &str,
     outcome: Result<LoginResult, LoginError>,
 ) {
@@ -874,7 +874,7 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
     let account_email = if already_signed_in {
         codex_credential::CodexCredential::read_id_token(&auth_path)
             .as_deref()
-            .and_then(crate::llm::codex_login::extract_email)
+            .and_then(phoenix_llm::codex_login::extract_email)
     } else {
         None
     };
@@ -941,7 +941,7 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::codex_login::{finalize_login, DeviceCode, LoginError, TokenResponse};
+    use phoenix_llm::codex_login::{finalize_login, DeviceCode, LoginError, TokenResponse};
     use std::time::Instant;
 
     #[test]

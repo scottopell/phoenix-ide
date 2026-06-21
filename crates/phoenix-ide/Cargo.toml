@@ -8,6 +8,11 @@ rust-version = "1.94"
 # Shared domain vocabulary (acyclic base crate)
 phoenix-core = { path = "../phoenix-core" }
 
+# LLM provider abstraction (LlmService trait, Anthropic/OpenAI/codex/mock
+# providers, model registry, credential + gateway resolution, SSE parsing).
+# Extracted so provider churn no longer recompiles the api/runtime layers.
+phoenix-llm = { path = "../phoenix-llm" }
+
 # PTY-backed terminal sessions (spawn, relay, command tracking, session
 # registry). The axum/WebSocket glue lives here in `api::terminal_ws`, not in
 # the library crate, to keep phoenix-terminal acyclic.
@@ -138,6 +143,10 @@ ts-rs = { version = "12", features = ["serde-compat", "chrono-impl"] }
 # constructors (ContentBlock::tool_use, …) are visible to this crate's tests.
 # Dev-only: production `cargo build` never enables the feature.
 phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+# Re-declared with test-support so phoenix-llm's #[cfg(test)] registry
+# constructors (ModelRegistry::new_empty, for_test_with_sonnet) are visible to
+# this crate's runtime/api/chain tests. Dev-only.
+phoenix-llm = { path = "../phoenix-llm", features = ["test-support"] }
 # Re-declared with test-support so phoenix-terminal's #[cfg(test)] ANSI/OSC
 # stream builders (full_command, TerminalStream) are visible to the api-layer
 # WebSocket relay tests. Dev-only.

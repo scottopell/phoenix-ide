@@ -318,7 +318,7 @@ pub enum SseWireEvent {
         sequence_id: i64,
         attempt: u32,
         max_attempts: u32,
-        reason: crate::llm::LlmAttemptReason,
+        reason: phoenix_llm::LlmAttemptReason,
         backing_off_ms: u64,
         #[ts(optional)]
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,7 +380,7 @@ pub enum SseWireEvent {
     /// Mid-stream quota snapshot from the codex backend. Ephemeral.
     RateLimitSnapshot {
         sequence_id: i64,
-        snapshot: crate::llm::QuotaDetails,
+        snapshot: phoenix_llm::QuotaDetails,
     },
     /// A work-affine resource in this conversation's `WorkScope` changed
     /// state. Carries the full refreshed `WorkScopeInventory` snapshot

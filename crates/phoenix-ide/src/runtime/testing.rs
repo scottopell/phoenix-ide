@@ -4,12 +4,12 @@
 
 use super::traits::*;
 use crate::db::{Message, MessageContent, MessageType, UsageData};
-use crate::llm::ModelRegistry;
-use crate::llm::{LlmError, LlmRequest, LlmResponse, PromptCacheKey, ToolDefinition};
 use crate::state_machine::ConvState;
 use crate::tools::browser::BrowserSessionManager;
 use crate::tools::{ToolContext, ToolOutput};
 use async_trait::async_trait;
+use phoenix_llm::ModelRegistry;
+use phoenix_llm::{LlmError, LlmRequest, LlmResponse, PromptCacheKey, ToolDefinition};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -109,19 +109,19 @@ impl LlmClient for StreamingMockLlmClient {
     async fn complete_streaming(
         &self,
         _request: &LlmRequest,
-        chunk_tx: &tokio::sync::broadcast::Sender<crate::llm::TokenChunk>,
+        chunk_tx: &tokio::sync::broadcast::Sender<phoenix_llm::TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
         // Emit the burst. Each send is a fire-and-forget into the broadcast
         // channel; the forwarder task reads and re-broadcasts as
         // `SseEvent::Token`. The count is deliberately large so the forwarder
         // provably has pending work when `complete_streaming` returns.
         for i in 0..self.token_count {
-            let _ = chunk_tx.send(crate::llm::TokenChunk::Text(format!("chunk{i} ")));
+            let _ = chunk_tx.send(phoenix_llm::TokenChunk::Text(format!("chunk{i} ")));
         }
         Ok(LlmResponse {
-            content: vec![crate::llm::ContentBlock::text(self.final_text.clone())],
+            content: vec![phoenix_llm::ContentBlock::text(self.final_text.clone())],
             end_turn: true,
-            usage: crate::llm::Usage::default(),
+            usage: phoenix_llm::Usage::default(),
         })
     }
 
@@ -892,7 +892,7 @@ impl StateStore for InMemoryStorage {
         _conversation_id: &str,
         _root_conversation_id: &str,
         _model: &str,
-        _usage: &crate::llm::Usage,
+        _usage: &phoenix_llm::Usage,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -1110,7 +1110,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
 mod tests {
 
     use super::*;
-    use crate::llm::{ContentBlock, Usage};
+    use phoenix_llm::{ContentBlock, Usage};
     use std::path::PathBuf;
     use tokio_util::sync::CancellationToken;
 
@@ -1229,7 +1229,7 @@ mod tests {
     /// Integration test: tool execution cycle
     #[tokio::test]
     async fn test_tool_execution_cycle() {
-        use crate::llm::ContentBlock;
+        use phoenix_llm::ContentBlock;
 
         let llm = MockLlmClient::new("test-model");
         // First response: tool call
@@ -1798,9 +1798,9 @@ mod tests {
     /// (tests the state machine directly, not through runtime)
     #[tokio::test]
     async fn test_state_machine_cancel_produces_synthetic_results() {
-        use crate::llm::ContentBlock;
         use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
         use crate::state_machine::{transition, CheckpointData, Effect};
+        use phoenix_llm::ContentBlock;
         use std::path::PathBuf;
 
         let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
@@ -2822,9 +2822,9 @@ mod tests {
     /// stale id falls through to `InvalidTransition`.
     #[tokio::test]
     async fn stale_tool_outcome_with_old_id_does_not_affect_new_round() {
-        use crate::llm::ContentBlock;
         use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
         use crate::state_machine::{transition, ConvContext, Event};
+        use phoenix_llm::ContentBlock;
         use std::path::PathBuf;
 
         let context = ConvContext::new("test", PathBuf::from("/tmp"), "model", 200_000);
@@ -3151,10 +3151,10 @@ mod tests {
     /// `CancellingTool + ToolAborted -> Failed + NotifyParent` arm.
     #[tokio::test]
     async fn wedged_sub_agent_in_cancelling_tool_notifies_parent_via_backstop() {
-        use crate::llm::ContentBlock;
         use crate::runtime::ConversationRuntime;
         use crate::state_machine::state::{AssistantMessage, SubAgentOutcome};
         use crate::state_machine::ConvContext;
+        use phoenix_llm::ContentBlock;
         use std::path::PathBuf;
         use tokio::sync::mpsc;
 

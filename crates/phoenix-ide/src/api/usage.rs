@@ -16,7 +16,6 @@
 #![allow(clippy::cast_precision_loss)]
 
 use super::AppState;
-use crate::llm::all_models;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -24,6 +23,7 @@ use axum::{
     Json,
 };
 use chrono::{Duration, Utc};
+use phoenix_llm::all_models;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use ts_rs::TS;

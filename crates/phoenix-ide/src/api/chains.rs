@@ -778,9 +778,9 @@ mod tests {
         })
     }
 
-    fn registry_with_test_llm() -> std::sync::Arc<crate::llm::ModelRegistry> {
-        use crate::llm::{ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, Usage};
+    fn registry_with_test_llm() -> std::sync::Arc<phoenix_llm::ModelRegistry> {
         use async_trait::async_trait;
+        use phoenix_llm::{ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, Usage};
         use tokio::sync::broadcast;
 
         #[derive(Debug)]
@@ -797,7 +797,7 @@ mod tests {
             async fn complete_streaming(
                 &self,
                 r: &LlmRequest,
-                _: &broadcast::Sender<crate::llm::TokenChunk>,
+                _: &broadcast::Sender<phoenix_llm::TokenChunk>,
             ) -> Result<LlmResponse, LlmError> {
                 self.complete(r).await
             }
@@ -806,7 +806,7 @@ mod tests {
                 "stub-model"
             }
         }
-        std::sync::Arc::new(crate::llm::ModelRegistry::for_test_with_sonnet(
+        std::sync::Arc::new(phoenix_llm::ModelRegistry::for_test_with_sonnet(
             std::sync::Arc::new(StubLlm),
         ))
     }

@@ -14,7 +14,7 @@
 //! - Backend URL: `https://chatgpt.com/backend-api/codex/responses`
 //! - Per-request header: `chatgpt-account-id: <account_id>`
 
-use crate::llm::registry::CredentialSource;
+use crate::registry::CredentialSource;
 use base64::Engine;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,7 @@ fn piggyback_enabled() -> bool {
 ///
 /// Returns `None` when neither is available; the registry treats that as
 /// "no `ChatGPT` bridge today".
+#[must_use]
 pub fn resolve_active_auth_path(env: &PhoenixRuntimeEnvironment) -> Option<PathBuf> {
     let phoenix_path = env.codex_auth_path();
     if phoenix_path.exists() {
@@ -367,6 +368,7 @@ impl std::fmt::Debug for CodexCredential {
 }
 
 impl CodexCredential {
+    #[must_use]
     pub fn new(auth_path: PathBuf) -> Self {
         Self {
             auth_path,
@@ -378,7 +380,10 @@ impl CodexCredential {
 
     /// Read `auth.json` once at construction and pull the `account_id` for header injection.
     /// Returns the credential plus the `account_id` (caller wires it into `chatgpt-account-id`).
-    /// Errors if the file is missing or wrong-mode at startup time.
+    ///
+    /// # Errors
+    /// Returns a [`CodexAuthError`] if `auth.json` is missing, is not a valid
+    /// ChatGPT-mode file, or carries no (or an empty) access token.
     pub fn load(auth_path: PathBuf) -> Result<(Arc<Self>, Option<String>), CodexAuthError> {
         let auth = read_auth_file(&auth_path)?;
         let tokens = auth
@@ -405,6 +410,7 @@ impl CodexCredential {
     /// the login preflight to extract human-friendly identity claims (email,
     /// name) for the sidebar account chip without exposing the JWT itself
     /// or coupling the API layer to the on-disk schema.
+    #[must_use]
     pub fn read_id_token(auth_path: &PathBuf) -> Option<String> {
         let auth = read_auth_file(auth_path).ok()?;
         auth.tokens.and_then(|t| t.id_token)

@@ -3,6 +3,18 @@
 //! This module contains all model definitions in a single location,
 //! making it easier to add new models and providers.
 
+/// Per-model metadata surfaced to API consumers (the `/api/models` response and
+/// the model picker). Built by [`super::ModelRegistry::available_model_info`]
+/// from a [`ModelSpec`] plus the live service's effective context window.
+#[derive(Debug, serde::Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub provider: String,
+    pub description: String,
+    pub context_window: usize,
+    pub recommended: bool,
+}
+
 /// LLM provider enumeration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {
@@ -13,6 +25,7 @@ pub enum Provider {
 
 impl Provider {
     /// Get the display name for this provider
+    #[must_use]
     pub fn display_name(self) -> &'static str {
         match self {
             Provider::Anthropic => "Anthropic",
@@ -22,6 +35,7 @@ impl Provider {
     }
 
     /// Lowercase provider name for gateway `provider` header (e.g. "anthropic", "openai").
+    #[must_use]
     pub fn header_value(self) -> &'static str {
         match self {
             Provider::Anthropic => "anthropic",
@@ -56,7 +70,7 @@ pub struct ModelSpec {
     /// Platform-API context window ceiling. **Not** route-aware — the codex
     /// bridge clamps this lower for every `OpenAI` model. Use
     /// [`Self::context_window_for`] to get the value that actually applies to
-    /// a specific routed service. `pub(super)` so siblings inside `crate::llm`
+    /// a specific routed service. `pub(super)` so siblings inside this crate
     /// (which know whether they're on a bridge route) can still read it
     /// directly when needed; external callers must go through the method.
     pub(super) context_window: usize,
@@ -73,9 +87,9 @@ impl ModelSpec {
     /// ceiling goes through here — the raw `context_window` field is
     /// `pub(super)` so external code can't accidentally read the unclamped
     /// value.
-    pub fn context_window_for(&self, service: &dyn crate::llm::LlmService) -> usize {
+    pub fn context_window_for(&self, service: &dyn crate::LlmService) -> usize {
         if service.uses_codex_bridge() {
-            crate::llm::CODEX_BRIDGE_CONTEXT_WINDOW
+            crate::CODEX_BRIDGE_CONTEXT_WINDOW
         } else {
             self.context_window
         }
@@ -83,6 +97,7 @@ impl ModelSpec {
 }
 
 /// Get all available model specifications
+#[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn all_models() -> Vec<ModelSpec> {
     vec![

@@ -2,7 +2,7 @@
 
 use super::{
     all_models, codex_credential, discover_models, probe_gateway, CodexCredential, DiscoveryConfig,
-    LlmService, LlmServiceImpl, LoggingService, Provider,
+    LlmService, LlmServiceImpl, LoggingService, ModelInfo, Provider,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use std::collections::HashMap;
@@ -96,6 +96,11 @@ impl LlmAuth {
     }
 
     /// Resolve the credential for use in request headers.
+    ///
+    /// # Errors
+    /// Returns an auth [`super::LlmError`] when the credential source yields
+    /// no credential (missing API key, unavailable helper, or an in-progress
+    /// recovery the caller should wait on).
     pub async fn resolve(&self) -> Result<ResolvedAuth, super::LlmError> {
         if let Some(credential) = self.source.get().await {
             return Ok(ResolvedAuth {
@@ -158,7 +163,7 @@ pub struct LlmConfig {
     pub default_model: Option<String>,
     /// Interactive credential helper. Implements `CredentialSource` for LLM auth
     /// and streams interactive output (OIDC flows) to the UI panel.
-    pub credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+    pub credential_helper: Option<Arc<crate::CredentialHelper>>,
     /// Direct URL override for the Anthropic endpoint (overrides gateway routing).
     pub anthropic_base_url: Option<String>,
     /// Direct URL override for the `OpenAI` endpoint (overrides gateway routing).
@@ -282,7 +287,7 @@ impl LlmConfig {
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(2 * 60 * 60 * 1000); // default 2 hours
-                crate::llm::CredentialHelper::new(command, Duration::from_millis(ttl_ms))
+                crate::CredentialHelper::new(command, Duration::from_millis(ttl_ms))
             });
 
         let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL")
@@ -440,7 +445,8 @@ pub struct ModelRegistry {
 
 impl ModelRegistry {
     /// Create an empty registry for testing purposes
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
     pub fn new_empty() -> Self {
         Self {
             services: std::sync::RwLock::new(HashMap::new()),
@@ -453,6 +459,7 @@ impl ModelRegistry {
         }
     }
 
+    #[must_use]
     pub fn new(config: &LlmConfig) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
@@ -786,6 +793,9 @@ impl ModelRegistry {
     }
 
     /// List all available model IDs
+    ///
+    /// # Panics
+    /// Panics if the internal services lock is poisoned.
     pub fn available_models(&self) -> Vec<String> {
         let services = self.services.read().expect("services lock poisoned");
         let mut models: Vec<_> = services.keys().cloned().collect();
@@ -794,13 +804,16 @@ impl ModelRegistry {
     }
 
     /// Get detailed information about available models
-    pub fn available_model_info(&self) -> Vec<crate::api::ModelInfo> {
+    ///
+    /// # Panics
+    /// Panics if the internal services or specs lock is poisoned.
+    pub fn available_model_info(&self) -> Vec<ModelInfo> {
         let services = self.services.read().expect("services lock poisoned");
         let specs = self.specs.read().expect("specs lock poisoned");
         let mut model_infos = Vec::new();
         for (model_id, spec) in specs.iter() {
             if let Some(service) = services.get(model_id) {
-                model_infos.push(crate::api::ModelInfo {
+                model_infos.push(ModelInfo {
                     id: spec.id.clone(),
                     provider: spec.provider.display_name().to_string(),
                     description: spec.description.clone(),
@@ -836,7 +849,7 @@ impl ModelRegistry {
     /// `service`. Test-only: bypasses `LlmConfig` and credential plumbing so
     /// integration-flavoured tests in non-llm modules (chain Q&A) can drive
     /// the public registry surface against a mock service.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_test_with_sonnet(service: Arc<dyn LlmService>) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         services.insert("claude-sonnet-4-6".to_string(), service);
@@ -888,8 +901,11 @@ impl ModelRegistry {
 
     /// Get the cheapest available model ID from the same provider family as `parent_model_id`.
     /// Falls back to `parent_model_id` if no cheap model is available for that provider.
+    ///
+    /// # Panics
+    /// Panics if the internal specs or services lock is poisoned.
     pub fn cheap_model_id_for_provider(&self, parent_model_id: &str) -> String {
-        use crate::llm::models::Provider;
+        use crate::models::Provider;
 
         let parent_provider = {
             let specs = self.specs.read().expect("specs lock poisoned");
@@ -945,11 +961,14 @@ impl ModelRegistry {
     /// Same as [`Self::reload_codex_credential`] but accepts an explicit
     /// path resolution. Used by tests that need to drive reload deterministically
     /// without manipulating process-wide env vars.
+    ///
+    /// # Panics
+    /// Panics if the internal services, specs, or loaded-path lock is poisoned.
     pub fn reload_codex_credential_with(
         &self,
         new_path: Option<std::path::PathBuf>,
     ) -> CodexReloadOutcome {
-        use crate::llm::models::Provider;
+        use crate::models::Provider;
         let cred_with_account = match new_path.as_ref() {
             Some(path) => match CodexCredential::load(path.clone()) {
                 Ok((cred, account_id)) => Some((cred, account_id)),
@@ -1229,7 +1248,7 @@ mod tests {
     fn test_credential_helper_enables_all_models() {
         // When credential_helper is set, all models become available
         let config = LlmConfig {
-            credential_helper: Some(crate::llm::CredentialHelper::new(
+            credential_helper: Some(crate::CredentialHelper::new(
                 "echo test-token".to_string(),
                 Duration::from_hours(1),
             )),
@@ -1243,14 +1262,14 @@ mod tests {
 
     /// Helper: build a `CodexCredential` pointing at a freshly-written valid
     /// auth.json file so `try_create_model` can complete the codex branch.
-    fn fake_codex_credential(dir: &tempfile::TempDir) -> Arc<crate::llm::CodexCredential> {
+    fn fake_codex_credential(dir: &tempfile::TempDir) -> Arc<crate::CodexCredential> {
         let path = dir.path().join("auth.json");
         std::fs::write(
             &path,
             br#"{"auth_mode":"chatgpt","tokens":{"access_token":"x","refresh_token":"r","account_id":"acc-1"}}"#,
         )
         .unwrap();
-        crate::llm::CodexCredential::load(path).unwrap().0
+        crate::CodexCredential::load(path).unwrap().0
     }
 
     /// With Codex auth enabled and a valid credential, `OpenAI` models register
@@ -1371,7 +1390,7 @@ mod tests {
             br#"{"auth_mode":"chatgpt","tokens":{"access_token":"a","refresh_token":"r","account_id":"acc-old"}}"#,
         )
         .unwrap();
-        let cred1 = crate::llm::CodexCredential::load(path1.clone()).unwrap().0;
+        let cred1 = crate::CodexCredential::load(path1.clone()).unwrap().0;
         let config = LlmConfig {
             use_codex_auth: true,
             codex_credential: Some(cred1),

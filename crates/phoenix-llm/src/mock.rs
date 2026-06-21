@@ -369,7 +369,7 @@ fn parse_stall(request: &LlmRequest) -> Option<(usize, u64)> {
 ///   attempt 3 → success → turn completes
 /// `[[retry:rate_limit,3]]` exercises the give-up path
 /// (transition to Error after `MAX_RETRY_ATTEMPTS`).
-fn parse_retry(request: &LlmRequest) -> Option<(crate::llm::LlmErrorKind, u32)> {
+fn parse_retry(request: &LlmRequest) -> Option<(crate::LlmErrorKind, u32)> {
     let text = latest_user_text(request)?;
     let start = text.find("[[retry:")? + "[[retry:".len();
     let rest = text.get(start..)?;
@@ -377,9 +377,9 @@ fn parse_retry(request: &LlmRequest) -> Option<(crate::llm::LlmErrorKind, u32)> 
     let body = rest.get(..end)?.trim();
     let (kind_str, n_str) = body.split_once(',')?;
     let kind = match kind_str.trim() {
-        "rate_limit" => crate::llm::LlmErrorKind::RateLimit,
-        "server_error" => crate::llm::LlmErrorKind::ServerError,
-        "network" => crate::llm::LlmErrorKind::Network,
+        "rate_limit" => crate::LlmErrorKind::RateLimit,
+        "server_error" => crate::LlmErrorKind::ServerError,
+        "network" => crate::LlmErrorKind::Network,
         _ => return None,
     };
     let n = n_str.trim().parse::<u32>().ok()?.min(MAX_RETRY_N);
@@ -779,9 +779,9 @@ impl LlmService for MockLlmService {
                 let message =
                     format!("mock retry simulation: attempt {attempt}/{fail_n} returning {kind:?}");
                 return Err(match kind {
-                    crate::llm::LlmErrorKind::RateLimit => LlmError::rate_limit(message),
-                    crate::llm::LlmErrorKind::ServerError => LlmError::server_error(message),
-                    crate::llm::LlmErrorKind::Network => LlmError::network(message),
+                    crate::LlmErrorKind::RateLimit => LlmError::rate_limit(message),
+                    crate::LlmErrorKind::ServerError => LlmError::server_error(message),
+                    crate::LlmErrorKind::Network => LlmError::network(message),
                     // parse_retry only emits the three retryable variants;
                     // any other kind escaped its validation and is a bug.
                     _ => unreachable!("parse_retry only emits retryable kinds"),
@@ -834,7 +834,7 @@ impl LlmService for MockLlmService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::types::{LlmMessage, MessageRole, PromptCacheKey};
+    use crate::types::{LlmMessage, MessageRole, PromptCacheKey};
 
     fn user_req(text: &str) -> LlmRequest {
         LlmRequest {
@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn retry_marker_parsed() {
-        use crate::llm::LlmErrorKind;
+        use crate::LlmErrorKind;
         assert_eq!(
             parse_retry(&user_req("[[retry:rate_limit,2]] hi")),
             Some((LlmErrorKind::RateLimit, 2))

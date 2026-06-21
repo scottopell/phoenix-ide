@@ -30,12 +30,12 @@ pub use types::*;
 
 use crate::chain_qa::ChainQa;
 use crate::db::{Database, Fts5Retriever, MessageRetriever};
-use crate::llm::ModelRegistry;
 use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
 use crate::terminal::ActiveTerminals;
 use crate::tools::mcp::McpClientManager;
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
+use phoenix_llm::ModelRegistry;
 use std::sync::Arc;
 
 /// Application state shared across handlers
@@ -47,7 +47,7 @@ pub struct AppState {
     #[allow(dead_code)] // Exposed for future API handlers (e.g., /status endpoint)
     pub platform: PlatformCapability,
     pub mcp_manager: Arc<McpClientManager>,
-    pub credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+    pub credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     /// When set, all non-exempt API endpoints require this password (REQ-AUTH-001).
     pub password: Option<String>,
     /// Server-side store of valid browser session tokens. Login mints a random
@@ -97,7 +97,7 @@ impl AppState {
         llm_registry: Arc<ModelRegistry>,
         platform: PlatformCapability,
         mcp_manager: Arc<McpClientManager>,
-        credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+        credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
         password: Option<String>,
         deployment: Arc<DeploymentConfig>,
         runtime_env: Arc<PhoenixRuntimeEnvironment>,

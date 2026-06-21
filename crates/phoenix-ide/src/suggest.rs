@@ -9,7 +9,7 @@
 //! Modeled on [`crate::title_generator`]: minimal request, small token budget,
 //! shared cache key, bounded by a timeout.
 
-use crate::llm::{
+use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, LlmResponse, LlmService, MessageRole, PromptCacheKey,
     SystemContent,
 };

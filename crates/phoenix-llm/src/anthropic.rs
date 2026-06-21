@@ -1094,8 +1094,8 @@ pub(crate) struct AnthropicUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::models::{ApiFormat, ModelSpec, Provider};
-    use crate::llm::types::{LlmRequest, PromptCacheKey, ToolDefinition};
+    use crate::models::{ApiFormat, ModelSpec, Provider};
+    use crate::types::{LlmRequest, PromptCacheKey, ToolDefinition};
 
     fn test_spec(supports_tool_search: bool) -> ModelSpec {
         ModelSpec {
@@ -1242,7 +1242,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert_eq!(err.kind, crate::llm::LlmErrorKind::ServerOverloaded);
+        assert_eq!(err.kind, crate::LlmErrorKind::ServerOverloaded);
         assert!(
             !err.kind.is_auto_retryable(),
             "overloaded Anthropic SSE errors should not be retried as empty responses"
@@ -1425,7 +1425,7 @@ mod tests {
         // Must be retryable (ServerError) not InvalidRequest -- likely a gateway issue.
         assert_eq!(
             result.unwrap_err().kind,
-            crate::llm::LlmErrorKind::ServerError,
+            crate::LlmErrorKind::ServerError,
             "Empty response without end_turn should be a retryable ServerError"
         );
     }
@@ -1437,11 +1437,11 @@ pub(crate) mod test_helpers {
 
     pub(crate) fn normalize_response(
         resp: AnthropicResponse,
-    ) -> Result<crate::llm::LlmResponse, crate::llm::LlmError> {
+    ) -> Result<crate::LlmResponse, crate::LlmError> {
         super::normalize_response(resp)
     }
 
-    pub(crate) fn translate_message(msg: &crate::llm::types::LlmMessage) -> AnthropicMessage {
+    pub(crate) fn translate_message(msg: &crate::types::LlmMessage) -> AnthropicMessage {
         super::translate_message(msg)
     }
 }
