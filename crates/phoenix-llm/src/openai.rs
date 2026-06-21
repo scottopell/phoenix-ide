@@ -1440,6 +1440,76 @@ mod tests {
         assert_eq!(err.kind, LlmErrorKind::RateLimit);
     }
 
+    // --- streaming SSE accumulator robustness ---
+
+    #[test]
+    fn process_event_malformed_sse_data_is_invalid_response_not_panic() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        let err = acc
+            .process_event("", "{ not json", &tx)
+            .unwrap_err();
+        assert!(
+            err.message.contains("Failed to parse SSE data"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn process_event_done_sentinel_is_ignored() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        // The `[DONE]` sentinel is not JSON; it must be a no-op, not a parse error.
+        acc.process_event("", "[DONE]", &tx).unwrap();
+        assert!(!acc.done, "[DONE] sentinel alone does not finalize the stream");
+    }
+
+    #[test]
+    fn process_event_unknown_dispatch_type_is_ignored() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        acc.process_event("", r#"{"type":"response.in_progress"}"#, &tx)
+            .unwrap();
+    }
+
+    #[test]
+    fn process_event_empty_dispatch_type_is_ignored_and_logged_once() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        // An event whose embedded `type` is empty has nothing to dispatch on; it
+        // must be tolerated (logged exactly once), never erroring the stream.
+        assert!(!acc.logged_empty_dispatch);
+        acc.process_event("", r#"{"type":""}"#, &tx).unwrap();
+        assert!(acc.logged_empty_dispatch, "first empty-dispatch event is logged");
+        acc.process_event("", r#"{"type":""}"#, &tx).unwrap();
+    }
+
+    #[test]
+    fn process_event_assembles_message_text_from_output_item_done() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        // The primary (non-fallback) assembly path: a completed message item.
+        let data = r#"{
+            "type":"response.output_item.done",
+            "item":{"type":"message","role":"assistant","content":[
+                {"type":"output_text","text":"Pong"}
+            ]}
+        }"#;
+        acc.process_event("response.output_item.done", data, &tx)
+            .unwrap();
+        assert_eq!(acc.output_items.len(), 1);
+
+        let resp = acc.into_response().unwrap();
+        assert!(
+            resp.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == "Pong")),
+            "assembled content should carry the message text: {:?}",
+            resp.content
+        );
+    }
+
     #[test]
     fn process_event_handles_codex_nested_error_shape() {
         use super::super::LlmErrorKind;

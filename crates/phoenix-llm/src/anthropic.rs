@@ -1250,6 +1250,151 @@ mod tests {
         assert!(err.message.contains("overloaded"));
     }
 
+    // --- streaming SSE accumulator robustness ---
+
+    #[test]
+    fn streaming_assembles_text_and_usage_from_event_sequence() {
+        let mut acc = StreamAccumulator::new();
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+
+        acc.process_event(
+            "message_start",
+            r#"{"message":{"usage":{"input_tokens":7}}}"#,
+            &tx,
+        )
+        .unwrap();
+        acc.process_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"text"}}"#,
+            &tx,
+        )
+        .unwrap();
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"text_delta","text":"Hello "}}"#,
+            &tx,
+        )
+        .unwrap();
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"text_delta","text":"world"}}"#,
+            &tx,
+        )
+        .unwrap();
+        acc.process_event("content_block_stop", r#"{"index":0}"#, &tx)
+            .unwrap();
+        acc.process_event(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":11}}"#,
+            &tx,
+        )
+        .unwrap();
+        acc.process_event("message_stop", "{}", &tx).unwrap();
+
+        let resp = acc.into_response_with_diagnostics("").unwrap();
+        assert_eq!(resp.content.len(), 1);
+        assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "Hello world"));
+        assert!(resp.end_turn);
+        assert_eq!(resp.usage.input_tokens, 7);
+        assert_eq!(resp.usage.output_tokens, 11);
+    }
+
+    #[test]
+    fn streaming_assembles_tool_use_from_split_input_json() {
+        let mut acc = StreamAccumulator::new();
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+
+        acc.process_event(
+            "content_block_start",
+            r#"{"index":0,"content_block":{"type":"tool_use","id":"tu1","name":"bash"}}"#,
+            &tx,
+        )
+        .unwrap();
+        // The arguments object arrives split across two deltas.
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}"#,
+            &tx,
+        )
+        .unwrap();
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
+            &tx,
+        )
+        .unwrap();
+        acc.process_event("content_block_stop", r#"{"index":0}"#, &tx)
+            .unwrap();
+        acc.process_event(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}"#,
+            &tx,
+        )
+        .unwrap();
+        acc.process_event("message_stop", "{}", &tx).unwrap();
+
+        let resp = acc.into_response_with_diagnostics("").unwrap();
+        assert_eq!(resp.content.len(), 1);
+        assert!(matches!(
+            &resp.content[0],
+            ContentBlock::ToolUse { id, name, input }
+                if id == "tu1" && name == "bash" && input["cmd"] == "ls"
+        ));
+    }
+
+    #[test]
+    fn streaming_malformed_sse_data_is_invalid_response_not_panic() {
+        let mut acc = StreamAccumulator::new();
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let err = acc
+            .process_event("content_block_delta", "{ not json", &tx)
+            .unwrap_err();
+        assert!(
+            err.message.contains("Failed to parse SSE data"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn streaming_ping_and_unknown_events_are_ignored() {
+        let mut acc = StreamAccumulator::new();
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        // Keep-alive pings and forward-compatible unknown events must be no-ops,
+        // not errors — the stream keeps flowing.
+        acc.process_event("ping", "{}", &tx).unwrap();
+        acc.process_event("some_future_event", r#"{"x":1}"#, &tx)
+            .unwrap();
+    }
+
+    #[test]
+    fn streaming_text_delta_before_block_start_is_not_committed() {
+        let mut acc = StreamAccumulator::new();
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        // A delta with no preceding content_block_start has no committed block to
+        // attach to; it must be dropped rather than fabricated into output.
+        acc.process_event(
+            "content_block_delta",
+            r#"{"index":0,"delta":{"type":"text_delta","text":"ghost"}}"#,
+            &tx,
+        )
+        .unwrap();
+        acc.process_event(
+            "message_delta",
+            r#"{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#,
+            &tx,
+        )
+        .unwrap();
+        acc.process_event("message_stop", "{}", &tx).unwrap();
+
+        let resp = acc.into_response_with_diagnostics("").unwrap();
+        assert!(
+            resp.content.is_empty(),
+            "an orphan delta must not fabricate a content block: {:?}",
+            resp.content
+        );
+    }
+
     #[test]
     fn test_resolve_anthropic_url_override_takes_priority() {
         let url = resolve_anthropic_url(
