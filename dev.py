@@ -2558,6 +2558,16 @@ def cmd_qa_grounding_panel() -> None:
     )
 
 
+def cmd_qa_meta_viewer() -> None:
+    """Capture MetaViewer edge-state Ladle screenshots into ignored local artifacts."""
+    subprocess.run(
+        ["pnpm", "qa:meta-viewer"],
+        cwd=ROOT / "ui",
+        check=True,
+        env=node_env(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # TLS
 # ---------------------------------------------------------------------------
@@ -7171,6 +7181,7 @@ def main():
     qa_parser = sub.add_parser("qa", help="Run local QA capture workflows")
     qa_sub = qa_parser.add_subparsers(dest="qa_command", required=True)
     qa_sub.add_parser("grounding-panel", help="Capture grounding panel Ladle screenshots")
+    qa_sub.add_parser("meta-viewer", help="Capture MetaViewer edge-state Ladle screenshots")
 
     # tls
     tls_parser = sub.add_parser("tls", help="Manage Phoenix HTTPS certificates")
@@ -7260,6 +7271,8 @@ def main():
     elif args.command == "qa":
         if args.qa_command == "grounding-panel":
             cmd_qa_grounding_panel()
+        elif args.qa_command == "meta-viewer":
+            cmd_qa_meta_viewer()
     elif args.command == "tls":
         if args.tls_command == "ca":
             cmd_tls_ca(args.dir)

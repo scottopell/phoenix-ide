@@ -18,6 +18,7 @@
     "preview": "vite preview",
     "ladle": "PHOENIX_LADLE=1 ladle serve --host 127.0.0.1 --port 61123",
     "qa:grounding-panel": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-grounding-panel.mjs",
+    "qa:meta-viewer": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-meta-viewer.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

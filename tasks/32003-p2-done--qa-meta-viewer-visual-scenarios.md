@@ -41,6 +41,24 @@ Key difference from grounding-panel: most scenarios need NO fetch mock — pass 
 - Re-testing the happy-path renderers (real files + unit tests own those)
 - Refactoring MetaViewer itself
 
+## As-built notes
+
+- **Dropped the "unsupported / opaque / binary kind" scenario.** The
+  `MetaViewerPayload` union is exhaustive over markdown/code/html/text/image and
+  the router has no "can't render this" branch — opaque/binary files carry
+  `viewer.kind: 'opaque'`, are non-openable upstream, and never reach MetaViewer
+  as a payload. The honest "cannot render" surface is the loader **error** path,
+  which the `error-dark` scenario covers.
+- **Patch-context uses a `text` payload, not `code`.** The changed-line
+  highlight + first-modified auto-scroll + "N changes from patch" banner are
+  MetaViewer-owned only for non-code bodies; `code` routes through Pierre's
+  CodeView, which owns its own patch handling (out of scope here).
+- **Capture script generalized** into `ui/scripts/capture-ladle-surface.mjs`
+  (shared engine) + thin per-surface configs; `capture-grounding-panel.mjs`
+  rewritten onto it with no behavior change (re-verified: 8/8 still capture).
+- Added one light variant (`large-text-fallback-light`) to prove theme plumbing
+  for this surface; the rest are dark, per the edge-states-only scope.
+
 ## References
 
 - `ui/src/components/viewer/MetaViewer.tsx`, `metaViewerTypes.ts`, `ViewerShell.tsx`, the `*ViewerBody.tsx` renderers
