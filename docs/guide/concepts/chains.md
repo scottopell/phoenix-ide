@@ -28,8 +28,9 @@ conversation — or starting a fresh one and re-supplying context — just to as
 - **Emerges automatically.** Any conversation continued into another forms a
   chain; standalone conversations stay ungrouped. Chains are linear — one line
   of continuations.
-- **You name it.** A chain carries an editable name; clearing it to whitespace
-  removes the name.
+- **You name it — or regenerate it.** A chain carries an editable name; clearing
+  it to whitespace removes it, and Phoenix can regenerate a name by summarizing
+  the chain's member conversations.
 - **Ask it.** A recall question runs a **read-only** agent scoped to the chain:
   it searches and reads across every member, cannot read outside the chain, and
   cannot change anything. Each question is answered fresh — prior answers are
