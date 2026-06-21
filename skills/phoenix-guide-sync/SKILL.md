@@ -100,6 +100,20 @@ Check all five, in order:
 
 ## Procedure
 
+0. **Sync the checkout first — non-negotiable.** The guide is grounded against
+   the code and specs in the working tree, so a stale tree makes this whole audit
+   lie: you validate quoted labels against *old* components, report "all true,"
+   and miss every change that landed on the default branch. Before auditing:
+
+   ```bash
+   git fetch origin <default-branch>
+   git rebase origin/<default-branch>     # branch you own → fine to land
+   ```
+
+   If a rebase isn't appropriate (shared branch, conflicts you won't own),
+   at minimum fetch and diff the source components/specs against the merge-base so
+   you know what moved. Never run the audit against a tree behind the default
+   branch — the headline failure mode is exactly this.
 1. **Snapshot the guide.** List `docs/guide/**`, parse each page's frontmatter,
    and read `SUMMARY.md`.
 2. **Build the current inventory** from the sources above: the tool list, the
