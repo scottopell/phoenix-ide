@@ -196,7 +196,7 @@ function ConversationPageContent() {
   // divider drag resizes its pane without re-rendering this page (and the
   // conversation subtree below it) on every pointer move — React state catches
   // up once, on pointer-up. See `useResizablePane`'s `onLiveResize`.
-  const appElementRef = useRef<HTMLDivElement>(null);
+  const appElementRef = useRef<HTMLDivElement | null>(null);
   useLayoutEffect(() => {
     appElementRef.current?.style.setProperty(
       '--viewer-pane-width',
@@ -324,6 +324,25 @@ function ConversationPageContent() {
       '--terminal-pane-height',
       `${collapsed ? TERMINAL_COLLAPSED_PX : size}px`,
     );
+  }, []);
+
+  // Callback ref for `#app`. The layout effects above only re-run on pane-state
+  // changes; the conversation-load path first paints a skeleton `#app` (without
+  // this ref) and mounts the real host later *without* a pane-state change, so
+  // those effects would never seed the variables on the real element. Syncing on
+  // attach (from the latest committed values, held in a ref to keep the callback
+  // stable) guarantees the host opens at the stored width, not the CSS fallback.
+  const paneVarsRef = useRef({ viewerWidth: '', terminalHeight: '' });
+  paneVarsRef.current = {
+    viewerWidth: `${viewerPane.collapsed ? 0 : viewerPane.size}px`,
+    terminalHeight: `${terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}px`,
+  };
+  const setAppElement = useCallback((el: HTMLDivElement | null) => {
+    appElementRef.current = el;
+    if (el) {
+      el.style.setProperty('--viewer-pane-width', paneVarsRef.current.viewerWidth);
+      el.style.setProperty('--terminal-pane-height', paneVarsRef.current.terminalHeight);
+    }
   }, []);
 
   // Credential helper auto-open — shared hook consolidates the pattern.
@@ -1113,7 +1132,7 @@ function ConversationPageContent() {
     >
     <div
       id="app"
-      ref={appElementRef}
+      ref={setAppElement}
       className={showSplitPaneViewer ? 'app-split-pane' : undefined}
     >
       <div className="conversation-column">

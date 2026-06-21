@@ -154,6 +154,40 @@ describe('useResizablePane live-drag channel', () => {
       raf.mockRestore();
     }
   });
+
+  it('commits a collapse transition mid-drag even on the live path', () => {
+    // Markup keyed on `collapsed` (sidebar/file-explorer rail, terminal strip)
+    // must switch state during the drag, not only on release — so a threshold
+    // crossing commits React state while the continuous size stays off React.
+    const raf = vi
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation((cb: FrameRequestCallback) => {
+        cb(0);
+        return 1;
+      });
+    try {
+      const liveCalls: Array<[number, boolean]> = [];
+      let renders = 0;
+      render(<LivePaneHarness onRender={() => { renders += 1; }} liveCalls={liveCalls} />);
+      const rendersAfterMount = renders;
+
+      const divider = screen.getByRole('separator', { name: 'Resize viewer pane' });
+      fireEvent.pointerDown(divider, { clientX: 500, pointerId: 1 });
+      // Inverted: drag right past the collapse threshold (600 + (-400) = 200 < 280).
+      fireEvent.pointerMove(divider, { clientX: 900, pointerId: 1 });
+
+      // Collapse committed DURING the drag (a re-render happened), and the live
+      // channel saw the clamped-min collapsed size.
+      expect(screen.getByTestId('pane-state')).toHaveTextContent('collapsed');
+      expect(renders).toBeGreaterThan(rendersAfterMount);
+      expect(liveCalls.at(-1)).toEqual([360, true]);
+
+      fireEvent.pointerUp(divider, { clientX: 900, pointerId: 1 });
+      expect(screen.getByTestId('pane-state')).toHaveTextContent('collapsed');
+    } finally {
+      raf.mockRestore();
+    }
+  });
 });
 
 describe('useResizablePane right-docked divider semantics', () => {

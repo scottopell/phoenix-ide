@@ -184,6 +184,14 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
       document.body.style.userSelect = 'none';
       document.body.style.cursor = axis === 'x' ? 'col-resize' : 'row-resize';
 
+      // Committed `collapsed` tracked across this drag. On the live path the
+      // continuous size never touches React, but a collapse *transition* must
+      // still commit so markup keyed on `collapsed` (a sidebar/file-explorer
+      // rail, the terminal's collapsed strip) switches state during the drag
+      // rather than only on release. Transitions are rare (one threshold
+      // crossing), so the commit cost is negligible.
+      let liveCollapsed = collapsed;
+
       // Resolve the (size, collapsed) a proposed pixel delta maps to. Collapse
       // pins the remembered size at `min` so a later expand restores sensibly.
       const resolve = (proposed: number): { size: number; collapsed: boolean } =>
@@ -209,8 +217,19 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
         if (!drag || ev.pointerId !== drag.pointerId) return;
         const delta = (drag.axis === 'x' ? ev.clientX : ev.clientY) - drag.startCoord;
         const signedDelta = drag.invert ? -delta : delta;
-        dragPendingRef.current = resolve(drag.startSize + signedDelta);
-        if (!drag.onLiveResize) {
+        const resolved = resolve(drag.startSize + signedDelta);
+        dragPendingRef.current = resolved;
+        if (drag.onLiveResize) {
+          // Size rides the live channel (rAF-coalesced below); a collapse
+          // transition commits immediately so dependent markup swaps now.
+          if (resolved.collapsed !== liveCollapsed) {
+            liveCollapsed = resolved.collapsed;
+            sizeInteracted.current = true;
+            collapsedInteracted.current = true;
+            setCollapsedState(resolved.collapsed);
+            setSize(resolved.size);
+          }
+        } else {
           // Legacy path commits React state — record the interaction so the
           // persistence effects fire for the dragged value.
           sizeInteracted.current = true;
