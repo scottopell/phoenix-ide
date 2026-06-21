@@ -3,7 +3,7 @@ title: keyword_search
 summary: Two-stage conceptual code search — ripgrep then an LLM filter — for finding code by idea, not exact string.
 category: reference
 keywords: [keyword_search, search, ripgrep, conceptual, find]
-related: [reference/tools/bash.md, reference/glossary.md]
+related: [reference/tools/bash.md, howto/compose-with-references.md, reference/glossary.md]
 ---
 
 # keyword_search
@@ -36,4 +36,5 @@ stated query and returns the relevant ones with reasons.
 ## Related
 
 - [bash](bash.md) — precise `rg`/`grep` when you know the string
+- [Compose with references](../../howto/compose-with-references.md) — point the agent at a file you already know with `@file`
 - [Glossary](../glossary.md) — canonical terms
