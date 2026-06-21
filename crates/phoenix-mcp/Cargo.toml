@@ -1,0 +1,53 @@
+[package]
+name = "phoenix-mcp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "MCP (Model Context Protocol) client engine for Phoenix IDE: the JSON-RPC protocol layer, stdio and Streamable HTTP transports, OAuth (DCR, PKCE), and the multi-server client manager. Transport-agnostic and Tool-trait-free — the thin `Tool` wrapper lives in phoenix-tools."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Runtime-environment detection (config/data dir resolution for server configs
+# and the OAuth token/registration store).
+phoenix-core = { path = "../phoenix-core" }
+
+# Async transport trait (`McpTransport`, `ServerMessageSink`).
+async-trait = "0.1"
+
+# Async runtime (subprocess stdio, locks, timeouts, the callback listener).
+tokio = { version = "1", features = ["full"] }
+
+# Streaming combinators for the HTTP SSE response body.
+futures = "0.3"
+
+# HTTP client for the MCP Streamable HTTP transport (specs/mcp/); `form`
+# carries the OAuth token-endpoint grants (application/x-www-form-urlencoded).
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls"] }
+
+# Serialization (JSON-RPC messages, server configs, OAuth records).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Timestamps on OAuth token/registration records.
+chrono = { version = "0.4", features = ["serde"] }
+
+# PKCE verifier/challenge and state-parameter encoding.
+base64 = "0.22"
+sha2 = "0.11"
+
+# Random session/state identifiers.
+uuid = { version = "1", features = ["v4"] }
+
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+futures = "0.3"
+# test-util enables tokio::time::{pause, advance} for the deterministic
+# timer/ordering tests in the protocol and lifecycle suites.
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints]
+workspace = true

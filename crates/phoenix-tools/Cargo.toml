@@ -26,6 +26,10 @@ phoenix-agents = { path = "../phoenix-agents" }
 # Bash command display simplification (cd-prefix stripping for UI).
 phoenix-bash-display = { path = "../phoenix-bash-display" }
 
+# MCP client engine (protocol, transports, OAuth, McpClientManager). The thin
+# `Tool`-trait wrapper over it lives in `src/mcp.rs`.
+phoenix-mcp = { path = "../phoenix-mcp" }
+
 # Async tool trait.
 async-trait = "0.1"
 
@@ -73,10 +77,6 @@ which = "8"
 
 # Process-group / signal management for bash.
 libc = "0.2"
-
-# HTTP client for the MCP Streamable HTTP transport (specs/mcp/); `form`
-# carries the OAuth token-endpoint grants (application/x-www-form-urlencoded).
-reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls"] }
 
 # Typed errors.
 thiserror = "2"

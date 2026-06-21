@@ -8,7 +8,7 @@
 //! them. Unlike stdio, requests are not serialized: each POST is an
 //! independent HTTP exchange correlated by the JSON-RPC id.
 
-use super::{HttpAuth, McpTransport, ServerMessageSink, SharedBearer, StaticCred, TransportError};
+use crate::{HttpAuth, McpTransport, ServerMessageSink, SharedBearer, StaticCred, TransportError};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION};
@@ -201,7 +201,7 @@ impl HttpTransport {
         // Bearer one carries the OAuth discovery and step-up parameters
         // (resource_metadata, error, scope), so it is selected explicitly
         // rather than taking whichever header happens to be first.
-        let www_authenticate = super::oauth::select_bearer_challenge(
+        let www_authenticate = crate::oauth::select_bearer_challenge(
             response
                 .headers()
                 .get_all("www-authenticate")
@@ -440,7 +440,7 @@ impl McpTransport for HttpTransport {
     }
 
     async fn notify(&self, notification: &Value) -> Result<(), TransportError> {
-        let (builder, sent_session_id) = self.post(super::NOTIFY_TIMEOUT);
+        let (builder, sent_session_id) = self.post(crate::NOTIFY_TIMEOUT);
         let response = builder
             .json(notification)
             .send()
@@ -867,8 +867,8 @@ impl SseFramer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{McpClientManager, McpConnState, McpServerConfig};
     use super::*;
+    use crate::{McpClientManager, McpConnState, McpServerConfig};
     use std::collections::VecDeque;
     use std::fmt::Write as _;
     use std::sync::{Arc, Mutex};
@@ -1301,10 +1301,7 @@ mod tests {
         ]
     }
 
-    async fn connect_http(
-        server: &TestServer,
-        auth: HttpAuth,
-    ) -> Result<super::super::McpServer, String> {
+    async fn connect_http(server: &TestServer, auth: HttpAuth) -> Result<crate::McpServer, String> {
         McpClientManager::connect_one(
             "remote",
             &http_config(&server.url, auth),
@@ -2024,7 +2021,7 @@ mod tests {
         // The late publish must be discarded -- not resurrect the removed
         // server -- and the session it created must be DELETEd.
         server.push_responses(vec![delete_ack()]);
-        let published = super::super::publish_if_current(
+        let published = crate::publish_if_current(
             &manager.servers,
             &manager.connect_tickets,
             "remote",
@@ -2203,7 +2200,7 @@ mod tests {
         assert_eq!(initializes, 1, "no duplicate connect was spawned");
 
         // The in-flight attempt finishes and publishes normally.
-        let published = super::super::publish_if_current(
+        let published = crate::publish_if_current(
             &manager.servers,
             &manager.connect_tickets,
             "remote",
@@ -2624,7 +2621,7 @@ mod tests {
     // registration + token endpoints, via path routing.
     // -----------------------------------------------------------------------
 
-    use super::super::oauth::{self, OAuthRegistrationRecord, OAuthTokenRecord};
+    use crate::oauth::{self, OAuthRegistrationRecord, OAuthTokenRecord};
     use base64::Engine as _;
     use sha2::Digest as _;
 
@@ -2745,7 +2742,7 @@ mod tests {
         manager: &McpClientManager,
         server: &TestServer,
         auth: HttpAuth,
-    ) -> Result<super::super::McpServer, String> {
+    ) -> Result<crate::McpServer, String> {
         McpClientManager::connect_one(
             "remote",
             &http_config(&server.url, auth),
@@ -3573,7 +3570,7 @@ mod tests {
         manager.set_oauth_redirect_base(REDIRECT_BASE.to_string());
         // The authorization server is discovered from the resource metadata;
         // the pre-configured client is seeded under that issuer post-discovery.
-        let auth = HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
+        let auth = HttpAuth::OAuth(Some(crate::PreconfiguredClient {
             client_id: "pre-1".to_string(),
             callback_port: None,
         }));
@@ -3777,7 +3774,7 @@ mod tests {
         let preconfigured = |client_id: &str| McpServerConfig::Http {
             url: server.url.clone(),
             headers: HashMap::new(),
-            auth: HttpAuth::OAuth(Some(super::super::PreconfiguredClient {
+            auth: HttpAuth::OAuth(Some(crate::PreconfiguredClient {
                 client_id: client_id.to_string(),
                 callback_port: None,
             })),

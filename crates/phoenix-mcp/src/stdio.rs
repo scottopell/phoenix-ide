@@ -1,7 +1,7 @@
 //! Stdio MCP transport: a child process exchanging JSON-RPC 2.0 over its
 //! stdin/stdout (REQ-MCP-003).
 
-use super::{McpTransport, ServerMessageSink, TransportError};
+use crate::{McpTransport, ServerMessageSink, TransportError};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
