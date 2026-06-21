@@ -4720,7 +4720,13 @@ def _build_pipeline_model(with_timings: bool = False):
             if i["compile_s"] is not None:
                 tip_lines.append(f"compile: {i['compile_s']:.1f}s (debug, full rebuild)")
             add(f"crate:{c}", c, "crate", sub=sub, tip="\n".join(tip_lines),
-                meter=weight(c) / maxw)
+                meter=weight(c) / maxw,
+                metrics={
+                    "kind": i["kind"], "dir": i["dir"],
+                    "loc": i["loc"], "files": i["files"],
+                    "ws_deps": i["ws_deps"], "ext_deps": i["ext_deps"],
+                    "rebuilds": i["rebuilds"], "compile_s": i["compile_s"],
+                })
         for dep, dependent in cedges:
             edges.append((f"crate:{dep}", f"crate:{dependent}"))
         # The root binary crate — nothing depends on it; it transitively pulls
@@ -4796,7 +4802,7 @@ def _check_graph_model():
     for c in sorted(cats):
         nodes[f"cat:{c}"] = {
             "id": f"cat:{c}", "label": _GRAPH_CATEGORY_LABELS.get(c, c),
-            "kind": "category", "sub": "changed-path trigger",
+            "kind": "category", "sub": "changed-path trigger", "category": c,
             "tip": f"Touching {c} paths activates the dependent lanes "
                    "(incremental gating).",
         }
@@ -4806,6 +4812,9 @@ def _check_graph_model():
         nodes[f"lane:{name}"] = {
             "id": f"lane:{name}", "label": name, "kind": "lane",
             "sub": (desc[:40] + "…") if len(desc) > 41 else desc, "tip": tip,
+            "desc": desc, "steps": steps,
+            "inputs": sorted(inputs) if inputs else [],
+            "always_on": not inputs,
         }
         if inputs:
             for c in sorted(inputs):
@@ -5071,25 +5080,89 @@ def _render_graph_html(build_svg, build_warn, check_svg, kinds_used, meta_line,
     )
 
 
+def _graph_to_dict(nodes, edges):
+    """Serialize one graph model to a plain dict: topological layer per node,
+    structured metric/step fields preserved, edges as [from, to] pairs."""
+    layer, _rows, _depth = _topo_layout(nodes, edges)
+    out_nodes = []
+    for nid, n in nodes.items():
+        d = {"id": n["id"], "label": n["label"], "kind": n["kind"],
+             "layer": layer[nid]}
+        if n.get("sub"):
+            d["sub"] = n["sub"]
+        for k in ("metrics", "steps", "inputs", "category", "always_on", "meter"):
+            if n.get(k) is not None:
+                d[k] = n[k]
+        out_nodes.append(d)
+    out_nodes.sort(key=lambda d: (d["layer"], d["id"]))
+    return {"nodes": out_nodes, "edges": [[a, b] for a, b in edges]}
+
+
+def _build_graph_json(bnodes, bedges, bwarn, cnodes, cedges,
+                      head, generated, weight_basis):
+    """Assemble the full machine-readable graph payload (minified by caller).
+
+    Edges are oriented dependency→dependent (the dependency builds first);
+    `layer` is the longest path from a source, so a node's layer exceeds every
+    input it depends on. `meter` is each node's weight (compile time or LoC,
+    per `weight_basis`) normalized to the heaviest node in [0,1]."""
+    return {
+        "schema": "phoenix-build-graph/1",
+        "head": head,
+        "generated": generated,
+        "weight_basis": weight_basis,
+        "warnings": [bwarn] if bwarn else [],
+        "graphs": {
+            "build": {
+                "description": "Build-artifact DAG: toolchain + workspace crate "
+                               "graph → ts-rs codegen → vite bundle → RustEmbed "
+                               "release binary. Edge [a,b] = a builds before b.",
+                **_graph_to_dict(bnodes, bedges),
+            },
+            "check": {
+                "description": "`./dev.py check` gating graph: changed-path "
+                               "categories (+ always-on) → lanes. Edge [a,b] = "
+                               "touching a activates lane b.",
+                **_graph_to_dict(cnodes, cedges),
+            },
+        },
+    }
+
+
 def cmd_graph(out: "Path | None" = None, serve: bool = False,
               port: "int | None" = None, open_browser: bool = False,
-              timings: bool = False) -> None:
-    """Emit the project build graph as a self-contained HTML page."""
+              timings: bool = False, fmt: str = "html") -> None:
+    """Emit the project build graph as HTML or machine-readable JSON."""
     bnodes, bedges, bwarn, weight_basis = _build_pipeline_model(with_timings=timings)
     cnodes, cedges = _check_graph_model()
-    build_svg = _svg_for_graph(bnodes, bedges)
-    check_svg = _svg_for_graph(cnodes, cedges)
 
     sha = subprocess.run(
         ["git", "rev-parse", "--short", "HEAD"],
         cwd=ROOT, capture_output=True, text=True,
     ).stdout.strip() or "unknown"
-    when = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    meta_line = f"HEAD {sha} · generated {when}"
-    kinds_used = {n["kind"] for n in {**bnodes, **cnodes}.values()}
-    page = _render_graph_html(build_svg, bwarn, check_svg, kinds_used,
-                              meta_line, weight_basis)
-    page_bytes = page.encode("utf-8")
+    now = datetime.datetime.now()
+
+    if fmt == "json":
+        payload = json.dumps(
+            _build_graph_json(bnodes, bedges, bwarn, cnodes, cedges,
+                              sha, now.isoformat(timespec="seconds"), weight_basis),
+            separators=(",", ":"),
+        )
+        content_type = "application/json; charset=utf-8"
+        default_name = "build-graph.json"
+    else:
+        build_svg = _svg_for_graph(bnodes, bedges)
+        check_svg = _svg_for_graph(cnodes, cedges)
+        meta_line = f"HEAD {sha} · generated {now.strftime('%Y-%m-%d %H:%M')}"
+        kinds_used = {n["kind"] for n in {**bnodes, **cnodes}.values()}
+        payload = _render_graph_html(build_svg, bwarn, check_svg, kinds_used,
+                                     meta_line, weight_basis)
+        content_type = "text/html; charset=utf-8"
+        default_name = "build-graph.html"
+    payload_bytes = payload.encode("utf-8")
+
+    # Summary goes to stderr so a JSON-to-stdout pipe stays pure data.
+    log = sys.stderr if (fmt == "json" and out is None and not serve) else sys.stdout
 
     if serve:
         import http.server
@@ -5098,17 +5171,17 @@ def cmd_graph(out: "Path | None" = None, serve: bool = False,
         class _Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(page_bytes)))
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload_bytes)))
                 self.end_headers()
-                self.wfile.write(page_bytes)
+                self.wfile.write(payload_bytes)
 
             def log_message(self, *a):
                 pass
 
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port or 0), _Handler)
         url = f"http://127.0.0.1:{httpd.server_address[1]}/"
-        print(f"✓ serving build graph at {url}  (Ctrl-C to stop)")
+        print(f"✓ serving build graph ({fmt}) at {url}  (Ctrl-C to stop)")
         print(f"  {len(bnodes)} build nodes, {len(cnodes)} check nodes")
         if bwarn:
             print(f"  ⚠ {bwarn}")
@@ -5122,16 +5195,19 @@ def cmd_graph(out: "Path | None" = None, serve: bool = False,
             httpd.server_close()
         return
 
-    out = out or (ROOT / "target" / "build-graph.html")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(page, encoding="utf-8")
-    print(f"✓ build graph → {out}")
-    print(f"  {len(bnodes)} build nodes, {len(cnodes)} check nodes")
+    if fmt == "json" and out is None:
+        sys.stdout.write(payload + "\n")
+    else:
+        out = out or (ROOT / "target" / default_name)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(payload, encoding="utf-8")
+        print(f"✓ build graph ({fmt}) → {out}", file=log)
+        if open_browser:
+            import webbrowser
+            webbrowser.open(out.as_uri())
+    print(f"  {len(bnodes)} build nodes, {len(cnodes)} check nodes", file=log)
     if bwarn:
-        print(f"  ⚠ {bwarn}")
-    if open_browser:
-        import webbrowser
-        webbrowser.open(out.as_uri())
+        print(f"  ⚠ {bwarn}", file=log)
 
 
 # =============================================================================
@@ -6875,8 +6951,14 @@ def main():
         help="Emit an HTML view of the project build graph (topologically layered)",
     )
     graph_parser.add_argument(
+        "--format", choices=("html", "json"), default="html",
+        help="Output format. json is minified, LLM/pipe-friendly, and prints "
+             "to stdout unless --out is given (default: html)",
+    )
+    graph_parser.add_argument(
         "--out", type=Path, default=None,
-        help="Output HTML path (default: target/build-graph.html)",
+        help="Output path (default: target/build-graph.{html,json}; json "
+             "without --out prints to stdout)",
     )
     graph_parser.add_argument(
         "--serve", action="store_true",
@@ -6980,6 +7062,7 @@ def main():
         cmd_graph(
             out=args.out, serve=args.serve, port=args.port,
             open_browser=args.open_browser, timings=args.timings,
+            fmt=args.format,
         )
     elif args.command == "seed":
         cmd_seed()
