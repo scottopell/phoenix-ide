@@ -31,8 +31,13 @@ use crate::state_machine::{ConvState, Event};
 /// a returning user finds the conversation ready.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Run the sweep loop forever. Spawn once at startup. The first tick fires
-/// immediately, so a restart with already-elapsed windows clears them on boot.
+/// Run the sweep loop forever. Spawn once at startup; the first tick fires
+/// immediately. The sweep's job is the live-process case — a window that
+/// elapses while Phoenix stays up. (A process restart resets Error rows to
+/// Idle via `Database::reset_all_to_idle` before this runs, so there is nothing
+/// to clear at boot. An executor evicted mid-run — e.g. a model upgrade — still
+/// clears correctly: `determine_resume_state` restores the usage-limit Error on
+/// recreate so the `DismissError` below applies.)
 pub async fn run(runtime: Arc<RuntimeManager>) {
     let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
     // A slow scan must not let ticks pile up into a burst afterwards.
@@ -44,37 +49,40 @@ pub async fn run(runtime: Arc<RuntimeManager>) {
 }
 
 async fn sweep_once(runtime: &Arc<RuntimeManager>) {
-    // `list_conversations` already restricts to non-archived, user-initiated
-    // (top-level) conversations — sub-agents are driven by their parent and
-    // are not independently resumable, so they are correctly excluded.
-    let convs = match runtime.db().list_conversations().await {
+    // A targeted projection: only top-level (non-archived, user-initiated)
+    // conversations already in a usage-limit error with a reset time. Avoids
+    // hydrating every active conversation — and the per-row message_count
+    // subquery — on every tick. Sub-agents are driven by their parent and are
+    // not independently resumable, so the user_initiated filter excludes them.
+    let convs = match runtime.db().list_usage_limit_errors().await {
         Ok(convs) => convs,
         Err(e) => {
-            tracing::warn!(error = %e, "usage-limit sweep: failed to list conversations");
+            tracing::warn!(error = %e, "usage-limit sweep: failed to query errored conversations");
             return;
         }
     };
 
     let now = Utc::now();
     let mut cleared = 0usize;
-    for conv in convs {
-        if !is_due_usage_limit_error(&conv.state, now) {
+    for (conv_id, state) in convs {
+        // The SQL narrows to usage-limit errors; this applies the time gate.
+        if !is_due_usage_limit_error(&state, now) {
             continue;
         }
         // DismissError is a no-op for any conversation whose live executor
-        // state is no longer Error (e.g. the user retried between the list and
+        // state is no longer Error (e.g. the user retried between the query and
         // this send), so the send is safe even against a stale snapshot.
-        match runtime.send_event(&conv.id, Event::DismissError).await {
+        match runtime.send_event(&conv_id, Event::DismissError).await {
             Ok(()) => {
                 cleared += 1;
                 tracing::info!(
-                    conv_id = %conv.id,
+                    conv_id = %conv_id,
                     "usage-limit window elapsed; cleared error to Idle"
                 );
             }
             Err(e) => {
                 tracing::warn!(
-                    conv_id = %conv.id,
+                    conv_id = %conv_id,
                     error = %e,
                     "usage-limit sweep: failed to clear error"
                 );

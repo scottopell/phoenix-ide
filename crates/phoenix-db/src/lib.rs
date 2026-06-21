@@ -1515,6 +1515,44 @@ impl Database {
         Ok(rows)
     }
 
+    /// Top-level conversations parked in a usage-limit error that carries a
+    /// reset time, projected to `(id, state)`.
+    ///
+    /// Pre-filtered in SQL to the usage-limit error shape so the auto-clear
+    /// sweep does not hydrate every active conversation — nor run the per-row
+    /// `message_count` subquery that `list_conversations` carries — on every
+    /// tick. The `resets_at <= now` comparison is left to the caller against
+    /// the parsed state. `json_extract` on the `state` column mirrors
+    /// `materialize_in_flight_tool_rounds` and `reset_all_to_idle`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn list_usage_limit_errors(&self) -> DbResult<Vec<(String, schema::ConvState)>> {
+        let rows: Vec<(String, String)> = sqlx::query(
+            "SELECT id, state FROM conversations
+             WHERE archived = 0 AND user_initiated = 1
+               AND json_extract(state, '$.type') = 'error'
+               AND json_extract(state, '$.error_kind') = 'usage_limit_reached'
+               AND json_extract(state, '$.resets_at') IS NOT NULL",
+        )
+        .try_map(|row: SqliteRow| Ok((row.try_get("id")?, row.try_get("state")?)))
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, state_json) in rows {
+            match serde_json::from_str::<schema::ConvState>(&state_json) {
+                Ok(state) => out.push((id, state)),
+                Err(e) => tracing::warn!(
+                    conv_id = %id, error = %e,
+                    "list_usage_limit_errors: skipping conversation with unparseable state"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
     /// Working directories Phoenix is serving, for `/preview` path containment.
     ///
     /// Returns every conversation's `cwd` and managed `worktree_path` (archived
@@ -5428,6 +5466,79 @@ mod tests {
 
         let fetched = db.get_conversation("test-id").await.unwrap();
         assert_eq!(fetched.id, conv.id);
+    }
+
+    #[tokio::test]
+    async fn list_usage_limit_errors_returns_only_due_candidate_rows() {
+        use phoenix_core::domain::db_schema::ErrorKind;
+        let db = Database::open_in_memory().await.unwrap();
+        let reset = Utc::now();
+
+        let usage_limit_err = |resets_at| ConvState::Error {
+            message: "You've hit your usage limit.".to_string(),
+            error_kind: ErrorKind::UsageLimitReached,
+            resets_at,
+        };
+
+        // Match: usage-limit error with a reset time.
+        db.create_conversation("ul", "s-ul", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state("ul", &usage_limit_err(Some(reset)))
+            .await
+            .unwrap();
+
+        // Excluded: usage-limit error WITHOUT a reset time (no window to wait).
+        db.create_conversation("ul-nores", "s-ulnr", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state("ul-nores", &usage_limit_err(None))
+            .await
+            .unwrap();
+
+        // Excluded: a different error kind, even with a reset time.
+        db.create_conversation("net", "s-net", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            "net",
+            &ConvState::Error {
+                message: "network".to_string(),
+                error_kind: ErrorKind::Network,
+                resets_at: Some(reset),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Excluded: a sub-agent (user_initiated = false) in a usage-limit error.
+        db.create_conversation("sub", "s-sub", "/tmp", false, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state("sub", &usage_limit_err(Some(reset)))
+            .await
+            .unwrap();
+
+        // Excluded: not an error at all.
+        db.create_conversation("idle", "s-idle", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let got = db.list_usage_limit_errors().await.unwrap();
+        let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["ul"],
+            "only the top-level usage-limit error with a reset time"
+        );
+        assert!(matches!(
+            got[0].1,
+            ConvState::Error {
+                error_kind: ErrorKind::UsageLimitReached,
+                resets_at: Some(_),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

@@ -2397,6 +2397,25 @@ impl RuntimeManager {
                 );
                 return Ok((conv.state, row_state_updated_at, false));
             }
+            // A usage-limit Error must be restored faithfully so the auto-clear
+            // sweep's DismissError lands on an executor that is actually in
+            // Error. A model-upgrade eviction (see get_or_create) can drop the
+            // live Error executor mid-run; without this, the recreate would
+            // derive a non-Error state via the recovery heuristic and silently
+            // reject the queued DismissError, leaving the row stuck in
+            // UsageLimitReached and the sweep re-firing every tick. (Across a
+            // process restart the row is already reset to Idle by
+            // reset_all_to_idle, so this arm only matters within one process.)
+            ConvState::Error {
+                error_kind: crate::db::ErrorKind::UsageLimitReached,
+                ..
+            } => {
+                tracing::debug!(
+                    conv_id = %conversation_id,
+                    "Restoring persisted usage-limit Error (cleared by the auto-clear sweep)"
+                );
+                return Ok((conv.state, row_state_updated_at, false));
+            }
             _ => {}
         }
 
@@ -3220,6 +3239,76 @@ mod scope_liveness_tests {
         assert!(
             mgr.scope_has_live_conversation(&scope).await.unwrap(),
             "a non-terminal, unarchived owner with a live handle is live"
+        );
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_usage_limit_error() {
+        // An executor recreated mid-run (e.g. model-upgrade eviction) for a
+        // usage-limit-errored conversation must resume in Error, so the
+        // auto-clear sweep's DismissError applies instead of being silently
+        // rejected against a derived non-Error state.
+        let mgr = test_manager().await;
+        mgr.db()
+            .create_conversation("ul", "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let reset = Utc::now();
+        mgr.db()
+            .update_conversation_state(
+                "ul",
+                &ConvState::Error {
+                    message: "You've hit your usage limit.".into(),
+                    error_kind: crate::db::ErrorKind::UsageLimitReached,
+                    resets_at: Some(reset),
+                },
+            )
+            .await
+            .expect("set error");
+
+        let (state, _ts, needs_auto_continue) =
+            mgr.determine_resume_state("ul").await.expect("resume");
+
+        assert!(
+            matches!(
+                state,
+                ConvState::Error {
+                    error_kind: crate::db::ErrorKind::UsageLimitReached,
+                    resets_at: Some(_),
+                    ..
+                }
+            ),
+            "usage-limit Error must be restored on recreate, got {state:?}"
+        );
+        assert!(!needs_auto_continue);
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_does_not_preserve_other_errors() {
+        // Only usage-limit Error is preserved; other error kinds keep the
+        // recovery-heuristic path (here, no messages -> derived to non-Error).
+        let mgr = test_manager().await;
+        mgr.db()
+            .create_conversation("net", "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        mgr.db()
+            .update_conversation_state(
+                "net",
+                &ConvState::Error {
+                    message: "network".into(),
+                    error_kind: crate::db::ErrorKind::Network,
+                    resets_at: None,
+                },
+            )
+            .await
+            .expect("set error");
+
+        let (state, _ts, _needs) = mgr.determine_resume_state("net").await.expect("resume");
+
+        assert!(
+            !matches!(state, ConvState::Error { .. }),
+            "a non-usage-limit Error must not be preserved, got {state:?}"
         );
     }
 
