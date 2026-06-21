@@ -33,8 +33,8 @@ The agent picks one operation per call via `op`:
 | `wait` | Block again on an existing handle | Same handle on re-timeout — no new handle |
 | `kill` | Signal the handle once (no auto-escalation) | Terminal status, or `kill_pending_kernel` if stuck |
 
-Common fields: `command`, `wait_seconds`, and an optional `label` that is echoed
-on every later response carrying that handle.
+Common fields: `cmd` (the shell text), `wait_seconds`, and an optional `label`
+that is echoed on every later response carrying that handle.
 
 ## Statuses
 

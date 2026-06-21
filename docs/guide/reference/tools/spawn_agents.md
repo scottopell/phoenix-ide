@@ -21,7 +21,7 @@ conversations — each running its task to completion and submitting one result.
 
 | Field | Default | Notes |
 |-------|---------|-------|
-| `description` | — | the task (required) |
+| `task` | — | the task description (required) |
 | `mode` | `explore` | `explore` (read-only) or `work` (writes) |
 | `model` | cheapest (Explore) / parent's (Work) | model override |
 | `max_turns` | 20 (Explore) / 50 (Work) | turn budget |

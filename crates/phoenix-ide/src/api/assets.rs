@@ -59,7 +59,10 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
 /// covers the dev filesystem fallback below.
 pub async fn serve_help_file(req: Request<Body>) -> impl IntoResponse {
     let rel = req.uri().path().trim_start_matches("/api/help/");
-    if rel.is_empty() || rel.contains("..") {
+    // Reject empty, parent-traversal, and absolute paths. An absolute `rel`
+    // (e.g. from `/api/help//etc/passwd`) would make `PathBuf::join` below
+    // discard the `docs/guide` base and read an arbitrary server file.
+    if rel.is_empty() || rel.contains("..") || rel.starts_with('/') {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not found"))

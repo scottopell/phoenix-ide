@@ -43,14 +43,16 @@ at a time. The bar has three zones.
 
 **Review** — always shows **`View Diff`**.
 
-**Resolve** — the "push it forward" zone, present only on an idle, open PR.
-Phoenix has no merge API, so Merge/Open are honest GitHub link-outs:
+**Resolve** — the "push it forward" zone, present on an idle conversation that
+isn't done (an open PR, or no PR yet but with changes ready to publish). Phoenix
+has no merge/PR-create API, so these are honest GitHub link-outs:
 
 | Verb (verbatim) | When | Does |
 |-----------------|------|------|
 | `Address feedback` (→ `Capturing...`) | an open PR Phoenix can post to | re-drives the agent against CI + review feedback; carries a freshness label and a `⚠` coverage marker |
-| `Merge on GitHub #N ↗` | checks confirmed passing | opens the PR on GitHub — rides as a non-glowing secondary beside `Address feedback` when green |
-| `Open PR #N ↗` | draft, not green, or stale status | opens the PR on GitHub to verify |
+| `Merge on GitHub #N ↗` | open PR, checks confirmed passing | opens the PR on GitHub — rides as a non-glowing secondary beside `Address feedback` when green |
+| `Open PR #N ↗` | open PR: draft, not green, or stale status | opens the PR on GitHub to verify |
+| `Create PR on GitHub ↗` | no PR yet, but the branch is pushed and PR-ready | opens GitHub's compare page to open the PR |
 
 **Finish** — the terminal verbs, each with an `ⓘ` hover hint:
 
@@ -84,10 +86,17 @@ continued**; `Clean up` shows where marked.
 | idle, PR merged | `Clean up` | — | Clean up + Abandon | — |
 | idle, PR closed | `Abandon` | — | Abandon | *"PR #N is closed without merge. Use Abandon to clean up."* |
 | idle, gh unavailable | `Clean up` | — | Clean up + Abandon | *"gh unavailable — manual cleanup."* |
-| idle, no PR found | `Clean up` | — | Clean up + Abandon | — |
+| idle, no PR — work **clean** | `Clean up` | — | Clean up + Abandon | — |
+| idle, no PR — **dirty, PR-ready** | `Create PR on GitHub ↗` | yes | Abandon | *"Changes found but no PR. Open a PR on GitHub before cleanup."* |
+| idle, no PR — **dirty, needs review²** | `View Diff` | — | Abandon | reason-specific, e.g. *"Uncommitted changes found. Review, commit, and push before opening a PR."* |
+| idle, no PR — **can't inspect / loading** | `View Diff` | — | Abandon | *"Could not inspect work changes…"* / *"Checking work changes…"* |
 
 ¹*Stuck* = the `error` or `context_exhausted` phase; the Resolve zone is always
 suppressed there, and a continued conversation's successor owns disposal.
+²When there's local work but no PR and it isn't push-ready (uncommitted, unpushed,
+diverged, or a non-GitHub remote), **`View Diff` glows** as the primary and
+`Clean up` is hidden — Phoenix wants you to look before discarding. The note names
+the exact reason.
 
 ## Related
 

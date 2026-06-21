@@ -22,7 +22,7 @@ can point at companion files), substitutes any arguments, and delivers the body.
 | Caller | Form |
 |--------|------|
 | You | `/name [args]` in the composer |
-| Agent | the `skill` tool with `name` + optional `arguments` |
+| Agent | the `skill` tool with `skill_name` (required) + optional `args` |
 
 Arguments are whitespace tokens: `$ARGUMENTS` (all), `$1`, `$2`, … (positional).
 If a skill has no `$ARGUMENTS` placeholder, your args are appended.

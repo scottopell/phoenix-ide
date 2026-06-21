@@ -20,12 +20,15 @@ and console logs, evaluates JavaScript, and can run performance profiles.
 
 ## Operations
 
-| Group | Verbs |
+These are **separate tools**, each named `browser_*` (there is no single
+`browser` tool):
+
+| Group | Tools |
 |-------|-------|
-| Navigate | `navigate`, `resize` (default viewport 1280×720) |
-| Interact | `click`, `type`, `key_press` |
-| Observe | `take_screenshot`, `eval`, `recent_console_logs`, `clear_console_logs`, `wait_for_selector` |
-| Profile | `profile` (scenarios, CPU/heap/coverage, raw per-run samples) |
+| Navigate | `browser_navigate`, `browser_resize` (default viewport 1280×720) |
+| Interact | `browser_click`, `browser_type`, `browser_key_press` |
+| Observe | `browser_take_screenshot`, `browser_eval`, `browser_recent_console_logs`, `browser_clear_console_logs`, `browser_wait_for_selector` |
+| Profile | `browser_profile` (scenarios, CPU/heap/coverage, raw per-run samples) |
 
 ## What you'll see
 
