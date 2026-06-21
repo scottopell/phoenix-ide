@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { FileExplorerContext } from './fileExplorerTypes';
 import type { OpenFileState } from './fileExplorerTypes';
-import { useViewerSlot } from '../../contexts/ViewerSlotContext';
+import { useViewerSlotData, useViewerSlotCommands } from '../../contexts/ViewerSlotContext';
 
 /**
  * Back-compat adapter exposing the file-oriented view of the unified viewer
@@ -12,7 +12,8 @@ import { useViewerSlot } from '../../contexts/ViewerSlotContext';
  * shape that the file explorer panel, command palette, and work actions consume.
  */
 export function FileExplorerProvider({ children }: { children: ReactNode }) {
-  const { slot, openProse, close } = useViewerSlot();
+  const slot = useViewerSlotData();
+  const { openProse, close } = useViewerSlotCommands();
 
   const openFileState = useMemo<OpenFileState | null>(() => {
     if (slot.kind !== 'prose') return null;

@@ -28,7 +28,7 @@ import { useIsDesktop } from '../hooks';
 import { useDensity, isSignificantText } from '../hooks/useDensity';
 import { useConversationInlineStream, type InlineStreamState } from '../hooks/useConversationInlineStream';
 import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
-import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 
 import { linkifyText } from '../utils/linkify';
 import { CopyButton } from './CopyButton';
@@ -1186,7 +1186,7 @@ function tryParseJson(text: string): Record<string, unknown> | null {
 }
 
 function BashInspectButton({ workScopeKey, handle }: { workScopeKey: string; handle: string }) {
-  const { openInspect } = useViewerSlot();
+  const { openInspect } = useViewerSlotCommands();
   return (
     <button
       type="button"

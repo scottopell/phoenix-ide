@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { api } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
-import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
 import { deriveWorkDisposition } from './workDisposition';
 
@@ -114,7 +114,7 @@ export function WorkControlBar({
   const [abandoning, setAbandoning] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const isLoading = markingMerged || abandoning;
-  const viewerSlot = useViewerSlot();
+  const { openDiffFullscreen } = useViewerSlotCommands();
 
   const prLoading = prStatusHandle.state.status === 'loading';
   const prStatus = prStatusHandle.state.status === 'ready' ? prStatusHandle.state.prStatus : null;
@@ -161,7 +161,7 @@ export function WorkControlBar({
         <button
           className={`work-actions-btn work-actions-view-diff${primaryClass('review')}`}
           data-testid="view-diff-button"
-          onClick={() => viewerSlot.openDiffFullscreen()}
+          onClick={() => openDiffFullscreen()}
         >
           View Diff
         </button>

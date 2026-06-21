@@ -41,11 +41,10 @@ export type ViewerSlot =
   | { kind: 'browser' }
   | { kind: 'inspect'; scopeKey: string; handleId: string };
 
-export interface ViewerSlotValue {
-  slot: ViewerSlot;
-  /** Server-authoritative live browser-session flag (from the atom). Gates the
-   *  manual browser-open affordance and drives the auto-open/close edges. */
-  browserSessionActive: boolean;
+/** The slot's imperative surface. Identity-stable across slot / browser-session
+ *  changes, so a command-only consumer (a button that opens a viewer) does not
+ *  re-render when the open viewer or the session flag changes. */
+export interface ViewerSlotCommands {
   openProse: (path: string, rootDir: string, options?: OpenFileOptions) => void;
   openDiff: (presentation: DiffPresentation) => void;
   openDiffFullscreen: () => void;
@@ -56,7 +55,20 @@ export interface ViewerSlotValue {
   close: () => void;
 }
 
-const ViewerSlotContext = createContext<ViewerSlotValue | null>(null);
+export interface ViewerSlotValue extends ViewerSlotCommands {
+  slot: ViewerSlot;
+  /** Server-authoritative live browser-session flag (from the atom). Gates the
+   *  manual browser-open affordance and drives the auto-open/close edges. */
+  browserSessionActive: boolean;
+}
+
+// Three contexts, not one, so a consumer subscribes only to the slice it reads:
+// commands (stable), the slot union, and the browser-session flag are
+// independent. A button that only calls `openDiffFullscreen` no longer
+// re-renders when the open viewer or the session flag changes.
+const ViewerSlotCommandsContext = createContext<ViewerSlotCommands | null>(null);
+const ViewerSlotDataContext = createContext<ViewerSlot | null>(null);
+const ViewerSlotBrowserActiveContext = createContext<boolean | null>(null);
 
 const VIEWER_PARAM = 'viewer';
 const DIFF_PRESENTATION_PARAM = 'presentation';
@@ -311,19 +323,60 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     }
   }, [scopeKey, browserSessionActive, slotKind, openBrowser, clearSlot]);
 
-  const value = useMemo<ViewerSlotValue>(
-    () => ({ slot, browserSessionActive, openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, close }),
-    [slot, browserSessionActive, openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, close],
+  const commands = useMemo<ViewerSlotCommands>(
+    () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, close }),
+    [openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, close],
   );
 
-  return <ViewerSlotContext.Provider value={value}>{children}</ViewerSlotContext.Provider>;
+  return (
+    <ViewerSlotCommandsContext.Provider value={commands}>
+      <ViewerSlotDataContext.Provider value={slot}>
+        <ViewerSlotBrowserActiveContext.Provider value={browserSessionActive}>
+          {children}
+        </ViewerSlotBrowserActiveContext.Provider>
+      </ViewerSlotDataContext.Provider>
+    </ViewerSlotCommandsContext.Provider>
+  );
 }
 
-// eslint-disable-next-line react-refresh/only-export-components
-export function useViewerSlot(): ViewerSlotValue {
-  const ctx = useContext(ViewerSlotContext);
+/* eslint-disable react-refresh/only-export-components -- hooks colocated with the provider */
+
+/** Imperative slot commands only. Stable; never re-renders on slot/flag change. */
+export function useViewerSlotCommands(): ViewerSlotCommands {
+  const ctx = useContext(ViewerSlotCommandsContext);
   if (!ctx) {
-    throw new Error('useViewerSlot must be used inside <ViewerSlotProvider>.');
+    throw new Error('useViewerSlotCommands must be used inside <ViewerSlotProvider>.');
   }
   return ctx;
+}
+
+/** The current slot union. Re-renders only when the open viewer changes. */
+export function useViewerSlotData(): ViewerSlot {
+  const ctx = useContext(ViewerSlotDataContext);
+  if (!ctx) {
+    throw new Error('useViewerSlotData must be used inside <ViewerSlotProvider>.');
+  }
+  return ctx;
+}
+
+/** The live browser-session flag. Re-renders only when the flag changes. */
+export function useBrowserSessionActive(): boolean {
+  const ctx = useContext(ViewerSlotBrowserActiveContext);
+  if (ctx === null) {
+    throw new Error('useBrowserSessionActive must be used inside <ViewerSlotProvider>.');
+  }
+  return ctx;
+}
+
+/** Back-compat combiner for consumers that genuinely need the whole surface
+ *  (e.g. `ConversationPage`). Subscribes to all three slices — prefer the
+ *  narrow hooks above when a consumer reads only one. */
+export function useViewerSlot(): ViewerSlotValue {
+  const commands = useViewerSlotCommands();
+  const slot = useViewerSlotData();
+  const browserSessionActive = useBrowserSessionActive();
+  return useMemo(
+    () => ({ slot, browserSessionActive, ...commands }),
+    [slot, browserSessionActive, commands],
+  );
 }

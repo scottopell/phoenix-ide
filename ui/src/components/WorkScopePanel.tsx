@@ -41,7 +41,7 @@ import {
   isBrowserIdle,
   BROWSER_IDLE_THRESHOLD_MS,
 } from './workScopeHelpers';
-import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { GroundingSection } from './GroundingPanel';
 import './WorkScopePanel.css';
 
@@ -120,13 +120,13 @@ function formatBytes(n: number): string {
 }
 
 /** The "inspect →" affordance. Isolated into its own component so the
- *  `useViewerSlot()` hook (which throws outside a `ViewerSlotProvider`) is only
+ *  `useViewerSlotCommands()` hook (which throws outside a `ViewerSlotProvider`) is only
  *  invoked when a row is actually inspectable. A non-inspectable row never
  *  renders this, so it never calls the hook — the standalone work-scope dock and
  *  plain tests can render bash rows without a provider. An inspectable row does
  *  need the provider; it is rendered inside one by construction. */
 function BashInspectButton({ scopeKey, handleId }: { scopeKey: string; handleId: string }) {
-  const { openInspect } = useViewerSlot();
+  const { openInspect } = useViewerSlotCommands();
   return (
     <button
       type="button"
@@ -140,10 +140,10 @@ function BashInspectButton({ scopeKey, handleId }: { scopeKey: string; handleId:
 }
 
 /** The "open →" affordance for a live browser session. Isolated so
- *  `useViewerSlot()` (which throws outside a `ViewerSlotProvider`) is only
+ *  `useViewerSlotCommands()` (which throws outside a `ViewerSlotProvider`) is only
  *  called when a live browser row is actually inspectable. */
 function BrowserOpenButton() {
-  const { openBrowser } = useViewerSlot();
+  const { openBrowser } = useViewerSlotCommands();
   return (
     <button
       type="button"
