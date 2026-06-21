@@ -1591,4 +1591,262 @@ mod tests {
             "the new `.gitignore` must be staged: {staged:?}"
         );
     }
+
+    // ---- find_branch_in_worktree_list: porcelain parsing ----
+
+    #[test]
+    fn find_branch_in_worktree_list_returns_none_for_free_branch() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        run_git(tmp.path(), &["branch", "feature", "main"]).unwrap();
+        // `feature` exists but is checked out in no worktree.
+        assert_eq!(find_branch_in_worktree_list(tmp.path(), "feature"), None);
+    }
+
+    #[test]
+    fn find_branch_in_worktree_list_finds_primary_worktree_branch() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let found = find_branch_in_worktree_list(tmp.path(), "main")
+            .expect("main is checked out in the primary worktree");
+        assert_eq!(
+            std::fs::canonicalize(found).unwrap(),
+            std::fs::canonicalize(tmp.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_branch_in_worktree_list_finds_linked_worktree_branch() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        run_git(tmp.path(), &["branch", "feature", "main"]).unwrap();
+        let wt = TempDir::new().unwrap();
+        run_git(
+            tmp.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                wt.path().to_str().unwrap(),
+                "feature",
+            ],
+        )
+        .unwrap();
+        let found = find_branch_in_worktree_list(tmp.path(), "feature")
+            .expect("feature is checked out in the linked worktree");
+        assert_eq!(
+            std::fs::canonicalize(found).unwrap(),
+            std::fs::canonicalize(wt.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_branch_in_worktree_list_requires_exact_ref_match() {
+        // A shared prefix must not be mistaken for a checkout: `feature` is
+        // checked out, `feature-2` is free. The match is on the full
+        // `refs/heads/<name>` line, so prefixes do not collide.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        run_git(tmp.path(), &["branch", "feature", "main"]).unwrap();
+        let wt = TempDir::new().unwrap();
+        run_git(
+            tmp.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                wt.path().to_str().unwrap(),
+                "feature",
+            ],
+        )
+        .unwrap();
+        assert_eq!(find_branch_in_worktree_list(tmp.path(), "feature-2"), None);
+    }
+
+    // ---- check_branch_conflict: the branch-collision gate ----
+    //
+    // `check_branch_conflict` resolves a Phoenix-owner lookup via
+    // `Handle::block_on`, so it must run on a blocking thread, not an async
+    // worker — hence `spawn_blocking` under a multi-thread runtime.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_branch_conflict_ok_when_branch_is_free() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        run_git(tmp.path(), &["branch", "feature", "main"]).unwrap();
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let cwd = tmp.path().to_path_buf();
+
+        let result =
+            tokio::task::spawn_blocking(move || check_branch_conflict(&cwd, &db, "feature"))
+                .await
+                .unwrap();
+        assert!(result.is_ok(), "a free branch must not conflict: {result:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_branch_conflict_flags_external_checkout() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        run_git(tmp.path(), &["branch", "feature", "main"]).unwrap();
+        let wt = TempDir::new().unwrap();
+        run_git(
+            tmp.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                wt.path().to_str().unwrap(),
+                "feature",
+            ],
+        )
+        .unwrap();
+        // Empty DB: no Phoenix conversation owns the branch, so a checkout that
+        // exists on disk must classify as an external (non-Phoenix) checkout.
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let cwd = tmp.path().to_path_buf();
+
+        let result =
+            tokio::task::spawn_blocking(move || check_branch_conflict(&cwd, &db, "feature"))
+                .await
+                .unwrap();
+        match result {
+            Err(BranchConflict::ExternalCheckout { branch, .. }) => assert_eq!(branch, "feature"),
+            other => panic!("expected ExternalCheckout, got {other:?}"),
+        }
+    }
+
+    // ---- materialize_branch: local/remote reconciliation ----
+
+    #[test]
+    fn materialize_branch_keeps_local_when_diverged_from_remote() {
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path());
+        let clone = TempDir::new().unwrap();
+        clone_repo(upstream.path(), clone.path());
+
+        // Local `feature` gains its own commit.
+        run_git(clone.path(), &["checkout", "--quiet", "-b", "feature", "main"]).unwrap();
+        commit_file(clone.path(), "local.txt", "L", "local-only");
+        let local_sha = run_git(clone.path(), &["rev-parse", "feature"]).unwrap();
+        run_git(clone.path(), &["checkout", "--quiet", "main"]).unwrap();
+
+        // Upstream `feature` gains a *different* commit → the two diverge.
+        run_git(upstream.path(), &["checkout", "--quiet", "-b", "feature", "main"]).unwrap();
+        commit_file(upstream.path(), "remote.txt", "R", "remote-only");
+        run_git(upstream.path(), &["checkout", "--quiet", "main"]).unwrap();
+
+        materialize_branch(clone.path(), "feature").unwrap();
+
+        // Diverged history must never be force-moved; local ref stays put.
+        let after = run_git(clone.path(), &["rev-parse", "feature"]).unwrap();
+        assert_eq!(
+            after.trim(),
+            local_sha.trim(),
+            "a diverged local branch must not be moved"
+        );
+    }
+
+    #[test]
+    fn materialize_branch_fast_forwards_local_to_remote_tip() {
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path());
+        let clone = TempDir::new().unwrap();
+        clone_repo(upstream.path(), clone.path());
+
+        // Local `feature` sits at `main`; upstream `feature` is one commit ahead.
+        run_git(clone.path(), &["branch", "feature", "main"]).unwrap();
+        run_git(upstream.path(), &["checkout", "--quiet", "-b", "feature", "main"]).unwrap();
+        commit_file(upstream.path(), "ahead.txt", "R", "remote ahead");
+        let remote_sha = run_git(upstream.path(), &["rev-parse", "feature"]).unwrap();
+        run_git(upstream.path(), &["checkout", "--quiet", "main"]).unwrap();
+
+        materialize_branch(clone.path(), "feature").unwrap();
+
+        // `feature` is checked out nowhere, so it fast-forwards to the remote tip.
+        let after = run_git(clone.path(), &["rev-parse", "feature"]).unwrap();
+        assert_eq!(
+            after.trim(),
+            remote_sha.trim(),
+            "an ancestor local branch must fast-forward to the remote tip"
+        );
+    }
+
+    #[test]
+    fn materialize_branch_creates_local_tracking_branch_when_remote_only() {
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path());
+        run_git(upstream.path(), &["checkout", "--quiet", "-b", "feature", "main"]).unwrap();
+        commit_file(upstream.path(), "r.txt", "R", "remote feature");
+        run_git(upstream.path(), &["checkout", "--quiet", "main"]).unwrap();
+
+        let clone = TempDir::new().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        assert!(
+            run_git(clone.path(), &["rev-parse", "--verify", "feature"]).is_err(),
+            "precondition: clone has no local `feature`"
+        );
+
+        materialize_branch(clone.path(), "feature").unwrap();
+
+        assert!(
+            run_git(clone.path(), &["rev-parse", "--verify", "feature"]).is_ok(),
+            "a remote-only branch must be materialized as a local tracking branch"
+        );
+    }
+
+    #[test]
+    fn materialize_branch_errors_when_branch_absent_everywhere() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let err = materialize_branch(tmp.path(), "ghost").unwrap_err();
+        assert!(
+            matches!(err, GitOpError::BranchNotFound(ref b) if b == "ghost"),
+            "got {err:?}"
+        );
+    }
+
+    // ---- ensure_local_exclude_has_phoenix: .git/info/exclude mutation ----
+
+    #[test]
+    fn ensure_local_exclude_appends_phoenix_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
+        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.lines().any(|l| l.trim() == ".phoenix/"),
+            "exclude was {exclude:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_local_exclude_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
+        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
+        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
+        let count = exclude.lines().filter(|l| l.trim() == ".phoenix/").count();
+        assert_eq!(count, 1, "the entry must not be duplicated: {exclude:?}");
+    }
+
+    #[test]
+    fn ensure_local_exclude_separates_from_unterminated_existing_content() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        let exclude_path = tmp.path().join(".git/info/exclude");
+        std::fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
+        // Pre-existing entry with NO trailing newline.
+        std::fs::write(&exclude_path, "*.tmp").unwrap();
+
+        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
+
+        let exclude = std::fs::read_to_string(&exclude_path).unwrap();
+        assert!(
+            exclude.contains("*.tmp\n.phoenix/"),
+            "entries must be newline-separated: {exclude:?}"
+        );
+        assert_eq!(exclude.lines().filter(|l| l.trim() == ".phoenix/").count(), 1);
+    }
 }
