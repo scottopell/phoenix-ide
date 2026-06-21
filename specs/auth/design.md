@@ -66,6 +66,13 @@ only, no InputArea, no WorkActions, no file explorer, no settings.
 SSE fan-out for multiple viewers is already supported by the broadcast
 channel architecture. Each viewer subscribes to the same channel.
 
+Because the share routes are reachable with only a token (no password),
+serving them must be free of server-side side effects. Opening the share
+SSE stream therefore attaches to a runtime only if one is already running
+and otherwise replays the persisted transcript; it never starts a runtime,
+which would let a token-only caller spawn an executor for an idle
+conversation (see `auth.allium` ReadOnlyViewingHasNoSideEffects).
+
 ### Behavioral Specification
 
 The complete behavioral contract (actors, surfaces, invariants, rules)

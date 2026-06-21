@@ -28,9 +28,19 @@ use thiserror::Error;
 
 /// Restrict the `SQLite` database file and its WAL sidecars to owner read/write
 /// (`0600`). The DB holds conversation history (command output, secrets the
-/// agent observed); the default umask can leave it group/world-readable on a
-/// shared host. Best-effort and Unix-only: a `chmod` failure is logged at debug
-/// and never fails startup; a no-op on non-Unix platforms.
+/// agent observed) and credentials at rest (MCP OAuth access/refresh tokens,
+/// registered client secrets); the default umask can leave it
+/// group/world-readable on a shared host. Best-effort and Unix-only: a `chmod`
+/// failure is logged at debug and never fails startup; a no-op on non-Unix
+/// platforms.
+///
+/// Owner-only filesystem permission is the accepted at-rest control for these
+/// secrets: Phoenix is a single-user server, so the DB owner is the trust
+/// boundary, and application-layer encryption would need a key stored next to
+/// the data on the same single-user host — moving, not closing, the exposure.
+/// Anyone who can read this file as its owner can already read the live
+/// process's memory. The same posture covers `~/.phoenix-ide/codex-auth.json`
+/// (written `0600`).
 #[cfg(unix)]
 fn restrict_db_permissions(path: &str) {
     use std::os::unix::fs::PermissionsExt;

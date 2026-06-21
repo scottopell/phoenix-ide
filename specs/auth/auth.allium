@@ -182,9 +182,13 @@ surface SharedConversation {
     -- No provides block: viewers cannot trigger any actions.
 
     @guarantee LiveUpdates
-        -- Viewer receives real-time SSE events for new messages
-        -- and state changes. Same stream as the owner, filtered to
-        -- exclude sensitive metadata.
+        -- When the conversation has a running runtime, the viewer attaches
+        -- to its broadcast channel and receives real-time SSE events for new
+        -- messages and state changes -- the same stream as the owner, filtered
+        -- to exclude sensitive metadata. An idle conversation has no live
+        -- activity to stream; the viewer still receives full history (see
+        -- FullHistory). Attaching never starts a runtime (see
+        -- ReadOnlyViewingHasNoSideEffects).
 
     @guarantee FullHistory
         -- Viewer sees all messages from conversation creation,
@@ -327,6 +331,19 @@ invariant ThrottleScopedToPasswordChecks {
     for bucket in ThrottleBuckets:
         bucket.consecutive_failures >= 0
 }
+
+-- Implementation constraint: ReadOnlyViewingHasNoSideEffects
+-- The SharedConversation surface is reachable by an unauthenticated Viewer
+-- holding only a share token, so serving it must never cause a server-side
+-- side effect. In particular, opening the share SSE stream attaches to an
+-- already-running runtime if one exists and otherwise serves the persisted
+-- transcript from a fresh broadcaster -- it never starts (get-or-creates) a
+-- runtime, which would let a token-only caller spawn an executor and allocate
+-- resources for an otherwise-idle conversation. The model expresses this as
+-- the surface's absent provides block (viewers trigger no actions); the
+-- no-runtime-start refinement is enforced at the call site.
+-- Implementation: see crates/phoenix-ide/src/api/handlers.rs
+-- (`shared_sse_stream` uses `try_get_handle`, not `get_or_create`).
 
 -- Implementation constraint: ConstantTimePasswordCheck
 -- The server compares the submitted password against config.password

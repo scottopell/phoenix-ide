@@ -5119,13 +5119,19 @@ async fn shared_sse_stream(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let (broadcast_tx, broadcast_rx) = match state.runtime.get_or_create(&conversation_id).await {
-        Ok(handle) => {
+    // A read-only share viewer must never *start* a runtime: `shared_sse_stream`
+    // is auth-exempt (token-gated), so calling `get_or_create` here would let an
+    // unauthenticated caller spawn an executor and allocate server resources for
+    // a conversation that is otherwise idle. Attach to a live runtime only if one
+    // is already running; otherwise serve the static transcript from a fresh
+    // broadcaster seeded at the last persisted sequence id (the DB messages below
+    // carry the full history). Live events then begin only if/when an
+    // authenticated path starts the runtime.
+    let (broadcast_tx, broadcast_rx) =
+        if let Some(handle) = state.runtime.try_get_handle(&conversation_id).await {
             let broadcast_rx = handle.broadcast_tx.subscribe();
             (handle.broadcast_tx, broadcast_rx)
-        }
-        Err(e) if is_invalid_runtime_cwd_error(&e) => {
-            tracing::warn!(conv_id = %conversation_id, error = %e, "Serving static shared SSE transcript without starting runtime because persisted cwd is invalid");
+        } else {
             let last_sequence_id = state
                 .runtime
                 .db()
@@ -5135,9 +5141,7 @@ async fn shared_sse_stream(
             let broadcaster = crate::runtime::SseBroadcaster::new(1, last_sequence_id);
             let broadcast_rx = broadcaster.subscribe();
             (broadcaster, broadcast_rx)
-        }
-        Err(e) => return Err(AppError::Internal(e)),
-    };
+        };
 
     let last_sequence_id = state
         .runtime
