@@ -13,14 +13,18 @@ function gitkeep(): Plugin {
   };
 }
 
-// Languages we ship TextMate grammars for in the Pierre diff/file viewer.
+// Languages we ship real TextMate grammars for in the Pierre diff/file viewer.
 // `@pierre/diffs` resolves a file's language from its extension and pulls the
 // grammar out of shiki's `bundledLanguages` map — a map of all ~237 languages,
 // each a code-split dynamic import. Vite emits a chunk per entry (~8MB of
 // grammars baked into the binary), the overwhelming majority for languages no
-// one viewing code here will open. This allowlist is the set we keep; every
-// other grammar chunk is pruned from the output below. A file whose language is
-// pruned still renders — as plaintext, no syntax colors.
+// one viewing code here will open. This allowlist is the set we keep with full
+// highlighting; every other grammar is stubbed to plaintext in the output below.
+//
+// This must remain a superset of the languages Phoenix routes through the code
+// viewer — `LANGUAGE_BY_EXTENSION` in ui/src/components/viewer/viewerFileTypes.ts.
+// A language Phoenix advertises as code but that is missing here would render as
+// plaintext, contradicting that declared support.
 const SHIKI_KEEP_LANGS = new Set([
   'bash', 'sh', 'shell', 'shellscript', 'zsh',
   'c', 'cpp', 'csharp', 'cs',
@@ -40,18 +44,25 @@ const SHIKI_KEEP_LANGS = new Set([
   'python', 'py',
   'ruby', 'rb',
   'rust', 'rs',
-  'sql', 'vue',
+  'sql', 'svelte', 'vue',
 ]);
 
-// Prune shiki grammar chunks for languages outside SHIKI_KEEP_LANGS.
+// Stub shiki grammar chunks for languages outside SHIKI_KEEP_LANGS down to empty
+// (plaintext) grammars, dropping their multi-KB pattern tables from the bundle.
 //
 // A grammar is reachable two ways: dynamically, from shiki's `bundledLanguages`
 // map (the bloat — one dynamic import per language), and statically, when a kept
 // grammar embeds another (vue embeds html/css/ts/…; php embeds html/sql/…). We
-// must keep the static-import closure of the allowlist or a kept grammar breaks,
-// and delete only grammars reachable *solely* via the dynamic map. Pruning a
-// dynamic-only grammar leaves a dangling `import('…')` in shiki's lookup chunk;
-// at runtime that 404s and the viewer falls back to plaintext for that file.
+// must keep the static-import closure of the allowlist or a kept grammar loses
+// its embedded sub-language, and stub only grammars reachable *solely* via the
+// dynamic map.
+//
+// We rewrite the chunk to export a pattern-less grammar rather than deleting the
+// asset. The dynamic `import()` in shiki's lookup chunk still resolves, shiki
+// registers an empty grammar, and the file renders as plaintext. Deleting the
+// chunk instead would leave that `import()` dangling: a 404 whose rejected
+// promise the viewer never catches, which can blank the pane on a cold load
+// before any highlighter exists to fall back through.
 //
 // This keys off the package boundary `@shikijs/langs/<lang>` — shiki's public
 // packaging, one published module per grammar — not any shiki internal module
@@ -98,16 +109,22 @@ function shikiLangPrune(): Plugin {
         }
       }
 
-      let pruned = 0;
-      for (const fileName of Array.from(grammarLang.keys())) {
-        if (!keep.has(fileName)) {
-          delete bundle[fileName];
-          pruned++;
-        }
+      let stubbed = 0;
+      for (const [fileName, lang] of Array.from(grammarLang.entries())) {
+        if (keep.has(fileName)) continue;
+        const out = bundle[fileName];
+        if (out.type !== 'chunk') continue;
+        // A pattern-less LanguageRegistration: shiki tokenizes every line as one
+        // plaintext token. Matches the real grammars' `export default [lang]`.
+        out.code =
+          `export default[{name:${JSON.stringify(lang)},` +
+          `scopeName:${JSON.stringify(`source.${lang}`)},patterns:[]}];\n`;
+        stubbed++;
       }
       this.info(
-        `pruned ${pruned} shiki grammar chunks, kept ${grammarLang.size - pruned} ` +
-          `(${SHIKI_KEEP_LANGS.size} allowlisted langs + static embeds)`,
+        `stubbed ${stubbed} shiki grammar chunks to plaintext, kept ` +
+          `${grammarLang.size - stubbed} real (${SHIKI_KEEP_LANGS.size} ` +
+          `allowlisted langs + static embeds)`,
       );
     },
   };
