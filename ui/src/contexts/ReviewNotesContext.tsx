@@ -89,8 +89,6 @@ interface ReviewNotesStore {
   subscribe: (listener: () => void) => () => void;
   getNotes: () => ReviewNote[];
   commands: ReviewNotesCommands;
-  /** Replace the pile wholesale — used by the scopeKey reset. */
-  reset: () => void;
 }
 
 function createReviewNotesStore(): ReviewNotesStore {
@@ -136,7 +134,6 @@ function createReviewNotesStore(): ReviewNotesStore {
     },
     getNotes: () => notes,
     commands,
-    reset: () => setNotes([]),
   };
 }
 
@@ -178,17 +175,19 @@ export function ReviewNotesProvider({
   if (storeRef.current === null) {
     storeRef.current = createReviewNotesStore();
   }
-  const store = storeRef.current;
 
-  // Reset the pile when the scope changes, during render, so children never
-  // commit with the previous scope's notes under the new scope key.
+  // Reset the pile when the scope changes by swapping in a FRESH store during
+  // render — never by mutating the current one. A mutator here would emit to the
+  // previous scope's `useSyncExternalStore` subscribers mid-render (StrictMode
+  // warns, and a concurrent retry could clear the old scope before the new one
+  // commits). A fresh store starts empty; the context swap makes children
+  // re-subscribe to it on commit, reading the empty snapshot for the new scope.
   const [trackedScope, setTrackedScope] = useState<string | undefined>(scopeKey);
   if (trackedScope !== scopeKey) {
     setTrackedScope(scopeKey);
-    if (store.getNotes().length > 0) {
-      store.reset();
-    }
+    storeRef.current = createReviewNotesStore();
   }
+  const store = storeRef.current;
 
   return (
     <ReviewNotesStoreContext.Provider value={store}>
