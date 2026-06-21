@@ -10,6 +10,7 @@ mod browser_view;
 mod chains;
 pub mod codex_login;
 mod deployment;
+mod discovery;
 mod git_handlers;
 pub(crate) mod handlers;
 mod lifecycle_handlers;
@@ -30,6 +31,7 @@ pub use types::*;
 
 use crate::chain_qa::ChainQa;
 use crate::db::{Database, Fts5Retriever, MessageRetriever};
+use crate::discovery::DiscoveryRegistry;
 use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
 use crate::terminal::ActiveTerminals;
@@ -83,6 +85,8 @@ pub struct AppState {
     /// the in-terminal `phx` can call the endpoint without the master password.
     /// Not the password: possessing it grants only command suggestions.
     pub suggest_token: String,
+    /// In-memory snapshot of loopback services that explicitly advertise an API catalog.
+    pub discovery: Arc<DiscoveryRegistry>,
 }
 
 impl AppState {
@@ -153,6 +157,7 @@ impl AppState {
             .map(auth::password_fingerprint)
             .unwrap_or_default();
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
+        let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
         Self {
             runtime,
             llm_registry,
@@ -170,6 +175,7 @@ impl AppState {
             deployment,
             runtime_env,
             suggest_token,
+            discovery,
         }
     }
 }

@@ -274,6 +274,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/tasks", get(list_project_tasks))
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
+        .route(
+            "/api/discovery/services",
+            get(super::discovery::list_services),
+        )
         // Environment info
         .route("/api/env", get(get_env))
         // MCP management
@@ -5529,6 +5533,10 @@ pub(crate) mod hard_delete_cascade_tests {
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
             suggest_token: String::new(),
+            discovery: crate::discovery::start(crate::discovery::DiscoveryConfig {
+                enabled: false,
+                ..crate::discovery::DiscoveryConfig::from_env()
+            }),
         }
     }
 
@@ -7666,6 +7674,10 @@ mod upgrade_model_state_guard_tests {
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
             suggest_token: String::new(),
+            discovery: crate::discovery::start(crate::discovery::DiscoveryConfig {
+                enabled: false,
+                ..crate::discovery::DiscoveryConfig::from_env()
+            }),
         }
     }
 
@@ -7933,6 +7945,10 @@ mod file_read_tests {
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
             suggest_token: String::new(),
+            discovery: crate::discovery::start(crate::discovery::DiscoveryConfig {
+                enabled: false,
+                ..crate::discovery::DiscoveryConfig::from_env()
+            }),
         }
     }
 

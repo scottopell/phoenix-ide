@@ -7554,6 +7554,121 @@ html * {
   vertical-align: middle;
 }
 
+/* --- Local Services --- */
+.local-services {
+  flex-shrink: 0;
+  padding: 4px 12px 8px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.local-services-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.local-services-header:hover {
+  color: var(--text-primary);
+}
+
+.local-services-count {
+  color: var(--accent-green, #22c55e);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.local-services-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+.local-service-row {
+  min-width: 0;
+  padding: 4px 0;
+}
+
+.local-service-row.stale {
+  opacity: 0.62;
+}
+
+.local-service-main,
+.local-service-meta {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.local-service-main {
+  gap: 5px;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.local-service-status {
+  flex: 0 0 auto;
+  color: var(--accent-green, #22c55e);
+  font-weight: 700;
+}
+
+.local-service-row.stale .local-service-status {
+  color: var(--accent-yellow, #eab308);
+}
+
+.local-service-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-service-port {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.local-service-meta {
+  justify-content: space-between;
+  gap: 8px;
+  margin-left: 16px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.local-service-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.local-service-action {
+  border: 0;
+  background: transparent;
+  color: var(--accent-blue, #58a6ff);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-decoration: none;
+}
+
+.local-service-action:hover {
+  text-decoration: underline;
+}
+
 .sidebar-list {
   flex: 1 1 auto;
   overflow: hidden auto;

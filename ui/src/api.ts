@@ -819,6 +819,36 @@ function applyResolutionOpts(params: URLSearchParams, opts?: ProjectResolutionOp
   if (opts?.baseBranch) params.set('base_branch', opts.baseBranch);
 }
 
+export type ServiceStatus = 'healthy' | 'stale';
+export type DiscoveryConfidence = 'explicit_api_catalog';
+export type DiscoverySource = 'loopback_probe';
+
+export type ServiceCapability =
+  | { kind: 'api_catalog'; url: string }
+  | { kind: 'open_api'; url: string; title: string | null; content_type: string | null }
+  | { kind: 'documentation'; url: string; title: string | null }
+  | { kind: 'html_ui'; url: string; title: string | null }
+  | { kind: 'other_link'; rel: string; url: string; title: string | null; content_type: string | null };
+
+export interface DiscoveredService {
+  id: string;
+  base_url: string;
+  host: string;
+  port: number;
+  title: string | null;
+  description: string | null;
+  capabilities: ServiceCapability[];
+  first_seen_at: string;
+  last_seen_at: string;
+  status: ServiceStatus;
+  confidence: DiscoveryConfidence;
+  source: DiscoverySource;
+}
+
+export interface DiscoveryServicesResponse {
+  services: DiscoveredService[];
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -1273,6 +1303,12 @@ export const api = {
   async listModels(): Promise<ModelsResponse> {
     const resp = await fetch('/api/models');
     if (!resp.ok) throw new Error('Failed to list models');
+    return resp.json();
+  },
+
+  async getLocalServices(): Promise<DiscoveryServicesResponse> {
+    const resp = await fetch('/api/discovery/services');
+    if (!resp.ok) throw new Error('Failed to load local services');
     return resp.json();
   },
 

@@ -7,6 +7,7 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { ChainDeleteConfirm } from './ChainDeleteConfirm';
 import { RenameDialog } from './RenameDialog';
 import { SettingsDropdown } from './SettingsDropdown';
+import { LocalServicesPanel } from './LocalServicesPanel';
 import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
@@ -376,6 +377,7 @@ export function Sidebar({
           ))}
         </div>
       )}
+      <LocalServicesPanel />
       <div className="sidebar-list">
         <ConversationList
           conversations={filteredConversations}
