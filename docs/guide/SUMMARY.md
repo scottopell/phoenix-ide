@@ -16,10 +16,10 @@ written.
 - [Modes](concepts/modes.md)
 - [Tasks](concepts/tasks.md)
 - [Sub-agents](concepts/sub-agents.md)
-- Skills — `concepts/skills.md` *(planned)*
+- [Skills](concepts/skills.md)
 - [Chains](concepts/chains.md)
 - [Workspace](concepts/workspace.md)
-- Permissions — `concepts/permissions.md` *(planned)*
+- [Permissions](concepts/permissions.md)
 - Providers & models — `concepts/providers.md` *(planned)*
 
 # How-to
@@ -27,8 +27,8 @@ written.
 - [Getting started](howto/getting-started.md)
 - [Run a managed task](howto/run-a-managed-task.md)
 - [Spawn sub-agents](howto/spawn-sub-agents.md)
-- Use the terminal — `howto/use-the-terminal.md` *(planned)*
-- Review changes — `howto/review-changes.md` *(planned)*
+- [Use the terminal](howto/use-the-terminal.md)
+- [Review changes](howto/review-changes.md)
 - Share read-only — `howto/share-read-only.md` *(planned)*
 - Steer a running agent — `howto/steer-a-running-agent.md` *(planned)*
 - [Compose with references](howto/compose-with-references.md)
@@ -39,10 +39,18 @@ written.
 
 - [Managed lifecycle states](reference/managed-lifecycle-states.md)
 - [Glossary](reference/glossary.md) — canonical term registry
-- [bash](reference/tools/bash.md)
-- Tool cards (patch, keyword_search, browse, tmux, spawn_agents, ask_user_question, skill, propose_task, …) — `reference/tools/` *(planned)*
 - [Input grammar](reference/input-grammar.md)
-- Keyboard shortcuts — `reference/keyboard.md` *(planned)*
+- [Keyboard shortcuts](reference/keyboard.md)
+- Tool cards:
+  - [bash](reference/tools/bash.md)
+  - [patch](reference/tools/patch.md)
+  - [keyword_search](reference/tools/keyword_search.md)
+  - [browser](reference/tools/browse.md)
+  - [propose_task](reference/tools/propose_task.md)
+  - [spawn_agents](reference/tools/spawn_agents.md)
+  - [ask_user_question](reference/tools/ask_user_question.md)
+  - [skill](reference/tools/skill.md)
+  - [tmux](reference/tools/tmux.md)
 - Modes matrix — `reference/modes-matrix.md` *(planned)*
 - Conversation states — `reference/states.md` *(planned)*
 - Command palette — `reference/command-palette.md` *(planned)*

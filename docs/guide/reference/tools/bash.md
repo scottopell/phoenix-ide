@@ -63,7 +63,7 @@ follow live output (and resource usage) in the **process inspector** panel.
 - **Read-only in Explore.** In [Explore mode](../../concepts/modes.md), bash is
   sandboxed and cannot write your tree.
 - **Dangerous commands are gated.** Blind `git add`, force-pushes, and dangerous
-  `rm` are screened by the **permission layer** before bash runs.
+  `rm` are screened by the [permission layer](../../concepts/permissions.md) before bash runs.
 
 ## Related
 

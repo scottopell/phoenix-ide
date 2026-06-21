@@ -35,9 +35,11 @@ unwritten page would 404 on GitHub.)
 - [Modes](concepts/modes.md) — Direct, Explore, Work, Branch
 - [Tasks](concepts/tasks.md) — the plan that gates Explore → Work
 - [Sub-agents](concepts/sub-agents.md) — child conversations, run in parallel
+- [Skills](concepts/skills.md) — reusable instruction sets
 - [Workspace](concepts/workspace.md) — the worktree and its live resources
+- [Permissions](concepts/permissions.md) — the deny layer over tool calls
 - [Chains](concepts/chains.md) — continuation runs, queryable as a unit
-- Overview, Skills, Permissions, Providers — *(planned)*
+- Overview, Providers — *(planned)*
 
 ## How-to
 
@@ -45,15 +47,18 @@ unwritten page would 404 on GitHub.)
 - [Run a managed task](howto/run-a-managed-task.md) — Explore → approve → Work → PR
 - [Spawn sub-agents](howto/spawn-sub-agents.md) — fan work out in parallel
 - [Compose with references](howto/compose-with-references.md) — `@file` `/skill` `./path`
-- Use the terminal, Review changes, Share read-only, Steer a running agent, Search conversations, Voice input — *(planned)*
+- [Use the terminal](howto/use-the-terminal.md) — persistent shell + tmux
+- [Review changes](howto/review-changes.md) — diff viewer + line notes
+- Share read-only, Steer a running agent, Search conversations, Voice input — *(planned)*
 
 ## Reference
 
 - [Managed lifecycle states](reference/managed-lifecycle-states.md) — approval & Done? bar states
 - [Glossary](reference/glossary.md) — canonical term registry
 - [Input grammar](reference/input-grammar.md) — `@file` `/skill` `./path`
-- [bash](reference/tools/bash.md) — and more tool cards *(planned)*
-- Keyboard shortcuts, Modes matrix, Conversation states, Command palette — *(planned)*
+- [Keyboard shortcuts](reference/keyboard.md) — every shortcut by scope
+- Tool cards: [bash](reference/tools/bash.md) · [patch](reference/tools/patch.md) · [keyword_search](reference/tools/keyword_search.md) · [browser](reference/tools/browse.md) · [propose_task](reference/tools/propose_task.md) · [spawn_agents](reference/tools/spawn_agents.md) · [ask_user_question](reference/tools/ask_user_question.md) · [skill](reference/tools/skill.md) · [tmux](reference/tools/tmux.md)
+- Modes matrix, Conversation states, Command palette — *(planned)*
 
 ---
 

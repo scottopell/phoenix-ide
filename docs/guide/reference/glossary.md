@@ -29,7 +29,8 @@ owns it once that page exists.
 | **chain** | A run of conversations linked by continuation, named and queryable as one unit. | [Chains](../concepts/chains.md) |
 | **chain Q&A** | Recall questions answered by a read-only agent scoped to one chain. | [Chains](../concepts/chains.md) |
 | **sub-agent** | A spawned child conversation running a delegated task. | [Sub-agents](../concepts/sub-agents.md) |
-| **skill** | A reusable instruction set invoked as `/name`. Lowercase. | Skills |
+| **skill** | A reusable instruction set invoked as `/name`. Lowercase. | [Skills](../concepts/skills.md) |
+| **permissions** | The deny layer that gates consequential tool calls before they run. | [Permissions](../concepts/permissions.md) |
 | **handle** | A backgrounded `bash` command you can peek/wait/kill. | [bash](tools/bash.md) |
 | **WorkScope** | The owner of a conversation's resources (shells, browser, tmux). One word, this casing. | [Workspace](../concepts/workspace.md) |
 
