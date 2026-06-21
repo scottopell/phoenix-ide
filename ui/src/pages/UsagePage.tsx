@@ -226,6 +226,17 @@ export function UsagePage() {
     return data.daily.map((d) => ({ day: d.day, rate: cacheHitRate(d.totals) * 100 }));
   }, [data]);
 
+  // Cache write is an Anthropic-only billing concept; OpenAI auto-caches with no
+  // write count, so the series is structurally zero on OpenAI-only data. Drop it
+  // when nothing in scope wrote to cache, rather than charting a flat-zero band.
+  const tokenSeries = useMemo(
+    () =>
+      TOKEN_SERIES.filter(
+        (s) => s.key !== 'cache_write_tokens' || (data?.windows.all.cache_write_tokens ?? 0) > 0,
+      ),
+    [data],
+  );
+
   const empty = data && data.windows.all.turns === 0;
 
   return (
@@ -270,7 +281,7 @@ export function UsagePage() {
                       <YAxis tickFormatter={fmtTokens} width={48} {...AXIS} />
                       <Tooltip content={<TokenTooltip />} />
                       <Legend wrapperStyle={{ fontSize: 11 }} />
-                      {TOKEN_SERIES.map((s) => (
+                      {tokenSeries.map((s) => (
                         <Area
                           key={s.key}
                           type="monotone"
