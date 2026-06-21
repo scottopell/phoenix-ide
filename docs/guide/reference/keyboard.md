@@ -37,6 +37,8 @@ related: [concepts/conversations.md, reference/glossary.md]
 
 ## Question panel
 
+*Active only while a question panel is open.*
+
 | Key | Action |
 |-----|--------|
 | `Up / Down` | Move between options |

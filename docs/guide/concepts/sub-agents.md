@@ -27,9 +27,9 @@ a contained job to a focused worker.
 - **Bounded.** Each has a turn budget and a wall-clock timeout, and a parent can
   fan out several at once. Explore sub-agents are read-only investigators; the
   costly write path is held to one at a time.
-- **One writer.** At most **one Work sub-agent runs per parent at a time**, and a
-  Work sub-agent stays inside the parent's worktree. Parallel writers on one
-  worktree can't happen — it's rejected when the agent tries to spawn them.
+- **One writer.** At most **one Work sub-agent runs per parent at a time**, and
+  when the parent has a worktree (Work/Branch) the Work sub-agent stays inside it.
+  Concurrent writers per parent can't happen — it's rejected at spawn.
 - **Reports back.** A sub-agent ends by submitting exactly one result (or an
   error); the parent reads those in and continues.
 
@@ -39,9 +39,9 @@ When the agent opens a sub-agent, a **sub-agent viewer** docks beside the chat
 with that child's full transcript, live while it runs. You watch and read; you
 don't drive it — a running sub-agent is parent-driven, a finished one is done.
 
-> **Remember:** only **one** Work (writing) sub-agent runs per parent at a time,
-> always inside the parent's worktree. Read-only Explore sub-agents fan out
-> freely; concurrent writers are structurally impossible.
+> **Remember:** only **one** Work (writing) sub-agent runs per parent at a time
+> (inside the parent's worktree when it has one). Read-only Explore sub-agents
+> fan out freely; concurrent writers are structurally impossible.
 
 ## See also
 

@@ -26,9 +26,8 @@ an Explore parent can only spawn read-only Explore sub-agents.
 2. **Watch them.** When the agent opens a sub-agent, a viewer docks beside the
    chat with that child's transcript, live while it runs and marked read-only.
 3. **Open or switch.** Open a sub-agent to read its full transcript; a link opens
-   it as a full page if you want room.
-4. **Let them report back.** Each sub-agent submits one result; the parent reads
-   them in and continues the main thread.
+   it as a full page if you want room. Each submits one result when done, and the
+   parent folds them in.
 
 ## Result
 

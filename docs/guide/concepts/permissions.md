@@ -24,12 +24,11 @@ around the check — rather than merely being discouraged.
   the conversation, your messages, or prior results. The same call is allowed or
   denied the same way every time.
 - **Typed rules per tool.** It's seeded with shell-safety rules: blind
-  `git add` (`-A`/`.`/`*`), force-push (`--force`/`-f`, but `--force-with-lease`
-  is fine), and dangerous `rm -rf` of `/`, `~`, `.git`, and the like.
+  `git add` (`-A`/`.`/`--all`/`*`), force-push (`--force`/`-f`, but
+  `--force-with-lease` is fine), and dangerous `rm -rf` of `/`, `~`, `$HOME`,
+  `.git`, `*`, and `.*`.
 - **Deny and continue.** A denial comes back to the agent through the normal
   tool-result channel, so it can adapt and try a safe alternative.
-- **Escalation.** Repeated denials are counted; a run that keeps hitting the wall
-  is surfaced to you rather than looping.
 
 ## What you'll see
 

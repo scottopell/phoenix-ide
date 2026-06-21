@@ -14,11 +14,14 @@ related: [howto/compose-with-references.md, reference/glossary.md]
 
 ## The three forms
 
-| Type | Opens autocomplete on | Sent to the agent | Blocks send if unresolved? |
-|------|-----------------------|-------------------|----------------------------|
-| `@file` | `@` anywhere | the file's **contents**, injected as a `<file path="…">` block | **yes** |
-| `/skill` | `/` at message start or after whitespace | the skill's instructions (with your trailing text as `$ARGUMENTS`) | **yes** |
-| `./path` | `./` anywhere | the **literal path** only — the agent decides what to read | no — never validated |
+All three trigger at the **start of the message or after whitespace** (so
+`user@host` won't open the `@` dropdown).
+
+| Type | Sent to the agent | Blocks send if unresolved? |
+|------|-------------------|----------------------------|
+| `@file` | the file's **contents**, injected as a `<file path="…">` block | **yes** — a bad `@file` blocks |
+| `/skill` | the skill's instructions (with your trailing text as `$ARGUMENTS`) | **no** — an unknown `/name` is sent as literal text |
+| `./path` | the **literal path** only — the agent decides what to read | no — never validated |
 
 What history shows is the original `@…` / `/…` / `./…`; the expansion (file
 contents, skill instructions) goes only to the agent. Use `./path` for large
@@ -40,14 +43,15 @@ A skill that declares an argument hint shows it as ghost text once selected.
 
 ## When a reference can't resolve
 
-An unresolvable `@` or `/` blocks send with an inline error; a `./path` never
-blocks (it's never expanded). Editing the draft clears the error.
+Only an unresolvable **`@file`** blocks send with an inline error. An unknown
+`/name` is **not** an error — it's sent through as literal text — and a `./path`
+is never expanded. Editing the draft clears the error.
 
 | Error (verbatim) | Cause |
 |------------------|-------|
 | `File not found: {path}` | `@` target missing |
 | `File is binary and cannot be included: {path}` | `@` target isn't UTF-8 text |
-| `Skill '{name}' failed: {error}` | `/` skill missing or errored |
+| `Skill '{name}' failed: {error}` | a **matched** skill failed to load (not "unknown name") |
 
 ## Limits
 

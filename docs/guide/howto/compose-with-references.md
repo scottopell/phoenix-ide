@@ -36,12 +36,12 @@ reference in history, expanded only for the agent.
 
 ## Troubleshooting
 
-- **Send is blocked with an inline error.** An `@` or `/` reference didn't
-  resolve (missing file, binary file, or unknown skill) — fix or remove it.
-  A `./path` never blocks. Exact error text and limits are in
+- **Send is blocked with an inline error.** Only a bad `@file` (missing or
+  binary) blocks — fix or remove it. An unknown `/name` is sent as literal text,
+  and a `./path` is never validated. Exact error text and limits are in
   [Input grammar](../reference/input-grammar.md#when-a-reference-cant-resolve).
-- **The dropdown didn't open.** `/` only triggers at the start of the message or
-  after a space; `@` and `./` trigger anywhere.
+- **The dropdown didn't open.** All three triggers fire only at the start of the
+  message or after whitespace — `user@host` won't open the `@` dropdown.
 
 ## See also
 

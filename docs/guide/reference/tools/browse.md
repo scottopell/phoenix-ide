@@ -35,7 +35,7 @@ with the diff/prose viewers.
 
 ## Limits & gotchas
 
-- **One session per WorkScope**, shared across a continuation; **30-minute** idle
+- **One session per workspace**, shared across a continuation; **30-minute** idle
   timeout (held open while the conversation is live).
 - `eval` results and console output over ~4 KB spill to a temp file.
 - Browser-native chords (Ctrl+P/W/T/Tab) can't be sent — Chrome intercepts them.

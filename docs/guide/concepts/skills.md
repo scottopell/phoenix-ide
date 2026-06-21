@@ -24,16 +24,17 @@ call instead of a re-typed paragraph.
 - **One skill, two callers.** You invoke `/skill-name`; the agent invokes the
   `skill` tool. Both load the *same* expanded instructions.
 - **Discovered, closest wins.** Skills live in `.claude/skills/` and
-  `.agents/skills/` from the working directory up to root (plus your home dir).
-  A skill nearer your project shadows one further out.
+  `.agents/skills/` — searched from the working directory up to root, in its
+  immediate subdirectories, and in your home dir. A skill nearer your project
+  shadows one further out.
 - **Parameterized.** A skill can take arguments, substituted into its body.
 - **Catalog, not bulk.** The agent always sees the *list* of skill names and
   descriptions; it loads a skill's full body only when it's invoked.
 
 ## What you'll see
 
-A **Skills** panel lists what's available, grouped (built-in, per-project, your
-own). Open one to read it, or drop it into your message — see
+A **Skills** panel lists what's available, grouped by source — built-in, each
+project, and your own. Open one to read it, or drop it into your message — see
 [Compose with references](../howto/compose-with-references.md).
 
 > **Remember:** a `/skill` you type and the agent's `skill` tool load *identical*
