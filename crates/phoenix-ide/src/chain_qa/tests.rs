@@ -781,7 +781,7 @@ async fn agent_loop_is_bounded_when_tools_never_stop() {
 // --- execute_tool input validation ------------------------------------------
 
 /// A `ChainQa` whose LLM is never invoked — for direct `execute_tool` tests.
-async fn qa_for_tool_tests(db: &Database) -> ChainQa {
+fn qa_for_tool_tests(db: &Database) -> ChainQa {
     let llm = CountingLlm::new("unused");
     let registry = registry_with_service(llm as Arc<dyn LlmService>);
     ChainQa::new(db.clone(), registry, test_retriever(db))
@@ -790,7 +790,7 @@ async fn qa_for_tool_tests(db: &Database) -> ChainQa {
 #[tokio::test]
 async fn execute_tool_rejects_blank_search_query() {
     let db = Database::open_in_memory().await.unwrap();
-    let qa = qa_for_tool_tests(&db).await;
+    let qa = qa_for_tool_tests(&db);
     // Blank query is refused before any retrieval, so no index setup is needed.
     let (out, is_error) = qa
         .execute_tool(
@@ -806,7 +806,7 @@ async fn execute_tool_rejects_blank_search_query() {
 #[tokio::test]
 async fn execute_tool_read_conversation_requires_an_id() {
     let db = Database::open_in_memory().await.unwrap();
-    let qa = qa_for_tool_tests(&db).await;
+    let qa = qa_for_tool_tests(&db);
     let (out, is_error) = qa
         .execute_tool(
             "read_conversation",
@@ -821,7 +821,7 @@ async fn execute_tool_read_conversation_requires_an_id() {
 #[tokio::test]
 async fn execute_tool_read_conversation_refuses_out_of_scope_member() {
     let db = Database::open_in_memory().await.unwrap();
-    let qa = qa_for_tool_tests(&db).await;
+    let qa = qa_for_tool_tests(&db);
     // The agent is scope-bound to the chain: a read outside the member set is
     // refused (REQ-RET-008), even if that conversation exists elsewhere.
     let (out, is_error) = qa
@@ -840,7 +840,7 @@ async fn execute_tool_read_conversation_clamps_oversized_cursor() {
     let db = Database::open_in_memory().await.unwrap();
     build_linear_chain(&db, &["cc-a", "cc-b"]).await;
     add_user_message(&db, "cc-a", 0, "some content").await;
-    let qa = qa_for_tool_tests(&db).await;
+    let qa = qa_for_tool_tests(&db);
 
     // A cursor past the end must yield the terminal marker, never panic on the
     // u64→usize narrowing.
@@ -858,7 +858,7 @@ async fn execute_tool_read_conversation_clamps_oversized_cursor() {
 #[tokio::test]
 async fn execute_tool_rejects_unknown_tool_name() {
     let db = Database::open_in_memory().await.unwrap();
-    let qa = qa_for_tool_tests(&db).await;
+    let qa = qa_for_tool_tests(&db);
     let (out, is_error) = qa
         .execute_tool("frobnicate", &serde_json::json!({}), &["m-a".to_string()])
         .await;

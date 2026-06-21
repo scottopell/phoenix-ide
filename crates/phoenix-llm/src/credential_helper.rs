@@ -345,6 +345,67 @@ impl CredentialHelper {
     }
 }
 
+#[async_trait::async_trait]
+impl CredentialSource for CredentialHelper {
+    /// Returns the cached credential if valid, or `None` immediately.
+    /// Auto-triggers the helper subprocess if idle/failed (fire-and-forget).
+    /// Never blocks -- the state machine handles waiting via `AwaitingRecovery`.
+    async fn get(&self) -> Option<String> {
+        {
+            let mut inner = self.inner.lock().await;
+            match &*inner {
+                HelperInner::Valid {
+                    credential,
+                    expires_at,
+                } => {
+                    if Instant::now() < *expires_at {
+                        return Some(credential.clone());
+                    }
+                    *inner = HelperInner::Idle;
+                    // Fall through to auto-trigger.
+                }
+                HelperInner::Running { .. } => {
+                    // Already running -- return None, caller checks is_recovering().
+                    return None;
+                }
+                HelperInner::Idle | HelperInner::Failed { .. } => {}
+            }
+        }
+
+        // Auto-trigger: spawn the helper (fire-and-forget, no waiting).
+        if let Some(weak) = self.self_ref.get() {
+            if let Some(arc_self) = weak.upgrade() {
+                let mut inner = self.inner.lock().await;
+                if matches!(&*inner, HelperInner::Idle | HelperInner::Failed { .. }) {
+                    *inner = HelperInner::Running {
+                        lines_so_far: vec![],
+                        subscribers: vec![],
+                    };
+                    drop(inner);
+                    Self::spawn_helper_task(arc_self);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Returns true when the helper subprocess is actively running.
+    async fn is_recovering(&self) -> bool {
+        matches!(&*self.inner.lock().await, HelperInner::Running { .. })
+    }
+
+    async fn invalidate(&self) -> bool {
+        let mut inner = self.inner.lock().await;
+        if matches!(&*inner, HelperInner::Valid { .. }) {
+            *inner = HelperInner::Idle;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,7 +440,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 HelperEvent::Line(s) => Some(s.clone()),
-                _ => None,
+                HelperEvent::Complete | HelperEvent::Error { .. } => None,
             })
             .collect()
     }
@@ -580,66 +641,5 @@ mod tests {
         // Both subscribers converge on Complete.
         timeout(TICK, h.wait_for_settlement()).await.unwrap();
         assert_eq!(h.get().await.as_deref(), Some("TOK"));
-    }
-}
-
-#[async_trait::async_trait]
-impl CredentialSource for CredentialHelper {
-    /// Returns the cached credential if valid, or `None` immediately.
-    /// Auto-triggers the helper subprocess if idle/failed (fire-and-forget).
-    /// Never blocks -- the state machine handles waiting via `AwaitingRecovery`.
-    async fn get(&self) -> Option<String> {
-        {
-            let mut inner = self.inner.lock().await;
-            match &*inner {
-                HelperInner::Valid {
-                    credential,
-                    expires_at,
-                } => {
-                    if Instant::now() < *expires_at {
-                        return Some(credential.clone());
-                    }
-                    *inner = HelperInner::Idle;
-                    // Fall through to auto-trigger.
-                }
-                HelperInner::Running { .. } => {
-                    // Already running -- return None, caller checks is_recovering().
-                    return None;
-                }
-                HelperInner::Idle | HelperInner::Failed { .. } => {}
-            }
-        }
-
-        // Auto-trigger: spawn the helper (fire-and-forget, no waiting).
-        if let Some(weak) = self.self_ref.get() {
-            if let Some(arc_self) = weak.upgrade() {
-                let mut inner = self.inner.lock().await;
-                if matches!(&*inner, HelperInner::Idle | HelperInner::Failed { .. }) {
-                    *inner = HelperInner::Running {
-                        lines_so_far: vec![],
-                        subscribers: vec![],
-                    };
-                    drop(inner);
-                    Self::spawn_helper_task(arc_self);
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Returns true when the helper subprocess is actively running.
-    async fn is_recovering(&self) -> bool {
-        matches!(&*self.inner.lock().await, HelperInner::Running { .. })
-    }
-
-    async fn invalidate(&self) -> bool {
-        let mut inner = self.inner.lock().await;
-        if matches!(&*inner, HelperInner::Valid { .. }) {
-            *inner = HelperInner::Idle;
-            true
-        } else {
-            false
-        }
     }
 }
