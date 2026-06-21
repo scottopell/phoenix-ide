@@ -120,7 +120,11 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   return (
     <aside
       className="fe-panel fe-panel--expanded"
-      style={width !== undefined ? { width: `${width}px` } : undefined}
+      // `--file-explorer-pane-width` (set on `.desktop-layout` by the divider's
+      // live-drag channel) wins over the committed `width` prop during a drag,
+      // so resizing does not re-render the file tree per frame; the prop is the
+      // fallback for hosts that don't drive the variable.
+      style={width !== undefined ? { width: `var(--file-explorer-pane-width, ${width}px)` } : undefined}
     >
       <div className="fe-header">
         <button className="fe-toggle" onClick={onToggle} title="Collapse grounding panel" aria-label="Collapse grounding panel">&#9666;</button>

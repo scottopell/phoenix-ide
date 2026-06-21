@@ -22,15 +22,30 @@ Acceptance criteria:
   pointer-up. The legacy (no-callback) path is additionally rAF-coalesced, so
   every consumer's drag is capped at one commit per frame instead of one per
   pointer event.
-- The **viewer divider** in `ConversationPage` (the one over the conversation
-  message area) is wired to the channel: its width is owned imperatively on the
+- **Viewer divider** (`ConversationPage`): width owned imperatively on the
   `#app` `--viewer-pane-width` variable by a layout effect (committed state) and
-  the drag callback (live), which never run concurrently — so dragging it no
-  longer re-renders `ConversationPage` / the message thread at all.
+  the drag callback (live) — dragging no longer re-renders the message thread.
+- **Terminal divider** (`ConversationPage`): same pattern via
+  `--terminal-pane-height`. `TerminalPanel`'s root reads
+  `var(--terminal-pane-height, <height>px)` (the prop stays the fallback for
+  `NewConversationPage`). xterm fit is driven by a `ResizeObserver` on the panel,
+  so it keeps tracking the live height without any React render.
+- **Sidebar + file-explorer dividers** (`DesktopLayout`): width owned on the
+  `.desktop-layout` `--sidebar-pane-width` / `--file-explorer-pane-width`
+  variables; the panels read `var(..., <width>px)`. The variable lives on the
+  ancestor, so the 5s conversation poll / SSE re-rendering `DesktopLayout`
+  mid-drag cannot clobber the live width. Collapse commits on pointer-up (the
+  collapsed rail is a different render); width tracks to its clamped min first.
 
-Remaining (needs in-browser profiling, not available in the remote sandbox):
-- Terminal divider — the height prop feeds `TerminalPanel`'s xterm fit logic, so
-  a CSS-var live channel must also decide when xterm refits (likely drag-end
-  only). Higher risk; do under a profiler.
-- Sub-agent / DesktopLayout sidebar + file-explorer dividers — convert to the
-  same channel once the terminal pattern is validated.
+Not converted (deliberate):
+- Sub-agent dock (`SubAgentViewerDock`) — its pane state is local to that
+  component and the conversation is a stable `children` element, so its drag
+  already never re-renders the conversation view; it benefits from the rAF
+  frame-cap. Converting it would need ref-forwarding into a lazy panel for
+  little gain.
+- `ChainPage` / `NewConversationPage` terminal dividers — separate pages outside
+  the conversation view; left on the (now frame-capped) legacy path.
+
+Profiling validation (raw render-count samples under CPU throttling, per the
+acceptance) still wants a browser-equipped session; the structural boundary is
+correct-by-construction and covered by a `useResizablePane` unit test.

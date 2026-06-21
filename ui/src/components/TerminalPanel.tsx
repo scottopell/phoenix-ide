@@ -1186,7 +1186,11 @@ export function TerminalPanel({
   const panelClass = `terminal-panel${isDisconnected ? ' terminal-panel--dead' : ''}`;
 
   return (
-    <div className={panelClass} style={{ height: `${height}px` }}>
+    // `--terminal-pane-height`, when an ancestor sets it, wins over the `height`
+    // prop: it is the live-drag channel the host page drives directly during a
+    // divider drag so the pane resizes without re-rendering the page (the
+    // committed `height` prop is the fallback for hosts that don't set the var).
+    <div className={panelClass} style={{ height: `var(--terminal-pane-height, ${height}px)` }}>
       <div
         className={`terminal-panel-header${collapsed ? ' terminal-panel-header--collapsed' : ''}`}
         onClick={handleHeaderClick}

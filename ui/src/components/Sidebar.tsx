@@ -326,7 +326,11 @@ export function Sidebar({
   return (
     <aside
       className="sidebar sidebar-expanded"
-      style={width !== undefined ? { width: `${width}px`, minWidth: `${width}px` } : undefined}
+      // `--sidebar-pane-width` (set on `.desktop-layout` by the divider's
+      // live-drag channel) wins over the committed `width` prop during a drag,
+      // so resizing does not re-render this list per frame; the prop is the
+      // fallback for hosts that don't drive the variable.
+      style={width !== undefined ? { width: `var(--sidebar-pane-width, ${width}px)`, minWidth: `var(--sidebar-pane-width, ${width}px)` } : undefined}
     >
       <div className="sidebar-header">
         <button className="sidebar-toggle-expanded" onClick={onToggle} title="Collapse sidebar">

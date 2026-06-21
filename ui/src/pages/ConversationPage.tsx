@@ -184,15 +184,18 @@ function ConversationPageContent() {
     collapseThreshold: 280,
   });
 
-  // The split-pane layout (`.app-split-pane`) sizes the viewer from the
-  // `--viewer-pane-width` CSS variable on `#app`. The variable is owned
-  // imperatively (not via the React `style` prop) by exactly two writers that
-  // never run concurrently: this layout effect, which syncs it to committed pane
-  // state, and the divider's live-drag channel below. Driving it from the style
-  // prop instead would let an unrelated re-render mid-drag (streaming,
-  // heartbeat) clobber the live width and snap the pane back; the effect's deps
-  // are frozen during a drag, so it cannot fire until the drag commits on
-  // pointer-up. (When the split pane is hidden the variable is simply unread.)
+  // The viewer pane (`--viewer-pane-width`) and the terminal pane
+  // (`--terminal-pane-height`, read by `TerminalPanel`) are sized from CSS
+  // variables on `#app`. Each variable is owned imperatively (NOT via the React
+  // `style` prop) by exactly two writers that never run concurrently: a layout
+  // effect that syncs it to committed pane state, and the matching divider's
+  // live-drag channel. Driving them from the style prop instead would let an
+  // unrelated re-render mid-drag (streaming, heartbeat) clobber the live size
+  // and snap the pane back; an effect's deps are frozen during a drag, so it
+  // cannot fire until the drag commits on pointer-up. The live channel means a
+  // divider drag resizes its pane without re-rendering this page (and the
+  // conversation subtree below it) on every pointer move — React state catches
+  // up once, on pointer-up. See `useResizablePane`'s `onLiveResize`.
   const appElementRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     appElementRef.current?.style.setProperty(
@@ -200,11 +203,6 @@ function ConversationPageContent() {
       `${viewerPane.collapsed ? 0 : viewerPane.size}px`,
     );
   }, [viewerPane.collapsed, viewerPane.size]);
-
-  // Live-drag channel for the viewer divider: write the width straight to the
-  // CSS variable so dragging resizes the pane without re-rendering this page
-  // (and the conversation subtree below it) on every pointer move. React state
-  // catches up once, on pointer-up — see `useResizablePane`'s `onLiveResize`.
   const handleViewerLiveResize = useCallback((size: number, collapsed: boolean) => {
     appElementRef.current?.style.setProperty(
       '--viewer-pane-width',
@@ -308,6 +306,25 @@ function ConversationPageContent() {
     collapseThreshold: 60,
     defaultCollapsed: true,
   });
+
+  // Terminal-pane height live-drag channel — mirrors the viewer pane above.
+  // `TerminalPanel` reads `--terminal-pane-height` (falling back to its `height`
+  // prop); the layout effect syncs it to committed state and the divider's
+  // `onLiveResize` drives it during a drag, so resizing the terminal does not
+  // re-render this page. The xterm fit is driven by a ResizeObserver on the
+  // panel element, so it keeps tracking the live height without React.
+  useLayoutEffect(() => {
+    appElementRef.current?.style.setProperty(
+      '--terminal-pane-height',
+      `${terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}px`,
+    );
+  }, [terminalPane.collapsed, terminalPane.size]);
+  const handleTerminalLiveResize = useCallback((size: number, collapsed: boolean) => {
+    appElementRef.current?.style.setProperty(
+      '--terminal-pane-height',
+      `${collapsed ? TERMINAL_COLLAPSED_PX : size}px`,
+    );
+  }, []);
 
   // Credential helper auto-open — shared hook consolidates the pattern.
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
@@ -1434,7 +1451,7 @@ function ConversationPageContent() {
           <PaneDivider
             orientation="horizontal"
             title="Drag to resize • Double-click to collapse/expand"
-            onPointerDown={(e) => terminalPane.startDrag(e, 'y', true)}
+            onPointerDown={(e) => terminalPane.startDrag(e, 'y', true, handleTerminalLiveResize)}
             onDoubleClick={() => {
               if (terminalPane.collapsed) {
                 terminalPane.expandFromCollapsed();

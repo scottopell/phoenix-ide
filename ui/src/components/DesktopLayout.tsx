@@ -1,5 +1,5 @@
 import { useLocation } from 'react-router-dom';
-import { lazy, Suspense, useEffect } from 'react';
+import { lazy, Suspense, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import {
   useConversationsList,
   useConversationsRefresh,
@@ -87,6 +87,32 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     defaultSize: 220,
     collapseThreshold: 120,
   });
+
+  // Live-drag channels for the sidebar and file-explorer dividers. Both panes'
+  // state lives here, so committing it on every pointer move would re-render the
+  // whole layout — including the (heavy) sidebar conversation list and file
+  // tree — at pointer frequency. Instead each panel's width is read from a CSS
+  // variable on `.desktop-layout` that two non-concurrent writers own: a layout
+  // effect synced to committed state, and the divider's `onLiveResize`. The
+  // variable lives on the ancestor (not the panel's React `style` prop), so an
+  // unrelated mid-drag re-render (the 5s conversation poll, SSE) cannot clobber
+  // the live width — the effect's deps are frozen until the drag commits on
+  // pointer-up. Collapse still commits on pointer-up (the collapsed rail is a
+  // different render); the width simply tracks to its clamped minimum first.
+  const layoutRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    layoutRef.current?.style.setProperty('--sidebar-pane-width', `${sidebarPane.size}px`);
+  }, [sidebarPane.size]);
+  useLayoutEffect(() => {
+    layoutRef.current?.style.setProperty('--file-explorer-pane-width', `${fileExplorerPane.size}px`);
+  }, [fileExplorerPane.size]);
+  const handleSidebarLiveResize = useCallback((size: number) => {
+    layoutRef.current?.style.setProperty('--sidebar-pane-width', `${size}px`);
+  }, []);
+  const handleFileExplorerLiveResize = useCallback((size: number) => {
+    layoutRef.current?.style.setProperty('--file-explorer-pane-width', `${size}px`);
+  }, []);
+
   const location = useLocation();
   const { toasts, dismissToast, showSuccess, showError, showInfo } = useToast();
   useNotificationClickNavigationBridge();
@@ -159,7 +185,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
       browserSessionActive={activeConversation?.browser_session_active ?? false}
     >
      <FileExplorerProvider>
-      <div className={isDesktop ? 'desktop-layout' : undefined}>
+      <div ref={layoutRef} className={isDesktop ? 'desktop-layout' : undefined}>
         {isDesktop && (
           <Sidebar
             collapsed={sidebarPane.collapsed}
@@ -175,7 +201,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           <PaneDivider
             orientation="vertical"
             title="Drag to resize • Drag past edge to collapse"
-            onPointerDown={(e) => sidebarPane.startDrag(e, 'x')}
+            onPointerDown={(e) => sidebarPane.startDrag(e, 'x', false, handleSidebarLiveResize)}
             onDoubleClick={() => sidebarPane.setCollapsed(!sidebarPane.collapsed)}
           />
         )}
@@ -198,7 +224,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           <PaneDivider
             orientation="vertical"
             title="Drag to resize • Drag past edge to collapse"
-            onPointerDown={(e) => fileExplorerPane.startDrag(e, 'x')}
+            onPointerDown={(e) => fileExplorerPane.startDrag(e, 'x', false, handleFileExplorerLiveResize)}
             onDoubleClick={() => fileExplorerPane.setCollapsed(!fileExplorerPane.collapsed)}
           />
         )}
