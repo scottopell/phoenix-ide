@@ -215,8 +215,9 @@ rule SkillTokenPassThrough {
 -- suggestion always resolves at send time.
 
 rule FileAutocompleteTriggered {
-    when: UserTypes(input, character: "@")
+    when: UserTypes(input, character)
 
+    requires: character = "@"
     requires: character_at_start_or_after_whitespace(input, "@")
 
     ensures: AutocompleteShown(mode: "file", query: text_after_sigil)
@@ -230,8 +231,9 @@ rule FileAutocompleteTriggered {
 }
 
 rule SkillAutocompleteTriggered {
-    when: UserTypes(input, character: "/")
+    when: UserTypes(input, character)
 
+    requires: character = "/"
     requires: character_at_start_of_message(input, "/")
 
     ensures: AutocompleteShown(mode: "skill", query: text_after_sigil)
@@ -245,8 +247,9 @@ rule SkillAutocompleteTriggered {
 }
 
 rule PathAutocompleteTriggered {
-    when: UserTypes(input, sequence: "./")
+    when: UserTypes(input, sequence)
 
+    requires: sequence = "./"
     requires: sequence_at_start_or_after_whitespace(input, "./")
 
     ensures: AutocompleteShown(mode: "path", query: text_after_sequence)
@@ -258,7 +261,8 @@ rule PathAutocompleteTriggered {
 }
 
 rule AutocompleteDismissed {
-    when: UserPresses(key: "Escape")
+    when: UserPresses(key)
+    requires: key = "Escape"
     requires: AutocompleteShown
     ensures: not AutocompleteShown
 }

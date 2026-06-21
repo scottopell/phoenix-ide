@@ -209,10 +209,11 @@ rule NoSlashToken {
 -- is identical across both paths regardless of delivery wrapper.
 
 rule LlmCallsSkillTool {
-    when: LlmToolCall(tool: "skill", skill_name: String, args: String, working_dir: Path)
+    when: LlmToolCall(tool, skill_name, args, working_dir)
 
     let skill = find_skill(collect_skills(working_dir), skill_name)
 
+    requires: tool = "skill"
     requires: exists skill
 
     ensures: ToolResult.created(
@@ -227,10 +228,11 @@ rule LlmCallsSkillTool {
 }
 
 rule LlmCallsSkillToolNotFound {
-    when: LlmToolCall(tool: "skill", skill_name: String, args: String, working_dir: Path)
+    when: LlmToolCall(tool, skill_name, args, working_dir)
 
     let skill = find_skill(collect_skills(working_dir), skill_name)
 
+    requires: tool = "skill"
     requires: not exists skill
 
     let available = skill_names_joined(collect_skills(working_dir))

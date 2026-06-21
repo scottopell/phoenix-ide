@@ -150,12 +150,17 @@ jobs:
         run: npm i -g @ast-grep/cli
 
       # allium-cli has no prebuilt binstall artifact; compile it. Cached in
-      # ~/.cargo/bin by the rust-cache step above (cache-bin: true).
+      # ~/.cargo/bin by the rust-cache step above (cache-bin: true). Pinned so
+      # every runner validates specs against one grammar version; the version
+      # check forces a reinstall when this pin is bumped even if a stale binary
+      # sits in the restored cache.
       - name: Install allium-cli
         if: matrix.needs-ui
+        env:
+          ALLIUM_VERSION: 3.5.0
         run: |
-          if ! command -v allium >/dev/null 2>&1; then
-            cargo install allium-cli --locked
+          if ! allium --version 2>/dev/null | grep -q "$ALLIUM_VERSION"; then
+            cargo install allium-cli --version "$ALLIUM_VERSION" --locked
           fi
 
       # Chrome on PATH → dev.py's _classify_browser_env() sets
