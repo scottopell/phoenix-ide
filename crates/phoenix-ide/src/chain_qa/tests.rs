@@ -701,3 +701,163 @@ fn render_full_transcript_surfaces_skill_body_images_and_server_tools() {
         "server-side tool block must be rendered: {rendered}",
     );
 }
+
+// --- agent loop bounding -----------------------------------------------------
+
+/// An LLM that never stops: every planning `complete()` issues another
+/// `search_conversations` call, so without a turn cap the agent would loop
+/// forever. `complete_streaming` returns the forced final answer.
+#[derive(Debug, Default)]
+struct AlwaysSearchLlm {
+    complete_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmService for AlwaysSearchLlm {
+    async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        self.complete_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(LlmResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "loop".to_string(),
+                name: "search_conversations".to_string(),
+                input: serde_json::json!({ "query": "again" }),
+            }],
+            end_turn: false,
+            usage: Usage::default(),
+        })
+    }
+
+    async fn complete_streaming(
+        &self,
+        _request: &LlmRequest,
+        chunk_tx: &broadcast::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        let _ = chunk_tx.send(TokenChunk::Text("forced final answer".to_string()));
+        tokio::task::yield_now().await;
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text("forced final answer")],
+            end_turn: true,
+            usage: Usage::default(),
+        })
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+}
+
+/// A runaway tool-caller must be bounded by `MAX_QA_TURNS`, not loop forever.
+/// The final allowed turn streams the answer instead of planning, so planning
+/// `complete()` runs exactly `MAX_QA_TURNS - 1` times and the Q&A still settles
+/// as `Completed`.
+#[tokio::test]
+async fn agent_loop_is_bounded_when_tools_never_stop() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["lp-a", "lp-b"]).await;
+    add_user_message(&db, "lp-b", 0, "leaf content").await;
+
+    let llm: Arc<AlwaysSearchLlm> = Arc::new(AlwaysSearchLlm::default());
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    let qa_id = qa
+        .submit_question_blocking("lp-a", "never satisfied?")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        llm.complete_calls.load(Ordering::SeqCst),
+        MAX_QA_TURNS - 1,
+        "planning turns must be capped at MAX_QA_TURNS - 1",
+    );
+
+    let history = qa.list_history("lp-a").await.unwrap();
+    assert_eq!(history[0].id, qa_id);
+    assert_eq!(history[0].status, ChainQaStatus::Completed);
+    assert_eq!(history[0].answer.as_deref(), Some("forced final answer"));
+}
+
+// --- execute_tool input validation ------------------------------------------
+
+/// A `ChainQa` whose LLM is never invoked — for direct `execute_tool` tests.
+async fn qa_for_tool_tests(db: &Database) -> ChainQa {
+    let llm = CountingLlm::new("unused");
+    let registry = registry_with_service(llm as Arc<dyn LlmService>);
+    ChainQa::new(db.clone(), registry, test_retriever(db))
+}
+
+#[tokio::test]
+async fn execute_tool_rejects_blank_search_query() {
+    let db = Database::open_in_memory().await.unwrap();
+    let qa = qa_for_tool_tests(&db).await;
+    // Blank query is refused before any retrieval, so no index setup is needed.
+    let (out, is_error) = qa
+        .execute_tool(
+            "search_conversations",
+            &serde_json::json!({ "query": "   " }),
+            &["m-a".to_string()],
+        )
+        .await;
+    assert!(is_error, "blank query must be an error: {out}");
+    assert!(out.contains("non-empty"), "got: {out}");
+}
+
+#[tokio::test]
+async fn execute_tool_read_conversation_requires_an_id() {
+    let db = Database::open_in_memory().await.unwrap();
+    let qa = qa_for_tool_tests(&db).await;
+    let (out, is_error) = qa
+        .execute_tool("read_conversation", &serde_json::json!({}), &["m-a".to_string()])
+        .await;
+    assert!(is_error, "missing id must be an error: {out}");
+    assert!(out.contains("requires 'conversation_id'"), "got: {out}");
+}
+
+#[tokio::test]
+async fn execute_tool_read_conversation_refuses_out_of_scope_member() {
+    let db = Database::open_in_memory().await.unwrap();
+    let qa = qa_for_tool_tests(&db).await;
+    // The agent is scope-bound to the chain: a read outside the member set is
+    // refused (REQ-RET-008), even if that conversation exists elsewhere.
+    let (out, is_error) = qa
+        .execute_tool(
+            "read_conversation",
+            &serde_json::json!({ "conversation_id": "outsider" }),
+            &["sc-a".to_string()],
+        )
+        .await;
+    assert!(is_error, "out-of-scope read must be an error: {out}");
+    assert!(out.contains("not part of this chain"), "got: {out}");
+}
+
+#[tokio::test]
+async fn execute_tool_read_conversation_clamps_oversized_cursor() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["cc-a", "cc-b"]).await;
+    add_user_message(&db, "cc-a", 0, "some content").await;
+    let qa = qa_for_tool_tests(&db).await;
+
+    // A cursor past the end must yield the terminal marker, never panic on the
+    // u64→usize narrowing.
+    let (out, is_error) = qa
+        .execute_tool(
+            "read_conversation",
+            &serde_json::json!({ "conversation_id": "cc-a", "cursor": u64::MAX }),
+            &["cc-a".to_string(), "cc-b".to_string()],
+        )
+        .await;
+    assert!(!is_error, "oversized cursor is not an error: {out}");
+    assert_eq!(out, "(end of conversation)");
+}
+
+#[tokio::test]
+async fn execute_tool_rejects_unknown_tool_name() {
+    let db = Database::open_in_memory().await.unwrap();
+    let qa = qa_for_tool_tests(&db).await;
+    let (out, is_error) = qa
+        .execute_tool("frobnicate", &serde_json::json!({}), &["m-a".to_string()])
+        .await;
+    assert!(is_error, "unknown tool must be an error: {out}");
+    assert!(out.contains("unknown tool 'frobnicate'"), "got: {out}");
+}
