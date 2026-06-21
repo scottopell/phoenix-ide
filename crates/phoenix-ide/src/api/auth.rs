@@ -231,8 +231,8 @@ fn throttle_key(req_headers: &header::HeaderMap, peer: Option<SocketAddr>) -> St
     }
 }
 
-/// Constant-time string comparison to prevent timing attacks on password checks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time string comparison to prevent timing attacks on secret checks.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

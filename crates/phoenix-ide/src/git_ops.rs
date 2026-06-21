@@ -579,6 +579,9 @@ pub(crate) fn create_worktree(
                 "add",
                 "-b",
                 branch_name,
+                // `--` ends option parsing so the positional path and start-point
+                // (the latter caller-influenced) can never be read as flags.
+                "--",
                 &worktree_path_str,
                 start_point,
             ],
@@ -594,7 +597,11 @@ pub(crate) fn create_worktree(
             ))
         })?;
     } else {
-        run_git(cwd, &["worktree", "add", &worktree_path_str, branch_name]).map_err(|e| {
+        run_git(
+            cwd,
+            &["worktree", "add", "--", &worktree_path_str, branch_name],
+        )
+        .map_err(|e| {
             // Branch pre-existed; clean only the partial worktree, never the branch.
             cleanup_failed_worktree(cwd, &worktree_path, None);
             GitOpError::Git(format!(

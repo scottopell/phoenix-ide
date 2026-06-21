@@ -167,16 +167,32 @@ enum PemKind {
 }
 
 fn write_pem(path: &Path, contents: &str, kind: PemKind) -> Result<(), Box<dyn Error>> {
-    fs::write(path, contents)?;
-
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mode = match kind {
             PemKind::Public => 0o644,
             PemKind::Private => 0o600,
         };
+        // Create with the target mode up front so a private key is never briefly
+        // world-readable in the window between creation under the process umask
+        // and a follow-up chmod. `mode` only applies when O_CREAT makes a new
+        // file, so re-assert it afterwards to also tighten a pre-existing file.
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(path)?;
+        f.write_all(contents.as_bytes())?;
         fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = kind;
+        fs::write(path, contents)?;
     }
 
     Ok(())
