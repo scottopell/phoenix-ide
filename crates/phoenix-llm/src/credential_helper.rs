@@ -362,9 +362,7 @@ mod tests {
     /// Drain a stream up to and including its first terminal event
     /// (`Complete` or `Error`), bounding each read so a hung helper
     /// fails the test instead of hanging the suite.
-    async fn drain(
-        mut s: tokio_stream::wrappers::ReceiverStream<HelperEvent>,
-    ) -> Vec<HelperEvent> {
+    async fn drain(mut s: tokio_stream::wrappers::ReceiverStream<HelperEvent>) -> Vec<HelperEvent> {
         let mut out = Vec::new();
         while let Ok(Some(ev)) = timeout(TICK, s.next()).await {
             let terminal = matches!(ev, HelperEvent::Complete | HelperEvent::Error { .. });
@@ -421,7 +419,10 @@ mod tests {
     async fn stderr_lines_become_line_events_before_complete() {
         // Helpers commonly write instructions (device URLs, codes) to stderr
         // and reserve stdout for the token.
-        let h = helper("printf 'visit https://x\\n' 1>&2; printf 'TOK\\n'", LONG_TTL);
+        let h = helper(
+            "printf 'visit https://x\\n' 1>&2; printf 'TOK\\n'",
+            LONG_TTL,
+        );
         let events = drain(Arc::clone(&h).run_and_stream().await).await;
 
         assert_eq!(lines(&events), vec!["visit https://x"]);
@@ -461,7 +462,13 @@ mod tests {
         let events = drain(Arc::clone(&h).run_and_stream().await).await;
 
         assert!(
-            matches!(events.last(), Some(HelperEvent::Error { exit_code: Some(1), .. })),
+            matches!(
+                events.last(),
+                Some(HelperEvent::Error {
+                    exit_code: Some(1),
+                    ..
+                })
+            ),
             "got {events:?}"
         );
         assert_eq!(h.credential_status().await, CredentialStatus::Failed);
@@ -476,7 +483,10 @@ mod tests {
         // Second call must short-circuit on the cached Valid state: only a
         // single Complete, no re-run (which would re-emit the "first" line).
         let second = drain(Arc::clone(&h).run_and_stream().await).await;
-        assert!(matches!(second.as_slice(), [HelperEvent::Complete]), "got {second:?}");
+        assert!(
+            matches!(second.as_slice(), [HelperEvent::Complete]),
+            "got {second:?}"
+        );
     }
 
     #[tokio::test]
@@ -547,7 +557,10 @@ mod tests {
     async fn second_subscriber_joins_running_helper_and_replays_buffer() {
         // The helper emits an instruction, then sleeps long enough for a
         // second subscriber to attach before the token is produced.
-        let h = helper("printf 'instr-1\\n' 1>&2; sleep 1; printf 'TOK\\n'", LONG_TTL);
+        let h = helper(
+            "printf 'instr-1\\n' 1>&2; sleep 1; printf 'TOK\\n'",
+            LONG_TTL,
+        );
 
         let mut s1 = Arc::clone(&h).run_and_stream().await;
         // Once subscriber 1 has observed the instruction line, it is provably

@@ -1446,9 +1446,7 @@ mod tests {
     fn process_event_malformed_sse_data_is_invalid_response_not_panic() {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
-        let err = acc
-            .process_event("", "{ not json", &tx)
-            .unwrap_err();
+        let err = acc.process_event("", "{ not json", &tx).unwrap_err();
         assert!(
             err.message.contains("Failed to parse SSE data"),
             "got: {}",
@@ -1462,7 +1460,10 @@ mod tests {
         let mut acc = ResponsesStreamAccumulator::new();
         // The `[DONE]` sentinel is not JSON; it must be a no-op, not a parse error.
         acc.process_event("", "[DONE]", &tx).unwrap();
-        assert!(!acc.done, "[DONE] sentinel alone does not finalize the stream");
+        assert!(
+            !acc.done,
+            "[DONE] sentinel alone does not finalize the stream"
+        );
     }
 
     #[test]
@@ -1481,7 +1482,10 @@ mod tests {
         // must be tolerated (logged exactly once), never erroring the stream.
         assert!(!acc.logged_empty_dispatch);
         acc.process_event("", r#"{"type":""}"#, &tx).unwrap();
-        assert!(acc.logged_empty_dispatch, "first empty-dispatch event is logged");
+        assert!(
+            acc.logged_empty_dispatch,
+            "first empty-dispatch event is logged"
+        );
         acc.process_event("", r#"{"type":""}"#, &tx).unwrap();
     }
 

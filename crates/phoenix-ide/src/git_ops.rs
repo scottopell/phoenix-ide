@@ -1681,7 +1681,10 @@ mod tests {
             tokio::task::spawn_blocking(move || check_branch_conflict(&cwd, &db, "feature"))
                 .await
                 .unwrap();
-        assert!(result.is_ok(), "a free branch must not conflict: {result:?}");
+        assert!(
+            result.is_ok(),
+            "a free branch must not conflict: {result:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1726,13 +1729,21 @@ mod tests {
         clone_repo(upstream.path(), clone.path());
 
         // Local `feature` gains its own commit.
-        run_git(clone.path(), &["checkout", "--quiet", "-b", "feature", "main"]).unwrap();
+        run_git(
+            clone.path(),
+            &["checkout", "--quiet", "-b", "feature", "main"],
+        )
+        .unwrap();
         commit_file(clone.path(), "local.txt", "L", "local-only");
         let local_sha = run_git(clone.path(), &["rev-parse", "feature"]).unwrap();
         run_git(clone.path(), &["checkout", "--quiet", "main"]).unwrap();
 
         // Upstream `feature` gains a *different* commit → the two diverge.
-        run_git(upstream.path(), &["checkout", "--quiet", "-b", "feature", "main"]).unwrap();
+        run_git(
+            upstream.path(),
+            &["checkout", "--quiet", "-b", "feature", "main"],
+        )
+        .unwrap();
         commit_file(upstream.path(), "remote.txt", "R", "remote-only");
         run_git(upstream.path(), &["checkout", "--quiet", "main"]).unwrap();
 
@@ -1756,7 +1767,11 @@ mod tests {
 
         // Local `feature` sits at `main`; upstream `feature` is one commit ahead.
         run_git(clone.path(), &["branch", "feature", "main"]).unwrap();
-        run_git(upstream.path(), &["checkout", "--quiet", "-b", "feature", "main"]).unwrap();
+        run_git(
+            upstream.path(),
+            &["checkout", "--quiet", "-b", "feature", "main"],
+        )
+        .unwrap();
         commit_file(upstream.path(), "ahead.txt", "R", "remote ahead");
         let remote_sha = run_git(upstream.path(), &["rev-parse", "feature"]).unwrap();
         run_git(upstream.path(), &["checkout", "--quiet", "main"]).unwrap();
@@ -1776,7 +1791,11 @@ mod tests {
     fn materialize_branch_creates_local_tracking_branch_when_remote_only() {
         let upstream = TempDir::new().unwrap();
         init_repo(upstream.path());
-        run_git(upstream.path(), &["checkout", "--quiet", "-b", "feature", "main"]).unwrap();
+        run_git(
+            upstream.path(),
+            &["checkout", "--quiet", "-b", "feature", "main"],
+        )
+        .unwrap();
         commit_file(upstream.path(), "r.txt", "R", "remote feature");
         run_git(upstream.path(), &["checkout", "--quiet", "main"]).unwrap();
 
@@ -1847,6 +1866,9 @@ mod tests {
             exclude.contains("*.tmp\n.phoenix/"),
             "entries must be newline-separated: {exclude:?}"
         );
-        assert_eq!(exclude.lines().filter(|l| l.trim() == ".phoenix/").count(), 1);
+        assert_eq!(
+            exclude.lines().filter(|l| l.trim() == ".phoenix/").count(),
+            1
+        );
     }
 }

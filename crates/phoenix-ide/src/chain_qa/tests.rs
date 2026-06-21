@@ -808,7 +808,11 @@ async fn execute_tool_read_conversation_requires_an_id() {
     let db = Database::open_in_memory().await.unwrap();
     let qa = qa_for_tool_tests(&db).await;
     let (out, is_error) = qa
-        .execute_tool("read_conversation", &serde_json::json!({}), &["m-a".to_string()])
+        .execute_tool(
+            "read_conversation",
+            &serde_json::json!({}),
+            &["m-a".to_string()],
+        )
         .await;
     assert!(is_error, "missing id must be an error: {out}");
     assert!(out.contains("requires 'conversation_id'"), "got: {out}");
