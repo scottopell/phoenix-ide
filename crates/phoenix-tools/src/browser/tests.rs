@@ -3,9 +3,9 @@
 //! Chrome/Chromium is auto-downloaded via the fetcher if not in PATH.
 
 use super::profile::BrowserProfileTool;
-use super::session::BrowserSessionManager;
 use super::tools::*;
 use crate::{Tool, ToolContext};
+use phoenix_browser::BrowserSessionManager;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;

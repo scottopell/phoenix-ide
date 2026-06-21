@@ -23,7 +23,6 @@
 //! `raw_samples` JSON key — there is exactly one place samples are emitted
 //! and it is the untouched `Vec<RunSample>`.
 
-use super::session::BrowserSession;
 use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use chromiumoxide::cdp::browser_protocol::{
@@ -42,6 +41,7 @@ use chromiumoxide::cdp::js_protocol::profiler::{
     TakePreciseCoverageParams,
 };
 use futures::StreamExt;
+use phoenix_browser::BrowserSession;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
@@ -239,7 +239,7 @@ const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// `None` if the state lock is poisoned.
 async fn with_profiling<R>(
     session: &Arc<RwLock<BrowserSession>>,
-    f: impl FnOnce(&mut super::session::ProfilingState) -> R,
+    f: impl FnOnce(&mut phoenix_browser::ProfilingState) -> R,
 ) -> Option<R> {
     let profiling = {
         let guard = session.read().await;

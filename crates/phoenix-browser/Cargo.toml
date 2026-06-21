@@ -1,0 +1,40 @@
+[package]
+name = "phoenix-browser"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Headless-browser engine for Phoenix IDE: the chromiumoxide/CDP driver, per-WorkScope session manager, console/profiling capture, and live-view screencast broker. Tool-free — the Tool-trait glue lives in phoenix-tools."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# WorkScope (session keying) and PhoenixRuntimeEnvironment (Chrome cache dir).
+phoenix-core = { path = "../phoenix-core" }
+
+# Browser automation via Chrome DevTools Protocol.
+chromiumoxide = { version = "0.9", default-features = false, features = ["fetcher", "rustls", "zip0"] }
+
+# Async runtime (CDP event pumps, broadcast channels, locks).
+tokio = { version = "1", features = ["full"] }
+
+# Serialization (console entries, profiling state, screencast events).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CDP event-stream combinators (StreamExt) and BoxFuture for the liveness hook.
+futures = "0.3"
+
+# Base64 (screencast frame payloads).
+base64 = "0.22"
+
+# Hashing (deterministic user-data-dir keying off WorkScope::stable_key).
+sha2 = "0.11"
+
+# Typed errors.
+thiserror = "2"
+
+tracing = "0.1"
+
+[lints]
+workspace = true

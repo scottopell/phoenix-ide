@@ -6,12 +6,12 @@
 //! REQ-BT-004: Capture Console Logs
 //! REQ-BT-005: Resize Viewport
 
-use super::session::BrowserSession;
 use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, RemoteObjectType};
 use chromiumoxide::page::ScreenshotParams;
+use phoenix_browser::BrowserSession;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -106,7 +106,9 @@ impl Tool for BrowserNavigateTool {
                 // Detect React and enrich the navigate result with __phoenix hints
                 let react_info = match tokio::time::timeout(
                     Duration::from_secs(2),
-                    guard.page.evaluate(super::react::REACT_DETECT_SCRIPT),
+                    guard
+                        .page
+                        .evaluate(phoenix_browser::react::REACT_DETECT_SCRIPT),
                 )
                 .await
                 {
@@ -463,7 +465,7 @@ impl Tool for BrowserRecentConsoleLogsTool {
             .iter()
             .map(|(level, text)| {
                 let display_text =
-                    crate::browser::session::truncate_unicode_safe(text.clone(), DISPLAY_ENTRY_LEN);
+                    phoenix_browser::truncate_unicode_safe(text.clone(), DISPLAY_ENTRY_LEN);
                 json!({"level": level, "text": display_text})
             })
             .collect();

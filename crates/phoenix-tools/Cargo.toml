@@ -30,6 +30,10 @@ phoenix-bash-display = { path = "../phoenix-bash-display" }
 # `Tool`-trait wrapper over it lives in `src/mcp.rs`.
 phoenix-mcp = { path = "../phoenix-mcp" }
 
+# Headless-browser engine (chromiumoxide/CDP driver, session manager,
+# screencast broker). The browser_* tool impls here wrap this engine.
+phoenix-browser = { path = "../phoenix-browser" }
+
 # Async tool trait.
 async-trait = "0.1"
 
@@ -46,7 +50,9 @@ serde_json = "1"
 # (Handle.started_at: SystemTime -> DateTime<Utc> on the wire).
 chrono = { version = "0.4", features = ["serde"] }
 
-# Browser automation via Chrome DevTools Protocol.
+# Chrome DevTools Protocol types used by the browser tool glue (CDP param
+# structs passed to the engine's page handle). The engine itself lives in
+# phoenix-browser.
 chromiumoxide = { version = "0.9", default-features = false, features = ["fetcher", "rustls", "zip0"] }
 
 # Static-analysis bash parser for bash_check.

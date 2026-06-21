@@ -56,7 +56,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-pub use browser::session::BrowserSession;
+pub use browser::BrowserSession;
 use phoenix_core::llm_service::LlmSelector;
 use phoenix_core::work_scope::WorkScope;
 

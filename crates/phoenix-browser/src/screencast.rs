@@ -41,7 +41,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
-use super::session::BrowserError;
+use crate::session::BrowserError;
 
 /// Default JPEG compression quality (0-100). 70 is the value the
 /// chrome-devtools team uses for their built-in screencast: sub-100KB frames

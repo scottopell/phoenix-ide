@@ -264,7 +264,7 @@ pub struct BrowserSession {
     /// `Weak` so the broker is kept alive only by attached viewers; when
     /// the last viewer drops, the broker drops, and `Page.stopScreencast`
     /// fires automatically.
-    screencast: Arc<tokio::sync::Mutex<std::sync::Weak<super::screencast::ScreencastBroker>>>,
+    screencast: Arc<tokio::sync::Mutex<std::sync::Weak<crate::screencast::ScreencastBroker>>>,
 }
 
 /// Maximum bytes stored per console arg in the capture buffer.
@@ -346,7 +346,8 @@ fn cap_for_memory(s: String) -> String {
 
 /// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary,
 /// appending `…` if truncation occurred.
-pub(crate) fn truncate_unicode_safe(s: String, max_bytes: usize) -> String {
+#[must_use]
+pub fn truncate_unicode_safe(s: String, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s;
     }
@@ -466,7 +467,7 @@ impl BrowserSession {
         // the browser is already usable without the helper.
         let inject_params =
             chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams::new(
-                super::react::PHOENIX_REACT_HELPER_SCRIPT.to_string(),
+                crate::react::PHOENIX_REACT_HELPER_SCRIPT.to_string(),
             );
         match tokio::time::timeout(SESSION_INIT_TIMEOUT, page.execute(inject_params)).await {
             Ok(Ok(_)) => {}
@@ -576,8 +577,8 @@ impl BrowserSession {
         &self,
     ) -> Result<
         (
-            Arc<super::screencast::ScreencastBroker>,
-            tokio::sync::broadcast::Receiver<super::screencast::ScreencastEvent>,
+            Arc<crate::screencast::ScreencastBroker>,
+            tokio::sync::broadcast::Receiver<crate::screencast::ScreencastEvent>,
             Option<String>,
         ),
         BrowserError,
@@ -589,7 +590,7 @@ impl BrowserSession {
         }
         // No live broker — create one. The first attach pays the screencast
         // start-up cost; subsequent attaches share the same broker.
-        let broker = super::screencast::ScreencastBroker::start(self.page.clone()).await?;
+        let broker = crate::screencast::ScreencastBroker::start(self.page.clone()).await?;
         *slot = Arc::downgrade(&broker);
         let (rx, url) = broker.subscribe().await;
         Ok((broker, rx, url))
@@ -783,7 +784,7 @@ impl Drop for BrowserSessionGuard<'_> {
 }
 
 /// Best-effort tear-down of the browser session belonging to `work_scope`,
-/// mirroring [`crate::tmux::registry::cascade_tmux_on_delete`] so
+/// mirroring the tmux registry's `cascade_tmux_on_delete` so
 /// archive / abandon / mark-merged / delete drop the Chrome process the same
 /// way they drop bash and tmux (REQ-BROWSER-WS-003).
 ///
