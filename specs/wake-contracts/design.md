@@ -208,7 +208,8 @@ The LLM-facing surface is the unified `wait_until` tool
   so it would relax the handle-ownership precondition rather than add an
   evaluator on the same edge. A degenerate form of this — returning a
   conversation stuck on a quota-window error to Idle once its reported
-  reset time passes — is served standalone today, outside this subsystem.
+  reset time passes — needs none of the handle machinery and is therefore
+  handled outside this subsystem rather than as a wake contract.
 
 Each of these is a separate condition-kind or contract-shape governed
 by its own spec revision. The foundation — persistence, delivery,
