@@ -233,7 +233,18 @@ async fn handle_socket(
     )
     .await;
 
-    tracing::debug!(conv_id = %conversation_id, ?exit, "Terminal relay exited");
+    // One greppable line distinguishing the three banner causes: a real
+    // session death (PtyEof / TearDown → full teardown, scrollback gone) from a
+    // detach that keeps the session reclaimable (browser drop vs another
+    // connection stealing the single attach slot).
+    let outcome = match exit {
+        RelayExit::PtyEof => "shell/tmux-attach exited — full teardown",
+        RelayExit::Stopped(StopReason::TearDown) => "conversation ended — full teardown",
+        RelayExit::Stopped(StopReason::Detach) => "reclaimed by another connection — detach only",
+        RelayExit::Stopped(StopReason::Running) => "writer stopped (Running) — treated as detach",
+        RelayExit::WsClosed => "browser disconnected — detach only (reclaimable)",
+    };
+    tracing::info!(conv_id = %conversation_id, scope = %scope, ?exit, outcome, "Terminal relay exited");
 
     // Branch cleanup on the exit reason:
     //   PtyEof                  → shell is already gone, full teardown (reap + remove).
