@@ -303,8 +303,13 @@ describe('conversationReducer', () => {
   // `specs/conversation_atom/conversation_atom.allium` SseInitFreshConnect
   // and SseInitReconnectMerge.
   describe('sse_init pending replay', () => {
+    // Pending replay tokens belong to the in-flight attempt, so they carry
+    // the same request_id as the preserved streamingBuffer fixtures
+    // ('test-req-id'). A reconnect replays the *same* attempt's tokens; a
+    // genuinely new attempt (after a mid-stream retry) would carry a different
+    // request_id and is covered by the buffer-keying tests below.
     function tokenEntry(seq: number, text: string): unknown {
-      return { type: 'token', sequence_id: seq, text, request_id: 'req-1' };
+      return { type: 'token', sequence_id: seq, text, request_id: 'test-req-id' };
     }
     function stateChangeEntry(seq: number, state: Record<string, unknown>): unknown {
       return {
@@ -1103,6 +1108,35 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_token', sequenceId: 2, delta: '!', requestId: 'test-req-id' });
 
       expect(next.streamingBuffer?.startedAt).toBe(startedAt);
+    });
+
+    // A retry after a mid-stream failure (network / server_error /
+    // invalid_response) opens a fresh LLM dispatch with a new request_id. The
+    // new attempt's tokens must start a clean buffer, not concatenate onto the
+    // failed attempt's partial text.
+    it('resets the streaming buffer when a new request_id arrives (retry)', () => {
+      const startedAt = Date.now() - 5000;
+      const atom: ConversationAtom = {
+        ...llmRequestingAtom(),
+        lastSequenceId: 4,
+        streamingBuffer: {
+          text: 'partial from attempt 1',
+          lastSequence: 4,
+          startedAt,
+          requestId: 'attempt-1',
+        },
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_token',
+        sequenceId: 5,
+        delta: 'fresh',
+        requestId: 'attempt-2',
+      });
+
+      expect(next.streamingBuffer?.text).toBe('fresh');
+      expect(next.streamingBuffer?.requestId).toBe('attempt-2');
+      expect(next.streamingBuffer?.startedAt).not.toBe(startedAt);
     });
 
     // Task 24683 regression: tokens arriving after the phase has left

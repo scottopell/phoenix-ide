@@ -912,20 +912,29 @@ export function conversationReducer(
       if (atom.phase.type !== 'llm_requesting') {
         return atom;
       }
-      return applyIfNewer(atom, 'sse_token', action.sequenceId, (a) => ({
-        ...a,
-        streamingBuffer: {
-          text: (a.streamingBuffer?.text ?? '') + action.delta,
-          lastSequence: action.sequenceId,
-          startedAt: a.streamingBuffer?.startedAt ?? Date.now(),
-          // The server's `request_id` is stable across every token of a
-          // streaming session and matches the eventual `AssistantMessage.
-          // message_id`. We capture it on every token (cheap; same value
-          // throughout) so the render unit's key is available immediately
-          // and survives a reconnect-replay that starts mid-stream.
-          requestId: action.requestId,
-        },
-      }));
+      return applyIfNewer(atom, 'sse_token', action.sequenceId, (a) => {
+        // Key the streaming buffer by request_id. A retry after a mid-stream
+        // failure (network / server_error / invalid_response) opens a fresh LLM
+        // dispatch with a new request_id; its tokens must start a clean buffer
+        // rather than concatenate onto the failed attempt's partial text. A
+        // matching request_id — the common case, including a reconnect-replay
+        // of the same attempt — appends as before.
+        const sameRequest = a.streamingBuffer?.requestId === action.requestId;
+        return {
+          ...a,
+          streamingBuffer: {
+            text: (sameRequest ? (a.streamingBuffer?.text ?? '') : '') + action.delta,
+            lastSequence: action.sequenceId,
+            startedAt: sameRequest ? (a.streamingBuffer?.startedAt ?? Date.now()) : Date.now(),
+            // The server's `request_id` is stable across every token of a
+            // streaming session and matches the eventual `AssistantMessage.
+            // message_id`. We capture it on every token (cheap; same value
+            // throughout) so the render unit's key is available immediately
+            // and survives a reconnect-replay that starts mid-stream.
+            requestId: action.requestId,
+          },
+        };
+      });
     }
 
     case 'sse_conversation_update':
