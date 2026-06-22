@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 import './GroundingPanel.css';
 
 interface SectionProps {
@@ -14,6 +14,8 @@ interface SectionProps {
   attention?: boolean;
   action?: ReactNode;
   children?: ReactNode;
+  scrollTop?: number | undefined;
+  onScrollTopChange?: ((scrollTop: number) => void) | undefined;
   onToggle: () => void;
 }
 
@@ -26,8 +28,21 @@ export function GroundingSection({
   attention = false,
   action,
   children,
+  scrollTop,
+  onScrollTopChange,
   onToggle,
 }: SectionProps) {
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (body && scrollTop !== undefined) body.scrollTop = scrollTop;
+  }, [expanded, children, scrollTop]);
+
+  const handleBodyScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    onScrollTopChange?.(event.currentTarget.scrollTop);
+  };
+
   return (
     <section className={`grounding-section${expanded ? ' is-expanded' : ''}${attention ? ' has-attention' : ''}${action ? ' has-action' : ''}`}>
       <button
@@ -43,7 +58,15 @@ export function GroundingSection({
         {count ? <span className="grounding-count">{count}</span> : null}
       </button>
       {action && <div className="grounding-header-action">{action}</div>}
-      {expanded && <div className="grounding-section-body">{children}</div>}
+      {expanded && (
+        <div
+          className="grounding-section-body"
+          ref={bodyRef}
+          onScroll={handleBodyScroll}
+        >
+          {children}
+        </div>
+      )}
     </section>
   );
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import type { TaskEntry, TaskCountResponse } from '../api';
@@ -58,7 +58,6 @@ export function TasksPanel({
   onScrollTopChange,
 }: TasksPanelProps) {
   const navigate = useNavigate();
-  const bodyRef = useRef<HTMLDivElement | null>(null);
   const [internalExpanded, setInternalExpanded] = useState(false);
   const expanded = controlledExpanded ?? internalExpanded;
   const setExpanded = onToggleExpanded ?? setInternalExpanded;
@@ -122,18 +121,9 @@ export function TasksPanel({
     ([a], [b]) => (STATUS_ORDER[a] ?? 99) - (STATUS_ORDER[b] ?? 99),
   );
 
-  useEffect(() => {
-    const body = bodyRef.current;
-    if (body && scrollTop !== undefined) body.scrollTop = scrollTop;
-  }, [expanded, tasks, scrollTop]);
-
 
   const toggleGroup = (status: string) => {
     setGroupExpanded({ ...groupExpanded, [status]: !groupExpanded[status] });
-  };
-
-  const handleScroll = (event: React.UIEvent<HTMLDivElement>) => {
-    onScrollTopChange?.(event.currentTarget.scrollTop);
   };
 
   // Once the full list is loaded (expanded), it is authoritative for the header;
@@ -156,6 +146,8 @@ export function TasksPanel({
       expanded={expanded}
       attention={(headerCounts?.current ?? false) || (headerCounts?.blocked ?? 0) > 0}
       onToggle={() => setExpanded(!expanded)}
+      scrollTop={scrollTop}
+      onScrollTopChange={onScrollTopChange}
     >
       <div className={`tasks-panel${expanded ? ' is-expanded' : ''}`}>
         {loading && <GroundingState tone="loading">Loading tasks…</GroundingState>}
@@ -163,7 +155,7 @@ export function TasksPanel({
           <GroundingState>No tasks found for this project.</GroundingState>
         )}
         {!loading && tasks.length > 0 && (
-          <div className="tasks-panel-body" ref={bodyRef} onScroll={handleScroll}>
+          <div className="tasks-panel-body">
             {sortedGroups.map(([status, groupTasks]) => {
               const isTerminal = TERMINAL_STATUSES.has(status);
               const isOpen = groupExpanded[status] ?? !isTerminal;

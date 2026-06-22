@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { api } from '../api';
 import type { SkillEntry } from '../api';
 import { GroundingSection, GroundingState } from './GroundingPanel';
@@ -26,7 +26,6 @@ export function SkillsPanel({
   scrollTop,
   onScrollTopChange,
 }: SkillsPanelProps) {
-  const bodyRef = useRef<HTMLDivElement | null>(null);
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const [internalExpanded, setInternalExpanded] = useState(false);
   const expanded = controlledExpanded ?? internalExpanded;
@@ -66,11 +65,6 @@ export function SkillsPanel({
 
   const grouped = useMemo(() => groupSkills(skills), [skills]);
 
-  useEffect(() => {
-    const body = bodyRef.current;
-    if (body && scrollTop !== undefined) body.scrollTop = scrollTop;
-  }, [expanded, skills, scrollTop]);
-
   const handleSkillClick = (skill: SkillEntry) => {
     if (onSkillClick) {
       onSkillClick(skill);
@@ -87,10 +81,6 @@ export function SkillsPanel({
     setExpandedGroups(next);
   };
 
-  const handleScroll = (event: React.UIEvent<HTMLDivElement>) => {
-    onScrollTopChange?.(event.currentTarget.scrollTop);
-  };
-
   return (
     <GroundingSection
       icon="/"
@@ -99,12 +89,14 @@ export function SkillsPanel({
       count={skills.length}
       expanded={expanded}
       onToggle={() => setExpanded(!expanded)}
+      scrollTop={scrollTop}
+      onScrollTopChange={onScrollTopChange}
     >
       <div className={`skills-panel${expanded ? ' is-expanded' : ''}`}>
         {skills.length === 0 ? (
           <GroundingState>No skills discovered for this conversation.</GroundingState>
         ) : (
-          <div className="skills-panel-body" ref={bodyRef} onScroll={handleScroll}>
+          <div className="skills-panel-body">
             {Array.from(grouped.entries()).map(([group, items]) => (
               <div key={group} className="skill-group">
                 <div
