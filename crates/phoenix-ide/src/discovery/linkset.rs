@@ -4,6 +4,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCatalog {
@@ -64,6 +65,7 @@ pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, St
                     );
                     continue;
                 }
+                let identity_href = identity_href(&url);
                 let url = url.to_string();
                 if !seen.insert((rel.clone(), url.clone())) {
                     continue;
@@ -74,7 +76,7 @@ pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, St
                     .or_else(|| link.get("content_type"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                identity_parts.insert((rel.clone(), href.to_string(), content_type.clone()));
+                identity_parts.insert((rel.clone(), identity_href, content_type.clone()));
 
                 if title.is_none() {
                     title.clone_from(&link_title);
@@ -95,6 +97,32 @@ pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, St
         description,
         capabilities,
         identity,
+    })
+}
+
+fn identity_href(url: &Url) -> String {
+    if is_loopback_url(url) {
+        let port = url.port_or_known_default().unwrap_or(80);
+        let mut normalized = format!("{}://loopback:{port}{}", url.scheme(), url.path());
+        if let Some(query) = url.query() {
+            normalized.push('?');
+            normalized.push_str(query);
+        }
+        if let Some(fragment) = url.fragment() {
+            normalized.push('#');
+            normalized.push_str(fragment);
+        }
+        normalized
+    } else {
+        url.to_string()
+    }
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
     })
 }
 
@@ -222,6 +250,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(first.identity, second.identity);
+    }
+
+    #[test]
+    fn identity_normalizes_reflected_loopback_absolute_hrefs() {
+        let v4_url = Url::parse("http://127.0.0.1:8787/.well-known/api-catalog").unwrap();
+        let v6_url = Url::parse("http://[::1]:8787/.well-known/api-catalog").unwrap();
+        let v4 = parse_catalog(
+            br#"{
+              "linkset": [{
+                "service-doc": [{"href": "http://127.0.0.1:8787/docs?view=api", "title": "Docs"}]
+              }]
+            }"#,
+            &v4_url,
+        )
+        .unwrap();
+        let v6 = parse_catalog(
+            br#"{
+              "linkset": [{
+                "service-doc": [{"href": "http://[::1]:8787/docs?view=api", "title": "Docs"}]
+              }]
+            }"#,
+            &v6_url,
+        )
+        .unwrap();
+
+        assert_eq!(
+            identity_href(&v4_url.join("http://127.0.0.1:8787/docs?view=api").unwrap()),
+            identity_href(&v6_url.join("http://[::1]:8787/docs?view=api").unwrap())
+        );
+        assert_eq!(v4.identity, v6.identity);
     }
 
     #[test]
