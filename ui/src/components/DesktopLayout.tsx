@@ -151,6 +151,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     : (activeConversation?.worktree_path ?? activeConversation?.cwd ?? null);
   const activeWorkScopeKey = activeConversationArchived ? undefined : activeConversation?.work_scope_key;
   const activeLiveWorkScope = activeConversationArchived ? undefined : liveWorkScope;
+  const browserSessionActive = !activeConversationArchived && (activeConversation?.browser_session_active ?? false);
 
   // Always render a single stable tree so children never unmounts across the
   // desktop/mobile breakpoint. Conditionally show sidebar and file-explorer
@@ -161,7 +162,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     <SubAgentViewerProvider>
     <ViewerSlotProvider
       scopeKey={activeSlug ?? undefined}
-      browserSessionActive={activeConversation?.browser_session_active ?? false}
+      browserSessionActive={browserSessionActive}
     >
      <FileExplorerProvider>
       <div className={isDesktop ? 'desktop-layout' : undefined}>

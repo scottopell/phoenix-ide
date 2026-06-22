@@ -134,6 +134,7 @@ function ConversationPageContent() {
   // Derived from atom
   const conversationId = atom.conversationId ?? undefined;
   const conversation = atom.conversation;
+  const isArchived = conversation?.archived === true;
   const prStatusHandle = useConversationPrStatus({
     conversationId,
     convModeLabel: conversation?.conv_mode_label,
@@ -439,12 +440,12 @@ function ConversationPageContent() {
 
   // Auto-open/close task approval overlay on state transitions
   useEffect(() => {
-    if (atom.phase.type === 'awaiting_task_approval') {
+    if (atom.phase.type === 'awaiting_task_approval' && !isArchived) {
       setShowTaskApproval(true);
     } else {
       setShowTaskApproval(false);
     }
-  }, [atom.phase.type]);
+  }, [atom.phase.type, isArchived]);
 
   // Ctrl+` toggles the terminal collapse state. Only blocked when focus is
   // inside the xterm itself — in every other input (chat textarea, etc.)
@@ -504,6 +505,7 @@ function ConversationPageContent() {
       files: FileAttachment[] = []
     ) => {
       if (!conversationId) return;
+      if (isArchived) return;
 
       sendingMessagesRef.current.add(localId);
 
@@ -562,11 +564,18 @@ function ConversationPageContent() {
         sendingMessagesRef.current.delete(localId);
       }
     },
-    [conversationId, isOnline, queueOperation, dispatch, markSteeringQueued]
+    [conversationId, isArchived, isOnline, queueOperation, dispatch, markSteeringQueued]
   );
 
   const sendMessageRef = useRef(sendMessage);
   useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
+
+  useEffect(() => {
+    if (!isArchived) return;
+    for (const msg of pendingMessages) {
+      if (msg.status !== 'steering_queued') dismiss(msg.localId);
+    }
+  }, [isArchived, pendingMessages, dismiss]);
 
   // Send queued messages when connection is restored. Iterate the derived
   // `pendingMessages` (NOT raw `queuedMessages`) so we don't re-POST entries
@@ -574,17 +583,17 @@ function ConversationPageContent() {
   // Skip `steering_queued` messages — they are already held server-side and
   // will be delivered automatically when the conversation reaches Idle.
   useEffect(() => {
-    if (!isConnected || !conversationId) return;
+    if (!isConnected || !conversationId || isArchived) return;
 
     for (const msg of pendingMessages) {
       if (msg.status === 'steering_queued') continue;
       if (sendingMessagesRef.current.has(msg.localId)) continue;
       sendMessageRef.current(msg.localId, msg.text, msg.images, msg.files ?? []);
     }
-  }, [isConnected, conversationId, pendingMessages]);
+  }, [isConnected, conversationId, isArchived, pendingMessages]);
 
   const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
-    if (!conversationId) return;
+    if (!conversationId || isArchived) return;
 
     const msg = enqueue(text, attachedImages, attachedFiles);
 
@@ -592,7 +601,7 @@ function ConversationPageContent() {
       // Await so expansion errors propagate back to InputArea (REQ-IR-007)
       await sendMessage(msg.localId, text, attachedImages, attachedFiles);
     }
-  }, [conversationId, enqueue, isConnected, sendMessage]);
+  }, [conversationId, isArchived, enqueue, isConnected, sendMessage]);
 
   const handleRetry = useCallback((localId: string) => {
     const msg = queuedMessages.find((m) => m.localId === localId);
@@ -660,17 +669,17 @@ function ConversationPageContent() {
   );
 
   const handleTriggerContinuation = useCallback(async () => {
-    if (!conversationId) return;
+    if (!conversationId || isArchived) return;
 
     try {
       await api.triggerContinuation(conversationId);
     } catch (err) {
       console.error('Failed to trigger continuation:', err);
     }
-  }, [conversationId]);
+  }, [conversationId, isArchived]);
 
   const handleUpgradeModel = useCallback(async (newModelId: string) => {
-    if (!conversationId || !canChangeModelInState(atom.phase)) return;
+    if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;
 
     try {
       await api.upgradeModel(conversationId, newModelId);
@@ -679,7 +688,7 @@ function ConversationPageContent() {
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }
-  }, [conversationId, atom.phase, showInfo, dispatch]);
+  }, [conversationId, isArchived, atom.phase, showInfo, dispatch]);
 
   // REQ-TERM-020 / REQ-SEED-001: "Let Phoenix set this up for me" handler.
   // TerminalPanel builds the prompt text and hands it off; this owns the API
@@ -722,7 +731,7 @@ function ConversationPageContent() {
   );
 
   const handleApproveTask = async () => {
-    if (!conversationId) return;
+    if (!conversationId || isArchived) return;
     try {
       const result = await api.approveTask(conversationId);
       if (result.first_task) {
@@ -734,7 +743,7 @@ function ConversationPageContent() {
   };
 
   const handleRejectTask = async () => {
-    if (!conversationId) return;
+    if (!conversationId || isArchived) return;
     try {
       await api.rejectTask(conversationId);
     } catch (err) {
@@ -743,7 +752,7 @@ function ConversationPageContent() {
   };
 
   const handleTaskFeedback = async (annotations: string) => {
-    if (!conversationId) return;
+    if (!conversationId || isArchived) return;
     try {
       await api.sendTaskFeedback(conversationId, annotations);
     } catch (err) {
@@ -876,16 +885,18 @@ function ConversationPageContent() {
 
   const convStateForChildren = atom.phase;
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
-  const isArchived = conversation?.archived === true;
   const fileRootPath = isArchived || !conversation ? null : (conversation.worktree_path ?? conversation.cwd);
   const handleOpenFiles = useCallback(() => {
     if (fileRootPath) setShowFileBrowser(true);
   }, [fileRootPath]);
+  const openFileState = fileRootPath ? fileExplorer.openFileState : null;
+  const browserViewerOpen = !isArchived && browserOpen;
+  const inspectViewerOpen = !isArchived && inspectOpen;
   const stateBarContinuation = useMemo(
-    () => convStateForChildren.type === 'idle'
+    () => !isArchived && convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }
       : { phase: 'unavailable' as const },
-    [convStateForChildren.type, handleTriggerContinuation],
+    [isArchived, convStateForChildren.type, handleTriggerContinuation],
   );
 
   if (error) {
@@ -927,8 +938,8 @@ function ConversationPageContent() {
   // Wide desktop (≥1280px) renders it as a split-pane sibling inside
   // the main return below (task 08654).
   if (isDesktop && !isWideDesktop) {
-    if (fileExplorer.openFileState) {
-      const prs = fileExplorer.openFileState;
+    if (openFileState) {
+      const prs = openFileState;
       return (
         <div id="app">
           <Suspense fallback={null}>
@@ -959,7 +970,7 @@ function ConversationPageContent() {
         </div>
       );
     }
-    if (browserOpen && conversationId) {
+    if (browserViewerOpen && conversationId) {
       return (
         <div id="app">
           <Suspense fallback={null}>
@@ -972,7 +983,7 @@ function ConversationPageContent() {
         </div>
       );
     }
-    if (inspectSlot) {
+    if (inspectViewerOpen && inspectSlot) {
       return (
         <div id="app">
           <Suspense fallback={null}>
@@ -1058,16 +1069,16 @@ function ConversationPageContent() {
   // .conversation-column when wide-desktop and a viewer (file OR diff)
   // is open. CSS in .app-split-pane (index.css) flexes children
   // horizontally.
-  const splitPanePrs = fileExplorer.openFileState;
+  const splitPanePrs = openFileState;
   const showSplitPaneViewer =
     isDesktop
     && isWideDesktop
-    && (splitPanePrs !== null || paneDiffOpen || browserOpen || inspectOpen);
+    && (splitPanePrs !== null || paneDiffOpen || browserViewerOpen || inspectViewerOpen);
 
   return (
     <ForkProposalsProvider
       conversationId={conversationId}
-      originTerminal={isTerminalConversationState(convStateForChildren)}
+      originTerminal={isArchived || isTerminalConversationState(convStateForChildren)}
       onOutcome={handleForkOutcome}
       onError={showError}
     >
@@ -1083,7 +1094,7 @@ function ConversationPageContent() {
       <div className="conversation-column">
       {seedBreadcrumb}
       {parentConvBreadcrumb}
-      {viewerSlot.browserSessionActive && !browserOpen && (
+      {viewerSlot.browserSessionActive && !isArchived && !browserOpen && (
         <div className="browser-view-launcher">
           <button
             type="button"
@@ -1103,9 +1114,9 @@ function ConversationPageContent() {
         convState={convStateForChildren}
         onRetry={handleRetry}
         onCancelSteering={handleCancelSteering}
-        onOpenFile={handleOpenFileFromPatch}
+        onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
-        workScopeKey={conversation.work_scope_key}
+        workScopeKey={isArchived ? undefined : conversation.work_scope_key}
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}
@@ -1142,7 +1153,7 @@ function ConversationPageContent() {
           </button>
           <div className="context-exhausted-summary">
             <div className="context-exhausted-actions">
-              {conversation.continued_in_conv_id ? (
+              {!isArchived && (conversation.continued_in_conv_id ? (
                 // REQ-BED-030 single-continuation policy: once a parent has a
                 // continuation, the Continue button is replaced with a link to
                 // that continuation. Clicking re-hits the idempotent
@@ -1201,7 +1212,7 @@ function ConversationPageContent() {
                 >
                   Continue in new conversation
                 </button>
-              )}
+              ))}
               <button
                 type="button"
                 className="context-exhausted-copy"
@@ -1443,7 +1454,7 @@ function ConversationPageContent() {
       )}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
-      {showTaskApproval && atom.phase.type === 'awaiting_task_approval' && (
+      {showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (
         <Suspense fallback={null}>
           <TaskApprovalReader
             title={atom.phase.title}
@@ -1483,15 +1494,15 @@ function ConversationPageContent() {
       {/* Mobile prose reader overlay — reads URL-driven state from
           FileExplorerProvider so cold reload (e.g. iOS PWA return) restores
           the exact file the user was viewing. */}
-      {!isDesktop && fileExplorer.openFileState && (
+      {!isDesktop && openFileState && (
         <Suspense fallback={null}>
           <FileViewer
-            filePath={fileExplorer.openFileState.path}
-            rootDir={fileExplorer.openFileState.rootDir}
+            filePath={openFileState.path}
+            rootDir={openFileState.rootDir}
             onClose={handleCloseFileViewer}
             onSendNotes={handleSendNotes}
-            patchContext={fileExplorer.openFileState.patchContext ?? undefined}
-            focusLine={fileExplorer.openFileState.focusLine}
+            patchContext={openFileState.patchContext ?? undefined}
+            focusLine={openFileState.focusLine}
           />
         </Suspense>
       )}
@@ -1519,7 +1530,7 @@ function ConversationPageContent() {
       {/* Browser view overlay: same fallback role as the diff overlay above
           — mobile, narrow desktop, or any case where the split pane is
           unavailable. REQ-BT-018. */}
-      {browserOpen && !showSplitPaneViewer && conversationId && (
+      {browserViewerOpen && !showSplitPaneViewer && conversationId && (
         <Suspense fallback={null}>
           <div className="browser-view-overlay">
             <BrowserViewPanel
@@ -1531,7 +1542,7 @@ function ConversationPageContent() {
       )}
       {/* Process inspector overlay: mobile, narrow desktop, or any case where
           the split pane is unavailable (REQ-PINSP-007). */}
-      {inspectSlot && !showSplitPaneViewer && (
+      {inspectViewerOpen && inspectSlot && !showSplitPaneViewer && (
         <Suspense fallback={null}>
           <ProcessInspectorPanel
             scopeKey={inspectSlot.scopeKey}
@@ -1597,13 +1608,13 @@ function ConversationPageContent() {
                   focusLine={splitPanePrs.focusLine}
                   inline
                 />
-              ) : browserOpen && conversationId ? (
+              ) : browserViewerOpen && conversationId ? (
                 <BrowserViewPanel
                   conversationId={conversationId}
                   onClose={handleCloseBrowserView}
                   inline
                 />
-              ) : inspectSlot ? (
+              ) : inspectViewerOpen && inspectSlot ? (
                 <ProcessInspectorPanel
                   scopeKey={inspectSlot.scopeKey}
                   handleId={inspectSlot.handleId}

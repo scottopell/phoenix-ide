@@ -109,10 +109,10 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
 
   const detailViewer = selectedSkill
     ? <SkillViewer skill={selectedSkill} onBack={() => setSelectedSkill(null)} />
-    : selectedTask && rootPath
+    : selectedTask
       ? <TaskViewer
           task={selectedTask}
-          tasksDir={`${rootPath}/tasks`}
+          tasksDir={rootPath ? `${rootPath}/tasks` : null}
           activeSlug={activeSlug}
           onBack={() => setSelectedTask(null)}
         />

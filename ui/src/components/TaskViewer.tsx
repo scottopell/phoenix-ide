@@ -6,7 +6,7 @@ import './TaskViewer.css';
 
 interface TaskViewerProps {
   task: TaskEntry;
-  tasksDir: string;
+  tasksDir?: string | null;
   /** Slug of the conversation the user is currently viewing. TaskViewer reads
    *  the live conversation row from the store; it is used as the seed parent
    *  when starting a "work on this task" sub-conversation. */
@@ -43,7 +43,7 @@ export function TaskViewer({ task, tasksDir, activeSlug, onBack }: TaskViewerPro
   // back to reconstructing it from id+priority+status+slug for older API
   // responses that may not include the field.
   const filename = `${task.id}-${task.priority}-${task.status}--${task.slug}.md`;
-  const filePath = task.path || `${tasksDir}/${filename}`;
+  const filePath = task.path || (tasksDir ? `${tasksDir}/${filename}` : filename);
 
   useEffect(() => {
     let cancelled = false;
