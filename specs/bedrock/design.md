@@ -1751,7 +1751,7 @@ architecture. It was produced by commissioning five independent expert proposals
 autopsy of all resolved bugs. The failure modes are the WHY behind every design
 decision in this document.*
 
-### The Six Failure Modes
+### The Seven Failure Modes
 
 Every bug found in the conversation runtime lived outside the pure `transition()`
 function — at the boundary between the state machine and the executor. Property tests
@@ -1811,6 +1811,24 @@ a parent could wait forever.
 **Prevention:** Bounded buffer (capacity = sub-agent count). `timeout: Duration`
 mandatory on `SubAgentConfig`. `deadline: Instant` in `AwaitingSubAgentsState`.
 Executor `select!` races result against `sleep_until(deadline)`.
+
+**FM-7: HTTP handler authority gap.**
+A lifecycle-sensitive HTTP handler reads `conversation.state` from the DB row to decide
+how to route an incoming event (`UserMessage` vs. `SteerMessage`). The live runtime
+may have entered a transient in-flight state via restart auto-resume that the DB row
+does not yet reflect: `reset_all_to_idle` writes `Idle` on startup; `determine_resume_state`
+then re-derives `LlmRequesting` (or another transient state) and creates the live runtime.
+During the auto-resume LLM call the DB row still reads `Idle`. A handler that reads only
+the DB row routes a `UserMessage`, which the executor rejects as `AgentBusy`; the client
+receives `200 OK` and then sees an error in the conversation stream (post-200 rejection).
+*Contract violated: for transient in-flight states the live runtime is the authority; the
+DB row is the safe rest-state after restart, not the current operational state.*
+**Prevention:** `RuntimeManager::effective_conversation_state(conv_id)` checks the live
+runtime's `watch::Receiver<ConvState>` first; falls back to the DB row only when no
+handle is present. `ConversationHandle` carries the receiver; the executor publishes
+every state transition to the paired `watch::Sender`. HTTP handlers call
+`effective_conversation_state` instead of reading `conversation.state` directly for
+any decision that affects event routing.
 
 ### Panel Summary and Architecture Selection
 

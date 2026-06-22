@@ -36,7 +36,7 @@ use phoenix_llm::{
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Safety-net wall-clock timeout for sub-agents (REQ-SA-006).
@@ -1023,6 +1023,11 @@ where
     /// DB handle) keeps retirement serialized with approve/request-changes so a
     /// terminal transition can't tear down an in-flight resolve's worktree.
     fork_cmd_tx: Option<mpsc::Sender<super::fork_resolve::ForkCommand>>,
+    /// Watch sender that publishes the current `ConvState` on every transition.
+    /// The paired `watch::Receiver` lives in `ConversationHandle` so HTTP
+    /// handlers can read live runtime state without holding the `runtimes` lock.
+    /// `None` in tests that do not exercise the live-state authority path.
+    state_watcher: Option<watch::Sender<ConvState>>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -1105,6 +1110,7 @@ where
             credential_helper: None,
             agent_catalog: Arc::from(Vec::new()),
             fork_cmd_tx: None,
+            state_watcher: None,
         }
     }
 
@@ -1117,6 +1123,14 @@ where
         tx: mpsc::Sender<super::fork_resolve::ForkCommand>,
     ) -> Self {
         self.fork_cmd_tx = Some(tx);
+        self
+    }
+
+    /// Attach a watch sender so the runtime publishes its current `ConvState`
+    /// on every transition. The paired receiver lives in `ConversationHandle`
+    /// and lets HTTP handlers read live state without consulting the DB.
+    pub fn with_state_watcher(mut self, tx: watch::Sender<ConvState>) -> Self {
+        self.state_watcher = Some(tx);
         self
     }
 
@@ -1829,6 +1843,12 @@ where
         // its prior value too — gating here keeps the in-memory stamp in sync.
         if self.state != old_state {
             self.state_updated_at = Utc::now();
+            // Publish the new state to any live-state observer (e.g. the
+            // `effective_conversation_state` authority used by HTTP handlers).
+            if let Some(tx) = &self.state_watcher {
+                // Receiver drop means the handle was removed — no action needed.
+                let _ = tx.send(self.state.clone());
+            }
         }
 
         // Retire any pending retry-backoff timer when the conversation leaves

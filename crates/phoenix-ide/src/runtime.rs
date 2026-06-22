@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 
 /// Request to spawn a sub-agent
 #[derive(Debug)]
@@ -193,6 +193,13 @@ pub struct ConversationHandle {
     /// handle share the same pointer so `Arc::ptr_eq` is a reliable identity
     /// check even across cheap clones.
     identity: Arc<()>,
+    /// Live-state observer. The executor writes to the paired sender on every
+    /// state transition; readers call `state_rx.borrow()` to get the current
+    /// executor state without acquiring the `runtimes` lock or touching the DB.
+    /// Authority rule: if a handle exists, its `state_rx` is authoritative for
+    /// transient in-flight state; the DB row is the safe rest-state fallback
+    /// when no handle is present (see `effective_conversation_state`).
+    pub(crate) state_rx: watch::Receiver<ConvState>,
 }
 
 /// Capacity of the per-conversation SSE broadcast channel.
@@ -1762,6 +1769,10 @@ impl RuntimeManager {
         .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
 
+        // Live-state watch channel for sub-agent (seeded Idle; transitions publish updates).
+        let (sub_state_tx, sub_state_rx) = watch::channel(ConvState::Idle);
+        let runtime = runtime.with_state_watcher(sub_state_tx);
+
         // 7. Store handle
         let sub_agent_identity = Arc::new(());
         self.runtimes.write().await.insert(
@@ -1770,6 +1781,7 @@ impl RuntimeManager {
                 event_tx: event_tx.clone(),
                 broadcast_tx: broadcaster.clone(),
                 identity: sub_agent_identity.clone(),
+                state_rx: sub_state_rx,
             },
         );
 
@@ -1880,6 +1892,7 @@ impl RuntimeManager {
                     event_tx: handle.event_tx.clone(),
                     broadcast_tx: handle.broadcast_tx.clone(),
                     identity: handle.identity.clone(),
+                    state_rx: handle.state_rx.clone(),
                 });
             }
         }
@@ -2075,7 +2088,7 @@ impl RuntimeManager {
 
         let runtime: ProductionRuntime = ConversationRuntime::new(
             context,
-            initial_state,
+            initial_state.clone(),
             storage,
             llm_client,
             tool_executor,
@@ -2104,6 +2117,12 @@ impl RuntimeManager {
         } else {
             runtime.with_fork_command_sender(self.fork_cmd_tx.clone())
         };
+
+        // Create the live-state watch channel seeded with the initial state.
+        // The executor writes to `state_tx` on every transition; the handle
+        // exposes `state_rx` to HTTP handlers via `effective_conversation_state`.
+        let (state_tx, state_rx) = watch::channel(initial_state);
+        let runtime = runtime.with_state_watcher(state_tx);
 
         // If auto-continuing, inject a system message so the LLM knows a restart
         // happened. This also serves as the restart loop counter — recovery.rs
@@ -2181,6 +2200,7 @@ impl RuntimeManager {
             event_tx: event_tx.clone(),
             broadcast_tx: broadcaster.clone(),
             identity: identity.clone(),
+            state_rx: state_rx.clone(),
         };
 
         // Store handle
@@ -2190,10 +2210,36 @@ impl RuntimeManager {
                 event_tx,
                 broadcast_tx: broadcaster,
                 identity,
+                state_rx,
             },
         );
 
         Ok(handle)
+    }
+
+    /// Inject a fake live handle carrying a specific `ConvState` into the
+    /// handle map.  Test-only: simulates the post-restart auto-resume window
+    /// where the executor has entered a transient state that has not yet been
+    /// persisted to the DB row.
+    #[cfg(test)]
+    pub(crate) async fn inject_handle_for_test(&self, conv_id: &str, live_state: ConvState) {
+        let (event_tx, event_rx) = mpsc::channel(32);
+        // Keep the receiver alive so sends into event_tx succeed (a dropped
+        // receiver closes the channel and causes `enqueue_steer_message` to err).
+        tokio::spawn(async move {
+            let mut rx = event_rx;
+            while rx.recv().await.is_some() {}
+        });
+        let (_state_tx, state_rx) = watch::channel(live_state);
+        self.runtimes.write().await.insert(
+            conv_id.to_string(),
+            ConversationHandle {
+                event_tx,
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
     }
 
     /// Evict an active runtime so it gets recreated with fresh config on next access.
@@ -2329,7 +2375,28 @@ impl RuntimeManager {
             event_tx: h.event_tx.clone(),
             broadcast_tx: h.broadcast_tx.clone(),
             identity: h.identity.clone(),
+            state_rx: h.state_rx.clone(),
         })
+    }
+
+    /// Return the authoritative `ConvState` for routing decisions.
+    ///
+    /// If a live runtime exists for `conv_id`, its in-memory executor state is
+    /// returned — this is the **only** authority for transient in-flight states
+    /// (`LlmRequesting`, `ToolExecuting`, etc.) that have not yet been persisted
+    /// to the DB row.  Falls through to `None` when no handle is present;
+    /// callers are expected to fall back to the DB row in that case.
+    ///
+    /// # Authority invariant
+    ///
+    /// HTTP handlers that make event-routing decisions (e.g. `UserMessage` vs.
+    /// `SteerMessage`) **must** call this instead of reading `conversation.state`
+    /// directly.  A persisted `Idle` row during restart auto-resume is correct
+    /// (it is the safe rest-state before any transition is persisted) but
+    /// misleading to a handler that consults only the DB.
+    pub async fn effective_conversation_state(&self, conv_id: &str) -> Option<ConvState> {
+        let runtimes = self.runtimes.read().await;
+        runtimes.get(conv_id).map(|h| h.state_rx.borrow().clone())
     }
 
     /// Remove and return the evicted broadcaster for `conversation_id`, if any.
@@ -3216,12 +3283,14 @@ mod scope_liveness_tests {
     /// real conversation runtime — mirrors the handle the executor inserts.
     async fn register_lingering_handle(mgr: &RuntimeManager, conv_id: &str) {
         let (event_tx, _event_rx) = mpsc::channel(1);
+        let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
         mgr.runtimes.write().await.insert(
             conv_id.to_string(),
             ConversationHandle {
                 event_tx,
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
+                state_rx,
             },
         );
     }

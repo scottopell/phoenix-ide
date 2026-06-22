@@ -2188,7 +2188,20 @@ async fn send_chat(
     // dispatch). A 409 lets the existing client-side error path
     // (`markFailed` in ConversationPage.tsx) surface the rejection to the
     // user with retry/dismiss controls.
-    if let Err(err) = check_user_message_acceptable(&conversation.state) {
+    //
+    // Authority: use the live runtime state when a handle exists; fall back
+    // to the DB row only when no runtime is running. The two diverge during
+    // restart auto-resume: `reset_all_to_idle` writes `Idle` to the DB row,
+    // then `get_or_create` re-derives `LlmRequesting` (InterruptedMidTurn)
+    // and creates a live handle. A handler that reads only the DB row would
+    // see `Idle`, route a `UserMessage`, and receive an `AgentBusy` rejection
+    // from the executor — the post-200 error path (FM-7, specs/bedrock/design.md).
+    let effective_state = state
+        .runtime
+        .effective_conversation_state(&id)
+        .await
+        .unwrap_or_else(|| conversation.state.clone());
+    if let Err(err) = check_user_message_acceptable(&effective_state) {
         // `AgentBusy` and `CancellationInProgress` states are transient — the
         // conversation will reach `Idle` once the current operation completes.
         // Instead of rejecting, queue the message as a steering directive so
@@ -2241,7 +2254,7 @@ async fn send_chat(
             };
             tracing::info!(
                 conv_id = %id,
-                state = conversation.state.variant_name(),
+                state = effective_state.variant_name(),
                 "Chat queued as steering message (conversation busy)"
             );
             state
@@ -2267,7 +2280,7 @@ async fn send_chat(
         };
         tracing::info!(
             conv_id = %id,
-            state = conversation.state.variant_name(),
+            state = effective_state.variant_name(),
             error_type,
             "Chat rejected: conversation state cannot accept UserMessage"
         );
@@ -8341,5 +8354,127 @@ mod attachment_storage_tests {
             assert_eq!(dir_mode, 0o700);
             assert_eq!(file_mode, 0o600);
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_authority_tests {
+    //! Regression: `POST /chat` must use live runtime state as the routing authority.
+    //!
+    //! The split-brain scenario (FM-7, specs/bedrock/design.md):
+    //! - DB row says `Idle` (written by `reset_all_to_idle` on startup)
+    //! - Live executor is in `LlmRequesting` (set by `determine_resume_state`
+    //!   detecting `InterruptedMidTurn`)
+    //! A handler that reads only the DB row routes a `UserMessage`, gets
+    //! `AgentBusy` from the executor, and surfaces a post-200 error.
+    //! The fix: `effective_conversation_state` returns the live state; the
+    //! handler queues a steering message instead.
+    use super::*;
+    use crate::db::Database;
+    use crate::llm::ModelRegistry;
+    use crate::platform::PlatformCapability;
+    use crate::runtime::RuntimeManager;
+    use crate::state_machine::ConvState;
+    use crate::tools::mcp::McpClientManager;
+    use std::sync::Arc;
+
+    /// Build a minimal `AppState` backed by an in-memory database.
+    async fn make_state() -> AppState {
+        let db = Database::open_in_memory().await.expect("open db");
+        let llm_registry = Arc::new(ModelRegistry::new_empty());
+        let platform = PlatformCapability::None;
+        let mcp_manager = Arc::new(McpClientManager::new());
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            llm_registry.clone(),
+            platform,
+            mcp_manager.clone(),
+            None,
+        ));
+        let terminals = runtime.terminals.clone();
+        let message_retriever: Arc<dyn crate::db::MessageRetriever> =
+            Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            llm_registry.clone(),
+            message_retriever.clone(),
+        );
+        let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
+        AppState {
+            runtime,
+            llm_registry,
+            db,
+            platform,
+            mcp_manager,
+            credential_helper: None,
+            password: None,
+            sessions,
+            login_throttle: super::super::auth::LoginThrottle::new(),
+            terminals,
+            chain_qa,
+            message_retriever,
+            codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+        }
+    }
+
+    /// Regression for FM-7: DB row says `Idle`, live runtime says `LlmRequesting`.
+    /// `POST /chat` must queue the message as a steering directive, not reject it
+    /// with `AgentBusy` after a spurious `200 OK`.
+    #[tokio::test]
+    async fn live_llm_requesting_routes_to_steering_despite_idle_db_row() {
+        let state = make_state().await;
+
+        // Create conversation — DB row starts Idle by default.
+        state
+            .db
+            .create_conversation("c-fm7", "fm7", "/tmp", true, None, None)
+            .await
+            .expect("create");
+
+        // Verify DB row is Idle (the safe rest-state after reset_all_to_idle).
+        let conv = state.db.get_conversation("c-fm7").await.expect("get");
+        assert!(
+            matches!(conv.state, ConvState::Idle),
+            "precondition: DB row must be Idle"
+        );
+
+        // Inject a live handle whose state_rx reports LlmRequesting.
+        // This mirrors the window after restart auto-resume where the executor
+        // has entered LlmRequesting but no DB write has occurred yet.
+        state
+            .runtime
+            .inject_handle_for_test("c-fm7", ConvState::LlmRequesting { attempt: 1 })
+            .await;
+
+        // Verify effective_conversation_state returns the live state.
+        let effective = state
+            .runtime
+            .effective_conversation_state("c-fm7")
+            .await
+            .expect("handle present");
+        assert!(
+            matches!(effective, ConvState::LlmRequesting { .. }),
+            "effective state must reflect live runtime, got {effective:?}"
+        );
+
+        // POST /chat: must queue as steering (not reject AgentBusy).
+        let req = ChatRequest {
+            text: "continue please".to_string(),
+            message_id: uuid::Uuid::new_v4().to_string(),
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+        };
+        let result = send_chat(State(state.clone()), Path("c-fm7".to_string()), Json(req))
+            .await
+            .expect("must not return Err — steering should succeed");
+
+        assert!(result.0.queued, "message must be queued");
+        assert!(
+            result.0.steering,
+            "must be routed as steering, not UserMessage"
+        );
     }
 }
