@@ -911,6 +911,9 @@ function ConversationPageContent() {
   const handleOpenFiles = useCallback(() => {
     if (fileRootPath) setShowFileBrowser(true);
   }, [fileRootPath]);
+  useEffect(() => {
+    if (!fileRootPath) setShowFileBrowser(false);
+  }, [fileRootPath]);
   const openFileState = fileRootPath ? fileExplorer.openFileState : null;
   const browserViewerOpen = !isArchived && browserOpen;
   const inspectViewerOpen = !isArchived && inspectOpen;

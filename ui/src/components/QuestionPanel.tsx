@@ -67,6 +67,7 @@ export function QuestionPanel({
 
   // --- Existing answer state ---
   const [answers, setAnswers] = useState<Record<string, string>>(() => {
+    if (readOnly) return {};
     const initial: Record<string, string> = {};
     for (const q of questions) {
       if (!q.multiSelect && hasPreviewOptions(q) && q.options.length > 0) {
@@ -637,7 +638,7 @@ export function QuestionPanel({
                 <button
                   className={`question-breadcrumb${isCurrent ? ' current' : ''}${answered && !isCurrent ? ' answered' : ''}${!answered && !isCurrent ? ' unanswered' : ''}`}
                   onClick={() => goToStep(i)}
-                  disabled={readOnly || submitting}
+                  disabled={submitting}
                   title={isCurrent ? q.question : `Go to question ${i + 1}: ${q.header}`}
                 >
                   {answered && !isCurrent && (
@@ -714,14 +715,24 @@ export function QuestionPanel({
             <button
               className="question-btn question-btn--nav"
               onClick={goBack}
-              disabled={isFirstStep || readOnly || submitting}
+              disabled={isFirstStep || submitting}
               title={formatShortcut('Shift+Tab for previous')}
             >
               <ArrowLeft size={16} />
               Back
             </button>
           )}
-          {!readOnly && !isLastStep ? (
+          {totalSteps > 1 && readOnly ? (
+            <button
+              className="question-btn question-btn--next"
+              onClick={goNext}
+              disabled={isLastStep || submitting}
+              title={formatShortcut('Tab for next')}
+            >
+              Next
+              <ArrowRight size={16} />
+            </button>
+          ) : !readOnly && !isLastStep ? (
             <button
               className="question-btn question-btn--next"
               onClick={goNext}

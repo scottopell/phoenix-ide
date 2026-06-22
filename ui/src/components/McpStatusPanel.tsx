@@ -222,14 +222,18 @@ export function McpStatusPanel({ showToast, showError, readOnly = false }: McpSt
             <div className="mcp-banner-head">
               <span className="mcp-oauth-label">Auth required</span>
               <span className="mcp-banner-name">{s.name}</span>
-              <a
-                href={s.pending_oauth_url}
-                target="_blank"
-                rel="noreferrer"
-                className="mcp-oauth-link"
-              >
-                Sign in &rarr;
-              </a>
+              {readOnly ? (
+                <span className="mcp-oauth-link">Sign-in required</span>
+              ) : (
+                <a
+                  href={s.pending_oauth_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mcp-oauth-link"
+                >
+                  Sign in &rarr;
+                </a>
+              )}
             </div>
             {s.auth_redirect_warning && (
               <div className="mcp-oauth-warning">
