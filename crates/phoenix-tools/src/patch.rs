@@ -544,6 +544,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_replace_error_includes_locations_and_snippets() {
+        let dir = tempdir().unwrap();
+        let tool = PatchTool::default();
+        let ctx = test_context(dir.path().to_path_buf());
+
+        let test_file = dir.path().join("test.txt");
+        fs::write(
+            &test_file,
+            "first block\nTARGET\nafter first\nsecond block\nTARGET\nafter second\n",
+        )
+        .unwrap();
+
+        let result = tool
+            .run(
+                json!({
+                    "path": "test.txt",
+                    "patches": [{
+                        "operation": "replace",
+                        "oldText": "TARGET",
+                        "newText": "replacement"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+
+        assert!(
+            !result.is_success(),
+            "expected error, got: {}",
+            result.output()
+        );
+        let output = result.output();
+        assert!(output.contains("oldText appears 2 times"), "{output}");
+        assert!(output.contains("line 2"), "{output}");
+        assert!(
+            output.contains("first block\n  TARGET\n  after first"),
+            "{output}"
+        );
+        assert!(output.contains("line 5"), "{output}");
+        assert!(
+            output.contains("second block\n  TARGET\n  after second"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Widen oldText with surrounding context"),
+            "{output}"
+        );
+        assert_eq!(
+            fs::read_to_string(&test_file).unwrap(),
+            "first block\nTARGET\nafter first\nsecond block\nTARGET\nafter second\n"
+        );
+    }
+
+    #[tokio::test]
     async fn test_overwrite_creates_file() {
         let dir = tempdir().unwrap();
         let tool = PatchTool::default();

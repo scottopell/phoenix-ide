@@ -18,6 +18,15 @@ THE SYSTEM SHALL support four operations:
 WHEN replace operation is requested
 THE SYSTEM SHALL require oldText to appear exactly once in the file
 
+WHEN oldText appears more than once after all safe matching strategies are exhausted
+THE SYSTEM SHALL reject the replace operation
+AND return duplicate-match diagnostics that include:
+- the total match count;
+- a bounded list of matching locations;
+- each reported match's 1-based start line number;
+- a short snippet around each reported match;
+- guidance to widen oldText or split edits into separate patch calls
+
 WHEN file does not exist
 THE SYSTEM SHALL allow only append_eof, prepend_bof, and overwrite operations
 AND create parent directories as needed

@@ -2,8 +2,11 @@
 //!
 //! Implements exact matching with fuzzy fallbacks for common whitespace issues.
 
-use super::types::{EditSpec, PatchError};
+use super::types::{DuplicateMatchDiagnostics, DuplicateMatchLocation, EditSpec, PatchError};
 use unicode_security::skeleton;
+
+const MAX_DUPLICATE_LOCATIONS: usize = 5;
+const MAX_SNIPPET_LINES: usize = 5;
 
 /// Find a unique match for `old_text` in `content`
 ///
@@ -34,12 +37,68 @@ pub fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpec, Patc
     }
 
     // Determine error type
-    let count = content.matches(old_text).count();
-    if count > 1 {
-        Err(PatchError::OldTextNotUnique(count))
+    let diagnostics = duplicate_match_diagnostics(content, old_text);
+    if diagnostics.total > 1 {
+        Err(PatchError::OldTextNotUnique(diagnostics))
     } else {
         Err(PatchError::OldTextNotFound)
     }
+}
+
+#[must_use]
+pub fn duplicate_match_diagnostics(content: &str, old_text: &str) -> DuplicateMatchDiagnostics {
+    let mut reported = Vec::new();
+    let mut total = 0;
+
+    for (offset, _) in content.match_indices(old_text) {
+        total += 1;
+        if reported.len() < MAX_DUPLICATE_LOCATIONS {
+            reported.push(DuplicateMatchLocation {
+                start_line: line_number_at(content, offset),
+                snippet: duplicate_match_snippet(content, offset, old_text.len()),
+            });
+        }
+    }
+
+    DuplicateMatchDiagnostics {
+        total,
+        omitted: total.saturating_sub(reported.len()),
+        reported,
+    }
+}
+
+fn line_number_at(content: &str, offset: usize) -> usize {
+    content
+        .char_indices()
+        .take_while(|(i, _)| *i < offset)
+        .filter(|(_, ch)| *ch == '\n')
+        .count()
+        + 1
+}
+
+fn duplicate_match_snippet(content: &str, offset: usize, len: usize) -> String {
+    let match_end = offset + len;
+    let start_line_index = line_index_at(content, offset);
+    let end_line_index = line_index_at(content, match_end);
+    let lines: Vec<&str> = content.split('\n').collect();
+
+    let mut snippet_start = start_line_index.saturating_sub(1);
+    let mut snippet_end = (end_line_index + 2).min(lines.len());
+
+    if snippet_end - snippet_start > MAX_SNIPPET_LINES {
+        snippet_start = start_line_index;
+        snippet_end = (snippet_start + MAX_SNIPPET_LINES).min(lines.len());
+    }
+
+    lines[snippet_start..snippet_end].join("\n")
+}
+
+fn line_index_at(content: &str, offset: usize) -> usize {
+    content
+        .char_indices()
+        .take_while(|(i, _)| *i < offset)
+        .filter(|(_, ch)| *ch == '\n')
+        .count()
 }
 
 /// Find exact unique match
@@ -237,7 +296,52 @@ mod tests {
     fn test_multiple_matches() {
         let content = "hello hello";
         let err = find_unique_match(content, "hello").unwrap_err();
-        assert_eq!(err, PatchError::OldTextNotUnique(2));
+        match err {
+            PatchError::OldTextNotUnique(diagnostics) => {
+                assert_eq!(diagnostics.total, 2);
+                assert_eq!(diagnostics.omitted, 0);
+                assert_eq!(diagnostics.reported.len(), 2);
+                assert_eq!(diagnostics.reported[0].start_line, 1);
+                assert_eq!(diagnostics.reported[1].start_line, 1);
+                assert_eq!(diagnostics.reported[0].snippet, "hello hello");
+            }
+            other @ (PatchError::ReplaceOnNonexistent
+            | PatchError::MissingOldText
+            | PatchError::ClipboardNotFound(_)
+            | PatchError::OldTextNotFound
+            | PatchError::EditOutOfBounds
+            | PatchError::ReindentPrefixMismatch { .. }
+            | PatchError::NoPatches) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_match_diagnostics_include_multiline_snippets() {
+        let content = "alpha\nmatch {\n    value\n}\nbeta\nmatch {\n    value\n}\ngamma";
+        let diagnostics = duplicate_match_diagnostics(content, "match {\n    value\n}");
+
+        assert_eq!(diagnostics.total, 2);
+        assert_eq!(diagnostics.reported[0].start_line, 2);
+        assert_eq!(
+            diagnostics.reported[0].snippet,
+            "alpha\nmatch {\n    value\n}\nbeta"
+        );
+        assert_eq!(diagnostics.reported[1].start_line, 6);
+        assert_eq!(
+            diagnostics.reported[1].snippet,
+            "beta\nmatch {\n    value\n}\ngamma"
+        );
+    }
+
+    #[test]
+    fn duplicate_match_diagnostics_are_bounded() {
+        let content = "x\nx\nx\nx\nx\nx\nx";
+        let diagnostics = duplicate_match_diagnostics(content, "x");
+
+        assert_eq!(diagnostics.total, 7);
+        assert_eq!(diagnostics.reported.len(), 5);
+        assert_eq!(diagnostics.omitted, 2);
+        assert_eq!(diagnostics.reported[4].start_line, 5);
     }
 
     #[test]

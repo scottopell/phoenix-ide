@@ -520,7 +520,24 @@ fn test_replace_not_unique() {
             reindent: None,
         }],
     );
-    assert!(matches!(result, Err(PatchError::OldTextNotUnique(2))));
+    match result {
+        Err(PatchError::OldTextNotUnique(diagnostics)) => {
+            assert_eq!(diagnostics.total, 2);
+            assert_eq!(diagnostics.reported.len(), 2);
+            assert_eq!(diagnostics.reported[0].start_line, 1);
+            assert_eq!(diagnostics.reported[0].snippet, "hello hello");
+        }
+        Err(
+            other @ (PatchError::ReplaceOnNonexistent
+            | PatchError::MissingOldText
+            | PatchError::ClipboardNotFound(_)
+            | PatchError::OldTextNotFound
+            | PatchError::EditOutOfBounds
+            | PatchError::ReindentPrefixMismatch { .. }
+            | PatchError::NoPatches),
+        ) => panic!("expected duplicate diagnostic, got {other:?}"),
+        Ok(plan) => panic!("expected duplicate diagnostic, got plan: {plan:?}"),
+    }
 }
 
 #[test]
