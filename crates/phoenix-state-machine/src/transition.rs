@@ -1786,6 +1786,11 @@ pub fn transition_parent(
                             }
                             Some(ModeContext::Explore { .. } | ModeContext::Direct) | None => None,
                         },
+                        approved_working_dir: context.working_dir.display().to_string(),
+                        approved_worktree_path: context
+                            .work_scope_worktree
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
                     },
                 );
             }
@@ -6014,6 +6019,10 @@ mod tests {
                 ToolInput::ApprovedCommissionReview(input) => {
                     assert_eq!(input.request.brief, "Ready for independent review");
                     assert_eq!(input.runtime_base_branch.as_deref(), Some("develop"));
+                    assert_eq!(
+                        input.approved_working_dir,
+                        context.working_dir.display().to_string()
+                    );
                 }
                 other => panic!("expected approved commission review input, got {other:?}"),
             }

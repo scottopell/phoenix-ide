@@ -35,6 +35,8 @@ struct ApprovedCommissionReviewInput {
     #[serde(flatten)]
     request: CommissionReviewInput,
     runtime_base_branch: Option<String>,
+    approved_working_dir: String,
+    approved_worktree_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,6 +208,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     let started = Instant::now();
     let approved: ApprovedCommissionReviewInput = serde_json::from_value(input)
         .map_err(|e| format!("Invalid approved commission_review input: {e}"))?;
+    assert_approved_context_has_not_drifted(&ctx, &approved)?;
     let input = approved.request;
     if input.brief.trim().is_empty() {
         return Err(
@@ -319,6 +322,32 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         findings,
         warnings,
     })
+}
+
+fn assert_approved_context_has_not_drifted(
+    ctx: &ToolContext,
+    approved: &ApprovedCommissionReviewInput,
+) -> Result<(), String> {
+    let current_cwd = ctx.working_dir.display().to_string();
+    if current_cwd != approved.approved_working_dir {
+        return Err(format!(
+            "commission_review target changed after approval: working directory was `{}` at approval time but is now `{current_cwd}`. Request review again.",
+            approved.approved_working_dir
+        ));
+    }
+
+    let current_worktree = ctx
+        .worktree_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    if current_worktree != approved.approved_worktree_path {
+        return Err(format!(
+            "commission_review target changed after approval: worktree was `{:?}` at approval time but is now `{:?}`. Request review again.",
+            approved.approved_worktree_path,
+            current_worktree
+        ));
+    }
+    Ok(())
 }
 
 async fn resolve_target(
@@ -510,7 +539,9 @@ fn review_chunks(body: &str) -> Vec<String> {
 fn parse_findings(text: &str) -> (Vec<ReviewFinding>, Option<String>, Vec<ReviewWarning>) {
     let mut warnings = Vec::new();
     let cleaned = strip_json_fence(text);
+    let mut parse_repaired = false;
     let parsed = serde_json::from_str::<ModelReviewResponse>(&cleaned).or_else(|_| {
+        parse_repaired = true;
         let start = cleaned.find('{').unwrap_or(0);
         let end = cleaned
             .rfind('}')
@@ -528,14 +559,33 @@ fn parse_findings(text: &str) -> (Vec<ReviewFinding>, Option<String>, Vec<Review
         return (Vec::new(), Some(text.trim().to_string()), warnings);
     };
 
+    if text.trim() != cleaned {
+        warnings.push(warning(
+            "model_output_repaired",
+            "reviewer JSON was wrapped in a markdown fence; parsed fenced body",
+            None,
+        ));
+    } else if parse_repaired {
+        warnings.push(warning(
+            "model_output_repaired",
+            "reviewer JSON was embedded in surrounding text; parsed JSON object body",
+            None,
+        ));
+    }
+
+    let mut dropped_findings = 0usize;
     let findings = parsed
         .findings
         .into_iter()
         .filter_map(|f| {
+            let Some(file) = f.file.filter(|file| !file.trim().is_empty()) else {
+                dropped_findings += 1;
+                return None;
+            };
             Some(ReviewFinding {
                 severity: f.severity.unwrap_or_else(|| "medium".to_string()),
                 confidence: f.confidence.unwrap_or_else(|| "medium".to_string()),
-                file: f.file?,
+                file,
                 line: f.line,
                 title: f.title.unwrap_or_else(|| "Review finding".to_string()),
                 rationale: f.rationale.unwrap_or_default(),
@@ -543,6 +593,13 @@ fn parse_findings(text: &str) -> (Vec<ReviewFinding>, Option<String>, Vec<Review
             })
         })
         .collect();
+    if dropped_findings > 0 {
+        warnings.push(warning(
+            "dropped_findings",
+            &format!("dropped {dropped_findings} reviewer finding(s) without a file"),
+            None,
+        ));
+    }
     (findings, parsed.summary, warnings)
 }
 
@@ -709,7 +766,16 @@ mod tests {
             parse_findings("```json\n{\"summary\":\"ok\",\"findings\":[]}\n```");
         assert_eq!(summary.as_deref(), Some("ok"));
         assert!(findings.is_empty());
-        assert!(warnings.is_empty());
+        assert_eq!(warnings[0].kind, "model_output_repaired");
+    }
+
+    #[test]
+    fn dropped_findings_are_reported() {
+        let (findings, _summary, warnings) = parse_findings(
+            r#"{"findings":[{"severity":"high","confidence":"high","title":"missing file"}]}"#,
+        );
+        assert!(findings.is_empty());
+        assert_eq!(warnings[0].kind, "dropped_findings");
     }
 
     #[test]

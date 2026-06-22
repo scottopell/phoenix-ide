@@ -236,13 +236,26 @@ export function parseConversationState(raw: unknown): ConversationState {
         priority: (obj['priority'] as string) ?? '',
         plan: (obj['plan'] as string) ?? '',
       };
-    case 'awaiting_commission_review_approval':
+    case 'awaiting_commission_review_approval': {
+      const brief = obj['brief'];
+      const focus = obj['focus'];
+      const allowDirty = obj['allow_dirty_working_tree'];
+      if (typeof brief !== 'string' || brief.trim() === '') {
+        return invalidRequestError('Invalid commission review approval state: missing brief');
+      }
+      if (focus !== undefined && focus !== null && typeof focus !== 'string') {
+        return invalidRequestError('Invalid commission review approval state: invalid focus');
+      }
+      if (typeof allowDirty !== 'boolean') {
+        return invalidRequestError('Invalid commission review approval state: invalid dirty-worktree flag');
+      }
       return {
         type: 'awaiting_commission_review_approval',
-        brief: (obj['brief'] as string) ?? '',
-        focus: (obj['focus'] as string | null | undefined) ?? null,
-        allow_dirty_working_tree: Boolean(obj['allow_dirty_working_tree']),
+        brief,
+        focus: focus ?? null,
+        allow_dirty_working_tree: allowDirty,
       };
+    }
     case 'awaiting_user_response':
       return {
         type: 'awaiting_user_response',

@@ -85,6 +85,8 @@ pub struct ApprovedCommissionReviewInput {
     #[serde(flatten)]
     pub request: CommissionReviewInput,
     pub runtime_base_branch: Option<String>,
+    pub approved_working_dir: String,
+    pub approved_worktree_path: Option<String>,
 }
 
 /// User decision for a pending `commission_review` request.
