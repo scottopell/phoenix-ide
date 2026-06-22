@@ -6,6 +6,7 @@ mod ask_user_question;
 pub mod bash;
 pub mod bash_check;
 pub mod browser;
+mod commission_review;
 mod keyword_search;
 pub mod mcp;
 pub mod patch;
@@ -33,6 +34,7 @@ pub use browser::{
     BrowserResizeTool, BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool,
     BrowserWaitForSelectorTool,
 };
+pub use commission_review::CommissionReviewTool;
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
 pub use propose_task::ProposeTaskTool;
@@ -483,6 +485,7 @@ fn write_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(PatchTool::default()),
         Arc::new(TmuxRunTool),
         Arc::new(TmuxTool),
+        Arc::new(CommissionReviewTool),
     ]
 }
 
@@ -883,6 +886,7 @@ mod tests {
         assert!(direct.contains("patch"));
         assert!(direct.contains("tmux_run"));
         assert!(direct.contains("tmux"));
+        assert!(direct.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(direct.contains(*tool), "Direct missing {tool}");
         }
@@ -923,6 +927,7 @@ mod tests {
         assert!(!explore.contains("bash"));
         assert!(!explore.contains("tmux_run"));
         assert!(!explore.contains("tmux"));
+        assert!(!explore.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(
                 !explore.contains(*tool),
@@ -953,6 +958,7 @@ mod tests {
         assert!(!sub_explore.contains("spawn_agents"));
         assert!(!sub_explore.contains("ask_user_question"));
         assert!(!sub_explore.contains("propose_task"));
+        assert!(!sub_explore.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(
                 !sub_explore.contains(*tool),
@@ -975,6 +981,7 @@ mod tests {
         assert!(sub_work.contains("submit_result"));
         assert!(!sub_work.contains("spawn_agents"));
         assert!(!sub_work.contains("propose_task"));
+        assert!(!sub_work.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(
                 !sub_work.contains(*tool),

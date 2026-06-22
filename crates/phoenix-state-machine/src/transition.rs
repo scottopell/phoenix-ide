@@ -1990,6 +1990,7 @@ pub fn transition_parent(
                 | ToolInput::SpawnAgents(_)
                 | ToolInput::SubmitResult(_)
                 | ToolInput::SubmitError(_)
+                | ToolInput::CommissionReview(_)
                 | ToolInput::AskUserQuestion(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
@@ -2240,6 +2241,7 @@ pub fn transition_parent(
                 | ToolInput::SubmitResult(_)
                 | ToolInput::SubmitError(_)
                 | ToolInput::ProposeTask(_)
+                | ToolInput::CommissionReview(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
@@ -2847,6 +2849,7 @@ pub fn transition_sub_agent(
                     | ToolInput::ReadImage(_)
                     | ToolInput::SpawnAgents(_)
                     | ToolInput::ProposeTask(_)
+                    | ToolInput::CommissionReview(_)
                     | ToolInput::AskUserQuestion(_)
                     | ToolInput::Unknown { .. }
                     | ToolInput::Malformed { .. } => {
