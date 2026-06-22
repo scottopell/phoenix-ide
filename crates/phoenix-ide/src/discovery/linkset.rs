@@ -1,13 +1,16 @@
 use super::ServiceCapability;
 use reqwest::Url;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCatalog {
     pub title: Option<String>,
     pub description: Option<String>,
     pub capabilities: Vec<ServiceCapability>,
+    pub identity: String,
 }
 
 pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, String> {
@@ -22,6 +25,7 @@ pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, St
     let mut description = None;
     let mut capabilities = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut identity_parts = BTreeSet::new();
 
     capabilities.push(ServiceCapability::ApiCatalog {
         url: catalog_url.to_string(),
@@ -70,6 +74,12 @@ pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, St
                     .or_else(|| link.get("content_type"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                identity_parts.insert((
+                    rel.clone(),
+                    href.to_string(),
+                    link_title.clone(),
+                    content_type.clone(),
+                ));
 
                 if title.is_none() {
                     title.clone_from(&link_title);
@@ -80,15 +90,54 @@ pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, St
         }
     }
 
-    if capabilities.len() == 1 && linksets.is_empty() {
+    if identity_parts.is_empty() {
         return Err("empty linkset".to_string());
     }
 
+    let identity = catalog_identity(title.as_ref(), description.as_ref(), &identity_parts);
     Ok(ParsedCatalog {
         title,
         description,
         capabilities,
+        identity,
     })
+}
+
+fn catalog_identity(
+    title: Option<&String>,
+    description: Option<&String>,
+    parts: &BTreeSet<(String, String, Option<String>, Option<String>)>,
+) -> String {
+    let mut hasher = Sha256::new();
+    if let Some(title) = title {
+        hasher.update(b"title\0");
+        hasher.update(title.as_bytes());
+        hasher.update(b"\0");
+    }
+    if let Some(description) = description {
+        hasher.update(b"description\0");
+        hasher.update(description.as_bytes());
+        hasher.update(b"\0");
+    }
+    for (rel, href, title, content_type) in parts {
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(href.as_bytes());
+        hasher.update(b"\0");
+        if let Some(title) = title {
+            hasher.update(title.as_bytes());
+        }
+        hasher.update(b"\0");
+        if let Some(content_type) = content_type {
+            hasher.update(content_type.as_bytes());
+        }
+        hasher.update(b"\0");
+    }
+    let mut out = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        write!(&mut out, "{byte:02x}").expect("write to string");
+    }
+    out
 }
 
 fn link_values(value: &Value) -> Vec<&serde_json::Map<String, Value>> {
@@ -167,6 +216,22 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| matches!(capability, ServiceCapability::HtmlUi { .. })));
+    }
+
+    #[test]
+    fn rejects_catalogs_with_no_advertised_links() {
+        let url = Url::parse("http://127.0.0.1:8787/.well-known/api-catalog").unwrap();
+        let error = parse_catalog(
+            br#"{
+              "linkset": [{
+                "title": "debug-router"
+              }]
+            }"#,
+            &url,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "empty linkset");
     }
 
     #[test]

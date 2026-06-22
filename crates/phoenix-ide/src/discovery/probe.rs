@@ -56,7 +56,7 @@ pub async fn probe(
     let parsed = parse_catalog(&body, &catalog_url)?;
     let now = Utc::now();
     let base_url = base_url(target)?;
-    let id = service_id(target);
+    let id = service_id(target, &parsed.identity);
 
     Ok(DiscoveredService {
         id,
@@ -89,8 +89,8 @@ fn base_url(target: ProbeTarget) -> Result<Url, String> {
         .map_err(|e| format!("invalid base url: {e}"))
 }
 
-fn service_id(target: ProbeTarget) -> String {
-    format!("loopback:{}", target.port)
+fn service_id(target: ProbeTarget, catalog_identity: &str) -> String {
+    format!("loopback:{}:{catalog_identity}", target.port)
 }
 
 async fn read_limited(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
@@ -122,6 +122,22 @@ mod tests {
             port: 8787,
         };
 
-        assert_eq!(service_id(v4), service_id(v6));
+        assert_eq!(
+            service_id(v4, "same-catalog"),
+            service_id(v6, "same-catalog")
+        );
+    }
+
+    #[test]
+    fn same_port_different_catalog_id_stays_distinct() {
+        let target = ProbeTarget {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 8787,
+        };
+
+        assert_ne!(
+            service_id(target, "catalog-a"),
+            service_id(target, "catalog-b")
+        );
     }
 }
