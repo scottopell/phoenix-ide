@@ -7485,6 +7485,193 @@ mod steer_drain_detector_tests {
         );
     }
 
+    /// Build a `CancellingSubAgents` state pending on the given agent ids (all
+    /// Work mode) with the given cause.
+    fn mk_cancelling_sub_agents(
+        agent_ids: &[&str],
+        cause: crate::state_machine::event::CancelCause,
+    ) -> ConvState {
+        ConvState::CancellingSubAgents {
+            pending: agent_ids
+                .iter()
+                .map(|id| PendingSubAgent {
+                    agent_id: (*id).to_string(),
+                    task: format!("task {id}"),
+                    mode: SubAgentMode::Work,
+                })
+                .collect(),
+            completed_results: vec![],
+            cause,
+        }
+    }
+
+    /// Test 4 (part A): the one-writer reservation is released ONLY when a
+    /// `SubAgentResult` for the in-flight Work agent is actually processed — not
+    /// merely because the parent is in `CancellingSubAgents`. Seed the counter at
+    /// 1 (a Work agent is in flight), process its result, confirm the counter
+    /// drops to 0.
+    #[tokio::test]
+    async fn one_writer_released_on_confirmed_stop() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-onewriter-release",
+            mk_cancelling_sub_agents(
+                &["w1"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            ),
+            vec![],
+        );
+        rt.active_work_subagents = 1;
+
+        // Before the result drains, the reservation is still held.
+        assert_eq!(
+            rt.active_work_subagents, 1,
+            "reservation held until the Work agent's result is processed"
+        );
+
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "w1".to_string(),
+            outcome: SubAgentOutcome::Failure {
+                error: "cancelled".to_string(),
+                error_kind: crate::db::ErrorKind::Cancelled,
+            },
+        })
+        .await
+        .expect("processing the Work agent's result must succeed");
+
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "reservation released exactly once when the Work result drained"
+        );
+        assert!(
+            matches!(rt.state, ConvState::Idle),
+            "the last drained result resolves CancellingSubAgents -> Idle, got {}",
+            rt.state.variant_name()
+        );
+    }
+
+    /// Test 4 (part B): after the 6s last-resort presumes a silent Work agent
+    /// dead and injects a synthetic result, the one-writer counter returns to 0
+    /// — no leak. Drives the backstop directly (no real 6s wait).
+    #[tokio::test]
+    async fn one_writer_released_by_last_resort_backstop() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-onewriter-backstop",
+            mk_cancelling_sub_agents(&["w1"], crate::state_machine::event::CancelCause::Timeout),
+            vec![],
+        );
+        rt.active_work_subagents = 1;
+
+        // Fire the last-resort backstop directly (the deadline arm would call
+        // this after 6s).
+        rt.handle_cancelling_sub_agents_timeout().await;
+
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "presumed-dead teardown must release the one-writer reservation — no leak"
+        );
+        assert!(
+            matches!(rt.state, ConvState::Idle),
+            "the backstop must drain to Idle, got {}",
+            rt.state.variant_name()
+        );
+    }
+
+    /// Test 5 (mixed drain): two pending Work agents — one reports a real result,
+    /// the other is presumed dead by the last-resort backstop. Exactly one
+    /// decrement each (no double-release, no leak); the parent reaches Idle.
+    #[tokio::test]
+    async fn mixed_drain_real_result_then_backstop_no_double_release() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-mixed-drain",
+            mk_cancelling_sub_agents(
+                &["real", "silent"],
+                crate::state_machine::event::CancelCause::Timeout,
+            ),
+            vec![],
+        );
+        rt.active_work_subagents = 2;
+
+        // "real" reports a genuine Success — fidelity preserved, counter -> 1.
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "real".to_string(),
+            outcome: SubAgentOutcome::Success {
+                result: "did real work".to_string(),
+            },
+        })
+        .await
+        .expect("processing the real result must succeed");
+
+        assert_eq!(
+            rt.active_work_subagents, 1,
+            "exactly one decrement for the real result"
+        );
+        assert!(
+            matches!(rt.state, ConvState::CancellingSubAgents { .. }),
+            "still draining the silent agent, got {}",
+            rt.state.variant_name()
+        );
+
+        // "silent" never reports; the backstop presumes it dead and drains it.
+        rt.handle_cancelling_sub_agents_timeout().await;
+
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "exactly one decrement for the presumed-dead agent — no double-release, no leak"
+        );
+        assert!(
+            matches!(rt.state, ConvState::Idle),
+            "parent reaches Idle after both agents drain, got {}",
+            rt.state.variant_name()
+        );
+    }
+
+    /// Double-release / underflow probe: a real result drains a Work agent
+    /// (counter -> 0, agent removed from pending), then a LATE synthetic result
+    /// for the SAME agent arrives. The pending-membership guard means the second
+    /// is a harmless rejected transition that does NOT decrement again — the
+    /// `saturating_sub` floor is never even reached because the guard fires first.
+    #[tokio::test]
+    async fn late_duplicate_result_for_same_agent_does_not_double_release() {
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-dup-nounder",
+            mk_cancelling_sub_agents(
+                &["w1"],
+                crate::state_machine::event::CancelCause::UserRequested,
+            ),
+            vec![],
+        );
+        rt.active_work_subagents = 1;
+
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "w1".to_string(),
+            outcome: SubAgentOutcome::Failure {
+                error: "cancelled".to_string(),
+                error_kind: crate::db::ErrorKind::Cancelled,
+            },
+        })
+        .await
+        .expect("first result must succeed");
+        assert_eq!(rt.active_work_subagents, 0);
+        assert!(matches!(rt.state, ConvState::Idle));
+
+        // A late duplicate for the same agent. The parent is now Idle, so this is
+        // buffered (Idle can't handle SubAgentResult) rather than re-decrementing.
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "w1".to_string(),
+            outcome: SubAgentOutcome::Failure {
+                error: "late dup".to_string(),
+                error_kind: crate::db::ErrorKind::Cancelled,
+            },
+        })
+        .await
+        .expect("a late duplicate must not error");
+
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "a late duplicate for an already-drained agent must not decrement again"
+        );
+    }
+
     /// Entering `Idle` with an empty queue produces no drain event.
     #[tokio::test]
     async fn no_drain_when_queue_empty_idle() {
