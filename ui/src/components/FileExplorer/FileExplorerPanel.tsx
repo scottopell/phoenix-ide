@@ -3,7 +3,7 @@
  * REQ-FE-001, REQ-FE-004, REQ-FE-005
  */
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { FileTree } from './FileTree';
 import { McpStatusPanel } from '../McpStatusPanel';
 import { SkillsPanel } from '../SkillsPanel';
@@ -22,34 +22,28 @@ interface Props {
   rootPath: string;
   conversationId: string | undefined;
   showToast: (message: string, duration?: number) => void;
-  /** Error-styled toast (red). Used by `McpStatusPanel` for failure
-   *  paths so they don't render with the same green styling as
-   *  success messages (REQ-NOTIF-002). */
   showError: (message: string, duration?: number) => void;
-  /** Branch name of the current conversation (for extracting task ID in Work mode) */
   branchName?: string | null | undefined;
-  /** Slug of the active conversation. Passed to TaskViewer, which reads the
-   *  live conversation row from the store to seed a "start working on this
-   *  task" sub-conversation (REQ-SEED-001 through -004). */
   activeSlug: string;
-  /** Width in px when expanded — driven by useResizablePane */
   width?: number | undefined;
-  /** The conversation's work-scope key. When present, the Work scope section
-   *  (and its collapsed-rail badge) render; resources are WorkScope-keyed so
-   *  this single key addresses every backgrounded bash handle, the tmux
-   *  server, and the browser session (REQ-WSUI-010). */
   workScopeKey?: string | null | undefined;
-  /** Live work-scope inventory from the conversation atom (SSE-fed). Drives
-   *  the collapsed-rail live count and overrides the section's initial fetch. */
   liveWorkScope?: WorkScopeInventory | null | undefined;
 }
 
-/** Extract task ID from a Work branch name like "task-08617-some-slug" */
 function extractTaskId(branchName: string | null | undefined): string | undefined {
   if (!branchName) return undefined;
   const match = branchName.match(/^task-([A-Za-z0-9]+)-/);
   return match ? match[1] : undefined;
 }
+
+const DEFAULT_TASK_GROUP_EXPANDED: Record<string, boolean> = {
+  'in-progress': true,
+  ready: true,
+  blocked: true,
+  brainstorming: false,
+  done: false,
+  'wont-do': false,
+};
 
 export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width, workScopeKey, liveWorkScope }: Props) {
   const { openFile, activeFile } = useFileExplorer();
@@ -58,17 +52,26 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   const [selectedSkill, setSelectedSkill] = useState<SkillEntry | null>(null);
   const [selectedTask, setSelectedTask] = useState<TaskEntry | null>(null);
   const [skillsPanelExpanded, setSkillsPanelExpanded] = useState(false);
-  // Default-expanded: this is an at-a-glance resource view, so the section is
-  // open on first paint rather than requiring a click like Skills/Tasks.
+  const [skillsGroupExpanded, setSkillsGroupExpanded] = useState<Set<string> | null>(null);
+  const [skillsScrollTop, setSkillsScrollTop] = useState(0);
+  const [tasksPanelExpanded, setTasksPanelExpanded] = useState(false);
+  const defaultTaskGroupExpanded = useMemo(() => ({ ...DEFAULT_TASK_GROUP_EXPANDED }), []);
+  const [taskGroupExpanded, setTaskGroupExpanded] = useState(defaultTaskGroupExpanded);
+  const [tasksScrollTop, setTasksScrollTop] = useState(0);
   const [workScopeExpanded, setWorkScopeExpanded] = useState(true);
 
-  const currentTaskId = extractTaskId(branchName);
+  useEffect(() => {
+    setSelectedSkill(null);
+    setSelectedTask(null);
+    setSkillsPanelExpanded(false);
+    setSkillsGroupExpanded(null);
+    setSkillsScrollTop(0);
+    setTasksPanelExpanded(false);
+    setTaskGroupExpanded(defaultTaskGroupExpanded);
+    setTasksScrollTop(0);
+  }, [conversationId, rootPath, defaultTaskGroupExpanded]);
 
-  // Seed the work-scope live count from the inventory endpoint even while
-  // collapsed: the collapsed rail does not mount `WorkScopeSection`, so without
-  // this the badge is driven solely by the SSE-fed `liveWorkScope` and reads 0
-  // forever when the spawn `work_scope_update` fell outside the replay window.
-  // One fetch per scope (no poll); SSE stays authoritative once it arrives.
+  const currentTaskId = extractTaskId(branchName);
   const workScopeCount = useSeededLiveCount(workScopeKey, liveWorkScope);
   const liveAttentionCount = liveWorkScope ? workScopeLiveCount(liveWorkScope) : workScopeCount;
   const projectName = rootPath.split('/').filter(Boolean).slice(-1)[0] || rootPath;
@@ -85,18 +88,10 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
         </button>
         <div className="fe-collapsed-title" title="Grounding">G</div>
         <div className="fe-collapsed-badges" aria-label="Grounding sections">
-          <button className="fe-collapsed-badge" onClick={onToggle} title="Project files">
-            Files
-          </button>
-          <button className="fe-collapsed-badge" onClick={onToggle} title="MCP capabilities">
-            MCP
-          </button>
-          <button className="fe-collapsed-badge" onClick={onToggle} title="Skills">
-            Skills
-          </button>
-          <button className="fe-collapsed-badge" onClick={onToggle} title="Tasks">
-            Tasks
-          </button>
+          <button className="fe-collapsed-badge" onClick={onToggle} title="Project files">Files</button>
+          <button className="fe-collapsed-badge" onClick={onToggle} title="MCP capabilities">MCP</button>
+          <button className="fe-collapsed-badge" onClick={onToggle} title="Skills">Skills</button>
+          <button className="fe-collapsed-badge" onClick={onToggle} title="Tasks">Tasks</button>
           {workScopeKey && (
             <button
               className={`fe-collapsed-badge${liveAttentionCount > 0 ? ' fe-collapsed-badge--active' : ''}`}
@@ -111,7 +106,6 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
     );
   }
 
-  // Detail viewer replaces the tree+panels when a skill or task is selected
   const detailViewer = selectedSkill
     ? <SkillViewer skill={selectedSkill} onBack={() => setSelectedSkill(null)} />
     : selectedTask
@@ -153,11 +147,21 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
             onSkillClick={setSelectedSkill}
             expanded={skillsPanelExpanded}
             onToggleExpanded={setSkillsPanelExpanded}
+            expandedGroups={skillsGroupExpanded}
+            onExpandedGroupsChange={setSkillsGroupExpanded}
+            scrollTop={skillsScrollTop}
+            onScrollTopChange={setSkillsScrollTop}
           />
           <TasksPanel
             conversationId={conversationId}
             currentTaskId={currentTaskId}
             onTaskClick={setSelectedTask}
+            expanded={tasksPanelExpanded}
+            onToggleExpanded={setTasksPanelExpanded}
+            groupExpanded={taskGroupExpanded}
+            onGroupExpandedChange={setTaskGroupExpanded}
+            scrollTop={tasksScrollTop}
+            onScrollTopChange={setTasksScrollTop}
           />
           {workScopeKey && (
             <WorkScopeSection

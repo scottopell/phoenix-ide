@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import type { TaskEntry, TaskCountResponse } from '../api';
@@ -10,6 +10,12 @@ interface TasksPanelProps {
   conversationId: string | undefined;
   currentTaskId?: string | undefined;
   onTaskClick?: ((task: TaskEntry) => void) | undefined;
+  expanded?: boolean;
+  onToggleExpanded?: (expanded: boolean) => void;
+  groupExpanded?: Record<string, boolean>;
+  onGroupExpandedChange?: (expanded: Record<string, boolean>) => void;
+  scrollTop?: number;
+  onScrollTopChange?: (scrollTop: number) => void;
 }
 
 const STATUS_ORDER: Record<string, number> = {
@@ -31,20 +37,37 @@ const PRIORITY_CLASS: Record<string, string> = {
 
 const TERMINAL_STATUSES = new Set(['done', 'wont-do']);
 
-export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: TasksPanelProps) {
+const DEFAULT_GROUP_EXPANDED: Record<string, boolean> = {
+  'in-progress': true,
+  ready: true,
+  blocked: true,
+  brainstorming: false,
+  done: false,
+  'wont-do': false,
+};
+
+export function TasksPanel({
+  conversationId,
+  currentTaskId,
+  onTaskClick,
+  expanded: controlledExpanded,
+  onToggleExpanded,
+  groupExpanded: controlledGroupExpanded,
+  onGroupExpandedChange,
+  scrollTop,
+  onScrollTopChange,
+}: TasksPanelProps) {
   const navigate = useNavigate();
-  const [expanded, setExpanded] = useState(false);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const [internalExpanded, setInternalExpanded] = useState(false);
+  const expanded = controlledExpanded ?? internalExpanded;
+  const setExpanded = onToggleExpanded ?? setInternalExpanded;
   const [tasks, setTasks] = useState<TaskEntry[]>([]);
   const [counts, setCounts] = useState<TaskCountResponse | null>(null);
   const [loading, setLoading] = useState(false);
-  const [groupExpanded, setGroupExpanded] = useState<Record<string, boolean>>({
-    'in-progress': true,
-    ready: true,
-    blocked: true,
-    brainstorming: false,
-    done: false,
-    'wont-do': false,
-  });
+  const [internalGroupExpanded, setInternalGroupExpanded] = useState(DEFAULT_GROUP_EXPANDED);
+  const groupExpanded = controlledGroupExpanded ?? internalGroupExpanded;
+  const setGroupExpanded = onGroupExpandedChange ?? setInternalGroupExpanded;
 
   // Clear both representations on conversation change so a stale count/list from
   // the prior conversation never bleeds across navigation (REQ-TASKS-UI-007).
@@ -99,12 +122,21 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
     ([a], [b]) => (STATUS_ORDER[a] ?? 99) - (STATUS_ORDER[b] ?? 99),
   );
 
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (body && scrollTop !== undefined) body.scrollTop = scrollTop;
+  }, [expanded, tasks, scrollTop]);
+
+
   const toggleGroup = (status: string) => {
-    setGroupExpanded((prev) => ({ ...prev, [status]: !prev[status] }));
+    setGroupExpanded({ ...groupExpanded, [status]: !groupExpanded[status] });
+  };
+
+  const handleScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    onScrollTopChange?.(event.currentTarget.scrollTop);
   };
 
   // Once the full list is loaded (expanded), it is authoritative for the header;
-  // otherwise the lightweight counts drive it. Both carry the same shape and
   // render through the same `taskCountsLabel`, so collapsing/expanding never
   // changes the wording.
   const fullSummary = summarizeTasks(tasks, currentTaskId);
@@ -131,7 +163,7 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
           <GroundingState>No tasks found for this project.</GroundingState>
         )}
         {!loading && tasks.length > 0 && (
-          <div className="tasks-panel-body">
+          <div className="tasks-panel-body" ref={bodyRef} onScroll={handleScroll}>
             {sortedGroups.map(([status, groupTasks]) => {
               const isTerminal = TERMINAL_STATUSES.has(status);
               const isOpen = groupExpanded[status] ?? !isTerminal;
@@ -201,3 +233,4 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
     </GroundingSection>
   );
 }
+  // otherwise the lightweight counts drive it. Both carry the same shape and
