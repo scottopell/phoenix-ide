@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { ThemeContext } from '../../hooks/useTheme';
-import { ReviewNotesProvider, useReviewNotes } from '../../contexts/ReviewNotesContext';
+import { ReviewNotesProvider, useReviewNotesCommands } from '../../contexts/ReviewNotesContext';
 import { MetaViewer } from '../../components/viewer/MetaViewer';
 import { FileViewer } from '../../components/FileViewer';
 import '../../index.css';
@@ -15,7 +15,7 @@ const noop = () => {};
 
 /** Pushes seeded notes into the review-notes pile once, on mount. */
 function SeedReviewNotes({ notes, absolutePath }: { notes: MetaViewerSeedNote[]; absolutePath: string }) {
-  const { addNote } = useReviewNotes();
+  const { addNote } = useReviewNotesCommands();
   const seeded = useRef(false);
   useEffect(() => {
     if (seeded.current) return;
