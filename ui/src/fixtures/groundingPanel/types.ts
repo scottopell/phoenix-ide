@@ -1,7 +1,7 @@
 import type { McpServerStatus, SkillEntry, TaskEntry, WorkScopeInventory } from '../../api';
 import type { FileItem } from '../../components/FileExplorer/FileTree';
 
-export type GroundingPanelScenarioKind = 'full' | 'empty' | 'errors' | 'collapsed' | 'skill-detail' | 'task-detail' | 'narrow';
+export type GroundingPanelScenarioKind = 'full' | 'empty' | 'errors' | 'collapsed' | 'skill-detail' | 'task-detail' | 'work' | 'narrow';
 
 export type GroundingPanelTheme = 'dark' | 'light';
 
@@ -14,6 +14,8 @@ export const groundingPanelScenarioDefinitions = [
   { id: 'empty-dark', title: 'Empty states', kind: 'empty', theme: 'dark', width: 360, collapsed: false },
   { id: 'errors-dark', title: 'Error states', kind: 'errors', theme: 'dark', width: 360, collapsed: false },
   { id: 'collapsed-dark', title: 'Collapsed rail', kind: 'collapsed', theme: 'dark', width: 360, collapsed: true },
+  { id: 'work-dark', title: 'Work resources / dark', kind: 'work', theme: 'dark', width: 360, collapsed: false },
+  { id: 'work-light', title: 'Work resources / light', kind: 'work', theme: 'light', width: 360, collapsed: false },
   { id: 'narrow-dark', title: 'Narrow panel', kind: 'narrow', theme: 'dark', width: 248, collapsed: false },
   { id: 'skill-detail-dark', title: 'Selected skill detail', kind: 'skill-detail', theme: 'dark', width: 360, collapsed: false },
   { id: 'task-detail-dark', title: 'Selected task detail', kind: 'task-detail', theme: 'dark', width: 360, collapsed: false },

@@ -124,7 +124,17 @@
 }
 
 .ws-section {
-  border-bottom: 1px solid var(--border-color);
+  position: relative;
+}
+
+.ws-section + .ws-section::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 10px;
+  left: 28px;
+  height: 1px;
+  background: color-mix(in srgb, var(--border-color) 48%, transparent);
 }
 
 .ws-section-head {

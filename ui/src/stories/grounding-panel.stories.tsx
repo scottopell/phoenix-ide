@@ -32,6 +32,12 @@ ErrorsDark.storyName = 'errors-dark';
 export const CollapsedDark = storyFor('collapsed-dark');
 CollapsedDark.storyName = 'collapsed-dark';
 
+export const WorkDark = storyFor('work-dark');
+WorkDark.storyName = 'work-dark';
+
+export const WorkLight = storyFor('work-light');
+WorkLight.storyName = 'work-light';
+
 export const NarrowDark = storyFor('narrow-dark');
 NarrowDark.storyName = 'narrow-dark';
 

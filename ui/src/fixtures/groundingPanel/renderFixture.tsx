@@ -65,6 +65,8 @@ export function GroundingPanelFixture({ scenario, showToolbar = true }: Props) {
         case 'empty':
         case 'errors':
           return document.querySelector('.grounding-section-body') != null;
+        case 'work':
+          return document.querySelector('.ws-section') != null;
         default:
           return document.querySelector('.grounding-section') != null;
       }
