@@ -2251,9 +2251,9 @@ where
     /// reservation as each result drains is safe because the agent is presumed
     /// dead. The last pending result resolves `CancellingSubAgents -> Idle`.
     async fn handle_cancelling_sub_agents_timeout(&mut self) {
-        let pending_ids: Vec<String> =
-            if let ConvState::CancellingSubAgents { pending, .. } = &self.state {
-                pending.iter().map(|p| p.agent_id.clone()).collect()
+        let (pending_ids, cause): (Vec<String>, crate::state_machine::event::CancelCause) =
+            if let ConvState::CancellingSubAgents { pending, cause, .. } = &self.state {
+                (pending.iter().map(|p| p.agent_id.clone()).collect(), *cause)
             } else {
                 // Deadline fired but state already moved on — nothing to do.
                 return;
@@ -2268,9 +2268,10 @@ where
         );
 
         // Inject a generic Failure{Cancelled} per still-pending sub-agent so the
-        // parent drains to Idle. The drain arm relabels by the state's `cause`
-        // (Timeout -> TimedOut, UserRequested -> Failure{Cancelled}); the last
-        // one resolves CancellingSubAgents -> Idle.
+        // parent drains out of CancellingSubAgents. The drain arm relabels by the
+        // state's `cause` (Timeout -> TimedOut, UserRequested -> Failure{Cancelled})
+        // and the last one resolves by cause: Timeout resumes to LlmRequesting,
+        // UserRequested settles to Idle.
         for agent_id in pending_ids {
             let event = Event::SubAgentResult {
                 agent_id,
@@ -2291,7 +2292,13 @@ where
         // after the work it describes. History replays by `sequence_id`; a
         // lower sequence would make the notice appear before (or transiently
         // instead of) the cancelled tool/sub-agent rounds on reconnect/replay.
-        self.broadcast_cancellation_backstop_message().await;
+        //
+        // Only a user-requested cancel actually stops the conversation; a
+        // completion timeout drains and resumes the parent's LLM turn, so the
+        // "cancellation completed" notice would be wrong there.
+        if cause == crate::state_machine::event::CancelCause::UserRequested {
+            self.broadcast_cancellation_backstop_message().await;
+        }
     }
 
     /// Persist+broadcast the user-visible "cancellation completed" system
@@ -7573,8 +7580,8 @@ mod steer_drain_detector_tests {
             "presumed-dead teardown must release the one-writer reservation — no leak"
         );
         assert!(
-            matches!(rt.state, ConvState::Idle),
-            "the backstop must drain to Idle, got {}",
+            matches!(rt.state, ConvState::LlmRequesting { .. }),
+            "a Timeout teardown resumes the parent (LlmRequesting), got {}",
             rt.state.variant_name()
         );
     }
@@ -7622,8 +7629,8 @@ mod steer_drain_detector_tests {
             "exactly one decrement for the presumed-dead agent — no double-release, no leak"
         );
         assert!(
-            matches!(rt.state, ConvState::Idle),
-            "parent reaches Idle after both agents drain, got {}",
+            matches!(rt.state, ConvState::LlmRequesting { .. }),
+            "Timeout teardown resumes the parent after both agents drain, got {}",
             rt.state.variant_name()
         );
     }

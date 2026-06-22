@@ -1254,12 +1254,13 @@ fn build_cancellation_results(
 /// (fidelity); a timeout-caused teardown records `TimedOut`; a user-requested
 /// cancel keeps the reported outcome (e.g. a `Failure { Cancelled }`).
 fn map_teardown_outcome(outcome: SubAgentOutcome, cause: CancelCause) -> SubAgentOutcome {
-    match (&outcome, cause) {
-        // A real success always wins (fidelity); a user-requested cancel keeps
-        // the reported outcome (e.g. Failure { Cancelled }).
-        (SubAgentOutcome::Success { .. }, _) | (_, CancelCause::UserRequested) => outcome,
-        // A timeout-caused teardown records TimedOut over any non-success outcome.
-        (_, CancelCause::Timeout) => SubAgentOutcome::TimedOut,
+    match cause {
+        // The completion deadline is a hard contract: any result (including a
+        // late Success) that arrives during a timeout teardown counts as timed out.
+        CancelCause::Timeout => SubAgentOutcome::TimedOut,
+        // A user-requested cancel keeps what the agent reported (Success, or
+        // Failure { Cancelled }).
+        CancelCause::UserRequested => outcome,
     }
 }
 
@@ -1377,7 +1378,9 @@ fn handle_core_sub_agents(
             .with_effect(Effect::PersistState))
         }
 
-        // CancellingSubAgents + SubAgentResult (last one) -> Idle
+        // CancellingSubAgents + SubAgentResult (last one)
+        // A completion timeout reports-and-continues (resume the parent's LLM
+        // turn); a user cancel reports-and-stops (settle to Idle).
         (
             CoreState::CancellingSubAgents {
                 pending,
@@ -1400,24 +1403,43 @@ fn handle_core_sub_agents(
                 outcome: recorded,
             });
 
-            let result = CoreTransitionResult::new(CoreState::Idle);
             // Persist the drained results back onto the originating spawn_agents
             // tool message only when we know its id (AwaitingSubAgents-origin).
             // For the CancellingTool-origin path no spawn id exists, so persisting
             // would fabricate a tool_result with a random id and no matching
             // tool_use — an orphan the provider rejects. Skip persistence there,
-            // matching that path's prior behaviour.
-            let result = if let Some(id) = spawn_tool_id {
-                result.with_effect(Effect::PersistSubAgentResults {
-                    results: new_results,
-                    spawn_tool_id: Some(id.clone()),
-                })
-            } else {
-                result
-            };
-            Ok(result
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_agent_done()))
+            // but still continue/stop per the cause.
+            match cause {
+                CancelCause::Timeout => {
+                    let result = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
+                    let result = if let Some(id) = spawn_tool_id {
+                        result.with_effect(Effect::PersistSubAgentResults {
+                            results: new_results,
+                            spawn_tool_id: Some(id.clone()),
+                        })
+                    } else {
+                        result
+                    };
+                    Ok(result
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_state_change())
+                        .with_effect(Effect::RequestLlm))
+                }
+                CancelCause::UserRequested => {
+                    let result = CoreTransitionResult::new(CoreState::Idle);
+                    let result = if let Some(id) = spawn_tool_id {
+                        result.with_effect(Effect::PersistSubAgentResults {
+                            results: new_results,
+                            spawn_tool_id: Some(id.clone()),
+                        })
+                    } else {
+                        result
+                    };
+                    Ok(result
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_agent_done()))
+                }
+            }
         }
 
         (state, event) => Err(TransitionError::InvalidTransition {
@@ -6222,10 +6244,12 @@ mod teardown_tests {
     // task 61004 M1: forced sub-agent teardown via the cancel protocol.
     //
     // These pin the `CancellingSubAgents + SubAgentResult` drain arms and the
-    // `map_teardown_outcome` mapping: a real `Success` always wins (fidelity),
-    // a `Timeout`-caused teardown relabels non-success outcomes `TimedOut`, and
-    // a `UserRequested` teardown keeps the reported outcome verbatim. The cause
-    // must also survive a multi-agent drain's self-transition unchanged.
+    // `map_teardown_outcome` mapping. The completion deadline is a hard contract:
+    // a `Timeout`-caused teardown relabels EVERY outcome (including a late Success)
+    // `TimedOut`, and the last-one drain resumes the parent's turn
+    // (-> LlmRequesting + RequestLlm). A `UserRequested` teardown keeps the
+    // reported outcome verbatim and stops (-> Idle + AgentDone). The cause must
+    // also survive a multi-agent drain's self-transition unchanged.
     // ========================================================================
 
     use super::{transition, ConvState, Effect, Event};
@@ -6277,10 +6301,12 @@ mod teardown_tests {
             )
     }
 
-    /// Test 1 (last-one arm): a real `Success` reported during a `Timeout`-caused
-    /// teardown is recorded as-is — fidelity beats the timeout relabel.
+    /// Test 1 (last-one arm): under a `Timeout`-caused teardown the deadline is a
+    /// hard contract — even a reported `Success` is recorded as `TimedOut`, and
+    /// the last result RESUMES the parent (-> `LlmRequesting` + `RequestLlm`) so
+    /// the model continues with the timeout report (matching the pre-rework timeout).
     #[test]
-    fn real_success_wins_over_timeout_relabel_last_arm() {
+    fn timeout_relabels_even_success_and_resumes_last_arm() {
         let state = ConvState::CancellingSubAgents {
             pending: vec![pending("a")],
             completed_results: vec![],
@@ -6299,20 +6325,29 @@ mod teardown_tests {
         )
         .unwrap();
 
-        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "a Timeout teardown resumes the parent, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Timeout resume must re-call the model"
+        );
         assert_eq!(
             recorded_in_persist(&result.effects, "a"),
-            SubAgentOutcome::Success {
-                result: "did the thing".to_string()
-            },
-            "a real Success must be recorded verbatim even under a Timeout cause"
+            SubAgentOutcome::TimedOut,
+            "a late Success under a Timeout cause is recorded TimedOut (deadline contract)"
         );
     }
 
-    /// Test 1 (more-pending arm): same, but with a second agent still pending so
-    /// the drain self-transitions `CancellingSubAgents -> CancellingSubAgents`.
+    /// Test 1 (more-pending arm): same relabel, but with a second agent still
+    /// pending so the drain self-transitions `CancellingSubAgents -> CancellingSubAgents`.
     #[test]
-    fn real_success_wins_over_timeout_relabel_more_pending_arm() {
+    fn timeout_relabels_even_success_more_pending_arm() {
         let state = ConvState::CancellingSubAgents {
             pending: vec![pending("a"), pending("b")],
             completed_results: vec![],
@@ -6333,15 +6368,13 @@ mod teardown_tests {
 
         assert_eq!(
             recorded_in_state(&result.new_state, "a"),
-            SubAgentOutcome::Success {
-                result: "real".to_string()
-            },
-            "Success recorded verbatim in the self-transition arm too"
+            SubAgentOutcome::TimedOut,
+            "Timeout relabels even Success in the self-transition arm too"
         );
     }
 
     /// Test 2: a non-success outcome under a `Timeout` cause is relabeled
-    /// `TimedOut`.
+    /// `TimedOut` and the last result resumes the parent (-> `LlmRequesting`).
     #[test]
     fn timeout_cause_relabels_non_success_to_timed_out() {
         let state = ConvState::CancellingSubAgents {
@@ -6363,7 +6396,18 @@ mod teardown_tests {
         )
         .unwrap();
 
-        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "a Timeout teardown resumes the parent, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Timeout resume must re-call the model"
+        );
         assert_eq!(
             recorded_in_persist(&result.effects, "a"),
             SubAgentOutcome::TimedOut,
@@ -6396,6 +6440,13 @@ mod teardown_tests {
         .unwrap();
 
         assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "a user cancel stops the turn — it must NOT resume the model"
+        );
         assert_eq!(
             recorded_in_persist(&result.effects, "a"),
             reported,
@@ -6516,7 +6567,10 @@ mod teardown_tests {
             },
         )
         .unwrap();
-        assert!(matches!(second.new_state, ConvState::Idle));
+        assert!(
+            matches!(second.new_state, ConvState::LlmRequesting { .. }),
+            "Timeout teardown resumes the parent after the last agent drains"
+        );
         assert_eq!(
             recorded_in_persist(&second.effects, "b"),
             SubAgentOutcome::TimedOut,
