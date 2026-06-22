@@ -3953,9 +3953,8 @@ where
 
     /// Persist aggregated sub-agent results. With a `spawn_tool_id`, update the
     /// originating `spawn_agents` tool message's content and `display_data`.
-    /// Without one, persist a standalone assistant text summary — never a
-    /// fabricated `tool_result`, which would be an orphan with no matching
-    /// `tool_use`.
+    /// Without one, persist a standalone meta-user summary — never a fabricated
+    /// `tool_result`, which would be an orphan with no matching `tool_use`.
     async fn persist_sub_agent_results(
         &mut self,
         results: Vec<SubAgentResult>,
@@ -4021,11 +4020,14 @@ where
         } else {
             // No spawn_tool_id: spawn_agents wasn't the last tool in the batch, so
             // there is no assistant tool_use to pair a tool_result against. Persist
-            // the summary as an assistant text message instead — a tool_result with
-            // a fabricated id would be an orphan the provider rejects. Assistant
-            // text renders into LLM history (render_messages), so the model still
-            // sees the results.
-            let content = crate::db::MessageContent::Agent(vec![ContentBlock::text(&llm_content)]);
+            // the summary as a META USER observation: it renders as user role
+            // (render_messages), so the model RESPONDS to the results instead of
+            // continuing them (an assistant-role message would leave the turn on
+            // the assistant side, to be extended rather than answered). It carries
+            // no tool id, so it can never be an orphan tool_result, and `is_meta`
+            // keeps the UI distinguishing it from real user input.
+            let content =
+                crate::db::MessageContent::User(crate::db::UserContent::meta(&llm_content));
             let msg_id = uuid::Uuid::new_v4().to_string();
             let seq = self.broadcast_tx.next_seq();
             let message = self
@@ -4040,7 +4042,7 @@ where
                 )
                 .await?;
 
-            // Broadcast the new message (assistant text, no bash enrichment needed)
+            // Broadcast the new message (meta user observation, no bash enrichment needed)
             let _ = self.broadcast_tx.send_message(message);
         }
 
@@ -7317,22 +7319,24 @@ mod steer_drain_detector_tests {
 
         let msgs = storage.get_all_messages("conv-persist-none");
         assert_eq!(msgs.len(), 1, "exactly one summary message persisted");
-        match &msgs[0].content {
-            MessageContent::Agent(blocks) => {
-                let rendered = render_messages(&msgs, &std::collections::HashSet::new());
-                assert_eq!(rendered.len(), 1, "the summary must reach LLM history");
-                assert_eq!(rendered[0].role, MessageRole::Assistant);
-                let text = format!("{blocks:?}");
-                assert!(
-                    text.contains("Timed out") && text.contains("investigate"),
-                    "the summary must carry the per-result outcome, got: {text}"
-                );
-            }
-            other => panic!(
-                "expected a non-tool Agent message, got {:?} (a tool_result here would be an orphan)",
-                other.message_type()
-            ),
-        }
+        let MessageContent::User(user_content) = &msgs[0].content else {
+            panic!(
+                "expected a non-tool meta-User message, got {:?} (a tool_result here would be an orphan)",
+                msgs[0].content.message_type()
+            );
+        };
+        let rendered = render_messages(&msgs, &std::collections::HashSet::new());
+        assert_eq!(rendered.len(), 1, "the summary must reach LLM history");
+        assert_eq!(
+            rendered[0].role,
+            MessageRole::User,
+            "delivered as a user observation so the model RESPONDS to the results rather than continuing them"
+        );
+        let text = format!("{user_content:?}");
+        assert!(
+            text.contains("Timed out") && text.contains("investigate"),
+            "the summary must carry the per-result outcome, got: {text}"
+        );
     }
 
     /// Regression (task 61005): a `SubAgentResult` buffered from an earlier
