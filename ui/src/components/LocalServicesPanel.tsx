@@ -128,8 +128,33 @@ function preferredOpenUrl(service: DiscoveredService): string | null {
   const preferred = service.capabilities.find((capability) =>
     capability.kind === 'html_ui' || capability.kind === 'documentation' || capability.kind === 'open_api'
   );
-  if (!preferred) return null;
+  if (!preferred || !isOpenableServiceUrl(service.base_url, preferred.url)) return null;
   return preferred.url;
+}
+
+function isOpenableServiceUrl(serviceBaseUrl: string, candidateUrl: string): boolean {
+  try {
+    const service = new URL(serviceBaseUrl);
+    const candidate = new URL(candidateUrl);
+    return (
+      isLoopbackHost(service.hostname) &&
+      isLoopbackHost(candidate.hostname) &&
+      service.protocol === candidate.protocol &&
+      effectivePort(service) === effectivePort(candidate)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
+function effectivePort(url: URL): string {
+  if (url.port) return url.port;
+  return url.protocol === 'https:' ? '443' : '80';
 }
 
 function hostLabel(baseUrl: string): string | null {
