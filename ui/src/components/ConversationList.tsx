@@ -128,6 +128,8 @@ export const ConversationRow = memo(function ConversationRow({
     .filter(Boolean)
     .join(' ');
 
+  const cachedPrForBadge = (!isChainMember || isChainLatest) ? conv.cached_pr : undefined;
+
   const stateTitle = (() => {
     if (conv.state?.type === 'context_exhausted') {
       return conv.presentation_mode === 'needs_action' ? 'Context full' : 'Continued';
@@ -183,7 +185,7 @@ export const ConversationRow = memo(function ConversationRow({
               {conv.conv_mode_label}
             </span>
           )}
-          {conv.cached_pr && <SidebarPrBadge pr={conv.cached_pr} />}
+          {cachedPrForBadge && <SidebarPrBadge pr={cachedPrForBadge} />}
         </div>
         <div className="conv-item-meta">
           <span

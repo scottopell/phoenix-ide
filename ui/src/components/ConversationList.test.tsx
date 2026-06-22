@@ -184,15 +184,17 @@ describe('ConversationRow — cached PR badge', () => {
     expect(badge.title).toContain('task-branch → main');
   });
 
-  it('renders the same cached PR on conversations sharing a work scope', () => {
-    const cached_pr = {
-      number: 44,
-      title: 'Shared PR',
-      url: 'https://github.com/o/r/pull/44',
-      display_state: 'open' as const,
-      base: 'main',
-      head: 'shared',
-    };
+  const cachedPr = (number = 44, title = 'Shared PR') => ({
+    number,
+    title,
+    url: `https://github.com/o/r/pull/${number}`,
+    display_state: 'open' as const,
+    base: 'main',
+    head: 'shared',
+  });
+
+  it('renders cached PR badges on standalone conversations sharing a work scope', () => {
+    const cached_pr = cachedPr();
 
     render(
       <MemoryRouter>
@@ -210,6 +212,65 @@ describe('ConversationRow — cached PR badge', () => {
     expect(document.querySelectorAll('.sidebar-pr-badge')).toHaveLength(2);
     expect(Array.from(document.querySelectorAll('.sidebar-pr-badge')).map((n) => n.textContent))
       .toEqual(['#44', '#44']);
+  });
+
+  it('renders a cached PR badge only on the latest chain member', () => {
+    const root = makeConv('root-id', 'root-slug', {
+      continued_in_conv_id: 'leaf-id',
+      updated_at: '2024-01-01T00:00:00Z',
+      cached_pr: cachedPr(50, 'Root PR'),
+    });
+    const leaf = makeConv('leaf-id', 'leaf-slug', {
+      updated_at: '2024-02-01T00:00:00Z',
+      cached_pr: cachedPr(50, 'Leaf PR'),
+    });
+
+    render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          sidebarMode
+          conversations={[leaf, root]}
+        />
+      </MemoryRouter>,
+    );
+
+    const badges = document.querySelectorAll('.sidebar-pr-badge');
+    expect(badges).toHaveLength(1);
+    expect(badges[0]!.textContent).toBe('#50');
+    expect(document.querySelector('[data-id="root-id"] .sidebar-pr-badge')).toBeNull();
+    expect(document.querySelector('[data-id="leaf-id"] .sidebar-pr-badge')).not.toBeNull();
+  });
+
+  it('does not render non-latest chain member PR badges when the member row is expanded', () => {
+    const root = makeConv('root-id', 'root-slug', {
+      continued_in_conv_id: 'leaf-id',
+      updated_at: '2024-01-01T00:00:00Z',
+      cached_pr: cachedPr(51),
+    });
+    const leaf = makeConv('leaf-id', 'leaf-slug', {
+      updated_at: '2024-02-01T00:00:00Z',
+      cached_pr: cachedPr(51),
+    });
+
+    render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          sidebarMode
+          conversations={[leaf, root]}
+        />
+      </MemoryRouter>,
+    );
+
+    const rootMenuButton = document.querySelector(
+      '[data-id="root-id"] .conv-item-menu-btn',
+    ) as HTMLButtonElement;
+    fireEvent.click(rootMenuButton);
+
+    expect(document.querySelector('[data-id="root-id"]')).toHaveClass('expanded');
+    expect(document.querySelector('[data-id="root-id"] .sidebar-pr-badge')).toBeNull();
+    expect(document.querySelectorAll('.sidebar-pr-badge')).toHaveLength(1);
   });
 });
 
