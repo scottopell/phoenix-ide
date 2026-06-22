@@ -113,7 +113,7 @@ export async function captureSurface(config) {
   try {
     for (const { storyKey, id } of stories) {
       consoleErrors.length = 0;
-      const url = `${baseUrl}/?story=${storyKey}`;
+      const url = `${baseUrl}/?story=${storyKey}&mode=preview`;
       await page.goto(url, { waitUntil: 'networkidle' });
       await page.waitForSelector(`[${readyAttribute}="${id}"]`, { timeout: 10_000 });
       await page.screenshot({ path: path.join(resolvedOut, `${id}.png`), fullPage: true });
