@@ -1056,7 +1056,7 @@ fn handle_core_cancellation(
             CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
-                ..
+                spawn_tool_id,
             },
             CoreEvent::UserCancel { cause, .. },
         ) => {
@@ -1065,6 +1065,7 @@ fn handle_core_cancellation(
                 pending: pending.clone(),
                 completed_results: completed_results.clone(),
                 cause,
+                spawn_tool_id: spawn_tool_id.clone(),
             })
             .with_effect(Effect::CancelSubAgents { ids })
             .with_effect(Effect::PersistState))
@@ -1145,6 +1146,7 @@ fn handle_core_cancellation(
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
                     cause: CancelCause::UserRequested,
+                    spawn_tool_id: None,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState))
@@ -1185,6 +1187,7 @@ fn handle_core_cancellation(
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
                     cause: CancelCause::UserRequested,
+                    spawn_tool_id: None,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState))
@@ -1343,6 +1346,7 @@ fn handle_core_sub_agents(
                 pending,
                 completed_results,
                 cause,
+                spawn_tool_id,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() > 1 => {
@@ -1368,6 +1372,7 @@ fn handle_core_sub_agents(
                 pending: new_pending,
                 completed_results: new_results,
                 cause: *cause,
+                spawn_tool_id: spawn_tool_id.clone(),
             })
             .with_effect(Effect::PersistState))
         }
@@ -1378,6 +1383,7 @@ fn handle_core_sub_agents(
                 pending,
                 completed_results,
                 cause,
+                spawn_tool_id,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() == 1 => {
@@ -1394,11 +1400,22 @@ fn handle_core_sub_agents(
                 outcome: recorded,
             });
 
-            Ok(CoreTransitionResult::new(CoreState::Idle)
-                .with_effect(Effect::PersistSubAgentResults {
+            let result = CoreTransitionResult::new(CoreState::Idle);
+            // Persist the drained results back onto the originating spawn_agents
+            // tool message only when we know its id (AwaitingSubAgents-origin).
+            // For the CancellingTool-origin path no spawn id exists, so persisting
+            // would fabricate a tool_result with a random id and no matching
+            // tool_use — an orphan the provider rejects. Skip persistence there,
+            // matching that path's prior behaviour.
+            let result = if let Some(id) = spawn_tool_id {
+                result.with_effect(Effect::PersistSubAgentResults {
                     results: new_results,
-                    spawn_tool_id: None,
+                    spawn_tool_id: Some(id.clone()),
                 })
+            } else {
+                result
+            };
+            Ok(result
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()))
         }
@@ -6268,6 +6285,7 @@ mod teardown_tests {
             pending: vec![pending("a")],
             completed_results: vec![],
             cause: CancelCause::Timeout,
+            spawn_tool_id: Some("spawn-1".to_string()),
         };
         let result = transition(
             &state,
@@ -6299,6 +6317,7 @@ mod teardown_tests {
             pending: vec![pending("a"), pending("b")],
             completed_results: vec![],
             cause: CancelCause::Timeout,
+            spawn_tool_id: Some("spawn-1".to_string()),
         };
         let result = transition(
             &state,
@@ -6329,6 +6348,7 @@ mod teardown_tests {
             pending: vec![pending("a")],
             completed_results: vec![],
             cause: CancelCause::Timeout,
+            spawn_tool_id: Some("spawn-1".to_string()),
         };
         let result = transition(
             &state,
@@ -6359,6 +6379,7 @@ mod teardown_tests {
             pending: vec![pending("a")],
             completed_results: vec![],
             cause: CancelCause::UserRequested,
+            spawn_tool_id: Some("spawn-1".to_string()),
         };
         let reported = SubAgentOutcome::Failure {
             error: "cancelled by user".to_string(),
@@ -6451,6 +6472,7 @@ mod teardown_tests {
             pending: vec![pending("a"), pending("b")],
             completed_results: vec![],
             cause: CancelCause::Timeout,
+            spawn_tool_id: Some("spawn-1".to_string()),
         };
         let first = transition(
             &state,

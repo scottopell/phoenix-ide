@@ -1802,6 +1802,7 @@ proptest! {
         pending,
         completed_results: vec![],
         cause: CancelCause::UserRequested,
+        spawn_tool_id: Some("spawn-1".to_string()),
     };
 
     for (i, agent_id) in initial_ids.iter().enumerate() {

@@ -1764,6 +1764,7 @@ mod tests {
             }],
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
+            spawn_tool_id: Some("spawn-1".to_string()),
         };
 
         let runtime = ConversationRuntime::new(
@@ -2761,6 +2762,7 @@ mod tests {
             }],
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
+            spawn_tool_id: Some("spawn-1".to_string()),
         };
 
         // Real result for X → Idle.
@@ -2829,6 +2831,7 @@ mod tests {
             }],
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
+            spawn_tool_id: Some("spawn-1".to_string()),
         };
 
         // Duplicate TimedOut for X (not in pending) → InvalidTransition.
@@ -3001,6 +3004,7 @@ mod tests {
             }],
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
+            spawn_tool_id: Some("spawn-1".to_string()),
         };
         assert_ne!(
             std::mem::discriminant(&one),

@@ -7502,6 +7502,9 @@ mod steer_drain_detector_tests {
                 .collect(),
             completed_results: vec![],
             cause,
+            // Default to a real spawn id so the last-one drain still persists
+            // results (exercising the common AwaitingSubAgents-origin path).
+            spawn_tool_id: Some("spawn-1".to_string()),
         }
     }
 
