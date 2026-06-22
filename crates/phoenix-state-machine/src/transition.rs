@@ -2712,6 +2712,12 @@ pub fn transition_parent(
             Ok(ParentTransitionResult::new(state.clone()))
         }
 
+        // Stale commission review approval decisions
+        (state, ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided { .. })) => {
+            tracing::debug!("Absorbing stale CommissionReviewApprovalDecided");
+            Ok(ParentTransitionResult::new(state.clone()))
+        }
+
         // ============================================================
         // Delegate to core
         // ============================================================
@@ -5958,6 +5964,134 @@ mod tests {
                 usage: Usage::default(),
                 request_id: "test-req-id".to_string(),
             }
+        }
+
+        fn approval_state() -> ConvState {
+            ConvState::AwaitingCommissionReviewApproval {
+                tool_call: ToolCall::new(
+                    "tool-review-1",
+                    ToolInput::CommissionReview(CommissionReviewInput {
+                        brief: "Ready for independent review".to_string(),
+                        focus: None,
+                        allow_dirty_working_tree: true,
+                    }),
+                ),
+                brief: "Ready for independent review".to_string(),
+                focus: None,
+                allow_dirty_working_tree: true,
+                assistant_message: AssistantMessage::new("req".to_string(), vec![], None, None),
+            }
+        }
+
+        fn has_execute_tool(effects: &[Effect]) -> bool {
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ExecuteTool { .. }))
+        }
+
+        #[test]
+        fn reject_does_not_execute_review() {
+            let result = transition(
+                &approval_state(),
+                &test_context(),
+                Event::CommissionReviewApprovalDecided {
+                    outcome: CommissionReviewApprovalOutcome::Rejected,
+                },
+            )
+            .expect("reject should settle approval state");
+
+            assert_eq!(result.new_state, ConvState::Idle);
+            assert!(!has_execute_tool(&result.effects));
+        }
+
+        #[test]
+        fn cancel_does_not_execute_review() {
+            let result = transition(
+                &approval_state(),
+                &test_context(),
+                Event::UserCancel { reason: None },
+            )
+            .expect("cancel should settle approval state");
+
+            assert_eq!(result.new_state, ConvState::Idle);
+            assert!(!has_execute_tool(&result.effects));
+        }
+
+        #[test]
+        fn stale_approval_from_idle_is_absorbed_without_execution() {
+            let result = transition(
+                &ConvState::Idle,
+                &test_context(),
+                Event::CommissionReviewApprovalDecided {
+                    outcome: CommissionReviewApprovalOutcome::Approved,
+                },
+            )
+            .expect("stale approval should be absorbed");
+
+            assert_eq!(result.new_state, ConvState::Idle);
+            assert!(!has_execute_tool(&result.effects));
+        }
+
+        #[test]
+        fn empty_brief_does_not_enter_approval_state() {
+            let tool = ToolCall::new(
+                "tool-review-1",
+                ToolInput::CommissionReview(CommissionReviewInput {
+                    brief: "   ".to_string(),
+                    focus: None,
+                    allow_dirty_working_tree: false,
+                }),
+            );
+            let event = Event::LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-review-1".to_string(),
+                    name: "commission_review".to_string(),
+                    input: serde_json::json!({ "brief": "   " }),
+                }],
+                tool_calls: vec![tool],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
+            };
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                event,
+            )
+            .expect("empty brief should be returned to LLM as tool error");
+            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+            assert!(!has_execute_tool(&result.effects));
+        }
+
+        #[test]
+        fn malformed_payload_does_not_enter_approval_state() {
+            let tool = ToolCall::new(
+                "tool-review-1",
+                ToolInput::Malformed {
+                    name: "commission_review".to_string(),
+                    input: serde_json::json!({ "brief": 12 }),
+                    error: "invalid type".to_string(),
+                },
+            );
+            let event = Event::LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-review-1".to_string(),
+                    name: "commission_review".to_string(),
+                    input: serde_json::json!({ "brief": 12 }),
+                }],
+                tool_calls: vec![tool],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
+            };
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                event,
+            )
+            .expect("malformed input should be returned to LLM as tool error");
+            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+            assert!(!has_execute_tool(&result.effects));
         }
 
         #[test]

@@ -17,12 +17,18 @@ export function CommissionReviewApproval({
   onReject,
 }: CommissionReviewApprovalProps) {
   const [busy, setBusy] = useState<'approve' | 'reject' | null>(null);
+  const [settled, setSettled] = useState<'approved' | 'rejected' | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const run = async (kind: 'approve' | 'reject', fn: () => Promise<void> | void) => {
-    if (busy) return;
+    if (busy || settled) return;
     setBusy(kind);
+    setError(null);
     try {
       await fn();
+      setSettled(kind === 'approve' ? 'approved' : 'rejected');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Failed to ${kind} review`);
     } finally {
       setBusy(null);
     }
@@ -56,13 +62,32 @@ export function CommissionReviewApproval({
             <p>Phoenix will infer the review target from this conversation/worktree and use the configured default LLM.</p>
             <p>Dirty worktree review: {allowDirtyWorkingTree ? 'explicitly allowed' : 'not allowed'}</p>
           </section>
+
+          {settled === 'approved' && (
+            <section className="task-approval-section" role="status">
+              <h3>Approved</h3>
+              <p>Starting review… this dialog will close when the conversation state updates.</p>
+            </section>
+          )}
+          {settled === 'rejected' && (
+            <section className="task-approval-section" role="status">
+              <h3>Rejected</h3>
+              <p>Review request rejected.</p>
+            </section>
+          )}
+          {error && (
+            <section className="task-approval-section" role="alert">
+              <h3>Error</h3>
+              <p>{error}</p>
+            </section>
+          )}
         </main>
 
         <footer className="task-approval-actions">
           <button
             type="button"
             className="task-approval-secondary"
-            disabled={busy !== null}
+            disabled={busy !== null || settled !== null}
             onClick={() => void run('reject', onReject)}
           >
             {busy === 'reject' ? 'Rejecting…' : 'Reject'}
@@ -70,7 +95,7 @@ export function CommissionReviewApproval({
           <button
             type="button"
             className="task-approval-primary"
-            disabled={busy !== null}
+            disabled={busy !== null || settled !== null}
             onClick={() => void run('approve', onApprove)}
           >
             {busy === 'approve' ? 'Approving…' : 'Approve review'}

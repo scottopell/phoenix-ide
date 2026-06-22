@@ -7,7 +7,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { api, canChangeModelInState, ConflictError, type ConversationState } from './api';
-import { canCancelConversationState } from './utils';
+import { parseConversationState, canCancelConversationState } from './utils';
 
 describe('api.continueConversation', () => {
   beforeEach(() => {
@@ -100,6 +100,7 @@ describe('canCancelConversationState', () => {
     [{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }, false],
     [{ type: 'cancelling_sub_agents', pending: [] }, false],
     [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, true],
+    [{ type: 'awaiting_commission_review_approval', brief: 'b', focus: null, allow_dirty_working_tree: false }, true],
     [{ type: 'awaiting_user_response', questions: [] }, false],
     [{ type: 'context_exhausted', summary: 's' }, false],
     [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }, true],
@@ -110,6 +111,32 @@ describe('canCancelConversationState', () => {
 
   it.each(cases)('%o -> %s', (state, expected) => {
     expect(canCancelConversationState(state)).toBe(expected);
+  });
+});
+
+describe('parseConversationState commission review approval', () => {
+  it('parses valid commission review approval state', () => {
+    expect(parseConversationState({
+      type: 'awaiting_commission_review_approval',
+      brief: 'Ready for review',
+      focus: 'security',
+      allow_dirty_working_tree: true,
+    })).toEqual({
+      type: 'awaiting_commission_review_approval',
+      brief: 'Ready for review',
+      focus: 'security',
+      allow_dirty_working_tree: true,
+    });
+  });
+
+  it('rejects invalid commission review payloads', () => {
+    for (const raw of [
+      { type: 'awaiting_commission_review_approval', allow_dirty_working_tree: false },
+      { type: 'awaiting_commission_review_approval', brief: 'Ready', allow_dirty_working_tree: 'false' },
+      { type: 'awaiting_commission_review_approval', brief: 'Ready', focus: 42, allow_dirty_working_tree: false },
+    ]) {
+      expect(parseConversationState(raw).type).toBe('error');
+    }
   });
 });
 
@@ -129,6 +156,7 @@ describe('canChangeModelInState (task 02713)', () => {
     [{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }, false],
     [{ type: 'cancelling_sub_agents', pending: [] }, false],
     [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, false],
+    [{ type: 'awaiting_commission_review_approval', brief: 'b', focus: null, allow_dirty_working_tree: false }, false],
     [{ type: 'awaiting_user_response', questions: [] }, false],
     [{ type: 'context_exhausted', summary: 's' }, false],
     [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }, false],
