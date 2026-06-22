@@ -1777,6 +1777,11 @@ pub fn transition_parent(
             let mut approved_tool = tool_call.clone();
             if let ToolInput::CommissionReview(input) = &mut approved_tool.input {
                 input.approved_after_human_confirmation = true;
+                input.runtime_base_branch = match context.mode_context.as_ref() {
+                    Some(ModeContext::Work { base_branch, .. })
+                    | Some(ModeContext::Branch { base_branch, .. }) => Some(base_branch.clone()),
+                    Some(ModeContext::Explore { .. } | ModeContext::Direct) | None => None,
+                };
             }
             Ok(
                 ParentTransitionResult::new(ParentState::Core(CoreState::ToolExecuting {

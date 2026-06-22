@@ -79,6 +79,8 @@ pub struct CommissionReviewInput {
     pub allow_dirty_working_tree: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub approved_after_human_confirmation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_base_branch: Option<String>,
 }
 
 /// User decision for a pending `commission_review` request.

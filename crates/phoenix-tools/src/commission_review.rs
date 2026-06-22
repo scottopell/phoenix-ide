@@ -28,6 +28,8 @@ struct CommissionReviewInput {
     allow_dirty_working_tree: bool,
     #[serde(default)]
     approved_after_human_confirmation: bool,
+    #[serde(default)]
+    runtime_base_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,7 +198,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         );
     }
 
-    let target = resolve_target(&ctx, input.allow_dirty_working_tree).await?;
+    let target = resolve_target(&ctx, &input).await?;
     let collection = collect_diff(&target, &ctx).await?;
 
     if !input.approved_after_human_confirmation {
@@ -296,7 +298,10 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     })
 }
 
-async fn resolve_target(ctx: &ToolContext, allow_dirty: bool) -> Result<ReviewTarget, String> {
+async fn resolve_target(
+    ctx: &ToolContext,
+    input: &CommissionReviewInput,
+) -> Result<ReviewTarget, String> {
     let repo_root = git_capture(&ctx.working_dir, &["rev-parse", "--show-toplevel"]).await?;
     let repo = PathBuf::from(repo_root.trim());
     let dirty = !git_capture(&repo, &["status", "--porcelain"])
@@ -306,10 +311,13 @@ async fn resolve_target(ctx: &ToolContext, allow_dirty: bool) -> Result<ReviewTa
     let head = git_capture(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
 
     if ctx.worktree_path.is_some() {
-        if dirty && !allow_dirty {
+        if dirty && !input.allow_dirty_working_tree {
             return Err("commission_review refused dirty worktree review. Commit/stash changes, or set allow_dirty_working_tree=true to include uncommitted changes.".to_string());
         }
-        let base = "main".to_string();
+        let base = input
+            .runtime_base_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_string());
         Ok(ReviewTarget {
             summary: ReviewTargetSummary {
                 kind: ReviewTargetKind::WorktreeDiff,
@@ -317,7 +325,7 @@ async fn resolve_target(ctx: &ToolContext, allow_dirty: bool) -> Result<ReviewTa
                 base: base.clone(),
                 head: head.trim().to_string(),
                 dirty,
-                allow_dirty_working_tree: allow_dirty,
+                allow_dirty_working_tree: input.allow_dirty_working_tree,
             },
             diff_spec: DiffSpec::Range {
                 base,
@@ -332,7 +340,7 @@ async fn resolve_target(ctx: &ToolContext, allow_dirty: bool) -> Result<ReviewTa
                 base: "workspace-base".to_string(),
                 head: "working-tree".to_string(),
                 dirty,
-                allow_dirty_working_tree: allow_dirty,
+                allow_dirty_working_tree: input.allow_dirty_working_tree,
             },
             diff_spec: DiffSpec::Workspace,
         })
