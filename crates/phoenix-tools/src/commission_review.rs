@@ -120,7 +120,11 @@ struct ReviewTarget {
 
 #[derive(Debug)]
 enum DiffSpec {
-    Range { base: String, head: String },
+    Range {
+        base: String,
+        head: String,
+        include_worktree: bool,
+    },
     Workspace,
 }
 
@@ -389,6 +393,7 @@ async fn resolve_target(
             diff_spec: DiffSpec::Range {
                 base,
                 head: "HEAD".to_string(),
+                include_worktree: dirty && input.allow_dirty_working_tree,
             },
         })
     } else {
@@ -410,14 +415,33 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
     let repo = Path::new(&target.summary.repo_root);
     let mut warnings = Vec::new();
     let numstat = match &target.diff_spec {
-        DiffSpec::Range { base, head } => {
-            git_capture(repo, &["diff", "--numstat", base, head]).await?
+        DiffSpec::Range {
+            base,
+            head,
+            include_worktree,
+        } => {
+            if *include_worktree {
+                git_capture(repo, &["diff", "--numstat", base, "--"]).await?
+            } else {
+                let merge_base_range = format!("{base}...{head}");
+                git_capture(repo, &["diff", "--numstat", &merge_base_range]).await?
+            }
         }
         DiffSpec::Workspace => git_capture(repo, &["diff", "--numstat", "HEAD", "--"]).await?,
     };
     let mut insertions = 0;
     let mut deletions = 0;
     let mut files = Vec::new();
+    let untracked = git_capture(repo, &["ls-files", "--others", "--exclude-standard"])
+        .await
+        .unwrap_or_default();
+    for file in untracked.lines().filter(|line| !line.trim().is_empty()) {
+        warnings.push(warning(
+            "untracked_file",
+            "untracked file is not included in git diff review",
+            Some(file),
+        ));
+    }
     for line in numstat.lines() {
         let parts: Vec<_> = line.split('\t').collect();
         if parts.len() >= 3 {
@@ -450,9 +474,19 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
             continue;
         }
         let diff = match &target.diff_spec {
-            DiffSpec::Range { base, head } => git_capture(repo, &["diff", base, head, "--", file])
-                .await
-                .unwrap_or_default(),
+            DiffSpec::Range {
+                base,
+                head,
+                include_worktree,
+            } => {
+                let diff_output = if *include_worktree {
+                    git_capture(repo, &["diff", base, "--", file]).await
+                } else {
+                    let merge_base_range = format!("{base}...{head}");
+                    git_capture(repo, &["diff", &merge_base_range, "--", file]).await
+                };
+                diff_output.unwrap_or_default()
+            }
             DiffSpec::Workspace => git_capture(repo, &["diff", "HEAD", "--", file])
                 .await
                 .unwrap_or_default(),

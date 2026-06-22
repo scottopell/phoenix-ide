@@ -552,9 +552,10 @@ export function StateBar({
             stateText =
               convState.type === "handed_off" ? "handed off" : "completed";
             break;
-          case "awaiting_task_approval":
-            dotClass += " approval";
-            stateText = "awaiting approval";
+          case 'awaiting_task_approval':
+          case 'awaiting_commission_review_approval':
+            dotClass += ' approval';
+            stateText = 'awaiting approval';
             break;
           case "awaiting_user_response":
             dotClass += " approval";

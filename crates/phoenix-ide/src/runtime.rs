@@ -2058,7 +2058,7 @@ impl RuntimeManager {
                     // default branch (REQ-PROJ-036).
                     let registry = ToolRegistry::direct(agent_catalog.to_vec());
                     if phoenix_core::git::detect_git_repo_root(&context.working_dir).is_some() {
-                        registry.with_propose_task()
+                        registry.with_propose_task().with_commission_review()
                     } else {
                         registry
                     }
@@ -2067,7 +2067,9 @@ impl RuntimeManager {
                     // Full tool suite plus `propose_task` (non-blocking fork
                     // proposal — REQ-PROJ-036). Work/Branch always sit on git
                     // history, so the tool is always offered.
-                    ToolRegistry::direct(agent_catalog.to_vec()).with_propose_task()
+                    ToolRegistry::direct(agent_catalog.to_vec())
+                        .with_propose_task()
+                        .with_commission_review()
                 }
             };
             ToolRegistryExecutor::with_mcp(
@@ -2457,6 +2459,7 @@ impl RuntimeManager {
         match &conv.state {
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
+            | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. }
             | ConvState::HandedOff { .. }
             | ConvState::SeededLlmRequesting { .. }

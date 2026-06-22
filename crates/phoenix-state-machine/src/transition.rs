@@ -1760,7 +1760,8 @@ pub fn transition_parent(
         // Parent-only state: AwaitingCommissionReviewApproval
         // ============================================================
         (
-            ParentState::AwaitingCommissionReviewApproval { .. },
+            ParentState::AwaitingCommissionReviewApproval { .. }
+            | ParentState::AwaitingUserResponse { .. },
             ParentEvent::Core(CoreEvent::UserMessage { .. } | CoreEvent::UserTriggerContinuation),
         ) => Err(TransitionError::AwaitingUserResponse),
 
@@ -1780,10 +1781,10 @@ pub fn transition_parent(
                     phoenix_core::domain::sm_state::ApprovedCommissionReviewInput {
                         request: input.clone(),
                         runtime_base_branch: match context.mode_context.as_ref() {
-                            Some(ModeContext::Work { base_branch, .. })
-                            | Some(ModeContext::Branch { base_branch, .. }) => {
-                                Some(base_branch.clone())
-                            }
+                            Some(
+                                ModeContext::Work { base_branch, .. }
+                                | ModeContext::Branch { base_branch, .. },
+                            ) => Some(base_branch.clone()),
                             Some(ModeContext::Explore { .. } | ModeContext::Direct) | None => None,
                         },
                         approved_working_dir: context.working_dir.display().to_string(),
@@ -1828,14 +1829,6 @@ pub fn transition_parent(
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()),
         ),
-
-        // ============================================================
-        // Parent-only state: AwaitingUserResponse
-        // ============================================================
-        (
-            ParentState::AwaitingUserResponse { .. },
-            ParentEvent::Core(CoreEvent::UserMessage { .. } | CoreEvent::UserTriggerContinuation),
-        ) => Err(TransitionError::AwaitingUserResponse),
 
         (
             ParentState::AwaitingUserResponse { .. },
@@ -2400,10 +2393,11 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
 
-                let tool_result = ToolResult::success(
-                    tool.id.clone(),
-                    "Commission review request submitted for human approval".to_string(),
-                );
+                // Park for approval without writing a tool_result placeholder.
+                // The original assistant message is carried in state and paired
+                // with the real review result after approval; writing an ack for
+                // this tool_use here would make the approved result collide with
+                // the deterministic tool_result message id.
                 let display_data = make_display_data(&content);
                 let assistant_message = AssistantMessage::new(
                     request_id.clone(),
@@ -2411,9 +2405,6 @@ pub fn transition_parent(
                     Some(usage_data),
                     display_data,
                 );
-                let checkpoint =
-                    CheckpointData::tool_round(assistant_message.clone(), vec![tool_result])
-                        .expect("commission_review produces exactly one tool_use and one result");
 
                 return Ok(ParentTransitionResult::new(
                     ParentState::AwaitingCommissionReviewApproval {
@@ -2424,7 +2415,6 @@ pub fn transition_parent(
                         assistant_message,
                     },
                 )
-                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change()));
             }

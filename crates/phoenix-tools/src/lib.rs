@@ -485,7 +485,6 @@ fn write_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(PatchTool::default()),
         Arc::new(TmuxRunTool),
         Arc::new(TmuxTool),
-        Arc::new(CommissionReviewTool),
     ]
 }
 
@@ -604,6 +603,14 @@ impl ToolRegistry {
     #[must_use]
     pub fn with_propose_task(mut self) -> Self {
         self.tools.push(Arc::new(ProposeTaskTool));
+        self
+    }
+
+    /// Add `commission_review` where Phoenix can infer a git-backed review target
+    /// and gate execution through parent approval.
+    #[must_use]
+    pub fn with_commission_review(mut self) -> Self {
+        self.tools.push(Arc::new(CommissionReviewTool));
         self
     }
 
@@ -886,7 +893,7 @@ mod tests {
         assert!(direct.contains("patch"));
         assert!(direct.contains("tmux_run"));
         assert!(direct.contains("tmux"));
-        assert!(direct.contains("commission_review"));
+        assert!(!direct.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(direct.contains(*tool), "Direct missing {tool}");
         }
@@ -900,8 +907,13 @@ mod tests {
         // always, Direct-in-a-git-repo conditionally — REQ-PROJ-036). Adds
         // propose_task on top of the full suite; the base `direct()` stays
         // propose_task-free above.
-        let direct_fork = names(&ToolRegistry::direct(Vec::new()).with_propose_task());
+        let direct_fork = names(
+            &ToolRegistry::direct(Vec::new())
+                .with_propose_task()
+                .with_commission_review(),
+        );
         assert!(direct_fork.contains("propose_task"));
+        assert!(direct_fork.contains("commission_review"));
         assert!(direct_fork.contains("bash"));
         assert!(direct_fork.contains("patch"));
 
@@ -912,6 +924,7 @@ mod tests {
         assert!(work.contains("tmux_run"));
         assert!(work.contains("tmux"));
         assert!(work.contains("propose_task"));
+        assert!(!work.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(work.contains(*tool), "Work missing {tool}");
         }

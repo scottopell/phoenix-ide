@@ -900,6 +900,7 @@ function ConversationPageContent() {
       await api.approveCommissionReview(conversationId);
     } catch (err) {
       console.error('Failed to approve commission review:', err);
+      throw err;
     }
   };
 
@@ -909,6 +910,7 @@ function ConversationPageContent() {
       await api.rejectCommissionReview(conversationId);
     } catch (err) {
       console.error('Failed to reject commission review:', err);
+      throw err;
     }
   };
 
