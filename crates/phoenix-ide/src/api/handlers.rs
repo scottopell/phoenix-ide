@@ -2181,26 +2181,9 @@ async fn send_chat(
 
     let validated_files = validate_submitted_attachments(&id, &req.files).await?;
 
-    // Fail-fast when the state would reject UserMessage. Without this, the
-    // chat POST returns 200, the runtime drops the queued event with only a
-    // "Transition rejected" log line, and the optimistic UI is stuck on
-    // `awaiting_llm` forever (no SSE event flows back to undo the optimistic
-    // dispatch). A 409 lets the existing client-side error path
-    // (`markFailed` in ConversationPage.tsx) surface the rejection to the
-    // user with retry/dismiss controls.
-    //
-    // Authority (FM-7, specs/bedrock/design.md):
-    // - If a live handle exists, its state_rx is authoritative even if the
-    //   DB row disagrees (e.g. DB=AwaitingTaskApproval, live=LlmRequesting
-    //   during approve-task git work). Always route from live state when
-    //   a handle is present.
-    // - If no live handle exists, stable DB states (Terminal,
-    //   AwaitingTaskApproval, ContextExhausted, etc.) are preserved by
-    //   reset_all_to_idle and are always accurate — reject immediately
-    //   without materialising a runtime.
-    // - Otherwise (DB=Idle or a transient-busy variant with no handle),
-    //   call get_or_create so determine_resume_state derives the true
-    //   initial state and populates state_rx.
+    // Route using live runtime state when a handle is present; fall back to
+    // the DB row for stable rejection states when no handle is active.
+    // See specs/bedrock/design.md FM-7 for the full authority rule.
     let effective_state = if let Some(live_state) =
         state.runtime.effective_conversation_state(&id).await
     {

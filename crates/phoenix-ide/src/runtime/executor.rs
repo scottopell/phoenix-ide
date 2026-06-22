@@ -1843,9 +1843,22 @@ where
         // its prior value too — gating here keeps the in-memory stamp in sync.
         if self.state != old_state {
             self.state_updated_at = Utc::now();
-            // Note: state_watcher is published AFTER effects/drain complete (below)
-            // so the intermediate Idle state is never exposed when an inline
-            // steering drain will immediately advance it to LlmRequesting.
+            // Publish early for most transitions so effective_conversation_state
+            // reflects the new state before long-running effects (e.g. ApproveTask
+            // git work) complete. Exception: suppress when entering Idle with
+            // queued steering messages — the inline drain will immediately advance
+            // the state to LlmRequesting, and exposing the transient Idle would let
+            // a concurrent POST /chat route a UserMessage before the drain finishes
+            // (FM-7 intermediate-Idle race). The end-of-function publish below
+            // covers that suppressed case once the drain completes.
+            let will_drain_from_idle = matches!(self.state, ConvState::Idle)
+                && !self.steering_queue.is_empty()
+                && !self.context.is_sub_agent;
+            if !will_drain_from_idle {
+                if let Some(tx) = &self.state_watcher {
+                    let _ = tx.send(self.state.clone());
+                }
+            }
         }
 
         // Retire any pending retry-backoff timer when the conversation leaves
