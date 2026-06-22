@@ -8662,12 +8662,14 @@ mod chat_authority_tests {
     async fn make_state() -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
-        let platform = PlatformCapability::None;
+        let platform = PlatformCapability::None {
+            details: "test".to_string(),
+        };
         let mcp_manager = Arc::new(McpClientManager::new());
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
-            platform,
+            platform.clone(),
             mcp_manager.clone(),
             None,
         ));

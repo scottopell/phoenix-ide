@@ -94,7 +94,11 @@ impl LlmLanguage {
             description: self.description().to_string(),
             prompts: LlmLanguagePromptCatalog {
                 base_prompt: base_prompt(self).to_string(),
-                explore_mode_block_template: mode_explore(self, TASKS_DIR),
+                explore_mode_block_template: mode_explore(
+                    self,
+                    TASKS_DIR,
+                    ExploreBashCapability::Unavailable,
+                ),
                 work_mode_block_template: mode_work(self, BRANCH_NAME, BASE_BRANCH, WORKTREE_PATH),
                 direct_mode_block: mode_direct(self).to_string(),
                 branch_mode_block_template: mode_branch(
