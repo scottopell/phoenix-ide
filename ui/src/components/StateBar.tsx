@@ -1,17 +1,44 @@
-import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent } from 'react';
-import { Link } from 'react-router-dom';
-import { useLastSseEventAtRef } from '../conversation/useConversationAtom';
-import { FolderTree } from 'lucide-react';
-import { canChangeModelInState, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
-import type { ConversationPrStatusState } from '../hooks/useConversationPrStatus';
-import type { ConnectionState } from '../hooks';
-import { useIsMobile } from '../hooks';
-import { getStateDescription, isAgentWorking } from '../utils';
-import { ContextIndicator } from './ContextIndicator';
-import { prBadgeClass, prBadgeLabel, prTooltip, unavailablePrHint } from './prBadge';
+import {
+  useState,
+  useRef,
+  useEffect,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
+import { Link } from "react-router-dom";
+import { useLastSseEventAtRef } from "../conversation/useConversationAtom";
+import { FolderTree } from "lucide-react";
+import {
+  canChangeModelInState,
+  type Conversation,
+  type ConversationState,
+  type ModelInfo,
+  type PrStatusResponse,
+} from "../api";
+import type { ConversationPrStatusState } from "../hooks/useConversationPrStatus";
+import type { ConnectionState } from "../hooks";
+import { useIsMobile } from "../hooks";
+import { getStateDescription, isAgentWorking } from "../utils";
+import { ContextIndicator } from "./ContextIndicator";
+import {
+  prBadgeClass,
+  prBadgeLabel,
+  prTooltip,
+  unavailablePrHint,
+} from "./prBadge";
 
 const CheckIcon = () => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+  <svg
+    width="12"
+    height="12"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="3"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+  >
     <polyline points="20 6 9 17 4 12" />
   </svg>
 );
@@ -30,8 +57,8 @@ const CheckIcon = () => (
  * cannot be triggered, not that the agent is "busy".
  */
 export type ContinuationState =
-  | { phase: 'idle'; onTrigger: () => void }
-  | { phase: 'unavailable' };
+  | { phase: "idle"; onTrigger: () => void }
+  | { phase: "unavailable" };
 
 interface StateBarProps {
   conversation: Conversation | null;
@@ -120,11 +147,11 @@ function formatContextWindow(n: number): string {
 
 /** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-5.5" -> "gpt-5.5" */
 function abbreviateModel(model: string): string {
-  if (!model.startsWith('claude-')) return model;
+  if (!model.startsWith("claude-")) return model;
   const inner = model.slice(7); // strip "claude-"
-  const lastHyphen = inner.lastIndexOf('-');
+  const lastHyphen = inner.lastIndexOf("-");
   if (lastHyphen > 0 && /^\d+$/.test(inner.slice(lastHyphen + 1))) {
-    return inner.slice(0, lastHyphen) + '.' + inner.slice(lastHyphen + 1);
+    return inner.slice(0, lastHyphen) + "." + inner.slice(lastHyphen + 1);
   }
   return inner;
 }
@@ -139,10 +166,44 @@ function getProjectName(conversation: Conversation): string | null {
   if (!cwd) return null;
 
   // Skip worktree UUIDs -- they're meaningless
-  if (cwd.includes('.phoenix/worktrees/')) return null;
+  if (cwd.includes(".phoenix/worktrees/")) return null;
 
-  const parts = cwd.replace(/\/$/, '').split('/');
+  const parts = cwd.replace(/\/$/, "").split("/");
   return parts[parts.length - 1] || null;
+}
+
+function summarizePath(path: string | null | undefined): string {
+  if (!path) return "—";
+  const trimmed = path.replace(/\/$/, "");
+  const parts = trimmed.split("/").filter(Boolean);
+  if (parts.length <= 2) return path;
+  return `…/${parts.slice(-2).join("/")}`;
+}
+
+function modeTitle(
+  mode: string | undefined,
+  isExplore: boolean,
+  isWork: boolean,
+  isBranchMode: boolean,
+): string {
+  if (isExplore) return "Explore mode: read-only git project";
+  if (isWork) return "Work mode: task branch";
+  if (isBranchMode) return "Branch mode: existing branch";
+  if (mode === "direct") return "Direct mode: full access";
+  return "Full access";
+}
+
+function modeMeaning(
+  mode: string | undefined,
+  isExplore: boolean,
+  isWork: boolean,
+  isBranchMode: boolean,
+): string {
+  if (isExplore) return "Read-only git project";
+  if (isWork) return "Task branch";
+  if (isBranchMode) return "Existing branch";
+  if (mode === "direct") return "Full access";
+  return "Full access";
 }
 
 function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
@@ -160,7 +221,7 @@ function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
         title={prTooltip(pr)}
         onClick={stopPropagation}
         onKeyDown={(event) => {
-          if (event.key === 'Enter' || event.key === ' ') {
+          if (event.key === "Enter" || event.key === " ") {
             event.stopPropagation();
           }
         }}
@@ -246,10 +307,12 @@ export function StateBar({
     }
     // Compute immediately to avoid the 1s render lag after a phase
     // transition; then tick once per second.
-    setPhaseElapsedSeconds(Math.max(0, Math.floor((Date.now() - phaseStateUpdatedAt) / 1000)));
+    setPhaseElapsedSeconds(
+      Math.max(0, Math.floor((Date.now() - phaseStateUpdatedAt) / 1000)),
+    );
     const interval = window.setInterval(() => {
       setPhaseElapsedSeconds(
-        Math.max(0, Math.floor((Date.now() - phaseStateUpdatedAt) / 1000))
+        Math.max(0, Math.floor((Date.now() - phaseStateUpdatedAt) / 1000)),
       );
     }, 1000);
     return () => window.clearInterval(interval);
@@ -265,9 +328,9 @@ export function StateBar({
   // trip the watchdog.
   const [watchdogSeconds, setWatchdogSeconds] = useState(0);
   const watchdogArmed =
-    (connectionState === 'connected' || connectionState === 'reconnected') &&
+    (connectionState === "connected" || connectionState === "reconnected") &&
     phaseIsWorking &&
-    typeof lastSseEventAtRef?.current === 'number';
+    typeof lastSseEventAtRef?.current === "number";
   useEffect(() => {
     if (!watchdogArmed) {
       setWatchdogSeconds(0);
@@ -280,14 +343,18 @@ export function StateBar({
     // The interval is created once per armed window — `lastSseEventAtRef` is
     // a stable object, so a fresh event does not tear it down and rebuild it.
     const compute = () => {
-      const elapsed = Math.max(0, Math.floor((Date.now() - lastSseEventAtRef!.current) / 1000));
+      const elapsed = Math.max(
+        0,
+        Math.floor((Date.now() - lastSseEventAtRef!.current) / 1000),
+      );
       setWatchdogSeconds(elapsed);
     };
     compute();
     const interval = window.setInterval(compute, 1000);
     return () => window.clearInterval(interval);
   }, [watchdogArmed, lastSseEventAtRef]);
-  const watchdogStale = watchdogArmed && watchdogSeconds >= HEARTBEAT_WATCHDOG_SECONDS;
+  const watchdogStale =
+    watchdogArmed && watchdogSeconds >= HEARTBEAT_WATCHDOG_SECONDS;
 
   // Last-known activity capture (REQ-WPV-005). When the connection
   // leaves the healthy set during a working phase, freeze a snapshot
@@ -305,7 +372,7 @@ export function StateBar({
     wasStreaming: boolean;
   } | null>(null);
   const connectionHealthy =
-    connectionState === 'connected' || connectionState === 'reconnected';
+    connectionState === "connected" || connectionState === "reconnected";
   useEffect(() => {
     if (connectionHealthy) {
       // Healthy connection — drop any frozen snapshot so the live
@@ -322,22 +389,28 @@ export function StateBar({
       phaseStateUpdatedAt != null
     ) {
       const wasStreaming =
-        (convState.type === 'llm_requesting' ||
-          convState.type === 'seeded_llm_requesting' ||
-          convState.type === 'awaiting_llm') &&
+        (convState.type === "llm_requesting" ||
+          convState.type === "seeded_llm_requesting" ||
+          convState.type === "awaiting_llm") &&
         firstByteRequestId != null;
       lastKnownActivityRef.current = {
         phase: convState,
         elapsedSecondsAtDisconnect: Math.max(
           0,
-          Math.floor((Date.now() - phaseStateUpdatedAt) / 1000)
+          Math.floor((Date.now() - phaseStateUpdatedAt) / 1000),
         ),
         wasStreaming,
       };
     }
     // No-op on subsequent renders during the same degraded window —
     // the snapshot is by-construction frozen.
-  }, [connectionHealthy, phaseIsWorking, phaseStateUpdatedAt, convState, firstByteRequestId]);
+  }, [
+    connectionHealthy,
+    phaseIsWorking,
+    phaseStateUpdatedAt,
+    convState,
+    firstByteRequestId,
+  ]);
 
   // Close model picker on outside click
   useEffect(() => {
@@ -347,22 +420,22 @@ export function StateBar({
         setPickerOpen(false);
       }
     };
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
   }, [pickerOpen]);
 
   // Close model picker on Escape
   useEffect(() => {
     if (!pickerOpen) return;
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setPickerOpen(false);
+      if (e.key === "Escape") setPickerOpen(false);
     };
-    document.addEventListener('keydown', handleKey);
-    return () => document.removeEventListener('keydown', handleKey);
+    document.addEventListener("keydown", handleKey);
+    return () => document.removeEventListener("keydown", handleKey);
   }, [pickerOpen]);
 
-  let dotClass = 'dot';
-  let stateText = '';
+  let dotClass = "dot";
+  let stateText = "";
 
   // REQ-WPV-003 / REQ-LRV-001: when a retry has fired this turn, append
   // "(retry K/N after <reason>)" to the base reason. Returns "" when no
@@ -371,7 +444,7 @@ export function StateBar({
   const retrySuffix =
     turnRetryContext != null
       ? ` (retry ${turnRetryContext.attempt}/${turnRetryContext.maxAttempts} after ${turnRetryContext.reasonText})`
-      : '';
+      : "";
 
   // Format the working-phase reason as "<base> Ns <retry?>" (e.g.
   // "awaiting LLM response 4s (retry 2/3 after rate limit)",
@@ -380,7 +453,7 @@ export function StateBar({
   const formatWorkingReason = (
     phase: ConversationState,
     elapsedSeconds: number,
-    streaming = false
+    streaming = false,
   ): string => {
     // REQ-WPV-007: mirror the live path — if the first byte had landed,
     // the label is `streaming` (no elapsed counter), with the retry suffix
@@ -393,47 +466,49 @@ export function StateBar({
     // working phases (`llm_requesting` → "awaiting LLM response...")
     // already end in an ellipsis. Appending `... <elapsed>` directly
     // would produce "awaiting LLM response... ... 7s".
-    const base = getStateDescription(phase).replace(/\.{3}$/, '');
+    const base = getStateDescription(phase).replace(/\.{3}$/, "");
     const withElapsed =
-      elapsedSeconds > 0 ? `${base} ... ${formatElapsed(elapsedSeconds)}` : base;
+      elapsedSeconds > 0
+        ? `${base} ... ${formatElapsed(elapsedSeconds)}`
+        : base;
     return `${withElapsed}${retrySuffix}`;
   };
 
   if (!conversation) {
-    dotClass += ' hidden';
-    stateText = '';
+    dotClass += " hidden";
+    stateText = "";
   } else if (watchdogStale) {
     // REQ-WPV-004: degraded-signal indicator overrides every working-
     // state message. The user needs to know the channel is suspect
     // before they trust further detail.
-    dotClass += ' degraded';
+    dotClass += " degraded";
     stateText = `no signal from server for ${formatElapsed(watchdogSeconds)}`;
   } else {
     // Determine dot and text based on connection state first.
     switch (connectionState) {
-      case 'disconnected':
-        dotClass += ' connecting';
-        stateText = 'connecting...';
+      case "disconnected":
+        dotClass += " connecting";
+        stateText = "connecting...";
         break;
 
-      case 'connecting':
-        dotClass += ' connecting';
-        stateText = 'connecting...';
+      case "connecting":
+        dotClass += " connecting";
+        stateText = "connecting...";
         break;
 
-      case 'reconnecting': {
+      case "reconnecting": {
         // REQ-WPV-005: don't mask agent activity. If we were working
         // when we degraded, show both the connection chip AND the
         // last-known agent activity with its elapsed FROZEN at
         // disconnect (honest about what we don't know — the agent
         // may or may not still be doing the thing).
-        dotClass += ' reconnecting';
+        dotClass += " reconnecting";
         const snap = lastKnownActivityRef.current;
         if (snap) {
           stateText = `reconnecting (${connectionAttempt}) — last: ${formatWorkingReason(
             snap.phase,
             snap.elapsedSecondsAtDisconnect,
-            snap.wasStreaming
+            snap.wasStreaming,
           )}`;
         } else {
           stateText = `reconnecting (${connectionAttempt})...`;
@@ -441,72 +516,79 @@ export function StateBar({
         break;
       }
 
-      case 'offline': {
+      case "offline": {
         // Same composition as reconnecting; the connection-chip text
         // changes from "reconnecting (N)" to "offline" but the
         // last-known activity is still surfaced when we have it.
-        dotClass += ' offline';
+        dotClass += " offline";
         const snap = lastKnownActivityRef.current;
         if (snap) {
           stateText = `offline — last: ${formatWorkingReason(
             snap.phase,
             snap.elapsedSecondsAtDisconnect,
-            snap.wasStreaming
+            snap.wasStreaming,
           )}`;
         } else {
-          stateText = 'offline';
+          stateText = "offline";
         }
         break;
       }
 
-      case 'reconnected':
-        dotClass += ' reconnected';
-        stateText = 'reconnected';
+      case "reconnected":
+        dotClass += " reconnected";
+        stateText = "reconnected";
         break;
 
-      case 'connected': {
+      case "connected": {
         // When connected, show agent state
         switch (convState.type) {
-          case 'idle':
-            dotClass += ' idle';
-            stateText = 'ready';
+          case "idle":
+            dotClass += " idle";
+            stateText = "ready";
             break;
-          case 'terminal':
-          case 'handed_off':
-            dotClass += ' terminal';
-            stateText = convState.type === 'handed_off' ? 'handed off' : 'completed';
+          case "terminal":
+          case "handed_off":
+            dotClass += " terminal";
+            stateText =
+              convState.type === "handed_off" ? "handed off" : "completed";
             break;
-          case 'awaiting_task_approval':
-            dotClass += ' approval';
-            stateText = 'awaiting approval';
+          case "awaiting_task_approval":
+            dotClass += " approval";
+            stateText = "awaiting approval";
             break;
-          case 'awaiting_user_response':
-            dotClass += ' approval';
+          case "awaiting_user_response":
+            dotClass += " approval";
             // "your reply" disambiguates from `awaiting LLM response`
             // (the llm_requesting label). Both surface in the same
             // StateBar slot; the prose has to make clear who the user
             // is waiting on.
-            stateText = 'awaiting your reply';
+            stateText = "awaiting your reply";
             break;
-          case 'error':
-            dotClass += ' error';
-            stateText = 'error';
+          case "error":
+            dotClass += " error";
+            stateText = "error";
             break;
-          case 'context_exhausted':
-            dotClass += ' error';
-            stateText = 'context full';
+          case "context_exhausted":
+            dotClass += " error";
+            stateText = "context full";
             break;
-          case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
-          case 'awaiting_sub_agents': case 'awaiting_continuation':
-          case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
-          case 'awaiting_recovery':
+          case "awaiting_llm":
+          case "llm_requesting":
+          case "seeded_llm_requesting":
+          case "tool_executing":
+          case "awaiting_sub_agents":
+          case "awaiting_continuation":
+          case "cancelling":
+          case "cancelling_tool":
+          case "cancelling_sub_agents":
+          case "awaiting_recovery":
             // REQ-WPV-001/003: elapsed counter is keyed off the
             // server-authoritative `phaseStateUpdatedAt`, so every
             // working phase gets a live "<reason> Ns" display (not
             // just tool_executing). The previous tool-only counter
             // is retained on the tool widget header itself via
             // `toolExecutingStartedAt`.
-            dotClass += ' working';
+            dotClass += " working";
             // REQ-WPV-007: once the first byte for the current LLM
             // request lands, switch the base reason from `awaiting LLM response Ns`
             // to `streaming` (no counter — the stream itself is the
@@ -514,9 +596,9 @@ export function StateBar({
             // the phase is one of the llm_requesting family; tool/
             // sub-agent phases retain their elapsed counter.
             if (
-              (convState.type === 'llm_requesting' ||
-                convState.type === 'seeded_llm_requesting' ||
-                convState.type === 'awaiting_llm') &&
+              (convState.type === "llm_requesting" ||
+                convState.type === "seeded_llm_requesting" ||
+                convState.type === "awaiting_llm") &&
               firstByteRequestId != null
             ) {
               // REQ-WPV-003: retry suffix carries through every working
@@ -529,18 +611,20 @@ export function StateBar({
               stateText = formatWorkingReason(convState, phaseElapsedSeconds);
             }
             break;
-          default: convState satisfies never;
+          default:
+            convState satisfies never;
         }
         break;
       }
 
       default:
-        dotClass += ' connecting';
-        stateText = 'connecting...';
+        dotClass += " connecting";
+        stateText = "connecting...";
     }
   }
 
-  const showOfflineBanner = connectionState === 'offline' && nextRetryIn !== null;
+  const showOfflineBanner =
+    connectionState === "offline" && nextRetryIn !== null;
 
   // Context window indicator -- use model-specific limit, fallback for legacy
   const maxTokens = modelContextWindow || 200_000;
@@ -549,23 +633,25 @@ export function StateBar({
   // from the idle discriminant, so no `convState.type` re-check is needed
   // here — narrowing the discriminated union is the guard (task 04001).
   const indicatorTrigger =
-    continuation?.phase === 'idle' ? continuation.onTrigger : undefined;
+    continuation?.phase === "idle" ? continuation.onTrigger : undefined;
 
   // Derived display values
   const mode = conversation?.conv_mode_label?.toLowerCase();
-  const isWork = mode === 'work';
-  const isExplore = mode === 'explore';
-  const isBranchMode = mode === 'branch';
+  const isWork = mode === "work";
+  const isExplore = mode === "explore";
+  const isBranchMode = mode === "branch";
   const modeLabel = conversation?.conv_mode_label;
-  const modeSuffix = isExplore ? ' (read-only)' : '';
+  const modeSuffix = isExplore ? " (read-only)" : "";
   const modeClass = `statebar-mode statebar-mode--${mode}`;
-  const modelAbbrev = conversation ? abbreviateModel(conversation.model ?? '') : '';
+  const modelAbbrev = conversation
+    ? abbreviateModel(conversation.model ?? "")
+    : "";
   const projectName = conversation ? getProjectName(conversation) : null;
 
   // Model picker: available when no operation is in flight (idle or error)
   // and we have models and a callback. Error-state switch lets the user
   // recover from overload/quota by picking another model, then retrying.
-  const currentModel = conversation?.model ?? '';
+  const currentModel = conversation?.model ?? "";
   const canPickModel = !!(
     onUpgradeModel &&
     availableModels &&
@@ -578,9 +664,9 @@ export function StateBar({
   const pickerModels: ModelInfo[] = (() => {
     if (!availableModels) return [];
     if (pickerShowAll) return availableModels;
-    const recommended = availableModels.filter(m => m.recommended);
-    if (currentModel && !recommended.some(m => m.id === currentModel)) {
-      const current = availableModels.find(m => m.id === currentModel);
+    const recommended = availableModels.filter((m) => m.recommended);
+    if (currentModel && !recommended.some((m) => m.id === currentModel)) {
+      const current = availableModels.find((m) => m.id === currentModel);
       if (current) return [current, ...recommended];
     }
     return recommended;
@@ -588,7 +674,7 @@ export function StateBar({
 
   const handleModelTriggerClick = () => {
     if (!canPickModel) return;
-    setPickerOpen(v => !v);
+    setPickerOpen((v) => !v);
   };
 
   const handleSelectModel = (modelId: string) => {
@@ -601,71 +687,359 @@ export function StateBar({
   const baseBranch = conversation?.base_branch;
   const branchName = conversation?.branch_name;
   const taskTitle = conversation?.task_title;
-  const prStatus = prStatusState?.status === 'ready' ? prStatusState.prStatus : null;
-  const prLoading = prStatusState?.status === 'loading';
-  const prHint = prStatus && !prStatus.found ? unavailablePrHint(prStatus.unavailable_reason) : null;
+  const prStatus =
+    prStatusState?.status === "ready" ? prStatusState.prStatus : null;
+  const prLoading = prStatusState?.status === "loading";
+  const prHint =
+    prStatus && !prStatus.found
+      ? unavailablePrHint(prStatus.unavailable_reason)
+      : null;
 
-  const showMobileCollapsed = isMobile && !mobileExpanded;
-  const headerProps = showMobileCollapsed
-    ? {
-        className: 'statebar-mobile-collapsed',
-        role: 'button',
-        tabIndex: 0,
-        'aria-expanded': false,
-        'aria-label': 'Expand status bar',
-        onClick: () => setMobileExpanded(true),
-        onKeyDown: (e: ReactKeyboardEvent) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            setMobileExpanded(true);
+  const cwdSummary = summarizePath(conversation?.cwd);
+  const modeHelp = modeTitle(mode, isExplore, isWork, isBranchMode);
+  const modeDetail = modeMeaning(mode, isExplore, isWork, isBranchMode);
+
+  const prStatusContent = (
+    <>
+      {prStatus?.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
+      {prHint && !prLoading && (
+        <span
+          className="pr-hint"
+          title="Install and authenticate GitHub CLI to enable PR tracking"
+        >
+          {prHint}
+        </span>
+      )}
+    </>
+  );
+
+  const renderModelControl = (variant: "desktop" | "mobile" = "desktop") => (
+    <span
+      className={`conv-model-wrapper${variant === "mobile" ? " conv-model-wrapper--mobile" : ""}`}
+      ref={pickerRef}
+    >
+      {canPickModel ? (
+        <button
+          className="conv-model conv-model--button"
+          title={`Model: ${conversation?.model ?? "default"} (click to change)`}
+          onClick={(e) => {
+            e.stopPropagation();
+            handleModelTriggerClick();
+          }}
+          aria-haspopup="listbox"
+          aria-expanded={pickerOpen}
+        >
+          {variant === "mobile"
+            ? (conversation?.model ?? "default")
+            : modelAbbrev}
+          <span className="conv-model-caret" aria-hidden="true">
+            &#9662;
+          </span>
+        </button>
+      ) : (
+        <span
+          className="conv-model"
+          title={`Model: ${conversation?.model ?? "default"}`}
+        >
+          {variant === "mobile"
+            ? (conversation?.model ?? "default")
+            : modelAbbrev}
+        </span>
+      )}
+      {pickerOpen && canPickModel && (
+        <div className="model-picker" role="listbox" aria-label="Select model">
+          <div className="model-picker-list">
+            {pickerModels.map((m) => {
+              const selected = m.id === currentModel;
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  role="option"
+                  aria-selected={selected}
+                  className={
+                    "model-picker-item" +
+                    (selected ? " model-picker-item--selected" : "")
+                  }
+                  onClick={() => handleSelectModel(m.id)}
+                  title={m.description || m.id}
+                >
+                  <span className="model-picker-item-check" aria-hidden="true">
+                    {selected ? <CheckIcon /> : null}
+                  </span>
+                  <span className="model-picker-item-id">{m.id}</span>
+                  <span className="model-picker-item-ctx">
+                    {formatContextWindow(m.context_window)}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <label className="model-picker-show-all-toggle">
+            <input
+              type="checkbox"
+              checked={pickerShowAll}
+              onChange={(e) => setPickerShowAll(e.target.checked)}
+            />
+            <span>Show all models</span>
+          </label>
+        </div>
+      )}
+    </span>
+  );
+
+  const renderFilesButton = () =>
+    onOpenFiles ? (
+      <button
+        type="button"
+        className="statebar-files-btn"
+        onClick={(e) => {
+          e.stopPropagation();
+          onOpenFiles();
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.stopPropagation();
           }
-        },
+        }}
+        aria-label="Browse project files"
+        title="Browse project files"
+      >
+        <FolderTree size={18} aria-hidden="true" />
+      </button>
+    ) : null;
+
+  if (isMobile) {
+    const toggleMobileExpanded = () => setMobileExpanded((v) => !v);
+    const handleCollapsedKey = (e: ReactKeyboardEvent) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        setMobileExpanded(true);
       }
-    : {};
+    };
+
+    return (
+      <>
+        <header
+          id="state-bar"
+          className={`statebar-mobile ${mobileExpanded ? "statebar-mobile-expanded" : "statebar-mobile-collapsed"}`}
+          role={!mobileExpanded ? "button" : undefined}
+          tabIndex={!mobileExpanded ? 0 : undefined}
+          aria-expanded={mobileExpanded}
+          aria-label={!mobileExpanded ? "Expand status bar" : undefined}
+          onClick={!mobileExpanded ? () => setMobileExpanded(true) : undefined}
+          onKeyDown={!mobileExpanded ? handleCollapsedKey : undefined}
+        >
+          <div className="statebar-mobile-primary">
+            {conversation ? (
+              <Link
+                to="/"
+                className="statebar-slug statebar-mobile-slug"
+                title="Back to conversations"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <span className="back-arrow">&larr;</span>
+                <span className="slug-text">{conversation.slug}</span>
+              </Link>
+            ) : (
+              <span className="statebar-slug">&mdash;</span>
+            )}
+            <div className="statebar-mobile-status" title={stateText}>
+              <span className={dotClass}></span>
+              {!mobileExpanded && (
+                <span className="state-text">{stateText}</span>
+              )}
+            </div>
+            <div className="statebar-mobile-actions">
+              {renderFilesButton()}
+              <button
+                type="button"
+                className="statebar-chevron"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleMobileExpanded();
+                }}
+                aria-label={
+                  mobileExpanded ? "Collapse status bar" : "Expand status bar"
+                }
+                aria-expanded={mobileExpanded}
+              >
+                {mobileExpanded ? "▾" : "▴"}
+              </button>
+            </div>
+          </div>
+
+          {mobileExpanded && conversation && (
+            <div className="statebar-mobile-details">
+              <section
+                className="statebar-mobile-section"
+                aria-label="Working directory"
+              >
+                <span className="statebar-mobile-label">Path</span>
+                <code
+                  className="statebar-mobile-value statebar-mobile-path"
+                  title={conversation.cwd}
+                >
+                  {cwdSummary}
+                </code>
+                {conversation.cwd && (
+                  <button
+                    type="button"
+                    className="statebar-mobile-copy"
+                    onClick={() =>
+                      void navigator.clipboard?.writeText(conversation.cwd)
+                    }
+                    aria-label={`Copy full working directory ${conversation.cwd}`}
+                    title={conversation.cwd}
+                  >
+                    Copy cwd
+                  </button>
+                )}
+              </section>
+
+              <section
+                className="statebar-mobile-section"
+                aria-label="Conversation identity"
+              >
+                {modeLabel && (
+                  <div className="statebar-mobile-row">
+                    <span className="statebar-mobile-label">Mode</span>
+                    <span className={modeClass} title={modeHelp}>
+                      {modeLabel}
+                      {modeSuffix}
+                    </span>
+                    <span className="statebar-mobile-help">{modeDetail}</span>
+                  </div>
+                )}
+                <div className="statebar-mobile-row">
+                  <span className="statebar-mobile-label">Model</span>
+                  {renderModelControl("mobile")}
+                </div>
+                {taskTitle && (
+                  <div className="statebar-mobile-row">
+                    <span className="statebar-mobile-label">Task</span>
+                    <span className="statebar-mobile-value" title={taskTitle}>
+                      {taskTitle}
+                    </span>
+                  </div>
+                )}
+              </section>
+
+              {branchName && (
+                <section
+                  className="statebar-mobile-section"
+                  aria-label="Branch and pull request"
+                >
+                  <span className="statebar-mobile-label">Branch</span>
+                  <code
+                    className="statebar-mobile-value statebar-mobile-branch"
+                    title={branchName}
+                  >
+                    {branchName}
+                  </code>
+                  <span className="statebar-mobile-pr">{prStatusContent}</span>
+                </section>
+              )}
+
+              <section
+                className="statebar-mobile-section statebar-mobile-section--runtime"
+                aria-label="Runtime and context"
+              >
+                <div className="statebar-mobile-runtime">
+                  <span className={dotClass}></span>
+                  <span className="state-text">{stateText}</span>
+                </div>
+                {contextWindowUsed > 0 && (
+                  <ContextIndicator
+                    used={contextWindowUsed}
+                    max={maxTokens}
+                    conversationId={conversation.id}
+                    onTriggerContinuation={indicatorTrigger}
+                  />
+                )}
+              </section>
+            </div>
+          )}
+        </header>
+        {showOfflineBanner && (
+          <div className="offline-banner">
+            <span className="offline-banner-text">
+              Connection lost. Reconnecting in {nextRetryIn}s...
+            </span>
+            {onRetryNow && (
+              <button className="offline-banner-retry" onClick={onRetryNow}>
+                Retry now
+              </button>
+            )}
+          </div>
+        )}
+      </>
+    );
+  }
 
   return (
     <>
-      <header id="state-bar" {...headerProps}>
+      <header id="state-bar">
         <div id="state-bar-left">
           {conversation ? (
             <>
               {/* Line 1: nav slug + mode + model */}
               <div className="statebar-line1">
-                <Link to="/" className="statebar-slug" title="Back to conversations">
+                <Link
+                  to="/"
+                  className="statebar-slug"
+                  title="Back to conversations"
+                >
                   <span className="back-arrow">&larr;</span>
                   <span className="slug-text">{conversation.slug}</span>
                 </Link>
                 {modeLabel && (
-                  <span className={modeClass} title={
-                    isExplore ? 'Read-only mode (git project)' :
-                    isWork ? 'Write mode (task branch)' :
-                    isBranchMode ? 'Branch mode (existing branch)' :
-                    'Full access (no git workflow)'
-                  }>
-                    {modeLabel}{modeSuffix}
+                  <span
+                    className={modeClass}
+                    title={
+                      isExplore
+                        ? "Read-only mode (git project)"
+                        : isWork
+                          ? "Write mode (task branch)"
+                          : isBranchMode
+                            ? "Branch mode (existing branch)"
+                            : "Full access (no git workflow)"
+                    }
+                  >
+                    {modeLabel}
+                    {modeSuffix}
                   </span>
                 )}
                 <span className="conv-model-wrapper" ref={pickerRef}>
                   {canPickModel ? (
                     <button
                       className="conv-model conv-model--button"
-                      title={`Model: ${conversation.model ?? 'default'} (click to change)`}
+                      title={`Model: ${conversation.model ?? "default"} (click to change)`}
                       onClick={handleModelTriggerClick}
                       aria-haspopup="listbox"
                       aria-expanded={pickerOpen}
                     >
                       {modelAbbrev}
-                      <span className="conv-model-caret" aria-hidden="true">&#9662;</span>
+                      <span className="conv-model-caret" aria-hidden="true">
+                        &#9662;
+                      </span>
                     </button>
                   ) : (
-                    <span className="conv-model" title={`Model: ${conversation.model ?? 'default'}`}>
+                    <span
+                      className="conv-model"
+                      title={`Model: ${conversation.model ?? "default"}`}
+                    >
                       {modelAbbrev}
                     </span>
                   )}
                   {pickerOpen && canPickModel && (
-                    <div className="model-picker" role="listbox" aria-label="Select model">
+                    <div
+                      className="model-picker"
+                      role="listbox"
+                      aria-label="Select model"
+                    >
                       <div className="model-picker-list">
-                        {pickerModels.map(m => {
+                        {pickerModels.map((m) => {
                           const selected = m.id === currentModel;
                           return (
                             <button
@@ -674,16 +1048,21 @@ export function StateBar({
                               role="option"
                               aria-selected={selected}
                               className={
-                                'model-picker-item' +
-                                (selected ? ' model-picker-item--selected' : '')
+                                "model-picker-item" +
+                                (selected ? " model-picker-item--selected" : "")
                               }
                               onClick={() => handleSelectModel(m.id)}
                               title={m.description || m.id}
                             >
-                              <span className="model-picker-item-check" aria-hidden="true">
+                              <span
+                                className="model-picker-item-check"
+                                aria-hidden="true"
+                              >
                                 {selected ? <CheckIcon /> : null}
                               </span>
-                              <span className="model-picker-item-id">{m.id}</span>
+                              <span className="model-picker-item-id">
+                                {m.id}
+                              </span>
                               <span className="model-picker-item-ctx">
                                 {formatContextWindow(m.context_window)}
                               </span>
@@ -708,29 +1087,48 @@ export function StateBar({
               {(taskTitle || branchName || projectName) && (
                 <div className="statebar-line2">
                   {taskTitle && (
-                    <span className="statebar-task-title" title={branchName ? `Branch: ${branchName}` : undefined}>
+                    <span
+                      className="statebar-task-title"
+                      title={branchName ? `Branch: ${branchName}` : undefined}
+                    >
                       {taskTitle}
                     </span>
                   )}
                   {branchName && baseBranch && (
-                    <span className={`git-flow${taskTitle ? ' git-flow--secondary' : ''}`} title={`${baseBranch} <- ${branchName}`}>
+                    <span
+                      className={`git-flow${taskTitle ? " git-flow--secondary" : ""}`}
+                      title={`${baseBranch} <- ${branchName}`}
+                    >
                       <span className="git-base">{baseBranch}</span>
                       <span className="git-arrow">&larr;</span>
                       <span className="git-branch">{branchName}</span>
-                      {prStatus?.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
+                      {prStatus?.found && prStatus.url && (
+                        <StateBarPrBadge pr={prStatus} />
+                      )}
                       {prHint && !prLoading && (
-                        <span className="pr-hint" title="Install and authenticate GitHub CLI to enable PR tracking">
+                        <span
+                          className="pr-hint"
+                          title="Install and authenticate GitHub CLI to enable PR tracking"
+                        >
                           {prHint}
                         </span>
                       )}
                     </span>
                   )}
                   {branchName && !baseBranch && (
-                    <span className="git-branch-solo" title={`Branch: ${branchName}`}>
+                    <span
+                      className="git-branch-solo"
+                      title={`Branch: ${branchName}`}
+                    >
                       {branchName}
-                      {prStatus?.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
+                      {prStatus?.found && prStatus.url && (
+                        <StateBarPrBadge pr={prStatus} />
+                      )}
                       {prHint && !prLoading && (
-                        <span className="pr-hint" title="Install and authenticate GitHub CLI to enable PR tracking">
+                        <span
+                          className="pr-hint"
+                          title="Install and authenticate GitHub CLI to enable PR tracking"
+                        >
                           {prHint}
                         </span>
                       )}
@@ -774,7 +1172,7 @@ export function StateBar({
                 // handler on `<header>` that calls preventDefault to expand
                 // the bar. Stop propagation so the button's default
                 // activation isn't suppressed and the bar doesn't toggle.
-                if (e.key === 'Enter' || e.key === ' ') {
+                if (e.key === "Enter" || e.key === " ") {
                   e.stopPropagation();
                 }
               }}
@@ -791,12 +1189,14 @@ export function StateBar({
             className="statebar-chevron"
             onClick={(e) => {
               e.stopPropagation();
-              setMobileExpanded(v => !v);
+              setMobileExpanded((v) => !v);
             }}
-            aria-label={mobileExpanded ? 'Collapse status bar' : 'Expand status bar'}
+            aria-label={
+              mobileExpanded ? "Collapse status bar" : "Expand status bar"
+            }
             aria-expanded={mobileExpanded}
           >
-            {mobileExpanded ? '▾' : '▴'}
+            {mobileExpanded ? "▾" : "▴"}
           </button>
         )}
       </header>
@@ -828,7 +1228,7 @@ export function StateBar({
 export function ConnectedStateBar({
   slug,
   ...rest
-}: Omit<StateBarProps, 'lastSseEventAtRef'> & { slug: string }) {
+}: Omit<StateBarProps, "lastSseEventAtRef"> & { slug: string }) {
   const lastSseEventAtRef = useLastSseEventAtRef(slug);
   return <StateBar {...rest} lastSseEventAtRef={lastSseEventAtRef} />;
 }

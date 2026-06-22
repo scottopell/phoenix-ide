@@ -36,8 +36,9 @@ beforeAll(() => {
   }
 });
 
-beforeEach(() => {
+  beforeEach(() => {
   vi.clearAllMocks();
+  setMobileViewport(false);
   (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue(mockPrStatus({ found: false }));
   (api.createPrAutoFixContext as ReturnType<typeof vi.fn>).mockResolvedValue({
     artifact_path: '.phoenix/pr-context/pr-12.json',
@@ -85,6 +86,9 @@ function renderStateBar({
   lastSseEventAt,
   firstByteRequestId,
   turnRetryContext,
+  onOpenFiles,
+  availableModels,
+  onUpgradeModel,
 }: {
   conversation?: Conversation;
   convState?: ComponentProps<typeof StateBar>['convState'];
@@ -98,6 +102,9 @@ function renderStateBar({
   lastSseEventAt?: number;
   firstByteRequestId?: string | null;
   turnRetryContext?: ComponentProps<typeof StateBar>['turnRetryContext'];
+  onOpenFiles?: ComponentProps<typeof StateBar>['onOpenFiles'];
+  availableModels?: ComponentProps<typeof StateBar>['availableModels'];
+  onUpgradeModel?: ComponentProps<typeof StateBar>['onUpgradeModel'];
 } = {}) {
   const props: ComponentProps<typeof StateBar> = {
     conversation,
@@ -108,6 +115,15 @@ function renderStateBar({
     contextWindowUsed,
     modelContextWindow,
   };
+  if (onOpenFiles !== undefined) {
+    props.onOpenFiles = onOpenFiles;
+  }
+  if (availableModels !== undefined) {
+    props.availableModels = availableModels;
+  }
+  if (onUpgradeModel !== undefined) {
+    props.onUpgradeModel = onUpgradeModel;
+  }
   if (continuation) {
     props.continuation = continuation;
   }
@@ -118,8 +134,6 @@ function renderStateBar({
     props.phaseStateUpdatedAt = phaseStateUpdatedAt;
   }
   if (lastSseEventAt !== undefined) {
-    // StateBar reads the heartbeat clock from a ref (see useLastSseEventAtRef);
-    // wrap the test's plain timestamp so the watchdog samples it.
     props.lastSseEventAtRef = { current: lastSseEventAt };
   }
   if (firstByteRequestId !== undefined) {
@@ -134,6 +148,28 @@ function renderStateBar({
     </MemoryRouter>,
   );
 }
+
+function setMobileViewport(matches = true) {
+  const listeners = new Set<(event: MediaQueryListEvent) => void>();
+  Object.defineProperty(window, 'matchMedia', {
+    writable: true,
+    value: vi.fn().mockImplementation((query: string) => ({
+      matches: query === '(max-width: 768px)' ? matches : false,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn((_event: string, cb: (event: MediaQueryListEvent) => void) => listeners.add(cb)),
+      removeEventListener: vi.fn((_event: string, cb: (event: MediaQueryListEvent) => void) => listeners.delete(cb)),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })),
+  });
+}
+
+const pickerModels: ModelInfo[] = [
+  { id: 'claude-sonnet-4-6', provider: 'anthropic', description: '', context_window: 200_000, recommended: true },
+  { id: 'claude-opus-4-7', provider: 'anthropic', description: '', context_window: 200_000, recommended: true },
+];
 
 function mockPrStatus(status: Partial<PrStatusResponse>): PrStatusResponse {
   return {
@@ -598,5 +634,142 @@ describe('StateBar working-phase indicators', () => {
     expect(screen.getByText(/^offline.*last.*8s/i)).toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/offline/);
+  });
+});
+
+describe('StateBar mobile layout', () => {
+  beforeEach(() => {
+    setMobileViewport(true);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+    });
+  });
+
+  it('keeps collapsed mobile sparse and exposes explore details when expanded', () => {
+    renderStateBar({
+      conversation: makeConversation({
+        slug: 'explore-long-project',
+        conv_mode_label: 'Explore',
+        cwd: '/Users/scott/projects/phoenix-ide',
+        branch_name: null,
+        base_branch: 'main',
+        task_title: null,
+        project_name: 'Phoenix IDE',
+      }),
+    });
+
+    expect(screen.getByText('explore-long-project')).toBeInTheDocument();
+    expect(screen.getByText('ready')).toBeInTheDocument();
+    expect(screen.queryByText(/read-only/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /copy full working directory/i })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i })[0]!);
+
+    expect(screen.getByTitle(/Explore mode/i)).toHaveTextContent('Explore');
+    expect(screen.getByText(/Read-only git project/i)).toBeInTheDocument();
+    expect(screen.getByText('claude-sonnet-4-6')).toBeInTheDocument();
+    expect(screen.getByText('…/projects/phoenix-ide')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /copy full working directory .*phoenix-ide/i })).toBeInTheDocument();
+    expect(screen.queryByText('Phoenix IDE')).not.toBeInTheDocument();
+    expect(screen.queryByText('main')).not.toBeInTheDocument();
+  });
+
+  it('renders work task, branch, PR, context, cwd copy, model, and file action without base branch', () => {
+    const onOpenFiles = vi.fn();
+    renderStateBar({
+      onOpenFiles,
+      contextWindowUsed: 170_000,
+      modelContextWindow: 200_000,
+      prStatus: mockPrStatus({
+        found: true,
+        number: 12,
+        title: 'Mobile StateBar',
+        url: 'https://github.com/scottopell/phoenix-ide/pull/12',
+        state: 'OPEN',
+        draft: false,
+        base: 'main',
+        head: 'task-56004-redesign-mobile-state-bar',
+        display_state: 'open',
+        check_state: 'passing',
+      }),
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /browse project files/i }));
+    expect(onOpenFiles).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!).toHaveAttribute('aria-expanded', 'false');
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+
+    expect(screen.getByText('Work')).toBeInTheDocument();
+    expect(screen.getByText(/Task branch/i)).toBeInTheDocument();
+    expect(screen.getByText('Track PR status')).toBeInTheDocument();
+    expect(screen.getByText('task-123-pr-status')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /#12 checks ✓/i })).toBeInTheDocument();
+    expect(screen.getByText('170k')).toBeInTheDocument();
+    expect(screen.getByText('claude-sonnet-4-6')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /copy full working directory/i })).toBeInTheDocument();
+    expect(screen.queryByText('main')).not.toBeInTheDocument();
+  });
+
+  it('renders branch mode branch identity without task title or base branch', () => {
+    renderStateBar({
+      conversation: makeConversation({
+        conv_mode_label: 'Branch',
+        task_title: null,
+        branch_name: 'feature/existing-branch',
+        base_branch: 'develop',
+        cwd: '/repo/product',
+      }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+
+    expect(screen.getByTitle(/Branch mode/i)).toHaveTextContent('Branch');
+    expect(screen.getByText(/Existing branch/i)).toBeInTheDocument();
+    expect(screen.getByText('feature/existing-branch')).toBeInTheDocument();
+    expect(screen.queryByText('Track PR status')).not.toBeInTheDocument();
+    expect(screen.queryByText('develop')).not.toBeInTheDocument();
+  });
+
+  it('renders direct fallback mode and cwd without separate project name', () => {
+    renderStateBar({
+      conversation: makeConversation({
+        conv_mode_label: 'Direct',
+        cwd: '/Users/scott/projects/direct-project',
+        branch_name: null,
+        base_branch: null,
+        task_title: null,
+        project_name: 'Direct Project',
+      }),
+    });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /expand status bar/i }).at(-1)!);
+
+    expect(screen.getByText('Direct')).toBeInTheDocument();
+    expect(screen.getByText(/Full access/i)).toBeInTheDocument();
+    expect(screen.getByText('…/projects/direct-project')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /copy full working directory .*direct-project/i })).toBeInTheDocument();
+    expect(screen.queryByText('Direct Project')).not.toBeInTheDocument();
+  });
+
+  it('keeps model picker enablement and file button keyboard behavior on mobile', () => {
+    const onUpgradeModel = vi.fn();
+    const onOpenFiles = vi.fn();
+    renderStateBar({
+      availableModels: pickerModels,
+      onUpgradeModel,
+      onOpenFiles,
+    });
+
+    fireEvent.keyDown(screen.getByRole('button', { name: /browse project files/i }), { key: 'Enter' });
+    fireEvent.click(screen.getByRole('button', { name: /browse project files/i }));
+    expect(onOpenFiles).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(screen.getAllByRole('button', { name: /expand status bar/i })[0]!, { key: 'Enter' });
+    expect(screen.getByTitle(/Model: claude-sonnet-4-6/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle(/Model: claude-sonnet-4-6/i));
+    expect(screen.getByRole('listbox', { name: /select model/i })).toBeInTheDocument();
   });
 });

@@ -6831,25 +6831,64 @@ html * {
     font-size: 14px;
   }
 
-  /* Collapsed StateBar: thin one-line summary, tap to expand.
-     Mirror of `(max-width: 768px)` in StateBar.tsx isMobile state. */
-  #state-bar.statebar-mobile-collapsed {
-    height: 32px;
-    cursor: pointer;
+  /* Dedicated mobile StateBar: a sparse primary row plus an expanded
+     information stack. Mirror of `(max-width: 768px)` in StateBar.tsx. */
+  #state-bar.statebar-mobile {
+    height: auto;
+    min-height: 44px;
+    padding: 0;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .statebar-mobile-primary {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
     padding: 0 8px;
+    min-width: 0;
   }
 
-  #state-bar.statebar-mobile-collapsed .statebar-line2,
-  #state-bar.statebar-mobile-collapsed .statebar-mode,
-  #state-bar.statebar-mobile-collapsed .conv-model-wrapper,
-  #state-bar.statebar-mobile-collapsed #state-text,
-  #state-bar.statebar-mobile-collapsed .context-bar {
-    display: none;
+  #state-bar.statebar-mobile-collapsed {
+    cursor: pointer;
   }
 
-  #state-bar.statebar-mobile-collapsed .statebar-slug {
-    max-width: 40vw;
+  .statebar-mobile-slug {
+    flex: 1 1 auto;
+    max-width: none;
     font-size: 13px;
+    color: var(--text-primary);
+  }
+
+  .statebar-mobile-status,
+  .statebar-mobile-runtime {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .statebar-mobile-status {
+    flex: 0 1 auto;
+    max-width: 34vw;
+  }
+
+  .statebar-mobile-status .state-text,
+  .statebar-mobile-runtime .state-text {
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .statebar-mobile-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+    margin-left: auto;
   }
 
   .statebar-chevron {
@@ -6857,18 +6896,123 @@ html * {
     border: 0;
     color: var(--text-muted);
     font-size: 12px;
-    width: 32px;
-    height: 32px;
+    width: 44px;
+    height: 44px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
     cursor: pointer;
-    margin-left: 4px;
+    border-radius: 4px;
   }
 
   .statebar-chevron:hover {
     color: var(--text-primary);
+    background: var(--bg-tertiary);
+  }
+
+  .statebar-chevron:focus-visible {
+    outline: 2px solid var(--accent-blue, currentColor);
+    outline-offset: -2px;
+  }
+
+  .statebar-mobile-details {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px;
+    border-top: 1px solid var(--border-color);
+    background: var(--bg-secondary);
+  }
+
+  .statebar-mobile-section {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 8px;
+    border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--bg-primary) 45%, transparent);
+  }
+
+  .statebar-mobile-section[aria-label="Conversation identity"],
+  .statebar-mobile-section--runtime {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .statebar-mobile-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .statebar-mobile-label {
+    flex: 0 0 48px;
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .statebar-mobile-value,
+  .statebar-mobile-help {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+    font-size: 12px;
+  }
+
+  .statebar-mobile-help {
+    color: var(--text-muted);
+  }
+
+  .statebar-mobile-path,
+  .statebar-mobile-branch {
+    font-family: var(--font-mono);
+  }
+
+  .statebar-mobile-copy {
+    min-height: 36px;
+    margin-left: auto;
+    padding: 0 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .statebar-mobile-copy:hover {
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+  }
+
+  .conv-model-wrapper--mobile {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .conv-model-wrapper--mobile .conv-model {
+    max-width: calc(100vw - 92px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .statebar-mobile-pr {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
   }
 }
 
