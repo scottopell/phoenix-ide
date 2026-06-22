@@ -1,8 +1,19 @@
 import { createInitialAtom, conversationReducer } from './atom';
 import type { ConversationAtom, SSEAction } from './atom';
-import type { Conversation } from '../api';
+import type { CachedPrSummary, Conversation } from '../api';
 import { RoutedStore } from './RoutedStore';
 import { notifyConversationSnapshotChange } from '../notifications';
+
+function cachedPrEqual(a: CachedPrSummary | null | undefined, b: CachedPrSummary | null | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.number === b.number
+    && a.title === b.title
+    && a.url === b.url
+    && a.display_state === b.display_state
+    && a.base === b.base
+    && a.head === b.head;
+}
 
 /**
  * Per-slug conversation atoms.
@@ -70,7 +81,8 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       // happen). Use id mismatch as the only equal-timestamp tie-break.
       if (
         conversation.updated_at === current.conversation.updated_at &&
-        conversation.id === current.conversation.id
+        conversation.id === current.conversation.id &&
+        cachedPrEqual(conversation.cached_pr, current.conversation.cached_pr)
       ) {
         return false;
       }

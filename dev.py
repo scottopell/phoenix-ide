@@ -2558,6 +2558,15 @@ def cmd_qa_grounding_panel() -> None:
     )
 
 
+def cmd_qa_meta_viewer() -> None:
+    """Capture MetaViewer edge-state Ladle screenshots into ignored local artifacts."""
+    subprocess.run(
+        ["pnpm", "qa:meta-viewer"],
+        cwd=ROOT / "ui",
+        check=True,
+        env=node_env(),
+    )
+
 
 def cmd_qa_conversation_panel() -> None:
     """Capture conversation side panel Ladle screenshots into ignored local artifacts."""

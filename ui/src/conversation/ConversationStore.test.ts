@@ -39,6 +39,46 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.upsertSnapshot('alpha', conv)).toBe(false);
   });
 
+  it('updates conversation when cached PR changes at the same updated_at', () => {
+    const store = new ConversationStore();
+    const base = makeConv('alpha', { updated_at: '2024-06-01T00:00:00Z' });
+    const withPr = makeConv('alpha', {
+      updated_at: '2024-06-01T00:00:00Z',
+      cached_pr: {
+        number: 12,
+        title: 'Cached PR',
+        url: 'https://example.test/pr/12',
+        display_state: 'open',
+        base: 'main',
+        head: 'feature',
+      },
+    });
+
+    expect(store.upsertSnapshot('alpha', base)).toBe(true);
+    expect(store.upsertSnapshot('alpha', withPr)).toBe(true);
+    expect(store.getSnapshot('alpha').conversation?.cached_pr?.number).toBe(12);
+  });
+
+  it('updates conversation when cached PR is cleared at the same updated_at', () => {
+    const store = new ConversationStore();
+    const withPr = makeConv('alpha', {
+      updated_at: '2024-06-01T00:00:00Z',
+      cached_pr: {
+        number: 12,
+        title: 'Cached PR',
+        url: 'https://example.test/pr/12',
+        display_state: 'open',
+        base: 'main',
+        head: 'feature',
+      },
+    });
+    const withoutPr = makeConv('alpha', { updated_at: '2024-06-01T00:00:00Z' });
+
+    expect(store.upsertSnapshot('alpha', withPr)).toBe(true);
+    expect(store.upsertSnapshot('alpha', withoutPr)).toBe(true);
+    expect(store.getSnapshot('alpha').conversation?.cached_pr).toBeUndefined();
+  });
+
   it('updates conversation when updated_at advances', () => {
     const store = new ConversationStore();
     const v1 = makeConv('alpha', { updated_at: '2024-06-01T00:00:00Z' });
