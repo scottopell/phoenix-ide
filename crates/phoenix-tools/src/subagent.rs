@@ -154,7 +154,7 @@ impl Tool for SpawnAgentsTool {
     }
 
     fn description(&self) -> String {
-        "Spawn sub-agents to execute tasks in parallel. Each sub-agent runs independently and returns a result. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
+        "Spawn sub-agents to execute tasks in parallel. Each sub-agent runs independently and returns a result. Omit agent_type for a generic Phoenix sub-agent, or set agent_type to one of the discovered named personas. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -191,8 +191,7 @@ impl Tool for SpawnAgentsTool {
             use std::fmt::Write as _;
             let names: Vec<&str> = self.agents.iter().map(|a| a.name.as_str()).collect();
             let mut description = String::from(
-                "Named agent persona to spawn. Supplies the sub-agent's persona \
-                              and its default model/mode. One of:",
+                "Named agent persona to spawn. Omit this field for a generic Phoenix sub-agent. When set, it supplies the sub-agent's persona and its default model/mode. Available named personas:",
             );
             for agent in &self.agents {
                 let _ = write!(description, "\n- {}: {}", agent.name, agent.description);
@@ -217,7 +216,7 @@ impl Tool for SpawnAgentsTool {
                     },
                     "minItems": 1,
                     "maxItems": 10,
-                    "description": "List of tasks to execute in parallel (max 10)"
+                    "description": "List of tasks to execute in parallel (max 10). Omit agent_type on a task to spawn a generic Phoenix sub-agent."
                 }
             }
         })
@@ -353,6 +352,42 @@ mod tests {
             json!(["docs-writer", "security-reviewer"])
         );
         let desc = agent_type["description"].as_str().unwrap();
+        assert!(desc.contains("docs-writer: Writes docs"));
+        assert!(desc.contains("security-reviewer: Finds vulns"));
+    }
+
+    #[test]
+    fn schema_documents_generic_subagents_with_named_agents() {
+        let tool = SpawnAgentsTool::with_agents(vec![
+            agent("docs-writer", "Writes docs"),
+            agent("security-reviewer", "Finds vulns"),
+        ]);
+        let schema = tool.input_schema();
+        let tool_desc = tool.description();
+        assert!(
+            tool_desc.contains("Omit agent_type for a generic Phoenix sub-agent"),
+            "tool description should advertise generic sub-agents: {tool_desc}"
+        );
+
+        let tasks_desc = schema["properties"]["tasks"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            tasks_desc.contains("Omit agent_type"),
+            "tasks description should advertise generic sub-agents: {tasks_desc}"
+        );
+
+        let agent_type = &schema["properties"]["tasks"]["items"]["properties"]["agent_type"];
+        assert_eq!(
+            agent_type["enum"],
+            json!(["docs-writer", "security-reviewer"]),
+            "known named personas must remain enum-validated"
+        );
+        let desc = agent_type["description"].as_str().unwrap();
+        assert!(
+            desc.contains("Omit this field for a generic Phoenix sub-agent"),
+            "agent_type description should not imply named personas are exhaustive: {desc}"
+        );
         assert!(desc.contains("docs-writer: Writes docs"));
         assert!(desc.contains("security-reviewer: Finds vulns"));
     }

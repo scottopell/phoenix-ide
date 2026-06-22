@@ -8022,6 +8022,48 @@ mod work_subagent_cwd_guard_tests {
         );
     }
 
+    #[tokio::test]
+    async fn accepts_unnamed_generic_work_subagent() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let (spawn_tx, mut spawn_rx) = mpsc::channel::<SubAgentSpawnRequest>(1);
+        let (cancel_tx, _cancel_rx) = mpsc::channel(1);
+        let mut rt = runtime_in_work_mode(worktree.path()).with_spawn_channels(spawn_tx, cancel_tx);
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "implement the fix".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Work),
+                    model: None,
+                    max_turns: None,
+                    agent_type: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::SpawnAgentsComplete {
+                spawned, result, ..
+            }) => {
+                assert!(!result.is_error(), "generic Work spawn should succeed");
+                assert_eq!(spawned.len(), 1);
+                assert_eq!(spawned[0].mode, SubAgentMode::Work);
+            }
+            other => panic!("expected SpawnAgentsComplete, got {other:?}"),
+        }
+
+        let request = spawn_rx
+            .try_recv()
+            .expect("generic Work sub-agent request should be sent");
+        assert_eq!(request.spec.mode, SubAgentMode::Work);
+        assert_eq!(request.spec.agent_name, None);
+        assert_eq!(request.spec.persona, None);
+        assert_eq!(request.spec.model_id, "test-model");
+        assert_eq!(rt.active_work_subagents, 1);
+    }
+
     /// An `agent_type` that matches no discovered agent is rejected before any
     /// sub-agent is spawned (REQ-AG-007). The empty worktree has no
     /// `.claude/agents/`, so discovery returns nothing and the lookup fails.
