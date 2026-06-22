@@ -118,6 +118,22 @@ export function ConversationPage() {
   );
 }
 
+function RecoveryBanner({ message, recoveryKind }: { message: string; recoveryKind: string }) {
+  return (
+    <div className="error-input-area">
+      <div className="error-body">
+        <div className="error-body-content">
+          <div className="error-body-title">Recovery required — {recoveryKind}</div>
+          <div className="error-body-details">{message}</div>
+        </div>
+      </div>
+      <div className="error-action-bar">
+        <span className="error-action-hint">This archived conversation is read-only.</span>
+      </div>
+    </div>
+  );
+}
+
 function ConversationPageContent() {
   const { slug } = useParams<{ slug: string }>();
   const navigate = useNavigate();
@@ -1265,7 +1281,9 @@ function ConversationPageContent() {
           </button>
         </div>
       )}
-      {convStateForChildren.type === 'awaiting_recovery' && !isArchived ? (
+      {convStateForChildren.type === 'awaiting_recovery' && isArchived ? (
+        <RecoveryBanner message={convStateForChildren.message} recoveryKind={convStateForChildren.recovery_kind} />
+      ) : convStateForChildren.type === 'awaiting_recovery' ? (
         <>
         {credentialStatus && (
           <Suspense fallback={null}>
@@ -1342,11 +1360,12 @@ function ConversationPageContent() {
           </RenderProfiler>
         )}
         </>
-      ) : !isArchived && convStateForChildren.type === 'awaiting_user_response' ? (
+      ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
           showToast={showInfo}
+          readOnly={isArchived}
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />

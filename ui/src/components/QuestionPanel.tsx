@@ -36,6 +36,7 @@ export interface QuestionPanelProps {
    *  reconciles. Mirrors handleSend in ConversationPage.tsx. */
   onAnswered: () => void;
   onDismissed: () => void;
+  readOnly?: boolean;
 }
 
 const OTHER_SENTINEL = '__other__';
@@ -55,6 +56,7 @@ export function QuestionPanel({
   showToast,
   onAnswered,
   onDismissed,
+  readOnly = false,
 }: QuestionPanelProps) {
   useRegisterFocusScope('question-panel');
 
@@ -231,7 +233,7 @@ export function QuestionPanel({
 
   // --- Submit / Dismiss ---
   const handleSubmit = useCallback(async () => {
-    if (!allAnswered || submitting) return;
+    if (readOnly || !allAnswered || submitting) return;
     setSubmitting(true);
     setFeedback(null);
     try {
@@ -250,6 +252,7 @@ export function QuestionPanel({
       setSubmitting(false);
     }
   }, [
+    readOnly,
     allAnswered,
     submitting,
     conversationId,
@@ -260,13 +263,13 @@ export function QuestionPanel({
   ]);
 
   const handleDismissClick = useCallback(() => {
-    if (submitting) return;
+    if (readOnly || submitting) return;
     setShowConfirmDismiss(true);
-  }, [submitting]);
+  }, [readOnly, submitting]);
 
   const handleConfirmDismiss = useCallback(async () => {
     setShowConfirmDismiss(false);
-    if (submitting) return;
+    if (readOnly || submitting) return;
     setSubmitting(true);
     setFeedback(null);
     try {
@@ -279,7 +282,7 @@ export function QuestionPanel({
     } finally {
       setSubmitting(false);
     }
-  }, [submitting, conversationId, onDismissed, showToast]);
+  }, [readOnly, submitting, conversationId, onDismissed, showToast]);
 
   // --- Navigation ---
   const goToStep = useCallback(
@@ -408,6 +411,7 @@ export function QuestionPanel({
   // --- Keyboard handler (component-level, not document) ---
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (readOnly) return;
       if (!currentQuestion) return;
 
       // If confirm dialog is open, don't handle
@@ -598,6 +602,7 @@ export function QuestionPanel({
       isQuestionAnswered,
       goNext,
       goBack,
+      readOnly,
       showToast,
       toggleNotes,
     ]
@@ -632,7 +637,7 @@ export function QuestionPanel({
                 <button
                   className={`question-breadcrumb${isCurrent ? ' current' : ''}${answered && !isCurrent ? ' answered' : ''}${!answered && !isCurrent ? ' unanswered' : ''}`}
                   onClick={() => goToStep(i)}
-                  disabled={submitting}
+                  disabled={readOnly || submitting}
                   title={isCurrent ? q.question : `Go to question ${i + 1}: ${q.header}`}
                 >
                   {answered && !isCurrent && (
@@ -658,30 +663,33 @@ export function QuestionPanel({
           notesText={annotations[currentQuestion.question]?.notes ?? ''}
           focusedIndex={focusedIndex}
           otherInputRef={otherInputRef}
-          onSelect={setAnswer}
-          onOtherText={setOtherText}
-          onMultiToggle={toggleMultiSelect}
+          readOnly={readOnly}
+          onSelect={readOnly ? () => {} : setAnswer}
+          onOtherText={readOnly ? () => {} : setOtherText}
+          onMultiToggle={readOnly ? () => {} : toggleMultiSelect}
           onFocusPreview={(questionText, preview) =>
             setFocusedPreviews((prev) => ({
               ...prev,
               [questionText]: preview,
             }))
           }
-          onToggleNotes={toggleNotes}
-          onSetNotes={setNotes}
+          onToggleNotes={readOnly ? () => {} : toggleNotes}
+          onSetNotes={readOnly ? () => {} : setNotes}
           onFocusIndex={setFocusedIndex}
         />
       </div>
 
       <div className="question-actions">
-        <button
-          className="question-btn question-btn--dismiss-small"
-          onClick={handleDismissClick}
-          disabled={submitting}
-          title="Dismiss questions without sending an answer"
-        >
-          Dismiss
-        </button>
+        {!readOnly && (
+          <button
+            className="question-btn question-btn--dismiss-small"
+            onClick={handleDismissClick}
+            disabled={submitting}
+            title="Dismiss questions without sending an answer"
+          >
+            Dismiss
+          </button>
+        )}
 
         <ConfirmDialog
           visible={showConfirmDismiss}
@@ -706,14 +714,14 @@ export function QuestionPanel({
             <button
               className="question-btn question-btn--nav"
               onClick={goBack}
-              disabled={isFirstStep || submitting}
+              disabled={isFirstStep || readOnly || submitting}
               title={formatShortcut('Shift+Tab for previous')}
             >
               <ArrowLeft size={16} />
               Back
             </button>
           )}
-          {!isLastStep ? (
+          {!readOnly && !isLastStep ? (
             <button
               className="question-btn question-btn--next"
               onClick={goNext}
@@ -723,7 +731,7 @@ export function QuestionPanel({
               Next
               <ArrowRight size={16} />
             </button>
-          ) : (
+          ) : !readOnly ? (
             <button
               className="question-btn question-btn--submit"
               onClick={handleSubmit}
@@ -737,7 +745,7 @@ export function QuestionPanel({
               <Check size={16} />
               {submitting ? 'Sending...' : 'Submit'}
             </button>
-          )}
+          ) : null}
         </div>
       </div>
     </div>
@@ -756,6 +764,7 @@ interface QuestionItemProps {
   notesText: string;
   focusedIndex: number;
   otherInputRef: React.RefObject<HTMLTextAreaElement | null>;
+  readOnly: boolean;
   onSelect: (questionText: string, value: string) => void;
   onOtherText: (questionText: string, value: string) => void;
   onMultiToggle: (questionText: string, label: string) => void;
@@ -775,6 +784,7 @@ function QuestionItem({
   notesText,
   focusedIndex,
   otherInputRef,
+  readOnly,
   onSelect,
   onOtherText,
   onMultiToggle,
@@ -965,7 +975,7 @@ function QuestionItem({
   };
 
   return (
-    <div className="question-item">
+    <div className="question-item" aria-readonly={readOnly}>
       <span className="question-header">{q.header}</span>
       <div className="question-text">
         <ReactMarkdown>{q.question}</ReactMarkdown>
