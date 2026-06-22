@@ -219,24 +219,51 @@ const PATH_LIKE_EXTENSIONS: &[&str] = &[
 ];
 
 /// Determine whether a token after @ looks like an intentional file path reference.
-/// Returns true if the token contains `/` (path separator) or ends with a known
-/// file extension. Returns false for bare words like "username" or "param".
+/// Path references must have a path-token shape before slash/extension heuristics apply.
 fn looks_like_file_path(token: &str) -> bool {
-    // Bazel labels (@repo//pkg:target, @+canonical//...) and URL-ish strings
-    // (@https://...) contain "//". Real file paths do not. Exclude these before
-    // the single-slash check would otherwise match them.
-    if token.contains("//") {
+    if !has_path_token_shape(token) {
         return false;
     }
+
     if token.contains('/') {
         return true;
     }
+
     if let Some(ext) = token.rsplit('.').next() {
-        if ext != token && PATH_LIKE_EXTENSIONS.contains(&ext) {
-            return true;
+        if ext != token {
+            let ext = ext.to_ascii_lowercase();
+            return PATH_LIKE_EXTENSIONS.contains(&ext.as_str());
         }
     }
+
     false
+}
+
+fn has_path_token_shape(token: &str) -> bool {
+    if token.is_empty() || token.contains("//") {
+        return false;
+    }
+
+    if !token.chars().all(is_path_token_char) {
+        return false;
+    }
+
+    if token.ends_with('/') || token.ends_with('.') {
+        return false;
+    }
+
+    if token.starts_with('/') {
+        return token
+            .split('/')
+            .skip(1)
+            .all(|component| !component.is_empty());
+    }
+
+    token.split('/').all(|component| !component.is_empty())
+}
+
+fn is_path_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '~' | '@')
 }
 
 /// Expand all inline references in `text` against `root`.
@@ -937,6 +964,27 @@ mod tests {
     }
 
     #[test]
+    fn test_fastapi_decorator_passes_through() {
+        let tmp = make_tmp();
+        let input = r#"@app.get("/.well-known/api-catalog", include_in_schema=False)"#;
+        let result = expand(input, &root(tmp.path())).unwrap();
+        assert_eq!(result.llm_text, input);
+    }
+
+    #[test]
+    fn test_pasted_fastapi_route_snippet_passes_through() {
+        let tmp = make_tmp();
+        let input = r#"Can you review this route?
+
+@app.get("/.well-known/api-catalog", include_in_schema=False)
+def api_catalog():
+    return {"ok": True}
+"#;
+        let result = expand(input, &root(tmp.path())).unwrap();
+        assert_eq!(result.llm_text, input);
+    }
+
+    #[test]
     fn test_at_with_extension_treated_as_file_ref() {
         let tmp = make_tmp();
         // This has .md extension -- looks like a file, should try to resolve
@@ -967,10 +1015,17 @@ mod tests {
         assert!(looks_like_file_path("AGENTS.md"));
         assert!(looks_like_file_path("config.toml"));
         assert!(looks_like_file_path("test.txt"));
+        assert!(looks_like_file_path("foo/bar"));
         assert!(!looks_like_file_path("username"));
         assert!(!looks_like_file_path("param"));
         assert!(!looks_like_file_path("override"));
         assert!(!looks_like_file_path("TODO"));
+        assert!(!looks_like_file_path(
+            "app.get(\"/.well-known/api-catalog\","
+        ));
+        assert!(!looks_like_file_path("src/main.rs,"));
+        assert!(!looks_like_file_path("foo/bar)"));
+        assert!(!looks_like_file_path("notes.md:"));
     }
 
     #[test]

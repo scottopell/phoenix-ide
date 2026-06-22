@@ -46,8 +46,9 @@ value SkillInvocation {
 
 config {
     -- File extensions recognized as "path-like" for @ reference heuristic.
-    -- A token after @ is treated as an intentional file reference when it
-    -- contains "/" or ends with one of these extensions.
+    -- A token after @ is treated as an intentional file reference when it has
+    -- a valid path-token shape and then either contains "/" or ends with one
+    -- of these extensions.
     path_like_extensions: Set<String> = {
         "rs", "ts", "tsx", "js", "jsx", "py", "go", "md", "json",
         "yaml", "yml", "toml", "txt", "css", "html", "sh", "sql",
@@ -80,7 +81,7 @@ rule TokenizeReferences {
 }
 
 ------------------------------------------------------------
--- Rules: Intent Classification (NEW)
+-- Rules: Intent Classification
 ------------------------------------------------------------
 
 -- Classify each @ reference as intentional file reference or literal text.
@@ -100,12 +101,16 @@ rule ClassifyAtReferenceAsFile {
 
     @guidance
         -- looks_like_path: black-box predicate evaluated on the token —
-        -- true when the token contains "/" OR its trailing dot-suffix is
-        -- in config.path_like_extensions. Implementation: the same check
-        -- in expand() in message_expander.rs.
+        -- true when the token has a valid path-token shape and then either
+        -- contains "/" or its trailing dot-suffix is in
+        -- config.path_like_extensions. Valid path-token shapes contain only
+        -- path characters and reject code/prose delimiters or trailing
+        -- punctuation before slash/extension checks are applied.
+        -- Implementation: the same check in expand() in message_expander.rs.
         -- Examples:
-        --   @src/main.rs       -> file_expansion (contains /)
+        --   @src/main.rs       -> file_expansion (valid path token with /)
         --   @AGENTS.md         -> file_expansion (.md is a known extension)
+        --   @app.get("/x",     -> not_a_reference (code-shaped token)
 }
 
 rule ClassifyAtReferenceAsLiteral {
@@ -119,6 +124,7 @@ rule ClassifyAtReferenceAsLiteral {
         -- Examples:
         --   @username          -> not_a_reference (bare word, no / or extension)
         --   @param             -> not_a_reference (bare word)
+        --   @app.get("/x",     -> not_a_reference (code-shaped token)
         --   user@email.com     -> not tokenized (@ not preceded by whitespace)
         --
         -- Implementation: in expand(), after tokenizing, check each @ ref.
