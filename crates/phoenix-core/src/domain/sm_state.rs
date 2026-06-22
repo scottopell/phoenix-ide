@@ -1035,10 +1035,8 @@ pub enum ConvState {
 
     /// Awaiting human approval before spending review tokens for `commission_review`.
     AwaitingCommissionReviewApproval {
-        tool_call: ToolCall,
-        brief: String,
-        focus: Option<String>,
-        allow_dirty_working_tree: bool,
+        tool_use_id: String,
+        request: CommissionReviewInput,
         assistant_message: AssistantMessage,
     },
 
@@ -1142,10 +1140,8 @@ pub enum ParentState {
         tool_use_id: String,
     },
     AwaitingCommissionReviewApproval {
-        tool_call: ToolCall,
-        brief: String,
-        focus: Option<String>,
-        allow_dirty_working_tree: bool,
+        tool_use_id: String,
+        request: CommissionReviewInput,
         assistant_message: AssistantMessage,
     },
     ContextExhausted {
@@ -1210,16 +1206,12 @@ impl From<ParentState> for ConvState {
                 tool_use_id,
             },
             ParentState::AwaitingCommissionReviewApproval {
-                tool_call,
-                brief,
-                focus,
-                allow_dirty_working_tree,
+                tool_use_id,
+                request,
                 assistant_message,
             } => ConvState::AwaitingCommissionReviewApproval {
-                tool_call,
-                brief,
-                focus,
-                allow_dirty_working_tree,
+                tool_use_id,
+                request,
                 assistant_message,
             },
             ParentState::ContextExhausted { summary } => ConvState::ContextExhausted { summary },
@@ -1436,16 +1428,12 @@ impl TryFrom<ConvState> for ParentState {
                 tool_use_id,
             }),
             ConvState::AwaitingCommissionReviewApproval {
-                tool_call,
-                brief,
-                focus,
-                allow_dirty_working_tree,
+                tool_use_id,
+                request,
                 assistant_message,
             } => Ok(ParentState::AwaitingCommissionReviewApproval {
-                tool_call,
-                brief,
-                focus,
-                allow_dirty_working_tree,
+                tool_use_id,
+                request,
                 assistant_message,
             }),
             ConvState::ContextExhausted { summary } => {

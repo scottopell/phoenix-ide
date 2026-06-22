@@ -6265,9 +6265,7 @@ mod tests {
     #[tokio::test]
     async fn test_reset_preserves_awaiting_commission_review_approval_state() {
         use phoenix_core::domain::llm_types::ContentBlock;
-        use phoenix_core::domain::sm_state::{
-            AssistantMessage, CommissionReviewInput, ToolCall, ToolInput,
-        };
+        use phoenix_core::domain::sm_state::{AssistantMessage, CommissionReviewInput};
 
         let db = Database::open_in_memory().await.unwrap();
 
@@ -6283,17 +6281,12 @@ mod tests {
         .unwrap();
 
         let approval_state = ConvState::AwaitingCommissionReviewApproval {
-            tool_call: ToolCall::new(
-                "tool-review-1",
-                ToolInput::CommissionReview(CommissionReviewInput {
-                    brief: "Ready for review".to_string(),
-                    focus: Some("correctness".to_string()),
-                    allow_dirty_working_tree: true,
-                }),
-            ),
-            brief: "Ready for review".to_string(),
-            focus: Some("correctness".to_string()),
-            allow_dirty_working_tree: true,
+            tool_use_id: "tool-review-1".to_string(),
+            request: CommissionReviewInput {
+                brief: "Ready for review".to_string(),
+                focus: Some("correctness".to_string()),
+                allow_dirty_working_tree: true,
+            },
             assistant_message: AssistantMessage::new(
                 "req".to_string(),
                 vec![ContentBlock::text("requesting review")],

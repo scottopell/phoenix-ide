@@ -237,9 +237,14 @@ export function parseConversationState(raw: unknown): ConversationState {
         plan: (obj['plan'] as string) ?? '',
       };
     case 'awaiting_commission_review_approval': {
-      const brief = obj['brief'];
-      const focus = obj['focus'];
-      const allowDirty = obj['allow_dirty_working_tree'];
+      const request = obj['request'];
+      if (!request || typeof request !== 'object' || Array.isArray(request)) {
+        return invalidRequestError('Invalid commission review approval state: missing request');
+      }
+      const requestObj = request as Record<string, unknown>;
+      const brief = requestObj['brief'];
+      const focus = requestObj['focus'];
+      const allowDirty = requestObj['allow_dirty_working_tree'];
       if (typeof brief !== 'string' || brief.trim() === '') {
         return invalidRequestError('Invalid commission review approval state: missing brief');
       }

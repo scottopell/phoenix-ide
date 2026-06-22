@@ -802,19 +802,12 @@ mod tests {
 
     fn commission_review_state() -> ConvState {
         ConvState::AwaitingCommissionReviewApproval {
-            tool_call: crate::state_machine::state::ToolCall::new(
-                "tool-review-1",
-                crate::state_machine::state::ToolInput::CommissionReview(
-                    crate::state_machine::state::CommissionReviewInput {
-                        brief: "Ready for review".to_string(),
-                        focus: None,
-                        allow_dirty_working_tree: false,
-                    },
-                ),
-            ),
-            brief: "Ready for review".to_string(),
-            focus: None,
-            allow_dirty_working_tree: false,
+            tool_use_id: "tool-review-1".to_string(),
+            request: crate::state_machine::state::CommissionReviewInput {
+                brief: "Ready for review".to_string(),
+                focus: None,
+                allow_dirty_working_tree: false,
+            },
             assistant_message: crate::state_machine::state::AssistantMessage::new(
                 "req".to_string(),
                 vec![],

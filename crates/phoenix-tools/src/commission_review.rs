@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 const MAX_REVIEW_BYTES: usize = 180_000;
@@ -414,6 +415,12 @@ async fn resolve_target(
 async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCollection, String> {
     let repo = Path::new(&target.summary.repo_root);
     let mut warnings = Vec::new();
+    let effective_range_base = match &target.diff_spec {
+        DiffSpec::Range { base, head, .. } => {
+            Some(git_capture(repo, &["merge-base", base, head]).await?)
+        }
+        DiffSpec::Workspace => None,
+    };
     let numstat = match &target.diff_spec {
         DiffSpec::Range {
             base,
@@ -421,10 +428,10 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
             include_worktree,
         } => {
             if *include_worktree {
-                git_capture(repo, &["diff", "--numstat", base, "--"]).await?
+                let merge_base = effective_range_base.as_deref().unwrap_or(base);
+                git_capture(repo, &["diff", "--numstat", merge_base, "--"]).await?
             } else {
-                let merge_base_range = format!("{base}...{head}");
-                git_capture(repo, &["diff", "--numstat", &merge_base_range]).await?
+                git_capture(repo, &["diff", "--numstat", &format!("{base}...{head}")]).await?
             }
         }
         DiffSpec::Workspace => git_capture(repo, &["diff", "--numstat", "HEAD", "--"]).await?,
@@ -479,17 +486,46 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                 head,
                 include_worktree,
             } => {
-                let diff_output = if *include_worktree {
-                    git_capture(repo, &["diff", base, "--", file]).await
+                let (diff_output, truncated) = if *include_worktree {
+                    let merge_base = effective_range_base.as_deref().unwrap_or(base);
+                    git_capture_limited(repo, &["diff", merge_base, "--", file], MAX_FILE_BYTES + 1)
+                        .await
+                        .unwrap_or_default()
                 } else {
                     let merge_base_range = format!("{base}...{head}");
-                    git_capture(repo, &["diff", &merge_base_range, "--", file]).await
+                    git_capture_limited(
+                        repo,
+                        &["diff", &merge_base_range, "--", file],
+                        MAX_FILE_BYTES + 1,
+                    )
+                    .await
+                    .unwrap_or_default()
                 };
-                diff_output.unwrap_or_default()
+                if truncated {
+                    warnings.push(warning(
+                        "file_too_large",
+                        "file diff exceeded per-file review cap",
+                        Some(file),
+                    ));
+                    continue;
+                }
+                diff_output
             }
-            DiffSpec::Workspace => git_capture(repo, &["diff", "HEAD", "--", file])
-                .await
-                .unwrap_or_default(),
+            DiffSpec::Workspace => {
+                let (diff_output, truncated) =
+                    git_capture_limited(repo, &["diff", "HEAD", "--", file], MAX_FILE_BYTES + 1)
+                        .await
+                        .unwrap_or_default();
+                if truncated {
+                    warnings.push(warning(
+                        "file_too_large",
+                        "file diff exceeded per-file review cap",
+                        Some(file),
+                    ));
+                    continue;
+                }
+                diff_output
+            }
         };
         if diff.len() > MAX_FILE_BYTES {
             warnings.push(warning(
@@ -502,10 +538,10 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
         if body.len() + diff.len() > MAX_REVIEW_BYTES {
             warnings.push(warning(
                 "review_truncated",
-                "review diff exceeded total review cap",
+                "file diff skipped because total review cap was already reached",
                 Some(file),
             ));
-            break;
+            continue;
         }
         if !diff.trim().is_empty() {
             files_reviewed += 1;
@@ -585,11 +621,24 @@ fn parse_findings(text: &str) -> (Vec<ReviewFinding>, Option<String>, Vec<Review
     let mut parse_repaired = false;
     let parsed = serde_json::from_str::<ModelReviewResponse>(&cleaned).or_else(|_| {
         parse_repaired = true;
-        let start = cleaned.find('{').unwrap_or(0);
-        let end = cleaned
-            .rfind('}')
-            .map(|idx| idx + 1)
-            .unwrap_or(cleaned.len());
+        let Some(start) = cleaned.find('{') else {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "no JSON object start",
+            )));
+        };
+        let Some(end) = cleaned.rfind('}').map(|idx| idx + 1) else {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "no JSON object end",
+            )));
+        };
+        if start >= end {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid JSON object bounds",
+            )));
+        }
         serde_json::from_str::<ModelReviewResponse>(&cleaned[start..end])
     });
 
@@ -760,6 +809,52 @@ async fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
         Ok(String::from_utf8_lossy(&output.stdout)
             .trim_end()
             .to_string())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+async fn git_capture_limited(
+    cwd: &Path,
+    args: &[&str],
+    max_bytes: usize,
+) -> Result<(String, bool), String> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run git {}: {e}", args.join(" ")))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("failed to capture git {} stdout", args.join(" ")))?;
+    let mut buf = vec![0_u8; max_bytes.saturating_add(1)];
+    let n = stdout
+        .read(&mut buf)
+        .await
+        .map_err(|e| format!("failed reading git {} stdout: {e}", args.join(" ")))?;
+    let truncated = n > max_bytes;
+    if truncated {
+        let _ = child.kill().await;
+        return Ok((String::new(), true));
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("failed waiting for git {}: {e}", args.join(" ")))?;
+    if output.status.success() {
+        Ok((
+            String::from_utf8_lossy(&buf[..n]).trim_end().to_string(),
+            false,
+        ))
     } else {
         Err(format!(
             "git {} failed: {}",

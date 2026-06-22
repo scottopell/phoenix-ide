@@ -118,9 +118,11 @@ describe('parseConversationState commission review approval', () => {
   it('parses valid commission review approval state', () => {
     expect(parseConversationState({
       type: 'awaiting_commission_review_approval',
-      brief: 'Ready for review',
-      focus: 'security',
-      allow_dirty_working_tree: true,
+      request: {
+        brief: 'Ready for review',
+        focus: 'security',
+        allow_dirty_working_tree: true,
+      },
     })).toEqual({
       type: 'awaiting_commission_review_approval',
       brief: 'Ready for review',
@@ -131,9 +133,9 @@ describe('parseConversationState commission review approval', () => {
 
   it('rejects invalid commission review payloads', () => {
     for (const raw of [
-      { type: 'awaiting_commission_review_approval', allow_dirty_working_tree: false },
-      { type: 'awaiting_commission_review_approval', brief: 'Ready', allow_dirty_working_tree: 'false' },
-      { type: 'awaiting_commission_review_approval', brief: 'Ready', focus: 42, allow_dirty_working_tree: false },
+      { type: 'awaiting_commission_review_approval', request: { allow_dirty_working_tree: false } },
+      { type: 'awaiting_commission_review_approval', request: { brief: 'Ready', allow_dirty_working_tree: 'false' } },
+      { type: 'awaiting_commission_review_approval', request: { brief: 'Ready', focus: 42, allow_dirty_working_tree: false } },
     ]) {
       expect(parseConversationState(raw).type).toBe('error');
     }

@@ -1767,19 +1767,19 @@ pub fn transition_parent(
 
         (
             ParentState::AwaitingCommissionReviewApproval {
-                tool_call,
+                tool_use_id,
+                request,
                 assistant_message,
-                ..
             },
             ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
                 outcome: CommissionReviewApprovalOutcome::Approved,
             }),
         ) => {
-            let mut approved_tool = tool_call.clone();
-            if let ToolInput::CommissionReview(input) = &approved_tool.input {
-                approved_tool.input = ToolInput::ApprovedCommissionReview(
+            let approved_tool = ToolCall::new(
+                tool_use_id.clone(),
+                ToolInput::ApprovedCommissionReview(
                     phoenix_core::domain::sm_state::ApprovedCommissionReviewInput {
-                        request: input.clone(),
+                        request: request.clone(),
                         runtime_base_branch: match context.mode_context.as_ref() {
                             Some(
                                 ModeContext::Work { base_branch, .. }
@@ -1793,8 +1793,8 @@ pub fn transition_parent(
                             .as_ref()
                             .map(|path| path.display().to_string()),
                     },
-                );
-            }
+                ),
+            );
             Ok(
                 ParentTransitionResult::new(ParentState::Core(CoreState::ToolExecuting {
                     current_tool: approved_tool.clone(),
@@ -1810,25 +1810,44 @@ pub fn transition_parent(
         }
 
         (
-            ParentState::AwaitingCommissionReviewApproval { .. },
+            ParentState::AwaitingCommissionReviewApproval {
+                tool_use_id,
+                request,
+                assistant_message,
+            },
             ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
                 outcome: CommissionReviewApprovalOutcome::Rejected,
             })
             | ParentEvent::Core(CoreEvent::UserCancel { .. }),
-        ) => Ok(
-            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
-                .with_effect(Effect::PersistMessage {
-                    content: phoenix_core::domain::db_schema::MessageContent::system(
-                        "Commission review rejected.",
-                    ),
-                    display_data: None,
-                    usage_data: None,
-                    message_id: uuid::Uuid::new_v4().to_string(),
-                    idempotent: false,
+        ) => {
+            let tool_result = ToolResult::success(
+                tool_use_id.clone(),
+                serde_json::json!({
+                    "status": "rejected",
+                    "summary": {
+                        "brief": request.brief,
+                        "focus": request.focus,
+                        "allow_dirty_working_tree": request.allow_dirty_working_tree,
+                        "reviewer_summary": "Commission review rejected before LLM execution"
+                    },
+                    "findings": [],
+                    "warnings": []
                 })
+                .to_string(),
+            );
+            let checkpoint =
+                CheckpointData::tool_round(assistant_message.clone(), vec![tool_result])
+                    .expect("commission_review rejection pairs exactly one tool_use");
+            Ok(
+                ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting {
+                    attempt: 1,
+                }))
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_agent_done()),
-        ),
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm),
+            )
+        }
 
         (
             ParentState::AwaitingUserResponse { .. },
@@ -2408,10 +2427,8 @@ pub fn transition_parent(
 
                 return Ok(ParentTransitionResult::new(
                     ParentState::AwaitingCommissionReviewApproval {
-                        tool_call: tool.clone(),
-                        brief: input.brief.clone(),
-                        focus: input.focus.clone(),
-                        allow_dirty_working_tree: input.allow_dirty_working_tree,
+                        tool_use_id: tool.id.clone(),
+                        request: input.clone(),
                         assistant_message,
                     },
                 )
@@ -5958,18 +5975,22 @@ mod tests {
 
         fn approval_state() -> ConvState {
             ConvState::AwaitingCommissionReviewApproval {
-                tool_call: ToolCall::new(
-                    "tool-review-1",
-                    ToolInput::CommissionReview(CommissionReviewInput {
-                        brief: "Ready for independent review".to_string(),
-                        focus: None,
-                        allow_dirty_working_tree: true,
-                    }),
+                tool_use_id: "tool-review-1".to_string(),
+                request: CommissionReviewInput {
+                    brief: "Ready for independent review".to_string(),
+                    focus: None,
+                    allow_dirty_working_tree: true,
+                },
+                assistant_message: AssistantMessage::new(
+                    "req".to_string(),
+                    vec![ContentBlock::ToolUse {
+                        id: "tool-review-1".to_string(),
+                        name: "commission_review".to_string(),
+                        input: serde_json::json!({ "brief": "Ready for independent review" }),
+                    }],
+                    None,
+                    None,
                 ),
-                brief: "Ready for independent review".to_string(),
-                focus: None,
-                allow_dirty_working_tree: true,
-                assistant_message: AssistantMessage::new("req".to_string(), vec![], None, None),
             }
         }
 
@@ -5990,7 +6011,7 @@ mod tests {
             )
             .expect("reject should settle approval state");
 
-            assert_eq!(result.new_state, ConvState::Idle);
+            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
             assert!(!has_execute_tool(&result.effects));
         }
 
@@ -6003,7 +6024,7 @@ mod tests {
             )
             .expect("cancel should settle approval state");
 
-            assert_eq!(result.new_state, ConvState::Idle);
+            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
             assert!(!has_execute_tool(&result.effects));
         }
 
@@ -6105,17 +6126,12 @@ mod tests {
         #[test]
         fn approval_converts_public_input_to_runtime_owned_input() {
             let state = ConvState::AwaitingCommissionReviewApproval {
-                tool_call: ToolCall::new(
-                    "tool-review-1",
-                    ToolInput::CommissionReview(CommissionReviewInput {
-                        brief: "Ready for independent review".to_string(),
-                        focus: None,
-                        allow_dirty_working_tree: true,
-                    }),
-                ),
-                brief: "Ready for independent review".to_string(),
-                focus: None,
-                allow_dirty_working_tree: true,
+                tool_use_id: "tool-review-1".to_string(),
+                request: CommissionReviewInput {
+                    brief: "Ready for independent review".to_string(),
+                    focus: None,
+                    allow_dirty_working_tree: true,
+                },
                 assistant_message: AssistantMessage::new("req".to_string(), vec![], None, None),
             };
             let mut context = test_context();
