@@ -321,6 +321,27 @@ export class CacheDB {
     store.delete(id);
   }
 
+  async deletePendingOpsForConversation(conversationId: string, type?: PendingOperation['type']): Promise<number> {
+    await this.init();
+    const tx = this.db!.transaction(['pendingOps'], 'readwrite');
+    const store = tx.objectStore('pendingOps');
+    const index = store.index('by-conversation');
+
+    const ops = await new Promise<PendingOperation[]>((resolve) => {
+      const request = index.getAll(IDBKeyRange.only(conversationId));
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => resolve([]);
+    });
+
+    let deleted = 0;
+    for (const op of ops) {
+      if (type && op.type !== type) continue;
+      store.delete(op.id);
+      deleted += 1;
+    }
+    return deleted;
+  }
+
   // Storage management
   async getStorageInfo(): Promise<{ usage: number; quota: number }> {
     if ('storage' in navigator && 'estimate' in navigator.storage) {

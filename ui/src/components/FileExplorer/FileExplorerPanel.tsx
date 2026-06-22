@@ -114,6 +114,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
           task={selectedTask}
           tasksDir={rootPath ? `${rootPath}/tasks` : null}
           activeSlug={activeSlug}
+          readOnly={!rootPath}
           onBack={() => setSelectedTask(null)}
         />
       : null;

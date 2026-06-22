@@ -153,7 +153,8 @@ function ConversationPageContent() {
   // No coordinating effects: the type system enforces the single slot.
   const viewerSlot = useViewerSlot();
   const slotKind = viewerSlot.slot.kind;
-  const diffPresentation = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.presentation : null;
+  const rawDiffPresentation = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.presentation : null;
+  const diffPresentation = isArchived ? null : rawDiffPresentation;
   const fullscreenDiffOpen = diffPresentation === 'fullscreen';
   const paneDiffOpen = diffPresentation === 'pane';
   const browserOpen = slotKind === 'browser';
@@ -210,7 +211,7 @@ function ConversationPageContent() {
   }, []);
 
   // App state for offline support
-  const { isOnline, queueOperation } = useAppMachine();
+  const { isOnline, queueOperation, removePendingOperations } = useAppMachine();
 
   // Toast for question panel feedback
   const { toasts, dismissToast, showInfo, showError } = useToast();
@@ -573,9 +574,14 @@ function ConversationPageContent() {
   useEffect(() => {
     if (!isArchived) return;
     for (const msg of pendingMessages) {
-      if (msg.status !== 'steering_queued') dismiss(msg.localId);
+      dismiss(msg.localId);
     }
-  }, [isArchived, pendingMessages, dismiss]);
+    if (conversationId) {
+      void removePendingOperations(conversationId, 'send_message').catch((err) => {
+        console.error('Failed to drop archived pending operations:', err);
+      });
+    }
+  }, [isArchived, conversationId, pendingMessages, dismiss, removePendingOperations]);
 
   // Send queued messages when connection is restored. Iterate the derived
   // `pendingMessages` (NOT raw `queuedMessages`) so we don't re-POST entries
@@ -1113,7 +1119,7 @@ function ConversationPageContent() {
         pendingMessages={pendingMessages}
         convState={convStateForChildren}
         onRetry={handleRetry}
-        onCancelSteering={handleCancelSteering}
+        onCancelSteering={isArchived ? undefined : handleCancelSteering}
         onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
         workScopeKey={isArchived ? undefined : conversation.work_scope_key}

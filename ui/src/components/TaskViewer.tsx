@@ -11,6 +11,7 @@ interface TaskViewerProps {
    *  the live conversation row from the store; it is used as the seed parent
    *  when starting a "work on this task" sub-conversation. */
   activeSlug: string;
+  readOnly?: boolean;
   onBack: () => void;
 }
 
@@ -25,7 +26,7 @@ const STATUS_CLASS: Record<string, string> = {
 
 const TERMINAL_STATUSES = new Set(['done', 'wont-do']);
 
-export function TaskViewer({ task, tasksDir, activeSlug, onBack }: TaskViewerProps) {
+export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBack }: TaskViewerProps) {
   const navigate = useNavigate();
   const createConversationWithStore = useCreateConversationWithStore();
   // Read the parent conversation live from the store rather than receiving a
@@ -82,7 +83,7 @@ export function TaskViewer({ task, tasksDir, activeSlug, onBack }: TaskViewerPro
   const isTerminal = TERMINAL_STATUSES.has(task.status);
   // The button needs the task body to build the prompt. We can show it as soon
   // as content is loaded; until then it's disabled with a loading hint.
-  const canStartWork = !isTerminal && parentConversation !== null;
+  const canStartWork = !readOnly && !isTerminal && parentConversation !== null && !parentConversation.archived;
 
   const handleStartWork = async () => {
     if (!parentConversation || rawContent === null) return;

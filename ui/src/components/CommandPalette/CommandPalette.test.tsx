@@ -93,6 +93,14 @@ describe('CommandPalette file root', () => {
     }))).toBe('/repo');
   });
 
+  it('returns no file root for archived conversations', () => {
+    expect(activeConversationFileRoot(makeConversation({
+      archived: true,
+      cwd: '/repo',
+      worktree_path: '/repo/.phoenix/worktrees/conv-1',
+    }))).toBeNull();
+  });
+
   it('searches files for the active conversation and opens results under worktree_path', async () => {
     const activeConversation = makeConversation({
       cwd: '/repo',

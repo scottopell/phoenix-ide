@@ -145,6 +145,13 @@ export function useAppMachine() {
     return id;
   }, [dispatch]);
 
+  const removePendingOperations = useCallback(async (conversationId: string, type?: PendingOperation['type']) => {
+    const removed = await cacheDB.deletePendingOpsForConversation(conversationId, type);
+    if (removed === 0) return;
+    pendingOpsCountRef.current = Math.max(0, pendingOpsCountRef.current - removed);
+    setPendingOpsCount(prev => Math.max(0, prev - removed));
+  }, []);
+
   return {
     isReady: appState.type === 'ready',
     initError: appState.type === 'error' ? appState.message : null,
@@ -152,5 +159,6 @@ export function useAppMachine() {
     pendingOpsCount,
     isSyncing: appState.type === 'ready' && appState.sync.type === 'syncing',
     queueOperation,
+    removePendingOperations,
   };
 }
