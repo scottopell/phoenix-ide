@@ -796,6 +796,16 @@ mod random_walk {
                 },
             },
 
+            ConvState::AwaitingCommissionReviewApproval { .. } => match rng.random_range(0..3) {
+                0 => Event::CommissionReviewApprovalDecided {
+                    outcome: crate::state::CommissionReviewApprovalOutcome::Approved,
+                },
+                1 => Event::CommissionReviewApprovalDecided {
+                    outcome: crate::state::CommissionReviewApprovalOutcome::Rejected,
+                },
+                _ => Event::UserCancel { reason: None },
+            },
+
             ConvState::AwaitingUserResponse { questions, .. } => {
                 match rng.random_range(0..2) {
                     0 => {

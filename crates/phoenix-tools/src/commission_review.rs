@@ -152,7 +152,7 @@ impl Tool for CommissionReviewTool {
     }
 
     fn description(&self) -> String {
-        "Request an independent Phoenix-native code review of the active git work. This is a capital-spend request: provide a concise executive brief explaining why the work is ready and why review tokens are useful now. Phoenix infers the review target from the active conversation/worktree. Set allow_dirty_working_tree only when reviewing uncommitted changes is intentional. The runtime approval surface sets approved_after_human_confirmation after the human approves; do not set it yourself.".to_string()
+        "Request an independent Phoenix-native code review of the active git work. This is a capital-spend request: provide a concise executive brief explaining why the work is ready and why review tokens are useful now. Phoenix infers the review target from the active conversation/worktree. Set allow_dirty_working_tree only when reviewing uncommitted changes is intentional.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -171,11 +171,6 @@ impl Tool for CommissionReviewTool {
                 "allow_dirty_working_tree": {
                     "type": "boolean",
                     "description": "Default false. Required for git-aware task/worktree review when uncommitted changes are present",
-                    "default": false
-                },
-                "approved_after_human_confirmation": {
-                    "type": "boolean",
-                    "description": "Runtime approval flag. The human approval flow sets this; agents must leave it false/omitted.",
                     "default": false
                 }
             }

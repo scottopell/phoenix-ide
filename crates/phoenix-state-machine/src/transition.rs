@@ -17,9 +17,10 @@ use super::event::{
 };
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
-    AssistantMessage, ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind,
-    ParentState, RecoveryKind, RecoveryResumeTarget, SubAgentOutcome, SubAgentResult,
-    SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
+    AssistantMessage, CommissionReviewApprovalOutcome, ContextExhaustionBehavior,
+    ContinuationSummaryRequest, CoreState, ModeKind, ParentState, RecoveryKind,
+    RecoveryResumeTarget, SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome,
+    ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -298,6 +299,11 @@ enum AskUserQuestionCall<'a> {
     Malformed(&'a str),
 }
 
+enum CommissionReviewCall<'a> {
+    Typed(&'a super::state::CommissionReviewInput),
+    Malformed(&'a str),
+}
+
 /// Result of a state transition
 #[derive(Debug)]
 pub struct TransitionResult {
@@ -410,6 +416,9 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         // transition_parent: explicit reject arms
         ConvState::AwaitingTaskApproval { .. } => Err(TransitionError::AwaitingTaskApproval),
         ConvState::AwaitingUserResponse { .. } => Err(TransitionError::AwaitingUserResponse),
+        ConvState::AwaitingCommissionReviewApproval { .. } => {
+            Err(TransitionError::AwaitingUserResponse)
+        }
         ConvState::ContextExhausted { .. } => Err(TransitionError::ContextExhausted),
         ConvState::HandedOff { .. } | ConvState::Terminal => {
             Err(TransitionError::ConversationTerminal)
@@ -1748,6 +1757,63 @@ pub fn transition_parent(
         ),
 
         // ============================================================
+        // Parent-only state: AwaitingCommissionReviewApproval
+        // ============================================================
+        (
+            ParentState::AwaitingCommissionReviewApproval { .. },
+            ParentEvent::Core(CoreEvent::UserMessage { .. } | CoreEvent::UserTriggerContinuation),
+        ) => Err(TransitionError::AwaitingUserResponse),
+
+        (
+            ParentState::AwaitingCommissionReviewApproval {
+                tool_call,
+                assistant_message,
+                ..
+            },
+            ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
+                outcome: CommissionReviewApprovalOutcome::Approved,
+            }),
+        ) => {
+            let mut approved_tool = tool_call.clone();
+            if let ToolInput::CommissionReview(input) = &mut approved_tool.input {
+                input.approved_after_human_confirmation = true;
+            }
+            Ok(
+                ParentTransitionResult::new(ParentState::Core(CoreState::ToolExecuting {
+                    current_tool: approved_tool.clone(),
+                    remaining_tools: vec![],
+                    completed_results: vec![],
+                    pending_sub_agents: vec![],
+                    assistant_message: assistant_message.clone(),
+                }))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::execute_tool(approved_tool)),
+            )
+        }
+
+        (
+            ParentState::AwaitingCommissionReviewApproval { .. },
+            ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
+                outcome: CommissionReviewApprovalOutcome::Rejected,
+            })
+            | ParentEvent::Core(CoreEvent::UserCancel { .. }),
+        ) => Ok(
+            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
+                .with_effect(Effect::PersistMessage {
+                    content: phoenix_core::domain::db_schema::MessageContent::system(
+                        "Commission review rejected.",
+                    ),
+                    display_data: None,
+                    usage_data: None,
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                    idempotent: false,
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_agent_done()),
+        ),
+
+        // ============================================================
         // Parent-only state: AwaitingUserResponse
         // ============================================================
         (
@@ -2222,6 +2288,129 @@ pub fn transition_parent(
                 .with_effect(Effect::RequestLlm));
             }
 
+            // REQ-CR-003: commission_review is a capital-spend request. Park
+            // for human approval instead of executing the review LLM in the
+            // normal tool round.
+            if let Some((tool, call)) = tool_calls.iter().find_map(|t| match &t.input {
+                ToolInput::CommissionReview(input) => Some((t, CommissionReviewCall::Typed(input))),
+                ToolInput::Malformed { name, error, .. } if name == "commission_review" => {
+                    Some((t, CommissionReviewCall::Malformed(error.as_str())))
+                }
+                ToolInput::Bash(_)
+                | ToolInput::Think(_)
+                | ToolInput::Patch(_)
+                | ToolInput::KeywordSearch(_)
+                | ToolInput::ReadImage(_)
+                | ToolInput::SpawnAgents(_)
+                | ToolInput::SubmitResult(_)
+                | ToolInput::SubmitError(_)
+                | ToolInput::ProposeTask(_)
+                | ToolInput::AskUserQuestion(_)
+                | ToolInput::Unknown { .. }
+                | ToolInput::Malformed { .. } => None,
+            }) {
+                if tool_calls.len() > 1 {
+                    let msg = "commission_review must be the only tool in response".to_string();
+                    let display_data = make_display_data(&content);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
+                    let error_results: Vec<ToolResult> = tool_calls
+                        .iter()
+                        .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
+                        .collect();
+                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)
+                        .expect("error_results.len() == tool_calls.len()");
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm));
+                }
+
+                let input = match call {
+                    CommissionReviewCall::Typed(input) => input,
+                    CommissionReviewCall::Malformed(err) => {
+                        let err_msg = format!(
+                            "commission_review input failed to parse: {err}. Re-emit the call with a valid `brief` string."
+                        );
+                        let display_data = make_display_data(&content);
+                        let assistant_message = AssistantMessage::new(
+                            request_id.clone(),
+                            content,
+                            Some(usage_data),
+                            display_data,
+                        );
+                        let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                        let checkpoint =
+                            CheckpointData::tool_round(assistant_message, vec![tool_result])
+                                .expect("commission_review produces exactly one result");
+                        return Ok(ParentTransitionResult::new(ParentState::Core(
+                            CoreState::LlmRequesting { attempt: 1 },
+                        ))
+                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_state_change())
+                        .with_effect(Effect::RequestLlm));
+                    }
+                };
+
+                if input.brief.trim().is_empty() {
+                    let err_msg = "commission_review requires a non-empty brief explaining why review is useful now".to_string();
+                    let display_data = make_display_data(&content);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
+                    let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result])
+                            .expect("commission_review produces exactly one result");
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm));
+                }
+
+                let tool_result = ToolResult::success(
+                    tool.id.clone(),
+                    "Commission review request submitted for human approval".to_string(),
+                );
+                let display_data = make_display_data(&content);
+                let assistant_message = AssistantMessage::new(
+                    request_id.clone(),
+                    content,
+                    Some(usage_data),
+                    display_data,
+                );
+                let checkpoint =
+                    CheckpointData::tool_round(assistant_message.clone(), vec![tool_result])
+                        .expect("commission_review produces exactly one tool_use and one result");
+
+                return Ok(ParentTransitionResult::new(
+                    ParentState::AwaitingCommissionReviewApproval {
+                        tool_call: tool.clone(),
+                        brief: input.brief.clone(),
+                        focus: input.focus.clone(),
+                        allow_dirty_working_tree: input.allow_dirty_working_tree,
+                        assistant_message,
+                    },
+                )
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change()));
+            }
+
             // REQ-AUQ-001: ask_user_question interception. Same shape as
             // propose_task: typed input takes the AwaitingUserResponse path,
             // a malformed payload surfaces the serde error to the LLM so it
@@ -2478,6 +2667,7 @@ pub fn transition_parent(
                 | ParentState::AwaitingRecovery { .. }
                 | ParentState::AwaitingTaskApproval { .. }
                 | ParentState::AwaitingUserResponse { .. }
+                | ParentState::AwaitingCommissionReviewApproval { .. }
                 | ParentState::ContextExhausted { .. }
                 | ParentState::HandedOff { .. }
                 | ParentState::Terminal => false,
@@ -3133,6 +3323,7 @@ fn current_attempt(state: &ConvState) -> u32 {
         | ConvState::AwaitingRecovery { .. }
         | ConvState::AwaitingTaskApproval { .. }
         | ConvState::AwaitingUserResponse { .. }
+        | ConvState::AwaitingCommissionReviewApproval { .. }
         | ConvState::ContextExhausted { .. }
         | ConvState::HandedOff { .. }
         | ConvState::Terminal => 1,
@@ -3449,6 +3640,7 @@ mod tests {
             | ConvState::AwaitingContinuation { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
+            | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. }
             | ConvState::HandedOff { .. }
             | ConvState::Terminal) => {

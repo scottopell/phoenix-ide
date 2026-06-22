@@ -55,7 +55,7 @@ export function formatShortDateTime(isoStr: string): string {
 export function isAgentWorking(state: ConversationState): boolean {
   switch (state.type) {
     case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
-    case 'awaiting_task_approval': case 'awaiting_user_response':
+    case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
       return false;
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
@@ -69,7 +69,7 @@ export function isAgentWorking(state: ConversationState): boolean {
 export function canCancelConversationState(state: ConversationState): boolean {
   switch (state.type) {
     case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
-    case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_recovery':
+    case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_commission_review_approval': case 'awaiting_recovery':
       return true;
     case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_llm': case 'awaiting_continuation': case 'awaiting_user_response':
@@ -84,7 +84,7 @@ export function isCancellingState(state: ConversationState): boolean {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return true;
     case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
-    case 'awaiting_task_approval': case 'awaiting_user_response':
+    case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
     case 'awaiting_recovery':
@@ -139,6 +139,7 @@ export function getStateDescription(state: ConversationState): string {
     case 'handed_off':
       return 'handed off';
     case 'awaiting_task_approval':
+    case 'awaiting_commission_review_approval':
       return 'awaiting approval';
     case 'awaiting_user_response':
       // Disambiguated from `llm_requesting`'s "awaiting LLM response":
@@ -234,6 +235,13 @@ export function parseConversationState(raw: unknown): ConversationState {
         title: (obj['title'] as string) ?? '',
         priority: (obj['priority'] as string) ?? '',
         plan: (obj['plan'] as string) ?? '',
+      };
+    case 'awaiting_commission_review_approval':
+      return {
+        type: 'awaiting_commission_review_approval',
+        brief: (obj['brief'] as string) ?? '',
+        focus: (obj['focus'] as string | null | undefined) ?? null,
+        allow_dirty_working_tree: Boolean(obj['allow_dirty_working_tree']),
       };
     case 'awaiting_user_response':
       return {

@@ -11,7 +11,7 @@ use super::AppState;
 use crate::db::{ConvMode, Conversation, MessageContent};
 use crate::git_ops::capture_branch_diff;
 use crate::runtime::fork_resolve::ForkResolveError;
-use crate::state_machine::state::TaskApprovalOutcome;
+use crate::state_machine::state::{CommissionReviewApprovalOutcome, TaskApprovalOutcome};
 use crate::state_machine::{ConvState, Event};
 use std::fmt::Write as _;
 
@@ -162,6 +162,78 @@ pub(crate) async fn task_feedback(
                 outcome: TaskApprovalOutcome::FeedbackProvided {
                     annotations: req.annotations,
                 },
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+// ============================================================
+// Commission Review Approval (REQ-CR-003)
+// ============================================================
+
+pub(crate) async fn approve_commission_review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(
+        conv.state,
+        ConvState::AwaitingCommissionReviewApproval { .. }
+    ) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting commission review approval".to_string(),
+        ));
+    }
+
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::CommissionReviewApprovalDecided {
+                outcome: CommissionReviewApprovalOutcome::Approved,
+            },
+        )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+pub(crate) async fn reject_commission_review(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(
+        conv.state,
+        ConvState::AwaitingCommissionReviewApproval { .. }
+    ) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting commission review approval".to_string(),
+        ));
+    }
+
+    state
+        .runtime
+        .send_event(
+            &id,
+            Event::CommissionReviewApprovalDecided {
+                outcome: CommissionReviewApprovalOutcome::Rejected,
             },
         )
         .await

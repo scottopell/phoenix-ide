@@ -77,8 +77,15 @@ pub struct CommissionReviewInput {
     pub focus: Option<String>,
     #[serde(default)]
     pub allow_dirty_working_tree: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub approved_after_human_confirmation: bool,
+}
+
+/// User decision for a pending `commission_review` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommissionReviewApprovalOutcome {
+    Approved,
+    Rejected,
 }
 
 /// Input for the `propose_task` tool (task approval workflow).
@@ -690,6 +697,7 @@ mod tests {
                 | ConvState::AwaitingContinuation { .. }
                 | ConvState::AwaitingTaskApproval { .. }
                 | ConvState::AwaitingUserResponse { .. }
+                | ConvState::AwaitingCommissionReviewApproval { .. }
                 | ConvState::ContextExhausted { .. }
                 | ConvState::HandedOff { .. }
                 | ConvState::Terminal => false,
@@ -1006,6 +1014,15 @@ pub enum ConvState {
         tool_use_id: String,
     },
 
+    /// Awaiting human approval before spending review tokens for `commission_review`.
+    AwaitingCommissionReviewApproval {
+        tool_call: ToolCall,
+        brief: String,
+        focus: Option<String>,
+        allow_dirty_working_tree: bool,
+        assistant_message: AssistantMessage,
+    },
+
     /// Context window exhausted - conversation is read-only
     ContextExhausted {
         /// The continuation summary
@@ -1105,6 +1122,13 @@ pub enum ParentState {
         questions: Vec<UserQuestion>,
         tool_use_id: String,
     },
+    AwaitingCommissionReviewApproval {
+        tool_call: ToolCall,
+        brief: String,
+        focus: Option<String>,
+        allow_dirty_working_tree: bool,
+        assistant_message: AssistantMessage,
+    },
     ContextExhausted {
         summary: String,
     },
@@ -1165,6 +1189,19 @@ impl From<ParentState> for ConvState {
             } => ConvState::AwaitingUserResponse {
                 questions,
                 tool_use_id,
+            },
+            ParentState::AwaitingCommissionReviewApproval {
+                tool_call,
+                brief,
+                focus,
+                allow_dirty_working_tree,
+                assistant_message,
+            } => ConvState::AwaitingCommissionReviewApproval {
+                tool_call,
+                brief,
+                focus,
+                allow_dirty_working_tree,
+                assistant_message,
             },
             ParentState::ContextExhausted { summary } => ConvState::ContextExhausted { summary },
             ParentState::HandedOff { successor_conv_id } => {
@@ -1379,6 +1416,19 @@ impl TryFrom<ConvState> for ParentState {
                 questions,
                 tool_use_id,
             }),
+            ConvState::AwaitingCommissionReviewApproval {
+                tool_call,
+                brief,
+                focus,
+                allow_dirty_working_tree,
+                assistant_message,
+            } => Ok(ParentState::AwaitingCommissionReviewApproval {
+                tool_call,
+                brief,
+                focus,
+                allow_dirty_working_tree,
+                assistant_message,
+            }),
             ConvState::ContextExhausted { summary } => {
                 Ok(ParentState::ContextExhausted { summary })
             }
@@ -1477,6 +1527,7 @@ impl TryFrom<ConvState> for SubAgentState {
             ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
+            | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. }
             | ConvState::HandedOff { .. }
             | ConvState::Terminal => Err(StateConversionError {
@@ -1513,6 +1564,9 @@ impl ParentState {
             ParentState::AwaitingRecovery { .. } => "AwaitingRecovery",
             ParentState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
             ParentState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
+            ParentState::AwaitingCommissionReviewApproval { .. } => {
+                "AwaitingCommissionReviewApproval"
+            }
             ParentState::ContextExhausted { .. } => "ContextExhausted",
             ParentState::HandedOff { .. } => "HandedOff",
             ParentState::Terminal => "Terminal",
@@ -1674,6 +1728,7 @@ impl ConvState {
                 | ConvState::ToolExecuting { .. }
                 | ConvState::AwaitingSubAgents { .. }
                 | ConvState::AwaitingTaskApproval { .. }
+                | ConvState::AwaitingCommissionReviewApproval { .. }
                 | ConvState::AwaitingRecovery { .. }
         )
     }
@@ -1703,6 +1758,7 @@ impl ConvState {
             | Self::AwaitingContinuation { .. }
             | Self::AwaitingTaskApproval { .. }
             | Self::AwaitingUserResponse { .. }
+            | Self::AwaitingCommissionReviewApproval { .. }
             | Self::ContextExhausted { .. }
             | Self::HandedOff { .. }
             | Self::Terminal => None,
@@ -1734,6 +1790,9 @@ impl ConvState {
             ConvState::HandedOff { .. } => "HandedOff",
             ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
             ConvState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
+            ConvState::AwaitingCommissionReviewApproval { .. } => {
+                "AwaitingCommissionReviewApproval"
+            }
             ConvState::Terminal => "Terminal",
         }
     }
@@ -1770,7 +1829,8 @@ impl ConvState {
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingContinuation { .. }
             | ConvState::AwaitingTaskApproval { .. }
-            | ConvState::AwaitingUserResponse { .. } => StepResult::Continue,
+            | ConvState::AwaitingUserResponse { .. }
+            | ConvState::AwaitingCommissionReviewApproval { .. } => StepResult::Continue,
         }
     }
 
@@ -1787,6 +1847,7 @@ impl ConvState {
             ConvState::Error { .. } => "error",
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
+            | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. } => "needs_action",
             ConvState::HandedOff { .. }
             | ConvState::Terminal
@@ -1810,9 +1871,9 @@ impl ConvState {
         match self {
             ConvState::Idle => DisplayState::Idle,
             ConvState::Error { .. } => DisplayState::Error,
-            ConvState::AwaitingTaskApproval { .. } | ConvState::AwaitingUserResponse { .. } => {
-                DisplayState::AwaitingApproval
-            }
+            ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+            | ConvState::AwaitingCommissionReviewApproval { .. } => DisplayState::AwaitingApproval,
             ConvState::ContextExhausted { .. }
             | ConvState::HandedOff { .. }
             | ConvState::Completed { .. }

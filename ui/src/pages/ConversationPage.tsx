@@ -53,6 +53,9 @@ const ConversationDiffViewer = lazy(() =>
 const TaskApprovalReader = lazy(() =>
   import('../components/TaskApprovalReader').then((m) => ({ default: m.TaskApprovalReader })),
 );
+const CommissionReviewApproval = lazy(() =>
+  import('../components/CommissionReviewApproval').then((m) => ({ default: m.CommissionReviewApproval })),
+);
 const FirstTaskWelcome = lazy(() =>
   import('../components/FirstTaskWelcome').then((m) => ({ default: m.FirstTaskWelcome })),
 );
@@ -891,6 +894,24 @@ function ConversationPageContent() {
     }
   };
 
+  const handleApproveCommissionReview = async () => {
+    if (!conversationId) return;
+    try {
+      await api.approveCommissionReview(conversationId);
+    } catch (err) {
+      console.error('Failed to approve commission review:', err);
+    }
+  };
+
+  const handleRejectCommissionReview = async () => {
+    if (!conversationId) return;
+    try {
+      await api.rejectCommissionReview(conversationId);
+    } catch (err) {
+      console.error('Failed to reject commission review:', err);
+    }
+  };
+
   const handleTaskFeedback = async (annotations: string) => {
     if (!conversationId || isArchived) return;
     try {
@@ -1605,6 +1626,17 @@ function ConversationPageContent() {
             onApprove={handleApproveTask}
             onReject={handleRejectTask}
             onSendFeedback={handleTaskFeedback}
+          />
+        </Suspense>
+      )}
+      {atom.phase.type === 'awaiting_commission_review_approval' && (
+        <Suspense fallback={null}>
+          <CommissionReviewApproval
+            brief={atom.phase.brief}
+            focus={atom.phase.focus}
+            allowDirtyWorkingTree={atom.phase.allow_dirty_working_tree}
+            onApprove={handleApproveCommissionReview}
+            onReject={handleRejectCommissionReview}
           />
         </Suspense>
       )}
