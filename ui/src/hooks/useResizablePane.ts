@@ -199,15 +199,23 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
           ? { size: clamp(min), collapsed: true }
           : { size: clamp(proposed), collapsed: false };
 
+      const commitCollapsed = (nextCollapsed: boolean) => {
+        if (nextCollapsed === liveCollapsed) return false;
+        liveCollapsed = nextCollapsed;
+        setCollapsedState(nextCollapsed);
+        return true;
+      };
+
       const flushFrame = () => {
         dragRafRef.current = null;
         const pending = dragPendingRef.current;
         const drag = dragRef.current;
         if (!pending || !drag) return;
+
         if (drag.onLiveResize) {
           drag.onLiveResize(pending.size, pending.collapsed);
         } else {
-          setCollapsedState(pending.collapsed);
+          commitCollapsed(pending.collapsed);
           setSize(pending.size);
         }
       };
@@ -222,11 +230,10 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
         if (drag.onLiveResize) {
           // Size rides the live channel (rAF-coalesced below); a collapse
           // transition commits immediately so dependent markup swaps now.
-          if (resolved.collapsed !== liveCollapsed) {
-            liveCollapsed = resolved.collapsed;
+          const collapsedChanged = commitCollapsed(resolved.collapsed);
+          if (collapsedChanged) {
             sizeInteracted.current = true;
             collapsedInteracted.current = true;
-            setCollapsedState(resolved.collapsed);
             setSize(resolved.size);
           }
         } else {
@@ -255,9 +262,12 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
         const pending = dragPendingRef.current;
         dragPendingRef.current = null;
         if (pending) {
+          const collapsedChanged = pending.collapsed !== liveCollapsed;
+          if (collapsedChanged) {
+            collapsedInteracted.current = true;
+            commitCollapsed(pending.collapsed);
+          }
           sizeInteracted.current = true;
-          collapsedInteracted.current = true;
-          setCollapsedState(pending.collapsed);
           setSize(pending.size);
         }
         try {

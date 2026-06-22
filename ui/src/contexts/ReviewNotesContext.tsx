@@ -1,8 +1,8 @@
 import {
   createContext,
   useContext,
+  useMemo,
   useRef,
-  useState,
   useSyncExternalStore,
 } from 'react';
 import type { ReactNode } from 'react';
@@ -171,23 +171,7 @@ export function ReviewNotesProvider({
    */
   scopeKey?: string | undefined;
 }) {
-  const storeRef = useRef<ReviewNotesStore | null>(null);
-  if (storeRef.current === null) {
-    storeRef.current = createReviewNotesStore();
-  }
-
-  // Reset the pile when the scope changes by swapping in a FRESH store during
-  // render — never by mutating the current one. A mutator here would emit to the
-  // previous scope's `useSyncExternalStore` subscribers mid-render (StrictMode
-  // warns, and a concurrent retry could clear the old scope before the new one
-  // commits). A fresh store starts empty; the context swap makes children
-  // re-subscribe to it on commit, reading the empty snapshot for the new scope.
-  const [trackedScope, setTrackedScope] = useState<string | undefined>(scopeKey);
-  if (trackedScope !== scopeKey) {
-    setTrackedScope(scopeKey);
-    storeRef.current = createReviewNotesStore();
-  }
-  const store = storeRef.current;
+  const store = useMemo(() => createReviewNotesStore(), [scopeKey]);
 
   return (
     <ReviewNotesStoreContext.Provider value={store}>
