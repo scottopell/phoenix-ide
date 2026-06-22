@@ -1823,12 +1823,13 @@ the DB row routes a `UserMessage`, which the executor rejects as `AgentBusy`; th
 receives `200 OK` and then sees an error in the conversation stream (post-200 rejection).
 *Contract violated: for transient in-flight states the live runtime is the authority; the
 DB row is the safe rest-state after restart, not the current operational state.*
-**Prevention:** `RuntimeManager::effective_conversation_state(conv_id)` checks the live
-runtime's `watch::Receiver<ConvState>` first; falls back to the DB row only when no
-handle is present. `ConversationHandle` carries the receiver; the executor publishes
-every state transition to the paired `watch::Sender`. HTTP handlers call
-`effective_conversation_state` instead of reading `conversation.state` directly for
-any decision that affects event routing.
+**Prevention (chat routing):** `send_chat` calls `RuntimeManager::get_or_create` before
+checking state, ensuring `determine_resume_state` has run. `effective_conversation_state(conv_id)`
+then reads the live handle’s `watch::Receiver<ConvState>` to get the true executor state;
+the DB row is only consulted as a fallback when no handle exists. The authority rule
+(`get_or_create` → `effective_conversation_state` → route) lives in one place in `send_chat`.
+Other handlers (cancel, approve-task, etc.) have distinct routing invariants and are out of
+scope for this fix; they are candidates for the typed command API (Option 2 in the task plan).
 
 ### Panel Summary and Architecture Selection
 

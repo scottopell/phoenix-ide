@@ -2029,6 +2029,12 @@ where
         // jump the elapsed counter (REQ-WPV-001).
         if self.state != drain_old_state {
             self.state_updated_at = Utc::now();
+            // Mirror apply_transition_result: publish the new state so live-state
+            // observers (e.g. effective_conversation_state) stay current after a
+            // steering drain transition (Idle → LlmRequesting is the common path).
+            if let Some(tx) = &self.state_watcher {
+                let _ = tx.send(self.state.clone());
+            }
         }
         for effect in drain_result.effects {
             if let Some(gen_event) = self.execute_effect(effect).await? {

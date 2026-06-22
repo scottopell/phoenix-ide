@@ -2189,13 +2189,20 @@ async fn send_chat(
     // (`markFailed` in ConversationPage.tsx) surface the rejection to the
     // user with retry/dismiss controls.
     //
-    // Authority: use the live runtime state when a handle exists; fall back
-    // to the DB row only when no runtime is running. The two diverge during
-    // restart auto-resume: `reset_all_to_idle` writes `Idle` to the DB row,
-    // then `get_or_create` re-derives `LlmRequesting` (InterruptedMidTurn)
-    // and creates a live handle. A handler that reads only the DB row would
-    // see `Idle`, route a `UserMessage`, and receive an `AgentBusy` rejection
-    // from the executor — the post-200 error path (FM-7, specs/bedrock/design.md).
+    // Authority: materialize the live runtime first (get_or_create runs
+    // determine_resume_state which re-derives the true initial state from
+    // message history), then read its state_rx. Without the eager
+    // get_or_create, the first POST /chat after a restart would see the
+    // reset_all_to_idle Idle row, route UserMessage, and then send_event’s
+    // internal get_or_create would derive LlmRequesting — producing the
+    // same post-200 AgentBusy rejection (FM-7, specs/bedrock/design.md).
+    // send_event’s own get_or_create call below hits the fast-path (handle
+    // already exists) so there is no double-creation cost.
+    let _handle = state
+        .runtime
+        .get_or_create(&id)
+        .await
+        .map_err(AppError::BadRequest)?;
     let effective_state = state
         .runtime
         .effective_conversation_state(&id)
@@ -8371,11 +8378,11 @@ mod chat_authority_tests {
     //! handler queues a steering message instead.
     use super::*;
     use crate::db::Database;
-    use crate::llm::ModelRegistry;
     use crate::platform::PlatformCapability;
     use crate::runtime::RuntimeManager;
     use crate::state_machine::ConvState;
     use crate::tools::mcp::McpClientManager;
+    use phoenix_llm::ModelRegistry;
     use std::sync::Arc;
 
     /// Build a minimal `AppState` backed by an in-memory database.
@@ -8416,6 +8423,7 @@ mod chat_authority_tests {
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
         }
     }
 
