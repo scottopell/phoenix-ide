@@ -65,7 +65,22 @@ describe('conversationListsEqual', () => {
     expect(conversationListsEqual([], [])).toBe(true);
   });
 
-  it('ignores fields outside (id, updated_at) — server bumps updated_at when those change', () => {
+  it('detects cached PR changes without an updated_at change', () => {
+    const a = [makeConv('a', '2025-01-01T00:00:00Z')];
+    const b = [makeConv('a', '2025-01-01T00:00:00Z', {
+      cached_pr: {
+        number: 12,
+        title: 'Cached PR',
+        url: 'https://example.test/pr/12',
+        display_state: 'open',
+        base: 'main',
+        head: 'feature',
+      },
+    })];
+    expect(conversationListsEqual(a, b)).toBe(false);
+  });
+
+  it('ignores fields outside (id, updated_at, cached_pr) — server bumps updated_at when those change', () => {
     // If the server changed something material (state, message_count, slug,
     // model, archived, etc.) it would also bump updated_at — see src/db.rs.
     // Within a single (id, updated_at) tuple, all other fields are by

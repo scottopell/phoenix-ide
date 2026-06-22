@@ -76,6 +76,7 @@ function Consumer({ onStore }: { onStore: (store: ConversationStore) => void }) 
         <li key={c.slug} data-testid={`row-${c.slug}`}>
           <span data-testid={`cwd-${c.slug}`}>{c.cwd}</span>
           <span data-testid={`updated-${c.slug}`}>{c.updated_at}</span>
+          {c.cached_pr && <span data-testid={`cached-pr-${c.slug}`}>{c.cached_pr.title}</span>}
         </li>
       ))}
     </ul>
@@ -131,6 +132,45 @@ describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
     });
     // Alpha untouched.
     expect(screen.getByTestId('cwd-alpha').textContent).toBe('/repo/main');
+  });
+
+  it('sidebar derivation includes cached PR changes without timestamp bump', async () => {
+    let store: ConversationStore | undefined;
+    const captureStore = (s: ConversationStore) => {
+      store = s;
+    };
+
+    render(
+      <ConversationProvider>
+        <Consumer onStore={captureStore} />
+      </ConversationProvider>,
+    );
+
+    act(() => {
+      store!.upsertSnapshot('alpha', makeConv('alpha', { updated_at: '2024-06-01T00:00:00Z' }));
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('row-alpha')).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId('cached-pr-alpha')).not.toBeInTheDocument();
+
+    act(() => {
+      store!.upsertSnapshot('alpha', makeConv('alpha', {
+        updated_at: '2024-06-01T00:00:00Z',
+        cached_pr: {
+          number: 12,
+          title: 'Cached PR now visible',
+          url: 'https://example.test/pr/12',
+          display_state: 'open',
+          base: 'main',
+          head: 'feature',
+        },
+      }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('cached-pr-alpha').textContent).toBe('Cached PR now visible');
+    });
   });
 
   it('store-level upsert with stale updated_at is dropped — cache-clobber regression', async () => {

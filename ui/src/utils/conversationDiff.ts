@@ -13,11 +13,28 @@
 //
 // Pure function, no React deps — unit-tested independently.
 
-import type { Conversation } from '../api';
+import type { CachedPrSummary, Conversation } from '../api';
+
+function cachedPrEqual(a: CachedPrSummary | null | undefined, b: CachedPrSummary | null | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.number === b.number
+    && a.title === b.title
+    && a.url === b.url
+    && a.display_state === b.display_state
+    && a.base === b.base
+    && a.head === b.head;
+}
+
+function sidebarRowEqual(a: Conversation, b: Conversation): boolean {
+  return a.id === b.id
+    && a.updated_at === b.updated_at
+    && cachedPrEqual(a.cached_pr, b.cached_pr);
+}
 
 /**
  * True iff `a` and `b` describe the same sidebar render: same length, same
- * order, same `(id, updated_at)` for every row.
+ * order, same row identity/update timestamp, and same cached PR badge data.
  */
 export function conversationListsEqual(
   a: readonly Conversation[],
@@ -28,8 +45,7 @@ export function conversationListsEqual(
   for (let i = 0; i < a.length; i++) {
     const x = a[i]!;
     const y = b[i]!;
-    if (x.id !== y.id) return false;
-    if (x.updated_at !== y.updated_at) return false;
+    if (!sidebarRowEqual(x, y)) return false;
   }
   return true;
 }

@@ -75,16 +75,24 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       if (conversation.updated_at < current.conversation.updated_at) {
         return false;
       }
-      // Equal updated_at + same id => same logical row. No-op unless an
-      // immutable id mismatch indicates this is actually a different
-      // conversation under the same slug (data corruption — should not
-      // happen). Use id mismatch as the only equal-timestamp tie-break.
-      if (
-        conversation.updated_at === current.conversation.updated_at &&
-        conversation.id === current.conversation.id &&
-        cachedPrEqual(conversation.cached_pr, current.conversation.cached_pr)
-      ) {
-        return false;
+      if (conversation.updated_at === current.conversation.updated_at) {
+        if (
+          conversation.id === current.conversation.id &&
+          !cachedPrEqual(conversation.cached_pr, current.conversation.cached_pr)
+        ) {
+          const merged: Conversation = { ...current.conversation };
+          if (conversation.cached_pr === undefined) {
+            delete merged.cached_pr;
+          } else {
+            merged.cached_pr = conversation.cached_pr;
+          }
+          this.slugByConvId.set(merged.id, slug);
+          notifyConversationSnapshotChange(merged);
+          return this.setAtom(slug, { ...current, conversation: merged });
+        }
+        if (conversation.id === current.conversation.id) {
+          return false;
+        }
       }
     }
     this.slugByConvId.set(conversation.id, slug);
