@@ -1,6 +1,28 @@
 import { describe, expect, it, beforeEach } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, act } from '@testing-library/react';
 import { useResizablePane } from './useResizablePane';
+
+function KeyedPaneHarness({ paneKey }: { paneKey: string }) {
+  const pane = useResizablePane({
+    key: paneKey,
+    min: 32,
+    max: 800,
+    defaultSize: 300,
+    collapseThreshold: 60,
+    defaultCollapsed: true,
+  });
+
+  return (
+    <>
+      <div data-testid="keyed-pane-state">
+        {pane.collapsed ? 'collapsed' : String(pane.size)}
+      </div>
+      <button type="button" onClick={pane.expandFromCollapsed}>
+        expand
+      </button>
+    </>
+  );
+}
 
 function RightDockedPaneHarness() {
   const pane = useResizablePane({
@@ -43,6 +65,33 @@ function dragDivider(startX: number, endX: number) {
   fireEvent.pointerMove(divider, { clientX: endX, pointerId: 1 });
   fireEvent.pointerUp(divider, { clientX: endX, pointerId: 1 });
 }
+
+describe('useResizablePane key switching', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('hydrates size and collapsed state from the active key', () => {
+    const { rerender } = render(<KeyedPaneHarness paneKey="terminal-height:a" />);
+
+    expect(screen.getByTestId('keyed-pane-state')).toHaveTextContent('collapsed');
+
+    fireEvent.click(screen.getByRole('button', { name: 'expand' }));
+    expect(screen.getByTestId('keyed-pane-state')).toHaveTextContent('300');
+    expect(localStorage.getItem('terminal-height:a-collapsed')).toBe('false');
+
+    act(() => {
+      rerender(<KeyedPaneHarness paneKey="terminal-height:b" />);
+    });
+    expect(screen.getByTestId('keyed-pane-state')).toHaveTextContent('collapsed');
+    expect(localStorage.getItem('terminal-height:b-collapsed')).toBeNull();
+
+    act(() => {
+      rerender(<KeyedPaneHarness paneKey="terminal-height:a" />);
+    });
+    expect(screen.getByTestId('keyed-pane-state')).toHaveTextContent('300');
+  });
+});
 
 describe('useResizablePane right-docked divider semantics', () => {
   beforeEach(() => {

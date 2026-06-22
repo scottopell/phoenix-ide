@@ -272,7 +272,7 @@ function ConversationPageContent() {
   // Default collapsed: most conversations don't use the terminal, and an
   // expanded default eats vertical space + spins up the WebSocket/xterm.
   const terminalPane = useResizablePane({
-    key: 'terminal-height',
+    key: `terminal-height:${slug}`,
     min: TERMINAL_COLLAPSED_PX,
     max: terminalPaneMax,
     defaultSize: 300,

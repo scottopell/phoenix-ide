@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 
 export interface UseResizablePaneOptions {
   /** localStorage key (size persisted at `${key}`, collapsed at `${key}-collapsed`) */
@@ -84,6 +84,17 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
   const [collapsed, setCollapsedState] = useState<boolean>(() =>
     readBool(collapsedKey, defaultCollapsed),
   );
+
+  const hydrationRef = useRef({ clamp, defaultSize, defaultCollapsed });
+  hydrationRef.current = { clamp, defaultSize, defaultCollapsed };
+
+  useLayoutEffect(() => {
+    const hydration = hydrationRef.current;
+    sizeInteracted.current = false;
+    collapsedInteracted.current = false;
+    setSize(hydration.clamp(readNumber(key, hydration.defaultSize)));
+    setCollapsedState(readBool(collapsedKey, hydration.defaultCollapsed));
+  }, [key, collapsedKey]);
 
   // Persistence is gated on real user interaction. Writing on mount makes the
   // initial default "sticky" — flipping the default in code never reaches
