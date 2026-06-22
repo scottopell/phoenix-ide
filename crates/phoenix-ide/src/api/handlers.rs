@@ -56,7 +56,7 @@ use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use serde_json::Value;
 use sqlx::Row;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -536,6 +536,41 @@ fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
     conv.state.presentation_mode()
 }
 
+fn conversation_work_scope(conv: &crate::db::Conversation) -> crate::work_scope::WorkScope {
+    crate::work_scope::WorkScope::resolve(
+        &conv.id,
+        conv.conv_mode.worktree_path().map(std::path::Path::new),
+    )
+}
+
+fn sidebar_cached_pr_summary(pr: &crate::db::WorkScopePrAssociation) -> Value {
+    serde_json::json!({
+        "number": pr.pr_number,
+        "title": pr.title,
+        "url": pr.url,
+        "display_state": pr.display_state,
+        "base": pr.base,
+        "head": pr.head,
+    })
+}
+
+async fn cached_pr_summaries_for_conversations(
+    state: &AppState,
+    conversations: &[crate::db::Conversation],
+) -> Result<HashMap<String, Value>, AppError> {
+    let scopes: Vec<_> = conversations.iter().map(conversation_work_scope).collect();
+    let associations = state
+        .runtime
+        .db()
+        .primary_work_scope_pr_associations(&scopes)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(associations
+        .into_iter()
+        .map(|(key, pr)| (key, sidebar_cached_pr_summary(&pr)))
+        .collect())
+}
+
 /// Serialize a conversation to JSON with `presentation_mode` included.
 ///
 /// Used by endpoints that return `serde_json::Value` (conversation list, etc.).
@@ -543,7 +578,11 @@ fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
 /// clients still receive it while the typed struct stays clean. Routes through
 /// `enrich_conversation_with_runtime` so process-wide fields (`terminal_uses_tmux`)
 /// land in every list response — see that helper's comment for the bug it fixes.
-fn conversation_to_json(state: &AppState, conv: &crate::db::Conversation) -> Value {
+fn conversation_to_json(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+    cached_pr: Option<&Value>,
+) -> Value {
     let mut val =
         serde_json::to_value(enrich_conversation_with_runtime(state, conv)).unwrap_or(Value::Null);
     if let Value::Object(ref mut map) = val {
@@ -555,6 +594,9 @@ fn conversation_to_json(state: &AppState, conv: &crate::db::Conversation) -> Val
             "requires_action".to_string(),
             Value::Bool(conv_requires_action(conv)),
         );
+        if let Some(pr) = cached_pr {
+            map.insert("cached_pr".to_string(), pr.clone());
+        }
     }
     val
 }
@@ -622,9 +664,13 @@ async fn list_conversations(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    let cached_prs = cached_pr_summaries_for_conversations(&state, &conversations).await?;
     let json_convs: Vec<Value> = conversations
         .iter()
-        .map(|c| conversation_to_json(&state, c))
+        .map(|c| {
+            let scope_key = conversation_work_scope(c).stable_key();
+            conversation_to_json(&state, c, cached_prs.get(&scope_key))
+        })
         .collect();
 
     Ok(Json(ConversationListResponse {
@@ -642,9 +688,13 @@ async fn list_archived_conversations(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    let cached_prs = cached_pr_summaries_for_conversations(&state, &conversations).await?;
     let json_convs: Vec<Value> = conversations
         .iter()
-        .map(|c| conversation_to_json(&state, c))
+        .map(|c| {
+            let scope_key = conversation_work_scope(c).stable_key();
+            conversation_to_json(&state, c, cached_prs.get(&scope_key))
+        })
         .collect();
 
     Ok(Json(ConversationListResponse {

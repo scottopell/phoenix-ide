@@ -2,7 +2,7 @@ import { memo, useState, useEffect, useRef, useMemo, useCallback, useLayoutEffec
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getConvDisplayState } from '../api';
-import type { Conversation } from '../api';
+import type { Conversation, CachedPrSummary } from '../api';
 import { formatRelativeTime, formatShortDateTime } from '../utils';
 import {
   computeChainRoots,
@@ -53,6 +53,42 @@ interface ConversationRowProps {
   /** Forwarded only when this row's menu is open; lets the parent install a
    *  click-outside listener scoped to the actual DOM node. */
   menuRef?: React.RefObject<HTMLDivElement> | undefined;
+}
+
+function sidebarPrBadgeLabel(pr: CachedPrSummary): string {
+  const n = `#${pr.number}`;
+  if (pr.display_state === 'draft') return `${n} draft`;
+  if (pr.display_state === 'merged') return `${n} merged`;
+  if (pr.display_state === 'closed') return `${n} closed`;
+  return n;
+}
+
+function sidebarPrBadgeClass(pr: CachedPrSummary): string {
+  if (pr.display_state === 'merged') return 'pr-badge pr-badge--merged sidebar-pr-badge';
+  if (pr.display_state === 'closed') return 'pr-badge pr-badge--failing sidebar-pr-badge';
+  if (pr.display_state === 'draft') return 'pr-badge pr-badge--pending sidebar-pr-badge';
+  return 'pr-badge pr-badge--unknown sidebar-pr-badge';
+}
+
+function sidebarPrTooltip(pr: CachedPrSummary): string {
+  const parts = [`PR #${pr.number}${pr.title ? ` — ${pr.title}` : ''}`];
+  if (pr.head || pr.base) parts.push(`${pr.head || '?'} → ${pr.base || '?'}`);
+  return parts.join('\n');
+}
+
+function SidebarPrBadge({ pr }: { pr: CachedPrSummary }) {
+  return (
+    <a
+      className={sidebarPrBadgeClass(pr)}
+      href={pr.url}
+      target="_blank"
+      rel="noreferrer"
+      title={sidebarPrTooltip(pr)}
+      onClick={(e) => e.stopPropagation()}
+    >
+      {sidebarPrBadgeLabel(pr)}
+    </a>
+  );
 }
 
 export const ConversationRow = memo(function ConversationRow({
@@ -138,6 +174,7 @@ export const ConversationRow = memo(function ConversationRow({
               {conv.conv_mode_label}
             </span>
           )}
+          {conv.cached_pr && <SidebarPrBadge pr={conv.cached_pr} />}
         </div>
         <div className="conv-item-meta">
           <span

@@ -148,11 +148,21 @@ export interface Conversation {
    *  Server-resolved from the conversation id + worktree path; always
    *  populated. */
   work_scope_key: string;
+  cached_pr?: CachedPrSummary | null;
 }
 
 export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';
 export type PrCheckState = 'passing' | 'pending' | 'failing' | 'unknown';
 export type PrDisplayState = 'open' | 'draft' | 'merged' | 'closed';
+
+export interface CachedPrSummary {
+  number: number;
+  title: string;
+  url: string;
+  display_state: PrDisplayState;
+  base: string;
+  head: string;
+}
 
 export interface PrCheckSummary {
   passing: number;
@@ -1808,4 +1818,3 @@ export function subscribeToChainStream(
   }
   return source;
 }
-

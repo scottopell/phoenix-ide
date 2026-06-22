@@ -131,6 +131,87 @@ const makeConv = (id: string, slug: string, overrides: Partial<Conversation> = {
   ...overrides,
 });
 
+describe('ConversationRow — cached PR badge', () => {
+  const renderRow = (conv: Conversation) => render(
+    <MemoryRouter>
+      <ConversationRow
+        conv={conv}
+        isMenuOpen={false}
+        isKeyboardSelected={false}
+        isActive={false}
+        isChainMember={false}
+        isChainLatest={false}
+        chainIndex={undefined}
+        showArchived={false}
+        onClick={vi.fn()}
+        onToggleMenu={vi.fn()}
+        onArchive={vi.fn()}
+        onDelete={vi.fn()}
+        onRename={vi.fn()}
+        onCloseMenu={vi.fn()}
+      />
+    </MemoryRouter>,
+  );
+
+  it('shows no PR badge when no cached PR exists', () => {
+    renderRow(makeConv('no-pr', 'no-pr'));
+    expect(document.querySelector('.sidebar-pr-badge')).toBeNull();
+  });
+
+  it.each([
+    ['open', '#12'],
+    ['draft', '#12 draft'],
+    ['merged', '#12 merged'],
+    ['closed', '#12 closed'],
+  ] as const)('shows cached %s PR badge', (display_state, label) => {
+    renderRow(makeConv(`with-${display_state}`, `with-${display_state}`, {
+      cached_pr: {
+        number: 12,
+        title: 'Fix sidebar',
+        url: 'https://github.com/o/r/pull/12',
+        display_state,
+        base: 'main',
+        head: 'task-branch',
+      },
+    }));
+
+    const badge = document.querySelector('.sidebar-pr-badge') as HTMLAnchorElement;
+    expect(badge).not.toBeNull();
+    expect(badge.textContent).toBe(label);
+    expect(badge.href).toBe('https://github.com/o/r/pull/12');
+    expect(badge.title).toContain('Fix sidebar');
+    expect(badge.title).toContain('task-branch → main');
+  });
+
+  it('renders the same cached PR on conversations sharing a work scope', () => {
+    const cached_pr = {
+      number: 44,
+      title: 'Shared PR',
+      url: 'https://github.com/o/r/pull/44',
+      display_state: 'open' as const,
+      base: 'main',
+      head: 'shared',
+    };
+
+    render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          sidebarMode
+          conversations={[
+            makeConv('a', 'a', { work_scope_key: 'worktree:/tmp/shared', cached_pr }),
+            makeConv('b', 'b', { work_scope_key: 'worktree:/tmp/shared', cached_pr }),
+          ]}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(document.querySelectorAll('.sidebar-pr-badge')).toHaveLength(2);
+    expect(Array.from(document.querySelectorAll('.sidebar-pr-badge')).map((n) => n.textContent))
+      .toEqual(['#44', '#44']);
+  });
+});
+
 const defaultProps = {
   archivedConversations: [] as Conversation[],
   showArchived: false,
