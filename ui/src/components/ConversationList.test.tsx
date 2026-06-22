@@ -265,6 +265,68 @@ describe('Chain grouping in sidebar mode (REQ-CHN-002)', () => {
     expect(standaloneRow!.closest('.conv-chain-block')).toBeNull();
   });
 
+  it('compacts completed non-latest chain members only in sidebar mode', () => {
+    const root = makeConv('cr', 'root-slug', {
+      updated_at: '2024-01-01T00:00:00Z',
+      continued_in_conv_id: 'cl',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+    });
+    const leaf = makeConv('cl', 'leaf-slug', {
+      updated_at: '2024-02-01T00:00:00Z',
+      presentation_mode: 'idle',
+      state: { type: 'idle' },
+    });
+    const standalone = makeConv('s', 'standalone-slug', {
+      updated_at: '2024-03-01T00:00:00Z',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} sidebarMode conversations={[standalone, leaf, root]} />
+      </MemoryRouter>
+    );
+
+    expect(container.querySelector('[data-id="cr"]')!.classList.contains('conv-item-chain-completed')).toBe(true);
+    expect(container.querySelector('[data-id="cl"]')!.classList.contains('conv-item-chain-completed')).toBe(false);
+    expect(container.querySelector('[data-id="s"]')!.classList.contains('conv-item-chain-completed')).toBe(false);
+  });
+
+  it('does not compact full-page chain members or active rows', () => {
+    const root = makeConv('cr', 'root-slug', {
+      updated_at: '2024-01-01T00:00:00Z',
+      continued_in_conv_id: 'cl',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+    });
+    const leaf = makeConv('cl', 'leaf-slug', {
+      updated_at: '2024-02-01T00:00:00Z',
+      presentation_mode: 'idle',
+      state: { type: 'idle' },
+    });
+
+    const { container: fullPageContainer } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[leaf, root]} />
+      </MemoryRouter>
+    );
+    expect(fullPageContainer.querySelector('[data-id="cr"]')!.classList.contains('conv-item-chain-completed')).toBe(false);
+
+    const { container: activeContainer } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          sidebarMode
+          conversations={[leaf, root]}
+          activeSlug="root-slug"
+        />
+      </MemoryRouter>
+    );
+    expect(activeContainer.querySelector('[data-id="cr"]')!.classList.contains('conv-item-chain-completed')).toBe(false);
+  });
+
   it('falls back to root.slug when chain_name is null', () => {
     const root = makeConv('rooty', 'root-slug-text', {
       updated_at: '2024-01-01T00:00:00Z',
@@ -619,6 +681,7 @@ describe('ConversationRow — React.memo behaviour', () => {
       isActive: false,
       isChainMember: false,
       isChainLatest: false,
+      isSidebarMode: false,
       chainIndex: undefined,
       showArchived: false,
       onClick: vi.fn(),
@@ -718,6 +781,7 @@ describe('ChainBlock — React.memo behaviour', () => {
       expandedRowId: null,
       keyboardSelectedId: null,
       activeSlug: null,
+      sidebarMode: false,
       showArchived: false,
       onToggleCollapsed: vi.fn(),
       onToggleChainMenu: vi.fn(),

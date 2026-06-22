@@ -7581,6 +7581,39 @@ html * {
   font-weight: 600;
 }
 
+.sidebar-mode .conv-item-chain-completed:not(.active) {
+  padding: 2px 4px;
+  margin-bottom: 0;
+  background: transparent;
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active) .conv-item-main {
+  padding: 2px 28px 2px 6px;
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active) .conv-item-slug {
+  margin-bottom: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-secondary);
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active) .conv-mode-badge,
+.sidebar-mode .conv-item-chain-completed:not(.active) .conv-item-meta {
+  display: none;
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active) .conv-item-menu-btn {
+  top: 2px;
+  right: 4px;
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active):hover,
+.sidebar-mode .conv-item-chain-completed:not(.active).keyboard-selected,
+.sidebar-mode .conv-item-chain-completed:not(.active).expanded {
+  background: var(--bg-tertiary);
+}
+
 /* Full-page (non-sidebar) chain block sizing — match surrounding list density.
  * Sidebar uses 13px/10px micro-scale; full-page needs to feel at home among
  * standard conv-item rows. */

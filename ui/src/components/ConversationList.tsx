@@ -42,6 +42,7 @@ interface ConversationRowProps {
   isActive: boolean;
   isChainMember: boolean;
   isChainLatest: boolean;
+  isSidebarMode: boolean;
   chainIndex: number | undefined;
   showArchived: boolean;
   onClick: (conv: Conversation) => void;
@@ -62,6 +63,7 @@ export const ConversationRow = memo(function ConversationRow({
   isActive,
   isChainMember,
   isChainLatest,
+  isSidebarMode,
   chainIndex,
   showArchived,
   onClick,
@@ -72,6 +74,12 @@ export const ConversationRow = memo(function ConversationRow({
   onCloseMenu,
   menuRef,
 }: ConversationRowProps) {
+  const displayState = getConvDisplayState(conv);
+  const isCompactCompletedChainMember = isSidebarMode
+    && isChainMember
+    && !isChainLatest
+    && !isActive
+    && displayState === 'terminal';
   const classes = [
     'conv-item',
     isMenuOpen ? 'expanded' : '',
@@ -79,6 +87,7 @@ export const ConversationRow = memo(function ConversationRow({
     isActive ? 'active' : '',
     isChainMember ? 'conv-item-chain-member' : '',
     isChainLatest ? 'conv-item-chain-latest' : '',
+    isCompactCompletedChainMember ? 'conv-item-chain-completed' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -87,7 +96,7 @@ export const ConversationRow = memo(function ConversationRow({
     if (conv.state?.type === 'context_exhausted') {
       return conv.presentation_mode === 'needs_action' ? 'Context full' : 'Continued';
     }
-    switch (getConvDisplayState(conv)) {
+    switch (displayState) {
       case 'idle': return 'Ready';
       case 'working': return 'Working';
       case 'error': return 'Error';
@@ -105,7 +114,7 @@ export const ConversationRow = memo(function ConversationRow({
       >
         <div className="conv-item-slug">
           <span
-            className={`conv-state-dot ${getConvDisplayState(conv)}`}
+            className={`conv-state-dot ${displayState}`}
             title={stateTitle}
           />
           {chainIndex !== undefined ? (
@@ -222,6 +231,7 @@ interface ChainBlockProps {
   expandedRowId: string | null;
   keyboardSelectedId: string | null | undefined;
   activeSlug: string | null | undefined;
+  sidebarMode: boolean;
   showArchived: boolean;
   onToggleCollapsed: (rootId: string) => void;
   onToggleChainMenu: (e: React.MouseEvent, rootId: string) => void;
@@ -245,6 +255,7 @@ export const ChainBlock = memo(function ChainBlock({
   expandedRowId,
   keyboardSelectedId,
   activeSlug,
+  sidebarMode,
   showArchived,
   onToggleCollapsed,
   onToggleChainMenu,
@@ -365,6 +376,7 @@ export const ChainBlock = memo(function ChainBlock({
               isActive={!!activeSlug && m.slug === activeSlug}
               isChainMember
               isChainLatest={m.id === item.latestMemberId}
+              isSidebarMode={sidebarMode}
               chainIndex={idx}
               showArchived={showArchived}
               onClick={onRowClick}
@@ -596,6 +608,7 @@ export function ConversationList({
                   isActive={!!activeSlug && conv.slug === activeSlug}
                   isChainMember={false}
                   isChainLatest={false}
+                  isSidebarMode={!!sidebarMode}
                   chainIndex={undefined}
                   showArchived={showArchived}
                   onClick={handleClick}
@@ -621,6 +634,7 @@ export function ConversationList({
                 expandedRowId={expandedId}
                 keyboardSelectedId={selectedId}
                 activeSlug={activeSlug}
+                sidebarMode={!!sidebarMode}
                 showArchived={showArchived}
                 onToggleCollapsed={toggleChainCollapsed}
                 onToggleChainMenu={toggleChainActions}
