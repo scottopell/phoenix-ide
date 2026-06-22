@@ -31,6 +31,7 @@ unwritten page would 404 on GitHub.)
 
 ## Concepts
 
+- [Overview](concepts/overview.md) — the big picture
 - [Conversations](concepts/conversations.md) — the primary unit of work
 - [Modes](concepts/modes.md) — Direct, Explore, Work, Branch
 - [Tasks](concepts/tasks.md) — the plan that gates Explore → Work
@@ -39,7 +40,7 @@ unwritten page would 404 on GitHub.)
 - [Workspace](concepts/workspace.md) — the worktree and its live resources
 - [Permissions](concepts/permissions.md) — the deny layer over tool calls
 - [Chains](concepts/chains.md) — continuation runs, queryable as a unit
-- Overview, Providers — *(planned)*
+- [Providers & models](concepts/providers.md) — picking the LLM
 
 ## How-to
 
@@ -49,7 +50,10 @@ unwritten page would 404 on GitHub.)
 - [Compose with references](howto/compose-with-references.md) — `@file` `/skill` `./path`
 - [Use the terminal](howto/use-the-terminal.md) — persistent shell + tmux
 - [Review changes](howto/review-changes.md) — diff viewer + line notes
-- Share read-only, Steer a running agent, Search conversations, Voice input — *(planned)*
+- [Steer a running agent](howto/steer-a-running-agent.md) — queue a message mid-run
+- [Search conversations](howto/search-conversations.md) — find past work
+- [Voice input](howto/voice-input.md) — dictate a message
+- Share read-only — *(planned)*
 
 ## Reference
 
@@ -58,7 +62,9 @@ unwritten page would 404 on GitHub.)
 - [Input grammar](reference/input-grammar.md) — `@file` `/skill` `./path`
 - [Keyboard shortcuts](reference/keyboard.md) — every shortcut by scope
 - Tool cards: [bash](reference/tools/bash.md) · [patch](reference/tools/patch.md) · [keyword_search](reference/tools/keyword_search.md) · [browser](reference/tools/browse.md) · [propose_task](reference/tools/propose_task.md) · [spawn_agents](reference/tools/spawn_agents.md) · [ask_user_question](reference/tools/ask_user_question.md) · [skill](reference/tools/skill.md) · [tmux](reference/tools/tmux.md)
-- Modes matrix, Conversation states, Command palette — *(planned)*
+- [Modes matrix](reference/modes-matrix.md) — capability grid per mode
+- [Conversation states](reference/conversation-states.md) — busy vs. waiting
+- [Command palette](reference/command-palette.md) — `Ctrl/Cmd+P`
 
 ---
 

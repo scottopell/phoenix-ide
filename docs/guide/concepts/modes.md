@@ -59,4 +59,5 @@ are covered in the [walkthrough](../howto/run-a-managed-task.md).
 - [Workspace](workspace.md) — the worktree a mode runs in
 - [Run a managed task](../howto/run-a-managed-task.md) — the end-to-end walkthrough
 - [Managed lifecycle states](../reference/managed-lifecycle-states.md) — every approval & Done? state
+- [Modes matrix](../reference/modes-matrix.md) — the capability grid
 - [Glossary](../reference/glossary.md) — canonical terms

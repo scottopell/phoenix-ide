@@ -35,6 +35,8 @@ owns it once that page exists.
 | **workspace** | The user-facing name for the **WorkScope** — the container owning a conversation's live resources (shells, tmux, browser). Use "workspace" in prose. | [Workspace](../concepts/workspace.md) |
 | **WorkScope** | The internal/precise name for the workspace; one word, this casing. Prefer "workspace" in user-facing prose. | [Workspace](../concepts/workspace.md) |
 | **fork** | A decoupled top-level Work conversation `propose_task` spawns from a writing mode (off the default branch); distinct from a continuation. | [propose_task](tools/propose_task.md) |
+| **steering message** | A message you send while the agent is busy; it queues and is delivered at the next turn. | [Steer a running agent](../howto/steer-a-running-agent.md) |
+| **command palette** | `Ctrl/Cmd+P` — search conversations and files, or run an action. | [Command palette](command-palette.md) |
 
 Unlinked owners are concept pages not yet written; link them here when they land.
 

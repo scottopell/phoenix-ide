@@ -11,7 +11,7 @@ written.
 
 # Concepts
 
-- Overview — `concepts/overview.md` *(planned)*
+- [Overview](concepts/overview.md)
 - [Conversations](concepts/conversations.md)
 - [Modes](concepts/modes.md)
 - [Tasks](concepts/tasks.md)
@@ -20,7 +20,7 @@ written.
 - [Chains](concepts/chains.md)
 - [Workspace](concepts/workspace.md)
 - [Permissions](concepts/permissions.md)
-- Providers & models — `concepts/providers.md` *(planned)*
+- [Providers & models](concepts/providers.md)
 
 # How-to
 
@@ -30,10 +30,10 @@ written.
 - [Use the terminal](howto/use-the-terminal.md)
 - [Review changes](howto/review-changes.md)
 - Share read-only — `howto/share-read-only.md` *(planned)*
-- Steer a running agent — `howto/steer-a-running-agent.md` *(planned)*
+- [Steer a running agent](howto/steer-a-running-agent.md)
 - [Compose with references](howto/compose-with-references.md)
-- Search conversations — `howto/search-conversations.md` *(planned)*
-- Voice input — `howto/voice-input.md` *(planned)*
+- [Search conversations](howto/search-conversations.md)
+- [Voice input](howto/voice-input.md)
 
 # Reference
 
@@ -51,9 +51,9 @@ written.
   - [ask_user_question](reference/tools/ask_user_question.md)
   - [skill](reference/tools/skill.md)
   - [tmux](reference/tools/tmux.md)
-- Modes matrix — `reference/modes-matrix.md` *(planned)*
-- Conversation states — `reference/states.md` *(planned)*
-- Command palette — `reference/command-palette.md` *(planned)*
+- [Modes matrix](reference/modes-matrix.md)
+- [Conversation states](reference/conversation-states.md)
+- [Command palette](reference/command-palette.md)
 
 ---
 
