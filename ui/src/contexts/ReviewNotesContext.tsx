@@ -171,6 +171,10 @@ export function ReviewNotesProvider({
    */
   scopeKey?: string | undefined;
 }) {
+  // `scopeKey` is a reset trigger, not a value read inside the factory: entering
+  // a different conversation must start a fresh, empty notes store. The dep is
+  // intentional even though `createReviewNotesStore` does not reference it.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const store = useMemo(() => createReviewNotesStore(), [scopeKey]);
 
   return (
