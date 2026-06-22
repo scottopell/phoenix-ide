@@ -8517,6 +8517,10 @@ mod chat_authority_tests {
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
             runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
             suggest_token: String::new(),
+            discovery: crate::discovery::start(crate::discovery::DiscoveryConfig {
+                enabled: false,
+                ..crate::discovery::DiscoveryConfig::from_env()
+            }),
         }
     }
 
