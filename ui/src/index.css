@@ -13058,3 +13058,11 @@ button.keyword-search-filepath:hover {
     linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent-blue) 5%, transparent)),
     var(--bg-primary);
 }
+
+.conversation-panel-fixture-stage {
+  align-items: stretch;
+}
+
+.conversation-panel-fixture-sidebar {
+  height: 100vh;
+}
