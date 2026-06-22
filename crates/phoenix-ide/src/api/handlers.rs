@@ -2189,15 +2189,36 @@ async fn send_chat(
     // (`markFailed` in ConversationPage.tsx) surface the rejection to the
     // user with retry/dismiss controls.
     //
-    // Authority: materialize the live runtime first (get_or_create runs
-    // determine_resume_state which re-derives the true initial state from
-    // message history), then read its state_rx. Without the eager
-    // get_or_create, the first POST /chat after a restart would see the
-    // reset_all_to_idle Idle row, route UserMessage, and then send_event’s
-    // internal get_or_create would derive LlmRequesting — producing the
-    // same post-200 AgentBusy rejection (FM-7, specs/bedrock/design.md).
-    // send_event’s own get_or_create call below hits the fast-path (handle
-    // already exists) so there is no double-creation cost.
+    // Authority: stable rejection states (Terminal, AwaitingTaskApproval,
+    // ContextExhausted, etc.) are preserved by reset_all_to_idle, so the DB
+    // row is always accurate for them — reject immediately without
+    // materialising a runtime. Transient-busy states (AgentBusy,
+    // CancellationInProgress) and Idle may diverge between DB and live
+    // executor after a restart auto-resume, so we call get_or_create first
+    // to run determine_resume_state and populate state_rx with the true
+    // initial state before reading effective_conversation_state.
+    // (FM-7, specs/bedrock/design.md)
+    if let Err(stable_err) = check_user_message_acceptable(&conversation.state) {
+        if !matches!(
+            stable_err,
+            TransitionError::AgentBusy | TransitionError::CancellationInProgress
+        ) {
+            // Stable rejection — no runtime needed; fall through to the
+            // existing error-type mapping below.
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                stable_err.to_string(),
+                match stable_err {
+                    TransitionError::ContextExhausted => "context_exhausted",
+                    TransitionError::ConversationTerminal => "conversation_terminal",
+                    TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
+                    TransitionError::AwaitingUserResponse => "awaiting_user_response",
+                    TransitionError::AgentBusy => "agent_busy",
+                    TransitionError::CancellationInProgress => "cancellation_in_progress",
+                    TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
+                },
+            ))));
+        }
+    }
     let _handle = state
         .runtime
         .get_or_create(&id)
@@ -8372,8 +8393,10 @@ mod chat_authority_tests {
     //! - DB row says `Idle` (written by `reset_all_to_idle` on startup)
     //! - Live executor is in `LlmRequesting` (set by `determine_resume_state`
     //!   detecting `InterruptedMidTurn`)
+    //!
     //! A handler that reads only the DB row routes a `UserMessage`, gets
     //! `AgentBusy` from the executor, and surfaces a post-200 error.
+    //!
     //! The fix: `effective_conversation_state` returns the live state; the
     //! handler queues a steering message instead.
     use super::*;

@@ -4525,6 +4525,12 @@ where
                     plan: plan_backup,
                 };
                 self.state_updated_at = Utc::now();
+                // Publish the revert so live-state observers (effective_conversation_state)
+                // see AwaitingTaskApproval, not the LlmRequesting this approval briefly
+                // advanced to before the failure.
+                if let Some(tx) = &self.state_watcher {
+                    let _ = tx.send(self.state.clone());
+                }
 
                 // Broadcast an error so the UI knows, but don't propagate — the
                 // conversation stays in AwaitingTaskApproval for retry.
@@ -4590,6 +4596,10 @@ where
                     plan: plan_backup,
                 };
                 self.state_updated_at = Utc::now();
+                // Publish the revert so live-state observers stay consistent.
+                if let Some(tx) = &self.state_watcher {
+                    let _ = tx.send(self.state.clone());
+                }
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
                     error: crate::runtime::user_facing_error::UserFacingError::retryable(
