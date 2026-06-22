@@ -20,6 +20,7 @@ import {
   getLastViewer,
   setLastViewer,
 } from '../storage/lastViewerStorage';
+import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import type { Conversation } from '../api';
 
 // The polling refresh tries to call api.listConversations on mount.
@@ -101,6 +102,40 @@ describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () 
 
     await waitFor(() => {
       expect(getLastViewer('doomed')).toBeNull();
+    });
+  });
+
+  it('clears slug-keyed terminal pane storage on phoenix:conversation-hard-deleted', async () => {
+    let store: ConversationStore | undefined;
+    const captureStore = (s: ConversationStore) => {
+      store = s;
+    };
+
+    render(
+      <ConversationProvider>
+        <CaptureStore onStore={captureStore} />
+      </ConversationProvider>,
+    );
+    expect(store).toBeDefined();
+
+    act(() => {
+      store!.upsertSnapshot('doomed', makeConv('doomed', 'conv-doomed'));
+    });
+    const key = terminalPaneStorageKey('doomed');
+    localStorage.setItem(key, '420');
+    localStorage.setItem(`${key}-collapsed`, 'false');
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent('phoenix:conversation-hard-deleted', {
+          detail: { conversationId: 'conv-doomed' },
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(localStorage.getItem(key)).toBeNull();
+      expect(localStorage.getItem(`${key}-collapsed`)).toBeNull();
     });
   });
 

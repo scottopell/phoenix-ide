@@ -5,6 +5,7 @@ import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
 import { cacheDB } from '../cache';
+import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ConnectedInputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
@@ -272,7 +273,7 @@ function ConversationPageContent() {
   // Default collapsed: most conversations don't use the terminal, and an
   // expanded default eats vertical space + spins up the WebSocket/xterm.
   const terminalPane = useResizablePane({
-    key: `terminal-height:${slug}`,
+    key: terminalPaneStorageKey(slug!),
     min: TERMINAL_COLLAPSED_PX,
     max: terminalPaneMax,
     defaultSize: 300,

@@ -5,6 +5,7 @@ import type { ConversationStore } from './ConversationStore';
 import { api } from '../api';
 import { cacheDB } from '../cache';
 import { clearLastViewer } from '../storage/lastViewerStorage';
+import { clearTerminalPaneStorage } from '../storage/terminalPaneStorage';
 import { clearDraftStorage } from '../hooks/useDraft';
 
 const POLL_INTERVAL_MS = 5000;
@@ -185,6 +186,7 @@ export function useConversationsRefreshDriver(): void {
         // that reuses this slug doesn't inherit any of it.
         store.remove(slug);
         clearLastViewer(slug);
+        clearTerminalPaneStorage(slug);
         draftStore.remove(slug);
       }
       // localStorage drafts are keyed by conversationId, not slug — clear
