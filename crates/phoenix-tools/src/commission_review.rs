@@ -328,7 +328,20 @@ fn assert_approved_context_has_not_drifted(
     ctx: &ToolContext,
     approved: &ApprovedCommissionReviewInput,
 ) -> Result<(), String> {
-    let current_cwd = ctx.working_dir.display().to_string();
+    assert_approved_paths_match(
+        &ctx.working_dir.display().to_string(),
+        &ctx.worktree_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        approved,
+    )
+}
+
+fn assert_approved_paths_match(
+    current_cwd: &str,
+    current_worktree: &Option<String>,
+    approved: &ApprovedCommissionReviewInput,
+) -> Result<(), String> {
     if current_cwd != approved.approved_working_dir {
         return Err(format!(
             "commission_review target changed after approval: working directory was `{}` at approval time but is now `{current_cwd}`. Request review again.",
@@ -336,11 +349,7 @@ fn assert_approved_context_has_not_drifted(
         ));
     }
 
-    let current_worktree = ctx
-        .worktree_path
-        .as_ref()
-        .map(|path| path.display().to_string());
-    if current_worktree != approved.approved_worktree_path {
+    if current_worktree != &approved.approved_worktree_path {
         return Err(format!(
             "commission_review target changed after approval: worktree was `{:?}` at approval time but is now `{:?}`. Request review again.",
             approved.approved_worktree_path,
@@ -776,6 +785,52 @@ mod tests {
         );
         assert!(findings.is_empty());
         assert_eq!(warnings[0].kind, "dropped_findings");
+    }
+
+    #[test]
+    fn approved_context_drift_is_rejected() {
+        let approved = ApprovedCommissionReviewInput {
+            request: CommissionReviewInput {
+                brief: "Ready".to_string(),
+                focus: None,
+                allow_dirty_working_tree: false,
+            },
+            runtime_base_branch: Some("main".to_string()),
+            approved_working_dir: "/repo/approved".to_string(),
+            approved_worktree_path: Some("/repo/approved-wt".to_string()),
+        };
+
+        let cwd_err = assert_approved_paths_match(
+            "/repo/current",
+            &Some("/repo/approved-wt".to_string()),
+            &approved,
+        )
+        .expect_err("changed cwd should reject");
+        assert!(cwd_err.contains("working directory"));
+
+        let wt_err = assert_approved_paths_match(
+            "/repo/approved",
+            &Some("/repo/current-wt".to_string()),
+            &approved,
+        )
+        .expect_err("changed worktree should reject");
+        assert!(wt_err.contains("worktree"));
+    }
+
+    #[test]
+    fn approved_context_match_is_allowed() {
+        let approved = ApprovedCommissionReviewInput {
+            request: CommissionReviewInput {
+                brief: "Ready".to_string(),
+                focus: None,
+                allow_dirty_working_tree: false,
+            },
+            runtime_base_branch: Some("main".to_string()),
+            approved_working_dir: "/repo/approved".to_string(),
+            approved_worktree_path: None,
+        };
+
+        assert!(assert_approved_paths_match("/repo/approved", &None, &approved).is_ok());
     }
 
     #[test]

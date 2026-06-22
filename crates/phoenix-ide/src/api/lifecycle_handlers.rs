@@ -174,6 +174,18 @@ pub(crate) async fn task_feedback(
 // Commission Review Approval (REQ-CR-003)
 // ============================================================
 
+fn ensure_commission_review_approval_state(conv: &Conversation) -> Result<(), AppError> {
+    if !matches!(
+        conv.state,
+        ConvState::AwaitingCommissionReviewApproval { .. }
+    ) {
+        return Err(AppError::BadRequest(
+            "Conversation is not awaiting commission review approval".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn approve_commission_review(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -185,14 +197,7 @@ pub(crate) async fn approve_commission_review(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !matches!(
-        conv.state,
-        ConvState::AwaitingCommissionReviewApproval { .. }
-    ) {
-        return Err(AppError::BadRequest(
-            "Conversation is not awaiting commission review approval".to_string(),
-        ));
-    }
+    ensure_commission_review_approval_state(&conv)?;
 
     state
         .runtime
@@ -219,14 +224,7 @@ pub(crate) async fn reject_commission_review(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !matches!(
-        conv.state,
-        ConvState::AwaitingCommissionReviewApproval { .. }
-    ) {
-        return Err(AppError::BadRequest(
-            "Conversation is not awaiting commission review approval".to_string(),
-        ));
-    }
+    ensure_commission_review_approval_state(&conv)?;
 
     state
         .runtime
@@ -802,6 +800,30 @@ mod tests {
         }
     }
 
+    fn commission_review_state() -> ConvState {
+        ConvState::AwaitingCommissionReviewApproval {
+            tool_call: crate::state_machine::state::ToolCall::new(
+                "tool-review-1",
+                crate::state_machine::state::ToolInput::CommissionReview(
+                    crate::state_machine::state::CommissionReviewInput {
+                        brief: "Ready for review".to_string(),
+                        focus: None,
+                        allow_dirty_working_tree: false,
+                    },
+                ),
+            ),
+            brief: "Ready for review".to_string(),
+            focus: None,
+            allow_dirty_working_tree: false,
+            assistant_message: crate::state_machine::state::AssistantMessage::new(
+                "req".to_string(),
+                vec![],
+                None,
+                None,
+            ),
+        }
+    }
+
     // ---- abandon gate -------------------------------------------------
 
     /// Unblocked: `continued_in_conv_id = None` — gate passes, handler
@@ -884,5 +906,17 @@ mod tests {
             }
             _ => panic!("expected AppError::Conflict, got a different variant"),
         }
+    }
+
+    #[test]
+    fn commission_review_gate_passes_only_for_approval_state() {
+        let mut conv = fixture("commission-review", None);
+        conv.state = commission_review_state();
+        assert!(ensure_commission_review_approval_state(&conv).is_ok());
+
+        conv.state = ConvState::Idle;
+        let err = ensure_commission_review_approval_state(&conv)
+            .expect_err("idle conversation must not approve commission review");
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 }
