@@ -739,6 +739,28 @@ fn render_messages(
     messages
 }
 
+/// Render a human-readable summary of sub-agent outcomes for the LLM.
+///
+/// Both `persist_sub_agent_results` carriers (the `spawn_agents` `tool_result`
+/// and the standalone assistant text message) feed the model this same text.
+fn render_sub_agent_summary(results: &[SubAgentResult]) -> String {
+    let body = results
+        .iter()
+        .map(|r| {
+            let outcome = match &r.outcome {
+                SubAgentOutcome::Success { result } => format!("Result: {result}"),
+                SubAgentOutcome::Failure { error, .. } => format!("Failed: {error}"),
+                SubAgentOutcome::TimedOut => {
+                    "Timed out: sub-agent exceeded its time limit".to_string()
+                }
+            };
+            format!("Task: \"{}\"\n{outcome}", r.task)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("Sub-agent results ({} completed):\n\n{body}", results.len())
+}
+
 /// Decide whether `path` is inside the worktree rooted at `root`.
 ///
 /// Three stages, each closing a class of bypass:
@@ -2092,7 +2114,9 @@ where
         let entering_llm_requesting_from_tool_round =
             matches!(
                 old_state,
-                ConvState::ToolExecuting { .. } | ConvState::AwaitingSubAgents { .. }
+                ConvState::ToolExecuting { .. }
+                    | ConvState::AwaitingSubAgents { .. }
+                    | ConvState::CancellingSubAgents { .. }
             ) && matches!(self.state, ConvState::LlmRequesting { .. });
 
         if !(entering_idle || entering_llm_requesting_from_tool_round)
@@ -3927,8 +3951,11 @@ where
         Ok(None)
     }
 
-    /// Persist aggregated sub-agent results: update the `spawn_agents` message
-    /// content and `display_data`, or create a standalone summary message.
+    /// Persist aggregated sub-agent results. With a `spawn_tool_id`, update the
+    /// originating `spawn_agents` tool message's content and `display_data`.
+    /// Without one, persist a standalone assistant text summary — never a
+    /// fabricated `tool_result`, which would be an orphan with no matching
+    /// `tool_use`.
     async fn persist_sub_agent_results(
         &mut self,
         results: Vec<SubAgentResult>,
@@ -3940,36 +3967,19 @@ where
             "results": results
         });
 
+        // Human-readable summary of sub-agent outcomes for the LLM. Both branches
+        // feed the model the same text; only the carrier differs (tool_result vs
+        // assistant text).
+        let llm_content = render_sub_agent_summary(&results);
+
         // If we have a spawn_tool_id, update its message's content (for LLM history)
         // and display_data (for UI).
         if let Some(tool_id) = spawn_tool_id {
             let message_id = tool_result_message_id(&tool_id);
 
-            // Build a human-readable summary of sub-agent outcomes for the LLM.
-            // This replaces the initial "Spawning N sub-agents..." acknowledgement so
-            // build_llm_messages_static feeds the actual results to the model.
-            let llm_content = results
-                .iter()
-                .map(|r| {
-                    let outcome = match &r.outcome {
-                        SubAgentOutcome::Success { result } => {
-                            format!("Result: {result}")
-                        }
-                        SubAgentOutcome::Failure { error, .. } => {
-                            format!("Failed: {error}")
-                        }
-                        SubAgentOutcome::TimedOut => {
-                            "Timed out: sub-agent exceeded its time limit".to_string()
-                        }
-                    };
-                    format!("Task: \"{}\"\n{outcome}", r.task)
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            let llm_content = format!(
-                "Sub-agent results ({} completed):\n\n{llm_content}",
-                results.len()
-            );
+            // This summary replaces the initial "Spawning N sub-agents..."
+            // acknowledgement so build_llm_messages_static feeds the actual
+            // results to the model.
 
             // Both writes must succeed before broadcasting. Otherwise the client
             // would see state the DB can't corroborate on reconnect (full resync
@@ -4009,14 +4019,13 @@ where
                 duration_ms: None,
             });
         } else {
-            // No spawn_tool_id - create a standalone summary message
-            // This happens when spawn_agents wasn't the last tool in a batch
-            let summary_text = format!("{} sub-agent(s) completed", results.len());
-            let content = crate::db::MessageContent::tool(
-                uuid::Uuid::new_v4().to_string(),
-                &summary_text,
-                false,
-            );
+            // No spawn_tool_id: spawn_agents wasn't the last tool in the batch, so
+            // there is no assistant tool_use to pair a tool_result against. Persist
+            // the summary as an assistant text message instead — a tool_result with
+            // a fabricated id would be an orphan the provider rejects. Assistant
+            // text renders into LLM history (render_messages), so the model still
+            // sees the results.
+            let content = crate::db::MessageContent::Agent(vec![ContentBlock::text(&llm_content)]);
             let msg_id = uuid::Uuid::new_v4().to_string();
             let seq = self.broadcast_tx.next_seq();
             let message = self
@@ -4031,7 +4040,7 @@ where
                 )
                 .await?;
 
-            // Broadcast the new message (tool message, no bash enrichment needed)
+            // Broadcast the new message (assistant text, no bash enrichment needed)
             let _ = self.broadcast_tx.send_message(message);
         }
 
@@ -7280,6 +7289,50 @@ mod steer_drain_detector_tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].message_id, "s1");
         assert!(rt.steering_queue.is_empty());
+    }
+
+    /// Fix B/C: `persist_sub_agent_results(_, None)` must persist a NON-tool
+    /// message. A fabricated `tool_result` (random id, no matching `tool_use`) is an
+    /// orphan the provider rejects; the `None` branch must instead emit an
+    /// assistant text summary that renders into LLM history. This pins that the
+    /// orphan branch is gone.
+    #[tokio::test]
+    async fn persist_sub_agent_results_none_emits_non_tool_message() {
+        use crate::db::MessageContent;
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-persist-none",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+
+        let results = vec![SubAgentResult {
+            agent_id: "a".to_string(),
+            task: "investigate".to_string(),
+            outcome: SubAgentOutcome::TimedOut,
+        }];
+        rt.persist_sub_agent_results(results, None)
+            .await
+            .expect("persist must succeed");
+
+        let msgs = storage.get_all_messages("conv-persist-none");
+        assert_eq!(msgs.len(), 1, "exactly one summary message persisted");
+        match &msgs[0].content {
+            MessageContent::Agent(blocks) => {
+                let rendered = render_messages(&msgs, &std::collections::HashSet::new());
+                assert_eq!(rendered.len(), 1, "the summary must reach LLM history");
+                assert_eq!(rendered[0].role, MessageRole::Assistant);
+                let text = format!("{blocks:?}");
+                assert!(
+                    text.contains("Timed out") && text.contains("investigate"),
+                    "the summary must carry the per-result outcome, got: {text}"
+                );
+            }
+            other => panic!(
+                "expected a non-tool Agent message, got {:?} (a tool_result here would be an orphan)",
+                other.message_type()
+            ),
+        }
     }
 
     /// Regression (task 61005): a `SubAgentResult` buffered from an earlier

@@ -1250,9 +1250,10 @@ fn build_cancellation_results(
 }
 
 /// Map a sub-agent's reported outcome to the outcome recorded when the parent
-/// is tearing the sub-agent down (task 61004). A real `Success` always wins
-/// (fidelity); a timeout-caused teardown records `TimedOut`; a user-requested
-/// cancel keeps the reported outcome (e.g. a `Failure { Cancelled }`).
+/// is tearing the sub-agent down. A `Timeout` cause records `TimedOut` for ANY
+/// result — even a late `Success` — because the completion deadline is a hard
+/// contract; a `UserRequested` cancel keeps the reported outcome (e.g. a
+/// `Success`, or a `Failure { Cancelled }`).
 fn map_teardown_outcome(outcome: SubAgentOutcome, cause: CancelCause) -> SubAgentOutcome {
     match cause {
         // The completion deadline is a hard contract: any result (including a
@@ -1403,42 +1404,32 @@ fn handle_core_sub_agents(
                 outcome: recorded,
             });
 
-            // Persist the drained results back onto the originating spawn_agents
-            // tool message only when we know its id (AwaitingSubAgents-origin).
-            // For the CancellingTool-origin path no spawn id exists, so persisting
-            // would fabricate a tool_result with a random id and no matching
-            // tool_use — an orphan the provider rejects. Skip persistence there,
-            // but still continue/stop per the cause.
+            // Always persist the drained results. The id is threaded through
+            // as-is: `Some` updates the originating spawn_agents tool message
+            // (AwaitingSubAgents-origin); `None` (CancellingTool-origin, or a
+            // multi-tool batch where spawn_agents wasn't last) persists a
+            // safe non-tool summary. The persist handler — not this gate —
+            // guarantees no orphaned tool_result is ever produced.
             match cause {
                 CancelCause::Timeout => {
-                    let result = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
-                    let result = if let Some(id) = spawn_tool_id {
-                        result.with_effect(Effect::PersistSubAgentResults {
-                            results: new_results,
-                            spawn_tool_id: Some(id.clone()),
-                        })
-                    } else {
-                        result
-                    };
-                    Ok(result
-                        .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change())
-                        .with_effect(Effect::RequestLlm))
+                    Ok(
+                        CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+                            .with_effect(Effect::PersistSubAgentResults {
+                                results: new_results,
+                                spawn_tool_id: spawn_tool_id.clone(),
+                            })
+                            .with_effect(Effect::PersistState)
+                            .with_effect(Effect::notify_state_change())
+                            .with_effect(Effect::RequestLlm),
+                    )
                 }
-                CancelCause::UserRequested => {
-                    let result = CoreTransitionResult::new(CoreState::Idle);
-                    let result = if let Some(id) = spawn_tool_id {
-                        result.with_effect(Effect::PersistSubAgentResults {
-                            results: new_results,
-                            spawn_tool_id: Some(id.clone()),
-                        })
-                    } else {
-                        result
-                    };
-                    Ok(result
-                        .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_agent_done()))
-                }
+                CancelCause::UserRequested => Ok(CoreTransitionResult::new(CoreState::Idle)
+                    .with_effect(Effect::PersistSubAgentResults {
+                        results: new_results,
+                        spawn_tool_id: spawn_tool_id.clone(),
+                    })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_agent_done())),
             }
         }
 
@@ -6509,6 +6500,96 @@ mod teardown_tests {
                 .iter()
                 .any(|e| matches!(e, Effect::PersistSubAgentResults { .. })),
             "the timeout reroute must not fabricate per-agent results directly"
+        );
+    }
+
+    /// Test 7: a multi-tool-spawn batch leaves `spawn_tool_id: None`
+    /// (`spawn_agents` wasn't the last tool). On a completion timeout the agents
+    /// drain through
+    /// `CancellingSubAgents`, and the LAST result must STILL persist its results
+    /// (with `spawn_tool_id: None`) and resume the parent — the absence of a spawn
+    /// id no longer suppresses persistence, so the resumed model sees the
+    /// timed-out results. Pins fix B/C.
+    #[test]
+    fn timeout_persists_results_even_with_no_spawn_id() {
+        // Drive the real reroute first so the CancellingSubAgents state is
+        // constructed exactly as production does, carrying spawn_tool_id: None.
+        let awaiting = ConvState::AwaitingSubAgents {
+            pending: vec![pending("a")],
+            completed_results: vec![],
+            spawn_tool_id: None,
+        };
+        let cancelling = transition(
+            &awaiting,
+            &test_context(),
+            Event::UserCancel {
+                reason: None,
+                cause: CancelCause::Timeout,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                cancelling.new_state,
+                ConvState::CancellingSubAgents {
+                    spawn_tool_id: None,
+                    ..
+                }
+            ),
+            "reroute must carry spawn_tool_id: None through to CancellingSubAgents"
+        );
+
+        // Drain the single (last) agent; it must persist AND resume.
+        let result = transition(
+            &cancelling.new_state,
+            &test_context(),
+            Event::SubAgentResult {
+                agent_id: "a".to_string(),
+                outcome: SubAgentOutcome::TimedOut,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "Timeout teardown resumes the parent even with no spawn id, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Timeout resume must re-call the model"
+        );
+        let persist = result
+            .effects
+            .iter()
+            .find_map(|e| {
+                if let Effect::PersistSubAgentResults {
+                    results,
+                    spawn_tool_id,
+                } = e
+                {
+                    Some((results.clone(), spawn_tool_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .expect("must persist results even when spawn_tool_id is None");
+        assert_eq!(
+            persist.1, None,
+            "the None spawn id is threaded through to the persist effect as-is"
+        );
+        assert_eq!(
+            persist
+                .0
+                .iter()
+                .find(|r| r.agent_id == "a")
+                .unwrap()
+                .outcome,
+            SubAgentOutcome::TimedOut,
+            "the timed-out result is carried in the persist effect"
         );
     }
 
