@@ -1,0 +1,1 @@
+The e2e read_file scenario intermittently fails with "expected a read_file tool use". Flakes are not allowed: diagnose why the agent sometimes chooses not to call read_file in the e2e harness, make the scenario deterministic or harden the harness/assertion without weakening coverage, and keep the fix in the current PR so CI cannot pass/fail nondeterministically.

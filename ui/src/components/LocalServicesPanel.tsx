@@ -128,7 +128,7 @@ function preferredOpenUrl(service: DiscoveredService): string | null {
   const preferred = service.capabilities.find((capability) =>
     capability.kind === 'html_ui' || capability.kind === 'documentation' || capability.kind === 'open_api'
   );
-  if (!preferred) return service.base_url;
+  if (!preferred) return null;
   return preferred.url;
 }
 

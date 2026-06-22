@@ -309,6 +309,31 @@ def _poll_to_idle(base_url: str, conv_id: str, timeout: float = 30.0) -> None:
     raise TimeoutError(f"poll timeout after {timeout}s")
 
 
+def _poll_to_idle_with_messages(
+    base_url: str,
+    conv_id: str,
+    predicate,
+    label: str,
+    timeout: float = 30.0,
+) -> dict:
+    start = time.monotonic()
+    last: dict | None = None
+    while time.monotonic() - start < timeout:
+        data = _get_conv(base_url, conv_id)
+        last = data
+        state = _state_str(data["conversation"]["state"])
+        if state == "error":
+            sd = data["conversation"].get("state_data") or {}
+            raise RuntimeError(f"conversation error: {sd.get('message')}")
+        if state == "idle" and predicate(data.get("messages") or []):
+            return data
+        time.sleep(0.1)
+    state = _state_str(last["conversation"]["state"]) if last else "unknown"
+    raise TimeoutError(
+        f"poll timeout waiting for idle transcript evidence: {label} (last state: {state})"
+    )
+
+
 def _drive(base_url: str, conv_id: str, timeout: float = 30.0, use_polling: bool = False) -> dict:
     """Wait for the conversation to settle, then return the authoritative
     state via GET (not the in-flight stream snapshot)."""
@@ -479,7 +504,13 @@ def scenario_read_file(base_url: str) -> None:
     # exercised. Every other scenario uses the SSE barrier; this is the one
     # place the poll path runs end-to-end.
     conv = _new_conv(base_url, "[[scenario:read_file]] inspect")
-    final = _drive(base_url, conv["id"], timeout=15.0, use_polling=True)
+    final = _poll_to_idle_with_messages(
+        base_url,
+        conv["id"],
+        lambda messages: _has_tool_use(messages, "read_file"),
+        "read_file tool use",
+        timeout=15.0,
+    )
     assert _has_tool_use(final["messages"], "read_file"), "expected a 'read_file' tool use"
     tool_msgs = [m for m in final["messages"] if m.get("message_type") == "tool"]
     assert tool_msgs, "expected at least one tool result message"

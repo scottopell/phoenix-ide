@@ -74,12 +74,7 @@ pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, St
                     .or_else(|| link.get("content_type"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                identity_parts.insert((
-                    rel.clone(),
-                    href.to_string(),
-                    link_title.clone(),
-                    content_type.clone(),
-                ));
+                identity_parts.insert((rel.clone(), href.to_string(), content_type.clone()));
 
                 if title.is_none() {
                     title.clone_from(&link_title);
@@ -94,7 +89,7 @@ pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, St
         return Err("empty linkset".to_string());
     }
 
-    let identity = catalog_identity(title.as_ref(), description.as_ref(), &identity_parts);
+    let identity = catalog_identity(&identity_parts);
     Ok(ParsedCatalog {
         title,
         description,
@@ -103,30 +98,12 @@ pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, St
     })
 }
 
-fn catalog_identity(
-    title: Option<&String>,
-    description: Option<&String>,
-    parts: &BTreeSet<(String, String, Option<String>, Option<String>)>,
-) -> String {
+fn catalog_identity(parts: &BTreeSet<(String, String, Option<String>)>) -> String {
     let mut hasher = Sha256::new();
-    if let Some(title) = title {
-        hasher.update(b"title\0");
-        hasher.update(title.as_bytes());
-        hasher.update(b"\0");
-    }
-    if let Some(description) = description {
-        hasher.update(b"description\0");
-        hasher.update(description.as_bytes());
-        hasher.update(b"\0");
-    }
-    for (rel, href, title, content_type) in parts {
+    for (rel, href, content_type) in parts {
         hasher.update(rel.as_bytes());
         hasher.update(b"\0");
         hasher.update(href.as_bytes());
-        hasher.update(b"\0");
-        if let Some(title) = title {
-            hasher.update(title.as_bytes());
-        }
         hasher.update(b"\0");
         if let Some(content_type) = content_type {
             hasher.update(content_type.as_bytes());
@@ -216,6 +193,35 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| matches!(capability, ServiceCapability::HtmlUi { .. })));
+    }
+
+    #[test]
+    fn identity_ignores_mutable_display_labels() {
+        let url = Url::parse("http://127.0.0.1:8787/.well-known/api-catalog").unwrap();
+        let first = parse_catalog(
+            br#"{
+              "linkset": [{
+                "title": "debug-router v1",
+                "description": "booting",
+                "service-doc": [{"href": "/docs", "title": "Docs v1"}]
+              }]
+            }"#,
+            &url,
+        )
+        .unwrap();
+        let second = parse_catalog(
+            br#"{
+              "linkset": [{
+                "title": "debug-router v2",
+                "description": "ready",
+                "service-doc": [{"href": "/docs", "title": "Docs v2"}]
+              }]
+            }"#,
+            &url,
+        )
+        .unwrap();
+
+        assert_eq!(first.identity, second.identity);
     }
 
     #[test]

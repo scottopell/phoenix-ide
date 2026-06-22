@@ -36,6 +36,15 @@ const service: DiscoveredService = {
   source: 'loopback_probe',
 };
 
+const serviceWithOnlyOtherLink: DiscoveredService = {
+  ...service,
+  id: 'loopback:8788',
+  port: 8788,
+  capabilities: [
+    { kind: 'other_link', rel: 'item', url: 'http://127.0.0.1:8788/item', title: 'Item', content_type: null },
+  ],
+};
+
 describe('LocalServicesPanel', () => {
   beforeEach(() => {
     localStorage.setItem('phoenix:local-services-expanded', 'true');
@@ -64,5 +73,16 @@ describe('LocalServicesPanel', () => {
 
     const open = await screen.findByText('Open');
     expect(open).toHaveAttribute('href', 'http://127.0.0.1:8787/');
+  });
+
+  it('does not open service roots without an advertised openable link', async () => {
+    apiMock.deploymentInfo.mockResolvedValue({ local_access: true });
+    apiMock.getLocalServices.mockResolvedValue({ services: [serviceWithOnlyOtherLink] });
+
+    render(<LocalServicesPanel />);
+
+    expect(await screen.findByText('debug-router')).toBeInTheDocument();
+    expect(screen.queryByText('Open')).not.toBeInTheDocument();
+    expect(screen.getByText('Copy')).toBeInTheDocument();
   });
 });
