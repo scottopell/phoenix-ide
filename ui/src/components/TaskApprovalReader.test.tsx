@@ -2,12 +2,12 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { TaskApprovalReader } from './TaskApprovalReader';
 
-function renderTaskApprovalReader() {
+function renderTaskApprovalReader(plan = '# Plan\n\nAdd the thing.') {
   return render(
     <TaskApprovalReader
       title="Review task"
       priority="p2"
-      plan="# Plan\n\nAdd the thing."
+      plan={plan}
       onApprove={vi.fn()}
       onReject={vi.fn()}
       onSendFeedback={vi.fn()}
@@ -20,6 +20,22 @@ function toolbarButtons() {
   if (!toolbar) throw new Error('toolbar not found');
   return within(toolbar).getAllByRole('button');
 }
+
+describe('TaskApprovalReader markdown rendering', () => {
+  it('renders fenced mermaid diagrams through the shared diagram component', async () => {
+    const { container } = renderTaskApprovalReader([
+      '# Plan',
+      '',
+      '```mermaid',
+      'flowchart TD',
+      '  A --> B',
+      '```',
+    ].join('\n'));
+
+    expect(await screen.findByTestId('mermaid-diagram')).toBeInTheDocument();
+    expect(container.querySelector('code.language-mermaid')).not.toBeInTheDocument();
+  });
+});
 
 describe('TaskApprovalReader feedback action emphasis', () => {
   it('keeps the default approval-oriented toolbar with no notes', () => {

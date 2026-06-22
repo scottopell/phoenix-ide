@@ -17,6 +17,7 @@ import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark } from '../utils/syntaxHighlighter';
+import { MermaidDiagram } from './MermaidDiagram';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import { Check, XCircle, MessageSquarePlus, Send, Loader2 } from 'lucide-react';
 import type { ForkProposalSummary } from '../api';
@@ -109,7 +110,11 @@ export function ForkProposalReview({
               children?: React.ReactNode;
               [key: string]: unknown;
             }) => {
-              const match = /language-(\w+)/.exec(className || '');
+              const match = /language-([^\s]+)/.exec(className || '');
+              const language = match?.[1]?.toLowerCase();
+              if (!inline && language === 'mermaid') {
+                return <MermaidDiagram code={String(children)} />;
+              }
               return !inline && match ? (
                 <SyntaxHighlighter style={oneDark} language={match[1]} PreTag="div" {...props}>
                   {String(children).replace(/\n$/, '')}

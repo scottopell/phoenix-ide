@@ -17,6 +17,7 @@ import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark } from '../utils/syntaxHighlighter';
+import { MermaidDiagram } from './MermaidDiagram';
 import { generateUUID } from '../utils/uuid';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import {
@@ -377,7 +378,11 @@ export function TaskApprovalReader({
               children?: React.ReactNode;
               [key: string]: unknown;
             }) => {
-              const match = /language-(\w+)/.exec(className || '');
+              const match = /language-([^\s]+)/.exec(className || '');
+              const language = match?.[1]?.toLowerCase();
+              if (!inline && language === 'mermaid') {
+                return <MermaidDiagram code={String(children)} />;
+              }
               return !inline && match ? (
                 <SyntaxHighlighter
                   style={oneDark}

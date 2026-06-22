@@ -1121,6 +1121,24 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     expect(screen.queryByRole('button', { name: 'Review' })).not.toBeInTheDocument();
   });
 
+  it('renders fenced mermaid diagrams in proposal bodies', async () => {
+    const { container } = render(
+      <ForkProposalReview
+        proposal={proposal({
+          status: 'pending',
+          body: ['# Fix the parser bug', '', '```mermaid', 'flowchart TD', '  A --> B', '```'].join('\n'),
+        })}
+        onApprove={vi.fn()}
+        onDismiss={vi.fn()}
+        onRequestChanges={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByTestId('mermaid-diagram')).toBeInTheDocument();
+    expect(container.querySelector('code.language-mermaid')).not.toBeInTheDocument();
+  });
+
   // Bug 1: a non-conflict action failure must leave the modal interactive so the
   // user can retry or Escape out, rather than stranding it permanently busy.
   // The provider catches the failure and resolves its action promise WITHOUT
