@@ -7,7 +7,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import { DraftContext } from '../conversation/DraftContext';
 import { ConversationStore } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
-import type { Conversation, Message } from '../api';
+import { api, type Conversation, type Message } from '../api';
 
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api');
@@ -15,6 +15,7 @@ vi.mock('../api', async () => {
     ...actual,
     api: {
       ...actual.api,
+      getConversationBySlug: vi.fn(),
       listConversations: vi.fn(() => Promise.resolve([])),
       listArchivedConversations: vi.fn(() => Promise.resolve([])),
       getModels: vi.fn(() => Promise.resolve([])),
@@ -31,6 +32,8 @@ vi.mock('../api', async () => {
 
 vi.mock('../cache', () => ({
   cacheDB: {
+    getConversationBySlug: vi.fn(() => Promise.resolve(null)),
+    getMessages: vi.fn(() => Promise.resolve([])),
     getAllConversations: vi.fn(() => Promise.resolve([])),
     syncConversations: vi.fn(() => Promise.resolve()),
     putConversation: vi.fn(() => Promise.resolve()),
@@ -114,6 +117,14 @@ function renderPage(conversation: Conversation) {
       contextWindow: { used: 0 },
   });
 
+  vi.mocked(api.getConversationBySlug).mockResolvedValue({
+    conversation,
+    messages: [historyMessage],
+    agent_working: false,
+    presentation_mode: 'idle',
+    context_window_size: 0,
+  });
+
   render(
     <ConversationContext.Provider value={store}>
       <DraftContext.Provider value={new DraftStore()}>
@@ -151,7 +162,7 @@ describe('ConversationPage archived read-only rendering', () => {
     renderPage(makeConversation());
 
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
-    expect(screen.getByRole('textbox')).toBeInTheDocument();
+    expect(await screen.findByRole('textbox')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /send/i })).toBeInTheDocument();
     expect(await screen.findByTestId('terminal-panel')).toBeInTheDocument();
     expect(screen.getByTestId('work-control-bar')).toBeInTheDocument();

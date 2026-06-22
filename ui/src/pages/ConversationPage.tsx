@@ -150,7 +150,10 @@ function ConversationPageContent() {
   // Derived from atom
   const conversationId = atom.conversationId ?? undefined;
   const conversation = atom.conversation;
-  const isArchived = conversation?.archived === true;
+  const [archiveStatusConfirmedConversationId, setArchiveStatusConfirmedConversationId] = useState<string | null>(null);
+  const archiveStatusConfirmed =
+    conversationId !== undefined && archiveStatusConfirmedConversationId === conversationId;
+  const isArchived = conversation?.archived === true || !archiveStatusConfirmed;
   const prStatusHandle = useConversationPrStatus({
     conversationId,
     convModeLabel: conversation?.conv_mode_label,
@@ -343,29 +346,27 @@ function ConversationPageContent() {
     }
 
     setError(null);
-
-    // Returning navigation: atom already has conversationId — just reconnect SSE.
-    // Reading via ref to avoid adding `atom` to deps (would re-run on every SSE event).
-    if (atomRef.current.conversationId) {
-      return;
-    }
+    setArchiveStatusConfirmedConversationId(null);
+    const hadAtomData = !!atomRef.current.conversationId;
 
     let cancelled = false;
 
     const loadConversation = async () => {
       try {
-        // Step 1: Show cached data immediately
-        const cached = await cacheDB.getConversationBySlug(slug);
-        if (cached && !cancelled) {
-          const cachedMessages = await cacheDB.getMessages(cached.id);
-          dispatch({
-            type: 'set_initial_data',
-            conversationId: cached.id,
-            conversation: cached,
-            messages: cachedMessages,
-            phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
-            contextWindow: { used: 0 },
-          });
+        let cached = atomRef.current.conversation;
+        if (!hadAtomData) {
+          cached = await cacheDB.getConversationBySlug(slug);
+          if (cached && !cancelled) {
+            const cachedMessages = await cacheDB.getMessages(cached.id);
+            dispatch({
+              type: 'set_initial_data',
+              conversationId: cached.id,
+              conversation: cached,
+              messages: cachedMessages,
+              phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
+              contextWindow: { used: 0 },
+            });
+          }
         }
 
         // Step 2: Fetch authoritative data from network
@@ -387,6 +388,7 @@ function ConversationPageContent() {
                   used: result.context_window_size || 0,
                 },
               });
+              setArchiveStatusConfirmedConversationId(result.conversation.id);
               await cacheDB.putConversation(result.conversation);
               await cacheDB.putMessages(result.messages);
             }
