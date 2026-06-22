@@ -10,8 +10,8 @@ import { CodexQuotaBlock } from './CodexQuotaBlock';
 interface ErrorBannerProps {
   message: string;
   error?: ErrorPresentation | undefined;
-  onRetry: () => void;
-  onDismiss: () => void;
+  onRetry?: (() => void) | undefined;
+  onDismiss?: (() => void) | undefined;
 }
 
 /**
@@ -135,7 +135,7 @@ export function ErrorBanner({ message, error, onRetry, onDismiss }: ErrorBannerP
   const codexQuota = useCodexQuota();
   const errorKind = error?.kind;
   const isUsageLimit = errorKind === 'usage_limit_reached';
-  const canUserResume = error?.can_user_resume ?? false;
+  const canUserResume = (error?.can_user_resume ?? false) && !!onRetry && !!onDismiss;
 
   const { title, details } = humanizeError(message, errorKind);
   // For a usage-limit error, prefer a structured title that includes

@@ -1265,7 +1265,7 @@ function ConversationPageContent() {
           </button>
         </div>
       )}
-      {isArchived ? null : convStateForChildren.type === 'awaiting_recovery' ? (
+      {convStateForChildren.type === 'awaiting_recovery' && !isArchived ? (
         <>
         {credentialStatus && (
           <Suspense fallback={null}>
@@ -1303,8 +1303,8 @@ function ConversationPageContent() {
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}
-          onRetry={() => handleSend('continue', [])}
-          onDismiss={() => {
+          onRetry={isArchived ? undefined : () => handleSend('continue', [])}
+          onDismiss={isArchived ? undefined : () => {
             // No optimistic idle: `dismissError` resolves on enqueue, not on
             // persist, so faking idle could diverge if the executor races/
             // rejects. The server-broadcast state_change SSE drives idle.
@@ -1318,7 +1318,7 @@ function ConversationPageContent() {
             banner's quick "retry/continue" so the user is not forced into the
             canned "continue" turn. Gated on can_user_resume to match the
             banner: a non-resumable error stays a dead end. */}
-        {(convStateForChildren.error?.can_user_resume ?? false) && (
+        {(convStateForChildren.error?.can_user_resume ?? false) && !isArchived && (
           <RenderProfiler id="InputArea">
           <ConnectedInputArea
             ref={inputRef}
@@ -1342,7 +1342,7 @@ function ConversationPageContent() {
           </RenderProfiler>
         )}
         </>
-      ) : convStateForChildren.type === 'awaiting_user_response' ? (
+      ) : !isArchived && convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
@@ -1350,7 +1350,7 @@ function ConversationPageContent() {
           onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
           onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
-      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
+      ) : !isArchived && convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
         <>
         {conversationId && (
           <WorkControlBar

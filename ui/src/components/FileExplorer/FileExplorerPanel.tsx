@@ -149,7 +149,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
               />
             </div>
           )}
-          <McpStatusPanel showToast={showToast} showError={showError} />
+          <McpStatusPanel showToast={showToast} showError={showError} readOnly={!rootPath} />
           <SkillsPanel
             conversationId={conversationId}
             onSkillClick={setSelectedSkill}
