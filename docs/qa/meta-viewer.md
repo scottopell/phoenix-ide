@@ -34,16 +34,14 @@ states (loading / error) mount the real `FileViewer` behind a mocked
 Payload-driven (`<MetaViewer payload>`, zero network):
 
 - `large-text-fallback-dark` / `large-text-fallback-light` — `plainLargeText`
-  render mode + its banner (a rare interior mode of `TextViewerBody`); the light
+  render mode + its banner (a rare markdown/html-source fallback mode); the light
   variant proves theme plumbing for this surface.
 - `patch-context-dark` — changed-line highlight, first-modified-line auto-scroll,
-  and the "N changes from patch" banner. Uses a `text` payload because that path
-  is MetaViewer-owned; `code` patch context is handled inside Pierre's CodeView
-  and is out of scope here.
+  and the "N changes from patch" banner in Pierre's file CodeView path.
 - `long-lines-text-dark` / `long-lines-code-dark` — lines (including unbreakable
-  tokens) far wider than the viewport, in the plain-text body and the Pierre code
-  body respectively. Establishes the horizontal-overflow user story: does a long
-  line wrap, get a horizontal scrollbar, or clip?
+  tokens) far wider than the viewport, in Pierre's plain-text and code paths.
+  Establishes the horizontal-overflow user story: does a long line wrap, get a
+  horizontal scrollbar, or clip?
 - `html-source-dark` — HTML source mode (highlighted, annotatable) with the
   Preview / Open-in-browser header toggles.
 - `html-preview-dark` — the sandboxed-preview iframe (`sandbox="allow-same-origin"`,

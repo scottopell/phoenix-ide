@@ -5119,29 +5119,6 @@ html * {
 
 @media (hover: none) { .annotatable__btn { display: none; } }
 
-/* === View-specific layout (compose with .annotatable) === */
-.viewer-text-line {
-  display: flex;
-  min-height: 24px;
-}
-
-.viewer-text-line__number {
-  width: 48px;
-  padding: 0 12px;
-  text-align: right;
-  color: var(--text-muted);
-  background: var(--bg-secondary);
-  flex-shrink: 0;
-  font-size: 12px;
-}
-
-.viewer-text-line__content {
-  flex: 1;
-  padding: 0 16px;
-  white-space: pre;
-  overflow-x: auto;
-}
-
 .viewer-code-line { display: block; }
 
 /* Markdown display */

@@ -1,7 +1,12 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { FileViewer } from './FileViewer';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
+
+vi.mock('@pierre/diffs/react', async () => {
+  const { makeCodeViewMock } = await import('./viewer/__testutils__/codeViewMock');
+  return makeCodeViewMock();
+});
 
 function renderReader(filePath: string) {
   return render(
@@ -51,13 +56,11 @@ describe('FileViewer typed file responses', () => {
 
     renderReader('notes.txt');
 
-    await waitFor(() => expect(screen.getByText('hello text file')).toBeInTheDocument());
+    expect(await screen.findByTestId('codeview-mock')).toBeInTheDocument();
     expect(screen.queryByRole('img')).not.toBeInTheDocument();
   });
 
-  it('routes very line-heavy text files to the large plain-text fallback', async () => {
-    // The fallback guards line-per-node text/markdown rendering; code renders
-    // through Pierre's virtualized view and never falls back.
+  it('routes very line-heavy text files through Pierre instead of the large plain-text fallback', async () => {
     vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
       kind: 'text',
       content: `${'line\n'.repeat(2_001)}tail`,
@@ -67,7 +70,7 @@ describe('FileViewer typed file responses', () => {
 
     renderReader('big.txt');
 
-    expect(await screen.findByTestId('viewer-large-text-fallback')).toBeInTheDocument();
-    expect(screen.getByText(/Large file shown as plain text/)).toBeInTheDocument();
+    expect(await screen.findByTestId('codeview-mock')).toBeInTheDocument();
+    expect(screen.queryByTestId('viewer-large-text-fallback')).not.toBeInTheDocument();
   });
 });

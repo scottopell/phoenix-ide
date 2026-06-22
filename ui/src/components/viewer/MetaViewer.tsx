@@ -43,11 +43,11 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
 
   const notes = useFileReviewNotes(absolutePath, onSendNotes, patchContext);
 
-  // Code payloads render through Pierre's CodeView, which owns its own
-  // virtualized scroller and line identity — the lineRef/contentRef machinery
-  // below (scroll restore, jump-to-line, select-all, copy) is bypassed for code
-  // and handled by PhoenixFileCodeView via its typed handle instead.
-  const usePierreCode = payload.kind === 'code';
+  // Pierre-backed payloads own their virtualized scroller and line identity — the
+  // lineRef/contentRef machinery below (scroll restore, jump-to-line, select-all,
+  // copy) is bypassed for them and handled by PhoenixFileCodeView via its typed
+  // handle instead.
+  const usePierreCode = payload.kind === 'code' || payload.kind === 'text';
   const fileCodeRef = useRef<PhoenixFileCodeViewHandle>(null);
 
   const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
@@ -75,8 +75,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // can't locate firstModifiedLine. Don't mark scrollRestoredRef here — leave
   // it false so the patchContext effect can still win.
   useLayoutEffect(() => {
-    // PhoenixFileCodeView owns scroll for code (Pierre's own scroller), under
-    // the same scrollKey — let it handle restore so the two don't fight.
+    // PhoenixFileCodeView owns scroll for Pierre-backed payloads under the same
+    // scrollKey — let it handle restore so the two don't fight.
     if (usePierreCode) return;
     if (!content) return;
     if (scrollRestoredRef.current) return;
@@ -98,7 +98,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // Auto-scroll to first modified line. Wins over saved scroll when a
   // patchContext is provided and the line element exists.
   useEffect(() => {
-    // Code's patch auto-scroll is handled inside PhoenixFileCodeView.
+    // Pierre-backed patch auto-scroll is handled inside PhoenixFileCodeView.
     if (usePierreCode) return undefined;
     if (!content || !patchContext?.firstModifiedLine) return undefined;
     const timer = setTimeout(() => {
@@ -121,9 +121,9 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     return () => el.removeEventListener('scroll', onScroll);
   }, [content, usePierreCode]);
 
-  // Persist scroll on backgrounding and unmount. Skipped for code: Pierre's
-  // wrapper persists under the same scrollKey, and the parent's contentRef
-  // never scrolls, so saving here would clobber the real position with 0.
+  // Persist scroll on backgrounding and unmount. Skipped for Pierre-backed
+  // payloads: the wrapper persists under the same scrollKey, and the parent's
+  // contentRef never scrolls, so saving here would clobber the real position with 0.
   useEffect(() => {
     if (usePierreCode) return;
     const save = () => {
@@ -203,8 +203,8 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const handleJumpTo = useCallback(
     (note: ReviewNote) => {
       if (note.anchor.kind !== 'file' || note.anchor.filePath !== absolutePath) return;
-      // Code renders in Pierre's own scroller; jump via its typed handle. Other
-      // bodies expose DOM line refs the viewer scrolls directly.
+      // Pierre-backed payloads render in their own scroller; jump via the typed
+      // handle. Other bodies expose DOM line refs the viewer scrolls directly.
       if (usePierreCode) {
         fileCodeRef.current?.scrollToLine(note.anchor.lineNumber);
         highlight(note.anchor.lineNumber);
@@ -233,7 +233,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // iframe (no per-line DOM cost), so a large HTML file must still reach it
   // rather than being stranded on the raw <pre>.
   const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
-  const largeFallback = textLike && payload.renderMode === 'plainLargeText' && !htmlPreview;
+  const largeFallback = textLike && !usePierreCode && payload.renderMode === 'plainLargeText' && !htmlPreview;
   const body = usePierreCode ? null : renderBody(payload, bodyProps, htmlViewMode, imageTakeover ? 'takeover' : 'pane');
 
   const headerExtras: ReactNode = textLike ? (
@@ -372,7 +372,7 @@ function renderBody(
   // fallback must not pre-empt it; only source-like rendering falls back.
   const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
   if (isTextLikePayload(payload) && payload.renderMode === 'plainLargeText' && !htmlPreview) {
-    return <TextViewerBody {...bodyProps} mode="plainLargeText" />;
+    return <TextViewerBody {...bodyProps} />;
   }
 
   switch (payload.kind) {
@@ -392,7 +392,9 @@ function renderBody(
         />
       );
     case 'text':
-      return <TextViewerBody {...bodyProps} />;
+      // Plain text renders through PhoenixFileCodeView (Pierre), routed ahead of
+      // renderBody in MetaViewer — this branch is unreachable.
+      return null;
     case 'image':
       return <ImageViewerBody fileName={payload.fileName} url={payload.url} viewKey={imageViewKey} />;
   }

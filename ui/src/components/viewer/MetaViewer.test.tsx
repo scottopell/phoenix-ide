@@ -126,10 +126,10 @@ describe('MetaViewer payload routing', () => {
     expect(screen.queryByTestId('viewer-large-text-fallback')).toBeNull();
   });
 
-  it('routes a plain-text payload to line-numbered text', () => {
+  it('routes a plain-text payload to the Pierre file code view, not the legacy text body', () => {
     const { container } = renderViewer({ ...textCommon, kind: 'text', content: 'plain line' });
-    expect(screen.getByText('plain line')).toBeInTheDocument();
-    expect(container.querySelector('.viewer-text')).not.toBeNull();
+    expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
+    expect(container.querySelector('.viewer-text')).toBeNull();
   });
 
   it('lets a large HTML file still toggle to the sandboxed preview (fallback only gates source)', () => {

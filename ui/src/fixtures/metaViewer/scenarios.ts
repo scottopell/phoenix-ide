@@ -2,6 +2,7 @@ import type {
   CodeViewerPayload,
   HtmlViewerPayload,
   ImageViewerPayload,
+  MarkdownViewerPayload,
   TextViewerPayload,
 } from '../../components/viewer/metaViewerTypes';
 import { metaViewerScenarioDefinitions } from './types';
@@ -135,6 +136,24 @@ function textPayload(
   };
 }
 
+function markdownPayload(
+  filePath: string,
+  content: string,
+  extra: Partial<MarkdownViewerPayload> = {},
+): MarkdownViewerPayload {
+  return {
+    kind: 'markdown',
+    title: filePath.split('/').pop() ?? filePath,
+    absolutePath: absPath(filePath),
+    onClose: noop,
+    onSendNotes: noop,
+    filePath,
+    rootDir: ROOT,
+    content,
+    ...extra,
+  };
+}
+
 function codePayload(filePath: string, content: string, language: string): CodeViewerPayload {
   return {
     kind: 'code',
@@ -185,21 +204,20 @@ function imagePayload(filePath: string): ImageViewerPayload {
 const byId: Record<MetaViewerScenarioId, Omit<MetaViewerScenario, 'id' | 'title' | 'theme' | 'interaction'>> = {
   'large-text-fallback-dark': {
     settleSelector: '[data-testid="viewer-large-text-fallback"]',
-    payload: textPayload('logs/worker.log', LARGE_LOG, { renderMode: 'plainLargeText' }),
+    payload: markdownPayload('logs/worker.md', LARGE_LOG, { renderMode: 'plainLargeText' }),
   },
   'large-text-fallback-light': {
     settleSelector: '[data-testid="viewer-large-text-fallback"]',
-    payload: textPayload('logs/worker.log', LARGE_LOG, { renderMode: 'plainLargeText' }),
+    payload: markdownPayload('logs/worker.md', LARGE_LOG, { renderMode: 'plainLargeText' }),
   },
   'patch-context-dark': {
-    settleSelector: '.annotatable--modified',
-    payload: textPayload('config/service.yaml', PATCH_FILE, {
+    settleSelector: '.phoenix-file-codeview [data-line]',
+    payload: textPayload('config/service.txt', PATCH_FILE, {
       patchContext: { modifiedLines: new Set([3, 4, 5]), firstModifiedLine: 3 },
     }),
   },
   'long-lines-text-dark': {
-    // Per-line text body; horizontal overflow is governed by .viewer-text CSS.
-    settleSelector: '.viewer-text',
+    settleSelector: '.phoenix-file-codeview [data-line]',
     payload: textPayload('logs/long-lines.txt', LONG_LINES_TEXT),
   },
   'long-lines-code-dark': {
@@ -222,7 +240,7 @@ const byId: Record<MetaViewerScenarioId, Omit<MetaViewerScenario, 'id' | 'title'
   },
   'notes-panel-dark': {
     settleSelector: '.notes-panel',
-    payload: textPayload('src/resolveScope.txt', NOTES_FILE),
+    payload: markdownPayload('src/resolveScope.md', NOTES_FILE),
     seedNotes: [
       { lineNumber: 2, lineContent: '  const trimmed = input.trim();', body: 'Guard against non-string input before trim.' },
       { lineNumber: 5, lineContent: '  const head = parts.shift();', body: 'shift() on an empty array is undefined — document the contract.' },
@@ -230,7 +248,7 @@ const byId: Record<MetaViewerScenarioId, Omit<MetaViewerScenario, 'id' | 'title'
   },
   'annotation-dialog-dark': {
     settleSelector: '.annotation-overlay',
-    payload: textPayload('src/resolveScope.txt', NOTES_FILE),
+    payload: markdownPayload('src/resolveScope.md', NOTES_FILE),
   },
   'loading-dark': {
     settleSelector: '.viewer-loading',
