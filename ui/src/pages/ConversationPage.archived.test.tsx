@@ -1,0 +1,161 @@
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { ConversationPage } from './ConversationPage';
+import { DesktopLayout } from '../components/DesktopLayout';
+import { ConversationContext } from '../conversation/ConversationContext';
+import { DraftContext } from '../conversation/DraftContext';
+import { ConversationStore } from '../conversation';
+import { DraftStore } from '../conversation/DraftStore';
+import type { Conversation, Message } from '../api';
+
+vi.mock('../api', async () => {
+  const actual = await vi.importActual<typeof import('../api')>('../api');
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      listConversations: vi.fn(() => Promise.resolve([])),
+      listArchivedConversations: vi.fn(() => Promise.resolve([])),
+      getModels: vi.fn(() => Promise.resolve([])),
+      getPrStatus: vi.fn(() => Promise.resolve({ found: false })),
+      getCredentialStatus: vi.fn(() => Promise.resolve('valid')),
+      getConversationUsage: vi.fn(() => Promise.resolve({ total_tokens: 0, turns: [] })),
+      getSystemPrompt: vi.fn(() => Promise.resolve({ system_prompt: null })),
+      getWorkScopeInventory: vi.fn(() => Promise.resolve({ bash: [], tmux: null, browser: null })),
+      getLlmLanguageSetting: vi.fn(() => Promise.resolve({ language: 'en' })),
+      getVersion: vi.fn(() => Promise.resolve({ version: 'test' })),
+    },
+  };
+});
+
+vi.mock('../cache', () => ({
+  cacheDB: {
+    getAllConversations: vi.fn(() => Promise.resolve([])),
+    syncConversations: vi.fn(() => Promise.resolve()),
+    putConversation: vi.fn(() => Promise.resolve()),
+    putMessages: vi.fn(() => Promise.resolve()),
+  },
+}));
+
+vi.mock('../hooks', async () => {
+  const actual = await vi.importActual<typeof import('../hooks')>('../hooks');
+  return {
+    ...actual,
+    useConnection: () => ({ state: 'connected', attempt: 0, nextRetryIn: null, retryNow: vi.fn() }),
+    useIsDesktop: () => true,
+    useIsWideDesktop: () => true,
+  };
+});
+
+vi.mock('../components/ConversationNavStack', () => ({
+  ConversationNavStack: ({ messages }: { messages: Message[] }) => (
+    <div data-testid="message-history">
+      {messages.map((message) => {
+        const content = message.content as { text?: string };
+        return <div key={message.message_id}>{content.text}</div>;
+      })}
+    </div>
+  ),
+}));
+
+vi.mock('../components/TerminalPanel', () => ({
+  TerminalPanel: () => <div data-testid="terminal-panel">terminal</div>,
+}));
+
+vi.mock('../components/WorkActions', () => ({
+  WorkControlBar: () => <div data-testid="work-control-bar">work actions</div>,
+}));
+
+vi.mock('../components/FileExplorer/FileTree', () => ({
+  FileTree: ({ rootPath }: { rootPath: string }) => <div data-testid="file-tree">{rootPath}</div>,
+}));
+
+const slug = 'archived-idle';
+const conversationId = 'conv-archived';
+
+function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
+  return {
+    id: conversationId,
+    slug,
+    model: 'claude-3-5-sonnet',
+    cwd: '/repo/project',
+    created_at: '2024-01-01T00:00:00Z',
+    updated_at: '2024-01-01T00:00:01Z',
+    message_count: 1,
+    state: { type: 'idle' },
+    archived: false,
+    browser_session_active: false,
+    terminal_uses_tmux: false,
+    worktree_path: '/repo/.phoenix/worktrees/conv-archived',
+    work_scope_key: 'worktree:/repo/.phoenix/worktrees/conv-archived',
+    conv_mode_label: 'Explore',
+    ...overrides,
+  } as Conversation;
+}
+
+const historyMessage: Message = {
+  message_id: 'm1',
+  sequence_id: 1,
+  conversation_id: conversationId,
+  message_type: 'user',
+  content: { text: 'keep this history visible' },
+  created_at: '2024-01-01T00:00:01Z',
+};
+
+function renderPage(conversation: Conversation) {
+  const store = new ConversationStore();
+  store.dispatch(conversation.slug, {
+      type: 'set_initial_data',
+      conversationId: conversation.id,
+      conversation,
+      messages: [historyMessage],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+  });
+
+  render(
+    <ConversationContext.Provider value={store}>
+      <DraftContext.Provider value={new DraftStore()}>
+        <MemoryRouter initialEntries={[`/c/${conversation.slug}`]}>
+          <Routes>
+            <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+          </Routes>
+        </MemoryRouter>
+      </DraftContext.Provider>
+    </ConversationContext.Provider>,
+  );
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe('ConversationPage archived read-only rendering', () => {
+  it('shows message history but hides composer, work actions, terminal, files, and work scope for archived idle conversations', async () => {
+    renderPage(makeConversation({ archived: true }));
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /send/i })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('terminal-panel')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('work-control-bar')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('file-tree')).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Files$/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Work \d+/)).not.toBeInTheDocument();
+    expect(screen.getByText('MCP')).toBeInTheDocument();
+    expect(screen.getByText('Skills')).toBeInTheDocument();
+  });
+
+  it('keeps composer, work actions, terminal, files, and work scope for non-archived idle conversations', async () => {
+    renderPage(makeConversation());
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(screen.getByRole('textbox')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /send/i })).toBeInTheDocument();
+    expect(await screen.findByTestId('terminal-panel')).toBeInTheDocument();
+    expect(screen.getByTestId('work-control-bar')).toBeInTheDocument();
+    expect(screen.getByTestId('file-tree')).toHaveTextContent('/repo/.phoenix/worktrees/conv-archived');
+    expect(screen.getByRole('button', { name: /Work/ })).toBeInTheDocument();
+  });
+});

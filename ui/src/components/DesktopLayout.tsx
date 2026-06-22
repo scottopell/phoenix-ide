@@ -145,7 +145,12 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     }
   }, [activeConversationId]);
 
-  const effectiveCwd = activeConversation?.worktree_path ?? activeConversation?.cwd ?? '/';
+  const activeConversationArchived = activeConversation?.archived === true;
+  const effectiveCwd = activeConversationArchived
+    ? null
+    : (activeConversation?.worktree_path ?? activeConversation?.cwd ?? null);
+  const activeWorkScopeKey = activeConversationArchived ? undefined : activeConversation?.work_scope_key;
+  const activeLiveWorkScope = activeConversationArchived ? undefined : liveWorkScope;
 
   // Always render a single stable tree so children never unmounts across the
   // desktop/mobile breakpoint. Conditionally show sidebar and file-explorer
@@ -190,8 +195,8 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             branchName={activeConversation?.branch_name}
             activeSlug={activeSlug}
             width={fileExplorerPane.collapsed ? undefined : fileExplorerPane.size}
-            workScopeKey={activeConversation?.work_scope_key}
-            liveWorkScope={liveWorkScope}
+            workScopeKey={activeWorkScopeKey}
+            liveWorkScope={activeLiveWorkScope}
           />
         )}
         {isDesktop && activeSlug && (

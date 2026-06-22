@@ -876,7 +876,11 @@ function ConversationPageContent() {
 
   const convStateForChildren = atom.phase;
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
-  const handleOpenFiles = useCallback(() => setShowFileBrowser(true), []);
+  const isArchived = conversation?.archived === true;
+  const fileRootPath = isArchived || !conversation ? null : (conversation.worktree_path ?? conversation.cwd);
+  const handleOpenFiles = useCallback(() => {
+    if (fileRootPath) setShowFileBrowser(true);
+  }, [fileRootPath]);
   const stateBarContinuation = useMemo(
     () => convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }
@@ -991,7 +995,7 @@ function ConversationPageContent() {
   // disable with a tooltip. Deliberately no onSendMessage — a stuck
   // conversation exposes only terminal cleanup, never a message-posting action
   // that would reopen the error. One definition, shared by both stuck branches.
-  const stuckCleanupBar = conversationId && (
+  const stuckCleanupBar = conversationId && !isArchived && (
     <WorkControlBar
       conversationId={conversationId}
       convModeLabel={conversation.conv_mode_label}
@@ -1003,6 +1007,7 @@ function ConversationPageContent() {
   );
   const showTerminal =
     !!conversationId &&
+    !isArchived &&
     convStateForChildren.type !== 'terminal' &&
     convStateForChildren.type !== 'handed_off' &&
     convStateForChildren.type !== 'context_exhausted';
@@ -1243,7 +1248,7 @@ function ConversationPageContent() {
           </button>
         </div>
       )}
-      {convStateForChildren.type === 'awaiting_recovery' ? (
+      {isArchived ? null : convStateForChildren.type === 'awaiting_recovery' ? (
         <>
         {credentialStatus && (
           <Suspense fallback={null}>
@@ -1397,7 +1402,7 @@ function ConversationPageContent() {
         phaseStateUpdatedAt={atom.phaseStateUpdatedAt}
         firstByteRequestId={atom.firstByteRequestId}
         turnRetryContext={atom.turnRetryContext}
-        onOpenFiles={isDesktop ? undefined : handleOpenFiles}
+        onOpenFiles={isDesktop || !fileRootPath ? undefined : handleOpenFiles}
         prStatusState={prStatusHandle.state}
       />
       </RenderProfiler>
@@ -1465,13 +1470,15 @@ function ConversationPageContent() {
 
 
       {/* Mobile file browser overlay */}
-      <FileBrowserOverlay
-        isOpen={showFileBrowser}
-        rootPath={conversation.worktree_path ?? conversation.cwd}
-        conversationId={conversation.id}
-        onClose={() => setShowFileBrowser(false)}
-        onFileSelect={handleFileSelect}
-      />
+      {fileRootPath && (
+        <FileBrowserOverlay
+          isOpen={showFileBrowser}
+          rootPath={fileRootPath}
+          conversationId={conversation.id}
+          onClose={() => setShowFileBrowser(false)}
+          onFileSelect={handleFileSelect}
+        />
+      )}
 
       {/* Mobile prose reader overlay — reads URL-driven state from
           FileExplorerProvider so cold reload (e.g. iOS PWA return) restores

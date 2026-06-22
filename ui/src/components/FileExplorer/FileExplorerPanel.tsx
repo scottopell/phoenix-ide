@@ -19,7 +19,7 @@ import type { SkillEntry, TaskEntry, WorkScopeInventory } from '../../api';
 interface Props {
   collapsed: boolean;
   onToggle: () => void;
-  rootPath: string;
+  rootPath?: string | null | undefined;
   conversationId: string | undefined;
   showToast: (message: string, duration?: number) => void;
   showError: (message: string, duration?: number) => void;
@@ -74,7 +74,8 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   const currentTaskId = extractTaskId(branchName);
   const workScopeCount = useSeededLiveCount(workScopeKey, liveWorkScope);
   const liveAttentionCount = liveWorkScope ? workScopeLiveCount(liveWorkScope) : workScopeCount;
-  const projectName = rootPath.split('/').filter(Boolean).slice(-1)[0] || rootPath;
+  const hasFileRoot = !!rootPath;
+  const projectName = rootPath ? (rootPath.split('/').filter(Boolean).slice(-1)[0] || rootPath) : 'Read-only';
 
   const handleFileSelect = useCallback((filePath: string, rootDir: string) => {
     openFile(filePath, rootDir);
@@ -88,7 +89,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
         </button>
         <div className="fe-collapsed-title" title="Grounding">G</div>
         <div className="fe-collapsed-badges" aria-label="Grounding sections">
-          <button className="fe-collapsed-badge" onClick={onToggle} title="Project files">Files</button>
+          {hasFileRoot && <button className="fe-collapsed-badge" onClick={onToggle} title="Project files">Files</button>}
           <button className="fe-collapsed-badge" onClick={onToggle} title="MCP capabilities">MCP</button>
           <button className="fe-collapsed-badge" onClick={onToggle} title="Skills">Skills</button>
           <button className="fe-collapsed-badge" onClick={onToggle} title="Tasks">Tasks</button>
@@ -108,7 +109,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
 
   const detailViewer = selectedSkill
     ? <SkillViewer skill={selectedSkill} onBack={() => setSelectedSkill(null)} />
-    : selectedTask
+    : selectedTask && rootPath
       ? <TaskViewer
           task={selectedTask}
           tasksDir={`${rootPath}/tasks`}
@@ -126,21 +127,27 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
         <button className="fe-toggle" onClick={onToggle} title="Collapse grounding panel" aria-label="Collapse grounding panel">&#9666;</button>
         <div className="fe-title-stack">
           <span className="fe-title">Grounding</span>
-          <span className="fe-subtitle" title={rootPath}>{projectName} · {branchName ?? 'no branch'}</span>
+          <span className="fe-subtitle" title={rootPath ?? undefined}>
+            {rootPath ? `${projectName} · ${branchName ?? 'no branch'}` : 'Read-only history'}
+          </span>
         </div>
-        <button className="fe-refresh" onClick={handleRefresh} title="Refresh file tree" aria-label="Refresh file tree">&#8635;</button>
+        {hasFileRoot && (
+          <button className="fe-refresh" onClick={handleRefresh} title="Refresh file tree" aria-label="Refresh file tree">&#8635;</button>
+        )}
       </div>
       {detailViewer || (
         <>
-          <div className="fe-tree-scroll">
-            <FileTree
-              rootPath={rootPath}
-              onFileSelect={handleFileSelect}
-              activeFile={activeFile}
-              conversationId={conversationId}
-              refreshKey={refreshKey}
-            />
-          </div>
+          {rootPath && (
+            <div className="fe-tree-scroll">
+              <FileTree
+                rootPath={rootPath}
+                onFileSelect={handleFileSelect}
+                activeFile={activeFile}
+                conversationId={conversationId}
+                refreshKey={refreshKey}
+              />
+            </div>
+          )}
           <McpStatusPanel showToast={showToast} showError={showError} />
           <SkillsPanel
             conversationId={conversationId}
