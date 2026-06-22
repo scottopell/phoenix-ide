@@ -25,6 +25,26 @@ pub enum LlmLanguage {
     Caveman,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmLanguagePromptCatalog {
+    pub base_prompt: String,
+    pub explore_mode_block_template: String,
+    pub work_mode_block_template: String,
+    pub direct_mode_block: String,
+    pub branch_mode_block_template: String,
+    pub sub_agent_suffix: String,
+    pub next_task_hint_template: String,
+    pub pr_autofix_instruction_template: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmLanguageCatalogEntry {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub prompts: LlmLanguagePromptCatalog,
+}
+
 impl LlmLanguage {
     /// All known languages in display order. Single source of truth for the
     /// settings API response and any UI dropdown so the available choices
@@ -43,6 +63,53 @@ impl LlmLanguage {
     }
 
     #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PhoenixNative => "Phoenix",
+            Self::Caveman => "Caveman",
+        }
+    }
+
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::PhoenixNative => "Default Phoenix prose",
+            Self::Caveman => "Ugg. Why use many word.",
+        }
+    }
+
+    #[must_use]
+    pub fn catalog_entry(self) -> LlmLanguageCatalogEntry {
+        const TASKS_DIR: &str = "{tasks_dir}";
+        const NEXT_ID: &str = "{next_id}";
+        const BRANCH_NAME: &str = "{branch_name}";
+        const BASE_BRANCH: &str = "{base_branch}";
+        const WORKTREE_PATH: &str = "{worktree_path}";
+        const ARTIFACT_PATH: &str = "{artifact_path}";
+
+        LlmLanguageCatalogEntry {
+            id: self.as_str().to_string(),
+            label: self.label().to_string(),
+            description: self.description().to_string(),
+            prompts: LlmLanguagePromptCatalog {
+                base_prompt: base_prompt(self).to_string(),
+                explore_mode_block_template: mode_explore(self, TASKS_DIR),
+                work_mode_block_template: mode_work(self, BRANCH_NAME, BASE_BRANCH, WORKTREE_PATH),
+                direct_mode_block: mode_direct(self).to_string(),
+                branch_mode_block_template: mode_branch(
+                    self,
+                    BRANCH_NAME,
+                    BASE_BRANCH,
+                    WORKTREE_PATH,
+                ),
+                sub_agent_suffix: sub_agent_suffix(self).to_string(),
+                next_task_hint_template: next_taskmd_id_hint(self, TASKS_DIR, NEXT_ID),
+                pr_autofix_instruction_template: pr_auto_fix_instruction(self, ARTIFACT_PATH),
+            },
+        }
+    }
+
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|lang| lang.as_str() == s)
     }
@@ -52,6 +119,15 @@ impl LlmLanguage {
     pub fn parse_or_default(s: &str) -> Self {
         Self::parse(s).unwrap_or_default()
     }
+}
+
+#[must_use]
+pub fn language_catalog() -> Vec<LlmLanguageCatalogEntry> {
+    LlmLanguage::ALL
+        .iter()
+        .copied()
+        .map(LlmLanguage::catalog_entry)
+        .collect()
 }
 
 // =============================================================================
@@ -349,6 +425,33 @@ mod tests {
             LlmLanguage::parse_or_default(""),
             LlmLanguage::PhoenixNative
         );
+    }
+
+    #[test]
+    fn language_catalog_covers_every_language_and_has_prompt_snippets() {
+        let catalog = language_catalog();
+        assert_eq!(catalog.len(), LlmLanguage::ALL.len());
+
+        for lang in LlmLanguage::ALL {
+            let entry = catalog
+                .iter()
+                .find(|entry| entry.id == lang.as_str())
+                .expect("catalog entry for language");
+            assert!(!entry.label.trim().is_empty());
+            assert!(!entry.description.trim().is_empty());
+            assert!(!entry.prompts.base_prompt.trim().is_empty());
+            assert!(!entry.prompts.explore_mode_block_template.trim().is_empty());
+            assert!(!entry.prompts.work_mode_block_template.trim().is_empty());
+            assert!(!entry.prompts.direct_mode_block.trim().is_empty());
+            assert!(!entry.prompts.branch_mode_block_template.trim().is_empty());
+            assert!(!entry.prompts.sub_agent_suffix.trim().is_empty());
+            assert!(!entry.prompts.next_task_hint_template.trim().is_empty());
+            assert!(!entry
+                .prompts
+                .pr_autofix_instruction_template
+                .trim()
+                .is_empty());
+        }
     }
 
     #[test]

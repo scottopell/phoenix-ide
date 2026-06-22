@@ -717,9 +717,28 @@ export interface NotificationSettings {
  * language is pinned to each conversation at creation time; chain
  * continuations and sub-agents inherit from their parent rather than
  * re-reading this default. */
+export interface LlmLanguagePrompts {
+  base_prompt: string;
+  explore_mode_block_template: string;
+  work_mode_block_template: string;
+  direct_mode_block: string;
+  branch_mode_block_template: string;
+  sub_agent_suffix: string;
+  next_task_hint_template: string;
+  pr_autofix_instruction_template: string;
+}
+
+export interface LlmLanguageCatalogEntry {
+  id: string;
+  label: string;
+  description: string;
+  prompts: LlmLanguagePrompts;
+}
+
 export interface LlmLanguageSetting {
   language: string;
   available: string[];
+  languages: LlmLanguageCatalogEntry[];
 }
 
 export interface UsageTotals {

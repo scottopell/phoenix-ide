@@ -44,6 +44,9 @@ const UsagePage = lazy(() =>
 const TerminalPage = lazy(() =>
   import('./pages/TerminalPage').then((m) => ({ default: m.TerminalPage })),
 );
+const LlmLanguagePage = lazy(() =>
+  import('./pages/LlmLanguagePage').then((m) => ({ default: m.LlmLanguagePage })),
+);
 const GroundingPanelFixturePage = import.meta.env.DEV
   ? lazy(() => import('./pages/GroundingPanelFixturePage').then((m) => ({ default: m.GroundingPanelFixturePage })))
   : null;
@@ -99,6 +102,7 @@ function AppRoutes() {
                 <Route path="/codex/login" element={<CodexLoginPage />} />
                 <Route path="/about" element={<AboutDeploymentPage />} />
                 <Route path="/usage" element={<UsagePage />} />
+                <Route path="/settings/llm-language" element={<LlmLanguagePage />} />
               </Routes>
             </DesktopLayout>
           } />

@@ -736,6 +736,8 @@ struct LlmLanguageSettingResponse {
     language: String,
     /// All values the client may choose between.
     available: Vec<String>,
+    /// Metadata and prompt templates for every built-in language.
+    languages: Vec<crate::llm_language::LlmLanguageCatalogEntry>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -752,6 +754,7 @@ fn llm_language_setting_response(
             .iter()
             .map(|l| l.as_str().to_string())
             .collect(),
+        languages: crate::llm_language::language_catalog(),
     }
 }
 

@@ -169,7 +169,7 @@ export function SettingsDropdown({
             />
           )}
           <NotificationsSection />
-          <LlmLanguageSection />
+          <LlmLanguageSection onCloseMenu={() => setOpen(false)} />
           <section className="settings-section">
             <button
               type="button"
@@ -431,20 +431,16 @@ function NotificationsSection() {
   );
 }
 
-// Friendly labels/tooltips for the language ids the backend ships. An
-// unknown id (e.g. one added on the server before the UI is updated)
-// falls back to the raw string so we never silently mislabel it.
-const LLM_LANGUAGE_LABELS: Record<string, { label: string; tooltip: string }> = {
-  'phoenix-native': { label: 'Phoenix', tooltip: 'Default Phoenix prose' },
-  caveman: { label: 'Caveman', tooltip: 'Ugg. Why use many word.' },
-};
-
-function llmLanguageLabel(lang: string): string {
-  return LLM_LANGUAGE_LABELS[lang]?.label ?? lang;
+function llmLanguageMeta(setting: LlmLanguageSetting, lang: string) {
+  return setting.languages.find((entry) => entry.id === lang);
 }
 
-function llmLanguageTooltip(lang: string): string {
-  return LLM_LANGUAGE_LABELS[lang]?.tooltip ?? lang;
+function llmLanguageLabel(setting: LlmLanguageSetting, lang: string): string {
+  return llmLanguageMeta(setting, lang)?.label ?? lang;
+}
+
+function llmLanguageTooltip(setting: LlmLanguageSetting, lang: string): string {
+  return llmLanguageMeta(setting, lang)?.description ?? lang;
 }
 
 /**
@@ -452,7 +448,8 @@ function llmLanguageTooltip(lang: string): string {
  * conversations stay in whatever language they were created with, and chain
  * continuations / sub-agents inherit from their parent.
  */
-function LlmLanguageSection() {
+function LlmLanguageSection({ onCloseMenu }: { onCloseMenu: () => void }) {
+  const navigate = useNavigate();
   const [setting, setSetting] = useState<LlmLanguageSetting | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -553,14 +550,21 @@ function LlmLanguageSection() {
                 className={`settings-theme-btn${active ? ' active' : ''}`}
                 onClick={() => select(lang)}
                 disabled={saving}
-                title={llmLanguageTooltip(lang)}
+                title={llmLanguageTooltip(setting, lang)}
               >
-                {llmLanguageLabel(lang)}
+                {llmLanguageLabel(setting, lang)}
               </button>
             );
           })}
         </div>
       )}
+      <button
+        type="button"
+        className="settings-inline-btn settings-about-link"
+        onClick={() => { onCloseMenu(); navigate('/settings/llm-language'); }}
+      >
+        View prompts →
+      </button>
       {saving && <div className="settings-section__hint">Saving…</div>}
       {error && <div className="settings-section__error">{error}</div>}
     </section>
