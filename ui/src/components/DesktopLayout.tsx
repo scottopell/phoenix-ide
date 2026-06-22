@@ -10,6 +10,7 @@ import { useResizablePane, useIsDesktop } from '../hooks';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
+import { useConversationReadiness } from '../contexts/useConversationReadiness';
 import { SubAgentViewerProvider, useSubAgentViewer } from '../contexts/SubAgentViewerContext';
 // Code-split: the panel pulls MessageComponents (markdown + syntax highlighting),
 // which must not land in the non-lazy app-shell bundle for routes that never
@@ -138,6 +139,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // (REQ-WSUI-010). Single-writer atom contract: only the SSE reducer writes
   // `workScope`; the section's initial fetch seeds local state, not the atom.
   const liveWorkScope = useWorkScope(activeSlug);
+  const { conversationId: readinessConversationId, confirmedLive } = useConversationReadiness();
 
   useEffect(() => {
     if (activeConversationId) {
@@ -145,13 +147,16 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     }
   }, [activeConversationId]);
 
-  const activeConversationArchived = activeConversation?.archived === true;
-  const effectiveCwd = activeConversationArchived
+  const activeConversationReadOnly =
+    activeConversation?.archived === true
+    || (activeConversation !== null && readinessConversationId !== activeConversation.id)
+    || (activeConversation !== null && !confirmedLive);
+  const effectiveCwd = activeConversationReadOnly
     ? null
     : (activeConversation?.worktree_path ?? activeConversation?.cwd ?? null);
-  const activeWorkScopeKey = activeConversationArchived ? undefined : activeConversation?.work_scope_key;
-  const activeLiveWorkScope = activeConversationArchived ? undefined : liveWorkScope;
-  const browserSessionActive = !activeConversationArchived && (activeConversation?.browser_session_active ?? false);
+  const activeWorkScopeKey = activeConversationReadOnly ? undefined : activeConversation?.work_scope_key;
+  const activeLiveWorkScope = activeConversationReadOnly ? undefined : liveWorkScope;
+  const browserSessionActive = !activeConversationReadOnly && (activeConversation?.browser_session_active ?? false);
 
   // Always render a single stable tree so children never unmounts across the
   // desktop/mobile breakpoint. Conditionally show sidebar and file-explorer

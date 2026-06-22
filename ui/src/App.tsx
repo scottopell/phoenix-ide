@@ -7,6 +7,7 @@ import { ThemeProvider } from './components/ThemeProvider';
 import { DensityProvider } from './components/DensityProvider';
 import { ConversationProvider } from './conversation';
 import { ChainProvider } from './chain';
+import { ConversationReadinessProvider } from './contexts/ConversationReadinessContext';
 import { api } from './api';
 import './index.css';
 
@@ -165,7 +166,9 @@ function App() {
           <FocusScopeProvider>
             <ConversationProvider>
               <ChainProvider>
-                <AppRoutes />
+                                <ConversationReadinessProvider>
+                    <AppRoutes />
+                  </ConversationReadinessProvider>
               </ChainProvider>
             </ConversationProvider>
           </FocusScopeProvider>

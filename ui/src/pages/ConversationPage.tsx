@@ -71,6 +71,7 @@ const ProcessInspectorPanel = lazy(() =>
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { useConversationReadiness } from '../contexts/useConversationReadiness';
 import {
   ForkProposalsProvider,
   useForkProposals,
@@ -136,6 +137,7 @@ function RecoveryBanner({ message, recoveryKind }: { message: string; recoveryKi
 
 function ConversationPageContent() {
   const { slug } = useParams<{ slug: string }>();
+  const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
   const createConversationWithStore = useCreateConversationWithStore();
 
@@ -153,12 +155,24 @@ function ConversationPageContent() {
   const [archiveStatusConfirmedConversationId, setArchiveStatusConfirmedConversationId] = useState<string | null>(null);
   const archiveStatusConfirmed =
     conversationId !== undefined && archiveStatusConfirmedConversationId === conversationId;
-  const isArchived = conversation?.archived === true || !archiveStatusConfirmed;
+  const serverArchived = conversation?.archived === true;
+  const isArchived = serverArchived || !archiveStatusConfirmed;
+  const confirmedLive = !!conversationId && archiveStatusConfirmed && !serverArchived;
   const prStatusHandle = useConversationPrStatus({
-    conversationId,
+    conversationId: confirmedLive ? conversationId : undefined,
     convModeLabel: conversation?.conv_mode_label,
     branchName: conversation?.branch_name,
   });
+
+  useEffect(() => {
+    setConversationReadiness({
+      conversationId: conversationId ?? null,
+      confirmedLive,
+    });
+    return () => {
+      setConversationReadiness({ conversationId: null, confirmedLive: false });
+    };
+  }, [setConversationReadiness, conversationId, confirmedLive]);
 
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
@@ -560,7 +574,7 @@ function ConversationPageContent() {
           // during the offline window. (task 02676)
           await queueOperation({
             type: 'send_message',
-            conversationId,
+              conversationId,
             payload: { text, images: imgs, files, localId },
             createdAt: new Date(),
             retryCount: 0,
@@ -590,7 +604,7 @@ function ConversationPageContent() {
   useEffect(() => { sendMessageRef.current = sendMessage; }, [sendMessage]);
 
   useEffect(() => {
-    if (!isArchived) return;
+    if (!serverArchived) return;
     for (const msg of pendingMessages) {
       dismiss(msg.localId);
     }
@@ -599,7 +613,7 @@ function ConversationPageContent() {
         console.error('Failed to drop archived pending operations:', err);
       });
     }
-  }, [isArchived, conversationId, pendingMessages, dismiss, removePendingOperations]);
+  }, [serverArchived, conversationId, pendingMessages, dismiss, removePendingOperations]);
 
   // Send queued messages when connection is restored. Iterate the derived
   // `pendingMessages` (NOT raw `queuedMessages`) so we don't re-POST entries

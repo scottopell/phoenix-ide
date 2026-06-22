@@ -8,6 +8,7 @@ import { DraftContext } from '../conversation/DraftContext';
 import { ConversationStore } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
 import { api, type Conversation, type Message } from '../api';
+import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api');
@@ -128,11 +129,13 @@ function renderPage(conversation: Conversation) {
   render(
     <ConversationContext.Provider value={store}>
       <DraftContext.Provider value={new DraftStore()}>
-        <MemoryRouter initialEntries={[`/c/${conversation.slug}`]}>
-          <Routes>
-            <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
-          </Routes>
-        </MemoryRouter>
+        <ConversationReadinessProvider>
+          <MemoryRouter initialEntries={[`/c/${conversation.slug}`]}>
+            <Routes>
+              <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+            </Routes>
+          </MemoryRouter>
+        </ConversationReadinessProvider>
       </DraftContext.Provider>
     </ConversationContext.Provider>,
   );
