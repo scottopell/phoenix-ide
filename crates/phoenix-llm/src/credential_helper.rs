@@ -409,7 +409,7 @@ impl CredentialSource for CredentialHelper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::CredentialSource;
+    use crate::CredentialSource;
     use futures::StreamExt;
     use tokio::time::timeout;
 
