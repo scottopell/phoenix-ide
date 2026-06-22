@@ -142,7 +142,6 @@ describe('ConversationRow — cached PR badge', () => {
         isActive={false}
         isChainMember={false}
         isChainLatest={false}
-        isSidebarMode={false}
         chainIndex={undefined}
         showArchived={false}
         onClick={vi.fn()}
