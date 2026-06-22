@@ -77,9 +77,13 @@ pub struct CommissionReviewInput {
     pub focus: Option<String>,
     #[serde(default)]
     pub allow_dirty_working_tree: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub approved_after_human_confirmation: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+}
+
+/// Runtime-owned execution payload for an approved `commission_review` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedCommissionReviewInput {
+    #[serde(flatten)]
+    pub request: CommissionReviewInput,
     pub runtime_base_branch: Option<String>,
 }
 
@@ -160,6 +164,7 @@ pub enum ToolInput {
     SubmitResult(SubmitResultInput),
     SubmitError(SubmitErrorInput),
     CommissionReview(CommissionReviewInput),
+    ApprovedCommissionReview(ApprovedCommissionReviewInput),
     ProposeTask(ProposeTaskInput),
     AskUserQuestion(AskUserQuestionInput),
     /// The tool name did not match any registered tool. Carries the original
@@ -342,6 +347,11 @@ impl From<CommissionReviewInput> for ToolInput {
         ToolInput::CommissionReview(input)
     }
 }
+impl From<ApprovedCommissionReviewInput> for ToolInput {
+    fn from(input: ApprovedCommissionReviewInput) -> Self {
+        ToolInput::ApprovedCommissionReview(input)
+    }
+}
 impl From<ProposeTaskInput> for ToolInput {
     fn from(input: ProposeTaskInput) -> Self {
         ToolInput::ProposeTask(input)
@@ -366,7 +376,9 @@ impl ToolInput {
             ToolInput::SpawnAgents(_) => "spawn_agents",
             ToolInput::SubmitResult(_) => "submit_result",
             ToolInput::SubmitError(_) => "submit_error",
-            ToolInput::CommissionReview(_) => "commission_review",
+            ToolInput::CommissionReview(_) | ToolInput::ApprovedCommissionReview(_) => {
+                "commission_review"
+            }
             ToolInput::ProposeTask(_) => "propose_task",
             ToolInput::AskUserQuestion(_) => "ask_user_question",
             ToolInput::Unknown { name, .. } | ToolInput::Malformed { name, .. } => name,
@@ -392,6 +404,9 @@ impl ToolInput {
             ToolInput::SubmitResult(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::SubmitError(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::CommissionReview(input) => {
+                serde_json::to_value(input).unwrap_or(Value::Null)
+            }
+            ToolInput::ApprovedCommissionReview(input) => {
                 serde_json::to_value(input).unwrap_or(Value::Null)
             }
             ToolInput::ProposeTask(input) => serde_json::to_value(input).unwrap_or(Value::Null),

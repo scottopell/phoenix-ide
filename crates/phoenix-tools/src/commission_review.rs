@@ -28,9 +28,12 @@ struct CommissionReviewInput {
     focus: Option<String>,
     #[serde(default)]
     allow_dirty_working_tree: bool,
-    #[serde(default)]
-    approved_after_human_confirmation: bool,
-    #[serde(default)]
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovedCommissionReviewInput {
+    #[serde(flatten)]
+    request: CommissionReviewInput,
     runtime_base_branch: Option<String>,
 }
 
@@ -40,6 +43,7 @@ enum ReviewStatus {
     Success,
     Skipped,
     CompletedWithWarnings,
+    #[allow(dead_code)]
     Rejected,
     #[allow(dead_code)]
     Failed,
@@ -200,8 +204,9 @@ impl Tool for CommissionReviewTool {
 
 async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, String> {
     let started = Instant::now();
-    let input: CommissionReviewInput = serde_json::from_value(input)
-        .map_err(|e| format!("Invalid commission_review input: {e}"))?;
+    let approved: ApprovedCommissionReviewInput = serde_json::from_value(input)
+        .map_err(|e| format!("Invalid approved commission_review input: {e}"))?;
+    let input = approved.request;
     if input.brief.trim().is_empty() {
         return Err(
             "commission_review requires a non-empty brief explaining why review is useful now"
@@ -209,30 +214,8 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         );
     }
 
-    let target = resolve_target(&ctx, &input).await?;
+    let target = resolve_target(&ctx, &input, approved.runtime_base_branch.as_deref()).await?;
     let collection = collect_diff(&target, &ctx).await?;
-
-    if !input.approved_after_human_confirmation {
-        return Ok(ReviewOutput {
-            status: ReviewStatus::Rejected,
-            summary: ReviewSummary {
-                target: target.summary,
-                files_changed: collection.files_changed,
-                files_reviewed: 0,
-                insertions: collection.insertions,
-                deletions: collection.deletions,
-                findings_count: 0,
-                elapsed_ms: started.elapsed().as_millis(),
-                input_tokens: None,
-                output_tokens: None,
-                reviewer_summary: Some(
-                    "Review not executed: awaiting human approval for token spend".to_string(),
-                ),
-            },
-            findings: Vec::new(),
-            warnings: collection.warnings,
-        });
-    }
 
     if ctx.cancel.is_cancelled() {
         return Err("commission_review cancelled before LLM review".to_string());
@@ -341,6 +324,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
 async fn resolve_target(
     ctx: &ToolContext,
     input: &CommissionReviewInput,
+    runtime_base_branch: Option<&str>,
 ) -> Result<ReviewTarget, String> {
     let repo_root = git_capture(&ctx.working_dir, &["rev-parse", "--show-toplevel"]).await?;
     let repo = PathBuf::from(repo_root.trim());
@@ -354,10 +338,7 @@ async fn resolve_target(
         if dirty && !input.allow_dirty_working_tree {
             return Err("commission_review refused dirty worktree review. Commit/stash changes, or set allow_dirty_working_tree=true to include uncommitted changes.".to_string());
         }
-        let base = input
-            .runtime_base_branch
-            .clone()
-            .unwrap_or_else(|| "main".to_string());
+        let base = runtime_base_branch.unwrap_or("main").to_string();
         Ok(ReviewTarget {
             summary: ReviewTargetSummary {
                 kind: ReviewTargetKind::WorktreeDiff,

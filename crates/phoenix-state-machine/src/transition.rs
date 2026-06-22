@@ -1775,13 +1775,19 @@ pub fn transition_parent(
             }),
         ) => {
             let mut approved_tool = tool_call.clone();
-            if let ToolInput::CommissionReview(input) = &mut approved_tool.input {
-                input.approved_after_human_confirmation = true;
-                input.runtime_base_branch = match context.mode_context.as_ref() {
-                    Some(ModeContext::Work { base_branch, .. })
-                    | Some(ModeContext::Branch { base_branch, .. }) => Some(base_branch.clone()),
-                    Some(ModeContext::Explore { .. } | ModeContext::Direct) | None => None,
-                };
+            if let ToolInput::CommissionReview(input) = &approved_tool.input {
+                approved_tool.input = ToolInput::ApprovedCommissionReview(
+                    phoenix_core::domain::sm_state::ApprovedCommissionReviewInput {
+                        request: input.clone(),
+                        runtime_base_branch: match context.mode_context.as_ref() {
+                            Some(ModeContext::Work { base_branch, .. })
+                            | Some(ModeContext::Branch { base_branch, .. }) => {
+                                Some(base_branch.clone())
+                            }
+                            Some(ModeContext::Explore { .. } | ModeContext::Direct) | None => None,
+                        },
+                    },
+                );
             }
             Ok(
                 ParentTransitionResult::new(ParentState::Core(CoreState::ToolExecuting {
@@ -2062,6 +2068,7 @@ pub fn transition_parent(
                 | ToolInput::SubmitResult(_)
                 | ToolInput::SubmitError(_)
                 | ToolInput::CommissionReview(_)
+                | ToolInput::ApprovedCommissionReview(_)
                 | ToolInput::AskUserQuestion(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
@@ -2310,6 +2317,7 @@ pub fn transition_parent(
                 | ToolInput::SubmitResult(_)
                 | ToolInput::SubmitError(_)
                 | ToolInput::ProposeTask(_)
+                | ToolInput::ApprovedCommissionReview(_)
                 | ToolInput::AskUserQuestion(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
@@ -2436,6 +2444,7 @@ pub fn transition_parent(
                 | ToolInput::SubmitError(_)
                 | ToolInput::ProposeTask(_)
                 | ToolInput::CommissionReview(_)
+                | ToolInput::ApprovedCommissionReview(_)
                 | ToolInput::Unknown { .. }
                 | ToolInput::Malformed { .. } => None,
             }) {
@@ -3045,6 +3054,7 @@ pub fn transition_sub_agent(
                     | ToolInput::SpawnAgents(_)
                     | ToolInput::ProposeTask(_)
                     | ToolInput::CommissionReview(_)
+                    | ToolInput::ApprovedCommissionReview(_)
                     | ToolInput::AskUserQuestion(_)
                     | ToolInput::Unknown { .. }
                     | ToolInput::Malformed { .. } => {
@@ -5912,6 +5922,102 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    mod commission_review_approval {
+        use super::*;
+        use crate::state::{CommissionReviewInput, ToolInput};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        fn commission_review_event() -> Event {
+            let tool = ToolCall::new(
+                "tool-review-1",
+                ToolInput::CommissionReview(CommissionReviewInput {
+                    brief: "Ready for independent review".to_string(),
+                    focus: Some("correctness".to_string()),
+                    allow_dirty_working_tree: false,
+                }),
+            );
+            Event::LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-review-1".to_string(),
+                    name: "commission_review".to_string(),
+                    input: serde_json::json!({
+                        "brief": "Ready for independent review",
+                        "focus": "correctness",
+                        "allow_dirty_working_tree": false,
+                    }),
+                }],
+                tool_calls: vec![tool],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
+            }
+        }
+
+        #[test]
+        fn commission_review_parks_for_approval() {
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &test_context(),
+                commission_review_event(),
+            )
+            .expect("commission_review should enter approval state");
+            assert!(matches!(
+                result.new_state,
+                ConvState::AwaitingCommissionReviewApproval { .. }
+            ));
+            assert!(!result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ExecuteTool { .. })));
+        }
+
+        #[test]
+        fn approval_converts_public_input_to_runtime_owned_input() {
+            let state = ConvState::AwaitingCommissionReviewApproval {
+                tool_call: ToolCall::new(
+                    "tool-review-1",
+                    ToolInput::CommissionReview(CommissionReviewInput {
+                        brief: "Ready for independent review".to_string(),
+                        focus: None,
+                        allow_dirty_working_tree: true,
+                    }),
+                ),
+                brief: "Ready for independent review".to_string(),
+                focus: None,
+                allow_dirty_working_tree: true,
+                assistant_message: AssistantMessage::new("req".to_string(), vec![], None, None),
+            };
+            let mut context = test_context();
+            context.mode_context = Some(ModeContext::Work {
+                branch_name: "task-branch".to_string(),
+                base_branch: "develop".to_string(),
+                worktree_path: "/tmp/wt".to_string(),
+            });
+
+            let result = transition(
+                &state,
+                &context,
+                Event::CommissionReviewApprovalDecided {
+                    outcome: CommissionReviewApprovalOutcome::Approved,
+                },
+            )
+            .expect("approval should execute review");
+
+            let execute_effect = result.effects.iter().find_map(|effect| match effect {
+                Effect::ExecuteTool { tool } => Some(tool),
+                _ => None,
+            });
+            let tool_call = execute_effect.expect("approval should emit ExecuteTool");
+            match &tool_call.input {
+                ToolInput::ApprovedCommissionReview(input) => {
+                    assert_eq!(input.request.brief, "Ready for independent review");
+                    assert_eq!(input.runtime_base_branch.as_deref(), Some("develop"));
+                }
+                other => panic!("expected approved commission review input, got {other:?}"),
+            }
+        }
     }
 
     // ========================================================================
