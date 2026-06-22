@@ -1,47 +1,161 @@
-# Commission Review Requirements
+# Commission Review
 
-## User need
+## User Story
 
-Agents need a Phoenix-native way to commission an independent review of the active work without relying on external review CLIs or separate provider credentials.
+As an agent completing a Phoenix task, I need to request an independent review of
+my active work so that correctness, security, and regression risks are checked
+before I hand the work back to the user.
+
+As a user supervising agent work, I want Phoenix to show me what the agent wants
+reviewed and why the review is worth the token spend so that I can approve large
+LLM costs deliberately instead of discovering them after the fact.
+
+As a Phoenix operator, I want review to use the same configured model stack as
+normal Phoenix conversations so that review works wherever Phoenix already works
+and does not require separate credentials or provider setup.
 
 ## Requirements
 
-### REQ-CR-001 Phoenix LLM provider stack
+### REQ-CR-001: Review Active Work Without External Setup
 
-Commission review shall use Phoenix's configured LLM selection and shall not require external provider credentials.
+WHEN an agent requests an independent code review
+THE SYSTEM SHALL use Phoenix's configured LLM provider selection to perform the
+review
+AND SHALL NOT require the user or agent to provide external review-service
+credentials
 
-### REQ-CR-002 Mandatory capital brief
+**Rationale:** Users already trust Phoenix's configured model stack. Requiring a
+separate CLI or provider account makes review harder to use and creates a second
+place for credentials, quotas, and failures to drift from the active Phoenix
+conversation.
 
-Commission review shall require a non-empty `brief` that explains why review is useful at this point in the work.
+---
 
-### REQ-CR-003 Human approval gate
+### REQ-CR-002: Justify Large Review Spend
 
-Commission review execution shall be gated by human approval because it can spend a significant token budget.
+WHEN an agent requests commission review
+THE SYSTEM SHALL require the request to include a non-empty executive brief
+explaining why the current work is ready for review and why review is useful now
 
-### REQ-CR-004 Inferred review target
+IF the executive brief is missing or empty
+THE SYSTEM SHALL reject the request before collecting review material or calling
+an LLM
 
-Commission review shall infer the review target from conversation and worktree context rather than requiring agents to provide refs, commits, or diff plumbing.
+**Rationale:** Review can be expensive. A concise justification helps the user
+make a cost decision and forces the agent to confirm that the work has reached a
+review-worthy point.
 
-### REQ-CR-005 Dirty worktree opt-in
+---
 
-A git-aware task or worktree review shall require a clean worktree unless `allow_dirty_working_tree` is explicitly true.
+### REQ-CR-003: Require Human Approval Before Review Execution
 
-### REQ-CR-006 Dirty state disclosure
+WHEN an agent requests commission review
+THE SYSTEM SHALL present the inferred review scope and spend justification to the
+user for approval before performing LLM review work
 
-When a dirty review is allowed, the approval and result surfaces shall disclose the dirty state and explicit opt-in.
+IF the user rejects the request
+THE SYSTEM SHALL return a structured rejected result to the agent
+AND SHALL NOT call the review LLM
 
-### REQ-CR-007 Structurally unavailable unsupported states
+**Rationale:** Users should control high-cost review actions. Approval before
+execution prevents accidental token spend while still letting agents ask for
+review at the moment it is most valuable.
 
-Unsupported states shall not expose `commission_review`; invalid review states shall not be representable as ordinary successful tool calls.
+---
 
-### REQ-CR-008 Read-only operation
+### REQ-CR-004: Infer the Review Target
 
-Commission review shall not edit files, stage changes, commit, push, or move refs.
+WHEN commission review is requested from a git-aware task or worktree
+THE SYSTEM SHALL infer the review target from the active conversation and
+worktree state
+AND SHALL NOT require the agent to supply refs, commits, or diff commands for the
+normal review path
 
-### REQ-CR-009 Cancellation
+WHEN commission review is requested from a direct conversation inside a git
+repository with workspace changes
+THE SYSTEM SHALL review the current workspace changes
 
-Long-running commission review work shall honor the conversation cancellation token.
+**Rationale:** Agents should not need to rebuild Phoenix's knowledge of the
+active task. Inferring the target avoids reviewing the wrong branch or omitting
+workspace changes because of hand-written diff plumbing.
 
-### REQ-CR-010 Skipped-file warnings
+---
 
-Large or unsupported files shall be reported as warnings and shall not be silently ignored.
+### REQ-CR-005: Prevent Accidental Dirty Worktree Reviews
+
+WHILE the review target is a git-aware task or worktree with uncommitted changes
+THE SYSTEM SHALL require `allow_dirty_working_tree` to be explicitly true before
+reviewing those changes
+
+IF the worktree is dirty and `allow_dirty_working_tree` is false
+THE SYSTEM SHALL reject the request with an actionable explanation
+AND SHALL NOT call the review LLM
+
+**Rationale:** Dirty reviews can mix intentional task work with scratch edits,
+local debug changes, or generated files. Explicit opt-in makes that ambiguity
+visible before Phoenix spends review budget.
+
+---
+
+### REQ-CR-006: Show Dirty State in Review Scope
+
+WHEN dirty worktree review is allowed
+THE SYSTEM SHALL include the dirty state and explicit dirty-review opt-in in the
+approval details and structured result
+
+**Rationale:** Users need to know whether review includes uncommitted work. The
+same fact must remain visible after the review so findings can be interpreted
+against the correct workspace state.
+
+---
+
+### REQ-CR-007: Hide Review Where Phoenix Cannot Infer Scope
+
+WHILE Phoenix cannot infer a supported review target from the active conversation
+state
+THE SYSTEM SHALL NOT expose commission review as an available tool
+
+IF an unavailable commission review request is replayed from stale conversation
+state
+THE SYSTEM SHALL report that review is unavailable rather than performing a
+best-effort review of an ambiguous target
+
+**Rationale:** Reviewing the wrong code is worse than not reviewing. Hiding the
+tool in unsupported contexts keeps agents on the safe path and prevents late,
+ambiguous failures.
+
+---
+
+### REQ-CR-008: Keep Review Read-Only
+
+WHEN commission review inspects repository state
+THE SYSTEM SHALL NOT edit files, stage changes, commit, push, fetch remote data,
+or move refs
+
+**Rationale:** Review is an advisory action. Users commissioning review expect
+observation and feedback only, not repository mutation or branch movement.
+
+---
+
+### REQ-CR-009: Honor Cancellation
+
+WHILE commission review is collecting review material or waiting for LLM review
+THE SYSTEM SHALL honor conversation cancellation
+AND SHALL stop the review without returning fabricated findings
+
+**Rationale:** Review can run longer than ordinary tools. Users need the same
+ability to stop runaway or no-longer-needed review work that they have for other
+long-running Phoenix operations.
+
+---
+
+### REQ-CR-010: Report Skipped Review Material
+
+WHEN commission review excludes a large, binary, unsupported, or truncated file
+THE SYSTEM SHALL include a warning identifying the skipped material and the
+reason it was skipped
+
+THE SYSTEM SHALL NOT silently omit changed files from the review result
+
+**Rationale:** Users and agents need to know the limits of a review. Explicit
+warnings prevent over-trusting a review that did not examine all changed files.
