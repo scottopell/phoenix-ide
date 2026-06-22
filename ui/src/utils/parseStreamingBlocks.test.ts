@@ -2,9 +2,51 @@ import { describe, it, expect } from 'vitest';
 import * as fc from 'fast-check';
 import { parseStreamingBlocks, type StreamingBlock } from './parseStreamingBlocks';
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
+const NESTED_MARKDOWN_STRESS = `\`\`\`markdown
+You are starting fresh in the \`datadog-agent\` repository on a new branch.
+
+## Context
+
+Recommended destination:
+
+\`\`\`text
+tools/check-skip-observability-demo/index.html
+\`\`\`
+
+## Current Agent behavior to understand
+
+### Scheduler
+
+\`\`\`text
+pkg/collector/scheduler/job.go
+\`\`\`
+
+The worker logs something similar to:
+
+\`\`\`text
+Check is already running, skipping execution...
+\`\`\`
+
+## Desired design direction
+
+\`\`\`text
+time →
+scheduled ticks:        |   |   |   |   |
+actual run spans:       [=======]   [=======]
+skipped attempts:           x           x
+current gauge samples:          ●           ●
+\`\`\`
+
+## Deliverable
+
+Create or replace:
+
+\`\`\`text
+tools/check-skip-observability-demo/index.html
+\`\`\`
+\`\`\`
+`;
+
 
 describe('parseStreamingBlocks', () => {
   it('returns empty array for empty string', () => {
@@ -112,6 +154,39 @@ describe('parseStreamingBlocks', () => {
     expect(result[0]).toEqual({ type: 'code', lang: '', content: 'line1\n\nline3\n', complete: true });
   });
 
+  it('keeps fenced markdown documents with nested fences in one code block', () => {
+    const result = parseStreamingBlocks(NESTED_MARKDOWN_STRESS);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ type: 'code', lang: 'markdown', complete: true });
+    expect(result[0]!.content).toContain('```text\ntools/check-skip-observability-demo/index.html\n```');
+    expect(result[0]!.content).toContain('```text\ntime →');
+    expect(result[0]!.content).toContain('## Deliverable\n');
+  });
+
+  it('does not churn completed block boundaries while streaming nested markdown fences', () => {
+    let maxBlocks = 0;
+    let previousStablePrefix = '';
+
+    for (let i = 1; i <= NESTED_MARKDOWN_STRESS.length; i++) {
+      const blocks = parseStreamingBlocks(NESTED_MARKDOWN_STRESS.slice(0, i));
+      maxBlocks = Math.max(maxBlocks, blocks.length);
+
+      const stablePrefix = blocks
+        .slice(0, -1)
+        .map((block) =>
+          block.type === 'code'
+            ? `${block.type}:${block.lang}:${block.complete}:${block.content}`
+            : `${block.type}:::${block.content}`
+        )
+        .join('\n---block---\n');
+      expect(stablePrefix.startsWith(previousStablePrefix)).toBe(true);
+      previousStablePrefix = stablePrefix;
+    }
+
+    expect(maxBlocks).toBe(1);
+  });
+
   it('streaming scenario: partial content then full content', () => {
     const full = 'intro\n```js\nconst x = 1;\n```\noutro\n';
 
@@ -129,10 +204,6 @@ describe('parseStreamingBlocks', () => {
     expect(final[1]).toEqual({ type: 'code', lang: 'js', content: 'const x = 1;\n', complete: true });
   });
 });
-
-// ---------------------------------------------------------------------------
-// Property tests
-// ---------------------------------------------------------------------------
 
 /**
  * Compute the original buffer from block content.
@@ -152,6 +223,12 @@ function stripFenceLines(buffer: string): string {
   let insideFence = false;
   let fenceChar = '';
   let fenceLength = 0;
+  let fenceLang = '';
+  let nestedFenceChar = '';
+  let nestedFenceLength = 0;
+
+  const closeRe = (char: string, length: number) => new RegExp(`^(${char === '`' ? '`' : '~'}{${length},})\\s*$`);
+  const isMarkdownLang = (lang: string) => ['markdown', 'md', 'mdx'].includes(lang.toLowerCase());
 
   for (let i = 0; i < lines.length; i++) {
     const part = lines[i]!;
@@ -160,12 +237,22 @@ function stripFenceLines(buffer: string): string {
     const bare = line.endsWith('\n') ? line.slice(0, -1) : line;
 
     if (insideFence) {
-      const re = new RegExp(`^(${fenceChar === '`' ? '`' : '~'}{${fenceLength},})\\s*$`);
-      if (re.test(bare)) {
+      const nestedOpener = isMarkdownLang(fenceLang) ? /^(`{3,}|~{3,})(.*)$/.exec(bare) : null;
+      if (nestedFenceChar !== '') {
+        result.push(line);
+        if (closeRe(nestedFenceChar, nestedFenceLength).test(bare)) {
+          nestedFenceChar = '';
+          nestedFenceLength = 0;
+        }
+      } else if (nestedOpener && !closeRe(fenceChar, fenceLength).test(bare)) {
+        nestedFenceChar = nestedOpener[1]![0]!;
+        nestedFenceLength = nestedOpener[1]!.length;
+        result.push(line);
+      } else if (closeRe(fenceChar, fenceLength).test(bare)) {
         insideFence = false;
         fenceChar = '';
         fenceLength = 0;
-        // Skip closing fence line
+        fenceLang = '';
       } else {
         result.push(line);
       }
@@ -175,7 +262,7 @@ function stripFenceLines(buffer: string): string {
         insideFence = true;
         fenceChar = m[1]![0]!;
         fenceLength = m[1]!.length;
-        // Skip opening fence line
+        fenceLang = m[2]!.trim().split(/\s+/)[0] ?? '';
       } else {
         result.push(line);
       }
