@@ -2189,46 +2189,58 @@ async fn send_chat(
     // (`markFailed` in ConversationPage.tsx) surface the rejection to the
     // user with retry/dismiss controls.
     //
-    // Authority: stable rejection states (Terminal, AwaitingTaskApproval,
-    // ContextExhausted, etc.) are preserved by reset_all_to_idle, so the DB
-    // row is always accurate for them — reject immediately without
-    // materialising a runtime. Transient-busy states (AgentBusy,
-    // CancellationInProgress) and Idle may diverge between DB and live
-    // executor after a restart auto-resume, so we call get_or_create first
-    // to run determine_resume_state and populate state_rx with the true
-    // initial state before reading effective_conversation_state.
-    // (FM-7, specs/bedrock/design.md)
-    if let Err(stable_err) = check_user_message_acceptable(&conversation.state) {
-        if !matches!(
-            stable_err,
-            TransitionError::AgentBusy | TransitionError::CancellationInProgress
-        ) {
-            // Stable rejection — no runtime needed; fall through to the
-            // existing error-type mapping below.
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                stable_err.to_string(),
-                match stable_err {
-                    TransitionError::ContextExhausted => "context_exhausted",
-                    TransitionError::ConversationTerminal => "conversation_terminal",
-                    TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
-                    TransitionError::AwaitingUserResponse => "awaiting_user_response",
-                    TransitionError::AgentBusy => "agent_busy",
-                    TransitionError::CancellationInProgress => "cancellation_in_progress",
-                    TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
-                },
-            ))));
+    // Authority (FM-7, specs/bedrock/design.md):
+    // - If a live handle exists, its state_rx is authoritative even if the
+    //   DB row disagrees (e.g. DB=AwaitingTaskApproval, live=LlmRequesting
+    //   during approve-task git work). Always route from live state when
+    //   a handle is present.
+    // - If no live handle exists, stable DB states (Terminal,
+    //   AwaitingTaskApproval, ContextExhausted, etc.) are preserved by
+    //   reset_all_to_idle and are always accurate — reject immediately
+    //   without materialising a runtime.
+    // - Otherwise (DB=Idle or a transient-busy variant with no handle),
+    //   call get_or_create so determine_resume_state derives the true
+    //   initial state and populates state_rx.
+    let effective_state = if let Some(live_state) =
+        state.runtime.effective_conversation_state(&id).await
+    {
+        // Live handle present — its state_rx is authoritative.
+        live_state
+    } else {
+        // No live handle yet. Stable DB rejection states don't require a
+        // runtime to be created — their DB row is always current.
+        if let Err(stable_err) = check_user_message_acceptable(&conversation.state) {
+            if !matches!(
+                stable_err,
+                TransitionError::AgentBusy | TransitionError::CancellationInProgress
+            ) {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    stable_err.to_string(),
+                    match stable_err {
+                        TransitionError::ContextExhausted => "context_exhausted",
+                        TransitionError::ConversationTerminal => "conversation_terminal",
+                        TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
+                        TransitionError::AwaitingUserResponse => "awaiting_user_response",
+                        TransitionError::AgentBusy => "agent_busy",
+                        TransitionError::CancellationInProgress => "cancellation_in_progress",
+                        TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
+                    },
+                ))));
+            }
         }
-    }
-    let _handle = state
-        .runtime
-        .get_or_create(&id)
-        .await
-        .map_err(AppError::BadRequest)?;
-    let effective_state = state
-        .runtime
-        .effective_conversation_state(&id)
-        .await
-        .unwrap_or_else(|| conversation.state.clone());
+        // DB says Idle (or a transient-busy variant) — materialise the
+        // runtime so determine_resume_state derives the true initial state.
+        let _handle = state
+            .runtime
+            .get_or_create(&id)
+            .await
+            .map_err(AppError::BadRequest)?;
+        state
+            .runtime
+            .effective_conversation_state(&id)
+            .await
+            .unwrap_or_else(|| conversation.state.clone())
+    };
     if let Err(err) = check_user_message_acceptable(&effective_state) {
         // `AgentBusy` and `CancellationInProgress` states are transient — the
         // conversation will reach `Idle` once the current operation completes.

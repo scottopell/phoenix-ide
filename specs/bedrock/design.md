@@ -1824,12 +1824,14 @@ receives `200 OK` and then sees an error in the conversation stream (post-200 re
 *Contract violated: for transient in-flight states the live runtime is the authority; the
 DB row is the safe rest-state after restart, not the current operational state.*
 **Prevention (chat routing):** `send_chat` calls `RuntimeManager::get_or_create` before
-checking state, ensuring `determine_resume_state` has run. `effective_conversation_state(conv_id)`
-then reads the live handle’s `watch::Receiver<ConvState>` to get the true executor state;
-the DB row is only consulted as a fallback when no handle exists. The authority rule
-(`get_or_create` → `effective_conversation_state` → route) lives in one place in `send_chat`.
-Other handlers (cancel, approve-task, etc.) have distinct routing invariants and are out of
-scope for this fix; they are candidates for the typed command API (Option 2 in the task plan).
+checking state, ensuring `determine_resume_state` has run and `state_rx` reflects the true
+executor state. Stable DB states that survive restart (`Terminal`, `AwaitingTaskApproval`,
+`ContextExhausted`, etc.) are rejected before runtime materialisation because the DB row is
+always accurate for them. For `Idle` and transient-busy states that can diverge after
+restart, the live handle's `watch::Receiver<ConvState>` is read via
+`effective_conversation_state(conv_id)`; the DB row is only consulted when no handle exists.
+Other handlers (`cancel_conversation`, `approve_task`, etc.) have distinct routing invariants
+governed by their own preconditions and are not subject to this authority rule.
 
 ### Panel Summary and Architecture Selection
 

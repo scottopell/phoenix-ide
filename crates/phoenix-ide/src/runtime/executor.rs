@@ -1843,12 +1843,9 @@ where
         // its prior value too — gating here keeps the in-memory stamp in sync.
         if self.state != old_state {
             self.state_updated_at = Utc::now();
-            // Publish the new state to any live-state observer (e.g. the
-            // `effective_conversation_state` authority used by HTTP handlers).
-            if let Some(tx) = &self.state_watcher {
-                // Receiver drop means the handle was removed — no action needed.
-                let _ = tx.send(self.state.clone());
-            }
+            // Note: state_watcher is published AFTER effects/drain complete (below)
+            // so the intermediate Idle state is never exposed when an inline
+            // steering drain will immediately advance it to LlmRequesting.
         }
 
         // Retire any pending retry-backoff timer when the conversation leaves
@@ -1964,6 +1961,17 @@ where
                     generated_events.push(gen_event);
                 }
             }
+        }
+
+        // Publish the final state to any live-state observer after all effects
+        // (including any inline steering drain) have completed. Publishing here
+        // rather than at the state-set site above prevents the intermediate
+        // `Idle` from being visible to `effective_conversation_state` during
+        // the await inside `run_effects_with_inline_drain`, which would cause a
+        // concurrent `POST /chat` to route a `UserMessage` before the drain has
+        // advanced the state back to `LlmRequesting` (FM-7).
+        if let Some(tx) = &self.state_watcher {
+            let _ = tx.send(self.state.clone());
         }
 
         Ok(generated_events)
