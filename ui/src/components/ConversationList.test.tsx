@@ -136,6 +136,7 @@ describe('ConversationRow — cached PR badge', () => {
     <MemoryRouter>
       <ConversationRow
         conv={conv}
+        isSidebarMode={false}
         isMenuOpen={false}
         isKeyboardSelected={false}
         isActive={false}

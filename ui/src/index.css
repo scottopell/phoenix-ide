@@ -4139,7 +4139,7 @@ pre:hover .copy-btn {
   border-bottom: 1px solid var(--border-color);
 }
 
-.llm-prompt-block__header h4 {
+.llm-prompt-block__title {
   margin: 0;
   font-size: 13px;
   color: var(--text-primary);

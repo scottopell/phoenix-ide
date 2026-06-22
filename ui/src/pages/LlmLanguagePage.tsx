@@ -32,7 +32,7 @@ function PromptBlock({ label, text }: { label: string; text: string }) {
   return (
     <div className="llm-prompt-block">
       <div className="llm-prompt-block__header">
-        <h4>{label}</h4>
+        <h4 className="llm-prompt-block__title">{label}</h4>
         <button type="button" className="settings-inline-btn" onClick={copy}>
           {copied ? 'Copied ✓' : 'Copy'}
         </button>
