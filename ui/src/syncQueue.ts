@@ -6,12 +6,17 @@ import type { PendingOperation } from './cache';
 export class SyncQueue {
   async processOperation(op: PendingOperation): Promise<void> {
     switch (op.type) {
-      case 'send_message':
+      case 'send_message': {
         if (!op.payload.localId) {
           throw new Error('send_message requires localId');
         }
         if (!op.payload.text && (op.payload.files || []).length === 0 && (op.payload.images || []).length === 0) {
           throw new Error('send_message requires text or attachments');
+        }
+        const current = await api.getConversation(op.conversationId);
+        if (current.conversation.archived) {
+          console.debug('Draining queued send for archived conversation:', op.conversationId);
+          break;
         }
         await api.sendMessage(
           op.conversationId,
@@ -21,7 +26,7 @@ export class SyncQueue {
           op.payload.localId,
         );
         break;
-      
+      }
       case 'archive':
         await api.archiveConversation(op.conversationId);
         break;

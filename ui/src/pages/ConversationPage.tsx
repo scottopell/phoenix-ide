@@ -156,8 +156,10 @@ function ConversationPageContent() {
   const archiveStatusConfirmed =
     conversationId !== undefined && archiveStatusConfirmedConversationId === conversationId;
   const serverArchived = conversation?.archived === true;
-  const isArchived = serverArchived || !archiveStatusConfirmed;
-  const confirmedLive = !!conversationId && archiveStatusConfirmed && !serverArchived;
+  const cachedIsSafeOffline =
+    !navigator.onLine && conversation?.archived !== true && !archiveStatusConfirmed;
+  const isArchived = serverArchived || (!archiveStatusConfirmed && !cachedIsSafeOffline);
+  const confirmedLive = !!conversationId && (archiveStatusConfirmed || cachedIsSafeOffline) && !serverArchived;
   const prStatusHandle = useConversationPrStatus({
     conversationId: confirmedLive ? conversationId : undefined,
     convModeLabel: conversation?.conv_mode_label,
@@ -405,6 +407,8 @@ function ConversationPageContent() {
               setArchiveStatusConfirmedConversationId(result.conversation.id);
               await cacheDB.putConversation(result.conversation);
               await cacheDB.putMessages(result.messages);
+            } else if (cached && !cached.archived) {
+              setArchiveStatusConfirmedConversationId(cached.id);
             }
           } catch (err) {
             if (!cancelled) {
