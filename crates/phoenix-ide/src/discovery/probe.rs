@@ -14,6 +14,7 @@ pub struct ProbeTarget {
 
 pub fn client(config: &DiscoveryConfig) -> Result<Client, reqwest::Error> {
     Client::builder()
+        .no_proxy()
         .redirect(Policy::none())
         .timeout(config.probe_timeout)
         .connect_timeout(config.probe_timeout)
@@ -55,7 +56,7 @@ pub async fn probe(
     let parsed = parse_catalog(&body, &catalog_url)?;
     let now = Utc::now();
     let base_url = base_url(target)?;
-    let id = format!("loopback:{}:{}", target.host, target.port);
+    let id = service_id(target);
 
     Ok(DiscoveredService {
         id,
@@ -88,6 +89,10 @@ fn base_url(target: ProbeTarget) -> Result<Url, String> {
         .map_err(|e| format!("invalid base url: {e}"))
 }
 
+fn service_id(target: ProbeTarget) -> String {
+    format!("loopback:{}", target.port)
+}
+
 async fn read_limited(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
@@ -99,4 +104,24 @@ async fn read_limited(response: reqwest::Response, limit: usize) -> Result<Vec<u
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{service_id, ProbeTarget};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn dual_stack_loopback_uses_one_service_id_per_port() {
+        let v4 = ProbeTarget {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 8787,
+        };
+        let v6 = ProbeTarget {
+            host: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            port: 8787,
+        };
+
+        assert_eq!(service_id(v4), service_id(v6));
+    }
 }

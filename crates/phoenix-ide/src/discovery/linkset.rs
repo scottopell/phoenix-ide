@@ -53,6 +53,13 @@ pub fn parse_catalog(body: &[u8], catalog_url: &Url) -> Result<ParsedCatalog, St
                 let Ok(url) = catalog_url.join(href) else {
                     continue;
                 };
+                if !matches!(url.scheme(), "http" | "https") {
+                    tracing::debug!(
+                        scheme = url.scheme(),
+                        "dropping unsafe API catalog link scheme"
+                    );
+                    continue;
+                }
                 let url = url.to_string();
                 if !seen.insert((rel.clone(), url.clone())) {
                     continue;
@@ -156,6 +163,31 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| matches!(capability, ServiceCapability::Documentation { .. })));
+        assert!(parsed
+            .capabilities
+            .iter()
+            .any(|capability| matches!(capability, ServiceCapability::HtmlUi { .. })));
+    }
+
+    #[test]
+    fn rejects_unsafe_link_schemes() {
+        let url = Url::parse("http://127.0.0.1:8787/.well-known/api-catalog").unwrap();
+        let parsed = parse_catalog(
+            br#"{
+              "linkset": [{
+                "title": "debug-router",
+                "service-doc": [{"href": "javascript:alert(1)", "title": "Bad"}],
+                "self": [{"href": "/", "type": "text/html", "title": "UI"}]
+              }]
+            }"#,
+            &url,
+        )
+        .unwrap();
+
+        assert!(!parsed.capabilities.iter().any(|capability| matches!(
+            capability,
+            ServiceCapability::Documentation { url, .. } if url.starts_with("javascript:")
+        )));
         assert!(parsed
             .capabilities
             .iter()

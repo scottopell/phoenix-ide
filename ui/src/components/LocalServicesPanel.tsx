@@ -6,6 +6,7 @@ const STORAGE_KEY = 'phoenix:local-services-expanded';
 
 export function LocalServicesPanel() {
   const [services, setServices] = useState<DiscoveredService[]>([]);
+  const [localAccess, setLocalAccess] = useState(false);
   const [expanded, setExpanded] = useState(() => {
     try {
       return localStorage.getItem(STORAGE_KEY) === 'true';
@@ -18,6 +19,12 @@ export function LocalServicesPanel() {
     api.getLocalServices()
       .then((response) => setServices(response.services))
       .catch(() => setServices([]));
+  }, []);
+
+  useEffect(() => {
+    api.deploymentInfo()
+      .then((info) => setLocalAccess(info.local_access))
+      .catch(() => setLocalAccess(false));
   }, []);
 
   useEffect(() => {
@@ -54,7 +61,7 @@ export function LocalServicesPanel() {
       {expanded && (
         <div className="local-services-list">
           {visibleServices.map((service) => (
-            <LocalServiceRow key={service.id} service={service} />
+            <LocalServiceRow key={service.id} service={service} localAccess={localAccess} />
           ))}
         </div>
       )}
@@ -62,7 +69,7 @@ export function LocalServicesPanel() {
   );
 }
 
-function LocalServiceRow({ service }: { service: DiscoveredService }) {
+function LocalServiceRow({ service, localAccess }: { service: DiscoveredService; localAccess: boolean }) {
   const label = service.title || hostLabel(service.base_url) || `:${service.port}`;
   const capabilityText = summarizeCapabilities(service.capabilities);
   const preferredUrl = preferredOpenUrl(service);
@@ -88,7 +95,7 @@ function LocalServiceRow({ service }: { service: DiscoveredService }) {
         <span>{capabilityText}</span>
         <span className="local-service-actions">
           <button className="local-service-action" type="button" onClick={copyUrl} title="Copy service URL">Copy</button>
-          {preferredUrl && (
+          {localAccess && preferredUrl && (
             <a className="local-service-action" href={preferredUrl} target="_blank" rel="noreferrer" title="Open service link">Open</a>
           )}
         </span>
