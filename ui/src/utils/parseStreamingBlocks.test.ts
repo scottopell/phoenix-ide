@@ -187,6 +187,29 @@ describe('parseStreamingBlocks', () => {
     expect(maxBlocks).toBe(1);
   });
 
+  it('keeps unlabeled nested fences inside markdown documents', () => {
+    const result = parseStreamingBlocks('```markdown\nHere:\n```\nfoo\n```\nEnd\n```\n');
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({
+      type: 'code',
+      lang: 'markdown',
+      content: 'Here:\n```\nfoo\n```\nEnd\n',
+      complete: true,
+    });
+  });
+
+  it('preserves the outer close after an opener-looking literal line', () => {
+    const result = parseStreamingBlocks('```markdown\n```text\n```\n');
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({
+      type: 'code',
+      lang: 'markdown',
+      content: '```text',
+      complete: true,
+    });
+  });
   it('streaming scenario: partial content then full content', () => {
     const full = 'intro\n```js\nconst x = 1;\n```\noutro\n';
 

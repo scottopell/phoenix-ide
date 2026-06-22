@@ -42,6 +42,32 @@ function matchCloseFence(line: string, char: string, minLength: number): boolean
   return re.test(line);
 }
 
+function lineBare(line: string): string {
+  return line.endsWith('\n') ? line.slice(0, -1) : line;
+}
+
+function findLaterClose(lines: string[], startIndex: number, char: string, minLength: number): number {
+  for (let i = startIndex + 1; i < lines.length; i++) {
+    if (matchCloseFence(lineBare(lines[i]!), char, minLength)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function hasNestedCloseAndOuterCloseAfter(
+  lines: string[],
+  openerIndex: number,
+  nestedChar: string,
+  nestedLength: number,
+  outerChar: string,
+  outerLength: number
+): boolean {
+  const nestedCloseIndex = findLaterClose(lines, openerIndex, nestedChar, nestedLength);
+  if (nestedCloseIndex === -1) return false;
+  return findLaterClose(lines, nestedCloseIndex, outerChar, outerLength) !== -1;
+}
+
 function isMarkdownFenceLang(lang: string): boolean {
   const normalized = lang.toLowerCase();
   return normalized === 'markdown' || normalized === 'md' || normalized === 'mdx';
@@ -107,6 +133,8 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
   let fenceLang = '';
   let nestedFenceChar = '';
   let nestedFenceLength = 0;
+  let nestedContentLineCount = 0;
+  let lastNestedCloseCompletedEmpty = false;
 
   // Accumulators
   let mdAccum = '';
@@ -128,11 +156,14 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
     fenceLang = '';
     nestedFenceChar = '';
     nestedFenceLength = 0;
+    nestedContentLineCount = 0;
+    lastNestedCloseCompletedEmpty = false;
   }
 
-  for (const line of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex]!;
     // For fence matching, use the line without its trailing newline.
-    const bare = line.endsWith('\n') ? line.slice(0, -1) : line;
+    const bare = lineBare(line);
 
     if (insideFence) {
       const nestedMarkdownFence = isMarkdownFenceLang(fenceLang) && nestedFenceChar !== '';
@@ -141,13 +172,29 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
       if (nestedMarkdownFence) {
         codeAccum += line;
         if (matchCloseFence(bare, nestedFenceChar, nestedFenceLength)) {
+          lastNestedCloseCompletedEmpty = nestedContentLineCount === 0;
           nestedFenceChar = '';
           nestedFenceLength = 0;
+          nestedContentLineCount = 0;
+        } else {
+          nestedContentLineCount += 1;
+          lastNestedCloseCompletedEmpty = false;
         }
-      } else if (nestedOpener && !matchCloseFence(bare, fenceChar, fenceLength)) {
-        nestedFenceChar = nestedOpener.char;
-        nestedFenceLength = nestedOpener.length;
-        codeAccum += line;
+      } else if (nestedOpener) {
+        const openerClosesOuter = matchCloseFence(bare, fenceChar, fenceLength);
+        const shouldStartNested = openerClosesOuter
+          ? hasNestedCloseAndOuterCloseAfter(lines, lineIndex, nestedOpener.char, nestedOpener.length, fenceChar, fenceLength)
+          : true;
+
+        if (shouldStartNested) {
+          nestedFenceChar = nestedOpener.char;
+          nestedFenceLength = nestedOpener.length;
+          nestedContentLineCount = 0;
+          lastNestedCloseCompletedEmpty = false;
+          codeAccum += line;
+        } else {
+          flushCode(true);
+        }
       } else if (matchCloseFence(bare, fenceChar, fenceLength)) {
         flushCode(true);
       } else {
@@ -170,7 +217,12 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
 
   // Emit any open code fence as incomplete
   if (insideFence) {
-    flushCode(false);
+    if (isMarkdownFenceLang(fenceLang) && nestedFenceChar === '' && lastNestedCloseCompletedEmpty) {
+      codeAccum = codeAccum.replace(new RegExp(`\\n?${fenceChar}{${fenceLength},}\\s*$`), '');
+      flushCode(true);
+    } else {
+      flushCode(false);
+    }
   }
 
   // Emit any trailing markdown
