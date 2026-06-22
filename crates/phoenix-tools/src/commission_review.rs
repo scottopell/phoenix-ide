@@ -7,6 +7,7 @@ use phoenix_core::domain::llm_types::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
@@ -14,6 +15,7 @@ use tokio::process::Command;
 
 const MAX_REVIEW_BYTES: usize = 180_000;
 const MAX_FILE_BYTES: usize = 80_000;
+const MAX_CHUNK_BYTES: usize = 60_000;
 const REVIEW_SYSTEM: &str = r#"You are an independent senior code reviewer for Phoenix IDE.
 Return only JSON matching this shape:
 {"findings":[{"severity":"critical|high|medium|low","confidence":"high|medium|low","file":"path","line":1,"title":"short","rationale":"why this matters","suggested_fix":"concrete fix"}],"summary":"short review summary"}
@@ -181,7 +183,16 @@ impl Tool for CommissionReviewTool {
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         match run_review(input, ctx).await {
-            Ok(out) => ToolOutput::success(pretty_json(&out)).with_display(json!(out)),
+            Ok(out) => {
+                let display = json!({
+                    "kind": "commission_review",
+                    "status": &out.status,
+                    "summary": &out.summary,
+                    "findings": &out.findings,
+                    "warnings": &out.warnings,
+                });
+                ToolOutput::success(pretty_json(&out)).with_display(display)
+            }
             Err(err) => ToolOutput::error(err),
         }
     }
@@ -250,28 +261,53 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     let service = ctx.llm_selector().default_service().ok_or_else(|| {
         "commission_review cannot run: no Phoenix LLM model is configured".to_string()
     })?;
-    let request = LlmRequest {
-        system: vec![SystemContent::new(REVIEW_SYSTEM)],
-        messages: vec![LlmMessage {
-            role: MessageRole::User,
-            content: vec![ContentBlock::text(review_prompt(
-                &input,
-                &target.summary,
-                &collection,
-            ))],
-        }],
-        tools: vec![],
-        max_tokens: Some(4096),
-        cache_key: PromptCacheKey::stable(format!("commission-review:{}", ctx.conversation_id)),
-    };
+    let chunks = review_chunks(&collection.body);
+    let mut findings = Vec::new();
+    let mut reviewer_summaries = Vec::new();
+    let mut warnings = Vec::new();
+    let mut input_tokens = 0;
+    let mut output_tokens = 0;
 
-    let response = tokio::select! {
-        () = ctx.cancel.cancelled() => return Err("commission_review cancelled during LLM review".to_string()),
-        response = service.complete(&request) => response.map_err(|e| format!("commission_review LLM review failed: {e}"))?,
-    };
+    for (index, chunk) in chunks.iter().enumerate() {
+        if ctx.cancel.is_cancelled() {
+            return Err("commission_review cancelled during LLM review".to_string());
+        }
+        let request = LlmRequest {
+            system: vec![SystemContent::new(REVIEW_SYSTEM)],
+            messages: vec![LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text(review_prompt(
+                    &input,
+                    &target.summary,
+                    &collection,
+                    chunk,
+                    index + 1,
+                    chunks.len(),
+                ))],
+            }],
+            tools: vec![],
+            max_tokens: Some(4096),
+            cache_key: PromptCacheKey::stable(format!(
+                "commission-review:{}:{index}",
+                ctx.conversation_id
+            )),
+        };
 
-    let usage = response.usage.clone();
-    let (findings, reviewer_summary, mut warnings) = parse_findings(&response.text());
+        let response = tokio::select! {
+            () = ctx.cancel.cancelled() => return Err("commission_review cancelled during LLM review".to_string()),
+            response = service.complete(&request) => response.map_err(|e| format!("commission_review LLM review failed: {e}"))?,
+        };
+        input_tokens += response.usage.input_tokens;
+        output_tokens += response.usage.output_tokens;
+        let (mut chunk_findings, chunk_summary, chunk_warnings) = parse_findings(&response.text());
+        findings.append(&mut chunk_findings);
+        if let Some(summary) = chunk_summary.filter(|s| !s.trim().is_empty()) {
+            reviewer_summaries.push(summary);
+        }
+        warnings.extend(chunk_warnings);
+    }
+
+    normalize_findings(&mut findings, &mut warnings);
     warnings.extend(collection.warnings);
     let status = if warnings.is_empty() {
         ReviewStatus::Success
@@ -289,9 +325,13 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
             deletions: collection.deletions,
             findings_count: findings.len(),
             elapsed_ms: started.elapsed().as_millis(),
-            input_tokens: Some(usage.input_tokens),
-            output_tokens: Some(usage.output_tokens),
-            reviewer_summary,
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            reviewer_summary: if reviewer_summaries.is_empty() {
+                None
+            } else {
+                Some(reviewer_summaries.join("\n\n"))
+            },
         },
         findings,
         warnings,
@@ -434,9 +474,12 @@ fn review_prompt(
     input: &CommissionReviewInput,
     target: &ReviewTargetSummary,
     collection: &DiffCollection,
+    diff_chunk: &str,
+    chunk_index: usize,
+    chunk_count: usize,
 ) -> String {
     format!(
-        "Brief:\n{}\n\nFocus:\n{}\n\nTarget:\n{}\n\nStats: {} changed files, {} reviewed files, +{}/-{}. Dirty: {}, dirty opt-in: {}.\n\nDiff:\n{}",
+        "Brief:\n{}\n\nFocus:\n{}\n\nTarget:\n{}\n\nStats: {} changed files, {} reviewed files, +{}/-{}. Dirty: {}, dirty opt-in: {}. Chunk {}/{}.\n\nDiff:\n{}",
         input.brief.trim(),
         input.focus.as_deref().unwrap_or("general correctness review"),
         serde_json::to_string_pretty(target).unwrap_or_default(),
@@ -446,16 +489,53 @@ fn review_prompt(
         collection.deletions,
         target.dirty,
         target.allow_dirty_working_tree,
-        collection.body
+        chunk_index,
+        chunk_count,
+        diff_chunk
     )
+}
+
+fn review_chunks(body: &str) -> Vec<String> {
+    if body.len() <= MAX_CHUNK_BYTES {
+        return vec![body.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for section in body
+        .split("\n\n--- FILE: ")
+        .filter(|s| !s.trim().is_empty())
+    {
+        let section = if section.starts_with("--- FILE: ") {
+            section.to_string()
+        } else {
+            format!("\n\n--- FILE: {section}")
+        };
+        if !current.is_empty() && current.len() + section.len() > MAX_CHUNK_BYTES {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if section.len() > MAX_CHUNK_BYTES {
+            chunks.push(section);
+        } else {
+            current.push_str(&section);
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn parse_findings(text: &str) -> (Vec<ReviewFinding>, Option<String>, Vec<ReviewWarning>) {
     let mut warnings = Vec::new();
-    let parsed = serde_json::from_str::<ModelReviewResponse>(text).or_else(|_| {
-        let start = text.find('{').unwrap_or(0);
-        let end = text.rfind('}').map(|idx| idx + 1).unwrap_or(text.len());
-        serde_json::from_str::<ModelReviewResponse>(&text[start..end])
+    let cleaned = strip_json_fence(text);
+    let parsed = serde_json::from_str::<ModelReviewResponse>(&cleaned).or_else(|_| {
+        let start = cleaned.find('{').unwrap_or(0);
+        let end = cleaned
+            .rfind('}')
+            .map(|idx| idx + 1)
+            .unwrap_or(cleaned.len());
+        serde_json::from_str::<ModelReviewResponse>(&cleaned[start..end])
     });
 
     let Ok(parsed) = parsed else {
@@ -483,6 +563,91 @@ fn parse_findings(text: &str) -> (Vec<ReviewFinding>, Option<String>, Vec<Review
         })
         .collect();
     (findings, parsed.summary, warnings)
+}
+
+fn strip_json_fence(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
+    }
+    trimmed
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("```"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn normalize_findings(findings: &mut Vec<ReviewFinding>, warnings: &mut Vec<ReviewWarning>) {
+    for finding in findings.iter_mut() {
+        finding.severity = normalize_enum(
+            &finding.severity,
+            &["critical", "high", "medium", "low"],
+            "medium",
+            warnings,
+            Some(&finding.file),
+            "invalid_severity",
+        );
+        finding.confidence = normalize_enum(
+            &finding.confidence,
+            &["high", "medium", "low"],
+            "medium",
+            warnings,
+            Some(&finding.file),
+            "invalid_confidence",
+        );
+        finding.file = finding.file.trim().to_string();
+        finding.title = finding.title.trim().to_string();
+    }
+
+    findings.sort_by(|a, b| {
+        severity_rank(&a.severity)
+            .cmp(&severity_rank(&b.severity))
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+
+    let mut seen = HashSet::new();
+    findings.retain(|finding| {
+        seen.insert((
+            finding.file.clone(),
+            finding.line,
+            finding.title.to_ascii_lowercase(),
+        ))
+    });
+}
+
+fn normalize_enum(
+    raw: &str,
+    allowed: &[&str],
+    fallback: &str,
+    warnings: &mut Vec<ReviewWarning>,
+    file: Option<&str>,
+    kind: &str,
+) -> String {
+    let value = raw.trim().to_ascii_lowercase();
+    if allowed.contains(&value.as_str()) {
+        value
+    } else {
+        warnings.push(warning(
+            kind,
+            &format!("reviewer returned unsupported value `{raw}`; normalized to `{fallback}`"),
+            file,
+        ));
+        fallback.to_string()
+    }
+}
+
+fn severity_rank(severity: &str) -> u8 {
+    match severity {
+        "critical" => 0,
+        "high" => 1,
+        "medium" => 2,
+        "low" => 3,
+        _ => 4,
+    }
 }
 
 fn is_unsupported(path: &str) -> bool {
@@ -555,5 +720,53 @@ mod tests {
         assert!(is_unsupported("ui/pnpm-lock.yaml.lock"));
         assert!(is_unsupported("image.png"));
         assert!(!is_unsupported("src/lib.rs"));
+    }
+
+    #[test]
+    fn fenced_json_is_parsed() {
+        let (findings, summary, warnings) =
+            parse_findings("```json\n{\"summary\":\"ok\",\"findings\":[]}\n```");
+        assert_eq!(summary.as_deref(), Some("ok"));
+        assert!(findings.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn findings_are_normalized_sorted_and_deduped() {
+        let mut findings = vec![
+            ReviewFinding {
+                severity: "LOW".to_string(),
+                confidence: "certain".to_string(),
+                file: "b.rs".to_string(),
+                line: Some(2),
+                title: "Dup".to_string(),
+                rationale: String::new(),
+                suggested_fix: String::new(),
+            },
+            ReviewFinding {
+                severity: "critical".to_string(),
+                confidence: "high".to_string(),
+                file: "a.rs".to_string(),
+                line: Some(1),
+                title: "Bad".to_string(),
+                rationale: String::new(),
+                suggested_fix: String::new(),
+            },
+            ReviewFinding {
+                severity: "low".to_string(),
+                confidence: "low".to_string(),
+                file: "b.rs".to_string(),
+                line: Some(2),
+                title: "dup".to_string(),
+                rationale: String::new(),
+                suggested_fix: String::new(),
+            },
+        ];
+        let mut warnings = Vec::new();
+        normalize_findings(&mut findings, &mut warnings);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].severity, "critical");
+        assert_eq!(findings[1].confidence, "medium");
+        assert_eq!(warnings[0].kind, "invalid_confidence");
     }
 }
