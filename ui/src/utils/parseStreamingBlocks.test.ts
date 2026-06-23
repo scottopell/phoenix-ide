@@ -187,16 +187,14 @@ describe('parseStreamingBlocks', () => {
     expect(maxBlocks).toBe(1);
   });
 
-  it('keeps unlabeled nested fences inside markdown documents', () => {
+  it('closes same-length unlabeled fences inside markdown documents', () => {
     const result = parseStreamingBlocks('```markdown\nHere:\n```\nfoo\n```\nEnd\n```\n');
 
-    expect(result).toHaveLength(1);
-    expect(result[0]).toEqual({
-      type: 'code',
-      lang: 'markdown',
-      content: 'Here:\n```\nfoo\n```\nEnd\n',
-      complete: true,
-    });
+    expect(result).toEqual([
+      { type: 'code', lang: 'markdown', content: 'Here:\n', complete: true },
+      { type: 'markdown', content: 'foo\n' },
+      { type: 'code', lang: '', content: 'End\n', complete: true },
+    ]);
   });
 
   it('preserves the outer close after an opener-looking literal line', () => {
@@ -209,6 +207,31 @@ describe('parseStreamingBlocks', () => {
       content: '```text',
       complete: true,
     });
+  });
+  it('keeps shorter unlabeled nested fences inside longer markdown wrappers', () => {
+    const result = parseStreamingBlocks('````markdown\nHere:\n```\nfoo\n```\nEnd\n````\n');
+
+    expect(result).toEqual([
+      { type: 'code', lang: 'markdown', content: 'Here:\n```\nfoo\n```\nEnd\n', complete: true },
+    ]);
+  });
+
+  it('prefers real outer closes after colon-ended markdown before later fences', () => {
+    const result = parseStreamingBlocks('```markdown\ndoc:\n```\ntext\n```\ncode\n```\n');
+
+    expect(result).toEqual([
+      { type: 'code', lang: 'markdown', content: 'doc:\n', complete: true },
+      { type: 'markdown', content: 'text\n' },
+      { type: 'code', lang: '', content: 'code\n', complete: true },
+    ]);
+  });
+
+  it('keeps longer markdown wrappers incomplete after empty inner closes', () => {
+    const result = parseStreamingBlocks('````markdown\n```text\n```\n');
+
+    expect(result).toEqual([
+      { type: 'code', lang: 'markdown', content: '```text\n```\n', complete: false },
+    ]);
   });
   it('prefers real outer closes before later independent fences', () => {
     const result = parseStreamingBlocks('```markdown\ndoc\n```\ntext\n```\ncode\n```\n');

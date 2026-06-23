@@ -46,36 +46,6 @@ function lineBare(line: string): string {
   return line.endsWith('\n') ? line.slice(0, -1) : line;
 }
 
-function findLaterClose(lines: string[], startIndex: number, char: string, minLength: number): number {
-  for (let i = startIndex + 1; i < lines.length; i++) {
-    if (matchCloseFence(lineBare(lines[i]!), char, minLength)) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-function previousNonBlankLineEndsWithColon(lines: string[], beforeIndex: number): boolean {
-  for (let i = beforeIndex - 1; i >= 0; i--) {
-    const trimmed = lineBare(lines[i]!).trim();
-    if (trimmed !== '') return trimmed.endsWith(':');
-  }
-  return false;
-}
-
-function hasNestedCloseAndOuterCloseAfter(
-  lines: string[],
-  openerIndex: number,
-  nestedChar: string,
-  nestedLength: number,
-  outerChar: string,
-  outerLength: number
-): boolean {
-  const nestedCloseIndex = findLaterClose(lines, openerIndex, nestedChar, nestedLength);
-  if (nestedCloseIndex === -1) return false;
-  return findLaterClose(lines, nestedCloseIndex, outerChar, outerLength) !== -1;
-}
-
 function isMarkdownFenceLang(lang: string): boolean {
   const normalized = lang.toLowerCase();
   return normalized === 'markdown' || normalized === 'md' || normalized === 'mdx';
@@ -189,11 +159,7 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
           lastNestedCloseCompletedEmpty = false;
         }
       } else if (nestedOpener) {
-        const openerClosesOuter = matchCloseFence(bare, fenceChar, fenceLength);
-        const shouldStartNested = openerClosesOuter
-          ? previousNonBlankLineEndsWithColon(lines, lineIndex) &&
-            hasNestedCloseAndOuterCloseAfter(lines, lineIndex, nestedOpener.char, nestedOpener.length, fenceChar, fenceLength)
-          : true;
+        const shouldStartNested = !matchCloseFence(bare, fenceChar, fenceLength);
 
         if (shouldStartNested) {
           nestedFenceChar = nestedOpener.char;
@@ -227,7 +193,13 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
 
   // Emit any open code fence as incomplete
   if (insideFence) {
-    if (isMarkdownFenceLang(fenceLang) && nestedFenceChar === '' && lastNestedCloseCompletedEmpty) {
+    const trailingBare = lines.length > 0 ? lineBare(lines[lines.length - 1]!) : '';
+    if (
+      isMarkdownFenceLang(fenceLang) &&
+      nestedFenceChar === '' &&
+      lastNestedCloseCompletedEmpty &&
+      matchCloseFence(trailingBare, fenceChar, fenceLength)
+    ) {
       codeAccum = codeAccum.replace(new RegExp(`\\n?${fenceChar}{${fenceLength},}\\s*$`), '');
       flushCode(true);
     } else {
