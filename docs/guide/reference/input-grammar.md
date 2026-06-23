@@ -43,9 +43,11 @@ A skill that declares an argument hint shows it as ghost text once selected.
 
 ## When a reference can't resolve
 
-Only an unresolvable **`@file`** blocks send with an inline error. An unknown
-`/name` is **not** an error — it's sent through as literal text — and a `./path`
-is never expanded. Editing the draft clears the error.
+A bad **`@file`** blocks send with an inline error — and so does a `/skill` that
+**matches a real skill but fails to load** (a broken `SKILL.md` or companion
+file). An **unknown** `/name` (no matching skill) is **not** an error — it's sent
+through as literal text — and a `./path` is never expanded. Editing the draft
+clears the error.
 
 | Error (verbatim) | Cause |
 |------------------|-------|

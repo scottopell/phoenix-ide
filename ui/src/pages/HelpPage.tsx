@@ -65,13 +65,18 @@ function stripFrontmatter(md: string): string {
 }
 
 /** Resolve a relative in-doc path (no fragment) against the current page's
- *  directory, to a doc-root-relative path. */
-function resolveDocPath(current: string, relPath: string): string {
+ *  directory. Returns the guide-root-relative path, or null if the link escapes
+ *  the guide tree (e.g. AUTHORING.md → ../../skills/…) — those aren't served by
+ *  /api/help and must not be routed through /help. */
+function resolveGuidePath(current: string, relPath: string): string | null {
+  const ROOT = '/__guide__/';
   const baseDir = current.includes('/') ? current.slice(0, current.lastIndexOf('/') + 1) : '';
   try {
-    return new URL(relPath, 'https://x/' + baseDir).pathname.replace(/^\//, '');
+    const u = new URL(relPath, 'https://x' + ROOT + baseDir);
+    if (!u.pathname.startsWith(ROOT)) return null; // climbed above the guide root
+    return u.pathname.slice(ROOT.length);
   } catch {
-    return relPath;
+    return null;
   }
 }
 
@@ -159,11 +164,17 @@ export function HelpPage() {
         const hashIdx = href.indexOf('#');
         const relPath = hashIdx >= 0 ? href.slice(0, hashIdx) : href;
         const frag = hashIdx >= 0 ? href.slice(hashIdx) : '';
-        const resolved = resolveDocPath(page, relPath);
+        const target = resolveGuidePath(page, relPath);
+        // Only guide-local .md pages route through /help; out-of-guide links
+        // (e.g. ../../skills/…), directory links, and non-.md targets aren't
+        // served by /api/help, so leave them as plain links (they work on GitHub).
+        if (!target || !target.endsWith('.md')) {
+          return <a href={href} {...props}>{children}</a>;
+        }
         return (
           <a
-            href={`/help?p=${encodeURIComponent(resolved)}${frag}`}
-            onClick={(e) => { e.preventDefault(); go(resolved, frag); }}
+            href={`/help?p=${encodeURIComponent(target)}${frag}`}
+            onClick={(e) => { e.preventDefault(); go(target, frag); }}
             {...props}
           >
             {children}

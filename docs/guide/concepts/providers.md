@@ -1,16 +1,16 @@
 ---
 title: Providers & models
-summary: Phoenix talks to several LLM providers behind one interface — you pick the model, it handles the rest.
+summary: Phoenix talks to multiple LLM providers behind one interface — you pick the model, it handles the rest.
 category: concepts
-keywords: [provider, model, anthropic, openai, fireworks, gateway, picker]
+keywords: [provider, model, anthropic, openai, gateway, picker]
 related: [concepts/conversations.md, howto/getting-started.md, reference/glossary.md]
 ---
 
 # Providers & models
 
-Phoenix speaks to several LLM providers — Anthropic, OpenAI, Fireworks — behind a
-single interface. You choose a **model**; Phoenix handles the provider-specific
-details. The model is a property of the conversation, like its mode.
+Phoenix speaks to multiple LLM providers — Anthropic and OpenAI — behind a single
+interface. You choose a **model**; Phoenix handles the provider-specific details.
+The model is a property of the conversation, like its mode.
 
 ## How it works
 

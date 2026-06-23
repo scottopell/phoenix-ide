@@ -27,10 +27,10 @@ related: [concepts/conversations.md, reference/managed-lifecycle-states.md, refe
 
 | State | What's happening |
 |-------|------------------|
-| Idle | ready for your next message (the only state where you can switch model) |
+| Idle | ready for your next message (you can switch model here — or in Error) |
 | Awaiting approval | a proposed task is waiting for your **Approve** / **Send Feedback** / **Discard** |
 | Awaiting your answer | the agent asked a question and needs your pick |
-| Error | a turn failed; retry from idle |
+| Error | a turn failed; retry from idle — you can switch model here to recover (e.g. from quota/overload) |
 
 ## Read-only (terminal)
 

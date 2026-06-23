@@ -28,7 +28,7 @@ In search mode, results group by source (conversations show slug + directory).
 | `New Conversation` | Conversation | go to the conversation list (`/`), where **+ New** starts one |
 | `Go to Conversation List` | Navigation | open the conversation list (`/`) |
 | `Open User Guide` | Help | open `/help` |
-| `Archive Current Conversation` | Conversation | archive the open conversation *(only when one is open)* |
+| `Archive Current Conversation` | Conversation | archive the open conversation — or, if it belongs to a **chain**, the whole chain *(only when a conversation is open)* |
 
 ## Keyboard
 

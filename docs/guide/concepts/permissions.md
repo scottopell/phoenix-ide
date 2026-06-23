@@ -23,10 +23,12 @@ around the check — rather than merely being discouraged.
 - **Intent-agnostic.** The check judges only the tool name and its input — not
   the conversation, your messages, or prior results. The same call is allowed or
   denied the same way every time.
-- **Typed rules per tool.** It's seeded with shell-safety rules: blind
-  `git add` (`-A`/`.`/`--all`/`*`), force-push (`--force`/`-f`, but
-  `--force-with-lease` is fine), and dangerous `rm -rf` of `/`, `~`, `$HOME`,
-  `.git`, `*`, and `.*`.
+- **Typed rules per tool.** It's seeded with shell-safety rules that screen the
+  **`bash`** tool's `run`: blind `git add` (`-A`/`.`/`--all`/`*`), force-push
+  (`--force`/`-f`, but `--force-with-lease` is fine), and dangerous `rm -rf` of
+  `/`, `~`, `$HOME`, `.git`, `*`, and `.*`. (These rules are scoped to `bash`; a
+  shell command run through another tool, like `tmux_run`, isn't screened by
+  them.)
 - **Deny and continue.** A denial comes back to the agent through the normal
   tool-result channel, so it can adapt and try a safe alternative.
 
