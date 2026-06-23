@@ -256,14 +256,52 @@ fn has_path_token_shape(token: &str) -> bool {
         return token
             .split('/')
             .skip(1)
-            .all(|component| !component.is_empty());
+            .all(|component| !component.is_empty() && path_component_has_valid_groups(component));
     }
 
-    token.split('/').all(|component| !component.is_empty())
+    token
+        .split('/')
+        .all(|component| !component.is_empty() && path_component_has_valid_groups(component))
+}
+
+fn path_component_has_valid_groups(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                let Some(close) = component[i + 1..].find(')').map(|offset| i + 1 + offset) else {
+                    return false;
+                };
+                if close == i + 1 {
+                    return false;
+                }
+                i = close + 1;
+            }
+            b')' => return false,
+            b'[' => {
+                let Some(close) = component[i + 1..].find(']').map(|offset| i + 1 + offset) else {
+                    return false;
+                };
+                if close == i + 1 {
+                    return false;
+                }
+                i = close + 1;
+            }
+            b']' => return false,
+            _ => i += 1,
+        }
+    }
+
+    true
 }
 
 fn is_path_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '~' | '@')
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '/' | '.' | '_' | '-' | '+' | '~' | '@' | '$' | '(' | ')' | '[' | ']'
+        )
 }
 
 /// Expand all inline references in `text` against `root`.
@@ -1010,12 +1048,39 @@ def api_catalog():
     }
 
     #[test]
+    fn test_framework_route_paths_expand() {
+        let tmp = make_tmp();
+        fs::create_dir_all(tmp.path().join("app/routes/[slug]")).unwrap();
+        fs::create_dir_all(tmp.path().join("app/routes/(auth)")).unwrap();
+        fs::write(tmp.path().join("app/routes/[slug].tsx"), "slug route").unwrap();
+        fs::write(tmp.path().join("app/routes/[slug]/$id.tsx"), "id route").unwrap();
+        fs::write(
+            tmp.path().join("app/routes/(auth)/login.tsx"),
+            "login route",
+        )
+        .unwrap();
+
+        let result = expand(
+            "see @app/routes/[slug].tsx and @app/routes/[slug]/$id.tsx and @app/routes/(auth)/login.tsx",
+            &root(tmp.path()),
+        )
+        .unwrap();
+
+        assert!(result.llm_text.contains("slug route"));
+        assert!(result.llm_text.contains("id route"));
+        assert!(result.llm_text.contains("login route"));
+    }
+
+    #[test]
     fn test_looks_like_file_path_function() {
         assert!(looks_like_file_path("src/main.rs"));
         assert!(looks_like_file_path("AGENTS.md"));
         assert!(looks_like_file_path("config.toml"));
         assert!(looks_like_file_path("test.txt"));
         assert!(looks_like_file_path("foo/bar"));
+        assert!(looks_like_file_path("app/routes/[slug].tsx"));
+        assert!(looks_like_file_path("app/routes/(auth)/login.tsx"));
+        assert!(looks_like_file_path("app/routes/[slug]/$id.tsx"));
         assert!(!looks_like_file_path("username"));
         assert!(!looks_like_file_path("param"));
         assert!(!looks_like_file_path("override"));

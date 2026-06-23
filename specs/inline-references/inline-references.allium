@@ -103,12 +103,14 @@ rule ClassifyAtReferenceAsFile {
         -- looks_like_path: black-box predicate evaluated on the token —
         -- true when the token has a valid path-token shape and then either
         -- contains "/" or its trailing dot-suffix is in
-        -- config.path_like_extensions. Valid path-token shapes contain only
-        -- path characters and reject code/prose delimiters or trailing
+        -- config.path_like_extensions. Valid path-token shapes contain normal
+        -- path characters, including balanced framework route groups such as
+        -- `[slug]` and `(auth)`, and reject call/prose delimiters or trailing
         -- punctuation before slash/extension checks are applied.
         -- Implementation: the same check in expand() in message_expander.rs.
         -- Examples:
         --   @src/main.rs       -> file_expansion (valid path token with /)
+        --   @app/routes/[slug].tsx -> file_expansion (balanced route segment)
         --   @AGENTS.md         -> file_expansion (.md is a known extension)
         --   @app.get("/x",     -> not_a_reference (code-shaped token)
 }
