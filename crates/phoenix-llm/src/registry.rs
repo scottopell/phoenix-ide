@@ -1,11 +1,12 @@
 //! Model registry for managing available LLM providers
 
 use super::{
-    all_models, codex_credential, discover_models, probe_gateway, CodexCredential, DiscoveryConfig,
-    LlmService, LlmServiceImpl, LoggingService, ModelInfo, Provider,
+    all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
+    probe_gateway, CodexCredential, DiscoveryConfig, LlmService, LlmServiceImpl, LoggingService,
+    ModelInfo, Provider,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -181,6 +182,10 @@ pub struct LlmConfig {
     /// How credential helper output should be sent in HTTP headers.
     /// Parsed from `LLM_AUTH_HEADER` env var at startup.
     pub auth_style: AuthStyle,
+    /// Additional model specs loaded from `PHOENIX_LLM_MODELS` inline JSON.
+    /// These are additive only; duplicate IDs are ignored when merged with
+    /// built-ins.
+    pub external_models: Vec<super::ModelSpec>,
     /// User has signalled intent to use the `ChatGPT` bridge. True when
     /// Phoenix's own login file (`~/.phoenix-ide/codex-auth.json`) exists at
     /// startup OR when `OPENAI_USE_CODEX_AUTH=1` is set (piggyback mode).
@@ -227,6 +232,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("custom_headers", &self.custom_headers)
             .field("request_tags", &self.request_tags)
             .field("auth_style", &self.auth_style)
+            .field("external_models", &self.external_models.len())
             .field("use_codex_auth", &self.use_codex_auth)
             .field("codex_credential", &self.codex_credential.is_some())
             .field("codex_credential_path", &self.codex_credential_path)
@@ -248,6 +254,7 @@ impl Clone for LlmConfig {
             custom_headers: self.custom_headers.clone(),
             request_tags: self.request_tags.clone(),
             auth_style: self.auth_style,
+            external_models: self.external_models.clone(),
             use_codex_auth: self.use_codex_auth,
             codex_credential: self.codex_credential.as_ref().map(Arc::clone),
             codex_credential_path: self.codex_credential_path.clone(),
@@ -269,6 +276,7 @@ impl Default for LlmConfig {
             custom_headers: Vec::new(),
             request_tags: std::collections::BTreeMap::new(),
             auth_style: AuthStyle::ApiKey,
+            external_models: Vec::new(),
             use_codex_auth: false,
             codex_credential: None,
             codex_credential_path: None,
@@ -317,6 +325,24 @@ impl LlmConfig {
             .ok()
             .as_deref()
             .map(parse_request_tags)
+            .unwrap_or_default();
+
+        let external_models = std::env::var("PHOENIX_LLM_MODELS")
+            .ok()
+            .filter(|raw| !raw.trim().is_empty())
+            .map(|raw| match parse_external_models(&raw) {
+                Ok(models) => {
+                    tracing::info!(count = models.len(), "loaded PHOENIX_LLM_MODELS additions");
+                    models
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "invalid PHOENIX_LLM_MODELS; ignoring externally configured LLM models"
+                    );
+                    Vec::new()
+                }
+            })
             .unwrap_or_default();
 
         // Resolve which file (if any) holds ChatGPT credentials at startup.
@@ -370,6 +396,7 @@ impl LlmConfig {
             } else {
                 AuthStyle::ApiKey
             },
+            external_models,
             use_codex_auth,
             codex_credential,
             codex_credential_path,
@@ -464,8 +491,8 @@ impl ModelRegistry {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
 
-        // Try to create each model from the centralized definitions
-        for spec in all_models() {
+        // Try to create each model from the centralized definitions plus valid external additions.
+        for spec in Self::model_specs(config) {
             if let Some(service) = Self::try_create_model(&spec, config) {
                 services.insert(spec.id.clone(), service);
                 specs.insert(spec.id.clone(), spec);
@@ -581,20 +608,14 @@ impl ModelRegistry {
 
         tracing::info!("Discovered {} models from gateway", discovered.len());
 
-        // Register hardcoded models that were confirmed by discovery.
+        // Register configured models that were confirmed by discovery.
         // The AI gateway returns provider-prefixed IDs (e.g. "anthropic/claude-sonnet-4-6"),
         // so also check for "{provider}/{id}" and "{provider}/{api_name}".
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
 
-        for spec in all_models() {
-            let prefixed_id = format!("{}/{}", spec.provider.header_value(), spec.id);
-            let prefixed_api = format!("{}/{}", spec.provider.header_value(), spec.api_name);
-            if discovered.contains(&spec.id)
-                || discovered.contains(&spec.api_name)
-                || discovered.contains(&prefixed_id)
-                || discovered.contains(&prefixed_api)
-            {
+        for spec in Self::model_specs(config) {
+            if Self::spec_matches_discovered_model(&spec, &discovered) {
                 if let Some(service) = Self::try_create_model(&spec, config) {
                     services.insert(spec.id.clone(), service);
                     specs.insert(spec.id.clone(), spec);
@@ -605,12 +626,12 @@ impl ModelRegistry {
         if services.is_empty() {
             tracing::warn!(
                 discovered = discovered.len(),
-                "No known models found in gateway discovery; falling back to hardcoded list"
+                "No configured known models found in gateway discovery; falling back to configured model list"
             );
             return Self::new_with_status(config, GatewayStatus::Unreachable);
         }
 
-        tracing::info!("Registered {} models (hardcoded only)", services.len());
+        tracing::info!("Registered {} discovered configured models", services.len());
 
         let default_model = Self::pick_default_model(&services, config);
 
@@ -623,6 +644,23 @@ impl ModelRegistry {
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
             config: Arc::new(config.clone()),
         }
+    }
+
+    /// Return built-in model specs plus valid external additions from config.
+    fn model_specs(config: &LlmConfig) -> Vec<super::ModelSpec> {
+        merge_model_specs(all_models(), &config.external_models)
+    }
+
+    fn spec_matches_discovered_model(
+        spec: &super::ModelSpec,
+        discovered: &HashSet<String>,
+    ) -> bool {
+        let prefixed_id = format!("{}/{}", spec.provider.header_value(), spec.id);
+        let prefixed_api = format!("{}/{}", spec.provider.header_value(), spec.api_name);
+        discovered.contains(&spec.id)
+            || discovered.contains(&spec.api_name)
+            || discovered.contains(&prefixed_id)
+            || discovered.contains(&prefixed_api)
     }
 
     /// Build a `DiscoveryConfig` from the available LLM config settings.
@@ -1003,7 +1041,7 @@ impl ModelRegistry {
         let mut new_codex_services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut new_codex_specs: HashMap<String, super::ModelSpec> = HashMap::new();
         if let Some((cred, _)) = cred_with_account.as_ref() {
-            for spec in all_models() {
+            for spec in Self::model_specs(&self.config) {
                 if spec.provider != Provider::OpenAI {
                     continue;
                 }
@@ -1036,7 +1074,7 @@ impl ModelRegistry {
             // Remove existing OpenAI entries before inserting the new ones,
             // so deregister-on-logout (cred=None) and switch-account both
             // converge on the right state.
-            let openai_ids: Vec<String> = all_models()
+            let openai_ids: Vec<String> = Self::model_specs(&self.config)
                 .iter()
                 .filter(|s| s.provider == Provider::OpenAI)
                 .map(|s| s.id.clone())
@@ -1183,6 +1221,85 @@ mod tests {
         // split_once on first '=' lets values contain '='
         let tags = parse_request_tags("query=a=b=c");
         assert_eq!(tags.get("query"), Some(&"a=b=c".to_string()));
+    }
+
+    fn external_baseten_model() -> super::super::ModelSpec {
+        parse_external_models(
+            r#"[{"id":"baseten/moonshotai/Kimi-K2.6","provider":"anthropic","api_format":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+    }
+
+    #[test]
+    fn configured_anthropic_model_registers_and_can_be_default() {
+        let model = external_baseten_model();
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            default_model: Some(model.id.clone()),
+            external_models: vec![model],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert!(registry.get("baseten/moonshotai/Kimi-K2.6").is_some());
+        assert_eq!(registry.default_model_id(), "baseten/moonshotai/Kimi-K2.6");
+        assert_eq!(
+            registry.context_window("baseten/moonshotai/Kimi-K2.6"),
+            262_000
+        );
+    }
+
+    #[test]
+    fn configured_model_appears_in_model_info() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            external_models: vec![external_baseten_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        let info = registry
+            .available_model_info()
+            .into_iter()
+            .find(|model| model.id == "baseten/moonshotai/Kimi-K2.6")
+            .expect("external model should be included in /api/models data");
+
+        assert_eq!(info.provider, "Anthropic");
+        assert_eq!(info.context_window, 262_000);
+        assert!(!info.recommended);
+    }
+
+    #[test]
+    fn discovery_matcher_allows_configured_model_id_and_provider_prefix() {
+        let model = external_baseten_model();
+        let discovered = HashSet::from(["anthropic/baseten/moonshotai/Kimi-K2.6".to_string()]);
+
+        assert!(ModelRegistry::spec_matches_discovered_model(
+            &model,
+            &discovered
+        ));
+    }
+
+    #[test]
+    fn duplicate_configured_model_does_not_override_builtin_registration() {
+        let duplicate = parse_external_models(
+            r#"[{"id":"claude-sonnet-4-6","api_name":"other-wire-name","provider":"anthropic","api_format":"anthropic","description":"Override attempt","context_window":123,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            external_models: vec![duplicate],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert_eq!(registry.context_window("claude-sonnet-4-6"), 1_000_000);
     }
 
     #[test]

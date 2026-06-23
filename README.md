@@ -176,6 +176,7 @@ you (dev mode auto-detects an LLM gateway; prod reads `.phoenix-ide.env` from th
 | `OPENAI_API_KEY` | Direct OpenAI API key | — |
 | `OPENAI_BASE_URL` | Override the OpenAI API base URL | — |
 | `DEFAULT_MODEL` | Preferred default model ID (used only if it actually registers) | first registered model |
+| `PHOENIX_LLM_MODELS` | Inline JSON array of additional model specs to add to the built-in registry | — |
 | `LLM_API_KEY_HELPER` | Command that prints a fresh API key/token on stdout (e.g. `claude` OAuth helper) | — |
 | `LLM_API_KEY_HELPER_TTL_MS` | How long a helper-produced credential is cached | `7200000` (2 h) |
 | `LLM_CUSTOM_HEADERS` | Extra request headers — newline-separated `Key: value` (literal `\n` accepted); a `provider` header is auto-injected | — |
@@ -188,6 +189,42 @@ you (dev mode auto-detects an LLM gateway; prod reads `.phoenix-ide.env` from th
 If none of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LLM_GATEWAY`, or
 `LLM_API_KEY_HELPER` (and no ChatGPT/Codex credential) is present, the server
 starts with no models and logs a warning.
+
+`PHOENIX_LLM_MODELS` is additive. It does not override built-in model IDs; a
+configured duplicate ID is ignored and Phoenix logs a warning while keeping the
+built-in definition. The value is parsed at startup, and invalid JSON or invalid
+fields are logged and ignored without removing built-in models. Each configured
+model object has this shape:
+
+```json
+[
+  {
+    "id": "provider-or-gateway/model-id",
+    "api_name": "optional-wire-model-name",
+    "provider": "anthropic",
+    "api_format": "anthropic",
+    "description": "Human-readable picker text",
+    "context_window": 200000,
+    "recommended": false,
+    "supports_tool_search": false
+  }
+]
+```
+
+`api_name` may be omitted; when absent Phoenix sends `id` as the wire model
+name. `provider` supports `anthropic` and `openai`; `api_format` supports
+`anthropic` and `openai_responses`.
+
+Example Anthropic-compatible gateway/provider POC:
+
+```env
+LLM_API_KEY_HELPER=ddtool auth token rapid-ai-platform --datacenter us1.staging.dog
+LLM_AUTH_HEADER=bearer
+ANTHROPIC_BASE_URL=https://ai-gateway.us1.staging.dog/v1/messages
+LLM_CUSTOM_HEADERS=source: openweight-restricted-poc-<firstname>-<lastname>\norg-id: 2\nx-target-account: eval
+DEFAULT_MODEL=baseten/moonshotai/Kimi-K2.6
+PHOENIX_LLM_MODELS='[{"id":"baseten/moonshotai/Kimi-K2.6","provider":"anthropic","api_format":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]'
+```
 
 ### TLS
 

@@ -81,7 +81,9 @@ pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // Re-exported types: QuotaDetails is consumed by `LlmOutcome::UsageLimitReached`
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.
-pub use models::{all_models, ModelInfo, ModelSpec, Provider};
+pub use models::{
+    all_models, merge_model_specs, parse_external_models, ModelInfo, ModelSpec, Provider,
+};
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
 #[allow(unused_imports)]

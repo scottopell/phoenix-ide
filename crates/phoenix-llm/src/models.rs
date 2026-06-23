@@ -1,7 +1,6 @@
 //! Centralized model definitions for all LLM providers
 //!
-//! This module contains all model definitions in a single location,
-//! making it easier to add new models and providers.
+use std::collections::HashSet;
 
 /// Per-model metadata surfaced to API consumers (the `/api/models` response and
 /// the model picker). Built by [`super::ModelRegistry::available_model_info`]
@@ -45,6 +44,22 @@ impl Provider {
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExternalProvider {
+    Anthropic,
+    OpenAI,
+}
+
+impl From<ExternalProvider> for Provider {
+    fn from(value: ExternalProvider) -> Self {
+        match value {
+            ExternalProvider::Anthropic => Provider::Anthropic,
+            ExternalProvider::OpenAI => Provider::OpenAI,
+        }
+    }
+}
+
 /// API format / wire protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiFormat {
@@ -52,6 +67,35 @@ pub enum ApiFormat {
     Anthropic,
     /// `OpenAI` Responses API
     OpenAIResponses,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExternalApiFormat {
+    Anthropic,
+    OpenAIResponses,
+}
+
+impl From<ExternalApiFormat> for ApiFormat {
+    fn from(value: ExternalApiFormat) -> Self {
+        match value {
+            ExternalApiFormat::Anthropic => ApiFormat::Anthropic,
+            ExternalApiFormat::OpenAIResponses => ApiFormat::OpenAIResponses,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalModelSpec {
+    id: String,
+    api_name: Option<String>,
+    provider: ExternalProvider,
+    api_format: ExternalApiFormat,
+    description: String,
+    context_window: usize,
+    recommended: bool,
+    supports_tool_search: bool,
 }
 
 /// Model specification with metadata
@@ -94,6 +138,73 @@ impl ModelSpec {
             self.context_window
         }
     }
+}
+
+/// Parse additional model specs from the `PHOENIX_LLM_MODELS` inline JSON format.
+///
+/// `api_name` defaults to `id`, so Anthropic-compatible gateway aliases can be
+/// trialled without duplicating the same identifier in config.
+///
+/// # Errors
+/// Returns an actionable validation error. The raw JSON is never included in the
+/// error string, so callers can log it without echoing deployment config.
+pub fn parse_external_models(raw: &str) -> Result<Vec<ModelSpec>, String> {
+    let specs: Vec<ExternalModelSpec> = serde_json::from_str(raw)
+        .map_err(|e| format!("invalid JSON for PHOENIX_LLM_MODELS: {e}"))?;
+
+    specs
+        .into_iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let id = spec.id.trim().to_string();
+            if id.is_empty() {
+                return Err(format!("model at index {index} has an empty id"));
+            }
+            let api_name = spec
+                .api_name
+                .map_or_else(|| id.clone(), |name| name.trim().to_string());
+            if api_name.is_empty() {
+                return Err(format!("model '{id}' has an empty api_name"));
+            }
+            let description = spec.description.trim().to_string();
+            if description.is_empty() {
+                return Err(format!("model '{id}' has an empty description"));
+            }
+            if spec.context_window == 0 {
+                return Err(format!("model '{id}' has invalid context_window 0"));
+            }
+            Ok(ModelSpec {
+                id,
+                api_name,
+                provider: spec.provider.into(),
+                api_format: spec.api_format.into(),
+                description,
+                context_window: spec.context_window,
+                recommended: spec.recommended,
+                supports_tool_search: spec.supports_tool_search,
+            })
+        })
+        .collect()
+}
+
+/// Merge built-in models with externally configured additions.
+///
+/// Duplicate IDs are rejected: the first definition wins, which preserves the
+/// built-in model contract and prevents silent overrides from config.
+#[must_use]
+pub fn merge_model_specs(mut builtins: Vec<ModelSpec>, external: &[ModelSpec]) -> Vec<ModelSpec> {
+    let mut ids: HashSet<String> = builtins.iter().map(|spec| spec.id.clone()).collect();
+    for spec in external {
+        if !ids.insert(spec.id.clone()) {
+            tracing::warn!(
+                model_id = %spec.id,
+                "PHOENIX_LLM_MODELS duplicate model id ignored; built-in or earlier configured model kept"
+            );
+            continue;
+        }
+        builtins.push(spec.clone());
+    }
+    builtins
 }
 
 /// Get all available model specifications
@@ -216,4 +327,53 @@ pub fn all_models() -> Vec<ModelSpec> {
             supports_tool_search: false,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_external_model_with_api_name_defaulting_to_id() {
+        let models = parse_external_models(
+            r#"[{"id":"baseten/moonshotai/Kimi-K2.6","provider":"anthropic","api_format":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("external model config should parse");
+
+        assert_eq!(models.len(), 1);
+        let model = &models[0];
+        assert_eq!(model.id, "baseten/moonshotai/Kimi-K2.6");
+        assert_eq!(model.api_name, model.id);
+        assert_eq!(model.provider, Provider::Anthropic);
+        assert_eq!(model.api_format, ApiFormat::Anthropic);
+        assert_eq!(model.context_window, 262_000);
+        assert!(!model.supports_tool_search);
+    }
+
+    #[test]
+    fn rejects_invalid_external_context_window() {
+        let err = parse_external_models(
+            r#"[{"id":"bad","provider":"anthropic","api_format":"anthropic","description":"Bad","context_window":0,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect_err("zero context window should be rejected");
+
+        assert!(err.contains("context_window 0"));
+    }
+
+    #[test]
+    fn duplicate_external_ids_do_not_override_builtins() {
+        let external = parse_external_models(
+            r#"[{"id":"claude-sonnet-4-6","api_name":"other-wire-name","provider":"anthropic","api_format":"anthropic","description":"Override attempt","context_window":123,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap();
+
+        let merged = merge_model_specs(all_models(), &external);
+        let sonnet = merged
+            .iter()
+            .find(|spec| spec.id == "claude-sonnet-4-6")
+            .unwrap();
+
+        assert_ne!(sonnet.api_name, "other-wire-name");
+        assert_ne!(sonnet.context_window, 123);
+    }
 }
