@@ -62,9 +62,11 @@ entity PatchEffect {
 -- Matching cascade
 -- ============================================================================
 --
--- find_unique_match(content, old_text) tries three strategies in order.
--- The first to return a unique match wins. If all three fail, the error
--- depends on how many raw occurrences exist (0 -> NotFound, >1 -> NotUnique).
+-- find_unique_match(content, old_text) tries four strategies in order.
+-- The first strategy to return a unique match wins. Strategies that see
+-- multiple candidate matches record duplicate diagnostics, but later unique
+-- strategies may still win. If no strategy returns a unique match, the result
+-- is NotUnique when any strategy saw multiple candidates, otherwise NotFound.
 
 entity MatchAttempt {
     content: String
@@ -73,10 +75,13 @@ entity MatchAttempt {
 
     -- Derived (evaluated lazily in cascade order)
     exact_result: find_exact_unique(content, old_text)
+    exact_duplicate: find_exact_duplicate(content, old_text)
     dedent_result: find_dedent_match(content, old_text)
+    dedent_duplicate: find_dedent_duplicate(content, old_text)
     trimmed_result: find_trimmed_match(content, old_text)
+    trimmed_duplicate: find_trimmed_duplicate(content, old_text)
     normalised_result: find_skeleton_match(content, old_text)
-    raw_count: count_all_occurrences(content, old_text)
+    normalised_duplicate: find_skeleton_duplicate(content, old_text)
 }
 
 rule ExactMatchSucceeds {
@@ -140,7 +145,10 @@ rule MatchNotFound {
     requires: attempt.dedent_result = null
     requires: attempt.trimmed_result = null
     requires: attempt.normalised_result = null
-    requires: attempt.raw_count = 0
+    requires: attempt.exact_duplicate = null
+    requires: attempt.dedent_duplicate = null
+    requires: attempt.trimmed_duplicate = null
+    requires: attempt.normalised_duplicate = null
     ensures: attempt.result = not_found
 }
 
@@ -150,8 +158,22 @@ rule MatchNotUnique {
     requires: attempt.dedent_result = null
     requires: attempt.trimmed_result = null
     requires: attempt.normalised_result = null
-    requires: attempt.raw_count > 1
+    requires:
+        attempt.exact_duplicate != null or
+        attempt.dedent_duplicate != null or
+        attempt.trimmed_duplicate != null or
+        attempt.normalised_duplicate != null
     ensures: attempt.result = not_unique
+    ensures: attempt.diagnostics = first_non_null(
+        attempt.exact_duplicate,
+        attempt.dedent_duplicate,
+        attempt.trimmed_duplicate,
+        attempt.normalised_duplicate
+    )
+    @guidance
+        -- Duplicate diagnostics include total candidate count, bounded matching
+        -- locations, 1-based start lines, concise snippets, and omitted-match
+        -- count when more candidates exist than are reported.
 }
 
 -- ============================================================================

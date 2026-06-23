@@ -59,19 +59,27 @@ pub fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpec, Patc
 }
 
 fn find_exact_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
-    let diagnostics = duplicate_match_diagnostics(content, old_text);
-    match diagnostics.total {
-        0 => None,
-        1 => Some(MatchOutcome::Unique(EditSpec {
-            offset: content.find(old_text)?,
+    let mut matches = content.match_indices(old_text);
+    let (first_offset, _) = matches.next()?;
+    let Some((second_offset, _)) = matches.next() else {
+        return Some(MatchOutcome::Unique(EditSpec {
+            offset: first_offset,
             length: old_text.len(),
-        })),
-        _ => Some(MatchOutcome::Duplicate(diagnostics)),
-    }
+        }));
+    };
+
+    Some(MatchOutcome::Duplicate(
+        duplicate_match_diagnostics_from_ranges(
+            content,
+            std::iter::once((first_offset, old_text.len()))
+                .chain(std::iter::once((second_offset, old_text.len())))
+                .chain(matches.map(|(offset, _)| (offset, old_text.len()))),
+        ),
+    ))
 }
 
-#[must_use]
-pub fn duplicate_match_diagnostics(content: &str, old_text: &str) -> DuplicateMatchDiagnostics {
+#[cfg(test)]
+fn duplicate_match_diagnostics(content: &str, old_text: &str) -> DuplicateMatchDiagnostics {
     duplicate_match_diagnostics_from_ranges(
         content,
         content
@@ -294,32 +302,34 @@ fn find_normalised_match(content: &str, old_text: &str) -> Option<MatchOutcome> 
     }
     skel_to_orig.push(content.len());
 
-    let matches: Vec<_> = skel_content.match_indices(&skel_old).collect();
-    match matches.len() {
-        0 => None,
-        1 => {
-            let (offset, _) = matches[0];
-            let (orig_start, orig_length) =
-                original_range_from_skeleton(&skel_to_orig, offset, skel_old.len(), content.len());
-            Some(MatchOutcome::Unique(EditSpec {
-                offset: orig_start,
-                length: orig_length,
-            }))
-        }
-        _ => Some(MatchOutcome::Duplicate(
-            duplicate_match_diagnostics_from_ranges(
-                content,
-                matches.into_iter().map(|(offset, _)| {
+    let mut matches = skel_content.match_indices(&skel_old);
+    let (first_offset, _) = matches.next()?;
+    let first_range =
+        original_range_from_skeleton(&skel_to_orig, first_offset, skel_old.len(), content.len());
+    let Some((second_offset, _)) = matches.next() else {
+        return Some(MatchOutcome::Unique(EditSpec {
+            offset: first_range.0,
+            length: first_range.1,
+        }));
+    };
+    let second_range =
+        original_range_from_skeleton(&skel_to_orig, second_offset, skel_old.len(), content.len());
+
+    Some(MatchOutcome::Duplicate(
+        duplicate_match_diagnostics_from_ranges(
+            content,
+            std::iter::once(first_range)
+                .chain(std::iter::once(second_range))
+                .chain(matches.map(|(offset, _)| {
                     original_range_from_skeleton(
                         &skel_to_orig,
                         offset,
                         skel_old.len(),
                         content.len(),
                     )
-                }),
-            ),
-        )),
-    }
+                })),
+        ),
+    ))
 }
 
 fn original_range_from_skeleton(
