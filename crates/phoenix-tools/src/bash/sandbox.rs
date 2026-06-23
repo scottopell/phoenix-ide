@@ -6,6 +6,7 @@ use nono::{AccessMode, CapabilitySet, Sandbox};
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 
 const REPO_ROOT_ENV: &str = "PHOENIX_SANDBOX_REPO_ROOT";
+const READ_DIRS_ENV: &str = "PHOENIX_SANDBOX_READ_DIRS";
 const SENSITIVE_DIRS_ENV: &str = "PHOENIX_SANDBOX_SENSITIVE_DIRS";
 const SCRATCH_ENV: &str = "PHOENIX_SANDBOX_SCRATCH";
 const HOME_ENV: &str = "PHOENIX_SANDBOX_HOME";
@@ -18,6 +19,7 @@ pub struct ExploreReadOnlyPolicy {
     scratch_dir: PathBuf,
     sandbox_home: PathBuf,
     platform_temp: PathBuf,
+    read_dirs: Vec<PathBuf>,
     sensitive_dirs: Vec<PathBuf>,
     path: OsString,
 }
@@ -36,15 +38,28 @@ impl ExploreReadOnlyPolicy {
         let scratch_dir = scratch_root.join(uuid::Uuid::new_v4().to_string());
         let sandbox_home = scratch_dir.join("home");
         std::fs::create_dir_all(&sandbox_home)?;
-        let platform_temp = platform_temp_dir(&repo_root, &scratch_dir, runtime_env.tmp_root());
+        let git_dirs = git_state_dirs(&repo_root);
+        let mut read_dirs = Vec::with_capacity(1 + git_dirs.len());
+        read_dirs.push(repo_root.clone());
+        read_dirs.extend(git_dirs);
+        read_dirs.sort();
+        read_dirs.dedup();
+        let sensitive_dirs = sensitive_dirs(&runtime_env);
+        let mut protected_dirs = Vec::with_capacity(read_dirs.len() + sensitive_dirs.len());
+        protected_dirs.extend(read_dirs.iter().cloned());
+        protected_dirs.extend(sensitive_dirs.iter().cloned());
+        protected_dirs.sort();
+        protected_dirs.dedup();
+        let platform_temp =
+            platform_temp_dir(&protected_dirs, &scratch_dir, runtime_env.tmp_root());
         std::fs::create_dir_all(&platform_temp)?;
         let path = inherited_path();
-        let sensitive_dirs = sensitive_dirs_for_home(runtime_env.home());
         Ok(Self {
             repo_root,
             scratch_dir,
             sandbox_home,
             platform_temp,
+            read_dirs,
             sensitive_dirs,
             path,
         })
@@ -55,6 +70,7 @@ impl ExploreReadOnlyPolicy {
         command.env(SCRATCH_ENV, &self.scratch_dir);
         command.env(HOME_ENV, &self.sandbox_home);
         command.env(PLATFORM_TEMP_ENV, &self.platform_temp);
+        command.env(READ_DIRS_ENV, join_paths(&self.read_dirs));
         command.env(SENSITIVE_DIRS_ENV, join_paths(&self.sensitive_dirs));
         self.apply_child_env(command);
     }
@@ -77,24 +93,25 @@ impl ExploreReadOnlyPolicy {
         let scratch_dir = env_path(SCRATCH_ENV)?;
         let sandbox_home = env_path(HOME_ENV)?;
         let platform_temp = env_path(PLATFORM_TEMP_ENV)?;
+        let read_dirs = std::env::var_os(READ_DIRS_ENV)
+            .map_or_else(|| vec![repo_root.clone()], |value| split_paths(&value));
         let sensitive_dirs = std::env::var_os(SENSITIVE_DIRS_ENV)
             .map(|value| split_paths(&value))
             .unwrap_or_default();
         let path = inherited_path();
         Ok(Self {
-            repo_root,
+            repo_root: repo_root.clone(),
             scratch_dir,
             sandbox_home,
             platform_temp,
+            read_dirs,
             sensitive_dirs,
             path,
         })
     }
 
     fn capability_set(&self) -> Result<CapabilitySet, String> {
-        let mut caps = CapabilitySet::new()
-            .allow_path("/", AccessMode::Read)
-            .map_err(|e| e.to_string())?
+        let mut caps = base_read_capabilities(&self.read_dirs, &self.sensitive_dirs)?
             .allow_path(&self.scratch_dir, AccessMode::ReadWrite)
             .map_err(|e| e.to_string())?;
 
@@ -111,8 +128,6 @@ impl ExploreReadOnlyPolicy {
         }
         #[cfg(target_os = "macos")]
         add_sensitive_denies(&mut caps, &self.sensitive_dirs)?;
-        #[cfg(not(target_os = "macos"))]
-        add_sensitive_denies(&mut caps, &self.sensitive_dirs);
 
         Ok(caps.block_network())
     }
@@ -224,14 +239,110 @@ fn inherited_path() -> OsString {
     std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
 }
 
-fn platform_temp_dir(repo_root: &Path, scratch_dir: &Path, tmp_root: &Path) -> PathBuf {
+#[cfg(target_os = "linux")]
+fn base_read_capabilities(
+    read_dirs: &[PathBuf],
+    sensitive_dirs: &[PathBuf],
+) -> Result<CapabilitySet, String> {
+    let mut caps = CapabilitySet::new();
+    for path in linux_read_roots(read_dirs, sensitive_dirs) {
+        if path.is_dir() {
+            caps = caps
+                .allow_path(&path, AccessMode::Read)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+    }
+    Ok(caps)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read_roots(read_dirs: &[PathBuf], sensitive_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = read_dirs.to_vec();
+    roots.extend(
+        [
+            "/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/nix", "/opt",
+        ]
+        .into_iter()
+        .map(PathBuf::from),
+    );
+    for protected in sensitive_dirs {
+        roots.retain(|root| !protected.starts_with(root));
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+#[cfg(not(target_os = "linux"))]
+fn base_read_capabilities(
+    _read_dirs: &[PathBuf],
+    _sensitive_dirs: &[PathBuf],
+) -> Result<CapabilitySet, String> {
+    CapabilitySet::new()
+        .allow_path("/", AccessMode::Read)
+        .map_err(|e| e.to_string())
+}
+
+fn platform_temp_dir(protected_dirs: &[PathBuf], scratch_dir: &Path, tmp_root: &Path) -> PathBuf {
     let temp = tmp_root.parent().unwrap_or(tmp_root);
     let temp = temp.canonicalize().unwrap_or_else(|_| temp.to_path_buf());
-    if repo_root.starts_with(&temp) || temp.starts_with(repo_root) {
+    if protected_dirs
+        .iter()
+        .any(|protected| protected.starts_with(&temp) || temp.starts_with(protected))
+    {
         scratch_dir.join("platform-temp")
     } else {
         temp
     }
+}
+
+fn sensitive_dirs(runtime_env: &PhoenixRuntimeEnvironment) -> Vec<PathBuf> {
+    let mut dirs = sensitive_dirs_for_home(runtime_env.home());
+    dirs.push(runtime_env.codex_home().to_path_buf());
+    dirs.push(runtime_env.data_dir().to_path_buf());
+    if let Some(parent) = runtime_env.db_path().parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs.into_iter().filter(|path| path.exists()).collect()
+}
+
+fn git_state_dirs(repo_root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for arg in ["--absolute-git-dir", "--git-common-dir"] {
+        if let Some(path) = git_rev_parse_path(repo_root, arg) {
+            dirs.push(path);
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn git_rev_parse_path(repo_root: &Path, arg: &str) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", arg])
+        .current_dir(repo_root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        repo_root.join(path)
+    };
+    absolute.canonicalize().ok()
 }
 
 fn sensitive_dirs_for_home(home: &Path) -> Vec<PathBuf> {
@@ -273,9 +384,6 @@ fn add_sensitive_denies(
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn add_sensitive_denies(_caps: &mut CapabilitySet, _sensitive_dirs: &[PathBuf]) {}
-
 #[cfg(target_os = "macos")]
 fn seatbelt_escape_path(path: &Path) -> String {
     path.to_string_lossy()
@@ -308,7 +416,30 @@ mod tests {
 
         assert_eq!(
             platform_temp_dir(
-                &repo.canonicalize().unwrap(),
+                &[repo.canonicalize().unwrap()],
+                &scratch,
+                &host_temp.join("phoenix-ide")
+            ),
+            scratch.join("platform-temp")
+        );
+    }
+
+    #[test]
+    fn platform_temp_falls_back_under_scratch_when_git_dir_is_under_temp() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let host_temp = temp.path().join("host-temp");
+        let git_dir = host_temp.join("git-dir");
+        let scratch = temp.path().join("scratch");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+
+        assert_eq!(
+            platform_temp_dir(
+                &[
+                    repo.canonicalize().unwrap(),
+                    git_dir.canonicalize().unwrap()
+                ],
                 &scratch,
                 &host_temp.join("phoenix-ide")
             ),

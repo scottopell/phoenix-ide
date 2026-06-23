@@ -176,7 +176,7 @@ pub fn mode_explore(
 ) -> String {
     let bash_guidance = match (lang, bash) {
         (LlmLanguage::PhoenixNative, ExploreBashCapability::Sandboxed) => {
-            "`bash` is available for read-only local investigation under an OS sandbox: it can read broadly, but source/Git metadata writes and network access are blocked, and only task proposals, scratch, synthetic home, and platform temp are writable."
+            "`bash` is available for read-only local investigation under an OS sandbox: it can read broadly, but source/Git metadata/task writes and network access are blocked. Use `patch` for task proposal drafts; bash may write only to scratch, synthetic home, and platform temp."
         }
         (LlmLanguage::PhoenixNative, ExploreBashCapability::Unavailable) => {
             "`bash` is unavailable because this host cannot enforce the Explore sandbox; use read-only tools instead."
