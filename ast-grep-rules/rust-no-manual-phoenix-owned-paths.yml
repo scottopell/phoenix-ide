@@ -1,0 +1,30 @@
+id: no-manual-phoenix-owned-paths
+language: Rust
+severity: error
+message: |
+  Manual construction of a Phoenix-owned filesystem path component. These paths
+  are derived by `phoenix_core::runtime_env::PhoenixRuntimeEnvironment`; use the
+  typed accessor (`phoenix_home`, `codex_home`, `db_path`, `terminal_output_dir`,
+  `tmux_socket_dir`, `builtin_skills_dir`, etc.) instead of duplicating path
+  literals that drift from env/config overrides.
+note: "Use PhoenixRuntimeEnvironment accessors for Phoenix-owned paths"
+rule:
+  any:
+    - pattern: $BASE.join(".phoenix-ide")
+    - pattern: $BASE.join(".codex")
+    - pattern: $BASE.join("phoenix.db")
+    - pattern: $BASE.join("terminal-output")
+    - pattern: $BASE.join("tmux-sockets")
+    - pattern: $BASE.join("builtin-skills")
+ignores:
+  - "**/phoenix-core/src/runtime_env.rs"
+  - "**/tests/**"
+  - "**/*tests.rs"
+  - "**/*proptests.rs"
+  # Mixed production/test files with current path-literal fixtures.
+  - "**/phoenix-llm/src/codex_credential.rs"
+  - "**/phoenix-terminal/src/spawn.rs"
+  - "**/phoenix-tools/src/tmux/registry.rs"
+  - "**/phoenix-skills/src/lib.rs"
+  - "**/phoenix-ide/src/system_prompt.rs"
+  - "**/phoenix-ide/src/api/deployment.rs"

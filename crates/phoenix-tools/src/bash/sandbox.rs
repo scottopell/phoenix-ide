@@ -1,8 +1,9 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nono::{AccessMode, CapabilitySet, Sandbox};
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 
 const TASK_DIRS_ENV: &str = "PHOENIX_SANDBOX_TASK_DIRS";
 const SENSITIVE_DIRS_ENV: &str = "PHOENIX_SANDBOX_SENSITIVE_DIRS";
@@ -10,7 +11,34 @@ const REPO_ROOT_ENV: &str = "PHOENIX_SANDBOX_REPO_ROOT";
 const SCRATCH_ENV: &str = "PHOENIX_SANDBOX_SCRATCH";
 const HOME_ENV: &str = "PHOENIX_SANDBOX_HOME";
 const PLATFORM_TEMP_ENV: &str = "PHOENIX_SANDBOX_PLATFORM_TEMP";
+const TASK_WRITES_ENV: &str = "PHOENIX_SANDBOX_TASK_WRITES";
 const LIST_SEPARATOR: &str = "\u{1f}";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExploreSandboxTaskWrites {
+    Allow,
+    Deny,
+}
+
+impl ExploreSandboxTaskWrites {
+    fn as_env(self) -> &'static str {
+        match self {
+            Self::Allow => "1",
+            Self::Deny => "0",
+        }
+    }
+
+    fn from_env() -> Self {
+        match std::env::var_os(TASK_WRITES_ENV).as_deref() {
+            Some(value) if value == "1" => Self::Allow,
+            _ => Self::Deny,
+        }
+    }
+
+    fn allows(self) -> bool {
+        matches!(self, Self::Allow)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ExploreReadOnlyPolicy {
@@ -20,6 +48,7 @@ pub struct ExploreReadOnlyPolicy {
     sandbox_home: PathBuf,
     platform_temp: PathBuf,
     sensitive_dirs: Vec<PathBuf>,
+    task_writes: ExploreSandboxTaskWrites,
     path: OsString,
 }
 
@@ -30,7 +59,11 @@ impl ExploreReadOnlyPolicy {
     ///
     /// Returns an I/O error when the working directory cannot be canonicalized
     /// or the scratch/home directories cannot be created.
-    pub fn discover(working_dir: &Path) -> std::io::Result<Self> {
+    pub fn discover(
+        working_dir: &Path,
+        task_writes: ExploreSandboxTaskWrites,
+    ) -> std::io::Result<Self> {
+        let runtime_env = PhoenixRuntimeEnvironment::detect();
         let repo_root = working_dir.canonicalize()?;
         let mut task_dirs: Vec<PathBuf> = taskmd_core::discover::candidates(&repo_root)
             .into_iter()
@@ -43,16 +76,14 @@ impl ExploreReadOnlyPolicy {
             .collect();
         task_dirs.sort();
         task_dirs.dedup();
-        let scratch_dir = std::env::temp_dir()
-            .join("phoenix-ide")
-            .join("explore-bash")
-            .join(uuid::Uuid::new_v4().to_string());
+        let scratch_root = runtime_env.tmp_subdir("explore-bash")?;
+        let scratch_dir = scratch_root.join(uuid::Uuid::new_v4().to_string());
         let sandbox_home = scratch_dir.join("home");
         std::fs::create_dir_all(&sandbox_home)?;
-        let platform_temp = platform_temp_dir(&repo_root, &scratch_dir);
+        let platform_temp = platform_temp_dir(&repo_root, &scratch_dir, runtime_env.tmp_root());
         std::fs::create_dir_all(&platform_temp)?;
         let path = inherited_path();
-        let sensitive_dirs = sensitive_dirs_for_home(std::env::var_os("HOME").as_deref());
+        let sensitive_dirs = sensitive_dirs_for_home(runtime_env.home());
         Ok(Self {
             repo_root,
             task_dirs,
@@ -60,6 +91,7 @@ impl ExploreReadOnlyPolicy {
             sandbox_home,
             platform_temp,
             sensitive_dirs,
+            task_writes,
             path,
         })
     }
@@ -71,6 +103,7 @@ impl ExploreReadOnlyPolicy {
         command.env(PLATFORM_TEMP_ENV, &self.platform_temp);
         command.env(TASK_DIRS_ENV, join_paths(&self.task_dirs));
         command.env(SENSITIVE_DIRS_ENV, join_paths(&self.sensitive_dirs));
+        command.env(TASK_WRITES_ENV, self.task_writes.as_env());
         self.apply_child_env(command);
     }
 
@@ -98,6 +131,7 @@ impl ExploreReadOnlyPolicy {
         let sensitive_dirs = std::env::var_os(SENSITIVE_DIRS_ENV)
             .map(|value| split_paths(&value))
             .unwrap_or_default();
+        let task_writes = ExploreSandboxTaskWrites::from_env();
         let path = inherited_path();
         Ok(Self {
             repo_root,
@@ -106,6 +140,7 @@ impl ExploreReadOnlyPolicy {
             sandbox_home,
             platform_temp,
             sensitive_dirs,
+            task_writes,
             path,
         })
     }
@@ -117,10 +152,9 @@ impl ExploreReadOnlyPolicy {
             .allow_path(&self.scratch_dir, AccessMode::ReadWrite)
             .map_err(|e| e.to_string())?;
 
-        for path in system_read_write_paths() {
-            if path.is_dir() {
-                caps = caps
-                    .allow_path(path, AccessMode::ReadWrite)
+        for path in system_read_write_files() {
+            if path.exists() {
+                caps.allow_file_mut(path, AccessMode::ReadWrite)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
             }
         }
@@ -129,11 +163,13 @@ impl ExploreReadOnlyPolicy {
                 .allow_path(&self.platform_temp, AccessMode::ReadWrite)
                 .map_err(|e| format!("{}: {e}", self.platform_temp.display()))?;
         }
-        for path in &self.task_dirs {
-            if path.is_dir() {
-                caps = caps
-                    .allow_path(path, AccessMode::ReadWrite)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+        if self.task_writes.allows() {
+            for path in &self.task_dirs {
+                if path.is_dir() {
+                    caps = caps
+                        .allow_path(path, AccessMode::ReadWrite)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                }
             }
         }
         #[cfg(target_os = "macos")]
@@ -161,8 +197,12 @@ impl ExploreSandboxLauncher {
     ///
     /// Returns an error when the policy cannot be constructed or the current
     /// Phoenix executable cannot be resolved.
-    pub fn command(cmd: &str, working_dir: &Path) -> Result<ExploreSandboxCommand, String> {
-        let policy = ExploreReadOnlyPolicy::discover(working_dir)
+    pub fn command(
+        cmd: &str,
+        working_dir: &Path,
+        task_writes: ExploreSandboxTaskWrites,
+    ) -> Result<ExploreSandboxCommand, String> {
+        let policy = ExploreReadOnlyPolicy::discover(working_dir, task_writes)
             .map_err(|e| format!("failed to create explore sandbox policy: {e}"))?;
         let exe = std::env::current_exe()
             .map_err(|e| format!("failed to resolve phoenix executable: {e}"))?;
@@ -205,7 +245,7 @@ fn apply_and_exec(cmd: &str) -> Result<std::convert::Infallible, String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let mut command = Command::new("/bin/bash");
+        let mut command = Command::new("bash");
         command
             .arg("-c")
             .arg(cmd)
@@ -213,7 +253,7 @@ fn apply_and_exec(cmd: &str) -> Result<std::convert::Infallible, String> {
             .env_clear();
         policy.apply_child_env(&mut command);
         let err = command.exec();
-        Err(format!("failed to exec /bin/bash: {err}"))
+        Err(format!("failed to exec bash from PATH: {err}"))
     }
 
     #[cfg(not(unix))]
@@ -251,20 +291,17 @@ fn inherited_path() -> OsString {
     std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
 }
 
-fn platform_temp_dir(repo_root: &Path, scratch_dir: &Path) -> PathBuf {
-    let temp = std::env::temp_dir();
-    if repo_root.starts_with(&temp) {
+fn platform_temp_dir(repo_root: &Path, scratch_dir: &Path, tmp_root: &Path) -> PathBuf {
+    let temp = tmp_root.parent().unwrap_or(tmp_root);
+    let temp = temp.canonicalize().unwrap_or_else(|_| temp.to_path_buf());
+    if repo_root.starts_with(&temp) || temp.starts_with(repo_root) {
         scratch_dir.join("platform-temp")
     } else {
         temp
     }
 }
 
-fn sensitive_dirs_for_home(home: Option<&OsStr>) -> Vec<PathBuf> {
-    let Some(home) = home else {
-        return Vec::new();
-    };
-    let home = PathBuf::from(home);
+fn sensitive_dirs_for_home(home: &Path) -> Vec<PathBuf> {
     [
         ".ssh",
         ".aws",
@@ -313,10 +350,15 @@ fn seatbelt_escape_path(path: &Path) -> String {
         .replace('"', "\\\"")
 }
 
-fn system_read_write_paths() -> &'static [PathBuf] {
+fn system_read_write_files() -> &'static [PathBuf] {
     use std::sync::OnceLock;
     static PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    PATHS.get_or_init(|| ["/dev"].into_iter().map(PathBuf::from).collect())
+    PATHS.get_or_init(|| {
+        ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -337,7 +379,8 @@ mod tests {
         .expect("template");
         make_symlink(&external, &repo.join("tasks"));
 
-        let policy = ExploreReadOnlyPolicy::discover(&repo).expect("policy");
+        let policy = ExploreReadOnlyPolicy::discover(&repo, ExploreSandboxTaskWrites::Allow)
+            .expect("policy");
         assert!(
             policy.task_dirs.is_empty(),
             "task dirs must not include symlink targets outside repo: {:?}",
@@ -358,30 +401,27 @@ mod tests {
         .expect("template");
         make_symlink(&real_tasks, &repo.join("tasks"));
 
-        let policy = ExploreReadOnlyPolicy::discover(&repo).expect("policy");
+        let policy = ExploreReadOnlyPolicy::discover(&repo, ExploreSandboxTaskWrites::Allow)
+            .expect("policy");
         assert_eq!(policy.task_dirs, vec![real_tasks.canonicalize().unwrap()]);
     }
 
     #[test]
     fn platform_temp_falls_back_under_scratch_when_repo_is_under_temp() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let repo = std::env::temp_dir().join(format!("phoenix-repo-{}", uuid::Uuid::new_v4()));
+        let host_temp = temp.path().join("host-temp");
+        let repo = host_temp.join(format!("phoenix-repo-{}", uuid::Uuid::new_v4()));
         let scratch = temp.path().join("scratch");
         std::fs::create_dir_all(&repo).expect("repo");
-        let _cleanup = RemoveDirOnDrop(repo.clone());
 
         assert_eq!(
-            platform_temp_dir(&repo, &scratch),
+            platform_temp_dir(
+                &repo.canonicalize().unwrap(),
+                &scratch,
+                &host_temp.join("phoenix-ide")
+            ),
             scratch.join("platform-temp")
         );
-    }
-
-    struct RemoveDirOnDrop(PathBuf);
-
-    impl Drop for RemoveDirOnDrop {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
     }
 
     #[cfg(unix)]

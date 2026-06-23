@@ -4,6 +4,7 @@ use hyper_util::{
     server::graceful::GracefulShutdown,
     service::TowerToHyperService,
 };
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use rustls::ServerConfig;
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use std::{
@@ -282,8 +283,9 @@ fn tls_dir_from_env(db_path: &str) -> PathBuf {
         return parent.join("tls");
     }
 
-    let home = env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-    home.join(".phoenix-ide").join("tls")
+    PhoenixRuntimeEnvironment::detect()
+        .phoenix_home()
+        .join("tls")
 }
 
 fn hosts_from_env() -> Vec<String> {

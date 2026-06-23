@@ -1,0 +1,19 @@
+id: no-home-helper-path-derivation
+language: Rust
+severity: error
+message: |
+  Direct home-directory helper call. Phoenix resolves HOME/CODEX_HOME once via
+  `phoenix_core::runtime_env::PhoenixRuntimeEnvironment`; production code must
+  use `.home()`, `.codex_home()`, or a runtime-env-derived path instead of
+  asking helper crates for a parallel home directory.
+note: "Use PhoenixRuntimeEnvironment for home-derived paths"
+rule:
+  any:
+    - pattern: dirs::home_dir()
+    - pattern: home::home_dir()
+    - pattern: directories::BaseDirs::new()
+ignores:
+  - "**/phoenix-core/src/runtime_env.rs"
+  - "**/tests/**"
+  - "**/*tests.rs"
+  - "**/*proptests.rs"

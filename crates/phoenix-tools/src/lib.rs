@@ -653,7 +653,7 @@ impl ToolRegistry {
     ) -> Self {
         debug_assert!(policy.has_sandboxed_bash());
         let mut tools = read_only_tools();
-        tools.push(Arc::new(SandboxedBashTool));
+        tools.push(Arc::new(SandboxedBashTool::with_task_writes()));
         if policy.allow_top_level_spawn_agents() {
             tools.extend(parent_coordination_tools(agents));
         } else {

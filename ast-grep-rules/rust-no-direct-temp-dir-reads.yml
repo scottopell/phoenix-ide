@@ -1,0 +1,27 @@
+id: no-direct-temp-dir-reads
+language: Rust
+severity: error
+message: |
+  Direct `std::env::temp_dir()` read. Phoenix filesystem locations are resolved
+  once by `phoenix_core::runtime_env::PhoenixRuntimeEnvironment`; production code
+  must use `.tmp_root()` / `.tmp_subdir(..)` or a runtime-env-derived path so all
+  subsystems agree on scratch locations and containment checks compare canonical
+  Phoenix-owned roots.
+
+  Tests may use `tempfile::TempDir` or are ignored by this rule when they need a
+  host temp fixture.
+note: "Centralize temp-dir access — see crates/phoenix-core/src/runtime_env.rs"
+rule:
+  pattern: std::env::temp_dir()
+ignores:
+  # The sanctioned resolver for temp/home filesystem environment.
+  - "**/phoenix-core/src/runtime_env.rs"
+  # These current direct uses are test fixtures in mixed production/test files;
+  # keep production sandbox code covered instead of globally ignoring crates/.
+  - "**/phoenix-db/src/lib.rs"
+  - "**/phoenix-ide/src/logging.rs"
+  - "**/phoenix-tools/src/tmux.rs"
+  # Standalone test/fixture files may intentionally allocate host temp dirs.
+  - "**/tests/**"
+  - "**/*tests.rs"
+  - "**/*proptests.rs"

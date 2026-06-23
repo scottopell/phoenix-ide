@@ -1,0 +1,18 @@
+id: no-direct-phoenix-data-env-reads
+language: Rust
+severity: error
+message: |
+  Direct read of Phoenix filesystem-location env (`PHOENIX_DATA_DIR` or
+  `PHOENIX_DB_PATH`). These locations are resolved once by
+  `phoenix_core::runtime_env::PhoenixRuntimeEnvironment`; production code must
+  read `.data_dir()` / `.db_path()` from that type so every subsystem opens the
+  same paths reported by deployment info.
+note: "Centralize Phoenix data path env access — see crates/phoenix-core/src/runtime_env.rs"
+rule:
+  any:
+    - pattern: std::env::var("PHOENIX_DATA_DIR")
+    - pattern: std::env::var_os("PHOENIX_DATA_DIR")
+    - pattern: std::env::var("PHOENIX_DB_PATH")
+    - pattern: std::env::var_os("PHOENIX_DB_PATH")
+ignores:
+  - "**/phoenix-core/src/runtime_env.rs"
