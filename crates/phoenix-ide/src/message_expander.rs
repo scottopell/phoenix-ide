@@ -265,42 +265,37 @@ fn has_path_token_shape(token: &str) -> bool {
 }
 
 fn path_component_has_valid_groups(component: &str) -> bool {
-    let bytes = component.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => {
-                let Some(close) = component[i + 1..].find(')').map(|offset| i + 1 + offset) else {
-                    return false;
-                };
-                if close == i + 1 {
-                    return false;
-                }
-                i = close + 1;
-            }
-            b')' => return false,
-            b'[' => {
-                let Some(close) = component[i + 1..].find(']').map(|offset| i + 1 + offset) else {
-                    return false;
-                };
-                if close == i + 1 {
+    let mut stack = Vec::new();
+    let mut previous_open = None;
+
+    for c in component.chars() {
+        match c {
+            '(' | '[' => stack.push(c),
+            ')' => {
+                if stack.last() != Some(&'(') || previous_open == Some('(') {
                     return false;
                 }
-                i = close + 1;
+                stack.pop();
             }
-            b']' => return false,
-            _ => i += 1,
+            ']' => {
+                if stack.last() != Some(&'[') || previous_open == Some('[') {
+                    return false;
+                }
+                stack.pop();
+            }
+            _ => {}
         }
+        previous_open = matches!(c, '(' | '[').then_some(c);
     }
 
-    true
+    stack.is_empty()
 }
 
 fn is_path_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(
+    !c.is_control()
+        && !matches!(
             c,
-            '/' | '.' | '_' | '-' | '+' | '~' | '@' | '$' | '(' | ')' | '[' | ']'
+            '"' | '\'' | '`' | ',' | ':' | ';' | '<' | '>' | '{' | '}' | '\\' | '|' | '?' | '!'
         )
 }
 
@@ -1052,6 +1047,8 @@ def api_catalog():
         let tmp = make_tmp();
         fs::create_dir_all(tmp.path().join("app/routes/[slug]")).unwrap();
         fs::create_dir_all(tmp.path().join("app/routes/(auth)")).unwrap();
+        fs::create_dir_all(tmp.path().join("app/shop/[[...slug]]")).unwrap();
+        fs::create_dir_all(tmp.path().join("docs")).unwrap();
         fs::write(tmp.path().join("app/routes/[slug].tsx"), "slug route").unwrap();
         fs::write(tmp.path().join("app/routes/[slug]/$id.tsx"), "id route").unwrap();
         fs::write(
@@ -1059,9 +1056,15 @@ def api_catalog():
             "login route",
         )
         .unwrap();
+        fs::write(
+            tmp.path().join("app/shop/[[...slug]]/page.tsx"),
+            "shop route",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("docs/café.md"), "unicode doc").unwrap();
 
         let result = expand(
-            "see @app/routes/[slug].tsx and @app/routes/[slug]/$id.tsx and @app/routes/(auth)/login.tsx",
+            "see @app/routes/[slug].tsx and @app/routes/[slug]/$id.tsx and @app/routes/(auth)/login.tsx and @app/shop/[[...slug]]/page.tsx and @docs/café.md",
             &root(tmp.path()),
         )
         .unwrap();
@@ -1069,6 +1072,8 @@ def api_catalog():
         assert!(result.llm_text.contains("slug route"));
         assert!(result.llm_text.contains("id route"));
         assert!(result.llm_text.contains("login route"));
+        assert!(result.llm_text.contains("shop route"));
+        assert!(result.llm_text.contains("unicode doc"));
     }
 
     #[test]
@@ -1081,6 +1086,8 @@ def api_catalog():
         assert!(looks_like_file_path("app/routes/[slug].tsx"));
         assert!(looks_like_file_path("app/routes/(auth)/login.tsx"));
         assert!(looks_like_file_path("app/routes/[slug]/$id.tsx"));
+        assert!(looks_like_file_path("app/shop/[[...slug]]/page.tsx"));
+        assert!(looks_like_file_path("docs/café.md"));
         assert!(!looks_like_file_path("username"));
         assert!(!looks_like_file_path("param"));
         assert!(!looks_like_file_path("override"));
@@ -1091,6 +1098,7 @@ def api_catalog():
         assert!(!looks_like_file_path("src/main.rs,"));
         assert!(!looks_like_file_path("foo/bar)"));
         assert!(!looks_like_file_path("notes.md:"));
+        assert!(!looks_like_file_path("app/shop/[[slug]/page.tsx"));
     }
 
     #[test]
