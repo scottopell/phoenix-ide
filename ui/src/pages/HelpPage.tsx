@@ -165,11 +165,16 @@ export function HelpPage() {
         const relPath = hashIdx >= 0 ? href.slice(0, hashIdx) : href;
         const frag = hashIdx >= 0 ? href.slice(hashIdx) : '';
         const target = resolveGuidePath(page, relPath);
-        // Only guide-local .md pages route through /help; out-of-guide links
+        // Only guide-local .md pages route through /help. Out-of-guide links
         // (e.g. ../../skills/…), directory links, and non-.md targets aren't
-        // served by /api/help, so leave them as plain links (they work on GitHub).
+        // served by /api/help and have no usable in-app destination — render
+        // them as plain text (not a broken anchor). They still resolve on GitHub.
         if (!target || !target.endsWith('.md')) {
-          return <a href={href} {...props}>{children}</a>;
+          return (
+            <span className="help-extlink" title="Outside the in-app guide — open this file on GitHub">
+              {children}
+            </span>
+          );
         }
         return (
           <a

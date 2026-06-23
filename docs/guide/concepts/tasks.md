@@ -35,8 +35,8 @@ the exact branch name depends on the plan's form:
 
 | Plan form | Task branch | On approval |
 |-----------|-------------|-------------|
-| taskmd file (`NNNNN-pX-…`) | `task-{NNNN}-{slug}` | status promoted to `in-progress` |
-| plain `.md` file | `task-{stem}-{conv-id8}` | committed as-is, no status change |
+| taskmd file (`NNNNN-pX-…`) | `task-{id}-{slug}` (full 5-digit id) | status promoted to `in-progress` |
+| plain `.md` file | `task-{sanitized-stem}-{conv-id-prefix}` | committed as-is, no status change |
 
 ## What you'll see
 

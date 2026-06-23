@@ -22,6 +22,7 @@ agent resumes with your answers.
 | Field | Bound |
 |-------|-------|
 | questions | 1–4 |
+| `header` (per question) | **required** — a short chip label, ≤ 12 chars |
 | options per question | 2–4 |
 | `multiSelect` | pick several (per question) |
 | `preview` | optional per-option preview — **single-select only** |

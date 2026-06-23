@@ -28,8 +28,9 @@ The **task-approval reader** opens — **Approve**, **Send Feedback**, or
 
 ## Limits & gotchas
 
-- A taskmd-named file (`NNNNN-pX-…`) must live under `tasks/`, and can't be
-  `done`.
+- A taskmd-named file (`NNNNN-pX-…`) must live under `tasks/`, and its status
+  must be **`ready`, `in-progress`, or `brainstorming`** — `blocked`, `done`, and
+  `wont-do` are rejected.
 - Sub-agents can't call it; it's withheld from Direct outside a git repo.
 - The two task-file forms produce [different branch names](../../concepts/tasks.md#from-plan-to-branch).
 
