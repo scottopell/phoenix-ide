@@ -253,6 +253,7 @@ fn has_path_token_shape(token: &str) -> bool {
         || token.ends_with(',')
         || token.ends_with('\'')
         || token.ends_with(':')
+        || token.ends_with('!')
     {
         return false;
     }
@@ -300,7 +301,7 @@ fn is_path_token_char(c: char) -> bool {
     !c.is_control()
         && !matches!(
             c,
-            '"' | '`' | ';' | '<' | '>' | '{' | '}' | '\\' | '|' | '?' | '!'
+            '"' | '`' | ';' | '<' | '>' | '{' | '}' | '\\' | '|' | '?'
         )
 }
 
@@ -1070,6 +1071,7 @@ def api_catalog():
         fs::create_dir_all(tmp.path().join("fixtures")).unwrap();
         fs::write(tmp.path().join("docs/café.md"), "unicode doc").unwrap();
         fs::write(tmp.path().join("docs/what's-new.md"), "apostrophe doc").unwrap();
+        fs::write(tmp.path().join("docs/important!.md"), "important doc").unwrap();
         fs::write(tmp.path().join("data/foo,bar.csv"), "comma data").unwrap();
         fs::write(
             tmp.path().join("fixtures/2026-06-23T12:00:00Z.json"),
@@ -1078,7 +1080,7 @@ def api_catalog():
         .unwrap();
 
         let result = expand(
-            "see @app/routes/[slug].tsx and @app/routes/[slug]/$id.tsx and @app/routes/(auth)/login.tsx and @app/shop/[[...slug]]/page.tsx and @docs/café.md and @docs/what's-new.md and @data/foo,bar.csv and @fixtures/2026-06-23T12:00:00Z.json",
+            "see @app/routes/[slug].tsx and @app/routes/[slug]/$id.tsx and @app/routes/(auth)/login.tsx and @app/shop/[[...slug]]/page.tsx and @docs/café.md and @docs/what's-new.md and @docs/important!.md and @data/foo,bar.csv and @fixtures/2026-06-23T12:00:00Z.json",
             &root(tmp.path()),
         )
         .unwrap();
@@ -1089,6 +1091,7 @@ def api_catalog():
         assert!(result.llm_text.contains("shop route"));
         assert!(result.llm_text.contains("unicode doc"));
         assert!(result.llm_text.contains("apostrophe doc"));
+        assert!(result.llm_text.contains("important doc"));
         assert!(result.llm_text.contains("comma data"));
         assert!(result.llm_text.contains("timestamp fixture"));
     }
@@ -1106,6 +1109,7 @@ def api_catalog():
         assert!(looks_like_file_path("app/shop/[[...slug]]/page.tsx"));
         assert!(looks_like_file_path("docs/café.md"));
         assert!(looks_like_file_path("docs/what's-new.md"));
+        assert!(looks_like_file_path("docs/important!.md"));
         assert!(looks_like_file_path("data/foo,bar.csv"));
         assert!(looks_like_file_path("fixtures/2026-06-23T12:00:00Z.json"));
         assert!(!looks_like_file_path("username"));
@@ -1120,6 +1124,7 @@ def api_catalog():
         assert!(!looks_like_file_path("notes.md:"));
         assert!(!looks_like_file_path("app/shop/[[slug]/page.tsx"));
         assert!(!looks_like_file_path("docs/what's-new.md'"));
+        assert!(!looks_like_file_path("docs/important.md!"));
     }
 
     #[test]
