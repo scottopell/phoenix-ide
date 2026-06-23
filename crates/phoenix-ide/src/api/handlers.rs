@@ -4254,10 +4254,10 @@ async fn search_conversation_files(
     let items: Vec<FileSearchEntry> = paths
         .into_iter()
         .map(|rel_path| {
-            let (_, is_text_file) = detect_file_type(std::path::Path::new(&rel_path));
+            let viewer = FileViewerKind::for_path(std::path::Path::new(&rel_path));
             FileSearchEntry {
                 path: rel_path,
-                is_text_file,
+                viewer,
             }
         })
         .collect();
@@ -8151,6 +8151,7 @@ mod file_read_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
+            file_indexer: Some(crate::file_index::WorkspaceIndexer::new().expect("notify init")),
         }
     }
 
@@ -8725,6 +8726,7 @@ mod chat_authority_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
+            file_indexer: Some(crate::file_index::WorkspaceIndexer::new().expect("notify init")),
         }
     }
 

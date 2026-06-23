@@ -988,10 +988,17 @@ fn resolve_global_gitignore() -> Option<PathBuf> {
             }
         }
     }
-    // Fall back to the XDG default.
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    // Fall back to the XDG default. `$HOME` is read through
+    // `PhoenixRuntimeEnvironment` so the deployment-info page reports the
+    // same home directory the indexer is actually reading from.
+    let base = std::env::var_os("XDG_CONFIG_HOME").map_or_else(
+        || {
+            phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()
+                .home()
+                .join(".config")
+        },
+        PathBuf::from,
+    );
     let candidate = base.join("git").join("ignore");
     candidate.is_file().then_some(candidate)
 }
