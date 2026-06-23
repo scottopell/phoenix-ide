@@ -453,6 +453,7 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
             conv.conv_mode.worktree_path().map(std::path::Path::new),
         )
         .stable_key(),
+        cached_pr: None,
         inner: conv.clone(),
     }
 }
@@ -466,8 +467,9 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
 async fn enrich_conversation_with_seed(
     state: &AppState,
     conv: &crate::db::Conversation,
-) -> crate::runtime::EnrichedConversation {
+) -> Result<crate::runtime::EnrichedConversation, AppError> {
     let mut enriched = enrich_conversation_with_runtime(state, conv);
+    enriched.cached_pr = cached_pr_summary_for_conversation(state, conv).await?;
     if let Some(parent_id) = conv.seed_parent_id.as_deref() {
         if let Ok(parent) = state.runtime.db().get_conversation(parent_id).await {
             enriched.seed_parent_slug = parent.slug;
@@ -496,7 +498,7 @@ async fn enrich_conversation_with_seed(
         .browser_sessions()
         .is_active(&work_scope)
         .await;
-    enriched
+    Ok(enriched)
 }
 
 /// Build an `EnrichedConversation` and apply runtime-derived fields that are
@@ -627,9 +629,8 @@ async fn conversation_to_json_with_seed(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> Result<Value, AppError> {
-    let enriched = enrich_conversation_with_seed(state, conv).await;
-    let cached_pr = cached_pr_summary_for_conversation(state, conv).await?;
-    let mut val = serde_json::to_value(enriched).unwrap_or(Value::Null);
+    let enriched = enrich_conversation_with_seed(state, conv).await?;
+    let mut val = serde_json::to_value(&enriched).unwrap_or(Value::Null);
     if let Value::Object(ref mut map) = val {
         map.insert(
             "presentation_mode".to_string(),
@@ -639,7 +640,7 @@ async fn conversation_to_json_with_seed(
             "requires_action".to_string(),
             Value::Bool(conv_requires_action(conv)),
         );
-        if let Some(pr) = cached_pr {
+        if let Some(pr) = enriched.cached_pr.clone() {
             map.insert("cached_pr".to_string(), pr);
         }
     }
@@ -2164,7 +2165,7 @@ async fn stream_conversation(
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
-        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
+        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await?),
         messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -5304,7 +5305,7 @@ async fn shared_sse_stream(
 
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
-        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
+        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await?),
         messages,
         agent_working: conversation.is_agent_working(),
         presentation_mode: conv_presentation_mode(&conversation).to_string(),
@@ -5618,6 +5619,17 @@ pub(crate) mod hard_delete_cascade_tests {
             )
             .await
             .expect("upsert pr association");
+
+        let conv = state
+            .db
+            .get_conversation("c-cached-pr")
+            .await
+            .expect("conversation");
+        let enriched = enrich_conversation_with_seed(&state, &conv)
+            .await
+            .expect("enriched conversation");
+        let init_cached_pr = enriched.cached_pr.expect("init cached_pr");
+        assert_eq!(init_cached_pr["number"], serde_json::json!(44));
 
         let Json(response) = get_conversation(
             State(state),

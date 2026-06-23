@@ -385,6 +385,7 @@ mod tests {
             browser_session_active: false,
             terminal_uses_tmux: false,
             work_scope_key: "conversation:conv-1".to_string(),
+            cached_pr: None,
         }
     }
 

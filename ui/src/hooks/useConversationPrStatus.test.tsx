@@ -50,7 +50,8 @@ function Probe({ conversationId, cached }: { conversationId: string; cached?: Ca
   });
   const number = handle.state.status === 'ready' ? handle.state.prStatus.number : 'none';
   const title = handle.state.status === 'ready' ? handle.state.prStatus.title : 'none';
-  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span></div>;
+  const refreshState = handle.state.status === 'ready' ? handle.state.prStatus.refresh.state : 'none';
+  return <div><span data-testid="pr-number">{number}</span><span data-testid="pr-title">{title}</span><span data-testid="refresh-state">{refreshState}</span></div>;
 }
 
 describe('useConversationPrStatus', () => {
@@ -92,6 +93,7 @@ describe('useConversationPrStatus', () => {
 
     expect(screen.getByTestId('pr-number')).toHaveTextContent('7');
     expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 7');
+    expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
     await waitFor(() => {
       expect(getPrStatus).toHaveBeenCalledWith('conv-7');
     });
@@ -127,6 +129,38 @@ describe('useConversationPrStatus', () => {
     await waitFor(() => {
       expect(screen.getByTestId('pr-number')).toHaveTextContent('2');
     });
+  });
+
+
+  it('does not replace fresh status when cached snapshot object churns', async () => {
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockResolvedValue({ ...prStatus(8), title: 'Fresh PR 8' });
+
+    const { rerender } = render(<Probe conversationId="conv-8" cached={cachedPr(8)} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('pr-title')).toHaveTextContent('Fresh PR 8');
+    });
+
+    rerender(<Probe conversationId="conv-8" cached={{ ...cachedPr(8) }} />);
+
+    expect(screen.getByTestId('pr-title')).toHaveTextContent('Fresh PR 8');
+    expect(getPrStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the cached PR link when the fresh status request fails', async () => {
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockRejectedValue(new Error('network failed'));
+
+    render(<Probe conversationId="conv-9" cached={cachedPr(9)} />);
+
+    await waitFor(() => {
+      expect(getPrStatus).toHaveBeenCalledWith('conv-9');
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('9');
+    expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 9');
+    expect(screen.getByTestId('refresh-state')).toHaveTextContent('unavailable');
   });
 
 });

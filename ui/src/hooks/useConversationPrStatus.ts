@@ -17,7 +17,7 @@ function displayStateToGhState(displayState: CachedPrSummary['display_state']): 
   return displayState === 'open' || displayState === 'draft' ? 'OPEN' : 'CLOSED';
 }
 
-function cachedPrToStatus(cachedPr: CachedPrSummary): PrStatusResponse {
+function cachedPrToStatus(cachedPr: CachedPrSummary, attemptedAt = new Date().toISOString()): PrStatusResponse {
   const draft = cachedPr.display_state === 'draft';
   const state = displayStateToGhState(cachedPr.display_state);
   return {
@@ -41,8 +41,9 @@ function cachedPrToStatus(cachedPr: CachedPrSummary): PrStatusResponse {
       head: cachedPr.head,
     },
     refresh: {
-      state: 'fresh',
-      last_attempted_at: new Date().toISOString(),
+      state: 'unavailable',
+      reason: 'command_failed',
+      last_attempted_at: attemptedAt,
       stale: true,
     },
     work_change: { kind: 'loading' },
@@ -84,6 +85,8 @@ export function useConversationPrStatus({
     () => (scopeKey && cachedPr ? cachedPrToStatus(cachedPr) : null),
     [cachedPr, scopeKey],
   );
+  const cachedSeedRef = useRef<PrStatusResponse | null>(null);
+  cachedSeedRef.current = cachedSeed;
   const [internalState, setInternalState] = useState<InternalConversationPrStatusState>(() => (
     cachedSeed && scopeKey
       ? { scopeKey, status: 'ready', prStatus: cachedSeed }
@@ -100,6 +103,25 @@ export function useConversationPrStatus({
       setInternalState({ scopeKey, status: 'ready', prStatus });
     } catch {
       if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
+      const fallback = cachedSeedRef.current;
+      if (fallback) {
+        setInternalState({
+          scopeKey,
+          status: 'ready',
+          prStatus: {
+            ...fallback,
+            unavailable_reason: 'command_failed',
+            refresh: {
+              ...fallback.refresh,
+              state: 'unavailable',
+              reason: 'command_failed',
+              last_attempted_at: new Date().toISOString(),
+              stale: true,
+            },
+          },
+        });
+        return;
+      }
       setInternalState({
         scopeKey,
         status: 'ready',
@@ -126,8 +148,9 @@ export function useConversationPrStatus({
       return;
     }
 
-    setInternalState(cachedSeed
-      ? { scopeKey, status: 'ready', prStatus: cachedSeed }
+    const seedForScope = cachedSeedRef.current;
+    setInternalState(seedForScope
+      ? { scopeKey, status: 'ready', prStatus: seedForScope }
       : { scopeKey, status: 'loading', prStatus: null });
     let cancelled = false;
     let timeout: number | null = null;
@@ -157,7 +180,7 @@ export function useConversationPrStatus({
       if (timeout != null) window.clearTimeout(timeout);
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [scopeKey, cachedSeed, refresh]);
+  }, [scopeKey, refresh]);
 
   return {
     state: publicStateForScope(internalState, scopeKey, cachedSeed),

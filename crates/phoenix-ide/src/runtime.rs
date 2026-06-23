@@ -700,6 +700,11 @@ pub struct EnrichedConversation {
     /// conversation id + worktree path, the same inputs the
     /// `browser_session_active` lookup uses.
     pub work_scope_key: String,
+    /// Compact DB-backed PR association for this conversation's work scope.
+    /// Rich status still comes from the PR status endpoint; this snapshot is
+    /// only enough to render a stable PR link before that refresh completes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_pr: Option<serde_json::Value>,
 }
 
 /// Events sent to SSE clients.
