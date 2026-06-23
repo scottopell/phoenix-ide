@@ -38,8 +38,10 @@ and scrollback for whatever the agent started.
 - Captured output in a tool response is middle-truncated at **128 KB**; the full
   scrollback stays in tmux (read it via `capture-pane` or the terminal).
 - Default wait **30 s** (max 900). One in-app attachment at a time.
-- Killed only on **hard-delete / archive** — soft state (blur, close tab) never
-  kills it. Use tmux when a process must outlive the tab.
+- Torn down when the **workspace is removed** — hard-delete, archive, and the
+  managed-cleanup terminal actions **Clean up** and **Abandon** (both delete the
+  worktree). *Soft* state (blur, close tab, navigate away) never kills it. Don't
+  leave long-running work in tmux expecting it to survive an Abandon/Clean up.
 
 ## Related
 

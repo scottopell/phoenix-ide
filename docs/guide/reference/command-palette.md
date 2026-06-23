@@ -25,8 +25,8 @@ In search mode, results group by source (conversations show slug + directory).
 
 | Action (verbatim) | Category | Does |
 |-------------------|----------|------|
-| `New Conversation` | Conversation | go to the new-conversation screen |
-| `Go to Conversation List` | Navigation | open the conversation list |
+| `New Conversation` | Conversation | go to the conversation list (`/`), where **+ New** starts one |
+| `Go to Conversation List` | Navigation | open the conversation list (`/`) |
 | `Open User Guide` | Help | open `/help` |
 | `Archive Current Conversation` | Conversation | archive the open conversation *(only when one is open)* |
 
@@ -34,10 +34,13 @@ In search mode, results group by source (conversations show slug + directory).
 
 | Key | Action |
 |-----|--------|
-| `↑` / `Ctrl+P` | previous result |
+| `↑` | previous result |
 | `↓` / `Ctrl+N` | next result |
 | `Enter` | select / run |
 | `Esc` | close |
+
+(`Ctrl/Cmd+P` toggles the palette — pressing it while open **closes** it, so use
+`↑` to move up.)
 
 ## Related
 

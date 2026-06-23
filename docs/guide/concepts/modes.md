@@ -45,8 +45,10 @@ working copy stays untouched.
 ## What you'll see
 
 A **mode badge** on the conversation header and list rows shows the current
-mode, and in Explore the write tools are simply absent. The per-mode controls
-are covered in the [walkthrough](../howto/run-a-managed-task.md).
+mode. In Explore, write tools are *constrained* rather than gone — `bash` runs
+read-only sandboxed and `patch` is limited to `tasks/` (see the
+[modes matrix](../reference/modes-matrix.md)). The per-mode controls are covered
+in the [walkthrough](../howto/run-a-managed-task.md).
 
 > **Remember:** a read-only mode *cannot* write — that's enforced, not asked.
 > And a worktree is a separate checkout, so your working copy is never touched
