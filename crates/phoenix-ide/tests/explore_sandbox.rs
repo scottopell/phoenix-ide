@@ -67,11 +67,21 @@ fn explore_sandbox_enforces_read_only_policy() {
         },
         &format!("cat {}", shell_quote(&outside)),
     );
-    assert!(
-        outside_read.status.success(),
-        "outside read failed: {outside_read:?}"
-    );
-    assert!(outside_read.stdout.contains("outside"));
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            outside_read.status.success(),
+            "outside read failed: {outside_read:?}"
+        );
+        assert!(outside_read.stdout.contains("outside"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            !outside_read.status.success(),
+            "outside read unexpectedly succeeded: {outside_read:?}"
+        );
+    }
 
     let denied = sandbox_run(
         bin,
