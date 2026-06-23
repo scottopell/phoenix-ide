@@ -138,6 +138,7 @@ function ConversationPageContent() {
     conversationId,
     convModeLabel: conversation?.conv_mode_label,
     branchName: conversation?.branch_name,
+    cachedPr: conversation?.cached_pr,
   });
 
   // Page-level state — not conversation data
