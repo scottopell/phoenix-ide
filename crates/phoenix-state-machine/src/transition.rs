@@ -17,10 +17,10 @@ use super::event::{
 };
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
-    AssistantMessage, CommissionReviewApprovalOutcome, ContextExhaustionBehavior,
-    ContinuationSummaryRequest, CoreState, ModeKind, ParentState, RecoveryKind,
-    RecoveryResumeTarget, SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome,
-    ToolCall, ToolInput,
+    AssistantMessage, CommissionReviewApprovalOutcome, CommissionReviewApprovalScope,
+    ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind, ParentState,
+    RecoveryKind, RecoveryResumeTarget, SubAgentResult, SubAgentState, TaskApprovalHandoff,
+    TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -302,6 +302,46 @@ enum AskUserQuestionCall<'a> {
 enum CommissionReviewCall<'a> {
     Typed(&'a super::state::CommissionReviewInput),
     Malformed(&'a str),
+}
+
+fn commission_review_scope_from_context(
+    context: &ConvContext,
+    input: &super::state::CommissionReviewInput,
+) -> CommissionReviewApprovalScope {
+    let (kind, base, head) = match context.mode_context.as_ref() {
+        Some(
+            ModeContext::Work {
+                base_branch,
+                branch_name,
+                ..
+            }
+            | ModeContext::Branch {
+                base_branch,
+                branch_name,
+                ..
+            },
+        ) => (
+            "worktree_diff".to_string(),
+            base_branch.clone(),
+            branch_name.clone(),
+        ),
+        _ => (
+            "workspace_diff".to_string(),
+            "HEAD".to_string(),
+            "working-tree".to_string(),
+        ),
+    };
+
+    CommissionReviewApprovalScope {
+        kind,
+        repo_root: context.working_dir.display().to_string(),
+        base,
+        head,
+        dirty: input.allow_dirty_working_tree,
+        changed_files: 0,
+        insertions: 0,
+        deletions: 0,
+    }
 }
 
 /// Result of a state transition
@@ -1770,6 +1810,7 @@ pub fn transition_parent(
                 tool_use_id,
                 request,
                 assistant_message,
+                ..
             },
             ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
                 outcome: CommissionReviewApprovalOutcome::Approved,
@@ -1814,6 +1855,7 @@ pub fn transition_parent(
                 tool_use_id,
                 request,
                 assistant_message,
+                ..
             },
             ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
                 outcome: CommissionReviewApprovalOutcome::Rejected,
@@ -2445,6 +2487,7 @@ pub fn transition_parent(
                     ParentState::AwaitingCommissionReviewApproval {
                         tool_use_id: tool.id.clone(),
                         request: input.clone(),
+                        scope: commission_review_scope_from_context(context, input),
                         assistant_message,
                     },
                 )
@@ -5997,6 +6040,16 @@ mod tests {
                     focus: None,
                     allow_dirty_working_tree: true,
                 },
+                scope: CommissionReviewApprovalScope {
+                    kind: "worktree_diff".to_string(),
+                    repo_root: "/tmp".to_string(),
+                    base: "main".to_string(),
+                    head: "task".to_string(),
+                    dirty: true,
+                    changed_files: 0,
+                    insertions: 0,
+                    deletions: 0,
+                },
                 assistant_message: AssistantMessage::new(
                     "req".to_string(),
                     vec![ContentBlock::ToolUse {
@@ -6147,6 +6200,16 @@ mod tests {
                     brief: "Ready for independent review".to_string(),
                     focus: None,
                     allow_dirty_working_tree: true,
+                },
+                scope: CommissionReviewApprovalScope {
+                    kind: "worktree_diff".to_string(),
+                    repo_root: "/tmp".to_string(),
+                    base: "main".to_string(),
+                    head: "task".to_string(),
+                    dirty: true,
+                    changed_files: 0,
+                    insertions: 0,
+                    deletions: 0,
                 },
                 assistant_message: AssistantMessage::new("req".to_string(), vec![], None, None),
             };

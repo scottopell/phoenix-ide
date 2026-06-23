@@ -1,6 +1,6 @@
 //! Phoenix-native commission review tool.
 
-use super::{Tool, ToolContext, ToolOutput};
+use super::{Tool, ToolContext, ToolLlmUsage, ToolOutput};
 use async_trait::async_trait;
 use phoenix_core::domain::llm_types::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, PromptCacheKey, SystemContent,
@@ -80,6 +80,8 @@ struct ReviewSummary {
     deletions: u64,
     findings_count: usize,
     elapsed_ms: u128,
+    #[serde(skip)]
+    usage: phoenix_core::domain::llm_types::Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,7 +204,12 @@ impl Tool for CommissionReviewTool {
                     "findings": &out.findings,
                     "warnings": &out.warnings,
                 });
-                ToolOutput::success(pretty_json(&out)).with_display(display)
+                ToolOutput::success(pretty_json(&out))
+                    .with_display(display)
+                    .with_llm_usage(ToolLlmUsage {
+                        model: "commission_review".to_string(),
+                        usage: out.summary.usage,
+                    })
             }
             Err(err) => ToolOutput::error(err),
         }
@@ -240,6 +247,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 deletions: collection.deletions,
                 findings_count: 0,
                 elapsed_ms: started.elapsed().as_millis(),
+                usage: phoenix_core::domain::llm_types::Usage::default(),
                 input_tokens: None,
                 output_tokens: None,
                 reviewer_summary: Some("No reviewable text diff was found".to_string()),
@@ -316,6 +324,12 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
             deletions: collection.deletions,
             findings_count: findings.len(),
             elapsed_ms: started.elapsed().as_millis(),
+            usage: phoenix_core::domain::llm_types::Usage {
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
             reviewer_summary: if reviewer_summaries.is_empty() {

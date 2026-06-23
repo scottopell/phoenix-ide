@@ -183,6 +183,7 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             output,
             images,
             display_data,
+            ..
         } => ToolOutcome::Success {
             output: cap_tool_output_text(output),
             display_data,
@@ -192,6 +193,7 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             output,
             images,
             display_data,
+            ..
         } => ToolOutcome::Error {
             output: cap_tool_output_text(output),
             display_data,
@@ -247,7 +249,8 @@ async fn forward_tool_outcome(
 /// only accepts `ToolAborted` from `CancellingTool`, entered when the
 /// `AbortTool` effect cancels the token (FM-1 prevention). A missing output
 /// (unknown tool) maps to `Failed`.
-async fn execute_tool_to_outcome<T: ToolExecutor + ?Sized>(
+async fn execute_tool_to_outcome<S, T>(
+    storage: S,
     tool_executor: Arc<T>,
     checked: crate::runtime::deny_gate::CheckedToolCall,
     tool_ctx: ToolContext,
@@ -255,7 +258,11 @@ async fn execute_tool_to_outcome<T: ToolExecutor + ?Sized>(
     conv_id: String,
     tool_name: String,
     tool_use_id: String,
-) -> ToolExecOutcome {
+) -> ToolExecOutcome
+where
+    S: Storage + Clone + 'static,
+    T: ToolExecutor + ?Sized,
+{
     tracing::info!(conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
 
@@ -267,7 +274,15 @@ async fn execute_tool_to_outcome<T: ToolExecutor + ?Sized>(
             tool_use_id,
             reason: crate::state_machine::AbortReason::CancellationRequested,
         }
-    } else if let Some(out) = output {
+    } else if let Some(mut out) = output {
+        if let Some(llm_usage) = out.take_llm_usage() {
+            let _ = storage
+                .insert_turn_usage(&conv_id, &conv_id, &llm_usage.model, &llm_usage.usage)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(conv_id = %conv_id, error = %e, "failed to record tool LLM usage");
+                });
+        }
         let duration_ms = u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         tracing::info!(
             conv_id = %conv_id,
@@ -3735,6 +3750,7 @@ where
         );
 
         let conv_id = self.context.conversation_id.clone();
+        let storage = self.storage.clone();
         let tool_executor = self.tool_executor.clone();
         let tool_use_id = tool.id.clone();
         // Retained for the outcome forwarder so a dropped sender (panicked or
@@ -3768,6 +3784,7 @@ where
 
         let tool_task = tokio::spawn(async move {
             let tool_outcome = execute_tool_to_outcome(
+                storage,
                 tool_executor,
                 checked,
                 tool_ctx,

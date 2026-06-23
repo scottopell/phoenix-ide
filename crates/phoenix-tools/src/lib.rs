@@ -97,6 +97,12 @@ pub struct ToolImage {
     pub data: String, // base64-encoded
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolLlmUsage {
+    pub model: String,
+    pub usage: phoenix_core::domain::llm_types::Usage,
+}
+
 /// Result from tool execution.
 ///
 /// An enum, not a `struct { success: bool, output: String, .. }`: those two
@@ -120,11 +126,13 @@ pub enum ToolOutput {
         /// not text).
         images: Vec<ToolImage>,
         display_data: Option<Value>,
+        llm_usage: Option<ToolLlmUsage>,
     },
     Error {
         output: String,
         images: Vec<ToolImage>,
         display_data: Option<Value>,
+        llm_usage: Option<ToolLlmUsage>,
     },
 }
 
@@ -134,6 +142,7 @@ impl ToolOutput {
             output: output.into(),
             images: vec![],
             display_data: None,
+            llm_usage: None,
         }
     }
 
@@ -142,6 +151,7 @@ impl ToolOutput {
             output: message.into(),
             images: vec![],
             display_data: None,
+            llm_usage: None,
         }
     }
 
@@ -155,8 +165,23 @@ impl ToolOutput {
         self
     }
 
-    /// Attach typed images for LLM consumption.
+    /// Attach tool-spent LLM usage for runtime accounting.
     #[must_use]
+    pub fn with_llm_usage(mut self, usage: ToolLlmUsage) -> Self {
+        match &mut self {
+            Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
+                *llm_usage = Some(usage);
+            }
+        }
+        self
+    }
+
+    pub fn take_llm_usage(&mut self) -> Option<ToolLlmUsage> {
+        match self {
+            Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => llm_usage.take(),
+        }
+    }
+
     pub fn with_images(mut self, imgs: Vec<ToolImage>) -> Self {
         match &mut self {
             Self::Success { images, .. } | Self::Error { images, .. } => *images = imgs,

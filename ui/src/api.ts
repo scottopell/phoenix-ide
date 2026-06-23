@@ -353,6 +353,16 @@ export type ConversationState =
       brief: string;
       focus?: string | null;
       allow_dirty_working_tree: boolean;
+      scope?: {
+        kind: string;
+        repo_root: string;
+        base: string;
+        head: string;
+        dirty: boolean;
+        changed_files: number;
+        insertions: number;
+        deletions: number;
+      };
     }
   | { type: 'awaiting_user_response'; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }

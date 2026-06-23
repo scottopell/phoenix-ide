@@ -5,6 +5,16 @@ export interface CommissionReviewApprovalProps {
   brief: string;
   focus?: string | null;
   allowDirtyWorkingTree: boolean;
+  scope?: {
+    kind: string;
+    repo_root: string;
+    base: string;
+    head: string;
+    dirty: boolean;
+    changed_files: number;
+    insertions: number;
+    deletions: number;
+  };
   onApprove: () => Promise<void> | void;
   onReject: () => Promise<void> | void;
 }
@@ -13,6 +23,7 @@ export function CommissionReviewApproval({
   brief,
   focus,
   allowDirtyWorkingTree,
+  scope,
   onApprove,
   onReject,
 }: CommissionReviewApprovalProps) {
@@ -61,6 +72,14 @@ export function CommissionReviewApproval({
             <h3>Scope</h3>
             <p>Phoenix will infer the review target from this conversation/worktree and use the configured default LLM.</p>
             <p>Dirty worktree review: {allowDirtyWorkingTree ? 'explicitly allowed' : 'not allowed'}</p>
+            {scope && (
+              <ul>
+                <li>Target: {scope.kind}</li>
+                <li>Repo: {scope.repo_root}</li>
+                <li>Base/head: {scope.base} → {scope.head}</li>
+                <li>Stats: {scope.changed_files} files, +{scope.insertions}/-{scope.deletions}</li>
+              </ul>
+            )}
           </section>
 
           {settled === 'approved' && (

@@ -1637,6 +1637,7 @@ function ConversationPageContent() {
             brief={atom.phase.brief}
             focus={atom.phase.focus}
             allowDirtyWorkingTree={atom.phase.allow_dirty_working_tree}
+            scope={atom.phase.scope}
             onApprove={handleApproveCommissionReview}
             onReject={handleRejectCommissionReview}
           />

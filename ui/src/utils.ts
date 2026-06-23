@@ -259,6 +259,7 @@ export function parseConversationState(raw: unknown): ConversationState {
         brief,
         focus: focus ?? null,
         allow_dirty_working_tree: allowDirty,
+        scope: obj['scope'] as any,
       };
     }
     case 'awaiting_user_response':

@@ -123,11 +123,31 @@ describe('parseConversationState commission review approval', () => {
         focus: 'security',
         allow_dirty_working_tree: true,
       },
+      scope: {
+        kind: 'worktree_diff',
+        repo_root: '/repo',
+        base: 'main',
+        head: 'task',
+        dirty: true,
+        changed_files: 0,
+        insertions: 0,
+        deletions: 0,
+      },
     })).toEqual({
       type: 'awaiting_commission_review_approval',
       brief: 'Ready for review',
       focus: 'security',
       allow_dirty_working_tree: true,
+      scope: {
+        kind: 'worktree_diff',
+        repo_root: '/repo',
+        base: 'main',
+        head: 'task',
+        dirty: true,
+        changed_files: 0,
+        insertions: 0,
+        deletions: 0,
+      },
     });
   });
 

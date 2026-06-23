@@ -6265,7 +6265,9 @@ mod tests {
     #[tokio::test]
     async fn test_reset_preserves_awaiting_commission_review_approval_state() {
         use phoenix_core::domain::llm_types::ContentBlock;
-        use phoenix_core::domain::sm_state::{AssistantMessage, CommissionReviewInput};
+        use phoenix_core::domain::sm_state::{
+            AssistantMessage, CommissionReviewApprovalScope, CommissionReviewInput,
+        };
 
         let db = Database::open_in_memory().await.unwrap();
 
@@ -6286,6 +6288,16 @@ mod tests {
                 brief: "Ready for review".to_string(),
                 focus: Some("correctness".to_string()),
                 allow_dirty_working_tree: true,
+            },
+            scope: CommissionReviewApprovalScope {
+                kind: "worktree_diff".to_string(),
+                repo_root: "/tmp".to_string(),
+                base: "main".to_string(),
+                head: "task".to_string(),
+                dirty: true,
+                changed_files: 0,
+                insertions: 0,
+                deletions: 0,
             },
             assistant_message: AssistantMessage::new(
                 "req".to_string(),

@@ -89,6 +89,19 @@ pub struct ApprovedCommissionReviewInput {
     pub approved_worktree_path: Option<String>,
 }
 
+/// Inferred scope shown before a `commission_review` approval decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommissionReviewApprovalScope {
+    pub kind: String,
+    pub repo_root: String,
+    pub base: String,
+    pub head: String,
+    pub dirty: bool,
+    pub changed_files: usize,
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
 /// User decision for a pending `commission_review` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommissionReviewApprovalOutcome {
@@ -1037,6 +1050,7 @@ pub enum ConvState {
     AwaitingCommissionReviewApproval {
         tool_use_id: String,
         request: CommissionReviewInput,
+        scope: CommissionReviewApprovalScope,
         assistant_message: AssistantMessage,
     },
 
@@ -1142,6 +1156,7 @@ pub enum ParentState {
     AwaitingCommissionReviewApproval {
         tool_use_id: String,
         request: CommissionReviewInput,
+        scope: CommissionReviewApprovalScope,
         assistant_message: AssistantMessage,
     },
     ContextExhausted {
@@ -1208,10 +1223,12 @@ impl From<ParentState> for ConvState {
             ParentState::AwaitingCommissionReviewApproval {
                 tool_use_id,
                 request,
+                scope,
                 assistant_message,
             } => ConvState::AwaitingCommissionReviewApproval {
                 tool_use_id,
                 request,
+                scope,
                 assistant_message,
             },
             ParentState::ContextExhausted { summary } => ConvState::ContextExhausted { summary },
@@ -1430,10 +1447,12 @@ impl TryFrom<ConvState> for ParentState {
             ConvState::AwaitingCommissionReviewApproval {
                 tool_use_id,
                 request,
+                scope,
                 assistant_message,
             } => Ok(ParentState::AwaitingCommissionReviewApproval {
                 tool_use_id,
                 request,
+                scope,
                 assistant_message,
             }),
             ConvState::ContextExhausted { summary } => {

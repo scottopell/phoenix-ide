@@ -808,6 +808,16 @@ mod tests {
                 focus: None,
                 allow_dirty_working_tree: false,
             },
+            scope: crate::state_machine::state::CommissionReviewApprovalScope {
+                kind: "workspace_diff".to_string(),
+                repo_root: "/tmp".to_string(),
+                base: "HEAD".to_string(),
+                head: "working-tree".to_string(),
+                dirty: false,
+                changed_files: 0,
+                insertions: 0,
+                deletions: 0,
+            },
             assistant_message: crate::state_machine::state::AssistantMessage::new(
                 "req".to_string(),
                 vec![],
