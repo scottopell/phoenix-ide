@@ -256,6 +256,7 @@ async fn execute_tool_to_outcome<S, T>(
     tool_ctx: ToolContext,
     cancel_token_check: &CancellationToken,
     conv_id: String,
+    root_conv_id: String,
     tool_name: String,
     tool_use_id: String,
 ) -> ToolExecOutcome
@@ -277,7 +278,7 @@ where
     } else if let Some(mut out) = output {
         if let Some(llm_usage) = out.take_llm_usage() {
             let _ = storage
-                .insert_turn_usage(&conv_id, &conv_id, &llm_usage.model, &llm_usage.usage)
+                .insert_turn_usage(&conv_id, &root_conv_id, &llm_usage.model, &llm_usage.usage)
                 .await
                 .map_err(|e| {
                     tracing::warn!(conv_id = %conv_id, error = %e, "failed to record tool LLM usage");
@@ -3758,6 +3759,7 @@ where
         );
 
         let conv_id = self.context.conversation_id.clone();
+        let root_conv_id = self.context.root_conversation_id.clone();
         let storage = self.storage.clone();
         let tool_executor = self.tool_executor.clone();
         let tool_use_id = tool.id.clone();
@@ -3798,6 +3800,7 @@ where
                 tool_ctx,
                 &cancel_token_check,
                 conv_id,
+                root_conv_id,
                 tool_name,
                 tool_use_id,
             )

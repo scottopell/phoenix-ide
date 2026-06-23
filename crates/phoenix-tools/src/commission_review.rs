@@ -13,6 +13,7 @@ use std::process::Stdio;
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 const MAX_REVIEW_BYTES: usize = 180_000;
 const MAX_FILE_BYTES: usize = 80_000;
@@ -523,7 +524,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
     let mut warnings = Vec::new();
     let effective_range_base = match &target.diff_spec {
         DiffSpec::Range { base, head, .. } => {
-            Some(git_capture(repo, &["merge-base", base, head]).await?)
+            Some(git_capture_cancel(repo, &["merge-base", base, head], &ctx.cancel).await?)
         }
         DiffSpec::Workspace => None,
     };
@@ -535,7 +536,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
         } => {
             if *include_worktree {
                 let merge_base = effective_range_base.as_deref().unwrap_or(base);
-                git_capture(
+                git_capture_cancel(
                     repo,
                     &[
                         "diff",
@@ -545,10 +546,11 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                         merge_base,
                         "--",
                     ],
+                    &ctx.cancel,
                 )
                 .await?
             } else {
-                git_capture(
+                git_capture_cancel(
                     repo,
                     &[
                         "diff",
@@ -557,12 +559,13 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                         "--numstat",
                         &format!("{base}...{head}"),
                     ],
+                    &ctx.cancel,
                 )
                 .await?
             }
         }
         DiffSpec::Workspace => {
-            git_capture(
+            git_capture_cancel(
                 repo,
                 &[
                     "diff",
@@ -572,6 +575,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                     "HEAD",
                     "--",
                 ],
+                &ctx.cancel,
             )
             .await?
         }
@@ -580,9 +584,13 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
     let mut deletions = 0;
     let mut files_changed = 0;
     let mut files = Vec::new();
-    let untracked = git_capture(repo, &["ls-files", "--others", "--exclude-standard"])
-        .await
-        .unwrap_or_default();
+    let untracked = git_capture_cancel(
+        repo,
+        &["ls-files", "--others", "--exclude-standard"],
+        &ctx.cancel,
+    )
+    .await
+    .unwrap_or_default();
     for file in untracked.lines().filter(|line| !line.trim().is_empty()) {
         warnings.push(warning(
             "untracked_file",
@@ -630,7 +638,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
             } => {
                 let capture_result = if *include_worktree {
                     let merge_base = effective_range_base.as_deref().unwrap_or(base);
-                    git_capture_limited(
+                    git_capture_limited_cancel(
                         repo,
                         &[
                             "diff",
@@ -641,11 +649,12 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                             file,
                         ],
                         MAX_FILE_BYTES + 1,
+                        &ctx.cancel,
                     )
                     .await
                 } else {
                     let merge_base_range = format!("{base}...{head}");
-                    git_capture_limited(
+                    git_capture_limited_cancel(
                         repo,
                         &[
                             "diff",
@@ -656,6 +665,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                             file,
                         ],
                         MAX_FILE_BYTES + 1,
+                        &ctx.cancel,
                     )
                     .await
                 };
@@ -681,10 +691,11 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                 diff_output
             }
             DiffSpec::Workspace => {
-                let (diff_output, truncated) = match git_capture_limited(
+                let (diff_output, truncated) = match git_capture_limited_cancel(
                     repo,
                     &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", file],
                     MAX_FILE_BYTES + 1,
+                    &ctx.cancel,
                 )
                 .await
                 {
@@ -983,6 +994,7 @@ fn git_command() -> Command {
     let mut command = Command::new("git");
     command.env("GIT_OPTIONAL_LOCKS", "0");
     command.env("GIT_NO_LAZY_FETCH", "1");
+    command.kill_on_drop(true);
     command
 }
 
@@ -1004,6 +1016,45 @@ async fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
+    }
+}
+
+async fn git_capture_cancel(
+    cwd: &Path,
+    args: &[&str],
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    let child = git_command()
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output();
+    tokio::select! {
+        () = cancel.cancelled() => Err(format!("git {} cancelled", args.join(" "))),
+        output = child => {
+            let output = output.map_err(|e| format!("failed to run git {}: {e}", args.join(" ")))?;
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+            } else {
+                Err(format!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        }
+    }
+}
+
+async fn git_capture_limited_cancel(
+    cwd: &Path,
+    args: &[&str],
+    max_bytes: usize,
+    cancel: &CancellationToken,
+) -> Result<(String, bool), String> {
+    tokio::select! {
+        () = cancel.cancelled() => Err(format!("git {} cancelled", args.join(" "))),
+        result = git_capture_limited(cwd, args, max_bytes) => result,
     }
 }
 
