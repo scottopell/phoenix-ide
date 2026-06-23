@@ -104,15 +104,17 @@ rule ClassifyAtReferenceAsFile {
         -- true when the token has a valid path-token shape and then either
         -- contains "/" or its trailing dot-suffix is in
         -- config.path_like_extensions. Valid path-token shapes preserve Unicode
-        -- path characters, including commas inside filenames and balanced framework
-        -- route groups such as `[slug]`, `(auth)`, and `[[...slug]]`, and reject
-        -- call/prose delimiters or trailing punctuation before slash/extension checks are applied.
+        -- path characters, including commas and apostrophes inside filenames and
+        -- balanced framework route groups such as `[slug]`, `(auth)`, and
+        -- `[[...slug]]`, and reject call/prose delimiters or trailing punctuation
+        -- before slash/extension checks are applied.
         -- Implementation: the same check in expand() in message_expander.rs.
         -- Examples:
         --   @src/main.rs       -> file_expansion (valid path token with /)
         --   @app/routes/[slug].tsx -> file_expansion (balanced route segment)
         --   @app/shop/[[...slug]]/page.tsx -> file_expansion (nested route segment)
         --   @docs/café.md     -> file_expansion (Unicode path character)
+        --   @docs/what's-new.md -> file_expansion (apostrophe inside filename)
         --   @data/foo,bar.csv -> file_expansion (comma inside filename)
         --   @AGENTS.md         -> file_expansion (.md is a known extension)
         --   @app.get("/x",     -> not_a_reference (code-shaped token)

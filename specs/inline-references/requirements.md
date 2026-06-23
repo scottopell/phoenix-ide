@@ -116,9 +116,9 @@ AND SHALL deliver the fully expanded content to the AI
 ### REQ-IR-007: Graceful Handling of Unresolvable Expansion References
 
 WHEN a message contains `@` followed by a token with a valid path-token shape
-(Unicode path characters, including balanced framework route groups, and no
-call/prose delimiters or trailing punctuation) and that token contains `/` or
-`.` with a recognized file extension
+(Unicode path characters, including punctuation inside filenames, balanced
+framework route groups, and no call/prose delimiters or trailing punctuation)
+and that token contains `/` or `.` with a recognized file extension
 AND the referenced file does not exist
 THE SYSTEM SHALL present the user with a clear error identifying the missing file
 AND SHALL NOT send the message until the reference is removed or corrected
