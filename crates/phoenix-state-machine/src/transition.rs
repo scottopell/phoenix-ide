@@ -307,7 +307,7 @@ enum CommissionReviewCall<'a> {
 
 fn commission_review_scope_from_context(
     context: &ConvContext,
-    _input: &super::state::CommissionReviewInput,
+    input: &super::state::CommissionReviewInput,
 ) -> CommissionReviewApprovalScope {
     let (kind, base, head) = match context.mode_context.as_ref() {
         Some(
@@ -339,16 +339,30 @@ fn commission_review_scope_from_context(
         .map(|status| !status.trim().is_empty())
         .unwrap_or(false);
     let (changed_files, insertions, deletions) = match if kind == "worktree_diff" {
-        git_output(
-            &context.working_dir,
-            &[
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--numstat",
-                &format!("{base}...HEAD"),
-            ],
-        )
+        if input.allow_dirty_working_tree && dirty {
+            git_output(
+                &context.working_dir,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    &base,
+                    "--",
+                ],
+            )
+        } else {
+            git_output(
+                &context.working_dir,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    &format!("{base}...HEAD"),
+                ],
+            )
+        }
     } else {
         git_output(
             &context.working_dir,
@@ -378,12 +392,15 @@ fn commission_review_scope_from_context(
     }
 }
 
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("GIT_NO_LAZY_FETCH", "1");
+    command
+}
+
 fn git_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let output = git_command().args(args).current_dir(cwd).output().ok()?;
     output.status.success().then(|| {
         String::from_utf8_lossy(&output.stdout)
             .trim_end()
@@ -1899,6 +1916,18 @@ pub fn transition_parent(
                             .work_scope_worktree
                             .as_ref()
                             .map(|path| path.display().to_string()),
+                        approved_head: git_output(&context.working_dir, &["rev-parse", "HEAD"])
+                            .unwrap_or_else(|| "HEAD".to_string()),
+                        approved_base: match context.mode_context.as_ref() {
+                            Some(
+                                ModeContext::Work { base_branch, .. }
+                                | ModeContext::Branch { base_branch, .. },
+                            ) => git_output(
+                                &context.working_dir,
+                                &["merge-base", base_branch, "HEAD"],
+                            ),
+                            _ => None,
+                        },
                     },
                 ),
             );

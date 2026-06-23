@@ -38,6 +38,8 @@ struct ApprovedCommissionReviewInput {
     runtime_base_branch: Option<String>,
     approved_working_dir: String,
     approved_worktree_path: Option<String>,
+    approved_head: String,
+    approved_base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -221,6 +223,25 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     let approved: ApprovedCommissionReviewInput = serde_json::from_value(input)
         .map_err(|e| format!("Invalid approved commission_review input: {e}"))?;
     assert_approved_context_has_not_drifted(&ctx, &approved)?;
+    let current_head = git_capture(&ctx.working_dir, &["rev-parse", "HEAD"]).await?;
+    if current_head != approved.approved_head {
+        return Err(format!(
+            "commission_review target changed after approval: HEAD was `{}` at approval time but is now `{current_head}`. Request review again.",
+            approved.approved_head
+        ));
+    }
+    if let (Some(base_branch), Some(approved_base)) = (
+        approved.runtime_base_branch.as_deref(),
+        approved.approved_base.as_deref(),
+    ) {
+        let current_base =
+            git_capture(&ctx.working_dir, &["merge-base", base_branch, "HEAD"]).await?;
+        if current_base != approved_base {
+            return Err(format!(
+                "commission_review target changed after approval: merge base was `{approved_base}` at approval time but is now `{current_base}`. Request review again."
+            ));
+        }
+    }
     let input = approved.request;
     if input.brief.trim().is_empty() {
         return Err(
@@ -958,8 +979,15 @@ fn warning(kind: &str, message: &str, file: Option<&str>) -> ReviewWarning {
     }
 }
 
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("GIT_NO_LAZY_FETCH", "1");
+    command
+}
+
 async fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -984,7 +1012,7 @@ async fn git_capture_limited(
     args: &[&str],
     max_bytes: usize,
 ) -> Result<(String, bool), String> {
-    let mut child = Command::new("git")
+    let mut child = git_command()
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -1110,6 +1138,8 @@ mod tests {
             runtime_base_branch: Some("main".to_string()),
             approved_working_dir: "/repo/approved".to_string(),
             approved_worktree_path: Some("/repo/approved-wt".to_string()),
+            approved_head: "head".to_string(),
+            approved_base: None,
         };
 
         let cwd_err = assert_approved_paths_match(
@@ -1140,6 +1170,8 @@ mod tests {
             runtime_base_branch: Some("main".to_string()),
             approved_working_dir: "/repo/approved".to_string(),
             approved_worktree_path: None,
+            approved_head: "head".to_string(),
+            approved_base: None,
         };
 
         assert!(assert_approved_paths_match("/repo/approved", &None, &approved).is_ok());

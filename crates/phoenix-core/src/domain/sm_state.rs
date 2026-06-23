@@ -87,6 +87,8 @@ pub struct ApprovedCommissionReviewInput {
     pub runtime_base_branch: Option<String>,
     pub approved_working_dir: String,
     pub approved_worktree_path: Option<String>,
+    pub approved_head: String,
+    pub approved_base: Option<String>,
 }
 
 /// Inferred scope shown before a `commission_review` approval decision.

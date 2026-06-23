@@ -3522,7 +3522,15 @@ where
                         .tool_uses()
                         .into_iter()
                         .map(|(id, name, input)| {
-                            let typed_input = ToolInput::from_name_and_value(name, input.clone());
+                            let typed_input = if name == "approved_commission_review" {
+                                ToolInput::Malformed {
+                                    name: name.to_string(),
+                                    input: input.clone(),
+                                    error: "approved_commission_review is runtime-only and cannot be emitted by the model".to_string(),
+                                }
+                            } else {
+                                ToolInput::from_name_and_value(name, input.clone())
+                            };
                             ToolCall::new(id.to_string(), typed_input)
                         })
                         .collect();
