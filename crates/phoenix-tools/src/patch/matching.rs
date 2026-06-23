@@ -7,6 +7,13 @@ use unicode_security::skeleton;
 
 const MAX_DUPLICATE_LOCATIONS: usize = 5;
 const MAX_SNIPPET_LINES: usize = 5;
+const MAX_SNIPPET_CHARS: usize = 240;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MatchOutcome {
+    Unique(EditSpec),
+    Duplicate(DuplicateMatchDiagnostics),
+}
 
 /// Find a unique match for `old_text` in `content`
 ///
@@ -16,46 +23,76 @@ const MAX_SNIPPET_LINES: usize = 5;
 /// 3. Trimmed line matching (first/last line variations)
 /// 4. NFKC-normalised match (handles Unicode lookalike characters)
 pub fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpec, PatchError> {
-    // 1. Try exact match
-    if let Some(spec) = find_exact_unique(content, old_text) {
-        return Ok(spec);
+    let mut duplicate: Option<DuplicateMatchDiagnostics> = None;
+
+    if let Some(outcome) = find_exact_match(content, old_text) {
+        match outcome {
+            MatchOutcome::Unique(spec) => return Ok(spec),
+            MatchOutcome::Duplicate(diagnostics) => duplicate = Some(diagnostics),
+        }
     }
 
-    // 2. Try dedent matching
-    if let Some(spec) = find_dedent_match(content, old_text) {
-        return Ok(spec);
+    if let Some(outcome) = find_dedent_match(content, old_text) {
+        match outcome {
+            MatchOutcome::Unique(spec) => return Ok(spec),
+            MatchOutcome::Duplicate(diagnostics) => duplicate.get_or_insert(diagnostics),
+        };
     }
 
-    // 3. Try trimmed line match
-    if let Some(spec) = find_trimmed_match(content, old_text) {
-        return Ok(spec);
+    if let Some(outcome) = find_trimmed_match(content, old_text) {
+        match outcome {
+            MatchOutcome::Unique(spec) => return Ok(spec),
+            MatchOutcome::Duplicate(diagnostics) => duplicate.get_or_insert(diagnostics),
+        };
     }
 
-    // 4. Try NFKC-normalised match (handles lookalike characters)
-    if let Some(spec) = find_normalised_match(content, old_text) {
-        return Ok(spec);
+    if let Some(outcome) = find_normalised_match(content, old_text) {
+        match outcome {
+            MatchOutcome::Unique(spec) => return Ok(spec),
+            MatchOutcome::Duplicate(diagnostics) => duplicate.get_or_insert(diagnostics),
+        };
     }
 
-    // Determine error type
-    let diagnostics = duplicate_match_diagnostics(content, old_text);
-    if diagnostics.total > 1 {
+    duplicate.map_or(Err(PatchError::OldTextNotFound), |diagnostics| {
         Err(PatchError::OldTextNotUnique(diagnostics))
-    } else {
-        Err(PatchError::OldTextNotFound)
+    })
+}
+
+fn find_exact_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
+    let diagnostics = duplicate_match_diagnostics(content, old_text);
+    match diagnostics.total {
+        0 => None,
+        1 => Some(MatchOutcome::Unique(EditSpec {
+            offset: content.find(old_text)?,
+            length: old_text.len(),
+        })),
+        _ => Some(MatchOutcome::Duplicate(diagnostics)),
     }
 }
 
 #[must_use]
 pub fn duplicate_match_diagnostics(content: &str, old_text: &str) -> DuplicateMatchDiagnostics {
+    duplicate_match_diagnostics_from_ranges(
+        content,
+        content
+            .match_indices(old_text)
+            .map(|(offset, _)| (offset, old_text.len())),
+    )
+}
+
+fn duplicate_match_diagnostics_from_ranges(
+    content: &str,
+    ranges: impl Iterator<Item = (usize, usize)>,
+) -> DuplicateMatchDiagnostics {
     let mut reported = Vec::new();
     let mut total = 0;
 
-    for (offset, _) in content.match_indices(old_text) {
+    for (offset, len) in ranges {
         total += 1;
         if reported.len() < MAX_DUPLICATE_LOCATIONS {
             reported.push(DuplicateMatchLocation {
                 start_line: line_number_at(content, offset),
-                snippet: duplicate_match_snippet(content, offset, old_text.len()),
+                snippet: duplicate_match_snippet(content, offset, len),
             });
         }
     }
@@ -78,93 +115,151 @@ fn line_number_at(content: &str, offset: usize) -> usize {
 
 fn duplicate_match_snippet(content: &str, offset: usize, len: usize) -> String {
     let match_end = offset + len;
-    let start_line_index = line_index_at(content, offset);
-    let end_line_index = line_index_at(content, match_end);
-    let lines: Vec<&str> = content.split('\n').collect();
-
-    let mut snippet_start = start_line_index.saturating_sub(1);
-    let mut snippet_end = (end_line_index + 2).min(lines.len());
-
-    if snippet_end - snippet_start > MAX_SNIPPET_LINES {
-        snippet_start = start_line_index;
-        snippet_end = (snippet_start + MAX_SNIPPET_LINES).min(lines.len());
-    }
-
-    lines[snippet_start..snippet_end].join("\n")
+    let start = context_start(content, offset);
+    let end = context_end(content, match_end, start);
+    let snippet = content.get(start..end).unwrap_or_default();
+    truncate_snippet_around_match(snippet, offset - start)
 }
 
-fn line_index_at(content: &str, offset: usize) -> usize {
+fn context_start(content: &str, offset: usize) -> usize {
+    let mut start = line_start(content, offset);
+    if start > 0 {
+        start = line_start(content, start - 1);
+    }
+    start
+}
+
+fn context_end(content: &str, offset: usize, snippet_start: usize) -> usize {
+    let mut end = line_end(content, offset);
+    if end < content.len() {
+        end = line_end(content, end + 1);
+    }
+    cap_end_to_max_lines(content, snippet_start, end)
+}
+
+fn cap_end_to_max_lines(content: &str, start: usize, end: usize) -> usize {
+    let mut newline_count = 0;
+    for (i, ch) in content.char_indices().skip_while(|(i, _)| *i < start) {
+        if i >= end {
+            break;
+        }
+        if ch == '\n' {
+            newline_count += 1;
+            if newline_count >= MAX_SNIPPET_LINES {
+                return i;
+            }
+        }
+    }
+    end
+}
+
+fn line_start(content: &str, offset: usize) -> usize {
     content
         .char_indices()
         .take_while(|(i, _)| *i < offset)
-        .filter(|(_, ch)| *ch == '\n')
-        .count()
+        .filter_map(|(i, ch)| (ch == '\n').then_some(i + 1))
+        .last()
+        .unwrap_or(0)
+}
+
+fn line_end(content: &str, offset: usize) -> usize {
+    content
+        .char_indices()
+        .find_map(|(i, ch)| (i >= offset && ch == '\n').then_some(i))
+        .unwrap_or(content.len())
+}
+
+fn truncate_snippet_around_match(snippet: &str, match_offset: usize) -> String {
+    if snippet.chars().count() <= MAX_SNIPPET_CHARS {
+        return snippet.to_string();
+    }
+
+    let half_window = MAX_SNIPPET_CHARS / 2;
+    let match_char_offset = snippet
+        .char_indices()
+        .take_while(|(i, _)| *i < match_offset)
+        .count();
+    let snippet_chars = snippet.chars().count();
+    let start_char = match_char_offset.saturating_sub(half_window);
+    let end_char = (start_char + MAX_SNIPPET_CHARS).min(snippet_chars);
+
+    let mut result = String::new();
+    if start_char > 0 {
+        result.push('…');
+    }
+    result.extend(snippet.chars().skip(start_char).take(end_char - start_char));
+    if end_char < snippet_chars {
+        result.push('…');
+    }
+    result
 }
 
 /// Find exact unique match
+#[allow(dead_code)]
 #[must_use]
 pub fn find_exact_unique(content: &str, old_text: &str) -> Option<EditSpec> {
-    let matches: Vec<_> = content.match_indices(old_text).collect();
-    if matches.len() == 1 {
-        Some(EditSpec {
-            offset: matches[0].0,
-            length: old_text.len(),
-        })
-    } else {
-        None
+    match find_exact_match(content, old_text)? {
+        MatchOutcome::Unique(spec) => Some(spec),
+        MatchOutcome::Duplicate(_) => None,
     }
 }
 
 /// Find match with different indentation
-fn find_dedent_match(content: &str, old_text: &str) -> Option<EditSpec> {
+fn find_dedent_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
     let old_indent = common_leading_whitespace(old_text);
+    let mut duplicate = None;
 
-    // Try different indent levels found in the content
     for line in content.lines() {
         let line_indent = leading_whitespace(line);
         if line_indent != old_indent && !line_indent.is_empty() {
-            // Try reindenting old_text to this level
             let adjusted = reindent_text(old_text, &old_indent, line_indent);
-            if let Some(spec) = find_exact_unique(content, &adjusted) {
-                return Some(spec);
+            if let Some(outcome) = find_exact_match(content, &adjusted) {
+                match outcome {
+                    MatchOutcome::Unique(spec) => return Some(MatchOutcome::Unique(spec)),
+                    outcome @ MatchOutcome::Duplicate(_) => duplicate = duplicate.or(Some(outcome)),
+                }
             }
         }
     }
-    None
+    duplicate
 }
 
 /// Find match with trimmed first/last lines
-fn find_trimmed_match(content: &str, old_text: &str) -> Option<EditSpec> {
+fn find_trimmed_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
     let lines: Vec<&str> = old_text.lines().collect();
     if lines.len() <= 2 {
         return None;
     }
 
-    // Try without first line
     let without_first = lines[1..].join("\n");
-    if let Some(mut spec) = find_exact_unique(content, &without_first) {
-        if spec.offset > 0 {
-            // Safety: `spec.offset` is from `find_exact_unique()` which returns byte
-            // offsets found via `str::find()` on `content`
-            #[allow(clippy::string_slice)]
-            let before = &content[..spec.offset];
-            let first_line_with_newline = format!("{}\n", lines[0]);
-            if before.ends_with(&first_line_with_newline) {
-                spec.offset -= first_line_with_newline.len();
-                spec.length += first_line_with_newline.len();
-                return Some(spec);
+    let mut duplicate = None;
+    if let Some(outcome) = find_exact_match(content, &without_first) {
+        match outcome {
+            MatchOutcome::Unique(mut spec) => {
+                if spec.offset > 0 {
+                    #[allow(clippy::string_slice)]
+                    let before = &content[..spec.offset];
+                    let first_line_with_newline = format!("{}\n", lines[0]);
+                    if before.ends_with(&first_line_with_newline) {
+                        spec.offset -= first_line_with_newline.len();
+                        spec.length += first_line_with_newline.len();
+                    }
+                }
+                return Some(MatchOutcome::Unique(spec));
             }
+            outcome @ MatchOutcome::Duplicate(_) => duplicate = Some(outcome),
         }
-        return Some(spec);
     }
 
-    // Try without last line
     let without_last = lines[..lines.len() - 1].join("\n");
-    if let Some(spec) = find_exact_unique(content, &without_last) {
-        return Some(spec);
+    if let Some(outcome) = find_exact_match(content, &without_last) {
+        match outcome {
+            MatchOutcome::Unique(spec) => return Some(MatchOutcome::Unique(spec)),
+            MatchOutcome::Duplicate(_) => return duplicate.or(Some(outcome)),
+        }
     }
 
-    None
+    duplicate
 }
 
 /// Find match using Unicode TR39 confusable skeleton mapping.
@@ -176,15 +271,13 @@ fn find_trimmed_match(content: &str, old_text: &str) -> Option<EditSpec> {
 ///
 /// Handles lookalike characters: em dash vs hyphen, curly vs straight
 /// quotes, fullwidth vs ASCII, etc.
-fn find_normalised_match(content: &str, old_text: &str) -> Option<EditSpec> {
+fn find_normalised_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
     let skel_old: String = skeleton(old_text).collect();
 
-    // If skeleton didn't change old_text, this strategy can't help
     if skel_old == old_text {
         return None;
     }
 
-    // Build skeleton content with a byte-offset map back to original.
     let mut skel_content = String::new();
     let mut skel_to_orig: Vec<usize> = Vec::new();
 
@@ -199,24 +292,49 @@ fn find_normalised_match(content: &str, old_text: &str) -> Option<EditSpec> {
             }
         }
     }
-    // Sentinel: map one past the end to content.len()
     skel_to_orig.push(content.len());
 
-    // Find unique match in skeleton content
-    let spec = find_exact_unique(&skel_content, &skel_old)?;
+    let matches: Vec<_> = skel_content.match_indices(&skel_old).collect();
+    match matches.len() {
+        0 => None,
+        1 => {
+            let (offset, _) = matches[0];
+            let (orig_start, orig_length) =
+                original_range_from_skeleton(&skel_to_orig, offset, skel_old.len(), content.len());
+            Some(MatchOutcome::Unique(EditSpec {
+                offset: orig_start,
+                length: orig_length,
+            }))
+        }
+        _ => Some(MatchOutcome::Duplicate(
+            duplicate_match_diagnostics_from_ranges(
+                content,
+                matches.into_iter().map(|(offset, _)| {
+                    original_range_from_skeleton(
+                        &skel_to_orig,
+                        offset,
+                        skel_old.len(),
+                        content.len(),
+                    )
+                }),
+            ),
+        )),
+    }
+}
 
-    // Map skeleton byte range back to original byte range
-    let orig_start = skel_to_orig[spec.offset];
-    let orig_end = if spec.offset + spec.length < skel_to_orig.len() {
-        skel_to_orig[spec.offset + spec.length]
+fn original_range_from_skeleton(
+    skel_to_orig: &[usize],
+    offset: usize,
+    length: usize,
+    content_len: usize,
+) -> (usize, usize) {
+    let orig_start = skel_to_orig[offset];
+    let orig_end = if offset + length < skel_to_orig.len() {
+        skel_to_orig[offset + length]
     } else {
-        content.len()
+        content_len
     };
-
-    Some(EditSpec {
-        offset: orig_start,
-        length: orig_end - orig_start,
-    })
+    (orig_start, orig_end - orig_start)
 }
 
 /// Get leading whitespace from a string
@@ -342,6 +460,72 @@ mod tests {
         assert_eq!(diagnostics.reported.len(), 5);
         assert_eq!(diagnostics.omitted, 2);
         assert_eq!(diagnostics.reported[4].start_line, 5);
+    }
+
+    #[test]
+    fn duplicate_match_snippets_are_capped_by_character_count() {
+        let long_prefix = "a".repeat(1_000);
+        let long_suffix = "b".repeat(1_000);
+        let content = format!("{long_prefix}TARGET{long_suffix} TARGET");
+        let diagnostics = duplicate_match_diagnostics(&content, "TARGET");
+
+        assert_eq!(diagnostics.total, 2);
+        assert!(
+            diagnostics.reported[0].snippet.chars().count() <= MAX_SNIPPET_CHARS + 2,
+            "snippet was not capped: {} chars",
+            diagnostics.reported[0].snippet.chars().count()
+        );
+        assert!(diagnostics.reported[0].snippet.contains("TARGET"));
+        assert!(diagnostics.reported[0].snippet.starts_with('…'));
+        assert!(diagnostics.reported[0].snippet.ends_with('…'));
+    }
+
+    #[test]
+    fn fuzzy_dedent_duplicate_reports_locations() {
+        let content = "\tindented line\nother\n\tindented line";
+        let err = find_unique_match(content, "  indented line").unwrap_err();
+
+        match err {
+            PatchError::OldTextNotUnique(diagnostics) => {
+                assert_eq!(diagnostics.total, 2);
+                assert_eq!(diagnostics.reported[0].start_line, 1);
+                assert_eq!(diagnostics.reported[1].start_line, 3);
+                assert!(diagnostics.reported[0].snippet.contains("\tindented line"));
+            }
+            other @ (PatchError::ReplaceOnNonexistent
+            | PatchError::MissingOldText
+            | PatchError::ClipboardNotFound(_)
+            | PatchError::OldTextNotFound
+            | PatchError::EditOutOfBounds
+            | PatchError::ReindentPrefixMismatch { .. }
+            | PatchError::NoPatches) => {
+                panic!("expected fuzzy duplicate diagnostics, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn fuzzy_normalised_duplicate_reports_locations() {
+        let content = "say \"hello\"\nagain\nsay \"hello\"";
+        let err = find_unique_match(content, "say \u{201C}hello\u{201D}").unwrap_err();
+
+        match err {
+            PatchError::OldTextNotUnique(diagnostics) => {
+                assert_eq!(diagnostics.total, 2);
+                assert_eq!(diagnostics.reported[0].start_line, 1);
+                assert_eq!(diagnostics.reported[1].start_line, 3);
+                assert!(diagnostics.reported[0].snippet.contains("say \"hello\""));
+            }
+            other @ (PatchError::ReplaceOnNonexistent
+            | PatchError::MissingOldText
+            | PatchError::ClipboardNotFound(_)
+            | PatchError::OldTextNotFound
+            | PatchError::EditOutOfBounds
+            | PatchError::ReindentPrefixMismatch { .. }
+            | PatchError::NoPatches) => {
+                panic!("expected normalised duplicate diagnostics, got {other:?}")
+            }
+        }
     }
 
     #[test]
