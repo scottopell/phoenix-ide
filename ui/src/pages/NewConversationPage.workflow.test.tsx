@@ -28,19 +28,31 @@ const task = {
   path: '/repo/tasks/27108-p1-ready--refine-new-workflows.md',
 };
 
-vi.mock('../api', () => ({
-  api: {
-    listModels: vi.fn(),
-    getEnv: vi.fn(),
-    validateCwd: vi.fn(),
-    listDirectory: vi.fn(),
-    listGitBranches: vi.fn(),
-    listProjectTasks: vi.fn(),
-    createConversation: vi.fn(),
-    listConversations: vi.fn().mockResolvedValue([]),
-    listArchivedConversations: vi.fn().mockResolvedValue([]),
-  },
-}));
+vi.mock('../api', () => {
+  class ExpansionError extends Error {
+    detail: { error: string };
+
+    constructor(error: string) {
+      super(error);
+      this.detail = { error };
+    }
+  }
+
+  return {
+    ExpansionError,
+    api: {
+      listModels: vi.fn(),
+      getEnv: vi.fn(),
+      validateCwd: vi.fn(),
+      listDirectory: vi.fn(),
+      listGitBranches: vi.fn(),
+      listProjectTasks: vi.fn(),
+      createConversation: vi.fn(),
+      listConversations: vi.fn().mockResolvedValue([]),
+      listArchivedConversations: vi.fn().mockResolvedValue([]),
+    },
+  };
+});
 
 vi.mock('../cache', () => ({
   cacheDB: {
@@ -157,6 +169,39 @@ describe('/new workflow modes', () => {
     renderPage();
 
     expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('');
+  });
+
+  it('shows a stable acknowledgement while create is pending and preserves the draft', async () => {
+    vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
+    vi.mocked(api.createConversation).mockImplementation(() => new Promise(() => {}));
+    renderPage();
+    await settleValidation();
+
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, { target: { value: 'slow mobile request' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
+
+    await screen.findAllByText('Creating conversation…');
+    expect(screen.getAllByRole('button', { name: 'Send' })[0]).toBeDisabled();
+    expect(screen.queryByRole('button', { name: /Creating/ })).not.toBeInTheDocument();
+    expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('slow mobile request');
+    expect(localStorage.getItem('phoenix-new-conversation-draft')).toBe('slow mobile request');
+
+  });
+
+  it('restores the interactive composer and keeps the draft when create fails', async () => {
+    vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
+    vi.mocked(api.createConversation).mockRejectedValue(new Error('network dropped'));
+    renderPage();
+    await settleValidation();
+
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, { target: { value: 'retry this later' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
+
+    await screen.findAllByText('network dropped');
+    expect(screen.getAllByRole('button', { name: 'Send' })[0]).toBeEnabled();
+    expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('retry this later');
+    expect(localStorage.getItem('phoenix-new-conversation-draft')).toBe('retry this later');
+    expect(screen.queryAllByText('Creating conversation…')).toHaveLength(0);
   });
 
   it('falls back to an empty draft when persisted draft storage cannot be read', async () => {

@@ -200,7 +200,15 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     }
   };
 
-  const buttonText = conv.creating ? (conv.dirStatus === 'will-create' ? 'Creating folder...' : 'Creating...') : 'Send';
+  const createStatusText = conv.creating
+    ? conv.dirStatus === 'will-create'
+      ? 'Creating folder…'
+      : conv.submission.mode === 'managed'
+        ? 'Setting up worktree…'
+        : conv.submission.mode === 'branch'
+          ? 'Opening branch conversation…'
+          : 'Creating conversation…'
+    : null;
   // Until an LLM is configured, the only meaningful action is the sign-in
   // CTA inside ConversationSettings. Hide the message composer + actions so
   // the user isn't tempted to type into a draft that can't be sent.
@@ -280,6 +288,12 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
                 </div>
               )}
               <NewConversationFileChips files={conv.files} onRemove={conv.removeFile} />
+              {createStatusText && (
+                <div className="new-conv-create-status" role="status" aria-live="polite">
+                  <span className="new-conv-create-spinner" aria-hidden="true" />
+                  <span>{createStatusText}</span>
+                </div>
+              )}
               <textarea
                 ref={textareaRef}
                 className="new-conv-textarea"
@@ -299,7 +313,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
                 <div className="new-conv-send-group">
                   <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
                   {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
-                  <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend || !!ir.expansionError}>{buttonText}</button>
+                  <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend || !!ir.expansionError}>Send</button>
                 </div>
               </div>
             </>
@@ -414,6 +428,12 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             </div>
           )}
           <NewConversationFileChips files={conv.files} onRemove={conv.removeFile} />
+          {createStatusText && (
+            <div className="new-conv-create-status new-conv-create-status--mobile" role="status" aria-live="polite">
+              <span className="new-conv-create-spinner" aria-hidden="true" />
+              <span>{createStatusText}</span>
+            </div>
+          )}
           <textarea
             className="new-conv-textarea-mobile"
             placeholder={inputPlaceholder}
@@ -431,7 +451,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
               <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
               {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
             </div>
-            <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend || !!ir.expansionError}>{buttonText}</button>
+            <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend || !!ir.expansionError}>Send</button>
           </div>
         </div>
       )}

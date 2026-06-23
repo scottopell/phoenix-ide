@@ -6580,11 +6580,42 @@ html * {
   font-weight: 500;
   cursor: pointer;
   transition: opacity 0.15s, transform 0.1s;
+  min-width: 64px;
 }
 
 .new-conv-send:disabled {
   opacity: 0.35;
   cursor: not-allowed;
+}
+
+.new-conv-create-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent-blue) 35%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent-blue) 10%, var(--bg-secondary));
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.3;
+}
+
+.new-conv-create-spinner {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  border: 2px solid color-mix(in srgb, var(--accent-blue) 22%, transparent);
+  border-top-color: var(--accent-blue);
+  border-radius: 50%;
+  animation: new-conv-spin 0.8s linear infinite;
+}
+
+@keyframes new-conv-spin {
+  to { transform: rotate(360deg); }
 }
 
 .new-conv-send:not(:disabled):hover {
@@ -6879,8 +6910,16 @@ html * {
 
   .new-conv-bottom-input .new-conv-send {
     min-height: 44px;
+    min-width: 78px;
     padding: 10px 20px;
     font-size: 14px;
+  }
+
+  .new-conv-create-status--mobile {
+    display: flex;
+    width: 100%;
+    box-sizing: border-box;
+    margin-bottom: 10px;
   }
 
   /* Dedicated mobile StateBar: a sparse primary row plus an expanded
