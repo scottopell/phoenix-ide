@@ -3,7 +3,7 @@ title: Use the terminal
 summary: Open the in-app terminal, run commands that persist across restarts, and turn on shell integration for the status HUD.
 category: howto
 keywords: [terminal, shell, tmux, persistent, shell integration]
-related: [reference/tools/tmux.md, concepts/workspace.md, reference/tools/bash.md]
+related: [reference/tools/tmux.md, concepts/work-scope.md, reference/tools/bash.md]
 ---
 
 # Use the terminal
@@ -42,5 +42,5 @@ HUD once shell integration is enabled.
 ## See also
 
 - [tmux](../reference/tools/tmux.md) — why sessions persist
-- [Workspace](../concepts/workspace.md) — the tmux server is WorkScope-owned
+- [Work scope](../concepts/work-scope.md) — the tmux server is work-scope-owned
 - [bash](../reference/tools/bash.md) — the agent's non-TTY command tool

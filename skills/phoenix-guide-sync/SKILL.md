@@ -94,7 +94,8 @@ Check all five, in order:
    - **Layer topology (Principle 3).** A non-landing page whose links/`related`
      don't reach at least one *other* layer.
    - **Term variants (glossary).** Grep for known variant spellings of canonical
-     terms (e.g. "mode picker" for **Workflow card**, "Managed mode" as a control).
+     terms (e.g. "mode picker" for **Workflow card**, "Managed mode" as a control,
+     "workspace" for **work scope** — the system term is *work scope* / `WorkScope`).
    - **Prose where a table belongs (Principle 4).** Flag enumerable content (3+
      parallel items with the same shape) written as prose.
 

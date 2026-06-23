@@ -1,16 +1,16 @@
 ---
 title: browser
-summary: Headless-browser automation — navigate, screenshot, click, type, eval, read console, profile — one session per workspace.
+summary: Headless-browser automation — navigate, screenshot, click, type, eval, read console, profile — one session per work scope.
 category: reference
 keywords: [browser, browse, navigate, screenshot, click, eval, console, profile]
-related: [concepts/workspace.md, reference/glossary.md]
+related: [concepts/work-scope.md, reference/glossary.md]
 ---
 
 # browser
 
 > **At a glance:** the agent drives a real headless Chrome — load pages,
 > interact, screenshot, read the console/DOM, profile. **One session per
-> [workspace](../../concepts/workspace.md)**, reaped after 30 minutes idle.
+> [work scope](../../concepts/work-scope.md)**, reaped after 30 minutes idle.
 
 ## What it does
 
@@ -38,12 +38,12 @@ with the diff/prose viewers.
 
 ## Limits & gotchas
 
-- **One session per workspace**, shared across a continuation; **30-minute** idle
+- **One session per work scope**, shared across a continuation; **30-minute** idle
   timeout (held open while the conversation is live).
 - `eval` results and console output over ~4 KB spill to a temp file.
 - Browser-native chords (Ctrl+P/W/T/Tab) can't be sent — Chrome intercepts them.
 
 ## Related
 
-- [Workspace](../../concepts/workspace.md) — the session is owned by the WorkScope
+- [Work scope](../../concepts/work-scope.md) — the session is owned by the work scope
 - [Glossary](../glossary.md) — canonical terms

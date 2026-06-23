@@ -10,7 +10,7 @@ related: [concepts/modes.md, reference/glossary.md]
 
 > **At a glance:** the agent runs a shell command; if it doesn't finish within
 > the agent's chosen wait window, it keeps running in the background as a
-> **handle**. Max **8 live handles** per workspace. No TTY — interactive
+> **handle**. Max **8 live handles** per work scope. No TTY — interactive
 > programs need **tmux** or the in-app **terminal**.
 
 ## What it does
@@ -53,7 +53,7 @@ follow live output (and resource usage) in the **process inspector** panel.
 
 ## Limits & gotchas
 
-- **8 live handles per workspace.** At the cap, a new `run` is refused with a
+- **8 live handles per work scope.** At the cap, a new `run` is refused with a
   list of existing handles — nothing is silently evicted. The agent must
   `kill` or `wait` one out first.
 - **Ephemeral by design.** Handles do **not** survive a Phoenix or system
@@ -67,6 +67,6 @@ follow live output (and resource usage) in the **process inspector** panel.
 
 ## Related
 
-- [Workspace](../../concepts/workspace.md) — what "per workspace" means for the handle cap
+- [Work scope](../../concepts/work-scope.md) — what "per work scope" means for the handle cap
 - [Modes](../../concepts/modes.md) — why bash is read-only in Explore
 - [Glossary](../glossary.md) — canonical terms (handle, WorkScope)

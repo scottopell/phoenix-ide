@@ -15,7 +15,7 @@ the **mode** the conversation runs in. Everything else hangs off that.
 ```
  you ─▶ conversation ──▶ agent ──▶ tools (bash, patch, browser, …)
             │  in a mode: Direct / Explore / Work / Branch
-            │  on a worktree — the workspace
+            │  on a worktree, with a work scope (its live resources)
             ├─ propose ▶ task        (a plan you approve)
             └─ continue ▶ chain      (a run of conversations)
 ```
@@ -26,8 +26,8 @@ the **mode** the conversation runs in. Everything else hangs off that.
   agent, in a directory, with a mode and a state.
 - **[Mode](modes.md)** — how much freedom the agent has, from read-only Explore
   to full-access Direct.
-- **[Workspace](workspace.md)** — the worktree and the live resources (shells,
-  tmux, browser) a conversation owns.
+- **[Work scope](work-scope.md)** — the live resources (shells, tmux, browser) a
+  conversation owns, keyed to its worktree.
 - **[Task](tasks.md)** — a plan the agent proposes and you approve before it
   writes.
 - **[Sub-agents](sub-agents.md)** — child conversations that fan work out in
@@ -42,8 +42,8 @@ the **mode** the conversation runs in. Everything else hangs off that.
 New here? [Getting started](../howto/getting-started.md) takes you from an empty
 screen to a running conversation.
 
-> **Remember:** everything in Phoenix hangs off a **conversation** — mode,
-> workspace, tools, and state are all properties of one.
+> **Remember:** everything in Phoenix hangs off a **conversation** — mode, work
+> scope, tools, and state are all properties of one.
 
 ## See also
 

@@ -21,7 +21,7 @@ owns it once that page exists.
 | **Direct / Explore / Work / Branch** | The four modes, capitalized. Match the badge text exactly. | [Modes](../concepts/modes.md) |
 | **managed** | The Explore → Work *lifecycle*, not a mode. Lowercase. There is no "Managed" control in the UI. | [Modes](../concepts/modes.md) |
 | **Workflow card** | A choice on the new-conversation screen (e.g. *"Chat in a fresh worktree"*) that selects a mode. Never "mode picker". | [Run a managed task](../howto/run-a-managed-task.md) |
-| **worktree** | An isolated git checkout for a managed task or branch, **shared by the conversations on it** (a continuation inherits it). One word, lowercase. | [Workspace](../concepts/workspace.md) |
+| **worktree** | An isolated git checkout for a managed task or branch, **shared by the conversations on it** (a continuation inherits it). The git artifact only — the resources keyed to it are the *work scope*. One word, lowercase. | [Work scope](../concepts/work-scope.md) |
 | **task branch** | The branch a managed task runs on, renamed from `task-pending-{id}` on approval. Exact name depends on the plan form — see [Tasks](../concepts/tasks.md#from-plan-to-branch). | [Tasks](../concepts/tasks.md) |
 | **task file** | The `tasks/NNNNN-pX-status--slug.md` file that holds the plan; a living contract. | [Tasks](../concepts/tasks.md) |
 | **Done? bar** | The Work/Branch action bar (label `Done?`) with View Diff, completion, and Abandon. | [Managed lifecycle states](managed-lifecycle-states.md) |
@@ -32,8 +32,7 @@ owns it once that page exists.
 | **skill** | A reusable instruction set invoked as `/name`. Lowercase. | [Skills](../concepts/skills.md) |
 | **permissions** | The deny layer that gates consequential tool calls before they run. | [Permissions](../concepts/permissions.md) |
 | **handle** | A backgrounded `bash` command you can peek/wait/kill. | [bash](tools/bash.md) |
-| **workspace** | The user-facing name for the **WorkScope** — the container owning a conversation's live resources (shells, tmux, browser). Use "workspace" in prose. | [Workspace](../concepts/workspace.md) |
-| **WorkScope** | The internal/precise name for the workspace; one word, this casing. Prefer "workspace" in user-facing prose. | [Workspace](../concepts/workspace.md) |
+| **work scope** | The container owning a conversation's live runtime resources (bash handles, tmux server, browser session). Keyed by the **worktree** for Work/Branch/Explore (shared across a continuation) or by the **conversation** for Direct. Two words, lowercase; `WorkScope` is the code type. Don't call it "workspace". | [Work scope](../concepts/work-scope.md) |
 | **fork** | A decoupled top-level Work conversation `propose_task` spawns from a writing mode (off the default branch); distinct from a continuation. | [propose_task](tools/propose_task.md) |
 | **steering message** | A message you send while the agent is busy; it queues and is delivered at the next turn. | [Steer a running agent](../howto/steer-a-running-agent.md) |
 | **command palette** | `Ctrl/Cmd+P` — search conversations and files, or run an action. | [Command palette](command-palette.md) |

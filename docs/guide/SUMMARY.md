@@ -18,7 +18,7 @@ written.
 - [Sub-agents](concepts/sub-agents.md)
 - [Skills](concepts/skills.md)
 - [Chains](concepts/chains.md)
-- [Workspace](concepts/workspace.md)
+- [Work scope](concepts/work-scope.md)
 - [Permissions](concepts/permissions.md)
 - [Providers & models](concepts/providers.md)
 

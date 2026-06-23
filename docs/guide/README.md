@@ -37,7 +37,7 @@ unwritten page would 404 on GitHub.)
 - [Tasks](concepts/tasks.md) — the plan that gates Explore → Work
 - [Sub-agents](concepts/sub-agents.md) — child conversations, run in parallel
 - [Skills](concepts/skills.md) — reusable instruction sets
-- [Workspace](concepts/workspace.md) — the worktree and its live resources
+- [Work scope](concepts/work-scope.md) — a conversation's live resources
 - [Permissions](concepts/permissions.md) — the deny layer over tool calls
 - [Chains](concepts/chains.md) — continuation runs, queryable as a unit
 - [Providers & models](concepts/providers.md) — picking the LLM

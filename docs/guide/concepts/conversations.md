@@ -48,7 +48,7 @@ working, or disconnected. You start new conversations from the sidebar.
 - [Overview](overview.md) — how this fits with everything else
 - [Conversation states](../reference/conversation-states.md) — every state, busy vs. waiting
 - [Modes](modes.md) — the freedom level a conversation runs in
-- [Workspace](workspace.md) — the resources a conversation owns
+- [Work scope](work-scope.md) — the resources a conversation owns
 - [Sub-agents](sub-agents.md) — child conversations spawned to parallelize
 - [Chains](chains.md) — runs of continued conversations
 - [Glossary](../reference/glossary.md) — conversation, continuation
