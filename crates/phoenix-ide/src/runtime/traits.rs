@@ -985,7 +985,9 @@ impl ToolExecutor for ToolRegistryExecutor {
     fn upgrade_to_work_mode(&self) {
         // Reuse the frozen catalog so the upgraded registry advertises the same
         // agent_type enum the executor resolves against (REQ-AG-008).
-        self.swap_registry(ToolRegistry::direct(self.agent_catalog.to_vec()));
+        self.swap_registry(
+            ToolRegistry::direct(self.agent_catalog.to_vec()).with_commission_review(),
+        );
         tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
     }
 }

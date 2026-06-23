@@ -2412,6 +2412,22 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
 
+                if should_trigger_continuation(&usage_data, context.context_window) {
+                    let tr = handle_context_exhaustion(
+                        context,
+                        content,
+                        tool_calls,
+                        usage_data,
+                        request_id,
+                        final_attempt,
+                    );
+                    return Ok(ParentTransitionResult {
+                        new_state: ParentState::try_from(tr.new_state)
+                            .expect("handle_context_exhaustion returns parent-valid state"),
+                        effects: tr.effects,
+                    });
+                }
+
                 // Park for approval without writing a tool_result placeholder.
                 // The original assistant message is carried in state and paired
                 // with the real review result after approval; writing an ack for

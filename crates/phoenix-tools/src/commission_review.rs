@@ -917,6 +917,28 @@ mod tests {
     }
 
     #[test]
+    fn large_diffs_are_split_into_chunks() {
+        let body = format!(
+            "\n\n--- FILE: a.rs ---\n{}\n\n--- FILE: b.rs ---\n{}",
+            "a".repeat(MAX_CHUNK_BYTES / 2),
+            "b".repeat(MAX_CHUNK_BYTES / 2)
+        );
+        let chunks = review_chunks(&body);
+        assert!(chunks.len() > 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.len() <= MAX_CHUNK_BYTES || chunks.len() == 1));
+    }
+
+    #[test]
+    fn malformed_braces_do_not_panic() {
+        let (findings, summary, warnings) = parse_findings("prefix } suffix");
+        assert!(findings.is_empty());
+        assert_eq!(summary.as_deref(), Some("prefix } suffix"));
+        assert_eq!(warnings[0].kind, "model_output_parse");
+    }
+
+    #[test]
     fn approved_context_drift_is_rejected() {
         let approved = ApprovedCommissionReviewInput {
             request: CommissionReviewInput {
