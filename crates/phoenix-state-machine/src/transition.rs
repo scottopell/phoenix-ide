@@ -27,6 +27,7 @@ use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::mode_context::ModeContext;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -306,7 +307,7 @@ enum CommissionReviewCall<'a> {
 
 fn commission_review_scope_from_context(
     context: &ConvContext,
-    input: &super::state::CommissionReviewInput,
+    _input: &super::state::CommissionReviewInput,
 ) -> CommissionReviewApprovalScope {
     let (kind, base, head) = match context.mode_context.as_ref() {
         Some(
@@ -332,16 +333,81 @@ fn commission_review_scope_from_context(
         ),
     };
 
+    let repo_root = git_output(&context.working_dir, &["rev-parse", "--show-toplevel"])
+        .unwrap_or_else(|| context.working_dir.display().to_string());
+    let dirty = git_output(&context.working_dir, &["status", "--porcelain"])
+        .map(|status| !status.trim().is_empty())
+        .unwrap_or(false);
+    let (changed_files, insertions, deletions) = match if kind == "worktree_diff" {
+        git_output(
+            &context.working_dir,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                &format!("{base}...HEAD"),
+            ],
+        )
+    } else {
+        git_output(
+            &context.working_dir,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--numstat",
+                "HEAD",
+                "--",
+            ],
+        )
+    } {
+        Some(numstat) => parse_numstat_summary(&numstat),
+        None => (0, 0, 0),
+    };
+
     CommissionReviewApprovalScope {
         kind,
-        repo_root: context.working_dir.display().to_string(),
+        repo_root,
         base,
         head,
-        dirty: input.allow_dirty_working_tree,
-        changed_files: 0,
-        insertions: 0,
-        deletions: 0,
+        dirty,
+        changed_files,
+        insertions,
+        deletions,
     }
+}
+
+fn git_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string()
+    })
+}
+
+fn parse_numstat_summary(numstat: &str) -> (usize, u64, u64) {
+    let mut files = 0;
+    let mut insertions = 0;
+    let mut deletions = 0;
+    for line in numstat.lines() {
+        let parts: Vec<_> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            files += 1;
+            if parts[0] != "-" {
+                insertions += parts[0].parse::<u64>().unwrap_or(0);
+            }
+            if parts[1] != "-" {
+                deletions += parts[1].parse::<u64>().unwrap_or(0);
+            }
+        }
+    }
+    (files, insertions, deletions)
 }
 
 /// Result of a state transition

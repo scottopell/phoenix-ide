@@ -303,6 +303,9 @@ impl<'de> Deserialize<'de> for ToolInput {
             "commission_review" => {
                 parse_tool_input_or_malformed::<CommissionReviewInput>("commission_review", payload)
             }
+            "approved_commission_review" => parse_tool_input_or_malformed::<
+                ApprovedCommissionReviewInput,
+            >("approved_commission_review", payload),
             "propose_task" => {
                 parse_tool_input_or_malformed::<ProposeTaskInput>("propose_task", payload)
             }
@@ -459,6 +462,7 @@ impl ToolInput {
             "submit_result" => parse::<SubmitResultInput>(name, value),
             "submit_error" => parse::<SubmitErrorInput>(name, value),
             "commission_review" => parse::<CommissionReviewInput>(name, value),
+            "approved_commission_review" => parse::<ApprovedCommissionReviewInput>(name, value),
             "propose_task" => parse::<ProposeTaskInput>(name, value),
             "ask_user_question" => parse::<AskUserQuestionInput>(name, value),
             _ => ToolInput::Unknown {

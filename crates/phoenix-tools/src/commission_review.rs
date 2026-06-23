@@ -269,7 +269,16 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
 
     for (index, chunk) in chunks.iter().enumerate() {
         if ctx.cancel.is_cancelled() {
-            return Err("commission_review cancelled during LLM review".to_string());
+            return Ok(failed_review_output(
+                started,
+                target.summary.clone(),
+                &collection,
+                findings,
+                warnings,
+                input_tokens,
+                output_tokens,
+                "commission_review cancelled during LLM review",
+            ));
         }
         let request = LlmRequest {
             system: vec![SystemContent::new(REVIEW_SYSTEM)],
@@ -293,8 +302,33 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         };
 
         let response = tokio::select! {
-            () = ctx.cancel.cancelled() => return Err("commission_review cancelled during LLM review".to_string()),
-            response = service.complete(&request) => response.map_err(|e| format!("commission_review LLM review failed: {e}"))?,
+            () = ctx.cancel.cancelled() => {
+                return Ok(failed_review_output(
+                    started,
+                    target.summary.clone(),
+                    &collection,
+                    findings,
+                    warnings,
+                    input_tokens,
+                    output_tokens,
+                    "commission_review cancelled during LLM review",
+                ));
+            }
+            response = service.complete(&request) => match response {
+                Ok(response) => response,
+                Err(e) => {
+                    return Ok(failed_review_output(
+                        started,
+                        target.summary.clone(),
+                        &collection,
+                        findings,
+                        warnings,
+                        input_tokens,
+                        output_tokens,
+                        &format!("commission_review LLM review failed: {e}"),
+                    ));
+                }
+            },
         };
         input_tokens += response.usage.input_tokens;
         output_tokens += response.usage.output_tokens;
@@ -341,6 +375,43 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         findings,
         warnings,
     })
+}
+
+fn failed_review_output(
+    started: Instant,
+    target: ReviewTargetSummary,
+    collection: &DiffCollection,
+    findings: Vec<ReviewFinding>,
+    mut warnings: Vec<ReviewWarning>,
+    input_tokens: u64,
+    output_tokens: u64,
+    reason: &str,
+) -> ReviewOutput {
+    warnings.extend(collection.warnings.clone());
+    warnings.push(warning("review_failed", reason, None));
+    ReviewOutput {
+        status: ReviewStatus::Failed,
+        summary: ReviewSummary {
+            target,
+            files_changed: collection.files_changed,
+            files_reviewed: collection.files_reviewed,
+            insertions: collection.insertions,
+            deletions: collection.deletions,
+            findings_count: findings.len(),
+            elapsed_ms: started.elapsed().as_millis(),
+            usage: phoenix_core::domain::llm_types::Usage {
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            reviewer_summary: Some(reason.to_string()),
+        },
+        findings,
+        warnings,
+    }
 }
 
 fn assert_approved_context_has_not_drifted(
@@ -536,7 +607,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                 head,
                 include_worktree,
             } => {
-                let (diff_output, truncated) = if *include_worktree {
+                let capture_result = if *include_worktree {
                     let merge_base = effective_range_base.as_deref().unwrap_or(base);
                     git_capture_limited(
                         repo,
@@ -551,7 +622,6 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                         MAX_FILE_BYTES + 1,
                     )
                     .await
-                    .unwrap_or_default()
                 } else {
                     let merge_base_range = format!("{base}...{head}");
                     git_capture_limited(
@@ -567,7 +637,17 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                         MAX_FILE_BYTES + 1,
                     )
                     .await
-                    .unwrap_or_default()
+                };
+                let (diff_output, truncated) = match capture_result {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warnings.push(warning(
+                            "diff_capture_failed",
+                            &format!("failed to capture file diff: {e}"),
+                            Some(file),
+                        ));
+                        continue;
+                    }
                 };
                 if truncated {
                     warnings.push(warning(
@@ -580,13 +660,23 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                 diff_output
             }
             DiffSpec::Workspace => {
-                let (diff_output, truncated) = git_capture_limited(
+                let (diff_output, truncated) = match git_capture_limited(
                     repo,
                     &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", file],
                     MAX_FILE_BYTES + 1,
                 )
                 .await
-                .unwrap_or_default();
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warnings.push(warning(
+                            "diff_capture_failed",
+                            &format!("failed to capture file diff: {e}"),
+                            Some(file),
+                        ));
+                        continue;
+                    }
+                };
                 if truncated {
                     warnings.push(warning(
                         "file_too_large",
