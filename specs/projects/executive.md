@@ -40,9 +40,10 @@ shapes by mode: in Explore it is the blocking Explore→Work gateway; in the wri
 fully decoupled top-level Work conversation off the repository default branch (REQ-PROJ-033
 through 036). It is withheld only from Direct-not-in-a-repo and from sub-agents. Tool
 registry is configured by mode: Explore exposes read-only/planning tools plus `bash` only
-when `nono` reports an enforceable OS sandbox; the sandboxed bash can read broadly,
-while writes are limited to task proposal, scratch, synthetic-home, and platform-temp
-locations, network is blocked, and ambient credential variables are stripped. `patch` is scoped
+when `nono` reports an enforceable OS sandbox that can block network; the sandboxed
+bash can read broadly, while writes are limited to scratch, synthetic-home, and
+platform-temp locations, network is blocked, and ambient credential variables are
+stripped. `patch` is scoped
 to the discovered taskmd directory so the agent can draft/revise a task file
 (REQ-PROJ-003 and REQ-PROJ-037). Write tools are enabled in Work and Branch. Push is a regular bash command with no
 lifecycle side effects. Phoenix can observe PR state through `gh` to guide the
@@ -68,7 +69,7 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-010:** Abandon a Conversation | Moved | Relocated to work-lifecycle REQ-WL-001 |
 | **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | Moved | Relocated to work-lifecycle REQ-WL-003 |
 | **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Explore gateway shipped; the writing-mode fork registry/interception path (REQ-PROJ-033/036) is spec-only |
-| **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Uses `nono::Sandbox::support_info()` to decide whether top-level Explore can expose sandboxed bash |
+| **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Uses `nono::Sandbox::support_info()` plus network-block enforcement probing to decide whether top-level Explore can expose sandboxed bash |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
 | **REQ-PROJ-015:** Project Worktree Registry | Descoped | ConvMode::Work serves as de facto registry |
 | **REQ-PROJ-016:** Standalone Conversation Mode | ⏭️ Superseded | Superseded by REQ-PROJ-018 (Direct Mode). `Standalone` was folded into `Direct` via migration 001; the `ConvMode::Standalone` variant no longer exists |

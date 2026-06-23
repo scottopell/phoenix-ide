@@ -415,7 +415,8 @@ established submit_result pattern, so no git work happens until approval.
 
 WHEN the server starts
 THE SYSTEM SHALL ask `nono::Sandbox::support_info()` whether the host has an
-enforceable OS sandbox backend
+enforceable OS sandbox backend capable of applying the Explore bash network-block
+policy
 
 THE SYSTEM SHALL re-check capabilities on every startup
 

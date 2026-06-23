@@ -674,7 +674,7 @@ reports support at startup.
 ### REQ-BASH-013: Fail-Closed Explore Bash Availability
 
 WHEN `nono::Sandbox::support_info()` reports that no enforceable sandbox backend
-is available
+with network-block support is available
 THE SYSTEM SHALL detect this at startup
 AND SHALL NOT expose `bash` in top-level Explore mode
 AND SHALL continue to expose the read-only/planning Explore tool set

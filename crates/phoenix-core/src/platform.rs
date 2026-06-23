@@ -21,14 +21,21 @@ impl PlatformCapability {
     #[must_use]
     pub fn detect() -> Self {
         let support = nono::Sandbox::support_info();
-        if support.is_supported {
+        if support.is_supported && network_block_supported() {
             Self::Nono {
                 platform: support.platform.to_string(),
                 details: support.details,
             }
         } else {
             Self::None {
-                details: support.details,
+                details: if support.is_supported {
+                    format!(
+                        "{}; network blocking unavailable for Explore bash",
+                        support.details
+                    )
+                } else {
+                    support.details
+                },
             }
         }
     }
@@ -38,6 +45,27 @@ impl PlatformCapability {
     pub fn has_sandbox(&self) -> bool {
         matches!(self, Self::Nono { .. })
     }
+}
+
+#[must_use]
+fn network_block_supported() -> bool {
+    network_block_supported_impl()
+}
+
+#[cfg(target_os = "macos")]
+fn network_block_supported_impl() -> bool {
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn network_block_supported_impl() -> bool {
+    nono::detect_abi().is_ok_and(|abi| abi.has_network())
+        || nono::sandbox::probe_seccomp_block_network_support().unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn network_block_supported_impl() -> bool {
+    false
 }
 
 #[cfg(test)]

@@ -210,10 +210,10 @@ impl Tool for SandboxedBashTool {
     fn description(&self) -> String {
         format!(
             "{}\n\nExplore mode sandbox: commands run under an OS-enforced nono sandbox. \
-             The repository/worktree is read-only; taskmd-discovered task \
-             proposal directories and $PHOENIX_SANDBOX_SCRATCH are writable; \
-             network access is blocked; HOME points at scratch; TMPDIR points \
-             at a writable temp location.",
+             The repository/worktree and task files are read-only; use the \
+             scoped patch/propose_task flow to draft task proposals. \
+             $PHOENIX_SANDBOX_SCRATCH, HOME, and TMPDIR point at writable \
+             Phoenix-owned scratch/temp locations; network access is blocked.",
             BashTool.description()
         )
     }

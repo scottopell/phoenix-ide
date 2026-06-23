@@ -14,11 +14,11 @@ The isolation model has two layers:
    each other's files by construction.
 
 2. **OS enforcement (supported platforms):** Top-level Explore conversations
-   expose `bash` only when `nono` reports an enforceable backend. Explore bash
-   runs in a child process whose sandbox allows broad local reads, restricts
-   writes to task proposal/scratch/synthetic-home/platform-temp locations,
-   strips ambient credential variables, and blocks network (see `specs/bash/`
-   REQ-BASH-012/013). Without sandbox support, Explore omits bash.
+   expose `bash` only when `nono` reports an enforceable backend that can also
+   block network. Explore bash runs in a child process whose sandbox allows broad
+   local reads, restricts writes to scratch/synthetic-home/platform-temp
+   locations, strips ambient credential variables, and blocks network (see
+   `specs/bash/` REQ-BASH-012/013). Without sandbox support, Explore omits bash.
 
 The state machine knows about `ConvMode` as a field on conversations. It does not
 know about git, worktrees, or projects — those are executor-layer concerns triggered
@@ -29,7 +29,8 @@ by state machine effects.
 ### REQ-PROJ-013 — Sandbox detection and tool registry selection
 
 At startup, the server asks `nono::Sandbox::support_info()` whether the current
-host has an enforceable sandbox backend:
+host has an enforceable sandbox backend, and verifies that the requested
+network-block policy is enforceable on that backend:
 
 ```
 PlatformCapability {
