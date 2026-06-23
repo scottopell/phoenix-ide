@@ -16,10 +16,16 @@ related: [concepts/modes.md, howto/run-a-managed-task.md, reference/glossary.md]
 | **Worktree** | none — your checkout | temporary, read-only | the task branch | your chosen branch |
 | **Write** (patch/bash) | ✓ | ✗ — `patch` only in `tasks/` | ✓ | ✓ |
 | **Read & search** | ✓ | ✓ | ✓ | ✓ |
-| **bash** | ✓ | sandboxed read-only | ✓ | ✓ |
-| **Terminal / tmux / browser** | ✓ | ✓ | ✓ | ✓ |
+| **bash** | ✓ | sandboxed read-only¹ | ✓ | ✓ |
+| **tmux** | ✓ | sandboxed¹ | ✓ | ✓ |
+| **Browser** | ✓ | ✓ | ✓ | ✓ |
 | **propose_task** | only in a git repo (fork) | ✓ — the Explore→Work gate | ✓ (fork) | ✓ (fork) |
 | **Push / open a PR** | ✓ | ✗ | ✓ | ✓ |
+
+¹Explore's sandboxed `bash`/`tmux` require platform sandbox support (Landlock on
+Linux). On a host **without** it, Explore drops to a stricter read-only set that
+**omits `bash` and `tmux` entirely** — the agent still reads, searches, browses,
+and drafts task files.
 
 ## Which Workflow card creates which mode
 

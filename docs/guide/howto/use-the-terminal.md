@@ -21,9 +21,11 @@ You're in a conversation with a working directory.
 1. **Open the terminal panel.** Expand it from its header (the toggle reads
    **Expand terminal** / **Collapse terminal**). It runs your shell, attached to
    the conversation's tmux `main` session when tmux is present.
-2. **Run commands** as you normally would. Because it's tmux-backed, output and
-   scrollback persist across restarts and tab close — the same session the agent
-   uses via [tmux](../reference/tools/tmux.md).
+2. **Run commands** as you normally would. **When tmux is present**, output and
+   scrollback are tmux-backed and persist across restarts and tab close — the
+   same session the agent uses via [tmux](../reference/tools/tmux.md). On a host
+   without tmux it falls back to a plain `$SHELL -i`, which is **ephemeral** —
+   don't leave long-running work there.
 3. **Turn on shell integration (recommended).** If Phoenix shows **Shell
    integration not detected**, open the snippet (**Enable shell integration**)
    and either **Copy to clipboard** into your shell's rc file, or click **Let

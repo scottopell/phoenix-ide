@@ -34,7 +34,7 @@ right and the guide is the bug.
 | Guide area | Source of truth |
 |------------|-----------------|
 | Feature/concept inventory | `specs/*/executive.md` (and `requirements.md`) |
-| Tool inventory & behavior | `crates/phoenix-ide/src/tools.rs` registry + `crates/phoenix-tools/`; each tool's `specs/<tool>/executive.md` |
+| Tool inventory & behavior | `crates/phoenix-tools/src/lib.rs` (`ToolRegistry` + the mode-specific constructors `direct`/`explore_with_sandbox`/`explore_no_sandbox`/`work`/`branch`); each tool's `specs/<tool>/executive.md` |
 | Exact tool values (caps, limits, statuses) | the tool's spec + Allium `specs/<tool>/*.allium` |
 | Modes & lifecycle | `specs/projects/executive.md`, `specs/bedrock/` |
 | Keyboard shortcuts | `specs/keyboard-interaction/`, `ui/src/components/ShortcutHelpPanel.tsx` |

@@ -60,9 +60,10 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
 pub async fn serve_help_file(req: Request<Body>) -> impl IntoResponse {
     let rel = req.uri().path().trim_start_matches("/api/help/");
     // Reject empty, parent-traversal, and absolute paths. An absolute `rel`
-    // (e.g. from `/api/help//etc/passwd`) would make `PathBuf::join` below
-    // discard the `docs/guide` base and read an arbitrary server file.
-    if rel.is_empty() || rel.contains("..") || rel.starts_with('/') {
+    // (e.g. `/api/help//etc/passwd`, or a drive-qualified `C:/...` on Windows)
+    // would make `PathBuf::join` below discard the `docs/guide` base and read an
+    // arbitrary server file. `Path::is_absolute` is platform-aware.
+    if rel.is_empty() || rel.contains("..") || std::path::Path::new(rel).is_absolute() {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not found"))
