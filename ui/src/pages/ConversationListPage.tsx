@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
-import { refreshModels } from '../modelsPoller';
-import type { ChainView, Conversation } from '../api';
-import { useModels, useAutoAuth, useIsDesktop } from '../hooks';
+import { refreshModels, subscribeModels } from '../modelsPoller';
+import type { ChainView, Conversation, CodexLoginPreflight } from '../api';
+import { useModels, useAutoAuth, useIsDesktop, useTheme } from '../hooks';
 import {
   useConversationsList,
   useConversationsRefresh,
@@ -27,12 +27,14 @@ import { ConversationListSkeleton } from '../components/Skeleton';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
+import { SettingsDropdown } from '../components/SettingsDropdown';
 
 const SCROLL_KEY = 'phoenix:conversation-list-scroll';
 
 export function ConversationListPage() {
   const navigate = useNavigate();
   const isDesktop = useIsDesktop();
+  const { theme, toggleTheme } = useTheme();
 
   // Task 08684: ConversationStore is the single source of truth. The
   // shared `useConversationsRefresh` (mounted in ConversationProvider)
@@ -88,7 +90,24 @@ export function ConversationListPage() {
 
   const { credentialStatus } = useModels();
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
+  const [codexPreflight, setCodexPreflight] = useState<CodexLoginPreflight | null>(null);
+  const refetchCodexPreflight = useCallback(() => {
+    api.codexLoginPreflight()
+      .then((preflight) => setCodexPreflight(preflight))
+      .catch(() => setCodexPreflight(null));
+  }, []);
 
+  useEffect(() => {
+    refetchCodexPreflight();
+    let lastConfigured: boolean | null = null;
+    const unsubscribe = subscribeModels((models) => {
+      if (lastConfigured !== null && lastConfigured !== models.llm_configured) {
+        refetchCodexPreflight();
+      }
+      lastConfigured = models.llm_configured;
+    });
+    return () => unsubscribe();
+  }, [refetchCodexPreflight]);
 
   // Listen for storage warnings
   useEffect(() => {
@@ -421,7 +440,20 @@ export function ConversationListPage() {
               onArchiveChain={handleArchiveChain}
               onDeleteChain={requestDeleteChain}
               onConversationClick={handleConversationClick}
+              listDensity={isDesktop ? 'full' : 'mobile'}
               authChip={authChip}
+              utilityActions={(
+                <SettingsDropdown
+                  theme={theme}
+                  onToggleTheme={toggleTheme}
+                  codexPreflight={codexPreflight}
+                  onPreflightInvalidated={() => {
+                    refetchCodexPreflight();
+                    void refreshModels();
+                  }}
+                  compact
+                />
+              )}
             />
             <StorageStatus conversationCount={totalConversations} />
           </>

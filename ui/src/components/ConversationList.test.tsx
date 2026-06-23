@@ -136,7 +136,7 @@ describe('ConversationRow — cached PR badge', () => {
     <MemoryRouter>
       <ConversationRow
         conv={conv}
-        isSidebarMode={false}
+        listDensity="full"
         isMenuOpen={false}
         isKeyboardSelected={false}
         isActive={false}
@@ -807,6 +807,112 @@ describe('Chain lifecycle UI (task 02701)', () => {
 // bails, the body does not run and the spy is not invoked. Profiler was
 // considered first but its onRender fires per commit in the profiled
 // subtree even when a child memoizes — false positive.
+
+describe('Mobile conversation list redesign', () => {
+  const pr = (number = 375) => ({
+    number,
+    title: 'Relevant PR',
+    url: `https://github.com/o/r/pull/${number}`,
+    display_state: 'open' as const,
+    base: 'main',
+    head: 'task-branch',
+  });
+
+  it('renders standalone PR badges as non-link visual badges on mobile while desktop stays clickable', () => {
+    const conv = makeConv('with-pr', 'resume-work', { cached_pr: pr(), conv_mode_label: 'WORK' });
+
+    const { container: mobile } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[conv]} />
+      </MemoryRouter>,
+    );
+    expect(mobile.querySelector('[data-id="with-pr"] span.sidebar-pr-badge')?.textContent).toBe('#375');
+    expect(mobile.querySelector('[data-id="with-pr"] a.sidebar-pr-badge')).toBeNull();
+    expect(mobile.querySelector('[data-id="with-pr"] .conv-item-model')).not.toBeNull();
+
+    const { container: desktop } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={[conv]} />
+      </MemoryRouter>,
+    );
+    expect(desktop.querySelector('[data-id="with-pr"] a.sidebar-pr-badge')).not.toBeNull();
+  });
+
+  it('defaults mobile chains to a compact summary with separate chain and latest-conversation targets', () => {
+    const root = makeConv('root-id', 'root-slug', {
+      updated_at: '2024-01-01T00:00:00Z',
+      continued_in_conv_id: 'leaf-id',
+      chain_name: 'mobile chain',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      cached_pr: pr(1),
+    });
+    const leaf = makeConv('leaf-id', 'leaf-slug', {
+      updated_at: '2024-02-01T00:00:00Z',
+      conv_mode_label: 'WORK',
+      cached_pr: pr(375),
+    });
+    const onConversationClick = vi.fn();
+    const onPath = vi.fn();
+
+    const { container } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="*" element={(
+            <>
+              <ConversationList
+                {...defaultProps}
+                listDensity="mobile"
+                conversations={[leaf, root]}
+                onConversationClick={onConversationClick}
+              />
+              <PathReader onPath={onPath} />
+            </>
+          )} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.conv-chain-block')).toHaveClass('collapsed');
+    expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(0);
+    const summary = container.querySelector('.conv-chain-latest-summary') as HTMLButtonElement;
+    expect(summary).not.toBeNull();
+    expect(summary.textContent).toContain('Latest #2');
+    expect(summary.querySelector('span.sidebar-pr-badge')?.textContent).toBe('#375');
+    expect(summary.querySelector('a.sidebar-pr-badge')).toBeNull();
+
+    fireEvent.click(summary);
+    expect(onConversationClick).toHaveBeenCalledWith(expect.objectContaining({ id: 'leaf-id' }));
+
+    fireEvent.click(container.querySelector('.conv-chain-name')!);
+    const calls = onPath.mock.calls;
+    expect(calls[calls.length - 1]![0]).toBe('/chains/root-id');
+  });
+
+  it('minimizes completed non-latest members on mobile full-page lists', () => {
+    const doneRoot = makeConv('done-root', 'done-root', {
+      continued_in_conv_id: 'done-leaf',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const doneLeaf = makeConv('done-leaf', 'done-leaf', { updated_at: '2024-02-01T00:00:00Z' });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          listDensity="mobile"
+          conversations={[doneLeaf, doneRoot]}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(container.querySelector('.conv-chain-caret')!);
+    expect(container.querySelector('[data-id="done-root"]')).toHaveClass('conv-item-chain-completed');
+  });
+});
+
 describe('ConversationRow — React.memo behaviour', () => {
   beforeEach(() => {
     formatRelativeTimeSpy.mockClear();
@@ -824,7 +930,7 @@ describe('ConversationRow — React.memo behaviour', () => {
       isActive: false,
       isChainMember: false,
       isChainLatest: false,
-      isSidebarMode: false,
+      listDensity: 'full',
       chainIndex: undefined,
       showArchived: false,
       onClick: vi.fn(),
@@ -924,7 +1030,7 @@ describe('ChainBlock — React.memo behaviour', () => {
       expandedRowId: null,
       keyboardSelectedId: null,
       activeSlug: null,
-      sidebarMode: false,
+      listDensity: 'full',
       showArchived: false,
       onToggleCollapsed: vi.fn(),
       onToggleChainMenu: vi.fn(),
@@ -1081,4 +1187,3 @@ describe('ConversationList — keyboard navigation behaviour', () => {
     ).toBe(false);
   });
 });
-

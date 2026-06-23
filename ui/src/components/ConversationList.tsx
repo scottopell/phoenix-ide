@@ -32,7 +32,9 @@ interface ConversationListProps {
   onConversationClick?: (conv: Conversation) => void;
   activeSlug?: string | null;
   sidebarMode?: boolean;
+  listDensity?: 'full' | 'mobile' | 'sidebar';
   authChip?: ReactNode;
+  utilityActions?: ReactNode;
 }
 
 interface ConversationRowProps {
@@ -42,7 +44,7 @@ interface ConversationRowProps {
   isActive: boolean;
   isChainMember: boolean;
   isChainLatest: boolean;
-  isSidebarMode: boolean;
+  listDensity: 'full' | 'mobile' | 'sidebar';
   chainIndex: number | undefined;
   showArchived: boolean;
   onClick: (conv: Conversation) => void;
@@ -77,7 +79,18 @@ function sidebarPrTooltip(pr: CachedPrSummary): string {
   return parts.join('\n');
 }
 
-function SidebarPrBadge({ pr }: { pr: CachedPrSummary }) {
+function PrBadge({ pr, interactive = true }: { pr: CachedPrSummary; interactive?: boolean }) {
+  if (!interactive) {
+    return (
+      <span
+        className={sidebarPrBadgeClass(pr)}
+        title={sidebarPrTooltip(pr)}
+        aria-label={`PR ${pr.number}`}
+      >
+        {sidebarPrBadgeLabel(pr)}
+      </span>
+    );
+  }
   return (
     <a
       className={sidebarPrBadgeClass(pr)}
@@ -92,6 +105,23 @@ function SidebarPrBadge({ pr }: { pr: CachedPrSummary }) {
   );
 }
 
+function compactContextLabel(conv: Conversation): string | null {
+  if (conv.project_name) return conv.project_name;
+  const path = conv.worktree_path || conv.cwd;
+  const leaf = path?.split('/').filter(Boolean).pop();
+  return leaf || null;
+}
+
+function stateLabel(conv: Conversation, displayState: ReturnType<typeof getConvDisplayState>): string {
+  if (conv.presentation_mode === 'needs_action' || displayState === 'awaiting-approval') return 'Needs approval';
+  if (displayState === 'working') return 'Working';
+  if (displayState === 'error') return 'Error';
+  if (displayState === 'terminal') return 'Completed';
+  return 'Ready';
+}
+
+export const SidebarPrBadge = PrBadge;
+
 export const ConversationRow = memo(function ConversationRow({
   conv,
   isMenuOpen,
@@ -99,7 +129,7 @@ export const ConversationRow = memo(function ConversationRow({
   isActive,
   isChainMember,
   isChainLatest,
-  isSidebarMode,
+  listDensity,
   chainIndex,
   showArchived,
   onClick,
@@ -111,11 +141,12 @@ export const ConversationRow = memo(function ConversationRow({
   menuRef,
 }: ConversationRowProps) {
   const displayState = getConvDisplayState(conv);
-  const isCompactCompletedChainMember = isSidebarMode
+  const isCompactCompletedChainMember = (listDensity === 'sidebar' || listDensity === 'mobile')
     && isChainMember
     && !isChainLatest
     && !isActive
     && displayState === 'terminal';
+  const isMobileList = listDensity === 'mobile';
   const classes = [
     'conv-item',
     isMenuOpen ? 'expanded' : '',
@@ -143,6 +174,9 @@ export const ConversationRow = memo(function ConversationRow({
     }
   })();
 
+  const contextLabel = compactContextLabel(conv);
+  const visibleStateLabel = stateLabel(conv, displayState);
+
   return (
     <li className={classes} data-id={conv.id}>
       <div
@@ -155,12 +189,15 @@ export const ConversationRow = memo(function ConversationRow({
             className={`conv-state-dot ${displayState}`}
             title={stateTitle}
           />
+          {isMobileList && (displayState === 'working' || displayState === 'error' || displayState === 'awaiting-approval') && (
+            <span className={`conv-state-chip ${displayState}`}>{visibleStateLabel}</span>
+          )}
           {chainIndex !== undefined ? (
             <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
               #{chainIndex + 1}
             </span>
           ) : (
-            conv.slug
+            <span className="conv-item-title">{conv.slug}</span>
           )}
           {isChainLatest && (
             <span className="conv-chain-latest-badge" title="Latest in chain — click to continue">
@@ -185,7 +222,15 @@ export const ConversationRow = memo(function ConversationRow({
               {conv.conv_mode_label}
             </span>
           )}
-          {cachedPrForBadge && <SidebarPrBadge pr={cachedPrForBadge} />}
+          {cachedPrForBadge && <PrBadge pr={cachedPrForBadge} interactive={!isMobileList} />}
+          {isMobileList && (
+            <span
+              className="conv-item-time conv-item-time-mobile"
+              title={`Created: ${formatShortDateTime(conv.created_at)}\nLast activity: ${formatRelativeTime(conv.updated_at)}`}
+            >
+              {formatRelativeTime(conv.updated_at)}
+            </span>
+          )}
         </div>
         <div className="conv-item-meta">
           <span
@@ -199,8 +244,8 @@ export const ConversationRow = memo(function ConversationRow({
           </span>
         </div>
         <div className="conv-item-meta secondary">
-          {conv.project_id && conv.cwd && (
-            <span className="conv-project-label">{conv.cwd.split('/').filter(Boolean).pop()}</span>
+          {contextLabel && (
+            <span className="conv-project-label">{contextLabel}</span>
           )}
           <span className="conv-item-model">{conv.model}</span>
           <span className="conv-item-cwd">{conv.cwd}</span>
@@ -275,7 +320,7 @@ interface ChainBlockProps {
   expandedRowId: string | null;
   keyboardSelectedId: string | null;
   activeSlug: string | null;
-  sidebarMode: boolean;
+  listDensity: 'full' | 'mobile' | 'sidebar';
   showArchived: boolean;
   onToggleCollapsed: (rootId: string) => void;
   onToggleChainMenu: (e: React.MouseEvent, rootId: string) => void;
@@ -299,7 +344,7 @@ export const ChainBlock = memo(function ChainBlock({
   expandedRowId,
   keyboardSelectedId,
   activeSlug,
-  sidebarMode,
+  listDensity,
   showArchived,
   onToggleCollapsed,
   onToggleChainMenu,
@@ -316,6 +361,10 @@ export const ChainBlock = memo(function ChainBlock({
   chainMenuRef,
 }: ChainBlockProps) {
   const navigate = useNavigate();
+  const latestMember = item.members.find((m) => m.id === item.latestMemberId) ?? item.members[item.members.length - 1];
+  const latestIndex = Math.max(0, item.members.findIndex((m) => m.id === latestMember?.id));
+  const latestDisplayState = latestMember ? getConvDisplayState(latestMember) : 'idle';
+  const latestContext = latestMember ? compactContextLabel(latestMember) : null;
   return (
     <li
       className={`conv-chain-block ${collapsed ? 'collapsed' : 'expanded'}`}
@@ -353,7 +402,9 @@ export const ChainBlock = memo(function ChainBlock({
           title={`Open chain "${item.displayName}"`}
         >
           <span className="conv-chain-name-label">{item.displayName}</span>
-          <span className="conv-chain-count">{item.members.length}</span>
+          {listDensity !== 'mobile' && (
+            <span className="conv-chain-count">{item.members.length} parts</span>
+          )}
         </button>
         <div ref={chainMenuRef} className="conv-chain-menu-container">
           <button
@@ -409,6 +460,24 @@ export const ChainBlock = memo(function ChainBlock({
           )}
         </div>
       </div>
+      {collapsed && listDensity === 'mobile' && latestMember && (
+        <button
+          className="conv-chain-latest-summary"
+          onClick={() => onRowClick(latestMember)}
+          title={latestMember.slug ? `Open latest conversation "${latestMember.slug}"` : 'Open latest conversation'}
+        >
+          <span className={`conv-state-dot ${latestDisplayState}`} title={stateLabel(latestMember, latestDisplayState)} />
+          <span className="conv-chain-summary-main">
+            <span className="conv-chain-summary-title">Latest #{latestIndex + 1}</span>
+            {latestMember.conv_mode_label && <span className="conv-mode-badge">{latestMember.conv_mode_label}</span>}
+            <span className="conv-item-time">{formatRelativeTime(latestMember.updated_at)}</span>
+          </span>
+          <span className="conv-chain-summary-meta">
+            {latestContext && <span className="conv-project-label">{latestContext}</span>}
+            {latestMember.cached_pr && <PrBadge pr={latestMember.cached_pr} interactive={false} />}
+          </span>
+        </button>
+      )}
       {!collapsed && (
         <ul className="conv-chain-members">
           {item.members.map((m, idx) => (
@@ -420,7 +489,7 @@ export const ChainBlock = memo(function ChainBlock({
               isActive={!!activeSlug && m.slug === activeSlug}
               isChainMember
               isChainLatest={m.id === item.latestMemberId}
-              isSidebarMode={sidebarMode}
+              listDensity={listDensity}
               chainIndex={idx}
               showArchived={showArchived}
               onClick={onRowClick}
@@ -438,6 +507,13 @@ export const ChainBlock = memo(function ChainBlock({
   );
 });
 
+const TerminalGlyph = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <polyline points="4 17 10 11 4 5" />
+    <line x1="12" y1="19" x2="20" y2="19" />
+  </svg>
+);
+
 export function ConversationList({
   conversations,
   archivedConversations,
@@ -452,25 +528,23 @@ export function ConversationList({
   onConversationClick,
   activeSlug,
   sidebarMode,
+  listDensity,
   authChip,
+  utilityActions,
 }: ConversationListProps) {
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  // Chain-block menu open state. Tracked separately from `expandedId` so a
-  // member row's dropdown and a chain header dropdown can never both be open
-  // at once but also can't share a key with a conversation row of the same
-  // id.
   const [expandedChainId, setExpandedChainId] = useState<string | null>(null);
-  // Per-chain collapse state. NOT persisted across navigations
-  // (specs/chains/design.md "Sidebar Grouping"). A chain absent from the
-  // map is considered expanded (the default).
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
   const chainMenuRef = useRef<HTMLDivElement>(null);
   const listRootRef = useRef<HTMLElement>(null);
   const lastRevealedActiveSlugRef = useRef<string | null>(null);
 
-  // Close context menu on click-outside
+  const effectiveListDensity = listDensity ?? (sidebarMode ? 'sidebar' : 'full');
+  const isSidebarLayout = effectiveListDensity === 'sidebar';
+  const isMobileList = effectiveListDensity === 'mobile';
+
   useEffect(() => {
     if (!expandedId) return;
     const handleMouseDown = (e: MouseEvent) => {
@@ -495,18 +569,11 @@ export function ConversationList({
 
   const displayList = showArchived ? archivedConversations : conversations;
 
-  // Chain grouping applies to both active and archived lists. Archive is a
-  // chain-level op now (chains/lifecycle), so the same chain block renders
-  // in either view.
   const groupedItems: SidebarItem[] = useMemo(() => {
     const roots = computeChainRoots(displayList);
     return groupConversationsForSidebar(displayList, roots);
   }, [displayList]);
 
-  // Keyboard navigation traverses the flat list of conversations as
-  // displayed. For chain blocks the order is members-in-chain-order
-  // interleaved with standalones at the chain block's recency rank, so a
-  // user pressing j/k walks through the same items they see.
   const keyboardItems = useMemo(() => {
     const out: Conversation[] = [];
     for (const item of groupedItems) {
@@ -596,21 +663,49 @@ export function ConversationList({
   const isEmpty = displayList.length === 0;
 
   return (
-    <section ref={listRootRef} id="conversation-list" className={`view active ${sidebarMode ? 'sidebar-mode' : ''}`}>
-      {!sidebarMode && (
-        <div className="view-header">
-          <h2>Conversations</h2>
-          <div className="view-header-actions">
-            {(archivedConversations.length > 0 || showArchived) && (
+    <section ref={listRootRef} id="conversation-list" className={`view active ${isSidebarLayout ? 'sidebar-mode' : ''} ${isMobileList ? 'mobile-list-density' : ''}`}>
+      {!isSidebarLayout && (
+        <div className="view-header conversation-list-header">
+          <div className="conversation-list-title-group">
+            <button
+              type="button"
+              className="conversation-list-brand"
+              onClick={() => navigate('/')}
+              title="Phoenix"
+              aria-label="Phoenix home"
+            >
+              <img src="/phoenix.svg" alt="" className="conversation-list-brand-logo" />
+              <span>Phoenix</span>
+            </button>
+            <div className="conversation-list-subnav">
               <button
-                className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
-                onClick={onToggleArchived}
-                title={showArchived ? 'Show active conversations' : 'Show archived conversations'}
+                className={`archive-toggle-text ${!showArchived ? 'active' : ''}`}
+                onClick={() => { if (showArchived) onToggleArchived(); }}
+                disabled={!showArchived}
               >
-                {showArchived ? 'Active' : `Archived (${archivedConversations.length})`}
+                Active
               </button>
-            )}
-            {authChip}
+              <span aria-hidden="true">·</span>
+              <button
+                className={`archive-toggle-text ${showArchived ? 'active' : ''}`}
+                onClick={() => { if (!showArchived) onToggleArchived(); }}
+              >
+                Archived {archivedConversations.length}
+              </button>
+              {authChip && <span className="conversation-list-auth-chip">{authChip}</span>}
+            </div>
+          </div>
+          <div className="conversation-list-command-cluster">
+            <button
+              type="button"
+              className="conversation-list-icon-btn"
+              onClick={() => navigate('/terminal')}
+              title="Terminal"
+              aria-label="Open terminal"
+            >
+              <TerminalGlyph />
+            </button>
+            {utilityActions}
             <button
               id="new-conv-btn"
               className="btn-primary"
@@ -622,7 +717,7 @@ export function ConversationList({
           </div>
         </div>
       )}
-      {sidebarMode && (archivedConversations.length > 0 || showArchived) && (
+      {isSidebarLayout && (archivedConversations.length > 0 || showArchived) && (
         <div className="sidebar-archive-toggle">
           <button
             className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
@@ -652,7 +747,7 @@ export function ConversationList({
                   isActive={!!activeSlug && conv.slug === activeSlug}
                   isChainMember={false}
                   isChainLatest={false}
-                  isSidebarMode={!!sidebarMode}
+                  listDensity={effectiveListDensity}
                   chainIndex={undefined}
                   showArchived={showArchived}
                   onClick={handleClick}
@@ -667,12 +762,10 @@ export function ConversationList({
             }
             const latestMember = item.members.find(m => m.id === item.latestMemberId);
             const isCompleted = getConvDisplayState(latestMember) === 'terminal';
-            // Completed chains default collapsed; the toggle set tracks non-default state.
-            const collapsed = isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
-            // Narrow the global ids to this chain before they cross the memo
-            // boundary: a chain that doesn't contain the expanded/selected/active
-            // row sees null, so a global id change lands as identical props on
-            // every chain but the one that gained or lost the row.
+            const hasActiveMember = item.members.some((m) => m.slug === activeSlug);
+            const collapsed = isMobileList
+              ? hasActiveMember ? false : !collapsedChains.has(item.rootId)
+              : isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
             const chainExpandedRowId =
               expandedId !== null && item.members.some((m) => m.id === expandedId)
                 ? expandedId
@@ -694,7 +787,7 @@ export function ConversationList({
                 expandedRowId={chainExpandedRowId}
                 keyboardSelectedId={chainKeyboardSelectedId}
                 activeSlug={chainActiveSlug}
-                sidebarMode={!!sidebarMode}
+                listDensity={effectiveListDensity}
                 showArchived={showArchived}
                 onToggleCollapsed={toggleChainCollapsed}
                 onToggleChainMenu={toggleChainActions}
