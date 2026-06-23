@@ -443,15 +443,50 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
         } => {
             if *include_worktree {
                 let merge_base = effective_range_base.as_deref().unwrap_or(base);
-                git_capture(repo, &["diff", "--numstat", merge_base, "--"]).await?
+                git_capture(
+                    repo,
+                    &[
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--numstat",
+                        merge_base,
+                        "--",
+                    ],
+                )
+                .await?
             } else {
-                git_capture(repo, &["diff", "--numstat", &format!("{base}...{head}")]).await?
+                git_capture(
+                    repo,
+                    &[
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--numstat",
+                        &format!("{base}...{head}"),
+                    ],
+                )
+                .await?
             }
         }
-        DiffSpec::Workspace => git_capture(repo, &["diff", "--numstat", "HEAD", "--"]).await?,
+        DiffSpec::Workspace => {
+            git_capture(
+                repo,
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    "HEAD",
+                    "--",
+                ],
+            )
+            .await?
+        }
     };
     let mut insertions = 0;
     let mut deletions = 0;
+    let mut files_changed = 0;
     let mut files = Vec::new();
     let untracked = git_capture(repo, &["ls-files", "--others", "--exclude-standard"])
         .await
@@ -466,6 +501,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
     for line in numstat.lines() {
         let parts: Vec<_> = line.split('\t').collect();
         if parts.len() >= 3 {
+            files_changed += 1;
             if parts[0] == "-" || parts[1] == "-" {
                 warnings.push(warning(
                     "unsupported_file",
@@ -502,14 +538,32 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
             } => {
                 let (diff_output, truncated) = if *include_worktree {
                     let merge_base = effective_range_base.as_deref().unwrap_or(base);
-                    git_capture_limited(repo, &["diff", merge_base, "--", file], MAX_FILE_BYTES + 1)
-                        .await
-                        .unwrap_or_default()
+                    git_capture_limited(
+                        repo,
+                        &[
+                            "diff",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            merge_base,
+                            "--",
+                            file,
+                        ],
+                        MAX_FILE_BYTES + 1,
+                    )
+                    .await
+                    .unwrap_or_default()
                 } else {
                     let merge_base_range = format!("{base}...{head}");
                     git_capture_limited(
                         repo,
-                        &["diff", &merge_base_range, "--", file],
+                        &[
+                            "diff",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            &merge_base_range,
+                            "--",
+                            file,
+                        ],
                         MAX_FILE_BYTES + 1,
                     )
                     .await
@@ -526,10 +580,13 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                 diff_output
             }
             DiffSpec::Workspace => {
-                let (diff_output, truncated) =
-                    git_capture_limited(repo, &["diff", "HEAD", "--", file], MAX_FILE_BYTES + 1)
-                        .await
-                        .unwrap_or_default();
+                let (diff_output, truncated) = git_capture_limited(
+                    repo,
+                    &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", file],
+                    MAX_FILE_BYTES + 1,
+                )
+                .await
+                .unwrap_or_default();
                 if truncated {
                     warnings.push(warning(
                         "file_too_large",
@@ -564,7 +621,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
     }
 
     Ok(DiffCollection {
-        files_changed: files.len(),
+        files_changed,
         files_reviewed,
         insertions,
         deletions,
