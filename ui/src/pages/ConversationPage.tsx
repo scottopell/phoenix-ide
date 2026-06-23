@@ -407,8 +407,6 @@ function ConversationPageContent() {
               setArchiveStatusConfirmedConversationId(result.conversation.id);
               await cacheDB.putConversation(result.conversation);
               await cacheDB.putMessages(result.messages);
-            } else if (cached && !cached.archived) {
-              setArchiveStatusConfirmedConversationId(cached.id);
             }
           } catch (err) {
             if (!cancelled) {
@@ -436,6 +434,42 @@ function ConversationPageContent() {
       cancelled = true;
     };
   }, [slug, navigate, dispatch]);
+
+  useEffect(() => {
+    if (!slug || !conversationId || archiveStatusConfirmed || !isConnected) return;
+    let cancelled = false;
+
+    const confirmArchiveStatus = async () => {
+      try {
+        const result = await api.getConversationBySlug(slug);
+        if (cancelled) return;
+        dispatch({
+          type: 'set_initial_data',
+          conversationId: result.conversation.id,
+          conversation: result.conversation,
+          messages: result.messages,
+          phase: result.conversation.state
+            ? parseConversationState(result.conversation.state)
+            : result.presentation_mode === 'working'
+              ? { type: 'awaiting_llm' }
+              : { type: 'idle' },
+          contextWindow: {
+            used: result.context_window_size || 0,
+          },
+        });
+        setArchiveStatusConfirmedConversationId(result.conversation.id);
+        await cacheDB.putConversation(result.conversation);
+        await cacheDB.putMessages(result.messages);
+      } catch (err) {
+        if (!cancelled) console.warn('Failed to confirm archive status:', err);
+      }
+    };
+
+    void confirmArchiveStatus();
+    return () => {
+      cancelled = true;
+    };
+  }, [slug, conversationId, archiveStatusConfirmed, isConnected, dispatch]);
 
   // Fetch system prompt once when conversationId is known
   useEffect(() => {
