@@ -46,9 +46,9 @@ The result gates which tool registry top-level Explore conversations receive:
 | `false` | read-only/planning tools, browser tools, non-spawning coordination tools, scoped `patch`, and `propose_task`; tmux, `spawn_agents`, and bash are omitted | No |
 
 The sandboxed bash path uses a Phoenix child-process launcher. The child applies
-`nono` to itself and then execs `/bin/bash -c <cmd>`, preserving the ordinary
-bash handle semantics while avoiding irreversible sandbox application in the
-server process.
+`nono` to itself and then execs `bash -c <cmd>` using `PATH`, preserving the
+ordinary bash handle semantics while avoiding irreversible sandbox application in
+the server process.
 
 ## Data Models
 
@@ -503,7 +503,7 @@ the porcelain command fails.
 
 | Tool | Explore mode | Work mode |
 |------|-------------|----------|
-| `bash` | Available only with `nono` sandbox support; broad local read, source/Git metadata writes denied, task proposal/scratch/synthetic-home/platform-temp writable, network blocked | Allowed (write enabled in worktree) |
+| `bash` | Available only with `nono` sandbox support; broad local read, source/Git metadata/task writes denied, scratch/synthetic-home/platform-temp writable, network blocked | Allowed (write enabled in worktree) |
 | `patch` | Scoped to discovered taskmd directory so the agent can draft a task file before `propose_task`; writes elsewhere rejected | Enabled (scoped to worktree) |
 | `think` | Allowed | Allowed |
 | `keyword_search` | Allowed | Allowed |

@@ -630,10 +630,9 @@ THE Explore bash sandbox SHALL provide:
 - explicit sensitive-path denies where the platform backend can enforce deny-within-read
 - read-only Git metadata access sufficient for linked worktree commands such as
   `git status`, `git log`, and `git blame`
-- read-write filesystem access to taskmd-discovered task proposal directories
-  under the repo root; symlinked task directories whose canonical target escapes
-  the repo are not granted
-- read-write filesystem access to a Phoenix-owned scratch directory
+- write access only to Phoenix-owned scratch, synthetic home, and writable temp
+  locations; task proposal files are created through scoped `patch`/`propose_task`,
+  not through sandboxed bash
 - a synthetic sandbox home under scratch, exposed as `PHOENIX_SANDBOX_HOME` and
   `HOME`
 - `PHOENIX_SANDBOX_SCRATCH` pointing at Phoenix-owned scratch
@@ -662,10 +661,13 @@ AND bash commands SHALL retain the existing writable behavior for that mode
 `git blame`, `rg`, `cat`) only if the read-only promise is enforced below the
 application layer. Explore is a read-only/network-blocked mode, not a
 confidentiality boundary: existing Explore read tools can already read arbitrary
-user-selected paths, so sandboxed bash follows the same broad-read model while
-constraining writes, network, and ambient credentials. `nono` is the sandbox
-abstraction; it uses the platform's supported backend (Landlock on Linux,
-Seatbelt on macOS) and reports support at startup.
+user-selected paths, so sandboxed bash follows the same broad-read model. On
+Linux this includes procfs reads such as `/proc/<pid>/environ`; that is an
+accepted consequence of the broad-read model rather than a credential-isolation
+guarantee. The sandbox constrains writes, network, and the ambient environment
+it directly passes to the child process. `nono` is the sandbox abstraction; it
+uses the platform's supported backend (Landlock on Linux, Seatbelt on macOS) and
+reports support at startup.
 
 ---
 

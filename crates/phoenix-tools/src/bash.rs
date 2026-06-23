@@ -45,26 +45,7 @@ use serde_json::{json, Value};
 /// instance itself is reusable across conversations.
 pub struct BashTool;
 
-#[derive(Debug, Clone, Copy)]
-pub struct SandboxedBashTool {
-    task_writes: sandbox::ExploreSandboxTaskWrites,
-}
-
-impl SandboxedBashTool {
-    #[must_use]
-    pub const fn with_task_writes() -> Self {
-        Self {
-            task_writes: sandbox::ExploreSandboxTaskWrites::Allow,
-        }
-    }
-
-    #[must_use]
-    pub const fn read_only() -> Self {
-        Self {
-            task_writes: sandbox::ExploreSandboxTaskWrites::Deny,
-        }
-    }
-}
+pub struct SandboxedBashTool;
 
 #[async_trait]
 impl Tool for BashTool {
@@ -242,11 +223,7 @@ impl Tool for SandboxedBashTool {
     }
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        if self.task_writes == sandbox::ExploreSandboxTaskWrites::Allow {
-            operations::dispatch_sandboxed(input, ctx).await
-        } else {
-            operations::dispatch_sandboxed_read_only(input, ctx).await
-        }
+        operations::dispatch_sandboxed(input, ctx).await
     }
 }
 

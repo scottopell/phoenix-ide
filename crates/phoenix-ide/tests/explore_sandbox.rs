@@ -44,7 +44,6 @@ fn explore_sandbox_enforces_read_only_policy() {
         bin,
         &SandboxFixture {
             repo: &repo,
-            tasks: &tasks,
             scratch: &scratch,
             sandbox_home: &sandbox_home,
             platform_temp: &platform_temp,
@@ -61,7 +60,6 @@ fn explore_sandbox_enforces_read_only_policy() {
         bin,
         &SandboxFixture {
             repo: &repo,
-            tasks: &tasks,
             scratch: &scratch,
             sandbox_home: &sandbox_home,
             platform_temp: &platform_temp,
@@ -79,7 +77,6 @@ fn explore_sandbox_enforces_read_only_policy() {
         bin,
         &SandboxFixture {
             repo: &repo,
-            tasks: &tasks,
             scratch: &scratch,
             sandbox_home: &sandbox_home,
             platform_temp: &platform_temp,
@@ -96,47 +93,26 @@ fn explore_sandbox_enforces_read_only_policy() {
         "hello\n"
     );
 
-    let task_write = sandbox_run(
+    let task_write_denied = sandbox_run(
         bin,
         &SandboxFixture {
             repo: &repo,
-            tasks: &tasks,
-            scratch: &scratch,
-            sandbox_home: &sandbox_home,
-            platform_temp: &platform_temp,
-            sensitive: &sensitive,
-        },
-        "echo ok > tasks/34001-p2-ready--sandbox-test.md && cat tasks/34001-p2-ready--sandbox-test.md",
-    );
-    assert!(
-        task_write.status.success(),
-        "task write failed: {task_write:?}"
-    );
-    assert!(task_write.stdout.contains("ok"));
-
-    let task_write_denied = sandbox_run_with_task_writes(
-        bin,
-        &SandboxFixture {
-            repo: &repo,
-            tasks: &tasks,
             scratch: &scratch,
             sandbox_home: &sandbox_home,
             platform_temp: &platform_temp,
             sensitive: &sensitive,
         },
         "echo bad > tasks/34002-p2-ready--sandbox-test.md",
-        false,
     );
     assert!(
         !task_write_denied.status.success(),
-        "task write unexpectedly succeeded without task-write grant"
+        "task write unexpectedly succeeded"
     );
 
     let scratch_write = sandbox_run(
         bin,
         &SandboxFixture {
             repo: &repo,
-            tasks: &tasks,
             scratch: &scratch,
             sandbox_home: &sandbox_home,
             platform_temp: &platform_temp,
@@ -154,7 +130,6 @@ fn explore_sandbox_enforces_read_only_policy() {
         bin,
         &SandboxFixture {
             repo: &repo,
-            tasks: &tasks,
             scratch: &scratch,
             sandbox_home: &sandbox_home,
             platform_temp: &platform_temp,
@@ -186,7 +161,6 @@ fn explore_sandbox_enforces_read_only_policy() {
             bin,
             &SandboxFixture {
                 repo: &repo,
-                tasks: &tasks,
                 scratch: &scratch,
                 sandbox_home: &sandbox_home,
                 platform_temp: &platform_temp,
@@ -204,7 +178,6 @@ fn explore_sandbox_enforces_read_only_policy() {
         bin,
         &SandboxFixture {
             repo: &repo,
-            tasks: &tasks,
             scratch: &scratch,
             sandbox_home: &sandbox_home,
             platform_temp: &platform_temp,
@@ -241,7 +214,6 @@ struct SandboxOutput {
 
 struct SandboxFixture<'a> {
     repo: &'a std::path::Path,
-    tasks: &'a std::path::Path,
     scratch: &'a std::path::Path,
     sandbox_home: &'a std::path::Path,
     platform_temp: &'a std::path::Path,
@@ -249,26 +221,12 @@ struct SandboxFixture<'a> {
 }
 
 fn sandbox_run(bin: &str, fixture: &SandboxFixture<'_>, cmd: &str) -> SandboxOutput {
-    sandbox_run_with_task_writes(bin, fixture, cmd, true)
-}
-
-fn sandbox_run_with_task_writes(
-    bin: &str,
-    fixture: &SandboxFixture<'_>,
-    cmd: &str,
-    task_writes: bool,
-) -> SandboxOutput {
     let output = Command::new(bin)
         .args(["--sandbox-exec", "--", cmd])
         .env("PHOENIX_SANDBOX_REPO_ROOT", fixture.repo)
         .env("PHOENIX_SANDBOX_SCRATCH", fixture.scratch)
         .env("PHOENIX_SANDBOX_HOME", fixture.sandbox_home)
         .env("PHOENIX_SANDBOX_PLATFORM_TEMP", fixture.platform_temp)
-        .env("PHOENIX_SANDBOX_TASK_DIRS", fixture.tasks)
-        .env(
-            "PHOENIX_SANDBOX_TASK_WRITES",
-            if task_writes { "1" } else { "0" },
-        )
         .env("PHOENIX_SANDBOX_SENSITIVE_DIRS", fixture.sensitive)
         .env("GH_TOKEN", "should-not-leak")
         .output()

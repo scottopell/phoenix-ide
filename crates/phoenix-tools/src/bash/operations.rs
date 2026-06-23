@@ -29,7 +29,7 @@ use super::handle::{
 };
 use super::registry::{BashHandleError, LiveHandleSummary, WorkScopeHandles};
 use super::ring::{RingLine, WindowView};
-use super::sandbox::{ExploreSandboxLauncher, ExploreSandboxTaskWrites};
+use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
 use crate::{ToolContext, ToolOutput};
 use phoenix_core::domain::tool_wire::{
@@ -414,9 +414,7 @@ fn resolve_wait_seconds(raw: Option<i64>) -> Result<u64, BashError> {
 #[derive(Debug, Clone, Copy)]
 pub enum BashSpawnMode {
     Direct,
-    ExploreReadOnly {
-        task_writes: ExploreSandboxTaskWrites,
-    },
+    ExploreReadOnly,
 }
 
 /// Run a bash request end-to-end and produce the `ToolOutput`.
@@ -425,25 +423,7 @@ pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
 }
 
 pub async fn dispatch_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
-    dispatch_with_spawn_mode(
-        input,
-        ctx,
-        BashSpawnMode::ExploreReadOnly {
-            task_writes: ExploreSandboxTaskWrites::Allow,
-        },
-    )
-    .await
-}
-
-pub async fn dispatch_sandboxed_read_only(input: Value, ctx: ToolContext) -> ToolOutput {
-    dispatch_with_spawn_mode(
-        input,
-        ctx,
-        BashSpawnMode::ExploreReadOnly {
-            task_writes: ExploreSandboxTaskWrites::Deny,
-        },
-    )
-    .await
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly).await
 }
 
 async fn dispatch_with_spawn_mode(
@@ -598,9 +578,8 @@ fn spawn_child(
             command.arg("-c").arg(cmd).current_dir(&ctx.working_dir);
             command
         }
-        BashSpawnMode::ExploreReadOnly { task_writes } => {
-            let sandbox_command =
-                ExploreSandboxLauncher::command(cmd, &ctx.working_dir, task_writes)?;
+        BashSpawnMode::ExploreReadOnly => {
+            let sandbox_command = ExploreSandboxLauncher::command(cmd, &ctx.working_dir)?;
             sandbox_scratch_dir = Some(sandbox_command.scratch_dir);
             Command::from(sandbox_command.command)
         }
