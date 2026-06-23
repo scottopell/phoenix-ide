@@ -55,6 +55,14 @@ function findLaterClose(lines: string[], startIndex: number, char: string, minLe
   return -1;
 }
 
+function previousNonBlankLineEndsWithColon(lines: string[], beforeIndex: number): boolean {
+  for (let i = beforeIndex - 1; i >= 0; i--) {
+    const trimmed = lineBare(lines[i]!).trim();
+    if (trimmed !== '') return trimmed.endsWith(':');
+  }
+  return false;
+}
+
 function hasNestedCloseAndOuterCloseAfter(
   lines: string[],
   openerIndex: number,
@@ -183,7 +191,8 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
       } else if (nestedOpener) {
         const openerClosesOuter = matchCloseFence(bare, fenceChar, fenceLength);
         const shouldStartNested = openerClosesOuter
-          ? hasNestedCloseAndOuterCloseAfter(lines, lineIndex, nestedOpener.char, nestedOpener.length, fenceChar, fenceLength)
+          ? previousNonBlankLineEndsWithColon(lines, lineIndex) &&
+            hasNestedCloseAndOuterCloseAfter(lines, lineIndex, nestedOpener.char, nestedOpener.length, fenceChar, fenceLength)
           : true;
 
         if (shouldStartNested) {
@@ -198,6 +207,7 @@ export function parseStreamingBlocks(buffer: string): StreamingBlock[] {
       } else if (matchCloseFence(bare, fenceChar, fenceLength)) {
         flushCode(true);
       } else {
+        lastNestedCloseCompletedEmpty = false;
         codeAccum += line;
       }
     } else {

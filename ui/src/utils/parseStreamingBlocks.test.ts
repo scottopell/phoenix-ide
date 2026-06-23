@@ -210,6 +210,24 @@ describe('parseStreamingBlocks', () => {
       complete: true,
     });
   });
+  it('prefers real outer closes before later independent fences', () => {
+    const result = parseStreamingBlocks('```markdown\ndoc\n```\ntext\n```\ncode\n```\n');
+
+    expect(result).toEqual([
+      { type: 'code', lang: 'markdown', content: 'doc\n', complete: true },
+      { type: 'markdown', content: 'text\n' },
+      { type: 'code', lang: '', content: 'code\n', complete: true },
+    ]);
+  });
+
+  it('keeps empty nested prefixes incomplete when more content follows', () => {
+    const result = parseStreamingBlocks('```markdown\n```text\n```\nmore');
+
+    expect(result).toEqual([
+      { type: 'code', lang: 'markdown', content: '```text\n```\nmore', complete: false },
+    ]);
+  });
+
   it('streaming scenario: partial content then full content', () => {
     const full = 'intro\n```js\nconst x = 1;\n```\noutro\n';
 
