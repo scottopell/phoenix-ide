@@ -29,16 +29,17 @@ impl ExploreReadOnlyPolicy {
     pub fn discover(working_dir: &Path) -> std::io::Result<Self> {
         let runtime_env = PhoenixRuntimeEnvironment::detect();
         let repo_root = working_dir.canonicalize()?;
-        let scratch_root = runtime_env.tmp_subdir("explore-bash")?;
-        let scratch_dir = scratch_root.join(uuid::Uuid::new_v4().to_string());
-        let sandbox_home = scratch_dir.join("home");
-        std::fs::create_dir_all(&sandbox_home)?;
         let git_dirs = git_state_dirs(&repo_root);
-        let mut protected_dirs = Vec::with_capacity(1 + git_dirs.len());
+        let mut protected_dirs = Vec::with_capacity(5 + git_dirs.len());
         protected_dirs.push(repo_root.clone());
         protected_dirs.extend(git_dirs);
+        protected_dirs.extend(runtime_protected_dirs(&runtime_env));
         protected_dirs.sort();
         protected_dirs.dedup();
+        let scratch_root = runtime_env.tmp_subdir("explore-bash")?;
+        let scratch_dir = scratch_dir(&scratch_root, &protected_dirs)?;
+        let sandbox_home = scratch_dir.join("home");
+        std::fs::create_dir_all(&sandbox_home)?;
         let platform_temp =
             platform_temp_dir(&protected_dirs, &scratch_dir, runtime_env.tmp_root());
         std::fs::create_dir_all(&platform_temp)?;
@@ -198,17 +199,55 @@ fn inherited_path() -> OsString {
     std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
 }
 
+fn scratch_dir(scratch_root: &Path, protected_dirs: &[PathBuf]) -> std::io::Result<PathBuf> {
+    let scratch_root = scratch_root
+        .canonicalize()
+        .unwrap_or_else(|_| scratch_root.to_path_buf());
+    if protected_dirs
+        .iter()
+        .any(|protected| paths_overlap(&scratch_root, protected))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "explore bash scratch root {} overlaps protected repository/Git/Phoenix state",
+                scratch_root.display()
+            ),
+        ));
+    }
+    Ok(scratch_root.join(uuid::Uuid::new_v4().to_string()))
+}
+
 fn platform_temp_dir(protected_dirs: &[PathBuf], scratch_dir: &Path, tmp_root: &Path) -> PathBuf {
     let temp = tmp_root.parent().unwrap_or(tmp_root);
     let temp = temp.canonicalize().unwrap_or_else(|_| temp.to_path_buf());
     if protected_dirs
         .iter()
-        .any(|protected| protected.starts_with(&temp) || temp.starts_with(protected))
+        .any(|protected| paths_overlap(&temp, protected))
     {
         scratch_dir.join("platform-temp")
     } else {
         temp
     }
+}
+
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+fn runtime_protected_dirs(runtime_env: &PhoenixRuntimeEnvironment) -> Vec<PathBuf> {
+    let mut dirs = vec![
+        runtime_env.home().to_path_buf(),
+        runtime_env.codex_home().to_path_buf(),
+        runtime_env.data_dir().to_path_buf(),
+        runtime_env.phoenix_home(),
+    ];
+    if let Some(parent) = runtime_env.db_path().parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 fn git_state_dirs(repo_root: &Path) -> Vec<PathBuf> {
@@ -302,5 +341,34 @@ mod tests {
             ),
             scratch.join("platform-temp")
         );
+    }
+
+    #[test]
+    fn platform_temp_falls_back_under_scratch_when_runtime_state_is_under_temp() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let host_temp = temp.path().join("host-temp");
+        let phoenix_data = host_temp.join("phoenix-data");
+        let scratch = temp.path().join("scratch");
+        std::fs::create_dir_all(&phoenix_data).expect("phoenix data");
+
+        assert_eq!(
+            platform_temp_dir(
+                &[phoenix_data.canonicalize().unwrap()],
+                &scratch,
+                &host_temp.join("phoenix-ide")
+            ),
+            scratch.join("platform-temp")
+        );
+    }
+
+    #[test]
+    fn scratch_dir_rejects_root_inside_protected_repo() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let scratch_root = repo.join(".tmp").join("phoenix-ide").join("explore-bash");
+        std::fs::create_dir_all(&scratch_root).expect("scratch root");
+
+        let err = scratch_dir(&scratch_root, &[repo.canonicalize().unwrap()]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

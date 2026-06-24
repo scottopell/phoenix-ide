@@ -630,14 +630,17 @@ THE Explore bash sandbox SHALL provide:
 - read-only Git metadata access sufficient for linked worktree commands such as
   `git status`, `git log`, and `git blame`
 - write access only to Phoenix-owned scratch, synthetic home, and writable temp
-  locations; task proposal files are created through scoped `patch`/`propose_task`,
-  not through sandboxed bash
+  locations that do not overlap the worktree, resolved Git metadata, or
+  Phoenix-owned runtime state; task proposal files are created through scoped
+  `patch`/`propose_task`, not through sandboxed bash
 - a synthetic sandbox home under scratch, exposed as `PHOENIX_SANDBOX_HOME` and
   `HOME`
 - `PHOENIX_SANDBOX_SCRATCH` pointing at Phoenix-owned scratch
 - platform-compatible temporary directory writes, exposed as `TMPDIR`; when the
-  repo itself lives under the platform temp root, `TMPDIR` falls back to a
-  Phoenix-owned scratch child so the temp grant cannot cover source files
+  platform temp root would cover the worktree, resolved Git metadata, or
+  Phoenix-owned runtime state, `TMPDIR` falls back to a Phoenix-owned scratch child
+  so the temp grant cannot cover protected state. The scratch root itself is
+  rejected when it overlaps protected repo/Git/Phoenix paths
 - inherited `PATH` preservation
 - blocked network access
 - a reduced environment that strips ambient SCM/OAuth, LLM-provider, and
