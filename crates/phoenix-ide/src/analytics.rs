@@ -144,11 +144,9 @@ pub async fn project_session(db: &Database, root_id: &str) -> Result<AnalyticsSe
             .then_with(|| a.message_id.cmp(&b.message_id))
     });
 
-    let anchors = turn_anchors(&messages);
     let turns: Vec<AnalyticsUsageTurn> = turn_rows
         .iter()
-        .enumerate()
-        .map(|(idx, r)| {
+        .map(|r| {
             let first_byte_at = r
                 .first_byte_at
                 .as_deref()
@@ -157,7 +155,10 @@ pub async fn project_session(db: &Database, root_id: &str) -> Result<AnalyticsSe
             let created_at = DateTime::parse_from_rfc3339(&r.created_at)
                 .map_or_else(|_| root.created_at, |t| t.with_timezone(&Utc));
             let first_byte_latency_ms = first_byte_at
-                .zip(anchors.get(idx).copied().flatten())
+                .and_then(|first| {
+                    first_byte_anchor(&messages, &r.conversation_id, first)
+                        .map(|anchor| (first, anchor))
+                })
                 .and_then(|(first, anchor)| first.signed_duration_since(anchor).to_std().ok())
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
             let tokens = TokenTotals {
@@ -277,21 +278,24 @@ fn following_tool_result<'a>(
     })
 }
 
-fn turn_anchors(messages: &[Message]) -> Vec<Option<DateTime<Utc>>> {
-    let mut anchors = Vec::new();
-    let mut last_non_agent = None;
-    for msg in messages {
-        match msg.content {
-            MessageContent::Agent(_) => anchors.push(last_non_agent),
+fn first_byte_anchor(
+    messages: &[Message],
+    conversation_id: &str,
+    first_byte_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    messages
+        .iter()
+        .filter(|msg| msg.conversation_id == conversation_id && msg.created_at <= first_byte_at)
+        .filter_map(|msg| match msg.content {
+            MessageContent::Agent(_) => None,
             MessageContent::User(_)
             | MessageContent::Tool(_)
             | MessageContent::System(_)
             | MessageContent::Error(_)
             | MessageContent::Continuation(_)
-            | MessageContent::Skill(_) => last_non_agent = Some(msg.created_at),
-        }
-    }
-    anchors
+            | MessageContent::Skill(_) => Some(msg.created_at),
+        })
+        .max()
 }
 
 fn duration_ms(display_data: Option<&Value>) -> Option<u64> {
@@ -523,47 +527,58 @@ mod tests {
     }
 
     #[test]
-    fn turn_anchors_track_preceding_non_agent_messages() {
+    fn first_byte_anchor_uses_source_conversation_preceding_message() {
         let start = Utc::now();
         let messages = vec![
-            msg_in("c", "u1", 1, start, MessageContent::user("hello"), None),
             msg_in(
-                "c",
-                "a1",
+                "parent",
+                "u-parent",
+                1,
+                start,
+                MessageContent::user("parent"),
+                None,
+            ),
+            msg_in(
+                "sub",
+                "u-sub",
+                1,
+                start + chrono::Duration::milliseconds(5),
+                MessageContent::user("sub"),
+                None,
+            ),
+            msg_in(
+                "parent",
+                "a-parent",
                 2,
-                start + chrono::Duration::milliseconds(10),
+                start + chrono::Duration::milliseconds(20),
                 MessageContent::Agent(vec![ContentBlock::Text {
-                    text: "hi".to_string(),
+                    text: "parent".to_string(),
                 }]),
                 None,
             ),
             msg_in(
-                "c",
-                "t1",
-                3,
-                start + chrono::Duration::milliseconds(20),
-                MessageContent::Tool(ToolContent::new("tu", "ok", false)),
-                None,
-            ),
-            msg_in(
-                "c",
-                "a2",
-                4,
+                "sub",
+                "a-sub",
+                2,
                 start + chrono::Duration::milliseconds(30),
                 MessageContent::Agent(vec![ContentBlock::Text {
-                    text: "done".to_string(),
+                    text: "sub".to_string(),
                 }]),
                 None,
             ),
         ];
 
-        let anchors = turn_anchors(&messages);
         assert_eq!(
-            anchors,
-            vec![
-                Some(start),
-                Some(start + chrono::Duration::milliseconds(20))
-            ]
+            first_byte_anchor(&messages, "sub", start + chrono::Duration::milliseconds(25)),
+            Some(start + chrono::Duration::milliseconds(5))
+        );
+        assert_eq!(
+            first_byte_anchor(
+                &messages,
+                "parent",
+                start + chrono::Duration::milliseconds(25)
+            ),
+            Some(start)
         );
     }
 }
