@@ -265,11 +265,45 @@ fn linux_read_roots(read_dirs: &[PathBuf], sensitive_dirs: &[PathBuf]) -> Vec<Pa
         .into_iter()
         .map(PathBuf::from),
     );
-    for protected in sensitive_dirs {
-        roots.retain(|root| !protected.starts_with(root));
+    for root in std::mem::take(&mut roots) {
+        roots.extend(subtract_sensitive_dirs(root, sensitive_dirs));
     }
     roots.sort();
     roots.dedup();
+    roots
+}
+
+#[cfg(target_os = "linux")]
+fn subtract_sensitive_dirs(root: PathBuf, sensitive_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let relevant: Vec<&PathBuf> = sensitive_dirs
+        .iter()
+        .filter(|sensitive| sensitive.starts_with(&root))
+        .collect();
+    if relevant.is_empty() {
+        return vec![root];
+    }
+    if relevant.iter().any(|sensitive| sensitive.as_path() == root) {
+        return Vec::new();
+    }
+
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if relevant
+            .iter()
+            .any(|sensitive| sensitive.starts_with(&path))
+        {
+            roots.extend(subtract_sensitive_dirs(path, sensitive_dirs));
+        } else {
+            roots.push(path);
+        }
+    }
     roots
 }
 
@@ -444,6 +478,31 @@ mod tests {
                 &host_temp.join("phoenix-ide")
             ),
             scratch.join("platform-temp")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_read_roots_preserves_system_siblings_when_sensitive_path_is_under_system_root() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let usr = temp.path().join("usr");
+        let bin = usr.join("bin");
+        let local = usr.join("local");
+        let phoenix = local.join("share").join("phoenix");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::create_dir_all(&phoenix).expect("phoenix");
+
+        let roots = subtract_sensitive_dirs(usr.clone(), &[phoenix]);
+        assert!(roots.contains(&bin), "roots: {roots:?}");
+        assert!(
+            roots.iter().all(|root| !root.ends_with("phoenix")),
+            "sensitive path leaked: {roots:?}"
+        );
+        assert!(
+            roots.iter().any(|root| root == &local.join("bin")
+                || root == &local.join("lib")
+                || root == &bin),
+            "safe executable siblings should remain available: {roots:?}"
         );
     }
 }

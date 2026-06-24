@@ -383,12 +383,14 @@ rule SubAgentSpecsResolved {
 
 -- Fresh spawn: the registry is determined by the sub-agent's mode.
 -- Explore => `subagent_explore` (read-only information tools + browser +
--- submit_result/submit_error; no bash). Work => `subagent_work`
--- (Explore set + bash + patch). Both modes get the parent's MCP tool set.
+-- sandboxed bash when the platform capability is available +
+-- submit_result/submit_error). Work => `subagent_work`
+-- (Explore set + Work bash + patch). Both modes get the parent's MCP tool set.
 --
--- The Explore registry omits bash entirely so read-only mode cannot
--- mutate state, matching the parent `explore_no_sandbox` registry. bash is
--- a write capability reserved for Work mode.
+-- The Explore registry never grants write-capable `patch`, and its bash entry
+-- is the same OS-sandboxed, network-blocked, scratch-only bash available to a
+-- top-level Explore conversation. If the platform cannot enforce that sandbox,
+-- the Explore registry omits bash.
 rule SubAgentRegistryOnFreshSpawn {
     when: SubAgentSpawnSucceeded(parent, sub_agent, mode, cwd_override)
     ensures:
