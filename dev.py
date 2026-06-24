@@ -195,11 +195,6 @@ LAUNCHD_LOG_PATH = Path.home() / ".phoenix-ide" / "prod.log"
 PROD_SHA_PATH = Path.home() / ".phoenix-ide" / "deployed.sha"
 NEWSYSLOG_CONF_PATH = Path("/etc/newsyslog.d") / f"{LAUNCHD_LABEL}.conf"
 
-# exe.dev LLM gateway configuration
-EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
-DEFAULT_GATEWAY = "http://169.254.169.254/gateway/llm"
-LOCAL_AI_PROXY = "http://127.0.0.1:8462"
-
 # Dev ports are assigned deterministically from the worktree path hash. Keep
 # Phoenix and Vite in disjoint blocks so each worktree has a stable pair while
 # avoiding the birthday-problem collisions we saw with a 9-slot pool.
@@ -229,38 +224,6 @@ TLS_BUNDLE_DIR = DB_DIR / "tls-bundles"
 TLS_INSTALL_DIR = DB_DIR / "tls"
 
 
-def _gateway_is_reachable(url: str) -> bool:
-    """Probe a gateway with a quick HTTP request. Any response means it's up."""
-    import urllib.request
-    import urllib.error
-    # Prefer /_proxy/status (ai-proxy health endpoint) — responds instantly without
-    # touching ddtool or upstream. Fall back to bare URL for other gateway types.
-    probe_url = f"{url.rstrip('/')}/_proxy/status"
-    for candidate in (probe_url, url):
-        try:
-            urllib.request.urlopen(candidate, timeout=0.5)
-            return True
-        except urllib.error.HTTPError:
-            return True  # 404, 405, etc. — server is listening
-        except Exception:
-            continue
-    return False
-
-
-def _discover_gateway_candidates() -> list[str]:
-    """Build an ordered list of gateway URLs to try."""
-    candidates = [LOCAL_AI_PROXY]
-    if EXE_DEV_CONFIG.exists():
-        try:
-            config = json.loads(EXE_DEV_CONFIG.read_text())
-            if gw := config.get("llm_gateway"):
-                candidates.append(gw)
-        except (json.JSONDecodeError, KeyError):
-            pass
-    candidates.append(DEFAULT_GATEWAY)
-    return candidates
-
-
 def write_deployed_sha():
     """Write the current HEAD SHA to ~/.phoenix-ide/deployed.sha."""
     result = subprocess.run(
@@ -288,16 +251,6 @@ def read_deployed_sha() -> str | None:
     if current and current != deployed:
         return f"{short} (HEAD is now {current[:7]})"
     return f"{short} (current)"
-
-
-def get_llm_gateway() -> str | None:
-    """Get LLM gateway URL from env or by probing candidates. Returns None if none reachable."""
-    if val := os.environ.get("LLM_GATEWAY"):
-        return val
-    for url in _discover_gateway_candidates():
-        if _gateway_is_reachable(url):
-            return url
-    return None
 
 
 def get_worktree_hash() -> str:
@@ -1202,10 +1155,6 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     # PHOENIX_PASSWORD (or override anything else) without polluting the
     # prod env file used by `./dev.py prod deploy`.
     dev_env_file = _load_env_file(env, ".phoenix-ide.dev.env")
-    # Auto-detect gateway only if .phoenix-ide.env didn't provide LLM config
-    if not env.get("LLM_API_KEY_HELPER") and not env.get("LLM_GATEWAY"):
-        if gateway := get_llm_gateway():
-            env["LLM_GATEWAY"] = gateway
     env["PHOENIX_PORT"] = str(port)
     env["PHOENIX_DB_PATH"] = str(db_path)
     # Bind loopback so the dev server is never network-reachable: on a remote or
@@ -5581,7 +5530,6 @@ class SystemdConfig:
     db_path: str
     install_dir: str
     port: int
-    llm_gateway: str | None = None
     # When set, injects Environment=HOME=<path> so the service user can find
     # ~/.claude/.credentials.json for per-request OAuth token reads.
     home_dir: str | None = None
@@ -5620,7 +5568,6 @@ NATIVE_SYSTEMD_CONFIG = SystemdConfig(
     db_path=str(PROD_DB_PATH),
     install_dir=str(PROD_INSTALL_DIR),
     port=PROD_PORT,
-    llm_gateway=None,  # Set at deploy time via get_llm_gateway()
 )
 
 
@@ -5690,10 +5637,6 @@ def generate_systemd_service(config: SystemdConfig, version: str) -> str:
         f"Environment=PHOENIX_DB_PATH={config.db_path}",
         f"Environment=PHOENIX_VERSION={version}",
     ]
-
-    if config.llm_gateway:
-        # Native mode: use LLM_GATEWAY directly
-        env_lines.append(f"Environment=LLM_GATEWAY={config.llm_gateway}")
 
     if config.home_dir:
         # Allow the service user to find ~/.claude/.credentials.json for OAuth auth.
@@ -5795,9 +5738,6 @@ def native_prod_deploy(version: str | None = None):
     if env_file_loaded:
         print(f"  Loaded env from {env_file_loaded}")
 
-    # Auto-detect gateway only if the env file didn't already provide LLM config (mirrors launchd).
-    gateway = None if _env_provides_llm_config(env_overrides) else get_llm_gateway()
-
     env_file_path = _install_prod_env_file(env_overrides, service_user)
     if env_file_path:
         print(f"  Installed prod env file: {env_file_path} (0640 root:{service_user})")
@@ -5810,7 +5750,6 @@ def native_prod_deploy(version: str | None = None):
         NATIVE_SYSTEMD_CONFIG,
         user=service_user,
         db_path=str(native_db_path),
-        llm_gateway=gateway,
         home_dir=str(Path.home()),
         env_file_path=env_file_path,
     )
@@ -6075,12 +6014,14 @@ def _preflight_prod_bind_auth(effective_env: dict[str, str], socket_activated: b
 
 
 def _env_provides_llm_config(env: dict[str, str]) -> bool:
-    """True if `env` already specifies how to reach an LLM, so the deploy paths
-    should not auto-detect and inject a local gateway. Counts a credential
-    helper, an explicit gateway, or a direct provider API key."""
+    """True if `env` already specifies how to reach an LLM.
+
+    Counts a credential helper, direct provider API key, or provider-compatible
+    base URL override.
+    """
     return any(
         env.get(k)
-        for k in ("LLM_API_KEY_HELPER", "LLM_GATEWAY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+        for k in ("LLM_API_KEY_HELPER", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL")
     )
 
 
@@ -6103,19 +6044,14 @@ def _detect_codex_auth(env: dict[str, str]) -> str | None:
     return None
 
 
-def _llm_mode_summary(env: dict[str, str], auto_gateway: str | None) -> str:
+def _llm_mode_summary(env: dict[str, str]) -> str:
     """Human-readable description of how the deployed server will reach an LLM,
-    for the post-deploy summary line. `auto_gateway` is the gateway the deploy
-    auto-detected (None when `env` already provided LLM config)."""
+    for the post-deploy summary line."""
     if env.get("LLM_API_KEY_HELPER"):
         return "api_key_helper (from .phoenix-ide.env)"
-    if env.get("LLM_GATEWAY"):
-        return f"gateway ({env['LLM_GATEWAY']}, from .phoenix-ide.env)"
     keys = [k for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY") if env.get(k)]
     if keys:
         return f"{' + '.join(keys)} (from .phoenix-ide.env)"
-    if auto_gateway:
-        return f"gateway ({auto_gateway}, auto-detected)"
     codex = _detect_codex_auth(env)
     if codex:
         return codex
@@ -6127,23 +6063,15 @@ def _configure_llm_env(env: dict[str, str]) -> str:
 
     Priority:
     1. .phoenix-ide.env overrides (LLM_API_KEY_HELPER, ANTHROPIC_API_KEY, etc.)
-    2. Auto-detected exe.dev gateway (LLM_GATEWAY)
+    2. Provider-compatible base URL overrides
     3. ANTHROPIC_API_KEY from shell environment
     """
     # If env file provided LLM config, respect it — skip auto-detection
     if env.get("LLM_API_KEY_HELPER"):
         helper = env["LLM_API_KEY_HELPER"]
         return f"api_key_helper ({helper})"
-    if env.get("LLM_GATEWAY"):
-        return f"gateway ({env['LLM_GATEWAY']})"
     if env.get("ANTHROPIC_API_KEY"):
         return "direct API key (ANTHROPIC_API_KEY)"
-
-    # Auto-detect exe.dev gateway
-    gateway = get_llm_gateway()
-    if gateway:
-        env["LLM_GATEWAY"] = gateway
-        return f"gateway ({gateway}) [auto-detected]"
 
     # Last resort: check shell env for API key
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -6155,7 +6083,6 @@ def _configure_llm_env(env: dict[str, str]) -> str:
     print("  Options:", file=sys.stderr)
     print("    1. Create .phoenix-ide.env with LLM_API_KEY_HELPER or ANTHROPIC_API_KEY", file=sys.stderr)
     print("    2. Set ANTHROPIC_API_KEY in your environment", file=sys.stderr)
-    print("    3. Run on a host with an exe.dev gateway", file=sys.stderr)
     sys.exit(1)
 
 
@@ -6585,7 +6512,6 @@ def print_launchd_path_report(path_str: str, source: str) -> None:
 
 def generate_launchd_plist(
     version: str,
-    llm_gateway: str | None,
     extra_env: dict[str, str] | None = None,
     path_override: str | None = None,
 ) -> str:
@@ -6602,8 +6528,6 @@ def generate_launchd_plist(
         "PHOENIX_LOG_FILE": str(LAUNCHD_LOG_PATH),
         "PHOENIX_LOG_STDOUT": "false",
     }
-    if llm_gateway:
-        env_vars["LLM_GATEWAY"] = llm_gateway
     # Merge .phoenix-ide.env overrides (LLM_API_KEY_HELPER, base URLs, etc.)
     if extra_env:
         env_vars.update(extra_env)
@@ -6779,14 +6703,11 @@ def launchd_prod_deploy(version: str | None = None):
         check=True,
     )
 
-    # Load .phoenix-ide.env and detect LLM gateway
+    # Load .phoenix-ide.env and LLM configuration
     env_overrides: dict[str, str] = {}
     env_file = _load_env_file(env_overrides)
     if env_file:
         print(f"  Loaded env from {env_file}")
-
-    # Auto-detect gateway only if the env file didn't already provide LLM config
-    gateway = None if _env_provides_llm_config(env_overrides) else get_llm_gateway()
 
     # Capture login-shell PATH so the launchd service sees user-installed
     # tools (uv, gh, node, …). launchd's default PATH is just
@@ -6796,7 +6717,7 @@ def launchd_prod_deploy(version: str | None = None):
     print_launchd_path_report(path_str, path_source)
 
     # Generate and write plist
-    plist_content = generate_launchd_plist(version, gateway, env_overrides, path_override=path_str)
+    plist_content = generate_launchd_plist(version, extra_env=env_overrides, path_override=path_str)
     LAUNCHD_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     LAUNCHD_PLIST_PATH.write_text(plist_content)
 
@@ -6816,7 +6737,7 @@ def launchd_prod_deploy(version: str | None = None):
         print("WARNING: Server started but health check failed after 20s", file=sys.stderr)
 
     write_deployed_sha()
-    llm_mode = _llm_mode_summary(env_overrides, gateway)
+    llm_mode = _llm_mode_summary(env_overrides)
     print(f"\n✓ Deployed {version} to production (launchd)")
     print(f"  Version: {health_version or 'unknown'}")
     print(f"  Startup: {elapsed:.1f}s")

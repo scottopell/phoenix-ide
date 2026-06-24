@@ -124,7 +124,7 @@ Mid-QA on a sub-agent's commit you spot drift in a file that was out of their sc
 
 ### Development
 
-**Always use `./dev.py`** — it configures LLM gateway automatically.
+**Always use `./dev.py`** — it configures the LLM environment automatically.
 
 ```bash
 ./dev.py up          # Build and start Phoenix + Vite (auto-seeds DB if empty)
@@ -151,7 +151,7 @@ Each git worktree gets unique ports and a database automatically. Servers orphan
 
 **Logs:** Dev server logs to `phoenix.log` in the project root. Production logs to `~/.phoenix-ide/prod.log`.
 
-⚠️ Do NOT use `cargo run` directly—server needs LLM gateway config from `./dev.py` via `.phoenix-ide.env` and/or `.phoenix-ide.dev.env`
+⚠️ Do NOT use `cargo run` directly—server needs LLM config from `./dev.py` via `.phoenix-ide.env` and/or `.phoenix-ide.dev.env`
 
 #### Node + pnpm
 

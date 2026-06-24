@@ -112,7 +112,7 @@ AND exit without sending a message
 WHEN `--model` is used with `--conversation` (continuing existing conversation)
 THE SYSTEM SHALL ignore the `--model` flag (model is fixed at creation time)
 
-**Rationale:** Agents and developers need to select specific models without using the web UI. Listing models enables discovery of what's available through the current LLM gateway.
+**Rationale:** Agents and developers need to select specific models without using the web UI. Listing models enables discovery of what's available through the current LLM configuration.
 
 ---
 

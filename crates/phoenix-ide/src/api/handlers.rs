@@ -24,11 +24,11 @@ use super::types::{
     ConversationListResponse, ConversationResponse, ConversationWithMessagesResponse,
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
-    FileViewerKind, GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse,
-    ModelsResponse, NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery,
-    ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse,
-    SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse, TaskCountQuery,
-    TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
+    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
+    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
+    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
+    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -39,7 +39,6 @@ use crate::git_ops::{
 };
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
-use phoenix_llm::GatewayStatus;
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -4787,14 +4786,7 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
     // Get model metadata from registry
     let models = state.llm_registry.available_model_info();
 
-    let gateway_status = match state.llm_registry.gateway_status {
-        GatewayStatus::NotConfigured => GatewayStatusApi::NotConfigured,
-        GatewayStatus::Healthy => GatewayStatusApi::Healthy,
-        GatewayStatus::Unreachable => GatewayStatusApi::Unreachable,
-    };
-
-    let llm_configured = state.llm_registry.has_models()
-        || state.llm_registry.gateway_status != GatewayStatus::NotConfigured;
+    let llm_configured = state.llm_registry.has_models();
 
     let credential_status = if let Some(ref hs) = state.credential_helper {
         use phoenix_llm::CredentialStatus;
@@ -4813,7 +4805,6 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
     Json(ModelsResponse {
         models,
         default: state.llm_registry.default_model_id().to_string(),
-        gateway_status,
         llm_configured,
         credential_status,
     })

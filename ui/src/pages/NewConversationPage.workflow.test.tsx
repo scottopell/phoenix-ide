@@ -10,7 +10,6 @@ const originalFetch = globalThis.fetch;
 const modelResponse = {
   models: [{ id: 'claude-3-5-sonnet', provider: 'anthropic', recommended: true }],
   default: 'claude-3-5-sonnet',
-  gateway_status: 'healthy',
   llm_configured: true,
   credential_status: 'valid',
 };

@@ -47,18 +47,7 @@ export function LlmStatusBanner({ models }: LlmStatusBannerProps) {
           >
             Sign in with Codex
           </button>
-          {', '}or set <code>ANTHROPIC_API_KEY</code> / <code>LLM_GATEWAY</code> and restart.
-        </span>
-      </div>
-    );
-  }
-
-  if (models.gateway_status === 'unreachable') {
-    return (
-      <div className="llm-status-banner llm-status-banner--warning">
-        <span className="llm-status-banner__icon">!</span>
-        <span className="llm-status-banner__text">
-          LLM gateway unreachable. Start your gateway and refresh.
+          {', '}or set <code>ANTHROPIC_API_KEY</code> / <code>OPENAI_API_KEY</code> and restart.
         </span>
       </div>
     );

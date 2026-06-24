@@ -624,12 +624,13 @@ impl LlmService for LoggingService {
 pub struct LlmConfig {
     pub anthropic_api_key: Option<String>,
     pub openai_api_key: Option<String>,
-    pub fireworks_api_key: Option<String>,
-    pub gemini_api_key: Option<String>,
-    
-    /// exe.dev gateway URL (e.g., "https://meteor-rain.exe.xyz")
-    pub gateway: Option<String>,
-    
+
+    /// Exact Anthropic Messages-compatible endpoint override.
+    pub anthropic_base_url: Option<String>,
+
+    /// Exact OpenAI Responses-compatible endpoint override.
+    pub openai_base_url: Option<String>,
+
     /// Default model ID
     pub default_model: Option<String>,
 }
@@ -639,9 +640,8 @@ impl LlmConfig {
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
             openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
-            fireworks_api_key: std::env::var("FIREWORKS_API_KEY").ok(),
-            gemini_api_key: std::env::var("GEMINI_API_KEY").ok(),
-            gateway: std::env::var("LLM_GATEWAY").ok(),
+            anthropic_base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
+            openai_base_url: std::env::var("OPENAI_BASE_URL").ok(),
             default_model: std::env::var("DEFAULT_MODEL").ok(),
         }
     }

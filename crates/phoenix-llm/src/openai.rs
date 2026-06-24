@@ -19,16 +19,12 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// Determine the full endpoint URL.
-/// Priority: `base_url_override` (used as-is) > `gateway` > provider default.
-fn resolve_endpoint(gateway: Option<&str>, base_url_override: Option<&str>) -> String {
-    if let Some(url) = base_url_override {
-        return url.to_string();
-    }
-
-    match gateway {
-        Some(gw) => format!("{}/openai/v1/responses", gw.trim_end_matches('/')),
-        None => "https://api.openai.com/v1/responses".to_string(),
-    }
+/// Priority: `base_url_override` (used as-is) > provider default.
+fn resolve_endpoint(base_url_override: Option<&str>) -> String {
+    base_url_override.map_or_else(
+        || "https://api.openai.com/v1/responses".to_string(),
+        std::string::ToString::to_string,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -59,7 +55,6 @@ fn apply_source_header(
 pub async fn complete(
     spec: &ModelSpec,
     api_key: &str,
-    gateway: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
     request_tags: &BTreeMap<String, String>,
@@ -71,7 +66,6 @@ pub async fn complete(
         return complete_streaming(
             spec,
             api_key,
-            gateway,
             base_url_override,
             custom_headers,
             request_tags,
@@ -82,7 +76,7 @@ pub async fn complete(
         .await;
     }
 
-    let url = resolve_endpoint(gateway, base_url_override);
+    let url = resolve_endpoint(base_url_override);
     let mut responses_request =
         translate_to_responses_request(&spec.api_name, request, use_codex_backend);
     if !request_tags.is_empty() {
@@ -468,7 +462,6 @@ impl ResponsesStreamAccumulator {
 pub async fn complete_streaming(
     spec: &ModelSpec,
     api_key: &str,
-    gateway: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
     request_tags: &BTreeMap<String, String>,
@@ -478,7 +471,7 @@ pub async fn complete_streaming(
 ) -> Result<LlmResponse, LlmError> {
     use futures::StreamExt;
 
-    let url = resolve_endpoint(gateway, base_url_override);
+    let url = resolve_endpoint(base_url_override);
     let mut responses_request =
         translate_to_responses_request(&spec.api_name, request, use_codex_backend);
     responses_request.stream = Some(true);

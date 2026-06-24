@@ -667,7 +667,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "LLM registry initialized"
         );
     } else {
-        tracing::warn!("No LLM API keys configured. Set ANTHROPIC_API_KEY, LLM_GATEWAY, or LLM_API_KEY_HELPER.");
+        tracing::warn!("No LLM API keys configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or LLM_API_KEY_HELPER.");
     }
 
     // Detect platform sandboxing capability (REQ-PROJ-013)

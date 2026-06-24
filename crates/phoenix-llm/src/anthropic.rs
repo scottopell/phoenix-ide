@@ -320,10 +320,6 @@ fn parse_anthropic_sse_error(v: &serde_json::Value) -> LlmError {
     }
 }
 
-/// Resolve the Anthropic endpoint URL with priority:
-/// 1. `base_url_override` (`ANTHROPIC_BASE_URL`) — used as-is, no path appended
-/// 2. `gateway` (`LLM_GATEWAY`) — appends `/anthropic/v1/messages`
-/// 3. Default: `https://api.anthropic.com/v1/messages`
 fn has_custom_source_header(custom_headers: &[(String, String)]) -> bool {
     custom_headers
         .iter()
@@ -343,14 +339,11 @@ fn apply_source_header(
     builder
 }
 
-fn resolve_anthropic_url(gateway: Option<&str>, base_url_override: Option<&str>) -> String {
+fn resolve_anthropic_url(base_url_override: Option<&str>) -> String {
     if let Some(url) = base_url_override {
         url.to_string()
     } else {
-        match gateway {
-            Some(gw) => format!("{}/anthropic/v1/messages", gw.trim_end_matches('/')),
-            None => "https://api.anthropic.com/v1/messages".to_string(),
-        }
+        "https://api.anthropic.com/v1/messages".to_string()
     }
 }
 
@@ -362,7 +355,6 @@ fn resolve_anthropic_url(gateway: Option<&str>, base_url_override: Option<&str>)
 pub async fn complete_streaming(
     spec: &ModelSpec,
     auth: &super::ResolvedAuth,
-    gateway: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
     request_tags: &BTreeMap<String, String>,
@@ -371,7 +363,7 @@ pub async fn complete_streaming(
 ) -> Result<LlmResponse, LlmError> {
     use futures::StreamExt;
 
-    let base_url = resolve_anthropic_url(gateway, base_url_override);
+    let base_url = resolve_anthropic_url(base_url_override);
     let client = Client::builder()
         .timeout(Duration::from_mins(10))
         .build()
@@ -457,13 +449,12 @@ pub async fn complete_streaming(
 pub async fn complete(
     spec: &ModelSpec,
     auth: &super::ResolvedAuth,
-    gateway: Option<&str>,
     base_url_override: Option<&str>,
     custom_headers: &[(String, String)],
     request_tags: &BTreeMap<String, String>,
     request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
-    let base_url = resolve_anthropic_url(gateway, base_url_override);
+    let base_url = resolve_anthropic_url(base_url_override);
 
     let client = Client::builder()
         .timeout(Duration::from_mins(5))
@@ -1107,15 +1098,14 @@ pub(crate) struct AnthropicUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ApiFormat, ModelSpec, Provider};
+    use crate::models::{ModelBackend, ModelSpec};
     use crate::types::{LlmRequest, PromptCacheKey, ToolDefinition};
 
     fn test_spec(supports_tool_search: bool) -> ModelSpec {
         ModelSpec {
             id: "test-model".into(),
             api_name: "test-model-api".into(),
-            provider: Provider::Anthropic,
-            api_format: ApiFormat::Anthropic,
+            backend: ModelBackend::Anthropic,
             description: "test".into(),
             context_window: 200_000,
             recommended: false,
@@ -1427,29 +1417,14 @@ mod tests {
 
     #[test]
     fn test_resolve_anthropic_url_override_takes_priority() {
-        let url = resolve_anthropic_url(
-            Some("http://gateway.local"),
-            Some("https://ai-gateway.us1.ddbuild.io/v1/messages"),
-        );
+        let url = resolve_anthropic_url(Some("https://ai-gateway.us1.ddbuild.io/v1/messages"));
         assert_eq!(url, "https://ai-gateway.us1.ddbuild.io/v1/messages");
     }
 
     #[test]
-    fn test_resolve_anthropic_url_gateway_fallback() {
-        let url = resolve_anthropic_url(Some("http://gateway.local"), None);
-        assert_eq!(url, "http://gateway.local/anthropic/v1/messages");
-    }
-
-    #[test]
     fn test_resolve_anthropic_url_default() {
-        let url = resolve_anthropic_url(None, None);
+        let url = resolve_anthropic_url(None);
         assert_eq!(url, "https://api.anthropic.com/v1/messages");
-    }
-
-    #[test]
-    fn test_resolve_anthropic_url_trailing_slash_stripped() {
-        let url = resolve_anthropic_url(Some("http://gateway.local/"), None);
-        assert_eq!(url, "http://gateway.local/anthropic/v1/messages");
     }
 
     #[test]

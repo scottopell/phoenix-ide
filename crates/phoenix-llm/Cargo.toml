@@ -3,7 +3,7 @@ name = "phoenix-llm"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.94"
-description = "LLM provider abstraction for Phoenix IDE: the LlmService trait plus Anthropic, OpenAI, codex-bridge, and mock providers, the model registry, credential/gateway resolution, and SSE stream parsing. Depends only on phoenix-core — no axum/HTTP handler glue beyond the self-contained codex OAuth callback server."
+description = "LLM provider abstraction for Phoenix IDE: the LlmService trait plus Anthropic, OpenAI, codex-bridge, and mock providers, the model registry, credential/base URL resolution, and SSE stream parsing. Depends only on phoenix-core — no axum/HTTP handler glue beyond the self-contained codex OAuth callback server."
 
 [lib]
 path = "src/lib.rs"

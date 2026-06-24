@@ -2,57 +2,37 @@
 //!
 //! Provides a common interface for interacting with various LLM providers.
 //!
-//! # Gateway Contract
+//! Phoenix supports direct provider APIs and provider-compatible endpoints via
+//! `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`. A configured base URL is used as-is;
+//! Phoenix does not append provider paths.
 //!
-//! Phoenix supports an optional LLM gateway (`LLM_GATEWAY` env var) that proxies
-//! requests to upstream providers. The primary supported gateway is the exe.dev
-//! built-in gateway at `http://169.254.169.254/gateway/llm`.
+//! ## Backend contract
 //!
-//! ## URL construction
-//!
-//! Given `LLM_GATEWAY=http://host/gateway/llm`, Phoenix constructs request URLs as:
-//!
-//! | Provider    | URL                                                      |
-//! |-------------|----------------------------------------------------------|
-//! | `Anthropic` | `{gateway}/anthropic/v1/messages`                        |
-//! | `OpenAI`    | `{gateway}/openai/v1/responses`                          |
-//!
-//! The first path segment after the gateway base is an **origin alias** that the
-//! gateway uses to route to the correct upstream provider. Known aliases:
-//! `anthropic`, `openai`.
-//!
-//! Note: the exe.dev gateway also supports an alternative path convention
-//! `{gateway}/_/gateway/{provider}/...` (used by the Shelley Go agent). Phoenix
-//! uses the shorter form. Both resolve to the same upstream.
+//! Each model has a [`ModelBackend`] that couples the route/auth family with the
+//! wire protocol. `ModelBackend::Anthropic` uses Anthropic Messages-compatible
+//! requests. `ModelBackend::OpenAIResponses` uses `OpenAI` Responses-compatible
+//! requests. Externally configured models use the same backend values, so the
+//! config says what Phoenix should speak rather than who hosts the model.
 //!
 //! ## Authentication
 //!
-//! When a gateway is configured, Phoenix sends `x-api-key: implicit` (Anthropic)
-//! or `Authorization: Bearer implicit` (`OpenAI`). The gateway handles
-//! real API key injection.
+//! Direct Anthropic calls use `x-api-key` unless `LLM_AUTH_HEADER=bearer` is set
+//! for helper-issued tokens. `OpenAI` Responses calls use bearer auth. The
+//! ChatGPT/Codex bridge only applies to built-in `OpenAI` Responses models.
 //!
 //! ## Discovery
 //!
-//! On startup, Phoenix probes `{gateway}/_proxy/status` for reachability, then
-//! queries `{gateway}/{provider}/v1/models` for each provider to discover
-//! available models. See [`discovery`] module.
+//! With `LLM_API_KEY_HELPER` and base URL overrides, Phoenix derives `/v1/models`
+//! URLs from those base URLs and filters the configured model set to discovered
+//! IDs when possible. Discovery is opportunistic: if listing is unavailable,
+//! Phoenix falls back to the configured model set.
 //!
 //! ## Streaming
 //!
 //! All streaming requests use `Transfer-Encoding: chunked` with
-//! `Content-Type: text/event-stream`. The gateway proxies SSE events from the
-//! upstream provider. Phoenix parses these with [`sse::SseParser`] which handles
+//! `Content-Type: text/event-stream`. Phoenix parses SSE events with
 //! chunk-boundary splits, bare `\r` line endings, and multi-line `data:` fields.
 //!
-//! ### Known issue: intermittent SSE corruption
-//!
-//! The exe.dev gateway has a known intermittent bug where SSE events are
-//! corrupted during long streams (~500+ chunks). Symptoms: two SSE events
-//! smashed together mid-JSON, or bytes dropped from event boundaries.
-//! Likely cause: chunked transfer-encoding reassembly in the gateway proxy.
-//! See task 594 for tracking. The `SseParser` includes diagnostic dump
-//! capability (`diagnostic_dump()`) to capture raw bytes when parse failures
-//! occur, aiding diagnosis.
 
 mod anthropic;
 pub mod codex_credential;
@@ -72,7 +52,7 @@ pub(crate) mod sse;
 
 pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
-pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
+pub use discovery::{discover_models, DiscoveryConfig};
 pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // AutoRetryPolicy / UserResumePolicy live in phoenix-core
 // (phoenix_core::domain::retry_policy) and are not re-exported here: nothing
@@ -82,16 +62,14 @@ pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.
 pub use models::{
-    all_models, merge_model_specs, parse_external_models, ModelInfo, ModelSource, ModelSpec,
-    Provider,
+    all_models, merge_model_specs, parse_external_models, ModelBackend, ModelInfo, ModelSource,
+    ModelSpec,
 };
 #[allow(unused_imports)]
 pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
 #[allow(unused_imports)]
 // CredentialSource + ResolvedAuth + AuthStyle: public API for downstream consumers
-pub use registry::{
-    AuthStyle, CredentialSource, GatewayStatus, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth,
-};
+pub use registry::{AuthStyle, CredentialSource, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth};
 pub use service::LlmServiceImpl;
 // `types` (ContentBlock, Usage, ImageSource, …) live in phoenix-core. Alias
 // the module back as `types` and glob-re-export so both `phoenix_llm::types::X`
@@ -139,7 +117,7 @@ pub trait LlmService: Send + Sync {
     /// True if this service routes through the ChatGPT-backend codex bridge.
     /// Consumed by [`crate::ModelSpec::context_window_for`] to apply the
     /// bridge's 272K cap regardless of the model's platform-API ceiling.
-    /// Default `false` covers Anthropic, mock, and gateway/direct `OpenAI`.
+    /// Default `false` covers Anthropic, mock, and direct `OpenAI`.
     fn uses_codex_bridge(&self) -> bool {
         false
     }

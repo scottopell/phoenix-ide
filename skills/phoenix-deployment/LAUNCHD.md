@@ -58,7 +58,7 @@ Using launchd-provided TCP listener
 
 ## LLM config
 
-`./dev.py prod deploy` reads `.phoenix-ide.env` from the **repo root** of the checkout you deploy from (via `_load_env_file`) and bakes those vars into the launchd plist. If it provides any LLM config — `LLM_API_KEY_HELPER`, `LLM_GATEWAY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` — the deploy uses that and does not auto-detect. Otherwise it auto-detects a local LLM gateway, mirroring dev mode.
+`./dev.py prod deploy` reads `.phoenix-ide.env` from the **repo root** of the checkout you deploy from (via `_load_env_file`) and bakes those vars into the launchd plist. If it provides any LLM config — `LLM_API_KEY_HELPER`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or Codex auth — the deploy uses that configuration.
 
 ## Environment overrides
 

@@ -20,54 +20,50 @@ AND include usage statistics when available
 
 ---
 
-### REQ-LLM-002: Gateway Support
+### REQ-LLM-002: Backend-compatible endpoint support
 
-WHEN exe.dev gateway URL is configured
-THE SYSTEM SHALL route all LLM requests through the gateway
-AND append provider-specific path suffixes
+WHEN an Anthropic or OpenAI-compatible base URL is configured
+THE SYSTEM SHALL use the configured URL as the exact request endpoint
+AND SHALL NOT append hidden provider-specific path suffixes
 
-WHEN gateway is not configured
+WHEN no base URL override is configured
 THE SYSTEM SHALL connect directly to provider APIs
 
-**Rationale:** exe.dev environment provides a gateway that handles API keys and routing, simplifying deployment.
+**Rationale:** Explicit endpoint URLs keep deployment configuration honest and avoid legacy gateway-root path construction.
 
 ---
 
 ### REQ-LLM-003: Model Registry
 
 WHEN server starts with direct API access
-THE SYSTEM SHALL enumerate available models based on configured API keys
+THE SYSTEM SHALL enumerate available models based on configured API keys and base URL overrides
 AND make unavailable models inaccessible
 
-WHEN server starts with gateway configured
-THE SYSTEM SHALL query gateway model listing endpoints at startup
-AND merge discovered models with hardcoded metadata
-AND fall back to hardcoded list if gateway doesn't support model listing
+WHEN server starts with credential-helper auth and provider-compatible base URLs
+THE SYSTEM SHALL query model listing endpoints derived from those base URLs when possible
+AND filter configured models against discovered IDs
+AND fall back to the configured model list if model listing is unavailable or unhelpful
 
 WHEN client requests model list
 THE SYSTEM SHALL return only models that are currently available
 
-**Rationale:** Dynamic discovery from gateway enables new models to appear automatically without code changes. Hardcoded fallback ensures Phoenix works with minimal gateways or direct API mode.
+**Rationale:** Opportunistic discovery from exact endpoint overrides lets configured models be validated without making model listing mandatory.
 
 ---
 
 ### REQ-LLM-003a: Model Discovery
 
-WHEN querying gateway for model list
-THE SYSTEM SHALL request from provider-specific endpoints:
-- `{gateway}/anthropic/v1/models` (requires `anthropic-version` header)
-- `{gateway}/openai/v1/models`
-- `{gateway}/fireworks/inference/v1/models`
+WHEN deriving a model-list URL from a provider-compatible base URL
+THE SYSTEM SHALL replace the final path segment with `models`
 
-WHEN gateway returns models
-THE SYSTEM SHALL extract model IDs and metadata (context_length, capabilities)
-AND merge with hardcoded descriptions and defaults
+WHEN a model-list endpoint returns models
+THE SYSTEM SHALL match discovered IDs against configured model IDs, wire model names, and backend-prefixed aliases
 
-WHEN gateway endpoint returns 404 or error
-THE SYSTEM SHALL fall back to hardcoded model list
+WHEN model-list discovery returns no usable configured models
+THE SYSTEM SHALL fall back to the configured model list
 AND log warning about fallback
 
-**Rationale:** Provider-specific endpoints return different metadata formats. Graceful degradation ensures Phoenix works regardless of gateway capabilities.
+**Rationale:** Model listing is a validation aid, not a required deployment dependency.
 
 ---
 

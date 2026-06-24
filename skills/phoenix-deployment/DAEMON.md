@@ -13,13 +13,13 @@ Applies when: Linux without systemd (containers, workspaces, VMs without systemd
 
 ## LLM configuration
 
-`deploy` probes for a gateway in this order:
-1. `LLM_GATEWAY` env var (if set)
-2. Local proxy at `http://127.0.0.1:8462`
-3. Link-local gateway at `http://169.254.169.254/gateway/llm`
-4. Falls back to `ANTHROPIC_API_KEY` env var
+Configure LLM access with `.phoenix-ide.env` before deployment. Common options:
 
-If none are available, deploy exits with an error. Set `ANTHROPIC_API_KEY` before deploying.
+1. `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`
+2. `LLM_API_KEY_HELPER` with `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` for provider-compatible endpoints
+3. In-app Codex login for ChatGPT/Codex-backed OpenAI models
+
+If none are available, deploy exits with an error. Set an API key, helper, or Codex auth before deploying.
 
 ## Checking status
 

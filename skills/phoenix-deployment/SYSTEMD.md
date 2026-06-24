@@ -10,7 +10,7 @@ Applies when: Linux with systemd available.
 | Database | `/var/lib/phoenix-ide/prod.db` |
 | Service name | `phoenix-ide` |
 | Socket unit | `phoenix-ide.socket` (zero-downtime upgrades) |
-| LLM config | `LLM_GATEWAY` env var in systemd unit |
+| LLM config | API keys, helper/base URL overrides, or Codex auth in service env |
 
 ## Service user
 

@@ -371,18 +371,6 @@ pub struct FileErrorResponse {
 // against the same struct the registry produces.
 pub use phoenix_llm::ModelInfo;
 
-/// Gateway reachability status surfaced to the frontend
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GatewayStatusApi {
-    /// No gateway is configured; running in direct API-key mode
-    NotConfigured,
-    /// Gateway is configured and was reachable at startup
-    Healthy,
-    /// Gateway is configured but was unreachable at startup
-    Unreachable,
-}
-
 /// Credential helper status surfaced to the frontend
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -404,9 +392,7 @@ pub enum CredentialStatusApi {
 pub struct ModelsResponse {
     pub models: Vec<ModelInfo>,
     pub default: String,
-    /// Gateway reachability status determined at startup
-    pub gateway_status: GatewayStatusApi,
-    /// True when at least one LLM provider is configured (gateway or direct key)
+    /// True when at least one LLM provider is configured.
     pub llm_configured: bool,
     /// Credential helper status (only meaningful when helper is configured).
     pub credential_status: CredentialStatusApi,

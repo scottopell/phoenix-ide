@@ -7,7 +7,7 @@ description: Development workflow and code conventions for Phoenix IDE. Use when
 
 ## Server Management
 
-**Always use `./dev.py` — never `cargo run` directly.** It configures the LLM gateway automatically.
+**Always use `./dev.py` — never `cargo run` directly.** It configures the LLM environment automatically.
 
 ```bash
 ./dev.py up          # Build and start Phoenix + Vite dev servers

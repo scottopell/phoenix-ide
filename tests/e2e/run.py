@@ -104,7 +104,6 @@ def _server():
     for k in (
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
-        "LLM_GATEWAY",
         "LLM_API_KEY_HELPER",
         "OPENAI_USE_CODEX_AUTH",
         "PHOENIX_PASSWORD",
