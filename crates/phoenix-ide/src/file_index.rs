@@ -260,6 +260,14 @@ struct WorkspaceActor {
     workspace_id: WorkspaceId,
     root: PathBuf,
     state: WorkspaceState,
+    /// Set once `request_self_invalidate` has been called. Suppresses
+    /// further event handling and additional invalidate requests while
+    /// the actor drains its command channel until shutdown. Without
+    /// this, every event arriving in the window between
+    /// `request_self_invalidate` and the matching `Shutdown` on
+    /// `commands_rx` would spawn another invalidate task — idempotent
+    /// but wasteful.
+    invalidating: bool,
     commands_rx: mpsc::Receiver<WorkspaceCommand>,
     events_rx: mpsc::Receiver<DebouncedEvent>,
     /// Held so the actor can subscribe to additional directories on a
@@ -317,6 +325,7 @@ impl WorkspaceActor {
             workspace_id,
             root,
             state: WorkspaceState::Loading,
+            invalidating: false,
             commands_rx,
             events_rx,
             events_tx,
@@ -353,6 +362,9 @@ impl WorkspaceActor {
                     }
                 }
                 Some(()) = self.rescan_signal_rx.recv() => {
+                    if self.invalidating {
+                        continue;
+                    }
                     // The debouncer told us it had to drop events under
                     // backpressure. Re-bootstrap so the index reconverges
                     // instead of serving stale data.
@@ -369,6 +381,13 @@ impl WorkspaceActor {
                         // as frozen.
                         continue;
                     };
+                    if self.invalidating {
+                        // Already self-invalidated. Draining commands
+                        // until Shutdown — further events would re-fire
+                        // request_self_invalidate without changing the
+                        // outcome.
+                        continue;
+                    }
                     if let Err(e) = self.handle_event(event).await {
                         tracing::debug!(?e, root = ?self.root, "file-index event handling failed");
                     }
@@ -405,21 +424,29 @@ impl WorkspaceActor {
         let mut watched_dirs = HashSet::new();
         let mut watch_failures = 0usize;
         for dir in &dirs {
-            if self.subscribe_dir(dir.clone()).await {
+            if self
+                .subscribe_dir(dir.clone(), SubscriptionKind::Workspace)
+                .await
+            {
                 watched_dirs.insert(dir.clone());
             } else {
                 watch_failures += 1;
             }
         }
 
-        // Register a direct watch on `.git/info/` (the bootstrap walker
-        // filter_entry skips `.git/`, so without an explicit watch
-        // edits to `.git/info/exclude` would never produce events). For
-        // linked worktrees the exclude lives at a different gitdir; the
-        // resolution and watch registration happen in `bootstrap_excludes`.
+        // Watch the `info/exclude` directory so edits to local git
+        // excludes invalidate the cached matcher. For linked worktrees
+        // this lives at a separate gitdir (`<common_gitdir>/worktrees/<name>/info`)
+        // and is OUTSIDE the workspace root — subscribed as
+        // `ExternalIgnoreWatch` so the debouncer's routing treats it
+        // distinctly from workspace-subtree subscriptions.
         let info_dir = bootstrap_excludes_dir(&self.root);
         if let Some(info_dir) = info_dir {
-            if info_dir.is_dir() && self.subscribe_dir(info_dir.clone()).await {
+            if info_dir.is_dir()
+                && self
+                    .subscribe_dir(info_dir.clone(), SubscriptionKind::ExternalIgnoreWatch)
+                    .await
+            {
                 watched_dirs.insert(info_dir);
             }
         }
@@ -495,7 +522,11 @@ impl WorkspaceActor {
     /// already dead the registry's dropped — we can just exit ourselves
     /// by closing our command channel. The Shutdown message we'll get
     /// back from the registry breaks the run loop cleanly.
-    fn request_self_invalidate(&self) {
+    fn request_self_invalidate(&mut self) {
+        if self.invalidating {
+            return;
+        }
+        self.invalidating = true;
         if let Some(registry) = self.registry.upgrade() {
             let root = self.root.clone();
             tokio::spawn(async move {
@@ -622,7 +653,10 @@ impl WorkspaceActor {
         }
 
         for dir in dirs_to_subscribe {
-            if self.subscribe_dir(dir.clone()).await {
+            if self
+                .subscribe_dir(dir.clone(), SubscriptionKind::Workspace)
+                .await
+            {
                 if let WorkspaceState::Ready { watched_dirs, .. } = &mut self.state {
                     watched_dirs.insert(dir);
                 }
@@ -681,7 +715,11 @@ impl WorkspaceActor {
             }
         }
         for dir in dirs_to_drop {
-            self.unsubscribe_dir(dir).await;
+            // Path-based removals only ever target workspace-subtree
+            // subscriptions; the external ignore-file watch lives
+            // outside `root` and is released wholesale via the
+            // `UnsubscribeAll` we send on actor shutdown.
+            self.unsubscribe_dir(dir, SubscriptionKind::Workspace).await;
         }
     }
 
@@ -726,13 +764,14 @@ impl WorkspaceActor {
     /// `fs.inotify.max_user_watches` exhaustion); callers must not
     /// record refused dirs as "covered" or the subtree would silently
     /// lose updates.
-    async fn subscribe_dir(&self, dir: PathBuf) -> bool {
+    async fn subscribe_dir(&self, dir: PathBuf, kind: SubscriptionKind) -> bool {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .debouncer_tx
             .send(DebouncerCommand::Subscribe {
                 dir: dir.clone(),
                 workspace_id: self.workspace_id,
+                kind,
                 sender: self.events_tx.clone(),
                 reply: reply_tx,
             })
@@ -755,12 +794,13 @@ impl WorkspaceActor {
         }
     }
 
-    async fn unsubscribe_dir(&self, dir: PathBuf) {
+    async fn unsubscribe_dir(&self, dir: PathBuf, kind: SubscriptionKind) {
         let _ = self
             .debouncer_tx
             .send(DebouncerCommand::Unsubscribe {
                 dir,
                 workspace_id: self.workspace_id,
+                kind,
             })
             .await;
     }
@@ -782,16 +822,39 @@ fn bootstrap_excludes_dir(root: &Path) -> Option<PathBuf> {
     Some(root.join(".git").join("info"))
 }
 
+/// What a directory subscription means for routing and lifetime.
+///
+/// `Workspace` — a directory under (or at) the workspace root that the
+/// bootstrap walk visited. Events here drive index inserts/removes via
+/// `apply_event`.
+///
+/// `ExternalIgnoreWatch` — a directory OUTSIDE the workspace root that
+/// holds the per-checkout `info/exclude` file (the gitdir's `info/`
+/// directory). For a linked git worktree this lives under the common
+/// gitdir, nowhere near the workspace. The workspace cares about exactly
+/// one signal from this dir — an edit to `info/exclude` — and the
+/// `event_touches_ignore_file` check inside `handle_event` handles that.
+/// All other events from this dir are filtered out by `path_is_indexable`.
+/// Stored in a separate table so a future routing optimization on the
+/// workspace-subtree path cannot accidentally drop these.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SubscriptionKind {
+    Workspace,
+    ExternalIgnoreWatch,
+}
+
 enum DebouncerCommand {
     Subscribe {
         dir: PathBuf,
         workspace_id: WorkspaceId,
+        kind: SubscriptionKind,
         sender: mpsc::Sender<DebouncedEvent>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Unsubscribe {
         dir: PathBuf,
         workspace_id: WorkspaceId,
+        kind: SubscriptionKind,
     },
     UnsubscribeAll {
         workspace_id: WorkspaceId,
@@ -810,10 +873,21 @@ enum DebouncerCommand {
 
 struct DebouncerActor {
     debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
-    /// Refcounted subscription table: directory -> set of (`workspace_id`,
-    /// sender). When the inner map empties we call `unwatch(dir)` so the
-    /// kernel inotify watch is released.
-    subscriptions: HashMap<PathBuf, HashMap<WorkspaceId, mpsc::Sender<DebouncedEvent>>>,
+    /// Refcounted workspace-subtree subscriptions: each entry is a
+    /// directory at or under some workspace root. Routed and refcounted
+    /// identically to `external_subscriptions`; kept separate so the
+    /// distinct lifetimes (subtree dirs come and go with directory
+    /// create/remove events; external watches only release on
+    /// `UnsubscribeAll`) and the distinct anchor invariant (subtree dirs
+    /// share their workspace's root prefix; external watches don't) are
+    /// visible to anyone reading the type.
+    workspace_subscriptions: HashMap<PathBuf, HashMap<WorkspaceId, mpsc::Sender<DebouncedEvent>>>,
+    /// Refcounted external watches — directories holding gitdir
+    /// `info/exclude` files for linked worktrees. These live OUTSIDE
+    /// the workspace root, so any routing optimization that assumes
+    /// "subscribed dir starts with workspace root" must consult this
+    /// table separately. See [`SubscriptionKind::ExternalIgnoreWatch`].
+    external_subscriptions: HashMap<PathBuf, HashMap<WorkspaceId, mpsc::Sender<DebouncedEvent>>>,
     /// Per-workspace cap-1 signal channels. Fired when `try_send` to the
     /// workspace's events channel returns Full — the workspace then
     /// self-invalidates so the index reconverges. Lives until the
@@ -866,7 +940,8 @@ impl DebouncerActor {
 
         let mut actor = Self {
             debouncer,
-            subscriptions: HashMap::new(),
+            workspace_subscriptions: HashMap::new(),
+            external_subscriptions: HashMap::new(),
             rescan_signals: HashMap::new(),
         };
 
@@ -884,19 +959,32 @@ impl DebouncerActor {
             DebouncerCommand::Subscribe {
                 dir,
                 workspace_id,
+                kind,
                 sender,
                 reply,
             } => {
-                let result = self.subscribe(&dir, workspace_id, sender);
+                let result = self.subscribe(&dir, workspace_id, kind, sender);
                 let _ = reply.send(result);
             }
-            DebouncerCommand::Unsubscribe { dir, workspace_id } => {
-                self.unsubscribe(&dir, workspace_id);
+            DebouncerCommand::Unsubscribe {
+                dir,
+                workspace_id,
+                kind,
+            } => {
+                self.unsubscribe(&dir, workspace_id, kind);
             }
             DebouncerCommand::UnsubscribeAll { workspace_id } => {
-                let dirs: Vec<PathBuf> = self.subscriptions.keys().cloned().collect();
-                for dir in dirs {
-                    self.unsubscribe(&dir, workspace_id);
+                // Release the workspace's subscriptions across both
+                // tables — workspace-subtree watches and any external
+                // ignore watch — so a shutting-down actor doesn't leave
+                // kernel watches behind.
+                let ws_dirs: Vec<PathBuf> = self.workspace_subscriptions.keys().cloned().collect();
+                for dir in ws_dirs {
+                    self.unsubscribe(&dir, workspace_id, SubscriptionKind::Workspace);
+                }
+                let ext_dirs: Vec<PathBuf> = self.external_subscriptions.keys().cloned().collect();
+                for dir in ext_dirs {
+                    self.unsubscribe(&dir, workspace_id, SubscriptionKind::ExternalIgnoreWatch);
                 }
                 self.rescan_signals.remove(&workspace_id);
             }
@@ -912,13 +1000,25 @@ impl DebouncerActor {
         }
     }
 
+    fn table_for_mut(
+        &mut self,
+        kind: SubscriptionKind,
+    ) -> &mut HashMap<PathBuf, HashMap<WorkspaceId, mpsc::Sender<DebouncedEvent>>> {
+        match kind {
+            SubscriptionKind::Workspace => &mut self.workspace_subscriptions,
+            SubscriptionKind::ExternalIgnoreWatch => &mut self.external_subscriptions,
+        }
+    }
+
     fn subscribe(
         &mut self,
         dir: &Path,
         workspace_id: WorkspaceId,
+        kind: SubscriptionKind,
         sender: mpsc::Sender<DebouncedEvent>,
     ) -> Result<(), String> {
-        let entry = self.subscriptions.entry(dir.to_path_buf());
+        let table = self.table_for_mut(kind);
+        let entry = table.entry(dir.to_path_buf());
         let first_subscriber = matches!(entry, std::collections::hash_map::Entry::Vacant(_));
         let subs = entry.or_default();
         let prior = subs.insert(workspace_id, sender);
@@ -926,22 +1026,23 @@ impl DebouncerActor {
         if first_subscriber {
             if let Err(e) = self.debouncer.watch(dir, RecursiveMode::NonRecursive) {
                 // Roll back the insertion so refcount stays honest.
-                self.subscriptions.remove(dir);
+                self.table_for_mut(kind).remove(dir);
                 return Err(format!("{e}"));
             }
         } else if prior.is_none() {
-            tracing::trace!(?dir, "additional file-index workspace subscribed");
+            tracing::trace!(?dir, ?kind, "additional file-index workspace subscribed");
         }
         Ok(())
     }
 
-    fn unsubscribe(&mut self, dir: &Path, workspace_id: WorkspaceId) {
-        let Some(subs) = self.subscriptions.get_mut(dir) else {
+    fn unsubscribe(&mut self, dir: &Path, workspace_id: WorkspaceId, kind: SubscriptionKind) {
+        let table = self.table_for_mut(kind);
+        let Some(subs) = table.get_mut(dir) else {
             return;
         };
         subs.remove(&workspace_id);
         if subs.is_empty() {
-            self.subscriptions.remove(dir);
+            table.remove(dir);
             let _ = self.debouncer.unwatch(dir);
         }
     }
@@ -963,24 +1064,28 @@ impl DebouncerActor {
         // blocking every other workspace. Whenever a drop happens we
         // fire the per-workspace rescan signal so the actor re-bootstraps
         // instead of serving a silently divergent index.
+        //
+        // Routing must consult BOTH subscription tables: workspace-subtree
+        // subscriptions share the workspace's root prefix and could be
+        // indexed for faster lookup; external-ignore-watch subscriptions
+        // (linked-worktree gitdirs) deliberately don't share that prefix.
+        // Iterate both unconditionally so the gitdir-info case isn't
+        // silently dropped by a future routing optimization.
         let mut dropped_for: HashSet<WorkspaceId> = HashSet::new();
         for event in events {
-            // Route by directory containment: an event's paths live
-            // *under* one or more subscribed directories. The direct
-            // hit (event's path's parent) is fast; we also consider
-            // ancestor directories so an event under a watched root
-            // reaches every workspace whose root prefixes the path.
             let event_paths = &event.event.paths;
             let mut routed: HashSet<WorkspaceId> = HashSet::new();
             for path in event_paths {
-                for (subscribed_dir, subs) in &self.subscriptions {
-                    if path.starts_with(subscribed_dir) {
-                        for (wid, sender) in subs {
-                            if routed.insert(*wid) {
-                                if let Err(mpsc::error::TrySendError::Full(_)) =
-                                    sender.try_send(event.clone())
-                                {
-                                    dropped_for.insert(*wid);
+                for table in [&self.workspace_subscriptions, &self.external_subscriptions] {
+                    for (subscribed_dir, subs) in table {
+                        if path.starts_with(subscribed_dir) {
+                            for (wid, sender) in subs {
+                                if routed.insert(*wid) {
+                                    if let Err(mpsc::error::TrySendError::Full(_)) =
+                                        sender.try_send(event.clone())
+                                    {
+                                        dropped_for.insert(*wid);
+                                    }
                                 }
                             }
                         }
@@ -2178,5 +2283,52 @@ mod tests {
     fn make_synthetic_create_event(path: PathBuf) -> DebouncedEvent {
         let event = notify::Event::new(notify::EventKind::Create(CreateKind::File)).add_path(path);
         DebouncedEvent::new(event, std::time::Instant::now())
+    }
+
+    /// Hazard H2 — once an actor self-invalidates, every event arriving
+    /// in the window before `Shutdown` lands on `commands_rx` used to
+    /// spawn another `invalidate_workspace` task. Idempotent (the
+    /// registry already removed the handle), but a flurry of subsequent
+    /// gitignore-touching events still produced N `tokio::spawn` calls.
+    /// The `invalidating` flag short-circuits subsequent triggers; this
+    /// test exercises it end-to-end by editing `.gitignore` several
+    /// times after the first edit takes effect, and asserts the actor
+    /// stops responding to events (no further re-spawns) instead of
+    /// continuing to bounce.
+    #[tokio::test]
+    async fn self_invalidate_is_idempotent_under_event_storm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_git(root);
+        write(&root.join(".gitignore"), "*.log\n");
+        write(&root.join("src/main.rs"), "");
+
+        let indexer = WorkspaceIndexer::new().await.unwrap();
+        let initial = search(&indexer, root, "").await;
+        assert!(initial.iter().any(|p| p == "src/main.rs"));
+
+        // Edit .gitignore many times in quick succession. The first
+        // edit triggers self-invalidate; subsequent edits arrive at the
+        // still-draining old actor. With the H2 flag they're no-ops; the
+        // important invariant is that the registry/state stays sane and
+        // the next search re-bootstraps cleanly.
+        for i in 0..20 {
+            write(&root.join(".gitignore"), &format!("*.log\n# {i}\n"));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Let any in-flight invalidation drain.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Create a new file and confirm the indexer is still healthy.
+        write(&root.join("src/added.rs"), "");
+        let saw = wait_for_path(&indexer, root, "added", Duration::from_secs(3), |results| {
+            results.iter().any(|p| p == "src/added.rs")
+        })
+        .await;
+        assert!(
+            saw,
+            "indexer wedged after event storm against an invalidating actor"
+        );
     }
 }
