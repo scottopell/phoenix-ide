@@ -629,6 +629,67 @@ describe('finalized code fence highlighting', () => {
     expect(copyToClipboard).toHaveBeenCalledWith(mermaidSource);
   });
 
+
+  it('renders short one-line assistant prose fully in compact mode', () => {
+    mockDensity = 'compact';
+
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-short-prose', [{
+            type: 'text',
+            text: 'Branch protection requires required checks first, so I’ll enable auto-merge for the approved PR and monitor it.',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.agent-text-block')).toBeInTheDocument();
+    expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
+  });
+
+  it('collapses one-line assistant prose that exceeds the compact preview limit', () => {
+    mockDensity = 'compact';
+    const text = 'A'.repeat(150);
+
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-long-preview-prose', [{
+            type: 'text',
+            text,
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.agent-text-collapsed')).toBeInTheDocument();
+    expect(container.querySelector('.agent-text-block')).not.toBeInTheDocument();
+    expect(screen.getByRole('button')).toHaveTextContent(`${'A'.repeat(139)}…`);
+  });
+
+  it('collapses short multi-line assistant prose when later lines are omitted', () => {
+    mockDensity = 'compact';
+
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-multiline-prose', [{
+            type: 'text',
+            text: 'First line summary.\n\nSecond line with more detail.',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.agent-text-collapsed')).toBeInTheDocument();
+    expect(container.querySelector('.agent-text-block')).not.toBeInTheDocument();
+    expect(screen.getByRole('button')).toHaveTextContent('First line summary.');
+  });
+
   it('renders short mermaid fences in compact mode instead of collapsing them', async () => {
     mockDensity = 'compact';
 
