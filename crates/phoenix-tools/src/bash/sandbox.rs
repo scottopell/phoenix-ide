@@ -200,9 +200,7 @@ fn inherited_path() -> OsString {
 }
 
 fn scratch_dir(scratch_root: &Path, protected_dirs: &[PathBuf]) -> std::io::Result<PathBuf> {
-    let scratch_root = scratch_root
-        .canonicalize()
-        .unwrap_or_else(|_| scratch_root.to_path_buf());
+    let scratch_root = canonicalize_existing_ancestor(scratch_root)?;
     if protected_dirs
         .iter()
         .any(|protected| paths_overlap(&scratch_root, protected))
@@ -216,6 +214,26 @@ fn scratch_dir(scratch_root: &Path, protected_dirs: &[PathBuf]) -> std::io::Resu
         ));
     }
     Ok(scratch_root.join(uuid::Uuid::new_v4().to_string()))
+}
+
+fn canonicalize_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    while !existing.exists() {
+        let Some(parent) = existing.parent() else {
+            return Ok(path.to_path_buf());
+        };
+        if let Some(name) = existing.file_name() {
+            missing.push(name.to_os_string());
+        }
+        existing = parent;
+    }
+
+    let mut canonical = existing.canonicalize()?;
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
 }
 
 fn platform_temp_dir(protected_dirs: &[PathBuf], scratch_dir: &Path, tmp_root: &Path) -> PathBuf {
@@ -382,5 +400,31 @@ mod tests {
 
         let err = scratch_dir(&scratch_root, &[repo.canonicalize().unwrap()]).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn scratch_dir_rejects_symlinked_root_inside_protected_repo() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let real_repo = temp.path().join("real-repo");
+        let link_repo = temp.path().join("link-repo");
+        std::fs::create_dir_all(&real_repo).expect("real repo");
+        make_symlink(&real_repo, &link_repo);
+        let scratch_root = link_repo
+            .join(".tmp")
+            .join("phoenix-ide")
+            .join("explore-bash");
+
+        let err = scratch_dir(&scratch_root, &[real_repo.canonicalize().unwrap()]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    fn make_symlink(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+    }
+
+    #[cfg(windows)]
+    fn make_symlink(target: &Path, link: &Path) {
+        std::os::windows::fs::symlink_dir(target, link).expect("symlink");
     }
 }
