@@ -940,6 +940,7 @@ describe('Mobile conversation list redesign', () => {
 
     expect(container.querySelector('.conv-chain-block')).toHaveClass('expanded');
     expect(container.querySelector('[data-id="active-leaf"]')).toHaveClass('active');
+    expect(container.querySelector('[data-id="active-leaf"] .conv-item-title')?.textContent).toBe('active-leaf');
     expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(2);
   });
 
@@ -980,6 +981,55 @@ describe('Mobile conversation list redesign', () => {
     );
 
     expect(container.querySelector('[data-id="context-full"] .conv-state-chip')?.textContent).toBe('Context full');
+  });
+
+  it('labels mobile question-blocked rows as needing a reply', () => {
+    const conv = makeConv('needs-reply', 'needs-reply', {
+      presentation_mode: 'needs_action',
+      state: { type: 'awaiting_user_response', questions: [] },
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[conv]} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-id="needs-reply"] .conv-state-chip')?.textContent).toBe('Needs reply');
+  });
+
+  it('mobile keyboard navigation targets collapsed chain summaries, not hidden history rows', () => {
+    const root = makeConv('kbd-root', 'kbd-root', {
+      continued_in_conv_id: 'kbd-leaf',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const leaf = makeConv('kbd-leaf', 'kbd-leaf', { updated_at: '2024-02-01T00:00:00Z' });
+    const onPath = vi.fn();
+
+    const { container } = render(
+      <MemoryRouter initialEntries={['/']}>
+        <Routes>
+          <Route path="*" element={(
+            <>
+              <ConversationList {...defaultProps} listDensity="mobile" conversations={[leaf, root]} />
+              <PathReader onPath={onPath} />
+            </>
+          )} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.conv-chain-block')).toHaveClass('collapsed');
+    expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(0);
+
+    fireEvent.keyDown(window, { key: 'j' });
+    expect(container.querySelector('.conv-chain-latest-summary')).toHaveClass('keyboard-selected');
+
+    fireEvent.keyDown(window, { key: 'Enter' });
+    const calls = onPath.mock.calls;
+    expect(calls[calls.length - 1]![0]).toBe('/c/kbd-leaf');
   });
 });
 

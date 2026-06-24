@@ -114,6 +114,7 @@ function compactContextLabel(conv: Conversation): string | null {
 
 function stateLabel(conv: Conversation, displayState: ReturnType<typeof getConvDisplayState>): string {
   if (conv.state?.type === 'context_exhausted' && conv.presentation_mode === 'needs_action') return 'Context full';
+  if (conv.state?.type === 'awaiting_user_response') return 'Needs reply';
   if (conv.presentation_mode === 'needs_action' || displayState === 'awaiting-approval') return 'Needs approval';
   if (displayState === 'working') return 'Working';
   if (displayState === 'error') return 'Error';
@@ -181,6 +182,9 @@ export const ConversationRow = memo(function ConversationRow({
 
   const contextLabel = compactContextLabel(conv);
   const visibleStateLabel = stateLabel(conv, displayState);
+  const shouldShowMobileChainTitle = isMobileList
+    && isChainMember
+    && (isCompactCompletedChainMember || isActive || isActionableDisplayState(displayState));
 
   return (
     <li className={classes} data-id={conv.id}>
@@ -198,7 +202,7 @@ export const ConversationRow = memo(function ConversationRow({
             <span className={`conv-state-chip ${displayState}`}>{visibleStateLabel}</span>
           )}
           {chainIndex !== undefined ? (
-            isCompactCompletedChainMember && isMobileList ? (
+            shouldShowMobileChainTitle ? (
               <>
                 <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
                   #{chainIndex + 1}
@@ -476,7 +480,7 @@ export const ChainBlock = memo(function ChainBlock({
       </div>
       {collapsed && listDensity === 'mobile' && latestMember && (
         <button
-          className="conv-chain-latest-summary"
+          className={`conv-chain-latest-summary ${keyboardSelectedId === latestMember.id ? 'keyboard-selected' : ''}`}
           onClick={() => onRowClick(latestMember)}
           title={latestMember.slug ? `Open latest conversation "${latestMember.slug}"` : 'Open latest conversation'}
         >
@@ -591,14 +595,30 @@ export function ConversationList({
     return groupConversationsForSidebar(displayList, roots);
   }, [displayList]);
 
+  const isChainCollapsed = useCallback((item: Extract<SidebarItem, { kind: 'chain' }>) => {
+    const latestMember = item.members.find(m => m.id === item.latestMemberId);
+    const isCompleted = getConvDisplayState(latestMember) === 'terminal';
+    if (effectiveListDensity === 'mobile') {
+      const hasActiveMember = item.members.some((m) => m.slug === activeSlug);
+      return hasActiveMember ? false : !collapsedChains.has(item.rootId);
+    }
+    return isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
+  }, [activeSlug, collapsedChains, effectiveListDensity]);
+
   const keyboardItems = useMemo(() => {
     const out: Conversation[] = [];
     for (const item of groupedItems) {
-      if (item.kind === 'single') out.push(item.conversation);
-      else out.push(...item.members);
+      if (item.kind === 'single') {
+        out.push(item.conversation);
+      } else if (effectiveListDensity === 'mobile' && isChainCollapsed(item)) {
+        const latestMember = item.members.find((m) => m.id === item.latestMemberId);
+        if (latestMember) out.push(latestMember);
+      } else {
+        out.push(...item.members);
+      }
     }
     return out;
-  }, [groupedItems]);
+  }, [effectiveListDensity, groupedItems, isChainCollapsed]);
 
   const { selectedId } = useKeyboardNav({
     items: keyboardItems,
@@ -779,12 +799,7 @@ export function ConversationList({
                 />
               );
             }
-            const latestMember = item.members.find(m => m.id === item.latestMemberId);
-            const isCompleted = getConvDisplayState(latestMember) === 'terminal';
-            const hasActiveMember = item.members.some((m) => m.slug === activeSlug);
-            const collapsed = isMobileList
-              ? hasActiveMember ? false : !collapsedChains.has(item.rootId)
-              : isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
+            const collapsed = isChainCollapsed(item);
             const chainExpandedRowId =
               expandedId !== null && item.members.some((m) => m.id === expandedId)
                 ? expandedId

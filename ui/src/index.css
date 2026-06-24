@@ -8193,8 +8193,14 @@ html * {
   cursor: pointer;
 }
 
-.conv-chain-latest-summary:hover {
+.conv-chain-latest-summary:hover,
+.conv-chain-latest-summary.keyboard-selected {
   background: var(--bg-tertiary);
+}
+
+.conv-chain-latest-summary.keyboard-selected {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
 }
 
 .conv-chain-summary-main,
