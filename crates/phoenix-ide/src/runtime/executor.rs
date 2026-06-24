@@ -3593,19 +3593,26 @@ where
             }
 
             if let LlmOutcome::Response { ref usage, .. } = llm_outcome {
+                let storage_for_usage = storage.clone();
+                let conv_id_for_usage = conv_id.clone();
+                let root_id_for_usage = root_conv_id.clone();
+                let model_for_usage = model_id.clone();
+                let usage_for_insert = usage.clone();
                 let first_byte_for_insert = *first_byte_at.lock().await;
-                if let Err(e) = storage
-                    .insert_turn_usage(
-                        &conv_id,
-                        &root_conv_id,
-                        &model_id,
-                        usage,
-                        first_byte_for_insert,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, "failed to write turn_usage row");
-                }
+                tokio::spawn(async move {
+                    if let Err(e) = storage_for_usage
+                        .insert_turn_usage(
+                            &conv_id_for_usage,
+                            &root_id_for_usage,
+                            &model_for_usage,
+                            &usage_for_insert,
+                            first_byte_for_insert,
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %e, "failed to write turn_usage row");
+                    }
+                });
             }
 
             let _ = llm_tx.send(llm_outcome);

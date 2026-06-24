@@ -571,17 +571,17 @@ pub async fn usage_conversation_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let session = match crate::analytics::project_session(&state.db, &id).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, conv_id = %id, "usage analytics projection failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response();
-        }
-    };
+    let turns_projection =
+        match crate::analytics::project_usage_turns_for_root(&state.db, &id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, conv_id = %id, "usage analytics projection failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response();
+            }
+        };
 
     let mut totals = Totals::default();
-    let turns: Vec<TurnPoint> = session
-        .turns
+    let turns: Vec<TurnPoint> = turns_projection
         .iter()
         .enumerate()
         .map(|(idx, r)| {

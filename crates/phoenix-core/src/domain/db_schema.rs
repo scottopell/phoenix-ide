@@ -1516,6 +1516,14 @@ pub struct UsageTurnRow {
     pub cache_read_tokens: i64,
 }
 
+/// Timestamp-only message anchor used to derive turn latency without hydrating
+/// full message content or attachments.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageAnchorRow {
+    pub conversation_id: String,
+    pub created_at: String,
+}
+
 #[cfg(test)]
 mod conv_mode_tests {
     use super::*;

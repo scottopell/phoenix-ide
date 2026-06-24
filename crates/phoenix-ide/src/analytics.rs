@@ -5,7 +5,9 @@
 //! transcript or tool I/O store.
 
 use crate::api::usage::{calculate_turn_cost, TurnCost};
-use crate::db::{ConvMode, Conversation, Database, Message, MessageContent};
+use crate::db::{
+    ConvMode, Conversation, Database, Message, MessageContent, UsageAnchorRow, UsageTurnRow,
+};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::llm_types::ContentBlock;
 use serde::Serialize;
@@ -112,9 +114,7 @@ pub struct AnalyticsSession {
 #[derive(Debug, Clone, Serialize)]
 pub struct TrajectoryExportPayload {
     pub client: &'static str,
-    pub session_id: String,
     pub source: &'static str,
-    pub fidelity: AnalyticsFidelity,
     pub session: AnalyticsSession,
 }
 
@@ -127,6 +127,12 @@ pub async fn project_session(db: &Database, root_id: &str) -> Result<AnalyticsSe
         .usage_conversation_turns(root_id)
         .await
         .map_err(|e| e.to_string())?;
+    let anchor_rows = db
+        .usage_anchor_messages(root_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let turns = project_usage_turns(&root, &turn_rows, &anchor_rows);
+
     let conversation_ids = db
         .analytics_conversation_ids_for_root(root_id)
         .await
@@ -144,7 +150,56 @@ pub async fn project_session(db: &Database, root_id: &str) -> Result<AnalyticsSe
             .then_with(|| a.message_id.cmp(&b.message_id))
     });
 
-    let turns: Vec<AnalyticsUsageTurn> = turn_rows
+    let tool_calls = project_tool_calls(&messages);
+    let first_seen = turns.first().map_or(root.created_at, |t| t.created_at);
+    let last_seen = turns.last().map_or(root.updated_at, |t| t.created_at);
+    let first_byte_available = turns.iter().any(|t| t.first_byte_at.is_some());
+    let unknown_cost = turns.iter().any(|t| !t.cost.pricing_known);
+
+    Ok(AnalyticsSession {
+        session_id: root.id.clone(),
+        root_session_id: root.id.clone(),
+        project_id: root.project_id.clone(),
+        cwd: root.cwd.clone(),
+        worktree_path: worktree_path(&root),
+        task_id: task_id(&root),
+        task_title: task_title(&root),
+        branch: branch_name(&root),
+        started_at: first_seen.min(root.created_at),
+        last_seen_at: last_seen.max(root.updated_at),
+        ended_at: terminal_status(&root).map(|_| root.state_updated_at),
+        terminal_status: terminal_status(&root),
+        turns,
+        tool_calls,
+        fidelity: AnalyticsFidelity::v1(first_byte_available, unknown_cost),
+    })
+}
+
+pub(crate) async fn project_usage_turns_for_root(
+    db: &Database,
+    root_id: &str,
+) -> Result<Vec<AnalyticsUsageTurn>, String> {
+    let root = db
+        .get_conversation(root_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let turn_rows = db
+        .usage_conversation_turns(root_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let anchor_rows = db
+        .usage_anchor_messages(root_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(project_usage_turns(&root, &turn_rows, &anchor_rows))
+}
+
+fn project_usage_turns(
+    root: &Conversation,
+    turn_rows: &[UsageTurnRow],
+    anchor_rows: &[UsageAnchorRow],
+) -> Vec<AnalyticsUsageTurn> {
+    turn_rows
         .iter()
         .map(|r| {
             let first_byte_at = r
@@ -156,7 +211,7 @@ pub async fn project_session(db: &Database, root_id: &str) -> Result<AnalyticsSe
                 .map_or_else(|_| root.created_at, |t| t.with_timezone(&Utc));
             let first_byte_latency_ms = first_byte_at
                 .and_then(|first| {
-                    first_byte_anchor(&messages, &r.conversation_id, first)
+                    first_byte_anchor(anchor_rows, &r.conversation_id, first)
                         .map(|anchor| (first, anchor))
                 })
                 .and_then(|(first, anchor)| first.signed_duration_since(anchor).to_std().ok())
@@ -185,31 +240,7 @@ pub async fn project_session(db: &Database, root_id: &str) -> Result<AnalyticsSe
                 ),
             }
         })
-        .collect();
-
-    let tool_calls = project_tool_calls(&messages);
-    let first_seen = turns.first().map_or(root.created_at, |t| t.created_at);
-    let last_seen = turns.last().map_or(root.updated_at, |t| t.created_at);
-    let first_byte_available = turns.iter().any(|t| t.first_byte_at.is_some());
-    let unknown_cost = turns.iter().any(|t| !t.cost.pricing_known);
-
-    Ok(AnalyticsSession {
-        session_id: root.id.clone(),
-        root_session_id: root.id.clone(),
-        project_id: root.project_id.clone(),
-        cwd: root.cwd.clone(),
-        worktree_path: worktree_path(&root),
-        task_id: task_id(&root),
-        task_title: task_title(&root),
-        branch: branch_name(&root),
-        started_at: first_seen.min(root.created_at),
-        last_seen_at: last_seen.max(root.updated_at),
-        ended_at: terminal_status(&root).map(|_| root.state_updated_at),
-        terminal_status: terminal_status(&root),
-        turns,
-        tool_calls,
-        fidelity: AnalyticsFidelity::v1(first_byte_available, unknown_cost),
-    })
+        .collect()
 }
 
 pub async fn trajectory_export(
@@ -219,9 +250,7 @@ pub async fn trajectory_export(
     let session = project_session(db, root_id).await?;
     Ok(TrajectoryExportPayload {
         client: "phoenix",
-        session_id: session.session_id.clone(),
         source: "phoenix_conversation_history",
-        fidelity: session.fidelity.clone(),
         session,
     })
 }
@@ -279,22 +308,19 @@ fn following_tool_result<'a>(
 }
 
 fn first_byte_anchor(
-    messages: &[Message],
+    anchors: &[UsageAnchorRow],
     conversation_id: &str,
     first_byte_at: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    messages
+    anchors
         .iter()
-        .filter(|msg| msg.conversation_id == conversation_id && msg.created_at <= first_byte_at)
-        .filter_map(|msg| match msg.content {
-            MessageContent::Agent(_) => None,
-            MessageContent::User(_)
-            | MessageContent::Tool(_)
-            | MessageContent::System(_)
-            | MessageContent::Error(_)
-            | MessageContent::Continuation(_)
-            | MessageContent::Skill(_) => Some(msg.created_at),
+        .filter(|anchor| anchor.conversation_id == conversation_id)
+        .filter_map(|anchor| {
+            DateTime::parse_from_rfc3339(&anchor.created_at)
+                .ok()
+                .map(|t| t.with_timezone(&Utc))
         })
+        .filter(|created_at| *created_at <= first_byte_at)
         .max()
 }
 
@@ -529,52 +555,24 @@ mod tests {
     #[test]
     fn first_byte_anchor_uses_source_conversation_preceding_message() {
         let start = Utc::now();
-        let messages = vec![
-            msg_in(
-                "parent",
-                "u-parent",
-                1,
-                start,
-                MessageContent::user("parent"),
-                None,
-            ),
-            msg_in(
-                "sub",
-                "u-sub",
-                1,
-                start + chrono::Duration::milliseconds(5),
-                MessageContent::user("sub"),
-                None,
-            ),
-            msg_in(
-                "parent",
-                "a-parent",
-                2,
-                start + chrono::Duration::milliseconds(20),
-                MessageContent::Agent(vec![ContentBlock::Text {
-                    text: "parent".to_string(),
-                }]),
-                None,
-            ),
-            msg_in(
-                "sub",
-                "a-sub",
-                2,
-                start + chrono::Duration::milliseconds(30),
-                MessageContent::Agent(vec![ContentBlock::Text {
-                    text: "sub".to_string(),
-                }]),
-                None,
-            ),
+        let anchors = vec![
+            UsageAnchorRow {
+                conversation_id: "parent".to_string(),
+                created_at: start.to_rfc3339(),
+            },
+            UsageAnchorRow {
+                conversation_id: "sub".to_string(),
+                created_at: (start + chrono::Duration::milliseconds(5)).to_rfc3339(),
+            },
         ];
 
         assert_eq!(
-            first_byte_anchor(&messages, "sub", start + chrono::Duration::milliseconds(25)),
+            first_byte_anchor(&anchors, "sub", start + chrono::Duration::milliseconds(25)),
             Some(start + chrono::Duration::milliseconds(5))
         );
         assert_eq!(
             first_byte_anchor(
-                &messages,
+                &anchors,
                 "parent",
                 start + chrono::Duration::milliseconds(25)
             ),

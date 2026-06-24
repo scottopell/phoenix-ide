@@ -4331,6 +4331,37 @@ impl Database {
         ids.dedup();
         Ok(ids)
     }
+
+    /// Timestamp-only non-agent message anchors for conversations in one root
+    /// session. Avoids hydrating message content/attachments for usage latency.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn usage_anchor_messages(&self, root_id: &str) -> DbResult<Vec<UsageAnchorRow>> {
+        let rows = sqlx::query(
+            "WITH session_conversations(id) AS (\
+                 SELECT ?1 UNION SELECT DISTINCT conversation_id FROM turn_usage WHERE root_conversation_id = ?1\
+             ) \
+             SELECT m.conversation_id, m.created_at \
+             FROM messages m \
+             JOIN session_conversations sc ON sc.id = m.conversation_id \
+             WHERE m.message_type != 'agent' \
+             ORDER BY m.conversation_id ASC, m.created_at ASC, m.sequence_id ASC",
+        )
+        .bind(root_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(UsageAnchorRow {
+                    conversation_id: r.try_get("conversation_id")?,
+                    created_at: r.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
 }
 
 /// The `cm_*` column values projected from a [`ConvMode`]. `kind` is the
@@ -5708,6 +5739,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, vec!["conv-root-only".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn usage_anchor_messages_returns_non_agent_timestamps_without_content() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("root-anchor", "root-anchor", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation(
+            "sub-anchor",
+            "sub-anchor",
+            "/tmp",
+            false,
+            Some("root-anchor"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        db.add_message(
+            "root-user",
+            "root-anchor",
+            &MessageContent::user("root"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "root-agent",
+            "root-anchor",
+            &MessageContent::agent(vec![phoenix_core::domain::llm_types::ContentBlock::Text {
+                text: "agent".to_string(),
+            }]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.add_message(
+            "sub-tool",
+            "sub-anchor",
+            &MessageContent::tool("tu", "ok", false),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let usage = phoenix_core::domain::llm_types::Usage::default();
+        db.insert_turn_usage("sub-anchor", "root-anchor", "mock", &usage, None)
+            .await
+            .unwrap();
+
+        let anchors = db.usage_anchor_messages("root-anchor").await.unwrap();
+        let ids: Vec<_> = anchors.iter().map(|a| a.conversation_id.as_str()).collect();
+        assert_eq!(ids, vec!["root-anchor", "sub-anchor"]);
     }
 
     #[tokio::test]
