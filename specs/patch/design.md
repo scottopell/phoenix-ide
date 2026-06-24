@@ -26,16 +26,20 @@ The patch tool enables precise file editing without full file rewrites. It suppo
         "properties": {
           "operation": {
             "type": "string",
-            "enum": ["replace", "append_eof", "prepend_bof", "overwrite"],
+            "enum": ["replace", "insert_before", "insert_after", "append_eof", "prepend_bof", "overwrite"],
             "description": "Type of operation to perform"
           },
           "oldText": {
             "type": "string",
-            "description": "Text to locate (must be unique in file, required for replace)"
+            "description": "Text to locate (must be unique in file unless replaceAll; required for replace, insert_before, insert_after)"
           },
           "newText": {
             "type": "string",
-            "description": "The new text to use (empty for deletions, leave empty if fromClipboard is set)"
+            "description": "The new text to use, or the text to insert for the insert operations (empty for deletions, leave empty if fromClipboard is set)"
+          },
+          "replaceAll": {
+            "type": "boolean",
+            "description": "Replace only: substitute every exact occurrence of oldText instead of requiring a unique match (exact matches only, no fuzzy recovery)"
           },
           "toClipboard": {
             "type": "string",
@@ -73,9 +77,13 @@ File modification tool for precise text edits.
 
 Operations:
 - replace: Substitute unique text with new content
+- insert_before: Insert newText immediately before a unique oldText anchor, leaving the anchor unchanged
+- insert_after: Insert newText immediately after a unique oldText anchor, leaving the anchor unchanged
 - append_eof: Append new text at the end of the file
 - prepend_bof: Insert new text at the beginning of the file
 - overwrite: Replace the entire file with new content (automatically creates the file)
+
+replaceAll (replace only): substitute every exact occurrence of oldText (exact matches only, no fuzzy recovery).
 
 Clipboard:
 - toClipboard: Store oldText to a named clipboard before the operation
@@ -95,7 +103,9 @@ Recipes:
 
 Usage notes:
 - All inputs are interpreted literally (no automatic newline handling)
-- For replace operations, oldText must appear EXACTLY ONCE in the file
+- For replace, insert_before, and insert_after, oldText must appear EXACTLY ONCE in the file (unless replaceAll)
+- Two patches in one call whose ranges overlap are rejected
+- On success the applied unified diff is returned so you can confirm placement without re-reading
 ```
 
 ## Core Data Structures
@@ -110,6 +120,7 @@ struct PatchRequest {
     operation: Operation,
     old_text: Option<String>,
     new_text: Option<String>,
+    replace_all: bool,          // replace only: substitute every exact occurrence
     to_clipboard: Option<String>,
     from_clipboard: Option<String>,
     reindent: Option<Reindent>,
@@ -117,6 +128,8 @@ struct PatchRequest {
 
 enum Operation {
     Replace,
+    InsertBefore,
+    InsertAfter,
     AppendEof,
     PrependBof,
     Overwrite,
@@ -211,6 +224,28 @@ fn apply_patch(
         Operation::PrependBof => buffer.insert(0, &new_text),
         Operation::AppendEof => buffer.insert(original.len(), &new_text),
         Operation::Overwrite => buffer.replace(0, original.len(), &new_text),
+        // insert_before / insert_after locate a unique anchor exactly as replace
+        // does, then emit a zero-length edit at the anchor's start / end. The
+        // anchor bytes are never part of the edit, so they are preserved.
+        Operation::InsertBefore => {
+            let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
+            let spec = self.find_unique_match(original, old_text, &new_text)?;
+            buffer.insert(spec.offset, &new_text);
+        }
+        Operation::InsertAfter => {
+            let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
+            let spec = self.find_unique_match(original, old_text, &new_text)?;
+            buffer.insert(spec.offset + spec.length, &new_text);
+        }
+        // replaceAll substitutes every exact occurrence (no fuzzy cascade). Zero
+        // exact matches => OldTextNotFound, unless the text is present only as a
+        // fuzzy/near match, in which case => ReplaceAllInexact.
+        Operation::Replace if patch.replace_all => {
+            let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
+            for spec in find_all_exact(original, old_text) {
+                buffer.replace(spec.offset, spec.length, &new_text);
+            }
+        }
         Operation::Replace => {
             let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
             let spec = self.find_unique_match(original, old_text, &new_text)?;
@@ -250,6 +285,17 @@ fn find_unique_match(
     
     // 3. Trim first/last lines if safe
     if let Some(spec) = find_unique_trimmed(original, old_text) {
+        return Ok(spec);
+    }
+
+    // 4. Unicode confusable-skeleton match (lookalikes: curly quotes, em dash,
+    //    ellipsis, fullwidth). Both content and old_text are skeletonised and
+    //    matched in skeleton space, then mapped back to original bytes. A match
+    //    is accepted ONLY if its mapped original slice itself skeletonises back
+    //    to old_text's skeleton — this rejects a needle landing inside a single
+    //    character's multi-char skeleton expansion (e.g. ".." inside "…"), which
+    //    would otherwise map to a misaligned, file-corrupting edit.
+    if let Some(spec) = find_unique_skeleton(original, old_text) {
         return Ok(spec);
     }
     
@@ -346,16 +392,28 @@ impl EditBuffer {
         self.edits.push(Edit { offset, length, replacement: text.to_string() });
     }
     
-    fn to_string(&self) -> String {
-        // Sort edits by offset (reverse order for correct application)
+    fn to_string(&self) -> Result<String, PatchError> {
+        // Sort by offset descending; ties break by length descending then by
+        // request index descending, so a replace at O precedes a zero-length
+        // insert at O, and two inserts at one offset keep request order.
         let mut edits = self.edits.clone();
-        edits.sort_by(|a, b| b.offset.cmp(&a.offset));
+        edits.sort_by(/* (offset desc, length desc, request index desc) */);
         
+        // Edits resolve against the original, so two edits with overlapping byte
+        // ranges have no well-defined combined result: reject rather than corrupt.
+        // A zero-length insert sharing only a boundary does not overlap.
         let mut result = self.original.clone();
+        let mut prev_start = None;
         for edit in edits {
+            if let Some(prev_start) = prev_start {
+                if edit.offset + edit.length > prev_start {
+                    return Err(PatchError::OverlappingEdits);
+                }
+            }
+            prev_start = Some(edit.offset);
             result.replace_range(edit.offset..edit.offset + edit.length, &edit.replacement);
         }
-        result
+        Ok(result)
     }
 }
 ```
@@ -443,9 +501,11 @@ fn is_autogenerated(path: &Path, content: &str) -> bool {
 enum PatchError {
     OldTextNotFound(String),
     OldTextNotUnique(String),
+    ReplaceAllInexact,            // replaceAll: no exact match, but a fuzzy/near match exists
     MissingOldText,
     ClipboardNotFound(String),
     ClipboardRequiresReplace,
+    OverlappingEdits,             // two edits in one call target overlapping ranges
     StripPreconditionFailed { line: String, prefix: String },
     FileNotFound(PathBuf),
     IoError(std::io::Error),

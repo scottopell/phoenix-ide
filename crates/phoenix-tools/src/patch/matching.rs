@@ -323,32 +323,38 @@ fn find_normalised_match(content: &str, old_text: &str) -> Option<MatchOutcome> 
     }
     skel_to_orig.push(content.len());
 
-    let mut matches = skel_content.match_indices(&skel_old);
-    let (first_offset, _) = matches.next()?;
-    let first_range =
-        original_range_from_skeleton(&skel_to_orig, first_offset, skel_old.len(), content.len());
-    let Some((second_offset, _)) = matches.next() else {
+    // Keep only matches aligned to whole original characters: the mapped
+    // original slice must itself skeletonise back to skel_old. A needle landing
+    // *inside* a single character's multi-char skeleton expansion (e.g. ".."
+    // inside the "..." skeleton of one "…") maps to a misaligned or empty range
+    // and would corrupt the file, so it is rejected here rather than matched.
+    let aligned: Vec<(usize, usize)> = skel_content
+        .match_indices(&skel_old)
+        .map(|(offset, _)| {
+            original_range_from_skeleton(&skel_to_orig, offset, skel_old.len(), content.len())
+        })
+        .filter(|&(start, len)| {
+            content
+                .get(start..start + len)
+                .is_some_and(|slice| skeleton(slice).collect::<String>() == skel_old)
+        })
+        .collect();
+
+    let mut ranges = aligned.into_iter();
+    let first_range = ranges.next()?;
+    let Some(second_range) = ranges.next() else {
         return Some(MatchOutcome::Unique(EditSpec {
             offset: first_range.0,
             length: first_range.1,
         }));
     };
-    let second_range =
-        original_range_from_skeleton(&skel_to_orig, second_offset, skel_old.len(), content.len());
 
     Some(MatchOutcome::Duplicate(
         duplicate_match_diagnostics_from_ranges(
             content,
             std::iter::once(first_range)
                 .chain(std::iter::once(second_range))
-                .chain(matches.map(|(offset, _)| {
-                    original_range_from_skeleton(
-                        &skel_to_orig,
-                        offset,
-                        skel_old.len(),
-                        content.len(),
-                    )
-                })),
+                .chain(ranges),
         ),
     ))
 }
@@ -667,6 +673,16 @@ mod tests {
         #[allow(clippy::string_slice)]
         let matched = &content[spec.offset..spec.offset + spec.length];
         assert_eq!(matched, "wait\u{2026} done");
+    }
+
+    #[test]
+    fn test_normalised_rejects_partial_skeleton_match() {
+        // ".." must not match *inside* a single "…" (skeleton "..."): that maps to
+        // a misaligned/empty range. It is treated as not found, never a length-0
+        // edit that would insert before the ellipsis.
+        let content = "x\u{2026}y";
+        let err = find_unique_match(content, "..").unwrap_err();
+        assert_eq!(err, PatchError::OldTextNotFound);
     }
 
     #[test]

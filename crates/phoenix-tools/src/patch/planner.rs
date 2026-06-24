@@ -39,6 +39,19 @@ impl PatchPlanner {
         &self.clipboards
     }
 
+    /// Snapshot the clipboard map so a caller can roll back to it if a step
+    /// *after* planning (e.g. the filesystem write) fails. `plan()` already
+    /// restores its own errors; this covers the post-plan failure path.
+    #[must_use]
+    pub fn clipboard_snapshot(&self) -> HashMap<String, String> {
+        self.clipboards.clone()
+    }
+
+    /// Restore the clipboard map from a snapshot.
+    pub fn restore_clipboards(&mut self, snapshot: HashMap<String, String>) {
+        self.clipboards = snapshot;
+    }
+
     /// Plan patches for a file
     ///
     /// # Arguments

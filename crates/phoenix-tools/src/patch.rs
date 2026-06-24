@@ -349,19 +349,23 @@ Size limit: each patch call must be less than 60 KB of input.".to_string()
             Err(e) => return ToolOutput::error(format!("Failed to read file: {e}")),
         };
 
-        // Plan patches
+        // Plan and apply under one lock so clipboard writes are atomic with the
+        // filesystem write. plan() rolls back its own errors; if planning succeeds
+        // but execute_effects fails, restore the snapshot so a call that never
+        // landed on disk leaves no clipboard text behind for a later fromClipboard.
         let plan = {
             let mut planner = self.planner.lock().unwrap();
-            match planner.plan(&path, current_content.as_deref(), &patch_input.patches) {
+            let snapshot = planner.clipboard_snapshot();
+            let plan = match planner.plan(&path, current_content.as_deref(), &patch_input.patches) {
                 Ok(plan) => plan,
                 Err(e) => return ToolOutput::error(e.to_string()),
+            };
+            if let Err(e) = execute_effects(&plan.effects) {
+                planner.restore_clipboards(snapshot);
+                return ToolOutput::error(format!("Failed to write file: {e}"));
             }
+            plan
         };
-
-        // Execute effects
-        if let Err(e) = execute_effects(&plan.effects) {
-            return ToolOutput::error(format!("Failed to write file: {e}"));
-        }
 
         // Build output
         let mut output = "<patches_applied>all</patches_applied>".to_string();
@@ -741,6 +745,59 @@ mod tests {
             "raw closing tag leaked into diff body: {bounded}"
         );
         assert!(bounded.contains("<\\/diff>"), "{bounded}");
+    }
+
+    #[tokio::test]
+    async fn clipboard_not_committed_when_write_fails() {
+        let dir = tempdir().unwrap();
+        // A regular file sitting where a directory would be needed forces
+        // execute_effects (create_dir_all of the parent) to fail *after* planning
+        // has already staged the clipboard write.
+        fs::write(dir.path().join("notdir"), "x").unwrap();
+        let tool = PatchTool::default();
+
+        let ctx = test_context(dir.path().to_path_buf());
+        let failed = tool
+            .run(
+                json!({
+                    "path": "notdir/child.txt",
+                    "patches": [{
+                        "operation": "append_eof",
+                        "oldText": "STAGED",
+                        "newText": "hi",
+                        "toClipboard": "clip"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+        assert!(
+            !failed.is_success(),
+            "expected write failure, got: {}",
+            failed.output()
+        );
+
+        // A later fromClipboard must not find "clip": the failed call rolled it back.
+        fs::write(dir.path().join("real.txt"), "target").unwrap();
+        let ctx = test_context(dir.path().to_path_buf());
+        let after = tool
+            .run(
+                json!({
+                    "path": "real.txt",
+                    "patches": [{
+                        "operation": "replace",
+                        "oldText": "target",
+                        "fromClipboard": "clip"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+        assert!(
+            !after.is_success() && after.output().contains("clip"),
+            "clipboard leaked from a failed call: {}",
+            after.output()
+        );
     }
 
     #[tokio::test]
