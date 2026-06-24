@@ -172,7 +172,7 @@ impl AppState {
             .unwrap_or_default();
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
-        let file_indexer = match WorkspaceIndexer::new() {
+        let file_indexer = match WorkspaceIndexer::new().await {
             Ok(idx) => Some(idx),
             Err(err) => {
                 tracing::warn!(

@@ -5629,7 +5629,11 @@ pub(crate) mod hard_delete_cascade_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
-            file_indexer: Some(crate::file_index::WorkspaceIndexer::new().expect("notify init")),
+            file_indexer: Some(
+                crate::file_index::WorkspaceIndexer::new()
+                    .await
+                    .expect("notify init"),
+            ),
         }
     }
 
@@ -7877,7 +7881,11 @@ mod upgrade_model_state_guard_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
-            file_indexer: Some(crate::file_index::WorkspaceIndexer::new().expect("notify init")),
+            file_indexer: Some(
+                crate::file_index::WorkspaceIndexer::new()
+                    .await
+                    .expect("notify init"),
+            ),
         }
     }
 
@@ -8151,7 +8159,11 @@ mod file_read_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
-            file_indexer: Some(crate::file_index::WorkspaceIndexer::new().expect("notify init")),
+            file_indexer: Some(
+                crate::file_index::WorkspaceIndexer::new()
+                    .await
+                    .expect("notify init"),
+            ),
         }
     }
 
@@ -8726,7 +8738,11 @@ mod chat_authority_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
-            file_indexer: Some(crate::file_index::WorkspaceIndexer::new().expect("notify init")),
+            file_indexer: Some(
+                crate::file_index::WorkspaceIndexer::new()
+                    .await
+                    .expect("notify init"),
+            ),
         }
     }
 

@@ -128,6 +128,13 @@ tempfile = "3"
 notify = "8"
 notify-debouncer-full = "0.7"
 
+# Lock-free concurrent hash map used by the file-index registry to map
+# workspace roots to actor handles. Reads are wait-free; writes coordinate
+# via epoch-based reclamation rather than locking. We picked papaya over
+# dashmap (which is unmaintained) so the registry remains a thin lookup
+# layer without sharded locks under workspace state.
+papaya = "0.2"
+
 # Markdown event-stream parser. Used to mask code regions during inline-
 # reference tokenization so `@`/`/` sigils inside fenced/inline/indented
 # code blocks don't get expanded as file or skill references.
