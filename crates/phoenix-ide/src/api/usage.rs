@@ -22,7 +22,6 @@ use axum::{
     Json,
 };
 use chrono::{Duration, Utc};
-use phoenix_llm::all_models;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use ts_rs::TS;
@@ -330,12 +329,9 @@ pub struct ConversationUsageDetail {
 }
 
 /// Resolve a model id to a provider display name, or `"Unknown"` if the id is
-/// not in the registry.
-fn provider_display(model_id: &str) -> String {
-    all_models().iter().find(|m| m.id == model_id).map_or_else(
-        || "Unknown".to_string(),
-        |m| m.provider.display_name().to_string(),
-    )
+/// not in the live registry.
+fn provider_display(state: &AppState, model_id: &str) -> String {
+    state.llm_registry.provider_display_name(model_id)
 }
 
 /// Fixed token-count bucket edges for the tokens-per-turn histogram. The final
@@ -435,7 +431,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
             .or_default()
             .add(i, o, cw, cr, t, cost);
         provider_map
-            .entry(provider_display(&row.model))
+            .entry(provider_display(&state, &row.model))
             .or_default()
             .add(i, o, cw, cr, t, cost);
 
@@ -469,7 +465,7 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
         .map(|(model, mut totals)| {
             totals.finish_cost();
             ModelUsage {
-                provider: provider_display(&model),
+                provider: provider_display(&state, &model),
                 model,
                 totals,
             }

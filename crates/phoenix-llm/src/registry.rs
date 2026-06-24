@@ -3,7 +3,7 @@
 use super::{
     all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
     probe_gateway, CodexCredential, DiscoveryConfig, LlmService, LlmServiceImpl, LoggingService,
-    ModelInfo, Provider,
+    ModelInfo, ModelSource, Provider,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use std::collections::{HashMap, HashSet};
@@ -732,7 +732,10 @@ impl ModelRegistry {
         // but the credential failed to load, OpenAI models are unavailable
         // rather than silently falling through to OPENAI_API_KEY (which
         // would bill the wrong account).
-        if config.use_codex_auth && spec.provider == Provider::OpenAI {
+        if config.use_codex_auth
+            && spec.provider == Provider::OpenAI
+            && spec.source == ModelSource::BuiltIn
+        {
             let cred = config.codex_credential.as_ref()?;
             let auth = LlmAuth::new(
                 Arc::clone(cred) as Arc<dyn CredentialSource>,
@@ -861,6 +864,20 @@ impl ModelRegistry {
             }
         }
         model_infos
+    }
+
+    /// Resolve a registered model id to a provider display name.
+    ///
+    /// Returns `"Unknown"` when the model is not currently registered.
+    ///
+    /// # Panics
+    /// Panics if the internal specs lock is poisoned.
+    pub fn provider_display_name(&self, model_id: &str) -> String {
+        let specs = self.specs.read().expect("specs lock poisoned");
+        specs.get(model_id).map_or_else(
+            || "Unknown".to_string(),
+            |spec| spec.provider.display_name().to_string(),
+        )
     }
 
     /// Check if any models are available
@@ -1042,7 +1059,7 @@ impl ModelRegistry {
         let mut new_codex_specs: HashMap<String, super::ModelSpec> = HashMap::new();
         if let Some((cred, _)) = cred_with_account.as_ref() {
             for spec in Self::model_specs(&self.config) {
-                if spec.provider != Provider::OpenAI {
+                if spec.provider != Provider::OpenAI || spec.source != ModelSource::BuiltIn {
                     continue;
                 }
                 let auth = LlmAuth::new(
@@ -1076,7 +1093,7 @@ impl ModelRegistry {
             // converge on the right state.
             let openai_ids: Vec<String> = Self::model_specs(&self.config)
                 .iter()
-                .filter(|s| s.provider == Provider::OpenAI)
+                .filter(|s| s.provider == Provider::OpenAI && s.source == ModelSource::BuiltIn)
                 .map(|s| s.id.clone())
                 .collect();
             for id in &openai_ids {
@@ -1284,6 +1301,22 @@ mod tests {
     }
 
     #[test]
+    fn provider_display_name_uses_external_model_metadata() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            external_models: vec![external_baseten_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert_eq!(
+            registry.provider_display_name("baseten/moonshotai/Kimi-K2.6"),
+            "Anthropic"
+        );
+        assert_eq!(registry.provider_display_name("unknown-model"), "Unknown");
+    }
+
+    #[test]
     fn duplicate_configured_model_does_not_override_builtin_registration() {
         let duplicate = parse_external_models(
             r#"[{"id":"claude-sonnet-4-6","api_name":"other-wire-name","provider":"anthropic","api_format":"anthropic","description":"Override attempt","context_window":123,"recommended":false,"supports_tool_search":false}]"#,
@@ -1389,7 +1422,46 @@ mod tests {
         crate::CodexCredential::load(path).unwrap().0
     }
 
-    /// With Codex auth enabled and a valid credential, `OpenAI` models register
+    fn external_openai_model() -> super::super::ModelSpec {
+        parse_external_models(
+            r#"[{"id":"openai-compatible/custom","provider":"openai","api_format":"openai_responses","description":"OpenAI-compatible POC","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+    }
+
+    #[test]
+    fn external_openai_model_bypasses_codex_bridge_when_direct_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = LlmConfig {
+            openai_api_key: Some("test-openai-key".to_string()),
+            openai_base_url: Some("https://example.test/v1/responses".to_string()),
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            external_models: vec![external_openai_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert!(
+            registry
+                .get("gpt-5.5")
+                .expect("built-in OpenAI model should still use Codex")
+                .uses_codex_bridge(),
+            "built-in OpenAI models keep existing Codex routing"
+        );
+        assert!(
+            !registry
+                .get("openai-compatible/custom")
+                .expect("external OpenAI-compatible model should register")
+                .uses_codex_bridge(),
+            "external OpenAI-compatible models must use explicit endpoint/auth config"
+        );
+    }
+
+    /// With Codex auth enabled and a valid credential, built-in `OpenAI` models register
     /// via the codex branch (no need for `OPENAI_API_KEY`) and are distinct from
     /// Anthropic registration.
     #[test]

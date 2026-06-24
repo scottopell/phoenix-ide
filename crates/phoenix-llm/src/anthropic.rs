@@ -1120,6 +1120,7 @@ mod tests {
             context_window: 200_000,
             recommended: false,
             supports_tool_search,
+            source: crate::models::ModelSource::BuiltIn,
         }
     }
 

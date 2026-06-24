@@ -100,6 +100,12 @@ struct ExternalModelSpec {
     supports_tool_search: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSource {
+    BuiltIn,
+    External,
+}
+
 /// Model specification with metadata
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
@@ -124,6 +130,10 @@ pub struct ModelSpec {
     pub recommended: bool,
     /// Whether this model supports Anthropic's tool search feature
     pub supports_tool_search: bool,
+    /// Where this model definition came from. External `OpenAI`-compatible
+    /// specs bypass the Codex bridge because their endpoint is operator-configured,
+    /// not `ChatGPT`'s backend.
+    pub source: ModelSource,
 }
 
 impl ModelSpec {
@@ -175,15 +185,25 @@ pub fn parse_external_models(raw: &str) -> Result<Vec<ModelSpec>, String> {
             if spec.context_window == 0 {
                 return Err(format!("model '{id}' has invalid context_window 0"));
             }
+            let provider: Provider = spec.provider.into();
+            let api_format: ApiFormat = spec.api_format.into();
+            if !matches_provider_api_format(provider, api_format) {
+                return Err(format!(
+                    "model '{id}' has mismatched provider/api_format: {} requires {}",
+                    provider.header_value(),
+                    provider.expected_api_format_name()
+                ));
+            }
             Ok(ModelSpec {
                 id,
                 api_name,
-                provider: spec.provider.into(),
-                api_format: spec.api_format.into(),
+                provider,
+                api_format,
                 description,
                 context_window: spec.context_window,
                 recommended: spec.recommended,
                 supports_tool_search: spec.supports_tool_search,
+                source: ModelSource::External,
             })
         })
         .collect()
@@ -209,6 +229,23 @@ pub fn merge_model_specs(mut builtins: Vec<ModelSpec>, external: &[ModelSpec]) -
     builtins
 }
 
+fn matches_provider_api_format(provider: Provider, api_format: ApiFormat) -> bool {
+    matches!(
+        (provider, api_format),
+        (Provider::Anthropic, ApiFormat::Anthropic)
+            | (Provider::OpenAI, ApiFormat::OpenAIResponses)
+    )
+}
+
+impl Provider {
+    fn expected_api_format_name(self) -> &'static str {
+        match self {
+            Provider::OpenAI => "openai_responses",
+            Provider::Anthropic | Provider::Mock => "anthropic",
+        }
+    }
+}
+
 /// Get all available model specifications
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -229,6 +266,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 1_000_000,
             recommended: true,
             supports_tool_search: true,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "claude-opus-4-7".into(),
@@ -239,6 +277,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 1_000_000,
             recommended: false,
             supports_tool_search: true,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "claude-opus-4-6".into(),
@@ -249,6 +288,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 1_000_000,
             recommended: false,
             supports_tool_search: true,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "claude-sonnet-4-6".into(),
@@ -259,6 +299,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 1_000_000,
             recommended: true,
             supports_tool_search: true,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "claude-haiku-4-5".into(),
@@ -269,6 +310,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 200_000,
             recommended: true,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
         // OpenAI models
         // Context windows here are the platform-API ceilings (what gateway/
@@ -285,6 +327,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 1_000_000,
             recommended: true,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "gpt-5.4".into(),
@@ -295,6 +338,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 400_000,
             recommended: false,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
         ModelSpec {
             id: "gpt-5.4-mini".into(),
@@ -305,6 +349,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 400_000,
             recommended: true,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
         // GPT-5 Codex models (responses API)
         ModelSpec {
@@ -316,6 +361,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 200_000,
             recommended: true,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
         // Mock model for frontend development without API keys
         ModelSpec {
@@ -327,6 +373,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 200_000,
             recommended: false,
             supports_tool_search: false,
+            source: ModelSource::BuiltIn,
         },
     ]
 }
@@ -361,6 +408,17 @@ mod tests {
 
         assert_eq!(models[0].provider, Provider::OpenAI);
         assert_eq!(models[0].api_format, ApiFormat::OpenAIResponses);
+    }
+
+    #[test]
+    fn rejects_crossed_provider_api_format_pairs() {
+        let err = parse_external_models(
+            r#"[{"id":"bad-openai","provider":"openai","api_format":"anthropic","description":"Bad crossed pair","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect_err("crossed provider/api_format pairs should be rejected");
+
+        assert!(err.contains("mismatched provider/api_format"));
+        assert!(err.contains("openai_responses"));
     }
 
     #[test]
