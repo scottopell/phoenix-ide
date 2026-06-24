@@ -865,6 +865,82 @@ export interface DiscoveredService {
   source: DiscoverySource;
 }
 
+
+export type AnalyticsFidelityValue = 'native' | 'derived' | 'estimated' | 'unknown' | 'unavailable';
+
+export interface AnalyticsFidelity {
+  tokens: AnalyticsFidelityValue;
+  cost: AnalyticsFidelityValue;
+  tool_calls: AnalyticsFidelityValue;
+  first_byte: AnalyticsFidelityValue;
+  retries: AnalyticsFidelityValue;
+  outcomes: AnalyticsFidelityValue;
+  lifecycle: AnalyticsFidelityValue;
+}
+
+export interface AnalyticsTokenTotals {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+}
+
+export interface AnalyticsUsageTurn {
+  turn_usage_id: number;
+  conversation_id: string;
+  root_conversation_id: string;
+  model: string;
+  created_at: string;
+  first_byte_at: string | null;
+  first_byte_latency_ms: number | null;
+  tokens: AnalyticsTokenTotals;
+  cost: {
+    input_usd: number | null;
+    output_usd: number | null;
+    cache_write_usd: number | null;
+    cache_read_usd: number | null;
+    total_usd: number | null;
+    pricing_known: boolean;
+  };
+}
+
+export interface AnalyticsToolCall {
+  conversation_id: string;
+  assistant_message_id: string;
+  tool_result_message_id: string | null;
+  tool_use_id: string;
+  tool_name: string;
+  is_error: boolean;
+  denied: boolean;
+  duration_ms: number | null;
+  normalized_command: string | null;
+  touched_files: string[];
+}
+
+export interface AnalyticsSession {
+  session_id: string;
+  root_session_id: string;
+  project_id: string | null;
+  cwd: string;
+  worktree_path: string | null;
+  task_id: string | null;
+  task_title: string | null;
+  branch: string | null;
+  started_at: string;
+  last_seen_at: string;
+  ended_at: string | null;
+  terminal_status: string | null;
+  turns: AnalyticsUsageTurn[];
+  tool_calls: AnalyticsToolCall[];
+  fidelity: AnalyticsFidelity;
+}
+
+export interface TrajectoryExportPayload {
+  client: 'phoenix';
+  source: string;
+  session: AnalyticsSession;
+}
+
 export interface DiscoveryServicesResponse {
   services: DiscoveredService[];
 }
@@ -899,6 +975,13 @@ export const api = {
   async usageConversationDetail(id: string): Promise<ConversationUsageDetail> {
     const resp = await fetch(`/api/usage/conversation/${encodeURIComponent(id)}`);
     if (!resp.ok) throw new Error('Failed to load conversation usage');
+    return resp.json();
+  },
+
+  /** Trajectory-compatible analytics export preview for one root conversation. */
+  async analyticsTrajectoryExport(id: string): Promise<TrajectoryExportPayload> {
+    const resp = await fetch(`/api/analytics/conversation/${encodeURIComponent(id)}/trajectory-export`);
+    if (!resp.ok) throw new Error('Failed to load analytics export');
     return resp.json();
   },
 

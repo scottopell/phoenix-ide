@@ -14,7 +14,7 @@ import {
   Tooltip,
   Legend,
 } from 'recharts';
-import { api } from '../api';
+import { api, type TrajectoryExportPayload } from '../api';
 import type { UsageOverview } from '../generated/UsageOverview';
 import type { ConversationUsageDetail } from '../generated/ConversationUsageDetail';
 import type { Totals } from '../generated/Totals';
@@ -38,6 +38,16 @@ function fmtLatency(ms: number | null | undefined): string {
   if (ms === null || ms === undefined) return 'unavailable';
   if (ms < 1000) return `${ms.toFixed(0)} ms`;
   return `${(ms / 1000).toFixed(2)} s`;
+}
+
+function fmtDateTime(value: string | null | undefined): string {
+  if (!value) return 'unavailable';
+  const time = Date.parse(value);
+  return Number.isNaN(time) ? value : new Date(time).toLocaleString();
+}
+
+function totalAnalyticsTokens(tokens: TrajectoryExportPayload['session']['turns'][number]['tokens']): number {
+  return tokens.input_tokens + tokens.output_tokens + tokens.cache_creation_tokens + tokens.cache_read_tokens;
 }
 
 function fmtCostSummary(cost: Totals['cost']): string {
@@ -143,6 +153,124 @@ function ChartCard({ title, hint, children }: { title: string; hint?: string; ch
   );
 }
 
+
+function AnalyticsExportPreview({ id }: { id: string }) {
+  const [open, setOpen] = useState(false);
+  const [payload, setPayload] = useState<TrajectoryExportPayload | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const load = useCallback(() => {
+    setOpen(true);
+    if (payload || loading) return;
+    setLoading(true);
+    setError(null);
+    api
+      .analyticsTrajectoryExport(id)
+      .then((p) => setPayload(p))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Failed to load analytics export'))
+      .finally(() => setLoading(false));
+  }, [id, loading, payload]);
+
+  const rawJson = useMemo(() => (payload ? JSON.stringify(payload, null, 2) : ''), [payload]);
+
+  const copyJson = useCallback(() => {
+    if (!rawJson) return;
+    void navigator.clipboard.writeText(rawJson).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    });
+  }, [rawJson]);
+
+  if (!open) {
+    return (
+      <button type="button" className="settings-inline-btn" onClick={load}>
+        View analytics export
+      </button>
+    );
+  }
+
+  return (
+    <section className="usage-export">
+      <div className="usage-export__head">
+        <div>
+          <h4>Analytics export preview</h4>
+          {payload && <span className="usage-card__hint">{payload.client} · {payload.source}</span>}
+        </div>
+        <button type="button" className="settings-inline-btn" onClick={() => setOpen(false)}>
+          Hide export
+        </button>
+      </div>
+      {loading && <div className="settings-section__hint">Loading analytics export…</div>}
+      {error && <div className="settings-section__error">{error}</div>}
+      {payload && (
+        <>
+          <div className="usage-export__summary">
+            <div><span>Session</span><strong>{payload.session.session_id}</strong></div>
+            <div><span>Branch</span><strong>{payload.session.branch ?? 'none'}</strong></div>
+            <div><span>Task</span><strong>{payload.session.task_title ?? payload.session.task_id ?? 'none'}</strong></div>
+            <div><span>Turns</span><strong>{payload.session.turns.length}</strong></div>
+            <div><span>Tool calls</span><strong>{payload.session.tool_calls.length}</strong></div>
+            <div><span>Last seen</span><strong>{fmtDateTime(payload.session.last_seen_at)}</strong></div>
+          </div>
+          <div className="usage-export__badges" aria-label="Analytics fidelity">
+            {Object.entries(payload.session.fidelity).map(([key, value]) => (
+              <span key={key} className={`usage-export__badge usage-export__badge--${value}`}>
+                {key.replaceAll('_', ' ')}: {value}
+              </span>
+            ))}
+          </div>
+          <div className="usage-export__tables">
+            <div>
+              <div className="usage-card__hint">Turns</div>
+              <div className="usage-mini-table usage-mini-table--turns">
+                <div className="usage-mini-table__row usage-mini-table__head">
+                  <span>#</span><span>Conversation</span><span>Model</span><span>Tokens</span><span>Cost</span><span>First byte</span>
+                </div>
+                {payload.session.turns.slice(0, 8).map((turn, idx) => (
+                  <div key={turn.turn_usage_id} className="usage-mini-table__row">
+                    <span>{idx + 1}</span>
+                    <span title={turn.conversation_id}>{turn.conversation_id === payload.session.session_id ? 'root' : turn.conversation_id}</span>
+                    <span title={turn.model}>{turn.model}</span>
+                    <span className="num">{fmtTokens(totalAnalyticsTokens(turn.tokens))}</span>
+                    <span className="num">{turn.cost.pricing_known ? fmtUsd(turn.cost.total_usd ?? 0) : 'unknown'}</span>
+                    <span className="num">{fmtLatency(turn.first_byte_latency_ms)}</span>
+                  </div>
+                ))}
+              </div>
+              {payload.session.turns.length > 8 && <div className="usage-card__hint">Showing first 8 of {payload.session.turns.length} turns.</div>}
+            </div>
+            <div>
+              <div className="usage-card__hint">Tool calls</div>
+              <div className="usage-mini-table usage-mini-table--tools">
+                <div className="usage-mini-table__row usage-mini-table__head">
+                  <span>Tool</span><span>Result</span><span>Error</span><span>Denied</span><span>Duration</span>
+                </div>
+                {payload.session.tool_calls.slice(0, 8).map((tool) => (
+                  <div key={`${tool.assistant_message_id}:${tool.tool_use_id}`} className="usage-mini-table__row">
+                    <span title={tool.tool_name}>{tool.tool_name}</span>
+                    <span>{tool.tool_result_message_id ? 'yes' : 'no'}</span>
+                    <span>{tool.is_error ? 'yes' : 'no'}</span>
+                    <span>{tool.denied ? 'yes' : 'no'}</span>
+                    <span className="num">{fmtLatency(tool.duration_ms)}</span>
+                  </div>
+                ))}
+              </div>
+              {payload.session.tool_calls.length > 8 && <div className="usage-card__hint">Showing first 8 of {payload.session.tool_calls.length} tool calls.</div>}
+            </div>
+          </div>
+          <details className="usage-export__raw">
+            <summary>Raw export JSON</summary>
+            <button type="button" className="settings-inline-btn" onClick={copyJson}>{copied ? 'Copied' : 'Copy JSON'}</button>
+            <pre>{rawJson}</pre>
+          </details>
+        </>
+      )}
+    </section>
+  );
+}
+
 function ConversationDrill({ id, label, onClose }: { id: string; label: string; onClose: () => void }) {
   const [detail, setDetail] = useState<ConversationUsageDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -224,6 +352,7 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
           unavailable.
         </div>
       )}
+      {detail && <AnalyticsExportPreview id={id} />}
       {detail && series.length > 0 && (
         <div className="usage-drill__charts">
           <div>
