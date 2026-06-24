@@ -169,3 +169,46 @@ into the system prompt ensures the sub-agent sees them before its first
 LLM call, without spending a tool call to read them. Exact paths only
 keeps context size predictable and prevents accidental injection of large
 directory trees.
+
+---
+
+### REQ-SA-009: Terminal Handle Identity for Wake Contracts
+
+WHEN a sub-agent is spawned
+THE SYSTEM SHALL expose a stable terminal-wait handle identified by the child
+conversation / agent id
+
+WHEN that handle is watched by a wake contract
+THE SYSTEM SHALL report terminal outcomes for successful `submit_result`,
+`submit_error`, wall-clock timeout, cancellation, turn-limit hard-stop fallback,
+and forgotten child handle
+
+THE sub-agent wake handle SHALL NOT be keyed by the parent's WorkScope and SHALL
+NOT imply parent-to-child continuation or automatic budget extension
+
+**Rationale:** Wake contracts need a stable way to reference sub-agent terminal
+completion without embedding blocking fan-in semantics into every parent state.
+The child conversation / agent id is already the durable sub-agent identity; the
+wake plane reuses it rather than inventing a parallel handle namespace.
+
+---
+
+### REQ-SA-010: Turn-Limit Grace Prompt Integrity
+
+WHEN a Work sub-agent reaches its turn limit and receives its grace turn
+THE SYSTEM SHALL instruct it not to report incomplete implementation as successful
+completion
+
+WHEN the assigned Work task required code changes and the sub-agent has not made
+them
+THE SYSTEM SHALL instruct it to call `submit_error` or explicitly report the
+implementation as incomplete while preserving useful analysis, plan details, and
+blockers for the parent
+
+WHEN an Explore sub-agent reaches its turn limit
+THE SYSTEM MAY continue to use analysis-oriented grace guidance because Explore
+work commonly completes by reporting findings rather than edits
+
+**Rationale:** The grace turn exists to force a terminal answer, not to relabel
+unfinished Work as success. Parent synthesis is safer when incomplete
+implementation is structurally visible in the terminal payload.

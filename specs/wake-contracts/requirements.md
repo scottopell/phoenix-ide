@@ -2,15 +2,32 @@
 
 ## User Story
 
-As an LLM agent, when I have started a long-running command (a build, a test
-suite, a dev server, a sub-agent) and have nothing else to do until it
-produces a useful event, I need a way to tell Phoenix "wake me when this
-specific condition fires" rather than polling the runtime every N seconds.
-Today every wait costs a full conversation round-trip — tool descriptions
-re-fed, history re-fed, an assistant turn spent saying "still waiting" —
-even when I had nothing to contribute in the interim. I need a primitive
-that consumes zero turns until the condition the LLM cares about actually
-holds.
+As an LLM agent, when I have started a long-running command, a tmux-backed
+process, or a sub-agent and have nothing else to do until that handle reaches a
+terminal state, I need a way to tell Phoenix "wake me when this handle is done"
+rather than polling the runtime every N seconds. Today every process wait costs a
+full conversation round-trip — tool descriptions re-fed, history re-fed, an
+assistant turn spent saying "still waiting" — even when I had nothing to
+contribute in the interim. Sub-agent fan-in avoids polling only by hardcoding a
+blocking parent state. I need a primitive that consumes zero turns until the
+specific terminal condition fires, while the parent conversation remains Idle and
+user-interruptible.
+
+## V1 scope
+
+Wake contracts v1 is intentionally narrow. It supports terminal waits on concrete
+Phoenix handles only:
+
+- **bash handles** returned by `bash op=run` when `wait_seconds` elapses;
+- **tmux pane/window handles** returned by `tmux_run` / referenced through the
+  tmux registry;
+- **sub-agent handles** identified by the child conversation / agent id.
+
+V1 does not define a general conversation-actor system, request/reply messaging,
+parent-to-child continuation, arbitrary clarification questions, or automatic
+sub-agent budget extension. Future actor-style messaging can reuse the same
+persisted wake-router infrastructure only if a later concrete use case justifies
+it.
 
 ## Background: from polling to wake
 
@@ -23,17 +40,17 @@ Today three tools spawn potentially-long work:
 - **`tmux_run`** — readiness modes are `return_immediately` and
   `wait_for_text`. No `wait_for_exit`. For finite long-running commands
   the LLM polls `tmux capture-pane`, same round-trip cost as bash.
-- **`subagent`** — spawns a sub-conversation; the parent blocks on
+- **`subagent`** — spawns a sub-conversation; the parent currently blocks on
   completion inside the state machine. This is the *only* current
   spawn-and-wait surface that does not require LLM polling, and it
   achieves that by hardcoding the wait into the state machine rather
-  than exposing a reusable primitive.
+  than exposing a reusable terminal-handle primitive.
 
 The subagent path proves the runtime *can* resume a conversation on an
-external signal. Wake contracts generalize that capability: any handle
-that the agent has spawned can register a wake condition, and the
-runtime delivers a synthetic tool result back into the conversation
-when the condition holds — without the LLM having to poll.
+external signal. Wake contracts generalize only that terminal-wait capability in
+v1: a conversation registers a wait on a bash, tmux, or sub-agent handle, returns
+to Idle, and receives a synthetic tool result when the handle reaches a terminal,
+expired, cancelled, or forgotten outcome.
 
 **No new conversation state.** Wake contracts do *not* introduce an
 `AwaitingWake` conv state. The conversation stays in `Idle` (or
@@ -164,25 +181,38 @@ query on `wake_contracts WHERE conv_id = ? AND status = pending`.
 
 ### REQ-WAKE-005: V1 Condition Kinds
 
-THE SYSTEM SHALL support the following condition kinds in v1:
+THE SYSTEM SHALL support the following condition kind in v1:
 
 - `HandleTerminal { handle_kind: Bash | TmuxPane | SubAgent, handle_id }`
-  — fires when the named handle reaches a terminal state (exited,
-  killed, signaled, kill_pending_kernel for bash; pane-process-exit
-  for tmux; child-conversation terminal for subagent)
+  — fires when the named handle reaches a terminal state.
+
+For `Bash`, terminal states SHALL include exited, killed, signaled,
+`kill_pending_kernel`, forgotten, and the synchronous wait surface's other
+terminal statuses.
+
+For `TmuxPane`, terminal states SHALL include the watched pane/window process
+exiting, the pane/window being explicitly killed, or the tmux server/session
+being forgotten by lifecycle teardown.
+
+For `SubAgent`, terminal states SHALL include successful `submit_result`,
+`submit_error`, wall-clock timeout, parent/child cancellation, turn-limit
+hard-stop fallback, and forgotten child handle.
 
 THE SYSTEM SHALL NOT support in v1:
+- arbitrary conversation-actor messages or request/reply continuation
+- parent-to-child continuation (`continue_subagent`) or `NeedMoreBudget`
+- automatic sub-agent budget extension
+- child clarification questions delivered to the parent
 - `RegexInTmuxPane { pane, pattern }` — deferred
 - `FileChanged { path }` — deferred
 - `PortListening { host, port }` — deferred
 - `WebhookFired { id }` — deferred (security surface)
 
-**Rationale:** HandleTerminal covers the highest-leverage case (build
-finished, test suite done, subagent submitted) and validates the
-abstraction with the simplest possible evaluator (handle status read).
-Other condition kinds are the same edge with different evaluators;
-the v1 contract row schema must accommodate them as a forward-compat
-discriminator.
+**Rationale:** HandleTerminal covers the highest-leverage cases: build/test
+processes finishing and delegated sub-agents reaching their terminal result. It
+validates the persistence, delivery, and wake-router edges without committing
+Phoenix to a general actor framework. Other condition kinds are separate
+evaluators; actor-style messaging is a separate product contract.
 
 ---
 
@@ -190,20 +220,31 @@ discriminator.
 
 WHEN a contract fires
 THE SYSTEM SHALL deliver to the conversation a synthetic tool result
-shaped as the tool result the equivalent successful `op=wait` would
-have returned — i.e., for `HandleTerminal/Bash` the tool result MUST
-carry the handle's terminal status (`exited` / `killed` /
-`kill_pending_kernel` / `forgotten`), `exit_code`, `duration_ms`, and
-a final tail window per REQ-BASH-004
+shaped as the tool result the equivalent successful synchronous wait would have
+returned.
+
+For `HandleTerminal/Bash`, the tool result MUST carry the handle's terminal
+status (`exited` / `killed` / `kill_pending_kernel` / `forgotten` and any other
+status exposed by `bash op=wait`), `exit_code`, `duration_ms`, and a final tail
+window per REQ-BASH-004.
+
+For `HandleTerminal/TmuxPane`, the tool result MUST carry the watched pane/window
+identity, terminal status, exit information when available, and a final captured
+tail window equivalent to the information the LLM would gather by inspecting the
+pane after exit.
+
+For `HandleTerminal/SubAgent`, the tool result MUST carry the child agent id,
+child conversation id, task label/description when available, and the structured
+sub-agent terminal payload defined by REQ-WAKE-017.
 
 THE delivered tool result SHALL be addressable back to the original
 tool call that registered the contract (via `tool_use_id`)
 
 **Rationale:** Pit-of-success: the LLM sees the same shape whether it
-synchronously waited or registered a wake contract. The decision
-between the two is "should I block this turn or not"; the response
-shape is the same. This makes the wake primitive a drop-in
-replacement for `op=wait`, not a parallel pathway.
+synchronously waited or registered a wake contract. The decision between the two
+is "should I block this turn or not"; the response shape is the same whenever a
+synchronous analogue exists. Sub-agent waits have no existing synchronous
+`op=wait` tool, so REQ-WAKE-017 defines the equivalent terminal payload.
 
 ---
 
@@ -413,6 +454,80 @@ there is no bash handle named `t-3`.
 
 ---
 
+### REQ-WAKE-017: Sub-Agent Terminal Wake Payload
+
+WHEN a `HandleTerminal/SubAgent` contract fires because the child called
+`submit_result`
+THE SYSTEM SHALL deliver `outcome: success` with the submitted result text and the
+child agent/conversation identity.
+
+WHEN a `HandleTerminal/SubAgent` contract fires because the child called
+`submit_error`
+THE SYSTEM SHALL deliver `outcome: failure` with the submitted error text and
+`error_kind`.
+
+WHEN the child reaches wall-clock timeout
+THE SYSTEM SHALL deliver `outcome: failure`, `error_kind: timeout`, and a message
+stating that the child exceeded its configured timeout.
+
+WHEN the child is cancelled by the parent, user, or lifecycle cascade
+THE SYSTEM SHALL deliver `outcome: failure`, `error_kind: cancelled`, and the
+cancellation reason when available.
+
+WHEN the child exhausts its turn-limit grace path and the runtime performs the
+hard-stop fallback
+THE SYSTEM SHALL deliver `outcome: failure`, `error_kind: turn_limit_exhausted`,
+and include the extracted partial assistant text when available.
+
+WHEN the child conversation/agent id cannot be found during router evaluation
+THE SYSTEM SHALL fire the contract with cause `Forgotten` and reason
+`subagent_handle_missing`.
+
+**Rationale:** Sub-agent wake is a terminal-result delivery mechanism, not a
+continuation protocol. The parent receives enough structured information to
+synthesize or recover, but v1 never asks the parent whether to extend the child or
+send it another prompt.
+
+---
+
+### REQ-WAKE-018: V1 Handle Identity and Lifecycle
+
+A `Bash` wake handle SHALL be addressed by the bash handle id returned by the bash
+tool. The handle remains WorkScope-keyed: it transfers across a continuation that
+inherits the same WorkScope, and a pending wake contract transfers with it per
+REQ-WAKE-012. Because bash handles are in-memory, Phoenix restart fires pending
+bash waits as `Forgotten { reason: "phoenix_restart" }`.
+
+A `TmuxPane` wake handle SHALL be addressed by the tmux registry's stable pane or
+window handle id. It is WorkScope-keyed for continuation inheritance and lifecycle
+teardown. A hard-delete or WorkScope teardown with no inheriting successor fires
+pending tmux waits as forgotten; a surviving tmux handle is re-registered on
+router startup.
+
+A `SubAgent` wake handle SHALL be addressed by the child conversation / agent id
+created for the sub-agent. It is not WorkScope-keyed and SHALL NOT transfer across
+WorkScope inheritance. Parent cancellation and child cancellation produce a
+terminal cancelled payload; parent hard-delete deletes the child through normal
+conversation cascade and either cancels the pending wake before deletion or, if
+only the orphaned contract remains observable, fires forgotten.
+
+**Rationale:** The three v1 handle kinds deliberately use their existing stable
+identities. The wake plane does not invent a parallel handle namespace, and it
+does not treat sub-agents as WorkScope resources.
+
+---
+
+## Implementation Sequence
+
+1. Improve the sub-agent grace-turn prompt so Work sub-agents do not present
+   incomplete implementation as success.
+2. Land the tightened wake-contract and sub-agent terminal-handle specs.
+3. Implement persisted wake contracts and the wake router for bash/tmux terminal
+   handles.
+4. Expose sub-agent terminal handles through the same wake plane.
+5. Evaluate whether blocking `AwaitingSubAgents` remains compatibility sugar or
+   lowers onto wake contracts internally.
+
 ## Status
 
 | Requirement | Status | Notes |
@@ -433,8 +548,10 @@ there is no bash handle named `t-3`.
 | REQ-WAKE-014 | Proposed | Tool description discipline |
 | REQ-WAKE-015 | Proposed | Cost observability metrics |
 | REQ-WAKE-016 | Proposed | Unified `wait_until` tool, not per-substrate |
+| REQ-WAKE-017 | Proposed | Sub-agent terminal payloads for success, error, timeout, cancellation, turn-limit fallback, forgotten |
+| REQ-WAKE-018 | Proposed | V1 handle identity/lifecycle for bash, tmux, and sub-agent handles |
 
-**Progress:** 0 of 16 implemented.
+**Progress:** 0 of 18 implemented.
 
 ## Dependencies
 

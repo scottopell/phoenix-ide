@@ -1,5 +1,15 @@
 # Wake Contracts — Design
 
+## V1 Design Boundary
+
+Wake contracts v1 is a terminal-handle wait plane, not a general actor plane. The
+only supported condition is `HandleTerminal` on bash, tmux pane/window, and
+sub-agent handles. The parent conversation registers the wait, returns to Idle,
+and is woken by a synthetic tool result when the watched handle reaches a
+terminal, expired, cancelled, or forgotten outcome. V1 does not add
+parent-to-child continuation, arbitrary child questions, `NeedMoreBudget`, or
+runtime heuristics that extend sub-agent budgets.
+
 ## Why Two Axes (Wake vs WorkScope)
 
 WorkScope answers a *resource ownership* question: when a conversation
@@ -94,15 +104,19 @@ contract."
 
 ### HandleTerminal is the sole condition kind
 
-`HandleTerminal` (fires on process exit) is the only condition kind
-whose evaluator is a pure read of existing state — the handle's
-`HandleState` is already tracked. Other candidate kinds —
-`RegexInTmuxPane` (regex match in pane capture), `FileChanged` (file
-mtime advance) — require new poller infrastructure (tmux capture-pane
-scheduling, a file-watcher) and are out of scope (see "Out of Scope").
-`HandleTerminal` exercises the persistence + delivery + state-machine
-pieces in isolation; condition-kind growth is a matter of adding
-evaluators against the same edge.
+`HandleTerminal` on bash, tmux pane/window, and sub-agent handles is the only
+condition kind whose evaluator is a pure read of existing state — process handle
+status, tmux pane/window process status, or child-conversation terminal status.
+Other candidate kinds — `RegexInTmuxPane` (regex match in pane capture),
+`FileChanged` (file mtime advance) — require new poller infrastructure (tmux
+capture-pane scheduling, a file-watcher) and are out of scope. General
+conversation-actor messaging is also out of scope: a sub-agent terminal wake
+reports that a delegated job ended; it does not ask the parent for another prompt
+or more budget.
+
+`HandleTerminal` exercises the persistence + delivery + state-machine pieces in
+isolation; condition-kind growth is a matter of adding evaluators against the
+same edge.
 
 ### No WebhookFired condition kind
 
@@ -187,6 +201,16 @@ LLM turn includes whatever has accumulated. The race "both arrive
 in the same millisecond" is serialized by the existing per-conv
 lock around message-log appends. No special policy is needed.
 
+### Sub-agent terminal delivery is not continuation
+
+A sub-agent wake delivers the same terminal information the blocking fan-in path
+needs: success result, submitted error, wall-clock timeout, cancellation,
+turn-limit hard-stop fallback with extracted partial text when available, or
+forgotten child handle. That payload wakes the parent so it can synthesize or
+recover. It never resumes the child, grants more turns, or forwards a child
+question to the parent. Those behaviours would require an actor/request-reply
+contract with different authorization, budget, and UI semantics.
+
 ### Tool surface — one tool
 
 The LLM-facing surface is the unified `wait_until` tool
@@ -195,6 +219,10 @@ The LLM-facing surface is the unified `wait_until` tool
 ## Out of Scope
 
 - Cross-conversation wake (one conversation wakes another)
+- Parent-to-child sub-agent continuation (`continue_subagent`)
+- `NeedMoreBudget` request/reply or automatic sub-agent budget extension
+- Arbitrary child clarification questions routed to the parent
+- General conversation-actor messaging
 - Webhook-triggered wake
 - Compound conditions (`wake_when_A_or_B`, `wait_any`, `wait_all`)
 - Wake with retry (`fire_on_condition_for_max_N_times`)

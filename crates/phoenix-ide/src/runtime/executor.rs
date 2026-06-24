@@ -4028,10 +4028,20 @@ where
                 // via the existing User message path (not System, which is
                 // UI-only bookkeeping and not sent to the LLM).
                 let msg_id = uuid::Uuid::new_v4().to_string();
-                let content = MessageContent::User(crate::db::UserContent::meta(
+                let grace_prompt = if matches!(
+                    self.context.mode_context,
+                    Some(ModeContext::Explore { .. })
+                ) {
                     "You have reached your turn limit. Please call submit_result now \
-                         with whatever findings you have so far. Do not call any other tools.",
-                ));
+                         with whatever findings you have so far. Do not call any other tools."
+                } else {
+                    "You have reached your turn limit. Do not call any tools except submit_result \
+                         or submit_error. If your assigned task required code changes and you have \
+                         not made them, do not present the task as complete. Call submit_error, or \
+                         use submit_result only if it explicitly says the implementation is incomplete \
+                         and includes the useful analysis, plan, and blockers for the parent."
+                };
+                let content = MessageContent::User(crate::db::UserContent::meta(grace_prompt));
                 if let Err(e) = self
                     .storage
                     .add_message(&msg_id, &self.context.conversation_id, &content, None, None)

@@ -27,7 +27,7 @@
 --   - A first-class AwaitingWake conv state (deliberately rejected;
 --     see design.md "Why No AwaitingWake State")
 --
--- Requirement traceability: REQ-WAKE-001 through REQ-WAKE-016
+-- Requirement traceability: REQ-WAKE-001 through REQ-WAKE-018
 -- Dependencies: specs/bedrock/bedrock.allium, specs/bash/bash.allium
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -79,7 +79,19 @@ value FirePayload {
     observed_exit_code: Integer?                     -- when cause = fired
     observed_duration_ms: Integer?                   -- when cause = fired
     observed_tail: List<bash/RingLine>?              -- when cause = fired
+    sub_agent_payload: SubAgentTerminalPayload?             -- when handle kind = subagent
     forgotten_reason: String?                        -- when cause = forgotten
+}
+
+value SubAgentTerminalPayload {
+    child_agent_id: String
+    child_conversation_id: String
+    task_label: String?
+    outcome: SubAgentTerminalOutcome
+    result_text: String?           -- present for submit_result success
+    error_text: String?            -- present for submitted/fallback failures
+    error_kind: String?            -- submit_error kind, timeout, cancelled, turn_limit_exhausted
+    partial_text: String?          -- present when turn-limit hard-stop extracts assistant text
 }
 
 ------------------------------------------------------------
@@ -106,6 +118,11 @@ enum TerminalCause {
                   -- restart that drops an in-memory bash handle, or
                   -- a hard-delete that tears down a WorkScope with
                   -- no inheritor)
+}
+
+enum SubAgentTerminalOutcome {
+    success
+    | failure
 }
 
 enum ContractStatus {
@@ -307,6 +324,11 @@ rule WakeRouterFiresOnConditionHold {
         -- AwaitingWake (it only made sense as a conv-state
         -- transition).
         --
+        -- For handle.kind = subagent, payload.sub_agent_payload is populated with
+        -- one of the REQ-WAKE-017 terminal outcomes: submit_result success,
+        -- submit_error failure, timeout, cancellation, turn-limit hard-stop fallback,
+        -- or forgotten child handle. The wake payload never resumes the child or
+        -- grants more budget.
         -- The synthetic tool result is appended to the conv message
         -- log via the same path as a normal tool result completion.
         -- The conv's next-LLM-turn trigger is the same path as

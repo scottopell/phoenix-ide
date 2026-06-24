@@ -51,6 +51,9 @@ only the architectural seams.
 - **Timeout** is a 20-minute wall-clock safety-net set when the parent
   enters `awaiting_sub_agents`; `max_turns` (per-mode default 20/50) is
   the primary budget.
+- **Sub-agent wake handle** is the child conversation / agent id. Wake contracts
+  can wait on that handle reaching terminal state, but the wake payload is not a
+  parent-to-child continuation channel and does not grant more budget.
 - **Named agents** (see [`../agents/`](../agents/executive.md)) thread
   through this layer: `SubAgentTask` gains an optional `agent_type`;
   `SubAgentSpec` gains `agent_name` and `persona`;
@@ -71,8 +74,10 @@ only the architectural seams.
 | **REQ-SA-006:** Timeout Enforcement | ✅ Complete | `DEFAULT_SUBAGENT_TIMEOUT = 20 min`; deadline races in executor `select!` |
 | **REQ-SA-007:** Model Tier Selection | ✅ Superseded | Replaced by REQ-PROJ-008 mode defaults + explicit `model` override |
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |
+| **REQ-SA-009:** Terminal Handle Identity for Wake Contracts | Proposed | Child conversation / agent id is the sub-agent wake handle |
+| **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Work grace prompt warns against reporting incomplete implementation as success |
 
-**Progress:** 7 of 8 implemented (one explicitly superseded; one deferred).
+**Progress:** 8 of 10 implemented (one explicitly superseded; one deferred; one proposed for wake runtime).
 
 ## Deferred refinements
 

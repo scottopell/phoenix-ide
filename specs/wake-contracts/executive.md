@@ -18,11 +18,14 @@ stays in `Idle`, and the runtime delivers a synthetic tool result
 into the conversation when the condition fires (or expires). The LLM
 consumes zero turns in between.
 
-V1 supports one condition kind: `HandleTerminal { handle_kind,
-handle_id }` — fires when a named bash/tmux/subagent handle reaches a
-terminal state. Future revisions add regex-in-pane, file-changed,
-port-listening, and other condition kinds against the same edge
-without revisiting the persistence layer or the delivery path.
+V1 supports one condition kind over three concrete handle kinds:
+`HandleTerminal { handle_kind, handle_id }` — fires when a named bash, tmux
+pane/window, or sub-agent handle reaches a terminal state. For sub-agents, the
+terminal payload covers `submit_result`, `submit_error`, wall-clock timeout,
+cancellation, turn-limit hard-stop fallback, and forgotten child handle. V1 does
+not define parent-to-child continuation, `NeedMoreBudget`, arbitrary child
+questions, automatic sub-agent budget extension, or a general conversation-actor
+framework.
 
 ## Technical Summary
 
@@ -44,11 +47,13 @@ user interaction. `is_busy()` is augmented to return true when the
 conv has at least one pending contract (one extra SQLite count per
 evaluation; lifecycle endpoints already do at least one read).
 
-The synthetic tool result delivered on fire is byte-shape-identical
-to the tool result the equivalent synchronous `op=wait` would have
-returned. This makes wake a drop-in replacement for polling from the
-LLM's vantage point: same payload, same `tool_use_id` correlation,
-just zero intervening turns.
+The synthetic tool result delivered on fire is byte-shape-identical to the tool
+result the equivalent synchronous wait would have returned when such a
+synchronous surface exists. Bash delivery mirrors `bash op=wait`; tmux delivery
+includes the watched pane/window terminal status and final captured tail; sub-agent
+delivery uses the structured terminal outcome described above. This makes wake a
+drop-in replacement for polling from the LLM's vantage point: same payload, same
+`tool_use_id` correlation, just zero intervening turns.
 
 Wake contracts are conversation-scoped, not WorkScope-scoped: a contract is
 owned by one conversation and delivers its synthetic result there. The handles
@@ -95,8 +100,10 @@ land separately.
 | REQ-WAKE-014 Tool Description | Proposed | Explicit cost model + when-to-use guidance |
 | REQ-WAKE-015 Cost Observability | Proposed | Metrics on registration / fire / forgotten breakdown |
 | REQ-WAKE-016 Unified Tool Surface | Proposed | Single `wait_until` tool, tagged-enum handle discriminator |
+| REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Success, error, timeout, cancellation, turn-limit fallback, forgotten child |
+| REQ-WAKE-018 Handle Identity + Lifecycle | Proposed | Bash/tmux WorkScope-keyed; sub-agent keyed by child conversation / agent id |
 
-**Progress:** 0 of 16 implemented.
+**Progress:** 0 of 18 implemented.
 
 ## Dependencies
 
