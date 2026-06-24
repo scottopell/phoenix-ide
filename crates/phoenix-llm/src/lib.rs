@@ -41,6 +41,7 @@ pub mod codex_login;
 pub mod credential_helper;
 mod discovery;
 mod error;
+mod headers;
 mod mock;
 mod models;
 mod openai;

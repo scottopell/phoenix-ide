@@ -92,8 +92,6 @@ value AnthropicRawResponse {
 -- The resolved Anthropic endpoint for one request.
 entity AnthropicEndpoint {
     source: AnthropicEndpointSource
-    -- Always false: Phoenix never appends hidden provider path suffixes.
-    path_suffix_appended: Boolean
 }
 
 -- The cache-breakpoint plan for one translated request. Anthropic gets
@@ -180,9 +178,9 @@ rule AnthropicEndpointResolved {
 
     ensures:
         if override_url != null:
-            AnthropicEndpoint.created(source: base_url_override, path_suffix_appended: false)
+            AnthropicEndpoint.created(source: base_url_override)
         else:
-            AnthropicEndpoint.created(source: provider_default, path_suffix_appended: false)
+            AnthropicEndpoint.created(source: provider_default)
 
     @guidance
         -- The override branch is used as-is precisely because a

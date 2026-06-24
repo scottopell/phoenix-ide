@@ -58,7 +58,7 @@ impl ModelBackend {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ExternalBackend {
-    #[serde(alias = "anthropic_messages")]
+    #[serde(rename = "anthropic", alias = "anthropic_messages")]
     Anthropic,
     #[serde(rename = "openai_responses")]
     OpenAIResponses,
@@ -83,7 +83,6 @@ pub(crate) enum ApiFormat {
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ExternalModelSpec {
     id: String,
     api_name: Option<String>,
@@ -150,46 +149,58 @@ impl ModelSpec {
 /// without duplicating the same identifier in config.
 ///
 /// # Errors
-/// Returns an actionable validation error. The raw JSON is never included in the
-/// error string, so callers can log it without echoing deployment config.
+/// Returns valid model specs. Invalid entries are logged and skipped so one bad
+/// item does not suppress the rest of the configured external models.
 pub fn parse_external_models(raw: &str) -> Result<Vec<ModelSpec>, String> {
-    let specs: Vec<ExternalModelSpec> = serde_json::from_str(raw)
-        .map_err(|e| format!("invalid JSON for PHOENIX_LLM_MODELS: {e}"))?;
+    let specs: Vec<serde_json::Value> =
+        serde_json::from_str(raw).map_err(|_| "invalid JSON for PHOENIX_LLM_MODELS".to_string())?;
 
-    specs
-        .into_iter()
-        .enumerate()
-        .map(|(index, spec)| {
-            let id = spec.id.trim().to_string();
-            if id.is_empty() {
-                return Err(format!("model at index {index} has an empty id"));
+    let mut parsed = Vec::new();
+    for (index, value) in specs.into_iter().enumerate() {
+        match serde_json::from_value::<ExternalModelSpec>(value)
+            .map_err(|_| format!("model at index {index} has invalid shape"))
+            .and_then(|spec| external_model_spec_from_config(index, spec))
+        {
+            Ok(spec) => parsed.push(spec),
+            Err(error) => {
+                tracing::warn!(error = %error, "ignoring invalid PHOENIX_LLM_MODELS entry");
             }
-            let api_name = spec
-                .api_name
-                .map_or_else(|| id.clone(), |name| name.trim().to_string());
-            if api_name.is_empty() {
-                return Err(format!("model '{id}' has an empty api_name"));
-            }
-            let description = spec.description.trim().to_string();
-            if description.is_empty() {
-                return Err(format!("model '{id}' has an empty description"));
-            }
-            if spec.context_window == 0 {
-                return Err(format!("model '{id}' has invalid context_window 0"));
-            }
-            let backend: ModelBackend = spec.backend.into();
-            Ok(ModelSpec {
-                id,
-                api_name,
-                backend,
-                description,
-                context_window: spec.context_window,
-                recommended: spec.recommended,
-                supports_tool_search: spec.supports_tool_search,
-                source: ModelSource::External,
-            })
-        })
-        .collect()
+        }
+    }
+    Ok(parsed)
+}
+
+fn external_model_spec_from_config(
+    index: usize,
+    spec: ExternalModelSpec,
+) -> Result<ModelSpec, String> {
+    let id = spec.id.trim().to_string();
+    if id.is_empty() {
+        return Err(format!("model at index {index} has an empty id"));
+    }
+    let api_name = spec
+        .api_name
+        .map_or_else(|| id.clone(), |name| name.trim().to_string());
+    if api_name.is_empty() {
+        return Err(format!("model '{id}' has an empty api_name"));
+    }
+    let description = spec.description.trim().to_string();
+    if description.is_empty() {
+        return Err(format!("model '{id}' has an empty description"));
+    }
+    if spec.context_window == 0 {
+        return Err(format!("model '{id}' has invalid context_window 0"));
+    }
+    Ok(ModelSpec {
+        id,
+        api_name,
+        backend: spec.backend.into(),
+        description,
+        context_window: spec.context_window,
+        recommended: spec.recommended,
+        supports_tool_search: spec.supports_tool_search,
+        source: ModelSource::External,
+    })
 }
 
 /// Merge built-in models with externally configured additions.
@@ -367,24 +378,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_external_backend() {
-        let err = parse_external_models(
+    fn skips_unknown_external_backend_entry() {
+        let models = parse_external_models(
             r#"[{"id":"bad-openai","backend":"not-a-backend","description":"Bad backend","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
         )
-        .expect_err("unknown backend should be rejected");
+        .expect("array syntax should parse even when an entry is invalid");
 
-        assert!(err.contains("unknown variant"));
-        assert!(err.contains("openai_responses"));
+        assert!(models.is_empty());
     }
 
     #[test]
-    fn rejects_invalid_external_context_window() {
-        let err = parse_external_models(
+    fn skips_invalid_external_context_window_entry() {
+        let models = parse_external_models(
             r#"[{"id":"bad","backend":"anthropic","description":"Bad","context_window":0,"recommended":false,"supports_tool_search":false}]"#,
         )
-        .expect_err("zero context window should be rejected");
+        .expect("array syntax should parse even when an entry is invalid");
 
-        assert!(err.contains("context_window 0"));
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn bad_external_models_json_is_rejected() {
+        let err = parse_external_models("not json")
+            .expect_err("top-level invalid JSON should still reject the config");
+
+        assert_eq!(err, "invalid JSON for PHOENIX_LLM_MODELS");
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! Anthropic Claude provider implementation
 
+use super::headers::apply_source_header;
 use super::models::ModelSpec;
 use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, LlmResponse, MessageRole, Usage,
-    LLM_SOURCE_HEADER,
 };
 use super::LlmError;
 use reqwest::Client;
@@ -318,25 +318,6 @@ fn parse_anthropic_sse_error(v: &serde_json::Value) -> LlmError {
         "invalid_request_error" => LlmError::invalid_request(detail),
         _ => LlmError::server_error(detail),
     }
-}
-
-fn has_custom_source_header(custom_headers: &[(String, String)]) -> bool {
-    custom_headers
-        .iter()
-        .any(|(key, _)| key.eq_ignore_ascii_case("source"))
-}
-
-fn apply_source_header(
-    mut builder: reqwest::RequestBuilder,
-    custom_headers: &[(String, String)],
-) -> reqwest::RequestBuilder {
-    if !has_custom_source_header(custom_headers) {
-        builder = builder.header("source", LLM_SOURCE_HEADER);
-    }
-    for (k, v) in custom_headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
-    builder
 }
 
 fn resolve_anthropic_url(base_url_override: Option<&str>) -> String {
@@ -1098,6 +1079,7 @@ pub(crate) struct AnthropicUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::headers::has_custom_source_header;
     use crate::models::{ModelBackend, ModelSpec};
     use crate::types::{LlmRequest, PromptCacheKey, ToolDefinition};
 

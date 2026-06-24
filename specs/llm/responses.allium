@@ -111,8 +111,6 @@ value ResponsesRawResponse {
 -- The resolved Responses endpoint for one request.
 entity ResponsesEndpoint {
     source: ResponsesEndpointSource
-    -- Always false: Phoenix never appends hidden provider path suffixes.
-    path_suffix_appended: Boolean
 }
 
 -- A streaming SSE accumulation in progress against the Responses API.
@@ -186,9 +184,9 @@ rule ResponsesEndpointResolved {
 
     ensures:
         if override_url != null:
-            ResponsesEndpoint.created(source: base_url_override, path_suffix_appended: false)
+            ResponsesEndpoint.created(source: base_url_override)
         else:
-            ResponsesEndpoint.created(source: provider_default, path_suffix_appended: false)
+            ResponsesEndpoint.created(source: provider_default)
 }
 
 ------------------------------------------------------------

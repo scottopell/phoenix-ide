@@ -6,6 +6,7 @@
 use crate::ModelBackend;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// Configuration for model discovery
 pub struct DiscoveryConfig {
@@ -36,6 +37,11 @@ pub struct DiscoveredModels {
     pub openai_responses: HashSet<String>,
 }
 
+fn empty_ids() -> &'static HashSet<String> {
+    static EMPTY: OnceLock<HashSet<String>> = OnceLock::new();
+    EMPTY.get_or_init(HashSet::new)
+}
+
 impl DiscoveredModels {
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -50,8 +56,9 @@ impl DiscoveredModels {
     #[must_use]
     pub fn ids_for_backend(&self, backend: ModelBackend) -> &HashSet<String> {
         match backend {
+            ModelBackend::Anthropic => &self.anthropic,
             ModelBackend::OpenAIResponses => &self.openai_responses,
-            ModelBackend::Anthropic | ModelBackend::Mock => &self.anthropic,
+            ModelBackend::Mock => empty_ids(),
         }
     }
 }

@@ -1,11 +1,12 @@
 //! `OpenAI` and `OpenAI`-compatible provider implementation
 
+use super::headers::apply_source_header;
 use super::models::ModelSpec;
 use super::rate_limit::{
     parse_active_limit, parse_credits_snapshot, parse_promo_message, parse_rate_limit_for_limit,
     QuotaDetails,
 };
-use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage, LLM_SOURCE_HEADER};
+use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage};
 use super::LlmError;
 use chrono::{DateTime, Utc};
 use reqwest::header::HeaderMap;
@@ -30,25 +31,6 @@ fn resolve_endpoint(base_url_override: Option<&str>) -> String {
 // ---------------------------------------------------------------------------
 // Responses API
 // ---------------------------------------------------------------------------
-
-fn has_custom_source_header(custom_headers: &[(String, String)]) -> bool {
-    custom_headers
-        .iter()
-        .any(|(key, _)| key.eq_ignore_ascii_case("source"))
-}
-
-fn apply_source_header(
-    mut builder: reqwest::RequestBuilder,
-    custom_headers: &[(String, String)],
-) -> reqwest::RequestBuilder {
-    if !has_custom_source_header(custom_headers) {
-        builder = builder.header("source", LLM_SOURCE_HEADER);
-    }
-    for (k, v) in custom_headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
-    builder
-}
 
 /// Complete using the `OpenAI` Responses API.
 #[allow(clippy::too_many_arguments)]
@@ -1128,6 +1110,7 @@ pub(crate) struct ResponsesApiUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::headers::has_custom_source_header;
     use crate::types::{LlmRequest, PromptCacheKey};
 
     fn empty_request() -> LlmRequest {

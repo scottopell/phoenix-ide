@@ -6013,18 +6013,6 @@ def _preflight_prod_bind_auth(effective_env: dict[str, str], socket_activated: b
     sys.exit(1)
 
 
-def _env_provides_llm_config(env: dict[str, str]) -> bool:
-    """True if `env` already specifies how to reach an LLM.
-
-    Counts a credential helper, direct provider API key, or provider-compatible
-    base URL override.
-    """
-    return any(
-        env.get(k)
-        for k in ("LLM_API_KEY_HELPER", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL")
-    )
-
-
 def _detect_codex_auth(env: dict[str, str]) -> str | None:
     """Return a human-readable summary if the server will find a ChatGPT/Codex
     bridge auth file at startup, else None. Mirrors
@@ -6082,8 +6070,6 @@ def _configure_llm_env(env: dict[str, str]) -> str:
         if api_key:
             env[key] = api_key
             return f"direct API key ({key})"
-    if codex := _detect_codex_auth(env):
-        return codex
 
     print("ERROR: No LLM configuration found.", file=sys.stderr)
     print("  Options:", file=sys.stderr)

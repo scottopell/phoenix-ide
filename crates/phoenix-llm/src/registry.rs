@@ -270,6 +270,7 @@ impl Default for LlmConfig {
 }
 
 impl LlmConfig {
+    #[allow(clippy::too_many_lines)]
     pub fn from_env(runtime_env: Arc<PhoenixRuntimeEnvironment>) -> Self {
         let credential_helper = std::env::var("LLM_API_KEY_HELPER")
             .ok()
@@ -285,10 +286,16 @@ impl LlmConfig {
         let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL")
             .ok()
             .filter(|s| !s.is_empty());
+        if let Some(url) = anthropic_base_url.as_deref() {
+            warn_if_endpoint_url_has_no_path("ANTHROPIC_BASE_URL", url);
+        }
 
         let openai_base_url = std::env::var("OPENAI_BASE_URL")
             .ok()
             .filter(|s| !s.is_empty());
+        if let Some(url) = openai_base_url.as_deref() {
+            warn_if_endpoint_url_has_no_path("OPENAI_BASE_URL", url);
+        }
 
         // Parse newline-separated "key: value" pairs (supports real newlines and literal \n)
         let custom_headers = std::env::var("LLM_CUSTOM_HEADERS")
@@ -388,6 +395,19 @@ impl LlmConfig {
     }
 }
 
+fn warn_if_endpoint_url_has_no_path(name: &str, url: &str) {
+    let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let has_path = without_scheme
+        .split_once('/')
+        .is_some_and(|(_, path)| !path.trim_matches('/').is_empty());
+    if !has_path {
+        tracing::warn!(
+            env_var = name,
+            "LLM base URL override has no path; Phoenix uses endpoint URLs as-is and will not append a provider path"
+        );
+    }
+}
+
 /// Parse the `LLM_REQUEST_TAGS` env-var format: comma-separated `key=value`
 /// pairs. Whitespace around keys/values is trimmed. Empty pairs and pairs
 /// without `=` are skipped. Empty keys are skipped (a value with no key has
@@ -409,12 +429,25 @@ fn parse_request_tags(raw: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+fn infer_provider_display_from_model_id(model_id: &str) -> String {
+    if model_id.starts_with("claude-") {
+        "Anthropic".to_string()
+    } else if model_id.starts_with("gpt-") {
+        "OpenAI".to_string()
+    } else {
+        "Unknown".to_string()
+    }
+}
+
 /// Derive a `/v1/models` URL from a base URL like `/v1/messages` or `/v1/responses`.
 /// Replaces the last path segment with `"models"`, stripping any query string first.
 fn derive_models_url(base_url: &str) -> Option<String> {
-    // Strip query string if present (e.g. "https://host/v1/messages?foo=bar")
     let path = base_url.split('?').next().unwrap_or(base_url);
+    let scheme_end = path.find("://").map_or(0, |idx| idx + 3);
     let last_slash = path.rfind('/')?;
+    if last_slash < scheme_end {
+        return None;
+    }
     // Safety: `last_slash` is from `rfind('/')` on `path`
     #[allow(clippy::string_slice)]
     Some(format!("{}models", &path[..=last_slash]))
@@ -803,7 +836,7 @@ impl ModelRegistry {
             .into_iter()
             .find(|spec| spec.id == model_id)
             .map_or_else(
-                || "Unknown".to_string(),
+                || infer_provider_display_from_model_id(model_id),
                 |spec| spec.backend.display_name().to_string(),
             )
     }
@@ -1265,6 +1298,11 @@ mod tests {
             "Anthropic"
         );
         assert_eq!(registry.provider_display_name("unknown-model"), "Unknown");
+        assert_eq!(
+            registry.provider_display_name("claude-retired-1"),
+            "Anthropic"
+        );
+        assert_eq!(registry.provider_display_name("gpt-retired-1"), "OpenAI");
     }
 
     #[test]
@@ -1695,8 +1733,13 @@ mod tests {
     }
 
     #[test]
+    fn test_derive_models_url_no_path_component() {
+        assert_eq!(derive_models_url("https://host"), None);
+        assert_eq!(derive_models_url("https://host?foo=bar"), None);
+    }
+
+    #[test]
     fn test_derive_models_url_no_slash() {
-        // A URL with no slash at all returns None
         assert_eq!(derive_models_url("noslash"), None);
     }
 

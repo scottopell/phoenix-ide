@@ -55,6 +55,7 @@ THE SYSTEM SHALL return only models that are currently available
 
 WHEN deriving a model-list URL from a provider-compatible base URL
 THE SYSTEM SHALL replace the final path segment with `models`
+AND SHALL skip discovery when the configured URL has no path segment to replace
 
 WHEN a model-list endpoint returns models
 THE SYSTEM SHALL match discovered IDs against configured model IDs, wire model names, and backend-prefixed aliases
