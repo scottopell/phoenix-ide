@@ -19,15 +19,14 @@ use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, 
 use super::state::{
     AssistantMessage, CommissionReviewApprovalOutcome, CommissionReviewApprovalScope,
     ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind, ParentState,
-    RecoveryKind, RecoveryResumeTarget, SubAgentResult, SubAgentState, TaskApprovalHandoff,
-    TaskApprovalOutcome, ToolCall, ToolInput,
+    RecoveryKind, RecoveryResumeTarget, SubAgentOutcome, SubAgentResult, SubAgentState,
+    TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::mode_context::ModeContext;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -333,52 +332,9 @@ fn commission_review_scope_from_context(
         ),
     };
 
-    let repo_root = git_output(&context.working_dir, &["rev-parse", "--show-toplevel"])
-        .unwrap_or_else(|| context.working_dir.display().to_string());
-    let dirty = git_output(&context.working_dir, &["status", "--porcelain"])
-        .map(|status| !status.trim().is_empty())
-        .unwrap_or(false);
-    let (changed_files, insertions, deletions) = match if kind == "worktree_diff" {
-        if input.allow_dirty_working_tree && dirty {
-            git_output(
-                &context.working_dir,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--numstat",
-                    &base,
-                    "--",
-                ],
-            )
-        } else {
-            git_output(
-                &context.working_dir,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--numstat",
-                    &format!("{base}...HEAD"),
-                ],
-            )
-        }
-    } else {
-        git_output(
-            &context.working_dir,
-            &[
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--numstat",
-                "HEAD",
-                "--",
-            ],
-        )
-    } {
-        Some(numstat) => parse_numstat_summary(&numstat),
-        None => (0, 0, 0),
-    };
+    let repo_root = context.working_dir.display().to_string();
+    let dirty = input.allow_dirty_working_tree;
+    let (changed_files, insertions, deletions) = (0, 0, 0);
 
     CommissionReviewApprovalScope {
         kind,
@@ -390,41 +346,6 @@ fn commission_review_scope_from_context(
         insertions,
         deletions,
     }
-}
-
-fn git_command() -> Command {
-    let mut command = Command::new("git");
-    command.env("GIT_OPTIONAL_LOCKS", "0");
-    command.env("GIT_NO_LAZY_FETCH", "1");
-    command
-}
-
-fn git_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
-    let output = git_command().args(args).current_dir(cwd).output().ok()?;
-    output.status.success().then(|| {
-        String::from_utf8_lossy(&output.stdout)
-            .trim_end()
-            .to_string()
-    })
-}
-
-fn parse_numstat_summary(numstat: &str) -> (usize, u64, u64) {
-    let mut files = 0;
-    let mut insertions = 0;
-    let mut deletions = 0;
-    for line in numstat.lines() {
-        let parts: Vec<_> = line.split('\t').collect();
-        if parts.len() >= 3 {
-            files += 1;
-            if parts[0] != "-" {
-                insertions += parts[0].parse::<u64>().unwrap_or(0);
-            }
-            if parts[1] != "-" {
-                deletions += parts[1].parse::<u64>().unwrap_or(0);
-            }
-        }
-    }
-    (files, insertions, deletions)
 }
 
 /// Result of a state transition
@@ -1916,18 +1837,8 @@ pub fn transition_parent(
                             .work_scope_worktree
                             .as_ref()
                             .map(|path| path.display().to_string()),
-                        approved_head: git_output(&context.working_dir, &["rev-parse", "HEAD"])
-                            .unwrap_or_else(|| "HEAD".to_string()),
-                        approved_base: match context.mode_context.as_ref() {
-                            Some(
-                                ModeContext::Work { base_branch, .. }
-                                | ModeContext::Branch { base_branch, .. },
-                            ) => git_output(
-                                &context.working_dir,
-                                &["merge-base", base_branch, "HEAD"],
-                            ),
-                            _ => None,
-                        },
+                        approved_head: None,
+                        approved_base: None,
                     },
                 ),
             );
@@ -6184,7 +6095,10 @@ mod tests {
             let result = transition(
                 &approval_state(),
                 &test_context(),
-                Event::UserCancel { reason: None },
+                Event::UserCancel {
+                    reason: None,
+                    cause: crate::event::CancelCause::UserRequested,
+                },
             )
             .expect("cancel should settle approval state");
 

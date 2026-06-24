@@ -803,7 +803,10 @@ mod random_walk {
                 1 => Event::CommissionReviewApprovalDecided {
                     outcome: crate::state::CommissionReviewApprovalOutcome::Rejected,
                 },
-                _ => Event::UserCancel { reason: None },
+                _ => Event::UserCancel {
+                    reason: None,
+                    cause: crate::event::CancelCause::UserRequested,
+                },
             },
 
             ConvState::AwaitingUserResponse { questions, .. } => {

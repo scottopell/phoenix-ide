@@ -39,7 +39,7 @@ struct ApprovedCommissionReviewInput {
     runtime_base_branch: Option<String>,
     approved_working_dir: String,
     approved_worktree_path: Option<String>,
-    approved_head: String,
+    approved_head: Option<String>,
     approved_base: Option<String>,
 }
 
@@ -224,12 +224,13 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     let approved: ApprovedCommissionReviewInput = serde_json::from_value(input)
         .map_err(|e| format!("Invalid approved commission_review input: {e}"))?;
     assert_approved_context_has_not_drifted(&ctx, &approved)?;
-    let current_head = git_capture(&ctx.working_dir, &["rev-parse", "HEAD"]).await?;
-    if current_head != approved.approved_head {
-        return Err(format!(
-            "commission_review target changed after approval: HEAD was `{}` at approval time but is now `{current_head}`. Request review again.",
-            approved.approved_head
-        ));
+    if let Some(approved_head) = approved.approved_head.as_deref() {
+        let current_head = git_capture(&ctx.working_dir, &["rev-parse", "HEAD"]).await?;
+        if current_head != approved_head {
+            return Err(format!(
+                "commission_review target changed after approval: HEAD was `{approved_head}` at approval time but is now `{current_head}`. Request review again."
+            ));
+        }
     }
     if let (Some(base_branch), Some(approved_base)) = (
         approved.runtime_base_branch.as_deref(),
@@ -1189,7 +1190,7 @@ mod tests {
             runtime_base_branch: Some("main".to_string()),
             approved_working_dir: "/repo/approved".to_string(),
             approved_worktree_path: Some("/repo/approved-wt".to_string()),
-            approved_head: "head".to_string(),
+            approved_head: None,
             approved_base: None,
         };
 
@@ -1221,7 +1222,7 @@ mod tests {
             runtime_base_branch: Some("main".to_string()),
             approved_working_dir: "/repo/approved".to_string(),
             approved_worktree_path: None,
-            approved_head: "head".to_string(),
+            approved_head: None,
             approved_base: None,
         };
 
