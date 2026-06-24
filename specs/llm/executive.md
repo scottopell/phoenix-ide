@@ -6,16 +6,16 @@ The LLM provider abstracts communication with multiple LLM APIs behind a common 
 
 ## Technical Summary
 
-Implements `LlmService` trait with `complete()` method returning `LlmResponse`. Provider implementations (Anthropic, OpenAI, Fireworks) translate common request format to provider-specific JSON and normalize responses back. Gateway URLs constructed by appending provider suffix to base gateway URL. `ModelRegistry` registers all models when gateway configured, or only models with API keys in direct mode. `LlmError` includes exhaustive `LlmErrorKind` enum (no `Unknown` variant, no catch-all) with separate `auto_retry_policy()` and `user_resume_policy()` methods. `LoggingService` wrapper records model, duration, and token counts. Usage tracking includes input/output tokens and cache statistics for context window computation.
+Implements `LlmService` trait with `complete()` method returning `LlmResponse`. Backend implementations translate common request format to Anthropic Messages or OpenAI Responses JSON and normalize responses back. Base URL overrides are exact endpoints; Phoenix does not construct gateway paths. `ModelRegistry` merges built-in specs with additive configured specs, registers only models with an available auth route, and keeps Codex bridge routing scoped to built-in OpenAI Responses models. `LlmError` includes exhaustive `LlmErrorKind` enum (no `Unknown` variant, no catch-all) with separate `auto_retry_policy()` and `user_resume_policy()` methods. `LoggingService` wrapper records model, duration, and token counts. Usage tracking includes input/output tokens and cache statistics for context window computation.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
 | **REQ-LLM-001:** Provider Abstraction | ✅ Complete | LlmService trait with async complete() |
-| **REQ-LLM-002:** Gateway Support | ✅ Complete | Gateway URL construction for Anthropic |
+| **REQ-LLM-002:** Backend-Compatible Endpoint Support | ✅ Complete | Exact base URL overrides, no hidden suffix append |
 | **REQ-LLM-003:** Model Registry | ✅ Complete | ModelRegistry with available_models() |
-| **REQ-LLM-003a:** Model Discovery | ✅ Complete | Queries gateway endpoints, falls back to hardcoded |
+| **REQ-LLM-003a:** Model Discovery | ✅ Complete | Opportunistic backend-scoped `/v1/models` discovery, falls back to configured models |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
 | **REQ-LLM-005:** Response Handling | ✅ Complete | Normalized to ContentBlock variants |
 | **REQ-LLM-006:** Error Classification | 🚧 Extension pending | Base classification complete; split of transient throttle vs quota exhaustion vs model-overloaded tracked in task 67002 |

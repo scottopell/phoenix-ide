@@ -260,217 +260,58 @@ pub enum LlmOutcome {
 The executor maps `Result<LlmResponse, LlmError>` → `LlmOutcome` via a total function
 (no `_ =>` arm). This mapping is where FM-3 prevention lives.
 
-## Provider Implementations
+## Backend Implementations
 
-### Anthropic Provider
+Phoenix has two HTTP backend families plus the in-process mock:
 
-```rust
-pub struct AnthropicService {
-    api_key: String,
-    model: AnthropicModel,
-    base_url: String,  // Default or gateway URL
-}
+| Backend | Request URL | Wire protocol |
+|---------|-------------|---------------|
+| `anthropic` | `ANTHROPIC_BASE_URL` as-is, or `https://api.anthropic.com/v1/messages` | Anthropic Messages |
+| `openai_responses` | `OPENAI_BASE_URL` as-is, or `https://api.openai.com/v1/responses` | OpenAI Responses |
 
-impl AnthropicService {
-    pub fn new(api_key: String, model: AnthropicModel, gateway: Option<&str>) -> Self {
-        let base_url = match gateway {
-            Some(gw) => format!("{}/anthropic/v1/messages", gw.trim_end_matches('/')),
-            None => "https://api.anthropic.com/v1/messages".to_string(),
-        };
-        Self { api_key, model, base_url }
-    }
-}
-
-pub enum AnthropicModel {
-    Claude45Opus,
-    Claude45Sonnet,
-    Claude45Haiku,
-}
-```
-
-### OpenAI Provider
+Configured base URLs are exact endpoints. Phoenix never treats them as gateway roots and never appends hidden provider path suffixes.
 
 ```rust
-pub struct OpenAiService {
-    api_key: String,
-    model: OpenAiModel,
-    base_url: String,
+pub enum ModelBackend {
+    Anthropic,
+    OpenAIResponses,
+    Mock,
 }
 
-impl OpenAiService {
-    pub fn new(api_key: String, model: OpenAiModel, gateway: Option<&str>) -> Self {
-        let base_url = match gateway {
-            Some(gw) => format!("{}/openai/v1", gw.trim_end_matches('/')),
-            None => "https://api.openai.com/v1".to_string(),
-        };
-        Self { api_key, model, base_url }
-    }
-}
-```
-
-### Fireworks Provider
-
-```rust
-pub struct FireworksService {
-    api_key: String,
-    model: FireworksModel,
-    base_url: String,
-}
-
-impl FireworksService {
-    pub fn new(api_key: String, model: FireworksModel, gateway: Option<&str>) -> Self {
-        let base_url = match gateway {
-            Some(gw) => format!("{}/fireworks/inference/v1", gw.trim_end_matches('/')),
-            None => "https://api.fireworks.ai/inference/v1".to_string(),
-        };
-        Self { api_key, model, base_url }
-    }
+pub struct ModelSpec {
+    pub id: String,
+    pub api_name: String,
+    pub backend: ModelBackend,
+    pub description: String,
+    pub context_window: usize,
+    pub recommended: bool,
+    pub supports_tool_search: bool,
 }
 ```
 
 ## Model Registry (REQ-LLM-003, REQ-SA-007)
 
+The registry starts from built-in model specs and merges valid additive specs from `PHOENIX_LLM_MODELS`. External specs declare a backend and may omit `api_name`, in which case Phoenix sends `id` as the wire model name. Duplicate IDs keep the built-in or earlier configured definition.
+
 ```rust
 pub struct ModelRegistry {
     services: HashMap<String, Arc<dyn LlmService>>,
-    families: Vec<ModelFamily>,  // tier resolution for sub-agents
-    logger: slog::Logger,
-}
-
-/// Model family defines tier mappings for sub-agent model selection.
-/// Each family groups models by the same provider lineage.
-pub struct ModelFamily {
-    pub name: String,       // "claude", "gpt"
-    pub fast: String,       // model ID: "claude-haiku-4-5", "gpt-4o-mini"
-    pub capable: String,    // model ID: "claude-sonnet-4-6", "gpt-4o"
-}
-
-impl ModelRegistry {
-    /// Resolve a model tier to a concrete model ID based on the parent's family.
-    /// Returns Err if the parent's model is not in a known family or the tier's
-    /// model is not available.
-    pub fn resolve_tier(&self, parent_model: &str, tier: ModelTier) -> Result<String, String> {
-        let family = self.families.iter()
-            .find(|f| f.fast == parent_model || f.capable == parent_model)
-            .ok_or_else(|| format!("Model '{parent_model}' not in a known family"))?;
-        let target = match tier {
-            ModelTier::Fast => &family.fast,
-            ModelTier::Capable => &family.capable,
-        };
-        if self.services.contains_key(target) {
-            Ok(target.clone())
-        } else {
-            Err(format!("Tier model '{target}' not available"))
-        }
-    }
-}
-
-impl ModelRegistry {
-    pub fn new(config: &LlmConfig, logger: slog::Logger) -> Self {
-        let mut services = HashMap::new();
-        
-        if config.gateway.is_some() {
-            // Gateway mode: register all models, gateway handles API keys
-            Self::register_all_models(&mut services, config);
-        } else {
-            // Direct mode: register only models with API keys
-            if config.anthropic_api_key.is_some() {
-                Self::register_anthropic_models(&mut services, config);
-            }
-            if config.openai_api_key.is_some() {
-                Self::register_openai_models(&mut services, config);
-            }
-            if config.fireworks_api_key.is_some() {
-                Self::register_fireworks_models(&mut services, config);
-            }
-        }
-        
-        Self { services, logger }
-    }
-    
-    fn register_all_models(services: &mut HashMap<String, Arc<dyn LlmService>>, config: &LlmConfig) {
-        // Gateway handles keys, so register everything
-        Self::register_anthropic_models(services, config);
-        Self::register_openai_models(services, config);
-        Self::register_fireworks_models(services, config);
-    }
-    
-    fn register_anthropic_models(services: &mut HashMap<String, Arc<dyn LlmService>>, config: &LlmConfig) {
-        let key = config.anthropic_api_key.clone().unwrap_or_default();
-        services.insert(
-            "claude-opus-4.5".to_string(),
-            Arc::new(AnthropicService::new(key.clone(), AnthropicModel::Claude45Opus, config.gateway.as_deref())),
-        );
-        services.insert(
-            "claude-sonnet-4.5".to_string(),
-            Arc::new(AnthropicService::new(key.clone(), AnthropicModel::Claude45Sonnet, config.gateway.as_deref())),
-        );
-        // ... other Claude models
-    }
-    
-    pub fn get(&self, model_id: &str) -> Option<Arc<dyn LlmService>> {
-        self.services.get(model_id).cloned()
-    }
-    
-    pub fn available_models(&self) -> Vec<String> {
-        self.services.keys().cloned().collect()
-    }
+    specs: HashMap<String, ModelSpec>,
 }
 ```
 
-## Gateway URL Construction (REQ-LLM-002)
-
-| Provider | Gateway Suffix | Direct URL |
-|----------|---------------|------------|
-| Anthropic | `/anthropic/v1/messages` | `https://api.anthropic.com/v1/messages` |
-| OpenAI | `/openai/v1` | `https://api.openai.com/v1` |
-| Fireworks | `/fireworks/inference/v1` | `https://api.fireworks.ai/inference/v1` |
-
-The gateway uses simple path prefixes to route to providers, not `/_/gateway/` prefixes.
+Registration requires an auth route for the model backend: static API key, credential helper, Codex bridge for built-in OpenAI Responses models, or mock opt-in. Externally configured OpenAI Responses models bypass the Codex bridge and use explicit endpoint/auth configuration.
 
 ### Model Discovery
 
-Each provider exposes a model listing endpoint through the gateway:
+When a credential helper and compatible base URL are configured, Phoenix derives model-listing URLs by replacing the final path segment with `models`:
 
-| Provider | Model List Endpoint | Response Format | Notes |
-|----------|-------------------|-----------------|-------|
-| Anthropic | `{gateway}/anthropic/v1/models` | Anthropic native | Requires `anthropic-version: 2023-06-01` header, includes `display_name` |
-| OpenAI | `{gateway}/openai/v1/models` | OpenAI standard | Basic metadata (id, created, owned_by) |
-| Fireworks | `{gateway}/fireworks/inference/v1/models` | OpenAI-compatible | Rich metadata: `context_length`, `supports_chat`, `supports_tools` |
+| Base URL | Discovery URL |
+|----------|---------------|
+| `https://proxy.example/v1/messages` | `https://proxy.example/v1/models` |
+| `https://proxy.example/v1/responses` | `https://proxy.example/v1/models` |
 
-Example responses:
-
-**Anthropic:**
-```json
-{
-  "data": [
-    {
-      "type": "model",
-      "id": "claude-sonnet-4-6",
-      "display_name": "Claude Sonnet 4.6",
-      "created_at": "2026-02-17T00:00:00Z"
-    }
-  ],
-  "has_more": false
-}
-```
-
-**Fireworks:**
-```json
-{
-  "data": [
-    {
-      "id": "accounts/fireworks/models/glm-5",
-      "object": "model",
-      "owned_by": "fireworks",
-      "created": 1770826344,
-      "context_length": 202752,
-      "supports_chat": true,
-      "supports_tools": true
-    }
-  ]
-}
-```
+Discovery is backend-scoped. Anthropic discovery results only validate `anthropic` models; OpenAI Responses discovery results only validate `openai_responses` models. If discovery returns no usable configured models, Phoenix falls back to the configured model list and logs a warning.
 
 ## Request Translation (REQ-LLM-004)
 

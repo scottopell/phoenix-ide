@@ -217,6 +217,7 @@ values are `anthropic` (Anthropic Messages-compatible) and `openai_responses`
 Example Anthropic-compatible provider POC:
 
 ```env
+ANTHROPIC_API_KEY=provider-api-key
 ANTHROPIC_BASE_URL=https://provider.example/v1/messages
 LLM_CUSTOM_HEADERS=source: my-provider-poc
 DEFAULT_MODEL=example/provider-model

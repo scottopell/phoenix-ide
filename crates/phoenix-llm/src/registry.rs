@@ -640,7 +640,13 @@ impl ModelRegistry {
     /// be derived from the configured base URLs.
     async fn build_discovery_config(config: &LlmConfig) -> Option<DiscoveryConfig> {
         let helper = config.credential_helper.as_ref()?;
-        let auth_token = helper.get().await;
+        let mut auth_token = helper.get().await;
+        if auth_token.is_none() && helper.is_recovering().await {
+            helper.wait_for_settlement().await;
+            if helper.credential_status().await == crate::CredentialStatus::Valid {
+                auth_token = helper.get().await;
+            }
+        }
         auth_token.as_ref()?;
 
         let discovery = DiscoveryConfig {
@@ -1352,6 +1358,28 @@ mod tests {
     async fn test_static_credential() {
         let cred = StaticCredential::new("test-key");
         assert_eq!(cred.get().await, Some("test-key".to_string()));
+    }
+
+    #[tokio::test]
+    async fn discovery_config_waits_for_starting_credential_helper() {
+        let config = LlmConfig {
+            credential_helper: Some(crate::CredentialHelper::new(
+                "echo test-token".to_string(),
+                Duration::from_hours(1),
+            )),
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("helper should settle and produce discovery config");
+
+        assert_eq!(discovery.auth_token.as_deref(), Some("test-token"));
+        assert_eq!(
+            discovery.anthropic_models_url.as_deref(),
+            Some("https://proxy.example/v1/models")
+        );
     }
 
     #[test]
