@@ -291,6 +291,8 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     let mut warnings = Vec::new();
     let mut input_tokens = 0;
     let mut output_tokens = 0;
+    let mut cache_creation_tokens = 0;
+    let mut cache_read_tokens = 0;
 
     for (index, chunk) in chunks.iter().enumerate() {
         if ctx.cancel.is_cancelled() {
@@ -302,6 +304,8 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 warnings,
                 input_tokens,
                 output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
                 "commission_review cancelled during LLM review",
             ));
         }
@@ -336,6 +340,8 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                     warnings,
                     input_tokens,
                     output_tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
                     "commission_review cancelled during LLM review",
                 ));
             }
@@ -350,6 +356,8 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                         warnings,
                         input_tokens,
                         output_tokens,
+                        cache_creation_tokens,
+                        cache_read_tokens,
                         &format!("commission_review LLM review failed: {e}"),
                     ));
                 }
@@ -357,6 +365,8 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         };
         input_tokens += response.usage.input_tokens;
         output_tokens += response.usage.output_tokens;
+        cache_creation_tokens += response.usage.cache_creation_tokens;
+        cache_read_tokens += response.usage.cache_read_tokens;
         let (mut chunk_findings, chunk_summary, chunk_warnings) = parse_findings(&response.text());
         findings.append(&mut chunk_findings);
         if let Some(summary) = chunk_summary.filter(|s| !s.trim().is_empty()) {
@@ -386,8 +396,8 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
             usage: phoenix_core::domain::llm_types::Usage {
                 input_tokens,
                 output_tokens,
-                cache_creation_tokens: 0,
-                cache_read_tokens: 0,
+                cache_creation_tokens,
+                cache_read_tokens,
             },
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
@@ -411,6 +421,8 @@ fn failed_review_output(
     mut warnings: Vec<ReviewWarning>,
     input_tokens: u64,
     output_tokens: u64,
+    cache_creation_tokens: u64,
+    cache_read_tokens: u64,
     reason: &str,
 ) -> ReviewOutput {
     warnings.extend(collection.warnings.clone());
@@ -428,8 +440,8 @@ fn failed_review_output(
             usage: phoenix_core::domain::llm_types::Usage {
                 input_tokens,
                 output_tokens,
-                cache_creation_tokens: 0,
-                cache_read_tokens: 0,
+                cache_creation_tokens,
+                cache_read_tokens,
             },
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),

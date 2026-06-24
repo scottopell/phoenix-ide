@@ -1865,8 +1865,7 @@ pub fn transition_parent(
             },
             ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
                 outcome: CommissionReviewApprovalOutcome::Rejected,
-            })
-            | ParentEvent::Core(CoreEvent::UserCancel { .. }),
+            }),
         ) => {
             let tool_result = ToolResult::success(
                 tool_use_id.clone(),
@@ -1896,6 +1895,15 @@ pub fn transition_parent(
                 .with_effect(Effect::RequestLlm),
             )
         }
+
+        (
+            ParentState::AwaitingCommissionReviewApproval { .. },
+            ParentEvent::Core(CoreEvent::UserCancel { .. }),
+        ) => Ok(
+            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_agent_done()),
+        ),
 
         (
             ParentState::AwaitingUserResponse { .. },
@@ -6102,7 +6110,7 @@ mod tests {
             )
             .expect("cancel should settle approval state");
 
-            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+            assert_eq!(result.new_state, ConvState::Idle);
             assert!(!has_execute_tool(&result.effects));
         }
 
