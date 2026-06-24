@@ -393,6 +393,15 @@ invariant ClipboardPersistence {
             lookup_clipboard(p, name) != null
 }
 
+invariant ClipboardAtomicOnFailure {
+    -- Clipboard writes are committed only when the whole plan() call succeeds.
+    -- Although edit building writes clipboards as it goes, a later failure (a
+    -- non-unique or absent match, an overlap, an out-of-bounds edit) restores
+    -- the clipboard map to its pre-call state. A call that reports an error
+    -- leaves both the file and the clipboards exactly as they were, so a
+    -- subsequent fromClipboard never reads text staged by a failed call.
+}
+
 invariant EmptyClipboardNameIgnored {
     -- Empty string ("") is never a valid clipboard name.
     -- It is not stored as a key, and referencing it does not trigger lookup.

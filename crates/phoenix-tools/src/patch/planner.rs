@@ -58,6 +58,25 @@ impl PatchPlanner {
         current_content: Option<&str>,
         patches: &[PatchRequest],
     ) -> Result<PatchPlan, PatchError> {
+        // Clipboard writes happen while building edits, but a later step (a
+        // failed match, an overlap, an out-of-bounds edit) can still abort the
+        // call with the file left unchanged. Snapshot the clipboards and restore
+        // them on any error so a call that reports failure never leaves writes
+        // behind for a subsequent fromClipboard to read.
+        let snapshot = self.clipboards.clone();
+        let result = self.plan_inner(path, current_content, patches);
+        if result.is_err() {
+            self.clipboards = snapshot;
+        }
+        result
+    }
+
+    fn plan_inner(
+        &mut self,
+        path: &Path,
+        current_content: Option<&str>,
+        patches: &[PatchRequest],
+    ) -> Result<PatchPlan, PatchError> {
         if patches.is_empty() {
             return Err(PatchError::NoPatches);
         }
@@ -827,6 +846,47 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err, PatchError::OverlappingEdits);
+    }
+
+    #[test]
+    fn test_failed_call_does_not_leak_clipboard_writes() {
+        // Patch 0 cuts "abcd" to a clipboard; patch 1 overlaps it, so the whole
+        // call fails and the file is unchanged. The clipboard must not retain the
+        // write from the failed call.
+        let mut planner = PatchPlanner::new();
+        let err = planner
+            .plan(
+                &path("test.txt"),
+                Some("abcdef"),
+                &[
+                    PatchRequest {
+                        operation: Operation::Replace,
+                        old_text: Some("abcd".to_string()),
+                        new_text: Some(String::new()),
+                        replace_all: false,
+                        to_clipboard: Some("clip".to_string()),
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                    PatchRequest {
+                        operation: Operation::Replace,
+                        old_text: Some("cdef".to_string()),
+                        new_text: Some("X".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                ],
+            )
+            .unwrap_err();
+
+        assert_eq!(err, PatchError::OverlappingEdits);
+        assert!(
+            !planner.clipboards().contains_key("clip"),
+            "clipboard retained a write from a failed call: {:?}",
+            planner.clipboards()
+        );
     }
 
     #[test]

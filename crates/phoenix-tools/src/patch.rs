@@ -37,34 +37,54 @@ use std::sync::Mutex;
 
 const MAX_INPUT_SIZE: usize = 60 * 1024; // 60KB limit
 
-/// Upper bound on diff lines echoed back to the agent. Large diffs are
-/// truncated with an explicit omitted-line count so the preview is never
-/// mistaken for the whole change.
+/// Caps on the diff echoed back to the agent. The preview must never swamp the
+/// tool response, so it is bounded on three axes: total lines, the length of any
+/// single line (a minified one-line file can otherwise yield a two-line,
+/// multi-megabyte diff), and total bytes.
 const MAX_DIFF_LINES: usize = 100;
+const MAX_DIFF_LINE_CHARS: usize = 500;
+const MAX_DIFF_BYTES: usize = 16 * 1024;
 
-/// Bound the applied diff for the LLM-visible response. Returns a string ending
-/// in a newline so the closing `</diff>` tag sits on its own line.
+/// Bound and sanitize the applied diff for the LLM-visible response.
+///
+/// Truncation is reported so the preview is never mistaken for the whole change.
+/// Any literal `<diff>` / `</diff>` in the file content is neutralized so a line
+/// of file text cannot close the wrapping tag early and masquerade as tool
+/// markup. Returns a string ending in a newline so the closing tag sits on its
+/// own line.
 fn bounded_diff(diff: &str) -> String {
     let total = diff.lines().count();
-    if total <= MAX_DIFF_LINES {
-        return if diff.is_empty() || diff.ends_with('\n') {
-            diff.to_string()
+    let mut out = String::new();
+    let mut emitted = 0usize;
+    let mut shortened = false;
+
+    for line in diff.lines() {
+        if emitted >= MAX_DIFF_LINES || out.len() >= MAX_DIFF_BYTES {
+            break;
+        }
+        if line.chars().count() > MAX_DIFF_LINE_CHARS {
+            out.extend(line.chars().take(MAX_DIFF_LINE_CHARS));
+            out.push('…');
+            shortened = true;
         } else {
-            format!("{diff}\n")
-        };
+            out.push_str(line);
+        }
+        out.push('\n');
+        emitted += 1;
     }
 
-    let omitted = total - MAX_DIFF_LINES;
-    let mut out = String::new();
-    for line in diff.lines().take(MAX_DIFF_LINES) {
-        out.push_str(line);
-        out.push('\n');
+    let omitted = total - emitted;
+    if omitted > 0 || shortened {
+        let _ = writeln!(
+            out,
+            "... diff truncated: {omitted} line(s) omitted, long lines shortened; \
+             read the file to see full context."
+        );
     }
-    let _ = writeln!(
-        out,
-        "... diff truncated, {omitted} more line(s) omitted; read the file to see full context."
-    );
-    out
+
+    // Neutralize the wrapping sentinel so file content can't close the block.
+    out.replace("</diff>", "<\\/diff>")
+        .replace("<diff>", "<\\diff>")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -694,9 +714,33 @@ mod tests {
         let bounded = bounded_diff(&diff);
         assert_eq!(bounded.lines().filter(|l| l.starts_with('+')).count(), 100);
         assert!(
-            bounded.contains("50 more line(s) omitted"),
+            bounded.contains("50 line(s) omitted"),
             "missing truncation note: {bounded}"
         );
+    }
+
+    #[test]
+    fn bounded_diff_caps_long_single_line_by_bytes() {
+        // A minified-file diff: two lines, one enormous. Must not echo it whole.
+        let diff = format!("+{}\n", "x".repeat(5_000_000));
+        let bounded = bounded_diff(&diff);
+        assert!(
+            bounded.len() < MAX_DIFF_BYTES + 4096,
+            "diff not byte-bounded: {} bytes",
+            bounded.len()
+        );
+        assert!(bounded.contains("long lines shortened"), "{bounded}");
+    }
+
+    #[test]
+    fn bounded_diff_neutralizes_closing_tag_in_content() {
+        let diff = "+let s = \"</diff>\";\n";
+        let bounded = bounded_diff(diff);
+        assert!(
+            !bounded.contains("</diff>"),
+            "raw closing tag leaked into diff body: {bounded}"
+        );
+        assert!(bounded.contains("<\\/diff>"), "{bounded}");
     }
 
     #[tokio::test]
