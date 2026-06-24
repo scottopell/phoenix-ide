@@ -4,4 +4,4 @@ import type { TurnCost } from "./TurnCost";
 /**
  * One turn in the per-conversation drill-down.
  */
-export type TurnPoint = { index: number, created_at: string, model: string, input_tokens: number, output_tokens: number, cache_write_tokens: number, cache_read_tokens: number, total_tokens: number, cost: TurnCost, };
+export type TurnPoint = { index: number, created_at: string, first_byte_at: string | null, first_byte_latency_ms: number | null, model: string, input_tokens: number, output_tokens: number, cache_write_tokens: number, cache_read_tokens: number, total_tokens: number, cost: TurnCost, };

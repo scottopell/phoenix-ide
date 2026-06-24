@@ -170,7 +170,7 @@ fn model_pricing(model: &str) -> Option<ModelPricing> {
     }
 }
 
-fn calculate_turn_cost(
+pub(crate) fn calculate_turn_cost(
     model: &str,
     input: i64,
     output: i64,
@@ -309,6 +309,8 @@ pub struct UsageOverview {
 pub struct TurnPoint {
     pub index: f64,
     pub created_at: String,
+    pub first_byte_at: Option<String>,
+    pub first_byte_latency_ms: Option<f64>,
     pub model: String,
     pub input_tokens: f64,
     pub output_tokens: f64,
@@ -597,9 +599,12 @@ pub async fn usage_conversation_detail(
                 1,
                 cost,
             );
+            let first_byte_at = r.first_byte_at.clone();
             TurnPoint {
                 index: idx as f64,
                 created_at: r.created_at.clone(),
+                first_byte_at,
+                first_byte_latency_ms: None,
                 model: r.model.clone(),
                 input_tokens: r.input_tokens as f64,
                 output_tokens: r.output_tokens as f64,

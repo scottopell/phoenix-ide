@@ -1504,8 +1504,12 @@ pub struct UsageConversationModelRow {
 /// per-conversation drill-down timeseries.
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageTurnRow {
+    pub id: i64,
+    pub conversation_id: String,
+    pub root_conversation_id: String,
     pub model: String,
     pub created_at: String,
+    pub first_byte_at: Option<String>,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_creation_tokens: i64,

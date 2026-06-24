@@ -4056,13 +4056,15 @@ impl Database {
         root_conversation_id: &str,
         model: &str,
         usage: &phoenix_core::domain::llm_types::Usage,
+        first_byte_at: Option<DateTime<Utc>>,
     ) -> DbResult<()> {
         let now_str = Utc::now().to_rfc3339();
+        let first_byte_str = first_byte_at.map(|t| t.to_rfc3339());
         sqlx::query(
             "INSERT INTO turn_usage \
              (conversation_id, root_conversation_id, model, \
-              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, created_at, first_byte_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(conversation_id)
         .bind(root_conversation_id)
@@ -4072,6 +4074,7 @@ impl Database {
         .bind(usage.cache_creation_tokens.cast_signed())
         .bind(usage.cache_read_tokens.cast_signed())
         .bind(&now_str)
+        .bind(first_byte_str)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -4283,8 +4286,8 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn usage_conversation_turns(&self, root_id: &str) -> DbResult<Vec<UsageTurnRow>> {
         let rows = sqlx::query(
-            "SELECT model, created_at, input_tokens, output_tokens, \
-             cache_creation_tokens, cache_read_tokens \
+            "SELECT id, conversation_id, root_conversation_id, model, created_at, first_byte_at, \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens \
              FROM turn_usage WHERE root_conversation_id = ?1 ORDER BY created_at ASC",
         )
         .bind(root_id)
@@ -4294,8 +4297,12 @@ impl Database {
         rows.into_iter()
             .map(|r| {
                 Ok(UsageTurnRow {
+                    id: r.try_get("id")?,
+                    conversation_id: r.try_get("conversation_id")?,
+                    root_conversation_id: r.try_get("root_conversation_id")?,
                     model: r.try_get("model")?,
                     created_at: r.try_get("created_at")?,
+                    first_byte_at: r.try_get("first_byte_at")?,
                     input_tokens: r.try_get("input_tokens")?,
                     output_tokens: r.try_get("output_tokens")?,
                     cache_creation_tokens: r.try_get("cache_creation_tokens")?,
@@ -4303,6 +4310,26 @@ impl Database {
                 })
             })
             .collect()
+    }
+    /// Conversation ids that belong to one analytics session/root conversation.
+    /// Includes the root id even when it has no token rows yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn analytics_conversation_ids_for_root(
+        &self,
+        root_id: &str,
+    ) -> DbResult<Vec<String>> {
+        let mut ids: Vec<String> = sqlx::query_scalar(
+            "SELECT ?1 AS id UNION SELECT DISTINCT conversation_id FROM turn_usage WHERE root_conversation_id = ?1 ORDER BY id ASC",
+        )
+        .bind(root_id)
+        .fetch_all(&self.pool)
+        .await?;
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 }
 
@@ -5637,6 +5664,50 @@ mod tests {
                 .pr_number,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn turn_usage_first_byte_at_is_nullable_and_roundtrips() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-fb", "slug-fb", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let usage = phoenix_core::domain::llm_types::Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 5,
+        };
+        db.insert_turn_usage("conv-fb", "conv-fb", "mock", &usage, None)
+            .await
+            .unwrap();
+        let observed = Utc::now();
+        db.insert_turn_usage("conv-fb", "conv-fb", "mock", &usage, Some(observed))
+            .await
+            .unwrap();
+
+        let rows = db.usage_conversation_turns("conv-fb").await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].first_byte_at, None);
+        assert_eq!(
+            rows[1].first_byte_at.as_deref(),
+            Some(observed.to_rfc3339().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn analytics_conversation_ids_include_root_without_usage() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-root-only", "slug-root-only", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let ids = db
+            .analytics_conversation_ids_for_root("conv-root-only")
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["conv-root-only".to_string()]);
     }
 
     #[tokio::test]

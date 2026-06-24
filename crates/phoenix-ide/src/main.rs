@@ -3,6 +3,7 @@
 //! A Rust backend implementing a conversation state machine for
 //! interacting with LLM agents.
 
+mod analytics;
 mod api;
 mod chain_qa;
 mod chain_runtime;

@@ -166,6 +166,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_clear_watermark_to_conversations",
         sql: MIGRATION_030,
     },
+    Migration {
+        version: 31,
+        name: "add_turn_usage_first_byte_at",
+        sql: MIGRATION_031,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -1024,6 +1029,11 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
     Ok(applied)
 }
 
+/// Persist first-byte timing metadata for token-bearing turns.
+const MIGRATION_031: &str = r"
+ALTER TABLE turn_usage ADD COLUMN first_byte_at TEXT;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,7 +1097,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 30);
+        assert_eq!(first, 31);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -1124,9 +1134,9 @@ mod tests {
             .unwrap();
 
         // Every version except the stamped 29 must run: 1–28 below the stamp
-        // and 30 (add_clear_watermark_to_conversations) above it.
+        // and 30–31 above it.
         let applied = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(applied, 29);
+        assert_eq!(applied, 30);
 
         // Migration 005's effects must be present.
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")

@@ -185,6 +185,7 @@ pub trait StateStore: Send + Sync {
         root_conversation_id: &str,
         model: &str,
         usage: &phoenix_llm::Usage,
+        first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String>;
 
     /// Update the steering queue for a conversation. Persists the FIFO queue
@@ -450,9 +451,16 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         root_conversation_id: &str,
         model: &str,
         usage: &phoenix_llm::Usage,
+        first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
         (**self)
-            .insert_turn_usage(conversation_id, root_conversation_id, model, usage)
+            .insert_turn_usage(
+                conversation_id,
+                root_conversation_id,
+                model,
+                usage,
+                first_byte_at,
+            )
             .await
     }
 
@@ -758,9 +766,16 @@ impl StateStore for DatabaseStorage {
         root_conversation_id: &str,
         model: &str,
         usage: &phoenix_llm::Usage,
+        first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
         self.db
-            .insert_turn_usage(conversation_id, root_conversation_id, model, usage)
+            .insert_turn_usage(
+                conversation_id,
+                root_conversation_id,
+                model,
+                usage,
+                first_byte_at,
+            )
             .await
             .map_err(|e| e.to_string())
     }

@@ -893,6 +893,7 @@ impl StateStore for InMemoryStorage {
         _root_conversation_id: &str,
         _model: &str,
         _usage: &phoenix_llm::Usage,
+        _first_byte_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(), String> {
         Ok(())
     }

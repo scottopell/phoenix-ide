@@ -34,6 +34,12 @@ function fmtUsd(n: number): string {
   return `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
 }
 
+function fmtLatency(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return 'unavailable';
+  if (ms < 1000) return `${ms.toFixed(0)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
 function fmtCostSummary(cost: Totals['cost']): string {
   const suffix = cost.pricing_known ? '' : '+';
   return `${fmtUsd(cost.estimated_usd)}${suffix}`;
@@ -186,6 +192,8 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
     return TOKEN_SERIES.filter((s) => s.key !== 'cache_write_tokens' || hasCacheWrite);
   }, [detail]);
 
+  const firstByteRows = useMemo(() => detail?.turns.filter((t) => t.first_byte_at !== null) ?? [], [detail]);
+
   return (
     <div className="usage-drill">
       <div className="usage-drill__head">
@@ -207,6 +215,13 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
       {detail && detail.totals.cost.unknown_turns > 0 && (
         <div className="settings-section__hint">
           Cost estimate excludes {Math.round(detail.totals.cost.unknown_turns)} turns with unknown pricing.
+        </div>
+      )}
+      {detail && firstByteRows.length > 0 && (
+        <div className="settings-section__hint">
+          First-byte latency observed for {firstByteRows.length} turn{firstByteRows.length === 1 ? '' : 's'}; latest is{' '}
+          {fmtLatency(firstByteRows[firstByteRows.length - 1]?.first_byte_latency_ms)}. Historical or unanchored rows render as
+          unavailable.
         </div>
       )}
       {detail && series.length > 0 && (

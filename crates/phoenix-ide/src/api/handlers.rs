@@ -63,6 +63,19 @@ use std::path::{Path as FsPath, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 
+async fn trajectory_export_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match crate::analytics::trajectory_export(&state.db, &id).await {
+        Ok(payload) => Json(payload).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, conv_id = %id, "trajectory export projection failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "analytics export failed").into_response()
+        }
+    }
+}
+
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
     // The SPA client routes (`/`, `/new`, `/c/:slug`, …) are registered below
@@ -314,6 +327,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/deployment", get(super::deployment::deployment_info))
         // Usage analytics (read-only)
         .route("/api/usage", get(super::usage::usage_overview))
+        .route(
+            "/api/analytics/conversation/:id/trajectory-export",
+            get(trajectory_export_handler),
+        )
         .route(
             "/api/usage/conversation/:id",
             get(super::usage::usage_conversation_detail),

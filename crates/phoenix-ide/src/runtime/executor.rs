@@ -279,7 +279,7 @@ where
     } else if let Some(mut out) = output {
         if let Some(llm_usage) = out.take_llm_usage() {
             let _ = storage
-                .insert_turn_usage(&conv_id, &root_conv_id, &llm_usage.model, &llm_usage.usage)
+                .insert_turn_usage(&conv_id, &root_conv_id, &llm_usage.model, &llm_usage.usage, None)
                 .await
                 .map_err(|e| {
                     tracing::warn!(conv_id = %conv_id, error = %e, "failed to record tool LLM usage");
@@ -3405,6 +3405,8 @@ where
 
         let broadcast_tx_for_tokens = self.broadcast_tx.clone();
         let request_id_for_fwd = request_id.clone();
+        let first_byte_at = Arc::new(tokio::sync::Mutex::new(None));
+        let first_byte_at_for_fwd = first_byte_at.clone();
         let forwarder_handle = tokio::spawn(async move {
             let mut rx = chunk_rx;
             // REQ-WPV-007: emit `SseEvent::LlmFirstByte` exactly once
@@ -3421,6 +3423,8 @@ where
                     Ok(phoenix_llm::TokenChunk::Text(text)) => {
                         if !first_text_seen {
                             first_text_seen = true;
+                            let observed_at = Utc::now();
+                            *first_byte_at_for_fwd.lock().await = Some(observed_at);
                             let request_id_for_first = request_id_for_fwd.clone();
                             let _ =
                                 broadcast_tx_for_tokens.send_seq(|seq| SseEvent::LlmFirstByte {
@@ -3553,6 +3557,7 @@ where
                     let root_id_for_usage = root_conv_id.clone();
                     let model_for_usage = model_id.clone();
                     let usage_for_insert = usage.clone();
+                    let first_byte_for_insert = *first_byte_at.lock().await;
                     tokio::spawn(async move {
                         if let Err(e) = storage_for_usage
                             .insert_turn_usage(
@@ -3560,6 +3565,7 @@ where
                                 &root_id_for_usage,
                                 &model_for_usage,
                                 &usage_for_insert,
+                                first_byte_for_insert,
                             )
                             .await
                         {
