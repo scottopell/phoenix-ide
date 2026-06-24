@@ -10,7 +10,6 @@ use chrono::{DateTime, Utc};
 use phoenix_core::domain::llm_types::ContentBlock;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -227,21 +226,14 @@ pub async fn trajectory_export(
 }
 
 fn project_tool_calls(messages: &[Message]) -> Vec<AnalyticsToolCall> {
-    let mut result_by_tool_use: HashMap<String, &Message> = HashMap::new();
-    for msg in messages {
-        if let MessageContent::Tool(content) = &msg.content {
-            result_by_tool_use.insert(content.tool_use_id.clone(), msg);
-        }
-    }
-
     let mut calls = Vec::new();
-    for msg in messages {
+    for (index, msg) in messages.iter().enumerate() {
         let MessageContent::Agent(blocks) = &msg.content else {
             continue;
         };
         for block in blocks {
             if let ContentBlock::ToolUse { id, name, input } = block {
-                let result = result_by_tool_use.get(id).copied();
+                let result = following_tool_result(messages, index, &msg.conversation_id, id);
                 let (is_error, denied, duration_ms) = result.map_or((false, false, None), |m| {
                     let MessageContent::Tool(content) = &m.content else {
                         return (false, false, None);
@@ -268,6 +260,21 @@ fn project_tool_calls(messages: &[Message]) -> Vec<AnalyticsToolCall> {
         }
     }
     calls
+}
+
+fn following_tool_result<'a>(
+    messages: &'a [Message],
+    assistant_index: usize,
+    conversation_id: &str,
+    tool_use_id: &str,
+) -> Option<&'a Message> {
+    messages.iter().skip(assistant_index + 1).find(|candidate| {
+        candidate.conversation_id == conversation_id
+            && matches!(
+                &candidate.content,
+                MessageContent::Tool(content) if content.tool_use_id == tool_use_id
+            )
+    })
 }
 
 fn turn_anchors(messages: &[Message]) -> Vec<Option<DateTime<Utc>>> {
@@ -389,23 +396,35 @@ mod tests {
     use serde_json::json;
 
     fn msg(id: &str, seq: i64, content: MessageContent, display_data: Option<Value>) -> Message {
+        msg_in("c", id, seq, Utc::now(), content, display_data)
+    }
+
+    fn msg_in(
+        conversation_id: &str,
+        id: &str,
+        seq: i64,
+        created_at: DateTime<Utc>,
+        content: MessageContent,
+        display_data: Option<Value>,
+    ) -> Message {
+        let message_type = match &content {
+            MessageContent::Agent(_) => MessageType::Agent,
+            MessageContent::Tool(_) => MessageType::Tool,
+            MessageContent::User(_) => MessageType::User,
+            MessageContent::System(_) => MessageType::System,
+            MessageContent::Error(_) => MessageType::Error,
+            MessageContent::Continuation(_) => MessageType::Continuation,
+            MessageContent::Skill(_) => MessageType::Skill,
+        };
         Message {
             message_id: id.to_string(),
-            conversation_id: "c".to_string(),
+            conversation_id: conversation_id.to_string(),
             sequence_id: seq,
-            message_type: match content {
-                MessageContent::Agent(_) => MessageType::Agent,
-                MessageContent::Tool(_) => MessageType::Tool,
-                MessageContent::User(_) => MessageType::User,
-                MessageContent::System(_) => MessageType::System,
-                MessageContent::Error(_) => MessageType::Error,
-                MessageContent::Continuation(_) => MessageType::Continuation,
-                MessageContent::Skill(_) => MessageType::Skill,
-            },
+            message_type,
             content,
             display_data,
             usage_data: None,
-            created_at: Utc::now(),
+            created_at,
         }
     }
 
@@ -443,6 +462,108 @@ mod tests {
         assert_eq!(
             calls[0].normalized_command.as_deref(),
             Some("rm -rf /tmp/nope")
+        );
+    }
+
+    #[test]
+    fn project_tool_calls_pairs_duplicate_ids_by_following_conversation_result() {
+        let messages = vec![
+            msg_in(
+                "parent",
+                "a-parent",
+                1,
+                Utc::now(),
+                MessageContent::Agent(vec![ContentBlock::ToolUse {
+                    id: "reused".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({ "cmd": "echo parent" }),
+                }]),
+                None,
+            ),
+            msg_in(
+                "parent",
+                "t-parent",
+                2,
+                Utc::now(),
+                MessageContent::Tool(ToolContent::new("reused", "parent result", false)),
+                Some(json!({ "duration_ms": 11 })),
+            ),
+            msg_in(
+                "sub",
+                "a-sub",
+                1,
+                Utc::now(),
+                MessageContent::Agent(vec![ContentBlock::ToolUse {
+                    id: "reused".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({ "cmd": "echo sub" }),
+                }]),
+                None,
+            ),
+            msg_in(
+                "sub",
+                "t-sub",
+                2,
+                Utc::now(),
+                MessageContent::Tool(ToolContent::new("reused", "sub result", true)),
+                Some(json!({ "duration_ms": 22 })),
+            ),
+        ];
+
+        let calls = project_tool_calls(&messages);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].assistant_message_id, "a-parent");
+        assert_eq!(calls[0].tool_result_message_id.as_deref(), Some("t-parent"));
+        assert_eq!(calls[0].duration_ms, Some(11));
+        assert!(!calls[0].is_error);
+        assert_eq!(calls[1].assistant_message_id, "a-sub");
+        assert_eq!(calls[1].tool_result_message_id.as_deref(), Some("t-sub"));
+        assert_eq!(calls[1].duration_ms, Some(22));
+        assert!(calls[1].is_error);
+    }
+
+    #[test]
+    fn turn_anchors_track_preceding_non_agent_messages() {
+        let start = Utc::now();
+        let messages = vec![
+            msg_in("c", "u1", 1, start, MessageContent::user("hello"), None),
+            msg_in(
+                "c",
+                "a1",
+                2,
+                start + chrono::Duration::milliseconds(10),
+                MessageContent::Agent(vec![ContentBlock::Text {
+                    text: "hi".to_string(),
+                }]),
+                None,
+            ),
+            msg_in(
+                "c",
+                "t1",
+                3,
+                start + chrono::Duration::milliseconds(20),
+                MessageContent::Tool(ToolContent::new("tu", "ok", false)),
+                None,
+            ),
+            msg_in(
+                "c",
+                "a2",
+                4,
+                start + chrono::Duration::milliseconds(30),
+                MessageContent::Agent(vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }]),
+                None,
+            ),
+        ];
+
+        let anchors = turn_anchors(&messages);
+        assert_eq!(
+            anchors,
+            vec![
+                Some(start),
+                Some(start + chrono::Duration::milliseconds(20))
+            ]
         );
     }
 }

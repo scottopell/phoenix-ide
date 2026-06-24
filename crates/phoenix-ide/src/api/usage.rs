@@ -571,50 +571,43 @@ pub async fn usage_conversation_detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let rows = match state.db.usage_conversation_turns(&id).await {
-        Ok(r) => r,
+    let session = match crate::analytics::project_session(&state.db, &id).await {
+        Ok(s) => s,
         Err(e) => {
-            tracing::error!(error = %e, conv_id = %id, "usage_conversation_turns failed");
+            tracing::error!(error = %e, conv_id = %id, "usage analytics projection failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response();
         }
     };
 
     let mut totals = Totals::default();
-    let turns: Vec<TurnPoint> = rows
+    let turns: Vec<TurnPoint> = session
+        .turns
         .iter()
         .enumerate()
         .map(|(idx, r)| {
-            let cost = calculate_turn_cost(
-                &r.model,
-                r.input_tokens,
-                r.output_tokens,
-                r.cache_creation_tokens,
-                r.cache_read_tokens,
-            );
             totals.add(
-                r.input_tokens,
-                r.output_tokens,
-                r.cache_creation_tokens,
-                r.cache_read_tokens,
+                r.tokens.input_tokens,
+                r.tokens.output_tokens,
+                r.tokens.cache_creation_tokens,
+                r.tokens.cache_read_tokens,
                 1,
-                cost,
+                r.cost,
             );
-            let first_byte_at = r.first_byte_at.clone();
             TurnPoint {
                 index: idx as f64,
-                created_at: r.created_at.clone(),
-                first_byte_at,
-                first_byte_latency_ms: None,
+                created_at: r.created_at.to_rfc3339(),
+                first_byte_at: r.first_byte_at.map(|t| t.to_rfc3339()),
+                first_byte_latency_ms: r.first_byte_latency_ms.map(|ms| ms as f64),
                 model: r.model.clone(),
-                input_tokens: r.input_tokens as f64,
-                output_tokens: r.output_tokens as f64,
-                cache_write_tokens: r.cache_creation_tokens as f64,
-                cache_read_tokens: r.cache_read_tokens as f64,
-                total_tokens: (r.input_tokens
-                    + r.output_tokens
-                    + r.cache_creation_tokens
-                    + r.cache_read_tokens) as f64,
-                cost,
+                input_tokens: r.tokens.input_tokens as f64,
+                output_tokens: r.tokens.output_tokens as f64,
+                cache_write_tokens: r.tokens.cache_creation_tokens as f64,
+                cache_read_tokens: r.tokens.cache_read_tokens as f64,
+                total_tokens: (r.tokens.input_tokens
+                    + r.tokens.output_tokens
+                    + r.tokens.cache_creation_tokens
+                    + r.tokens.cache_read_tokens) as f64,
+                cost: r.cost,
             }
         })
         .collect();

@@ -7,13 +7,13 @@ Phoenix analytics are projections over Phoenix-owned data:
 - `conversations` for session identity, lifecycle, project/task/branch/worktree attribution, model, and root/sub-agent grouping;
 - `messages` plus attachment child tables for user, assistant, and tool history;
 - `turn_usage` for token-bearing LLM turns;
-- future typed fact tables only when a value cannot be reconstructed from existing history.
+- typed fact tables for values that cannot be reconstructed from existing history.
 
 Phoenix does not maintain a second analytics transcript or full JSONL capture log.
 
-## V1 persisted shape
+## Persisted shape
 
-`turn_usage` remains the canonical token-bearing turn table. V1 adds only:
+`turn_usage` is the canonical token-bearing turn table. It carries nullable first-byte timing metadata:
 
 ```sql
 ALTER TABLE turn_usage ADD COLUMN first_byte_at TEXT;
@@ -41,7 +41,7 @@ Tool-call projections reference source message ids instead of copying full input
 
 The export adapter is a consumer of the analytics projection. It returns a Phoenix-owned session payload with Trajectory-compatible session facts, source metadata, and fidelity metadata. It does not require a running Trajectory daemon and does not write an authoritative downstream store.
 
-## Deferred durable facts
+## Durable fact boundaries
 
 Additional fact tables are introduced only when analytics surfaces require values that cannot be reconstructed from history:
 
