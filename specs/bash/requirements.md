@@ -627,11 +627,6 @@ process
 
 THE Explore bash sandbox SHALL provide:
 - broad filesystem read access matching Explore's existing read-only tool semantics
-  where the platform can enforce sensitive-path denies; on Linux, read grants are
-  limited to the worktree, resolved Git metadata directories, and system roots
-  needed to execute local commands so home/Phoenix/Codex credential paths are not
-  covered by an irreversible broad-root allow
-- explicit sensitive-path denies where the platform backend can enforce deny-within-read
 - read-only Git metadata access sufficient for linked worktree commands such as
   `git status`, `git log`, and `git blame`
 - write access only to Phoenix-owned scratch, synthetic home, and writable temp
@@ -665,14 +660,11 @@ AND bash commands SHALL retain the existing writable behavior for that mode
 `git blame`, `rg`, `cat`) only if the read-only promise is enforced below the
 application layer. Explore is a read-only/network-blocked mode, not a
 confidentiality boundary: existing Explore read tools can already read arbitrary
-user-selected paths, so sandboxed bash follows the same broad-read model where
-the backend can also deny sensitive subpaths. On Linux, Landlock cannot express a
-deny inside a previously allowed root, so Phoenix grants explicit read roots
-(worktree, resolved Git metadata directories, and system locations needed to run
-commands) instead of granting `/` and then pretending home/Phoenix/Codex secrets
-are denied. Procfs reads such as `/proc/<pid>/environ` remain an accepted
-consequence when covered by a read grant rather than a credential-isolation
-guarantee. The sandbox constrains writes, network, and the ambient environment
+user-selected paths, so sandboxed bash follows the same broad-read model. Readable
+credential files, Phoenix data files, procfs process environments, and other
+ordinary readable filesystem content are part of that accepted read model; protecting
+sensitive reads is a separate feature with its own threat model. The sandbox
+constrains writes, network, and the ambient environment
 it directly passes to the child process. `nono` is the sandbox abstraction; it
 uses the platform's supported backend (Landlock on Linux, Seatbelt on macOS) and
 reports support at startup.

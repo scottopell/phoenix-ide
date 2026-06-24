@@ -41,9 +41,8 @@ fully decoupled top-level Work conversation off the repository default branch (R
 through 036). It is withheld only from Direct-not-in-a-repo and from sub-agents. Tool
 registry is configured by mode: Explore exposes read-only/planning tools plus `bash` only
 when `nono` reports an enforceable OS sandbox that can block network; sandboxed
-bash can read the worktree, resolved Git metadata, and system locations needed
-for local investigation without covering home/Phoenix/Codex credential paths,
-while writes are limited to scratch, synthetic-home, and platform-temp locations, network is blocked, and ambient credential variables are
+bash can read local files broadly like other Explore read tools, while writes are
+limited to scratch, synthetic-home, and platform-temp locations, network is blocked, and ambient credential variables are
 stripped. `patch` is scoped
 to the discovered taskmd directory so the agent can draft/revise a task file
 (REQ-PROJ-003 and REQ-PROJ-037). Write tools are enabled in Work and Branch. Push is a regular bash command with no

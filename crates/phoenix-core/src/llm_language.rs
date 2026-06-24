@@ -176,13 +176,13 @@ pub fn mode_explore(
 ) -> String {
     let bash_guidance = match (lang, bash) {
         (LlmLanguage::PhoenixNative, ExploreBashCapability::Sandboxed) => {
-            "`bash` is available for read-only local investigation under an OS sandbox. On Linux it can read the worktree, resolved Git metadata, and system locations needed for local commands; use `read_file`/`search` for other local paths. On macOS it can read broadly except sensitive credential/data paths. Source/Git metadata/task writes and network access are blocked. Use `patch` for task proposal drafts; bash may write only to scratch, synthetic home, and platform temp."
+            "`bash` is available for read-only local investigation under an OS sandbox: it can read local files broadly like other Explore read tools, but source/Git metadata/task writes and network access are blocked. Use `patch` for task proposal drafts; bash may write only to scratch, synthetic home, and platform temp."
         }
         (LlmLanguage::PhoenixNative, ExploreBashCapability::Unavailable) => {
             "`bash` is unavailable because this host cannot enforce the Explore sandbox; use read-only tools instead."
         }
         (LlmLanguage::Caveman, ExploreBashCapability::Sandboxed) => {
-            "Bash can inspect this cave's worktree and local command gear. For other files, use read tools. No write code and no network."
+            "Bash can look wide but no write code and no network."
         }
         (LlmLanguage::Caveman, ExploreBashCapability::Unavailable) => "No bash here.",
     };

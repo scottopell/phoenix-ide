@@ -15,9 +15,8 @@ The isolation model has two layers:
 
 2. **OS enforcement (supported platforms):** Top-level Explore conversations
    expose `bash` only when `nono` reports an enforceable backend that can also
-   block network. Explore bash runs in a child process whose sandbox allows local
-   investigation reads without covering home/Phoenix/Codex credential paths,
-   restricts writes to scratch/synthetic-home/platform-temp
+   block network. Explore bash runs in a child process whose sandbox allows broad
+   local reads, restricts writes to scratch/synthetic-home/platform-temp
    locations, strips ambient credential variables, and blocks network (see
    `specs/bash/` REQ-BASH-012/013). Without sandbox support, Explore omits bash.
 

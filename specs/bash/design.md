@@ -853,9 +853,7 @@ directories read-write, a Phoenix-owned scratch directory read-write, a
 synthetic sandbox home under scratch, and platform-compatible temporary
 directory writes. If the worktree itself is under the platform temp root, the
 temp capability falls back to a Phoenix-owned scratch child so the temp grant
-cannot cover source files. Task proposal directories are canonicalized and only
-accepted when their resolved target remains under the repo root.
-`PHOENIX_SANDBOX_SCRATCH` names scratch,
+cannot cover source files. `PHOENIX_SANDBOX_SCRATCH` names scratch,
 `PHOENIX_SANDBOX_HOME` and `HOME` name the synthetic home, and `TMPDIR` names
 the platform temp directory. Network access is blocked and the child
 environment is rebuilt from a small allowlist that preserves `PATH` while
@@ -867,9 +865,9 @@ to the platform.
 
 Broad read is deliberate: Explore already exposes read-only tools that can read
 arbitrary user-selected paths, and sandboxed bash follows that product contract.
-The sandbox is the write/network/ambient-credential boundary. Platform backends
-that can enforce deny-within-read also receive explicit sensitive-path read
-denies for high-confidence credential stores.
+The sandbox is the write/network/ambient-credential boundary. Sensitive readable
+paths are part of the same broad-read risk model as `read_file` and `search`; read
+confidentiality is a separate feature with its own threat model.
 
 Platform detection is `nono::Sandbox::support_info()` at startup. When `nono`
 reports no enforceable backend, top-level Explore registries omit bash. Direct,

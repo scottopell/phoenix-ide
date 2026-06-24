@@ -67,21 +67,11 @@ fn explore_sandbox_enforces_read_only_policy() {
         },
         &format!("cat {}", shell_quote(&outside)),
     );
-    #[cfg(target_os = "macos")]
-    {
-        assert!(
-            outside_read.status.success(),
-            "outside read failed: {outside_read:?}"
-        );
-        assert!(outside_read.stdout.contains("outside"));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        assert!(
-            !outside_read.status.success(),
-            "outside read unexpectedly succeeded: {outside_read:?}"
-        );
-    }
+    assert!(
+        outside_read.status.success(),
+        "outside read failed: {outside_read:?}"
+    );
+    assert!(outside_read.stdout.contains("outside"));
 
     let denied = sandbox_run(
         bin,
@@ -165,24 +155,22 @@ fn explore_sandbox_enforces_read_only_policy() {
         .contains(&format!("tmp={}", platform_temp.display())));
     assert!(env_probe.stdout.contains("gh=unset"));
 
-    #[cfg(target_os = "macos")]
-    {
-        let sensitive_read = sandbox_run(
-            bin,
-            &SandboxFixture {
-                repo: &repo,
-                scratch: &scratch,
-                sandbox_home: &sandbox_home,
-                platform_temp: &platform_temp,
-                sensitive: &sensitive,
-            },
-            &format!("cat {}", shell_quote(&sensitive.join("secret.txt"))),
-        );
-        assert!(
-            !sensitive_read.status.success(),
-            "sensitive read unexpectedly succeeded: {sensitive_read:?}"
-        );
-    }
+    let sensitive_read = sandbox_run(
+        bin,
+        &SandboxFixture {
+            repo: &repo,
+            scratch: &scratch,
+            sandbox_home: &sandbox_home,
+            platform_temp: &platform_temp,
+            sensitive: &sensitive,
+        },
+        &format!("cat {}", shell_quote(&sensitive.join("secret.txt"))),
+    );
+    assert!(
+        sensitive_read.status.success(),
+        "sensitive read failed despite broad-read model: {sensitive_read:?}"
+    );
+    assert!(sensitive_read.stdout.contains("secret"));
 
     let network = sandbox_run(
         bin,
