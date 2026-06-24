@@ -27,6 +27,18 @@ function fmtTokens(n: number): string {
   return `${(n / 1_000_000_000).toFixed(2)}B`;
 }
 
+function fmtUsd(n: number): string {
+  if (n === 0) return '$0.00';
+  if (n < 1) return `$${n.toFixed(4)}`;
+  if (n < 100) return `$${n.toFixed(2)}`;
+  return `$${n.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+}
+
+function fmtCostSummary(cost: Totals['cost']): string {
+  const suffix = cost.pricing_known ? '' : '+';
+  return `${fmtUsd(cost.estimated_usd)}${suffix}`;
+}
+
 function fmtPct(n: number): string {
   return `${(n * 100).toFixed(1)}%`;
 }
@@ -61,7 +73,7 @@ function KpiCard({ label, totals }: { label: string; totals: Totals }) {
       <div className="usage-kpi__label">{label}</div>
       <div className="usage-kpi__cost">{fmtTokens(totals.total_tokens)}</div>
       <div className="usage-kpi__sub">
-        <span>tokens</span>
+        <span>{fmtCostSummary(totals.cost)} est.</span>
         <span>{Math.round(totals.turns)} turns</span>
         <span>{fmtPct(cacheHitRate(totals))} cache</span>
       </div>
@@ -73,10 +85,12 @@ interface TooltipEntry {
   name?: string;
   value?: number;
   color?: string;
+  payload?: unknown;
 }
 
 function TokenTooltip({ active, payload, label }: { active?: boolean; payload?: TooltipEntry[]; label?: string }) {
   if (!active || !payload?.length) return null;
+  const point = payload[0]?.payload as { turnCost?: number | null; pricingKnown?: boolean } | undefined;
   return (
     <div className="usage-tip">
       <div className="usage-tip__title">{label}</div>
@@ -87,6 +101,26 @@ function TokenTooltip({ active, payload, label }: { active?: boolean; payload?: 
           <span className="usage-tip__val">{fmtTokens(e.value ?? 0)}</span>
         </div>
       ))}
+      {point && 'turnCost' in point && (
+        <div className="usage-tip__row usage-tip__row--total">
+          <span>Estimated cost</span>
+          <span className="usage-tip__val">{point.pricingKnown ? fmtUsd(point.turnCost ?? 0) : 'unknown'}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CostTooltip({ active, payload, label }: { active?: boolean; payload?: TooltipEntry[]; label?: string }) {
+  if (!active || !payload?.length) return null;
+  const value = payload[0]?.value ?? 0;
+  return (
+    <div className="usage-tip">
+      <div className="usage-tip__title">Turn {label}</div>
+      <div className="usage-tip__row">
+        <span>Cumulative estimated cost</span>
+        <span className="usage-tip__val">{fmtUsd(value)}</span>
+      </div>
     </div>
   );
 }
@@ -129,10 +163,27 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
   const series = useMemo(() => {
     if (!detail) return [];
     let tokens = 0;
+    let cost = 0;
     return detail.turns.map((t) => {
       tokens += t.total_tokens;
-      return { index: t.index + 1, turnTokens: t.total_tokens, cumTokens: tokens };
+      if (t.cost.total_usd !== null) cost += t.cost.total_usd;
+      return {
+        index: t.index + 1,
+        input_tokens: t.input_tokens,
+        output_tokens: t.output_tokens,
+        cache_write_tokens: t.cache_write_tokens,
+        cache_read_tokens: t.cache_read_tokens,
+        cumTokens: tokens,
+        turnCost: t.cost.total_usd,
+        cumCost: cost,
+        pricingKnown: t.cost.pricing_known,
+      };
     });
+  }, [detail]);
+
+  const drillTokenSeries = useMemo(() => {
+    const hasCacheWrite = detail?.turns.some((t) => t.cache_write_tokens > 0) ?? false;
+    return TOKEN_SERIES.filter((s) => s.key !== 'cache_write_tokens' || hasCacheWrite);
   }, [detail]);
 
   return (
@@ -142,7 +193,8 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
           <h3>{label}</h3>
           {detail && (
             <span className="usage-card__hint">
-              {fmtTokens(detail.totals.total_tokens)} tokens · {Math.round(detail.totals.turns)} turns
+              {fmtTokens(detail.totals.total_tokens)} tokens · {Math.round(detail.totals.turns)} turns ·{' '}
+              {fmtCostSummary(detail.totals.cost)} estimated
             </span>
           )}
         </div>
@@ -152,6 +204,11 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
       </div>
       {error && <div className="settings-section__error">{error}</div>}
       {!detail && !error && <div className="settings-section__hint">Loading…</div>}
+      {detail && detail.totals.cost.unknown_turns > 0 && (
+        <div className="settings-section__hint">
+          Cost estimate excludes {Math.round(detail.totals.cost.unknown_turns)} turns with unknown pricing.
+        </div>
+      )}
       {detail && series.length > 0 && (
         <div className="usage-drill__charts">
           <div>
@@ -162,7 +219,10 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
                 <XAxis dataKey="index" {...AXIS} />
                 <YAxis tickFormatter={fmtTokens} width={48} {...AXIS} />
                 <Tooltip content={<TokenTooltip />} />
-                <Bar dataKey="turnTokens" name="Tokens" fill="var(--accent-blue)" />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                {drillTokenSeries.map((s) => (
+                  <Bar key={s.key} dataKey={s.key} name={s.label} stackId="tokens" fill={s.color} />
+                ))}
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -182,6 +242,18 @@ function ConversationDrill({ id, label, onClose }: { id: string; label: string; 
                   fillOpacity={0.15}
                 />
               </AreaChart>
+            </ResponsiveContainer>
+          </div>
+          <div>
+            <div className="usage-card__hint">Cumulative estimated cost</div>
+            <ResponsiveContainer width="100%" height={180}>
+              <LineChart data={series} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                <CartesianGrid stroke={GRID} vertical={false} />
+                <XAxis dataKey="index" {...AXIS} />
+                <YAxis tickFormatter={(v: number) => fmtUsd(v)} width={56} {...AXIS} />
+                <Tooltip content={<CostTooltip />} />
+                <Line type="monotone" dataKey="cumCost" name="Estimated cost" stroke="var(--accent-yellow)" dot={false} />
+              </LineChart>
             </ResponsiveContainer>
           </div>
         </div>
@@ -365,6 +437,7 @@ export function UsagePage() {
                   <div className="usage-table__head usage-table__row">
                     <span>Conversation</span>
                     <span className="num">Tokens</span>
+                    <span className="num">Est. cost</span>
                     <span className="num">Turns</span>
                     <span className="num">Cache</span>
                   </div>
@@ -380,6 +453,7 @@ export function UsagePage() {
                         {c.worktree && <span className="usage-conv-meta">{c.worktree}</span>}
                       </span>
                       <span className="num">{fmtTokens(c.totals.total_tokens)}</span>
+                      <span className="num">{fmtCostSummary(c.totals.cost)}</span>
                       <span className="num">{Math.round(c.totals.turns)}</span>
                       <span className="num">{fmtPct(cacheHitRate(c.totals))}</span>
                     </button>

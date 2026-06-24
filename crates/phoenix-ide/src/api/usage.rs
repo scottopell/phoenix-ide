@@ -3,9 +3,8 @@
 //! Serves `GET /api/usage` (the aggregate dashboard) and
 //! `GET /api/usage/conversation/:id` (per-conversation drill-down). Both are
 //! computed from the `turn_usage` table, which records token counts and the
-//! model per LLM turn. This surface is purely token-oriented — it carries no
-//! notion of monetary cost. A token-to-cost layer, if ever wanted, can map
-//! these counts downstream without touching the persistence or query layers.
+//! model per LLM turn. Monetary cost is derived at presentation time from the
+//! model id stored with each token row; it is not persisted.
 //!
 //! Token counts cross the wire as `f64` rather than `u64`: every realistic
 //! count is well under 2^53, so the value is exact, and the UI gets plain
@@ -28,8 +27,171 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use ts_rs::TS;
 
-/// Aggregated token counts and turn count for one scope (a day, a model, a
-/// provider, a project, a conversation, or a rolling window).
+/// Estimated USD cost for a token aggregate. `estimated_usd` includes only rows
+/// with known pricing; callers must show `pricing_known == false` / non-zero
+/// `unknown_turns` so unpriced models are not mistaken for free usage.
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct CostSummary {
+    pub estimated_usd: f64,
+    pub pricing_known: bool,
+    pub unknown_turns: f64,
+}
+
+impl Default for CostSummary {
+    fn default() -> Self {
+        Self {
+            estimated_usd: 0.0,
+            pricing_known: true,
+            unknown_turns: 0.0,
+        }
+    }
+}
+
+impl CostSummary {
+    fn add_known(&mut self, usd: f64) {
+        self.estimated_usd += usd;
+    }
+
+    fn add_unknown(&mut self, turns: i64) {
+        self.unknown_turns += turns as f64;
+    }
+
+    fn finish(&mut self) {
+        self.pricing_known = self.unknown_turns == 0.0;
+    }
+}
+
+/// Estimated per-category USD cost for one turn. Category fields are `None`
+/// when the turn's model has no known pricing.
+#[derive(Debug, Clone, Copy, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct TurnCost {
+    pub input_usd: Option<f64>,
+    pub output_usd: Option<f64>,
+    pub cache_write_usd: Option<f64>,
+    pub cache_read_usd: Option<f64>,
+    pub total_usd: Option<f64>,
+    pub pricing_known: bool,
+}
+
+/// USD prices per 1M tokens for the token classes emitted by Phoenix.
+#[derive(Debug, Clone, Copy)]
+struct ModelPricing {
+    input: f64,
+    output: f64,
+    cache_write: f64,
+    cache_read: f64,
+}
+
+impl ModelPricing {
+    fn cost(self, input: i64, output: i64, cache_write: i64, cache_read: i64) -> TurnCost {
+        let input_usd = tokens_to_usd(input, self.input);
+        let output_usd = tokens_to_usd(output, self.output);
+        let cache_write_usd = tokens_to_usd(cache_write, self.cache_write);
+        let cache_read_usd = tokens_to_usd(cache_read, self.cache_read);
+        TurnCost {
+            input_usd: Some(input_usd),
+            output_usd: Some(output_usd),
+            cache_write_usd: Some(cache_write_usd),
+            cache_read_usd: Some(cache_read_usd),
+            total_usd: Some(input_usd + output_usd + cache_write_usd + cache_read_usd),
+            pricing_known: true,
+        }
+    }
+}
+
+fn tokens_to_usd(tokens: i64, usd_per_million: f64) -> f64 {
+    (tokens as f64 / 1_000_000.0) * usd_per_million
+}
+
+fn unknown_turn_cost() -> TurnCost {
+    TurnCost {
+        input_usd: None,
+        output_usd: None,
+        cache_write_usd: None,
+        cache_read_usd: None,
+        total_usd: None,
+        pricing_known: false,
+    }
+}
+
+fn model_pricing(model: &str) -> Option<ModelPricing> {
+    match model {
+        "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" => Some(ModelPricing {
+            input: 15.00,
+            output: 75.00,
+            cache_write: 18.75,
+            cache_read: 1.50,
+        }),
+        "claude-sonnet-4-6" => Some(ModelPricing {
+            input: 3.00,
+            output: 15.00,
+            cache_write: 3.75,
+            cache_read: 0.30,
+        }),
+        "claude-haiku-4-5" => Some(ModelPricing {
+            input: 0.80,
+            output: 4.00,
+            cache_write: 1.00,
+            cache_read: 0.08,
+        }),
+        "gpt-5.5" => Some(ModelPricing {
+            input: 5.00,
+            output: 30.00,
+            cache_write: 5.00,
+            cache_read: 0.50,
+        }),
+        "gpt-5.4" => Some(ModelPricing {
+            input: 2.50,
+            output: 15.00,
+            cache_write: 2.50,
+            cache_read: 0.25,
+        }),
+        "gpt-5.4-mini" => Some(ModelPricing {
+            input: 0.75,
+            output: 4.50,
+            cache_write: 0.75,
+            cache_read: 0.075,
+        }),
+        "gpt-5.3-codex" => Some(ModelPricing {
+            input: 1.25,
+            output: 10.00,
+            cache_write: 1.25,
+            cache_read: 0.125,
+        }),
+        "mock" => Some(ModelPricing {
+            input: 0.0,
+            output: 0.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        }),
+        _ => None,
+    }
+}
+
+fn calculate_turn_cost(
+    model: &str,
+    input: i64,
+    output: i64,
+    cache_write: i64,
+    cache_read: i64,
+) -> TurnCost {
+    model_pricing(model).map_or_else(unknown_turn_cost, |p| {
+        p.cost(input, output, cache_write, cache_read)
+    })
+}
+
+fn add_cost(summary: &mut CostSummary, cost: TurnCost, turns: i64) {
+    if let Some(usd) = cost.total_usd {
+        summary.add_known(usd);
+    } else {
+        summary.add_unknown(turns);
+    }
+}
+
+/// Aggregated token counts, turn count, and derived estimated cost for one
+/// scope (a day, a model, a provider, a project, a conversation, or a rolling window).
 #[derive(Debug, Clone, Default, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct Totals {
@@ -39,16 +201,22 @@ pub struct Totals {
     pub cache_read_tokens: f64,
     pub total_tokens: f64,
     pub turns: f64,
+    pub cost: CostSummary,
 }
 
 impl Totals {
-    fn add(&mut self, input: i64, output: i64, cw: i64, cr: i64, turns: i64) {
+    fn add(&mut self, input: i64, output: i64, cw: i64, cr: i64, turns: i64, cost: TurnCost) {
         self.input_tokens += input as f64;
         self.output_tokens += output as f64;
         self.cache_write_tokens += cw as f64;
         self.cache_read_tokens += cr as f64;
         self.total_tokens += (input + output + cw + cr) as f64;
         self.turns += turns as f64;
+        add_cost(&mut self.cost, cost, turns);
+    }
+
+    fn finish_cost(&mut self) {
+        self.cost.finish();
     }
 }
 
@@ -147,6 +315,7 @@ pub struct TurnPoint {
     pub cache_write_tokens: f64,
     pub cache_read_tokens: f64,
     pub total_tokens: f64,
+    pub cost: TurnCost,
 }
 
 /// The `/api/usage/conversation/:id` payload.
@@ -254,49 +423,64 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
             row.cache_read_tokens,
             row.turns,
         );
+        let cost = calculate_turn_cost(&row.model, i, o, cw, cr);
         daily_map
             .entry(row.day.clone())
             .or_default()
-            .add(i, o, cw, cr, t);
+            .add(i, o, cw, cr, t, cost);
         model_map
             .entry(row.model.clone())
             .or_default()
-            .add(i, o, cw, cr, t);
+            .add(i, o, cw, cr, t, cost);
         provider_map
             .entry(provider_display(&row.model))
             .or_default()
-            .add(i, o, cw, cr, t);
+            .add(i, o, cw, cr, t, cost);
 
-        windows.all.add(i, o, cw, cr, t);
+        windows.all.add(i, o, cw, cr, t, cost);
         if row.day.as_str() >= month_start.as_str() {
-            windows.month.add(i, o, cw, cr, t);
+            windows.month.add(i, o, cw, cr, t, cost);
         }
         if row.day.as_str() >= week_start.as_str() {
-            windows.week.add(i, o, cw, cr, t);
+            windows.week.add(i, o, cw, cr, t, cost);
         }
         if row.day == today {
-            windows.today.add(i, o, cw, cr, t);
+            windows.today.add(i, o, cw, cr, t, cost);
         }
     }
 
+    windows.today.finish_cost();
+    windows.week.finish_cost();
+    windows.month.finish_cost();
+    windows.all.finish_cost();
+
     let daily: Vec<DailyUsage> = daily_map
         .into_iter()
-        .map(|(day, totals)| DailyUsage { day, totals })
+        .map(|(day, mut totals)| {
+            totals.finish_cost();
+            DailyUsage { day, totals }
+        })
         .collect();
 
     let mut by_model: Vec<ModelUsage> = model_map
         .into_iter()
-        .map(|(model, totals)| ModelUsage {
-            provider: provider_display(&model),
-            model,
-            totals,
+        .map(|(model, mut totals)| {
+            totals.finish_cost();
+            ModelUsage {
+                provider: provider_display(&model),
+                model,
+                totals,
+            }
         })
         .collect();
     by_model.sort_by(|a, b| b.totals.total_tokens.total_cmp(&a.totals.total_tokens));
 
     let mut by_provider: Vec<ProviderUsage> = provider_map
         .into_iter()
-        .map(|(provider, totals)| ProviderUsage { provider, totals })
+        .map(|(provider, mut totals)| {
+            totals.finish_cost();
+            ProviderUsage { provider, totals }
+        })
         .collect();
     by_provider.sort_by(|a, b| b.totals.total_tokens.total_cmp(&a.totals.total_tokens));
 
@@ -327,26 +511,30 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
                 started_at: row.started_at.clone(),
                 totals: Totals::default(),
             });
-        acc.totals.add(i, o, cw, cr, t);
+        let cost = calculate_turn_cost(&row.model, i, o, cw, cr);
+        acc.totals.add(i, o, cw, cr, t, cost);
         if row.started_at < acc.started_at {
             acc.started_at.clone_from(&row.started_at);
         }
         project_map
             .entry(row.project_id.clone())
             .or_default()
-            .add(i, o, cw, cr, t);
+            .add(i, o, cw, cr, t, cost);
     }
 
     let mut conversations: Vec<ConversationUsageRow> = conv_map
         .into_iter()
-        .map(|(id, a)| ConversationUsageRow {
-            root_conversation_id: id,
-            label: a.label,
-            slug: a.slug,
-            project_id: a.project_id,
-            worktree: a.worktree,
-            started_at: a.started_at,
-            totals: a.totals,
+        .map(|(id, mut a)| {
+            a.totals.finish_cost();
+            ConversationUsageRow {
+                root_conversation_id: id,
+                label: a.label,
+                slug: a.slug,
+                project_id: a.project_id,
+                worktree: a.worktree,
+                started_at: a.started_at,
+                totals: a.totals,
+            }
         })
         .collect();
     conversations.sort_by(|a, b| b.totals.total_tokens.total_cmp(&a.totals.total_tokens));
@@ -354,7 +542,10 @@ pub async fn usage_overview(State(state): State<AppState>) -> impl IntoResponse 
 
     let mut by_project: Vec<ProjectUsage> = project_map
         .into_iter()
-        .map(|(project_id, totals)| ProjectUsage { project_id, totals })
+        .map(|(project_id, mut totals)| {
+            totals.finish_cost();
+            ProjectUsage { project_id, totals }
+        })
         .collect();
     by_project.sort_by(|a, b| b.totals.total_tokens.total_cmp(&a.totals.total_tokens));
 
@@ -391,12 +582,20 @@ pub async fn usage_conversation_detail(
         .iter()
         .enumerate()
         .map(|(idx, r)| {
+            let cost = calculate_turn_cost(
+                &r.model,
+                r.input_tokens,
+                r.output_tokens,
+                r.cache_creation_tokens,
+                r.cache_read_tokens,
+            );
             totals.add(
                 r.input_tokens,
                 r.output_tokens,
                 r.cache_creation_tokens,
                 r.cache_read_tokens,
                 1,
+                cost,
             );
             TurnPoint {
                 index: idx as f64,
@@ -410,9 +609,11 @@ pub async fn usage_conversation_detail(
                     + r.output_tokens
                     + r.cache_creation_tokens
                     + r.cache_read_tokens) as f64,
+                cost,
             }
         })
         .collect();
+    totals.finish_cost();
 
     Json(ConversationUsageDetail {
         root_conversation_id: id,
@@ -446,11 +647,74 @@ mod tests {
     #[test]
     fn totals_sum_tokens_and_turns() {
         let mut t = Totals::default();
-        t.add(1_000_000, 0, 0, 0, 1);
-        t.add(0, 500_000, 250_000, 1_000_000, 1);
+        let known = calculate_turn_cost("claude-sonnet-4-6", 1_000_000, 0, 0, 0);
+        let unknown = calculate_turn_cost("unpriced-model", 0, 500_000, 250_000, 1_000_000);
+        t.add(1_000_000, 0, 0, 0, 1, known);
+        t.add(0, 500_000, 250_000, 1_000_000, 1, unknown);
+        t.finish_cost();
         assert_eq!(t.input_tokens, 1_000_000.0);
         assert_eq!(t.output_tokens, 500_000.0);
         assert_eq!(t.total_tokens, 2_750_000.0);
         assert_eq!(t.turns, 2.0);
+        assert_eq!(t.cost.estimated_usd, 3.0);
+        assert_eq!(t.cost.unknown_turns, 1.0);
+        assert!(!t.cost.pricing_known);
+    }
+
+    #[test]
+    fn cost_calculation_prices_each_token_category() {
+        let cost = calculate_turn_cost(
+            "claude-sonnet-4-6",
+            1_000_000,
+            2_000_000,
+            3_000_000,
+            4_000_000,
+        );
+        assert!(cost.pricing_known);
+        assert_eq!(cost.input_usd, Some(3.0));
+        assert_eq!(cost.output_usd, Some(30.0));
+        assert_eq!(cost.cache_write_usd, Some(11.25));
+        assert_eq!(cost.cache_read_usd, Some(1.2));
+        assert_eq!(cost.total_usd, Some(45.45));
+    }
+
+    #[test]
+    fn unknown_model_pricing_is_not_zero_cost() {
+        let cost = calculate_turn_cost("future-model", 1_000_000, 1_000_000, 0, 0);
+        assert!(!cost.pricing_known);
+        assert_eq!(cost.total_usd, None);
+
+        let mut totals = Totals::default();
+        totals.add(1_000_000, 1_000_000, 0, 0, 1, cost);
+        totals.finish_cost();
+        assert_eq!(totals.cost.estimated_usd, 0.0);
+        assert_eq!(totals.cost.unknown_turns, 1.0);
+        assert!(!totals.cost.pricing_known);
+    }
+
+    #[test]
+    fn mixed_model_aggregation_sums_per_model_costs() {
+        let mut totals = Totals::default();
+        totals.add(
+            1_000_000,
+            0,
+            0,
+            0,
+            1,
+            calculate_turn_cost("claude-sonnet-4-6", 1_000_000, 0, 0, 0),
+        );
+        totals.add(
+            0,
+            1_000_000,
+            0,
+            0,
+            1,
+            calculate_turn_cost("claude-haiku-4-5", 0, 1_000_000, 0, 0),
+        );
+        totals.finish_cost();
+
+        assert_eq!(totals.cost.estimated_usd, 7.0);
+        assert_eq!(totals.cost.unknown_turns, 0.0);
+        assert!(totals.cost.pricing_known);
     }
 }

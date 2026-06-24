@@ -120,6 +120,13 @@
   padding-left: 12px;
 }
 
+.usage-tip__row--total {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
 /* Conversation table */
 .usage-table {
   display: flex;
@@ -128,7 +135,7 @@
 
 .usage-table__row {
   display: grid;
-  grid-template-columns: 1fr 90px 64px 64px;
+  grid-template-columns: 1fr 90px 76px 64px 64px;
   gap: 8px;
   align-items: center;
   padding: 6px 8px;
