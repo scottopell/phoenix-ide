@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import './TaskApprovalReader.css';
 
 export interface CommissionReviewApprovalProps {
   brief: string;
