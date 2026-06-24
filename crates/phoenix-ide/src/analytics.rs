@@ -152,7 +152,7 @@ pub async fn project_session(db: &Database, root_id: &str) -> Result<AnalyticsSe
 
     let tool_calls = project_tool_calls(&messages);
     let first_seen = turns.first().map_or(root.created_at, |t| t.created_at);
-    let last_seen = turns.last().map_or(root.updated_at, |t| t.created_at);
+    let last_seen = session_last_seen_at(&root, &turns, &messages);
     let first_byte_available = turns.iter().any(|t| t.first_byte_at.is_some());
     let unknown_cost = turns.iter().any(|t| !t.cost.pricing_known);
 
@@ -255,6 +255,26 @@ pub async fn trajectory_export(
     })
 }
 
+fn session_last_seen_at(
+    root: &Conversation,
+    turns: &[AnalyticsUsageTurn],
+    messages: &[Message],
+) -> DateTime<Utc> {
+    turns
+        .iter()
+        .map(|t| t.created_at)
+        .max()
+        .unwrap_or(root.updated_at)
+        .max(root.updated_at)
+        .max(
+            messages
+                .iter()
+                .map(|m| m.created_at)
+                .max()
+                .unwrap_or(root.updated_at),
+        )
+}
+
 fn project_tool_calls(messages: &[Message]) -> Vec<AnalyticsToolCall> {
     let mut calls = Vec::new();
     for (index, msg) in messages.iter().enumerate() {
@@ -270,7 +290,11 @@ fn project_tool_calls(messages: &[Message]) -> Vec<AnalyticsToolCall> {
                     };
                     (
                         content.is_error,
-                        is_deterministic_denial(content.content.as_str(), m.display_data.as_ref()),
+                        content.is_error
+                            && is_deterministic_denial(
+                                content.content.as_str(),
+                                m.display_data.as_ref(),
+                            ),
                         duration_ms(m.display_data.as_ref()),
                     )
                 });
@@ -550,6 +574,77 @@ mod tests {
         assert_eq!(calls[1].tool_result_message_id.as_deref(), Some("t-sub"));
         assert_eq!(calls[1].duration_ms, Some(22));
         assert!(calls[1].is_error);
+    }
+
+    #[test]
+    fn successful_tool_output_with_error_marker_is_not_denied() {
+        let messages = vec![
+            msg(
+                "a1",
+                1,
+                MessageContent::Agent(vec![ContentBlock::ToolUse {
+                    id: "tu1".to_string(),
+                    name: "bash".to_string(),
+                    input: json!({ "cmd": "echo fixture" }),
+                }]),
+                None,
+            ),
+            msg(
+                "t1",
+                2,
+                MessageContent::Tool(ToolContent::new(
+                    "tu1",
+                    r#"{"error":"command_safety_rejected"}"#,
+                    false,
+                )),
+                Some(json!({ "error": "command_safety_rejected" })),
+            ),
+        ];
+
+        let calls = project_tool_calls(&messages);
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].is_error);
+        assert!(!calls[0].denied);
+    }
+
+    #[test]
+    fn session_last_seen_includes_message_activity_after_usage() {
+        let root = Conversation {
+            id: "root".to_string(),
+            slug: Some("root".to_string()),
+            title: Some("root".to_string()),
+            cwd: "/tmp".to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: crate::state_machine::ConvState::Idle,
+            state_updated_at: Utc::now(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            archived: false,
+            model: Some("mock".to_string()),
+            project_id: None,
+            conv_mode: ConvMode::Direct,
+            desired_base_branch: None,
+            message_count: 0,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            chain_name: None,
+            llm_language: crate::llm_language::LlmLanguage::default(),
+            spawned_from_conversation_id: None,
+        };
+        let later = root.updated_at + chrono::Duration::seconds(30);
+        let messages = vec![msg_in(
+            "sub",
+            "sub-tool",
+            1,
+            later,
+            MessageContent::Tool(ToolContent::new("tu", "ok", false)),
+            None,
+        )];
+
+        let last_seen = session_last_seen_at(&root, &[], &messages);
+        assert_eq!(last_seen, later);
     }
 
     #[test]

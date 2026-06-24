@@ -4322,7 +4322,13 @@ impl Database {
         root_id: &str,
     ) -> DbResult<Vec<String>> {
         let mut ids: Vec<String> = sqlx::query_scalar(
-            "SELECT ?1 AS id UNION SELECT DISTINCT conversation_id FROM turn_usage WHERE root_conversation_id = ?1 ORDER BY id ASC",
+            "WITH RECURSIVE session_conversations(id) AS (\
+                 SELECT ?1 \
+                 UNION \
+                 SELECT c.id FROM conversations c \
+                 JOIN session_conversations sc ON c.parent_conversation_id = sc.id \
+             ) \
+             SELECT id FROM session_conversations ORDER BY id ASC",
         )
         .bind(root_id)
         .fetch_all(&self.pool)
@@ -4340,8 +4346,11 @@ impl Database {
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn usage_anchor_messages(&self, root_id: &str) -> DbResult<Vec<UsageAnchorRow>> {
         let rows = sqlx::query(
-            "WITH session_conversations(id) AS (\
-                 SELECT ?1 UNION SELECT DISTINCT conversation_id FROM turn_usage WHERE root_conversation_id = ?1\
+            "WITH RECURSIVE session_conversations(id) AS (\
+                 SELECT ?1 \
+                 UNION \
+                 SELECT c.id FROM conversations c \
+                 JOIN session_conversations sc ON c.parent_conversation_id = sc.id \
              ) \
              SELECT m.conversation_id, m.created_at \
              FROM messages m \
@@ -5733,12 +5742,28 @@ mod tests {
         db.create_conversation("conv-root-only", "slug-root-only", "/tmp", true, None, None)
             .await
             .unwrap();
+        db.create_conversation(
+            "conv-child-no-usage",
+            "slug-child-no-usage",
+            "/tmp",
+            false,
+            Some("conv-root-only"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let ids = db
             .analytics_conversation_ids_for_root("conv-root-only")
             .await
             .unwrap();
-        assert_eq!(ids, vec!["conv-root-only".to_string()]);
+        assert_eq!(
+            ids,
+            vec![
+                "conv-child-no-usage".to_string(),
+                "conv-root-only".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
