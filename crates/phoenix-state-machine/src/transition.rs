@@ -6240,7 +6240,28 @@ mod tests {
 
             let execute_effect = result.effects.iter().find_map(|effect| match effect {
                 Effect::ExecuteTool { tool } => Some(tool),
-                _ => None,
+                Effect::PersistMessage { .. }
+                | Effect::PersistState
+                | Effect::RequestLlm
+                | Effect::BroadcastAssistantMessage { .. }
+                | Effect::AbortTool { .. }
+                | Effect::AbortLlm
+                | Effect::CancelSubAgents { .. }
+                | Effect::NotifyParent { .. }
+                | Effect::NotifyStateChange
+                | Effect::NotifyAgentDone
+                | Effect::ScheduleRetry { .. }
+                | Effect::PersistCheckpoint { .. }
+                | Effect::PersistToolResults { .. }
+                | Effect::PersistHiddenSystemMarker { .. }
+                | Effect::PersistSubAgentResults { .. }
+                | Effect::RequestContinuation { .. }
+                | Effect::NotifyContextExhausted { .. }
+                | Effect::ApproveTask { .. }
+                | Effect::ApproveTaskFreshHandoff { .. }
+                | Effect::PersistForkProposal { .. }
+                | Effect::ResolveTask { .. }
+                | Effect::ClearSteeringQueueEntries { .. } => None,
             });
             let tool_call = execute_effect.expect("approval should emit ExecuteTool");
             match &tool_call.input {
@@ -6252,7 +6273,21 @@ mod tests {
                         context.working_dir.display().to_string()
                     );
                 }
-                other => panic!("expected approved commission review input, got {other:?}"),
+                other @ (ToolInput::Bash(_)
+                | ToolInput::Think(_)
+                | ToolInput::Patch(_)
+                | ToolInput::KeywordSearch(_)
+                | ToolInput::ReadImage(_)
+                | ToolInput::SpawnAgents(_)
+                | ToolInput::SubmitResult(_)
+                | ToolInput::SubmitError(_)
+                | ToolInput::CommissionReview(_)
+                | ToolInput::ProposeTask(_)
+                | ToolInput::AskUserQuestion(_)
+                | ToolInput::Unknown { .. }
+                | ToolInput::Malformed { .. }) => {
+                    panic!("expected approved commission review input, got {other:?}")
+                }
             }
         }
     }

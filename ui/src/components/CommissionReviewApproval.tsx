@@ -3,9 +3,9 @@ import './TaskApprovalReader.css';
 
 export interface CommissionReviewApprovalProps {
   brief: string;
-  focus?: string | null;
+  focus: string | null | undefined;
   allowDirtyWorkingTree: boolean;
-  scope?: {
+  scope: {
     kind: string;
     repo_root: string;
     base: string;
@@ -14,7 +14,7 @@ export interface CommissionReviewApprovalProps {
     changed_files: number;
     insertions: number;
     deletions: number;
-  };
+  } | undefined;
   onApprove: () => Promise<void> | void;
   onReject: () => Promise<void> | void;
 }

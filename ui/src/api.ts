@@ -336,6 +336,17 @@ export type RecoveryResumeTarget =
   | { type: 'conversation_turn' }
   | { type: 'continuation_summary'; request: ContinuationSummaryRequest };
 
+export interface CommissionReviewApprovalScope {
+  kind: string;
+  repo_root: string;
+  base: string;
+  head: string;
+  dirty: boolean;
+  changed_files: number;
+  insertions: number;
+  deletions: number;
+}
+
 export type ConversationState =
   | { type: 'idle' }
   | { type: 'awaiting_llm' }
@@ -353,16 +364,7 @@ export type ConversationState =
       brief: string;
       focus?: string | null;
       allow_dirty_working_tree: boolean;
-      scope?: {
-        kind: string;
-        repo_root: string;
-        base: string;
-        head: string;
-        dirty: boolean;
-        changed_files: number;
-        insertions: number;
-        deletions: number;
-      };
+      scope: CommissionReviewApprovalScope | undefined;
     }
   | { type: 'awaiting_user_response'; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }

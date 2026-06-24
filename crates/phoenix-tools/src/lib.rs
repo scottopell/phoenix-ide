@@ -126,13 +126,13 @@ pub enum ToolOutput {
         /// not text).
         images: Vec<ToolImage>,
         display_data: Option<Value>,
-        llm_usage: Option<ToolLlmUsage>,
+        llm_usage: Option<Box<ToolLlmUsage>>,
     },
     Error {
         output: String,
         images: Vec<ToolImage>,
         display_data: Option<Value>,
-        llm_usage: Option<ToolLlmUsage>,
+        llm_usage: Option<Box<ToolLlmUsage>>,
     },
 }
 
@@ -170,7 +170,7 @@ impl ToolOutput {
     pub fn with_llm_usage(mut self, usage: ToolLlmUsage) -> Self {
         match &mut self {
             Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
-                *llm_usage = Some(usage);
+                *llm_usage = Some(Box::new(usage));
             }
         }
         self
@@ -178,10 +178,13 @@ impl ToolOutput {
 
     pub fn take_llm_usage(&mut self) -> Option<ToolLlmUsage> {
         match self {
-            Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => llm_usage.take(),
+            Self::Success { llm_usage, .. } | Self::Error { llm_usage, .. } => {
+                llm_usage.take().map(|usage| *usage)
+            }
         }
     }
 
+    #[must_use]
     pub fn with_images(mut self, imgs: Vec<ToolImage>) -> Self {
         match &mut self {
             Self::Success { images, .. } | Self::Error { images, .. } => *images = imgs,

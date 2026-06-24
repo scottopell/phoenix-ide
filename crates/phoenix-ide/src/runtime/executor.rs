@@ -249,6 +249,7 @@ async fn forward_tool_outcome(
 /// only accepts `ToolAborted` from `CancellingTool`, entered when the
 /// `AbortTool` effect cancels the token (FM-1 prevention). A missing output
 /// (unknown tool) maps to `Failed`.
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_to_outcome<S, T>(
     storage: S,
     tool_executor: Arc<T>,

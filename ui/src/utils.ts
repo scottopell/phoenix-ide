@@ -1,6 +1,6 @@
 // Utility functions
 
-import type { ConversationState, RecoveryResumeTarget, ToolCall, PendingSubAgent, SubAgentResult, UserQuestion } from './api';
+import type { CommissionReviewApprovalScope, ConversationState, RecoveryResumeTarget, ToolCall, PendingSubAgent, SubAgentResult, UserQuestion } from './api';
 import { getErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 
@@ -175,6 +175,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+function parseCommissionReviewScope(raw: unknown): CommissionReviewApprovalScope | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return undefined;
+  }
+  const obj = raw as Record<string, unknown>;
+  const kind = obj['kind'];
+  const repoRoot = obj['repo_root'];
+  const base = obj['base'];
+  const head = obj['head'];
+  const dirty = obj['dirty'];
+  const changedFiles = obj['changed_files'];
+  const insertions = obj['insertions'];
+  const deletions = obj['deletions'];
+  if (
+    typeof kind !== 'string' ||
+    typeof repoRoot !== 'string' ||
+    typeof base !== 'string' ||
+    typeof head !== 'string' ||
+    typeof dirty !== 'boolean' ||
+    typeof changedFiles !== 'number' ||
+    typeof insertions !== 'number' ||
+    typeof deletions !== 'number'
+  ) {
+    return undefined;
+  }
+  return {
+    kind,
+    repo_root: repoRoot,
+    base,
+    head,
+    dirty,
+    changed_files: changedFiles,
+    insertions,
+    deletions,
+  };
+}
+
 function parseRecoveryResumeTarget(raw: Record<string, unknown>): RecoveryResumeTarget {
   if (raw['type'] === 'continuation_summary' && isRecord(raw['request'])) {
     return {
@@ -259,7 +296,7 @@ export function parseConversationState(raw: unknown): ConversationState {
         brief,
         focus: focus ?? null,
         allow_dirty_working_tree: allowDirty,
-        scope: obj['scope'] as any,
+        scope: parseCommissionReviewScope(obj['scope']),
       };
     }
     case 'awaiting_user_response':

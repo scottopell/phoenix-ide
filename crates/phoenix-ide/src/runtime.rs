@@ -710,6 +710,7 @@ pub struct EnrichedConversation {
 /// responsibility of [`SseBroadcaster`] — do not hand-craft `sequence_id`
 /// values at call sites.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum SseEvent {
     Init {
         /// Snapshot's own place in the total order. On init this equals

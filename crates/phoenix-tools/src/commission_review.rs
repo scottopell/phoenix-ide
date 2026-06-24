@@ -8,6 +8,7 @@ use phoenix_core::domain::llm_types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
@@ -219,6 +220,7 @@ impl Tool for CommissionReviewTool {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, String> {
     let started = Instant::now();
     let approved: ApprovedCommissionReviewInput = serde_json::from_value(input)
@@ -400,6 +402,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn failed_review_output(
     started: Instant,
     target: ReviewTargetSummary,
@@ -441,18 +444,20 @@ fn assert_approved_context_has_not_drifted(
     ctx: &ToolContext,
     approved: &ApprovedCommissionReviewInput,
 ) -> Result<(), String> {
+    let current_worktree = ctx
+        .worktree_path
+        .as_ref()
+        .map(|path| path.display().to_string());
     assert_approved_paths_match(
         &ctx.working_dir.display().to_string(),
-        &ctx.worktree_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
+        current_worktree.as_ref(),
         approved,
     )
 }
 
 fn assert_approved_paths_match(
     current_cwd: &str,
-    current_worktree: &Option<String>,
+    current_worktree: Option<&String>,
     approved: &ApprovedCommissionReviewInput,
 ) -> Result<(), String> {
     if current_cwd != approved.approved_working_dir {
@@ -462,7 +467,7 @@ fn assert_approved_paths_match(
         ));
     }
 
-    if current_worktree != &approved.approved_worktree_path {
+    if current_worktree != approved.approved_worktree_path.as_ref() {
         return Err(format!(
             "commission_review target changed after approval: worktree was `{:?}` at approval time but is now `{:?}`. Request review again.",
             approved.approved_worktree_path,
@@ -520,6 +525,7 @@ async fn resolve_target(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCollection, String> {
     let repo = Path::new(&target.summary.repo_root);
     let mut warnings = Vec::new();
@@ -739,7 +745,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
         }
         if !diff.trim().is_empty() {
             files_reviewed += 1;
-            body.push_str(&format!("\n\n--- FILE: {file} ---\n{diff}"));
+            let _ = write!(body, "\n\n--- FILE: {file} ---\n{diff}");
         }
     }
 
@@ -833,7 +839,7 @@ fn parse_findings(text: &str) -> (Vec<ReviewFinding>, Option<String>, Vec<Review
                 "invalid JSON object bounds",
             )));
         }
-        serde_json::from_str::<ModelReviewResponse>(&cleaned[start..end])
+        serde_json::from_str::<ModelReviewResponse>(cleaned.get(start..end).unwrap_or_default())
     });
 
     let Ok(parsed) = parsed else {
@@ -1196,7 +1202,7 @@ mod tests {
 
         let cwd_err = assert_approved_paths_match(
             "/repo/current",
-            &Some("/repo/approved-wt".to_string()),
+            Some(&"/repo/approved-wt".to_string()),
             &approved,
         )
         .expect_err("changed cwd should reject");
@@ -1204,7 +1210,7 @@ mod tests {
 
         let wt_err = assert_approved_paths_match(
             "/repo/approved",
-            &Some("/repo/current-wt".to_string()),
+            Some(&"/repo/current-wt".to_string()),
             &approved,
         )
         .expect_err("changed worktree should reject");
@@ -1226,7 +1232,7 @@ mod tests {
             approved_base: None,
         };
 
-        assert!(assert_approved_paths_match("/repo/approved", &None, &approved).is_ok());
+        assert!(assert_approved_paths_match("/repo/approved", None, &approved).is_ok());
     }
 
     #[test]
