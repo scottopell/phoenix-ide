@@ -636,37 +636,32 @@ impl ModelRegistry {
 
     /// Build a `DiscoveryConfig` from credential-helper auth and base URL overrides.
     ///
-    /// Returns `None` when no helper credential is ready or no model-listing URL can
-    /// be derived from the configured base URLs.
+    /// Returns `None` when no model-listing URL can be derived or no helper
+    /// credential is already cached. It never starts or waits for the helper;
+    /// interactive auth must happen after the server is serving the auth UI.
     async fn build_discovery_config(config: &LlmConfig) -> Option<DiscoveryConfig> {
-        let helper = config.credential_helper.as_ref()?;
-        let mut auth_token = helper.get().await;
-        if auth_token.is_none() && helper.is_recovering().await {
-            helper.wait_for_settlement().await;
-            if helper.credential_status().await == crate::CredentialStatus::Valid {
-                auth_token = helper.get().await;
-            }
+        let anthropic_models_url = config
+            .anthropic_base_url
+            .as_deref()
+            .and_then(derive_models_url);
+        let openai_models_url = config
+            .openai_base_url
+            .as_deref()
+            .and_then(derive_models_url);
+        if anthropic_models_url.is_none() && openai_models_url.is_none() {
+            return None;
         }
+
+        let helper = config.credential_helper.as_ref()?;
+        let auth_token = helper.cached_credential().await;
         auth_token.as_ref()?;
 
-        let discovery = DiscoveryConfig {
-            anthropic_models_url: config
-                .anthropic_base_url
-                .as_deref()
-                .and_then(derive_models_url),
-            openai_models_url: config
-                .openai_base_url
-                .as_deref()
-                .and_then(derive_models_url),
+        Some(DiscoveryConfig {
+            anthropic_models_url,
+            openai_models_url,
             auth_token,
             custom_headers: config.custom_headers.clone(),
-        };
-
-        if discovery.anthropic_models_url.is_none() && discovery.openai_models_url.is_none() {
-            None
-        } else {
-            Some(discovery)
-        }
+        })
     }
 
     /// Try to create a model service, validating prerequisites
@@ -1361,19 +1356,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_config_waits_for_starting_credential_helper() {
+    async fn discovery_config_does_not_start_idle_credential_helper() {
+        let helper =
+            crate::CredentialHelper::new("echo test-token".to_string(), Duration::from_hours(1));
         let config = LlmConfig {
-            credential_helper: Some(crate::CredentialHelper::new(
-                "echo test-token".to_string(),
-                Duration::from_hours(1),
-            )),
+            credential_helper: Some(helper.clone()),
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            ..Default::default()
+        };
+
+        assert!(ModelRegistry::build_discovery_config(&config)
+            .await
+            .is_none());
+        assert_eq!(
+            helper.credential_status().await,
+            crate::CredentialStatus::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_uses_cached_credential_helper_token() {
+        let helper =
+            crate::CredentialHelper::new("echo test-token".to_string(), Duration::from_hours(1));
+        assert!(helper.get().await.is_none());
+        helper.wait_for_settlement().await;
+        let config = LlmConfig {
+            credential_helper: Some(helper),
             anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
             ..Default::default()
         };
 
         let discovery = ModelRegistry::build_discovery_config(&config)
             .await
-            .expect("helper should settle and produce discovery config");
+            .expect("cached helper token should produce discovery config");
 
         assert_eq!(discovery.auth_token.as_deref(), Some("test-token"));
         assert_eq!(

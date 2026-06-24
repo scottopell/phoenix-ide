@@ -84,6 +84,23 @@ impl CredentialHelper {
         this
     }
 
+    /// Return the cached credential only when it is already valid. Does not start
+    /// the helper subprocess.
+    pub async fn cached_credential(&self) -> Option<String> {
+        let mut inner = self.inner.lock().await;
+        match &*inner {
+            HelperInner::Valid {
+                credential,
+                expires_at,
+            } if Instant::now() < *expires_at => Some(credential.clone()),
+            HelperInner::Valid { .. } => {
+                *inner = HelperInner::Idle;
+                None
+            }
+            HelperInner::Idle | HelperInner::Running { .. } | HelperInner::Failed { .. } => None,
+        }
+    }
+
     /// Wait until the helper transitions out of Running (to Valid or Failed).
     /// Returns immediately if not currently Running.
     pub async fn wait_for_settlement(&self) {
