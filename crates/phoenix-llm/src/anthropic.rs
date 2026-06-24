@@ -324,6 +324,25 @@ fn parse_anthropic_sse_error(v: &serde_json::Value) -> LlmError {
 /// 1. `base_url_override` (`ANTHROPIC_BASE_URL`) — used as-is, no path appended
 /// 2. `gateway` (`LLM_GATEWAY`) — appends `/anthropic/v1/messages`
 /// 3. Default: `https://api.anthropic.com/v1/messages`
+fn has_custom_source_header(custom_headers: &[(String, String)]) -> bool {
+    custom_headers
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case("source"))
+}
+
+fn apply_source_header(
+    mut builder: reqwest::RequestBuilder,
+    custom_headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    if !has_custom_source_header(custom_headers) {
+        builder = builder.header("source", LLM_SOURCE_HEADER);
+    }
+    for (k, v) in custom_headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    builder
+}
+
 fn resolve_anthropic_url(gateway: Option<&str>, base_url_override: Option<&str>) -> String {
     if let Some(url) = base_url_override {
         url.to_string()
@@ -379,11 +398,8 @@ pub async fn complete_streaming(
     }
     builder = builder
         .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .header("source", LLM_SOURCE_HEADER);
-    for (k, v) in custom_headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
+        .header("content-type", "application/json");
+    builder = apply_source_header(builder, custom_headers);
     let response = builder.json(&anthropic_request).send().await.map_err(|e| {
         if e.is_timeout() {
             LlmError::network(format!("Request timeout: {e}"))
@@ -473,11 +489,8 @@ pub async fn complete(
     }
     builder = builder
         .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .header("source", LLM_SOURCE_HEADER);
-    for (k, v) in custom_headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
+        .header("content-type", "application/json");
+    builder = apply_source_header(builder, custom_headers);
     let response = builder.json(&anthropic_request).send().await.map_err(|e| {
         if e.is_timeout() {
             LlmError::network(format!("Request timeout: {e}"))
@@ -1131,6 +1144,22 @@ mod tests {
             max_tokens: None,
             cache_key: PromptCacheKey::ephemeral(),
         }
+    }
+
+    #[test]
+    fn custom_source_header_suppresses_default_source_header() {
+        assert!(has_custom_source_header(&[(
+            "source".to_string(),
+            "custom-poc".to_string(),
+        )]));
+        assert!(has_custom_source_header(&[(
+            "Source".to_string(),
+            "custom-poc".to_string(),
+        )]));
+        assert!(!has_custom_source_header(&[(
+            "x-source".to_string(),
+            "custom-poc".to_string(),
+        )]));
     }
 
     #[test]

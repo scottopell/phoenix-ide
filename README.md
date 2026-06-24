@@ -223,7 +223,7 @@ LLM_AUTH_HEADER=bearer
 ANTHROPIC_BASE_URL=https://ai-gateway.us1.staging.dog/v1/messages
 LLM_CUSTOM_HEADERS=source: openweight-restricted-poc-<firstname>-<lastname>\norg-id: 2\nx-target-account: eval
 DEFAULT_MODEL=baseten/moonshotai/Kimi-K2.6
-PHOENIX_LLM_MODELS='[{"id":"baseten/moonshotai/Kimi-K2.6","provider":"anthropic","api_format":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]'
+PHOENIX_LLM_MODELS=[{"id":"baseten/moonshotai/Kimi-K2.6","provider":"anthropic","api_format":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]
 ```
 
 ### TLS

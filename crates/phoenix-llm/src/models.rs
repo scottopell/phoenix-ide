@@ -48,6 +48,7 @@ impl Provider {
 #[serde(rename_all = "snake_case")]
 enum ExternalProvider {
     Anthropic,
+    #[serde(rename = "openai")]
     OpenAI,
 }
 
@@ -73,6 +74,7 @@ pub enum ApiFormat {
 #[serde(rename_all = "snake_case")]
 enum ExternalApiFormat {
     Anthropic,
+    #[serde(rename = "openai_responses")]
     OpenAIResponses,
 }
 
@@ -348,6 +350,17 @@ mod tests {
         assert_eq!(model.api_format, ApiFormat::Anthropic);
         assert_eq!(model.context_window, 262_000);
         assert!(!model.supports_tool_search);
+    }
+
+    #[test]
+    fn parses_documented_openai_external_names() {
+        let models = parse_external_models(
+            r#"[{"id":"openai-compatible/model","provider":"openai","api_format":"openai_responses","description":"OpenAI-compatible POC","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("documented OpenAI config values should parse");
+
+        assert_eq!(models[0].provider, Provider::OpenAI);
+        assert_eq!(models[0].api_format, ApiFormat::OpenAIResponses);
     }
 
     #[test]

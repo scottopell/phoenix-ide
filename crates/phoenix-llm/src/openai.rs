@@ -35,6 +35,25 @@ fn resolve_endpoint(gateway: Option<&str>, base_url_override: Option<&str>) -> S
 // Responses API
 // ---------------------------------------------------------------------------
 
+fn has_custom_source_header(custom_headers: &[(String, String)]) -> bool {
+    custom_headers
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case("source"))
+}
+
+fn apply_source_header(
+    mut builder: reqwest::RequestBuilder,
+    custom_headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    if !has_custom_source_header(custom_headers) {
+        builder = builder.header("source", LLM_SOURCE_HEADER);
+    }
+    for (k, v) in custom_headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    builder
+}
+
 /// Complete using the `OpenAI` Responses API.
 #[allow(clippy::too_many_arguments)]
 pub async fn complete(
@@ -78,11 +97,8 @@ pub async fn complete(
     let mut builder = client
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .header("source", LLM_SOURCE_HEADER);
-    for (k, v) in custom_headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
+        .header("Content-Type", "application/json");
+    builder = apply_source_header(builder, custom_headers);
     let response = builder.json(&responses_request).send().await.map_err(|e| {
         if e.is_timeout() {
             LlmError::network(format!("Request timeout: {e}"))
@@ -478,11 +494,8 @@ pub async fn complete_streaming(
     let mut builder = client
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .header("source", LLM_SOURCE_HEADER);
-    for (k, v) in custom_headers {
-        builder = builder.header(k.as_str(), v.as_str());
-    }
+        .header("Content-Type", "application/json");
+    builder = apply_source_header(builder, custom_headers);
     let response = builder.json(&responses_request).send().await.map_err(|e| {
         if e.is_timeout() {
             LlmError::network(format!("Request timeout: {e}"))
@@ -1132,6 +1145,22 @@ mod tests {
             max_tokens: None,
             cache_key: PromptCacheKey::stable("test"),
         }
+    }
+
+    #[test]
+    fn custom_source_header_suppresses_default_source_header() {
+        assert!(has_custom_source_header(&[(
+            "source".to_string(),
+            "custom-poc".to_string(),
+        )]));
+        assert!(has_custom_source_header(&[(
+            "Source".to_string(),
+            "custom-poc".to_string(),
+        )]));
+        assert!(!has_custom_source_header(&[(
+            "x-source".to_string(),
+            "custom-poc".to_string(),
+        )]));
     }
 
     /// A tool result carrying an image (e.g. `read_image`) serialises its
