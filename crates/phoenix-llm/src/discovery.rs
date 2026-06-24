@@ -3,6 +3,7 @@
 //! Queries `/v1/models` endpoints derived from configured base URLs to validate
 //! which configured models are available.
 
+use crate::ModelBackend;
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -29,11 +30,37 @@ struct ModelData {
     id: String,
 }
 
+#[derive(Debug, Default)]
+pub struct DiscoveredModels {
+    pub anthropic: HashSet<String>,
+    pub openai_responses: HashSet<String>,
+}
+
+impl DiscoveredModels {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.anthropic.is_empty() && self.openai_responses.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.anthropic.len() + self.openai_responses.len()
+    }
+
+    #[must_use]
+    pub fn ids_for_backend(&self, backend: ModelBackend) -> &HashSet<String> {
+        match backend {
+            ModelBackend::OpenAIResponses => &self.openai_responses,
+            ModelBackend::Anthropic | ModelBackend::Mock => &self.anthropic,
+        }
+    }
+}
+
 /// Discover available model IDs from configured model-listing endpoints.
 ///
-/// Returns a set of model IDs that the endpoints report as available.
-pub async fn discover_models(config: &DiscoveryConfig) -> HashSet<String> {
-    let mut models = HashSet::new();
+/// Returns backend-scoped model IDs that the endpoints report as available.
+pub async fn discover_models(config: &DiscoveryConfig) -> DiscoveredModels {
+    let mut models = DiscoveredModels::default();
 
     if let Some(ref url) = config.anthropic_models_url {
         match discover_provider(
@@ -45,7 +72,7 @@ pub async fn discover_models(config: &DiscoveryConfig) -> HashSet<String> {
         )
         .await
         {
-            Ok(m) => models.extend(m),
+            Ok(m) => models.anthropic.extend(m),
             Err(e) => tracing::warn!(provider = "anthropic", error = %e, "Discovery failed"),
         }
     }
@@ -60,7 +87,7 @@ pub async fn discover_models(config: &DiscoveryConfig) -> HashSet<String> {
         )
         .await
         {
-            Ok(m) => models.extend(m),
+            Ok(m) => models.openai_responses.extend(m),
             Err(e) => tracing::warn!(provider = "openai", error = %e, "Discovery failed"),
         }
     }

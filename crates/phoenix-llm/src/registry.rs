@@ -2,11 +2,11 @@
 
 use super::{
     all_models, codex_credential, discover_models, merge_model_specs, parse_external_models,
-    CodexCredential, DiscoveryConfig, LlmService, LlmServiceImpl, LoggingService, ModelBackend,
-    ModelInfo, ModelSource,
+    CodexCredential, DiscoveredModels, DiscoveryConfig, LlmService, LlmServiceImpl, LoggingService,
+    ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -590,14 +590,15 @@ impl ModelRegistry {
 
     fn spec_matches_discovered_model(
         spec: &super::ModelSpec,
-        discovered: &HashSet<String>,
+        discovered: &DiscoveredModels,
     ) -> bool {
+        let ids = discovered.ids_for_backend(spec.backend);
         let prefixed_id = format!("{}/{}", spec.backend.header_value(), spec.id);
         let prefixed_api = format!("{}/{}", spec.backend.header_value(), spec.api_name);
-        discovered.contains(&spec.id)
-            || discovered.contains(&spec.api_name)
-            || discovered.contains(&prefixed_id)
-            || discovered.contains(&prefixed_api)
+        ids.contains(&spec.id)
+            || ids.contains(&spec.api_name)
+            || ids.contains(&prefixed_id)
+            || ids.contains(&prefixed_api)
     }
 
     /// Build a `DiscoveryConfig` from credential-helper auth and base URL overrides.
@@ -788,11 +789,23 @@ impl ModelRegistry {
     /// # Panics
     /// Panics if the internal specs lock is poisoned.
     pub fn provider_display_name(&self, model_id: &str) -> String {
-        let specs = self.specs.read().expect("specs lock poisoned");
-        specs.get(model_id).map_or_else(
-            || "Unknown".to_string(),
-            |spec| spec.backend.display_name().to_string(),
-        )
+        if let Some(spec) = self
+            .specs
+            .read()
+            .expect("specs lock poisoned")
+            .get(model_id)
+            .cloned()
+        {
+            return spec.backend.display_name().to_string();
+        }
+
+        Self::model_specs(&self.config)
+            .into_iter()
+            .find(|spec| spec.id == model_id)
+            .map_or_else(
+                || "Unknown".to_string(),
+                |spec| spec.backend.display_name().to_string(),
+            )
     }
 
     /// Check if any models are available
@@ -1088,6 +1101,7 @@ pub struct CodexReloadOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn test_no_api_keys_no_models() {
@@ -1205,9 +1219,12 @@ mod tests {
     }
 
     #[test]
-    fn discovery_matcher_allows_configured_model_id_and_provider_prefix() {
+    fn discovery_matcher_allows_configured_model_id_and_backend_prefix() {
         let model = external_baseten_model();
-        let discovered = HashSet::from(["anthropic/baseten/moonshotai/Kimi-K2.6".to_string()]);
+        let discovered = DiscoveredModels {
+            anthropic: HashSet::from(["anthropic/baseten/moonshotai/Kimi-K2.6".to_string()]),
+            openai_responses: HashSet::new(),
+        };
 
         assert!(ModelRegistry::spec_matches_discovered_model(
             &model,
@@ -1216,13 +1233,25 @@ mod tests {
     }
 
     #[test]
-    fn provider_display_name_uses_external_model_metadata() {
-        let config = LlmConfig {
-            anthropic_api_key: Some("test-key".to_string()),
+    fn discovery_matcher_does_not_cross_backend_boundaries() {
+        let model = external_baseten_model();
+        let discovered = DiscoveredModels {
+            anthropic: HashSet::new(),
+            openai_responses: HashSet::from(["baseten/moonshotai/Kimi-K2.6".to_string()]),
+        };
+
+        assert!(!ModelRegistry::spec_matches_discovered_model(
+            &model,
+            &discovered
+        ));
+    }
+
+    #[test]
+    fn provider_display_name_uses_external_model_metadata_even_when_unregistered() {
+        let registry = ModelRegistry::new(&LlmConfig {
             external_models: vec![external_baseten_model()],
             ..Default::default()
-        };
-        let registry = ModelRegistry::new(&config);
+        });
 
         assert_eq!(
             registry.provider_display_name("baseten/moonshotai/Kimi-K2.6"),
