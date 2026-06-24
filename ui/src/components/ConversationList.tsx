@@ -113,11 +113,16 @@ function compactContextLabel(conv: Conversation): string | null {
 }
 
 function stateLabel(conv: Conversation, displayState: ReturnType<typeof getConvDisplayState>): string {
+  if (conv.state?.type === 'context_exhausted' && conv.presentation_mode === 'needs_action') return 'Context full';
   if (conv.presentation_mode === 'needs_action' || displayState === 'awaiting-approval') return 'Needs approval';
   if (displayState === 'working') return 'Working';
   if (displayState === 'error') return 'Error';
   if (displayState === 'terminal') return 'Completed';
   return 'Ready';
+}
+
+function isActionableDisplayState(displayState: ReturnType<typeof getConvDisplayState>): boolean {
+  return displayState === 'working' || displayState === 'error' || displayState === 'awaiting-approval';
 }
 
 export const SidebarPrBadge = PrBadge;
@@ -193,9 +198,18 @@ export const ConversationRow = memo(function ConversationRow({
             <span className={`conv-state-chip ${displayState}`}>{visibleStateLabel}</span>
           )}
           {chainIndex !== undefined ? (
-            <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
-              #{chainIndex + 1}
-            </span>
+            isCompactCompletedChainMember && isMobileList ? (
+              <>
+                <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
+                  #{chainIndex + 1}
+                </span>
+                <span className="conv-item-title">{conv.slug}</span>
+              </>
+            ) : (
+              <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
+                #{chainIndex + 1}
+              </span>
+            )
           ) : (
             <span className="conv-item-title">{conv.slug}</span>
           )}
@@ -467,6 +481,9 @@ export const ChainBlock = memo(function ChainBlock({
           title={latestMember.slug ? `Open latest conversation "${latestMember.slug}"` : 'Open latest conversation'}
         >
           <span className={`conv-state-dot ${latestDisplayState}`} title={stateLabel(latestMember, latestDisplayState)} />
+          {isActionableDisplayState(latestDisplayState) && (
+            <span className={`conv-state-chip ${latestDisplayState}`}>{stateLabel(latestMember, latestDisplayState)}</span>
+          )}
           <span className="conv-chain-summary-main">
             <span className="conv-chain-summary-title">Latest #{latestIndex + 1}</span>
             {latestMember.conv_mode_label && <span className="conv-mode-badge">{latestMember.conv_mode_label}</span>}
@@ -638,7 +655,9 @@ export function ConversationList({
 
       const latestMember = item.members.find(m => m.id === item.latestMemberId);
       const isCompleted = getConvDisplayState(latestMember) === 'terminal';
-      const collapsed = isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
+      const collapsed = effectiveListDensity === 'mobile'
+        ? false
+        : isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
       if (collapsed) {
         setCollapsedChains((prev) => {
           const next = new Set(prev);
@@ -655,7 +674,7 @@ export function ConversationList({
       lastRevealedActiveSlugRef.current = activeSlug;
       return;
     }
-  }, [activeSlug, groupedItems, collapsedChains]);
+  }, [activeSlug, groupedItems, collapsedChains, effectiveListDensity]);
 
   const closeRowMenu = useCallback(() => setExpandedId(null), []);
   const closeChainMenu = useCallback(() => setExpandedChainId(null), []);

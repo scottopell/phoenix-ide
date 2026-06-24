@@ -430,6 +430,12 @@ body {
 }
 
 
+.view-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .conversation-list-header {
   align-items: flex-start;
   gap: 10px;
@@ -8263,9 +8269,13 @@ html * {
 }
 
 .mobile-list-density .conv-item-chain-completed:not(.active) .conv-chain-latest-badge,
-.mobile-list-density .conv-item-chain-completed:not(.active) .conv-mode-badge,
-.mobile-list-density .conv-item-chain-completed:not(.active) .conv-item-meta {
+.mobile-list-density .conv-item-chain-completed:not(.active) .conv-mode-badge {
   display: none;
+}
+
+.mobile-list-density .conv-item-chain-completed:not(.active) .conv-item-meta.secondary {
+  display: flex;
+  margin-top: 4px;
 }
 
 /* Full-page (non-sidebar) chain block sizing — match surrounding list density. */

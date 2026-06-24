@@ -910,6 +910,76 @@ describe('Mobile conversation list redesign', () => {
 
     fireEvent.click(container.querySelector('.conv-chain-caret')!);
     expect(container.querySelector('[data-id="done-root"]')).toHaveClass('conv-item-chain-completed');
+    expect(container.querySelector('[data-id="done-root"] .conv-item-title')?.textContent).toBe('done-root');
+    expect(container.querySelector('[data-id="done-root"] .conv-project-label')?.textContent).toBe('project');
+  });
+
+  it('keeps the active mobile chain expanded even for completed chains', async () => {
+    const root = makeConv('active-root', 'active-root', {
+      continued_in_conv_id: 'active-leaf',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const leaf = makeConv('active-leaf', 'active-leaf', {
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-02-01T00:00:00Z',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          listDensity="mobile"
+          conversations={[leaf, root]}
+          activeSlug="active-leaf"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.conv-chain-block')).toHaveClass('expanded');
+    expect(container.querySelector('[data-id="active-leaf"]')).toHaveClass('active');
+    expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(2);
+  });
+
+  it('shows actionable state labels in collapsed mobile chain summaries', () => {
+    const root = makeConv('needs-root', 'needs-root', {
+      continued_in_conv_id: 'needs-leaf',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const leaf = makeConv('needs-leaf', 'needs-leaf', {
+      presentation_mode: 'needs_action',
+      state: { type: 'awaiting_task_approval', title: 'Approve', priority: 'p2', plan: 'Plan' },
+      updated_at: '2024-02-01T00:00:00Z',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[leaf, root]} />
+      </MemoryRouter>,
+    );
+
+    const summary = container.querySelector('.conv-chain-latest-summary') as HTMLButtonElement;
+    expect(summary).not.toBeNull();
+    expect(summary.querySelector('.conv-state-chip')?.textContent).toBe('Needs approval');
+  });
+
+  it('labels context-full mobile rows distinctly from task approvals', () => {
+    const conv = makeConv('context-full', 'context-full', {
+      presentation_mode: 'needs_action',
+      state: { type: 'context_exhausted' },
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[conv]} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-id="context-full"] .conv-state-chip')?.textContent).toBe('Context full');
   });
 });
 
