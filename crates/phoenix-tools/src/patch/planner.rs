@@ -4,7 +4,7 @@
 //! operating on string content without any IO. This makes it ideal
 //! for property-based testing.
 
-use super::matching::find_unique_match;
+use super::matching::{find_all_exact, find_unique_match};
 use super::types::{Edit, Operation, PatchEffect, PatchError, PatchPlan, PatchRequest, Reindent};
 use similar::TextDiff;
 use std::collections::HashMap;
@@ -67,7 +67,10 @@ impl PatchPlanner {
             content.to_string()
         } else {
             for patch in patches {
-                if matches!(patch.operation, Operation::Replace) {
+                if matches!(
+                    patch.operation,
+                    Operation::Replace | Operation::InsertBefore | Operation::InsertAfter
+                ) {
                     return Err(PatchError::ReplaceOnNonexistent);
                 }
             }
@@ -125,32 +128,68 @@ impl PatchPlanner {
                 new_text = apply_reindent(&new_text, reindent)?;
             }
 
-            // Store to clipboard if requested (ignore empty string names)
-            if let Some(name) = &patch.to_clipboard {
-                if !name.is_empty() {
-                    if let Some(old_text) = &patch.old_text {
-                        self.clipboards.insert(name.clone(), old_text.clone());
+            // Store to clipboard if requested (ignore empty string names).
+            // replace_all has no single matched text, so it never writes a clipboard.
+            let replace_all = matches!(patch.operation, Operation::Replace) && patch.replace_all;
+            if !replace_all {
+                if let Some(name) = &patch.to_clipboard {
+                    if !name.is_empty() {
+                        if let Some(old_text) = &patch.old_text {
+                            self.clipboards.insert(name.clone(), old_text.clone());
+                        }
                     }
                 }
             }
 
-            // Determine edit based on operation
-            let edit = match patch.operation {
-                Operation::PrependBof => Edit {
+            // Determine edit(s) based on operation
+            match patch.operation {
+                Operation::PrependBof => edits.push(Edit {
                     offset: 0,
                     length: 0,
                     replacement: new_text,
-                },
-                Operation::AppendEof => Edit {
+                }),
+                Operation::AppendEof => edits.push(Edit {
                     offset: original.len(),
                     length: 0,
                     replacement: new_text,
-                },
-                Operation::Overwrite => Edit {
+                }),
+                Operation::Overwrite => edits.push(Edit {
                     offset: 0,
                     length: original.len(),
                     replacement: new_text,
-                },
+                }),
+                Operation::InsertBefore => {
+                    let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
+                    let spec = find_unique_match(original, old_text)?;
+                    edits.push(Edit {
+                        offset: spec.offset,
+                        length: 0,
+                        replacement: new_text,
+                    });
+                }
+                Operation::InsertAfter => {
+                    let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
+                    let spec = find_unique_match(original, old_text)?;
+                    edits.push(Edit {
+                        offset: spec.offset + spec.length,
+                        length: 0,
+                        replacement: new_text,
+                    });
+                }
+                Operation::Replace if patch.replace_all => {
+                    let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
+                    let specs = find_all_exact(original, old_text);
+                    if specs.is_empty() {
+                        return Err(PatchError::OldTextNotFound);
+                    }
+                    for spec in specs {
+                        edits.push(Edit {
+                            offset: spec.offset,
+                            length: spec.length,
+                            replacement: new_text.clone(),
+                        });
+                    }
+                }
                 Operation::Replace => {
                     let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
 
@@ -167,15 +206,13 @@ impl PatchPlanner {
                         }
                     }
 
-                    Edit {
+                    edits.push(Edit {
                         offset: spec.offset,
                         length: spec.length,
                         replacement: new_text,
-                    }
+                    });
                 }
-            };
-
-            edits.push(edit);
+            }
         }
 
         Ok(edits)
@@ -183,15 +220,30 @@ impl PatchPlanner {
 
     /// Apply edits to content (in reverse order to maintain offsets)
     fn apply_edits(original: &str, mut edits: Vec<Edit>) -> Result<String, PatchError> {
+        let original_len = original.len();
         let mut result = original.to_string();
 
-        // Sort by offset descending so we can apply without adjusting offsets
-        edits.sort_by_key(|b| std::cmp::Reverse(b.offset));
+        // Sort by offset descending so we can apply without adjusting offsets.
+        // Ties break by length descending so a replace at offset O applies before
+        // a zero-length insert at O (the insert then lands before the replacement).
+        edits.sort_by_key(|b| (std::cmp::Reverse(b.offset), std::cmp::Reverse(b.length)));
 
+        // Bounds and overlap are validated against the ORIGINAL content, since
+        // every edit's offset was computed there. Walking high-to-low, each edit
+        // must end at or before the previously applied (higher) edit's start; a
+        // shared endpoint (zero-length insert at a boundary) is allowed, any true
+        // overlap is rejected before writing.
+        let mut prev_start: Option<usize> = None;
         for edit in &edits {
-            if edit.offset + edit.length > result.len() {
+            if edit.offset + edit.length > original_len {
                 return Err(PatchError::EditOutOfBounds);
             }
+            if let Some(prev_start) = prev_start {
+                if edit.offset + edit.length > prev_start {
+                    return Err(PatchError::OverlappingEdits);
+                }
+            }
+            prev_start = Some(edit.offset);
             result.replace_range(edit.offset..edit.offset + edit.length, &edit.replacement);
         }
 
@@ -298,6 +350,7 @@ mod tests {
                 None,
                 &[PatchRequest {
                     operation: Operation::Overwrite,
+                    replace_all: false,
                     old_text: None,
                     new_text: Some("hello world".to_string()),
                     to_clipboard: None,
@@ -326,6 +379,7 @@ mod tests {
                 Some("hello world"),
                 &[PatchRequest {
                     operation: Operation::Replace,
+                    replace_all: false,
                     old_text: Some("world".to_string()),
                     new_text: Some("rust".to_string()),
                     to_clipboard: None,
@@ -347,6 +401,7 @@ mod tests {
                 None,
                 &[PatchRequest {
                     operation: Operation::Replace,
+                    replace_all: false,
                     old_text: Some("foo".to_string()),
                     new_text: Some("bar".to_string()),
                     to_clipboard: None,
@@ -370,6 +425,7 @@ mod tests {
                 Some("hello world"),
                 &[PatchRequest {
                     operation: Operation::Replace,
+                    replace_all: false,
                     old_text: Some("world".to_string()),
                     new_text: Some(String::new()),
                     to_clipboard: Some("clip1".to_string()),
@@ -392,6 +448,7 @@ mod tests {
                 Some("hello "),
                 &[PatchRequest {
                     operation: Operation::AppendEof,
+                    replace_all: false,
                     old_text: None,
                     new_text: None,
                     to_clipboard: None,
@@ -413,6 +470,7 @@ mod tests {
                 Some("hello"),
                 &[PatchRequest {
                     operation: Operation::AppendEof,
+                    replace_all: false,
                     old_text: None,
                     new_text: Some(" world".to_string()),
                     to_clipboard: None,
@@ -434,6 +492,7 @@ mod tests {
                 Some("world"),
                 &[PatchRequest {
                     operation: Operation::PrependBof,
+                    replace_all: false,
                     old_text: None,
                     new_text: Some("hello ".to_string()),
                     to_clipboard: None,
@@ -455,6 +514,7 @@ mod tests {
                 Some("MARKER"),
                 &[PatchRequest {
                     operation: Operation::Replace,
+                    replace_all: false,
                     old_text: Some("MARKER".to_string()),
                     new_text: Some("  line1\n  line2".to_string()),
                     to_clipboard: None,
@@ -480,6 +540,7 @@ mod tests {
                 &[
                     PatchRequest {
                         operation: Operation::Replace,
+                        replace_all: false,
                         old_text: Some("AAA".to_string()),
                         new_text: Some("111".to_string()),
                         to_clipboard: None,
@@ -488,6 +549,7 @@ mod tests {
                     },
                     PatchRequest {
                         operation: Operation::Replace,
+                        replace_all: false,
                         old_text: Some("CCC".to_string()),
                         new_text: Some("333".to_string()),
                         to_clipboard: None,
@@ -502,6 +564,207 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_on_nonexistent_fails() {
+        let mut planner = PatchPlanner::new();
+        let err = planner
+            .plan(
+                &path("test.txt"),
+                None,
+                &[PatchRequest {
+                    operation: Operation::InsertAfter,
+                    old_text: Some("anchor".to_string()),
+                    new_text: Some("X".to_string()),
+                    replace_all: false,
+                    to_clipboard: None,
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap_err();
+
+        assert_eq!(err, PatchError::ReplaceOnNonexistent);
+    }
+
+    #[test]
+    fn test_insert_before_preserves_anchor() {
+        let mut planner = PatchPlanner::new();
+        let plan = planner
+            .plan(
+                &path("test.txt"),
+                Some("line1\nanchor\nline3"),
+                &[PatchRequest {
+                    operation: Operation::InsertBefore,
+                    old_text: Some("anchor".to_string()),
+                    new_text: Some("inserted\n".to_string()),
+                    replace_all: false,
+                    to_clipboard: None,
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(plan.resulting_content, "line1\ninserted\nanchor\nline3");
+    }
+
+    #[test]
+    fn test_insert_after_preserves_anchor() {
+        let mut planner = PatchPlanner::new();
+        let plan = planner
+            .plan(
+                &path("test.txt"),
+                Some("line1\nanchor\nline3"),
+                &[PatchRequest {
+                    operation: Operation::InsertAfter,
+                    old_text: Some("anchor".to_string()),
+                    new_text: Some("\ninserted".to_string()),
+                    replace_all: false,
+                    to_clipboard: None,
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(plan.resulting_content, "line1\nanchor\ninserted\nline3");
+    }
+
+    #[test]
+    fn test_insert_before_duplicate_anchor_is_rejected() {
+        let mut planner = PatchPlanner::new();
+        let err = planner
+            .plan(
+                &path("test.txt"),
+                Some("dup\nother\ndup"),
+                &[PatchRequest {
+                    operation: Operation::InsertBefore,
+                    old_text: Some("dup".to_string()),
+                    new_text: Some("X".to_string()),
+                    replace_all: false,
+                    to_clipboard: None,
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, PatchError::OldTextNotUnique(_)));
+    }
+
+    #[test]
+    fn test_replace_all_substitutes_every_occurrence() {
+        let mut planner = PatchPlanner::new();
+        let plan = planner
+            .plan(
+                &path("test.txt"),
+                Some("foo bar foo baz foo"),
+                &[PatchRequest {
+                    operation: Operation::Replace,
+                    old_text: Some("foo".to_string()),
+                    new_text: Some("X".to_string()),
+                    replace_all: true,
+                    to_clipboard: None,
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(plan.resulting_content, "X bar X baz X");
+    }
+
+    #[test]
+    fn test_replace_all_with_no_occurrence_errors() {
+        let mut planner = PatchPlanner::new();
+        let err = planner
+            .plan(
+                &path("test.txt"),
+                Some("nothing here"),
+                &[PatchRequest {
+                    operation: Operation::Replace,
+                    old_text: Some("absent".to_string()),
+                    new_text: Some("X".to_string()),
+                    replace_all: true,
+                    to_clipboard: None,
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap_err();
+
+        assert_eq!(err, PatchError::OldTextNotFound);
+    }
+
+    #[test]
+    fn test_overlapping_edits_are_rejected() {
+        // Two replaces whose matched ranges overlap ("abcd" and "cdef" share "cd").
+        let mut planner = PatchPlanner::new();
+        let err = planner
+            .plan(
+                &path("test.txt"),
+                Some("abcdef"),
+                &[
+                    PatchRequest {
+                        operation: Operation::Replace,
+                        old_text: Some("abcd".to_string()),
+                        new_text: Some("1".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                    PatchRequest {
+                        operation: Operation::Replace,
+                        old_text: Some("cdef".to_string()),
+                        new_text: Some("2".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                ],
+            )
+            .unwrap_err();
+
+        assert_eq!(err, PatchError::OverlappingEdits);
+    }
+
+    #[test]
+    fn test_insert_at_replace_boundary_does_not_overlap() {
+        // insert_before's anchor abuts the replaced region; sharing only the
+        // boundary byte is allowed.
+        let mut planner = PatchPlanner::new();
+        let plan = planner
+            .plan(
+                &path("test.txt"),
+                Some("AAABBB"),
+                &[
+                    PatchRequest {
+                        operation: Operation::Replace,
+                        old_text: Some("AAA".to_string()),
+                        new_text: Some("X".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                    PatchRequest {
+                        operation: Operation::InsertBefore,
+                        old_text: Some("BBB".to_string()),
+                        new_text: Some("Y".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(plan.resulting_content, "XYBBB");
+    }
+
+    #[test]
     fn test_empty_clipboard_name_treated_as_none() {
         // LLMs sometimes pass "" instead of omitting fromClipboard
         let mut planner = PatchPlanner::new();
@@ -511,6 +774,7 @@ mod tests {
                 Some("hello"),
                 &[PatchRequest {
                     operation: Operation::Replace,
+                    replace_all: false,
                     old_text: Some("hello".to_string()),
                     new_text: Some("world".to_string()),
                     to_clipboard: Some(String::new()), // empty string

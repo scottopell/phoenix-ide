@@ -150,7 +150,7 @@ proptest! {
             None,
             &[PatchRequest {
                 operation: Operation::Overwrite,
-                old_text: None,
+                replace_all: false,                old_text: None,
                 new_text: Some(content.clone()),
                 to_clipboard: None,
                 from_clipboard: None,
@@ -168,7 +168,7 @@ proptest! {
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::Replace,
-                old_text: Some(content.clone()),
+                replace_all: false,                old_text: Some(content.clone()),
                 new_text: Some(replacement.clone()),
                 to_clipboard: None,
                 from_clipboard: None,
@@ -212,7 +212,7 @@ proptest! {
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::Replace,
-                old_text: Some(middle.clone()),
+                replace_all: false,                old_text: Some(middle.clone()),
                 new_text: Some("".to_string()),
                 to_clipboard: Some("cut".to_string()),
                 from_clipboard: None,
@@ -237,7 +237,7 @@ proptest! {
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::Replace,
-                old_text: Some(junction.clone()),
+                replace_all: false,                old_text: Some(junction.clone()),
                 new_text: None,
                 to_clipboard: None,
                 from_clipboard: Some("cut".to_string()),
@@ -280,7 +280,7 @@ proptest! {
             Some(marker),
             &[PatchRequest {
                 operation: Operation::Replace,
-                old_text: Some(marker.to_string()),
+                replace_all: false,                old_text: Some(marker.to_string()),
                 new_text: Some(indented.clone()),
                 to_clipboard: None,
                 from_clipboard: None,
@@ -333,7 +333,7 @@ proptest! {
             &[
                 PatchRequest {
                     operation: Operation::Replace,
-                    old_text: Some(part1.clone()),
+                    replace_all: false,                    old_text: Some(part1.clone()),
                     new_text: Some(repl1.clone()),
                     to_clipboard: None,
                     from_clipboard: None,
@@ -341,7 +341,7 @@ proptest! {
                 },
                 PatchRequest {
                     operation: Operation::Replace,
-                    old_text: Some(part3.clone()),
+                    replace_all: false,                    old_text: Some(part3.clone()),
                     new_text: Some(repl3.clone()),
                     to_clipboard: None,
                     from_clipboard: None,
@@ -378,7 +378,7 @@ proptest! {
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::AppendEof,
-                old_text: None,
+                replace_all: false,                old_text: None,
                 new_text: Some(suffix.clone()),
                 to_clipboard: None,
                 from_clipboard: None,
@@ -394,7 +394,7 @@ proptest! {
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::PrependBof,
-                old_text: None,
+                replace_all: false,                old_text: None,
                 new_text: Some(prefix.clone()),
                 to_clipboard: None,
                 from_clipboard: None,
@@ -433,7 +433,7 @@ proptest! {
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::Overwrite,
-                old_text: None,
+                replace_all: false,                old_text: None,
                 new_text: Some(new_content.clone()),
                 to_clipboard: None,
                 from_clipboard: None,
@@ -450,7 +450,7 @@ proptest! {
             fs.get(&path).map(|s| s.as_str()),
             &[PatchRequest {
                 operation: Operation::Overwrite,
-                old_text: None,
+                replace_all: false,                old_text: None,
                 new_text: Some(new_content.clone()),
                 to_clipboard: None,
                 from_clipboard: None,
@@ -477,6 +477,7 @@ fn test_replace_on_nonexistent_fails() {
         None,
         &[PatchRequest {
             operation: Operation::Replace,
+            replace_all: false,
             old_text: Some("foo".to_string()),
             new_text: Some("bar".to_string()),
             to_clipboard: None,
@@ -495,6 +496,7 @@ fn test_replace_not_found() {
         Some("hello world"),
         &[PatchRequest {
             operation: Operation::Replace,
+            replace_all: false,
             old_text: Some("foo".to_string()),
             new_text: Some("bar".to_string()),
             to_clipboard: None,
@@ -513,6 +515,7 @@ fn test_replace_not_unique() {
         Some("hello hello"),
         &[PatchRequest {
             operation: Operation::Replace,
+            replace_all: false,
             old_text: Some("hello".to_string()),
             new_text: Some("world".to_string()),
             to_clipboard: None,
@@ -533,6 +536,7 @@ fn test_replace_not_unique() {
             | PatchError::ClipboardNotFound(_)
             | PatchError::OldTextNotFound
             | PatchError::EditOutOfBounds
+            | PatchError::OverlappingEdits
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches),
         ) => panic!("expected duplicate diagnostic, got {other:?}"),
@@ -548,6 +552,7 @@ fn test_clipboard_not_found() {
         Some("hello"),
         &[PatchRequest {
             operation: Operation::AppendEof,
+            replace_all: false,
             old_text: None,
             new_text: None,
             to_clipboard: None,
@@ -595,6 +600,7 @@ fn test_overwrite_then_replace_with_filesystem() {
             current_content.as_deref(),
             &[PatchRequest {
                 operation: Operation::Overwrite,
+                replace_all: false,
                 old_text: None,
                 new_text: Some("Hello World".to_string()),
                 to_clipboard: None,
@@ -622,6 +628,7 @@ fn test_overwrite_then_replace_with_filesystem() {
             current_content.as_deref(),
             &[PatchRequest {
                 operation: Operation::Replace,
+                replace_all: false,
                 old_text: Some("Hello World".to_string()),
                 new_text: Some("Hello Phoenix IDE".to_string()),
                 to_clipboard: None,

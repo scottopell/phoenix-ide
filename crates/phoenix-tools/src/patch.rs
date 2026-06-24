@@ -31,10 +31,41 @@ use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use executor::{execute_effects, read_file_content};
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 const MAX_INPUT_SIZE: usize = 60 * 1024; // 60KB limit
+
+/// Upper bound on diff lines echoed back to the agent. Large diffs are
+/// truncated with an explicit omitted-line count so the preview is never
+/// mistaken for the whole change.
+const MAX_DIFF_LINES: usize = 100;
+
+/// Bound the applied diff for the LLM-visible response. Returns a string ending
+/// in a newline so the closing `</diff>` tag sits on its own line.
+fn bounded_diff(diff: &str) -> String {
+    let total = diff.lines().count();
+    if total <= MAX_DIFF_LINES {
+        return if diff.is_empty() || diff.ends_with('\n') {
+            diff.to_string()
+        } else {
+            format!("{diff}\n")
+        };
+    }
+
+    let omitted = total - MAX_DIFF_LINES;
+    let mut out = String::new();
+    for line in diff.lines().take(MAX_DIFF_LINES) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let _ = writeln!(
+        out,
+        "... diff truncated, {omitted} more line(s) omitted; read the file to see full context."
+    );
+    out
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PatchScope {
@@ -165,9 +196,15 @@ impl Tool for PatchTool {
 
 Operations:
 - replace: Substitute unique text with new content
+- insert_before: Insert newText immediately before a unique oldText anchor, leaving the anchor unchanged
+- insert_after: Insert newText immediately after a unique oldText anchor, leaving the anchor unchanged
 - append_eof: Append new text at the end of the file
 - prepend_bof: Insert new text at the beginning of the file
 - overwrite: Replace the entire file with new content (automatically creates the file)
+
+To add code next to existing code (e.g. a new test beside its siblings), prefer insert_before/insert_after with a unique anchor over append_eof — append_eof drops content at the very end of the file, where it is often syntactically wrong.
+
+replaceAll (replace only): substitute every exact occurrence of oldText instead of requiring a unique match. Use for mechanical refactors of repeated identical blocks. Exact matches only (no fuzzy recovery).
 
 Clipboard:
 - toClipboard: Store oldText to a named clipboard before the operation
@@ -189,8 +226,9 @@ Recipes:
 
 Usage notes:
 - All inputs are interpreted literally (no automatic newline or whitespace handling)
-- For replace operations, oldText must appear EXACTLY ONCE in the file
-- All patches in a single call resolve against the original file content simultaneously, not sequentially. Repeating the same oldText across patches cannot disambiguate sites. For sequential edits where each step sees the prior result, use separate patch tool calls.
+- For replace, insert_before, and insert_after, oldText must appear EXACTLY ONCE in the file (unless replaceAll is set)
+- All patches in a single call resolve against the original file content simultaneously, not sequentially. Repeating the same oldText across patches cannot disambiguate sites, and two patches whose ranges overlap are rejected. For sequential edits where each step sees the prior result, use separate patch tool calls.
+- On success the applied unified diff is returned so you can confirm where each edit landed without re-reading the file.
 
 Size limit: each patch call must be less than 60 KB of input.".to_string()
     }
@@ -213,16 +251,20 @@ Size limit: each patch call must be less than 60 KB of input.".to_string()
                         "properties": {
                             "operation": {
                                 "type": "string",
-                                "enum": ["replace", "append_eof", "prepend_bof", "overwrite"],
+                                "enum": ["replace", "insert_before", "insert_after", "append_eof", "prepend_bof", "overwrite"],
                                 "description": "Type of operation to perform"
                             },
                             "oldText": {
                                 "type": "string",
-                                "description": "Text to locate. Required for replace. Must be unique in file; when the same text appears at multiple sites, widen with surrounding context."
+                                "description": "Text to locate. Required for replace, insert_before, insert_after. Must be unique in file (unless replaceAll); when the same text appears at multiple sites, widen with surrounding context."
                             },
                             "newText": {
                                 "type": "string",
-                                "description": "The new text to use (empty for deletions, leave empty if fromClipboard is set)"
+                                "description": "The new text to use, or the text to insert for insert_before/insert_after (empty for deletions, leave empty if fromClipboard is set)"
+                            },
+                            "replaceAll": {
+                                "type": "boolean",
+                                "description": "Replace only: substitute every exact occurrence of oldText instead of requiring a unique match. Exact matches only (no fuzzy recovery)."
                             },
                             "toClipboard": {
                                 "type": "string",
@@ -308,6 +350,8 @@ Size limit: each patch call must be less than 60 KB of input.".to_string()
                 "\n<warning>This file appears to be auto-generated. Edits may be overwritten.</warning>",
             );
         }
+
+        let _ = write!(output, "\n<diff>\n{}</diff>", bounded_diff(&plan.diff));
 
         if let Some(next_step) = self.proposal_next_step(&patch_input.path) {
             output.push_str(&next_step);
@@ -540,7 +584,18 @@ mod tests {
             "expected success, got: {}",
             result.output()
         );
-        assert_eq!(result.output(), "<patches_applied>all</patches_applied>");
+        assert!(
+            result
+                .output()
+                .contains("<patches_applied>all</patches_applied>"),
+            "missing success marker: {}",
+            result.output()
+        );
+        assert!(
+            !result.output().contains("propose_task"),
+            "unrestricted success must not include the proposal reminder: {}",
+            result.output()
+        );
     }
 
     #[tokio::test]
@@ -594,6 +649,53 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&test_file).unwrap(),
             "first block\nTARGET\nafter first\nsecond block\nTARGET\nafter second\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_output_includes_applied_diff() {
+        let dir = tempdir().unwrap();
+        let tool = PatchTool::default();
+        let ctx = test_context(dir.path().to_path_buf());
+
+        let test_file = dir.path().join("test.txt");
+        fs::write(&test_file, "Hello World").unwrap();
+
+        let result = tool
+            .run(
+                json!({
+                    "path": "test.txt",
+                    "patches": [{
+                        "operation": "replace",
+                        "oldText": "World",
+                        "newText": "Rust"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+
+        assert!(result.is_success(), "Error: {}", result.output());
+        let output = result.output();
+        assert!(output.contains("<diff>"), "missing diff block: {output}");
+        assert!(
+            output.contains("-Hello World"),
+            "missing old line: {output}"
+        );
+        assert!(output.contains("+Hello Rust"), "missing new line: {output}");
+    }
+
+    #[test]
+    fn bounded_diff_truncates_and_reports_omitted() {
+        let mut diff = String::new();
+        for i in 0..150 {
+            let _ = writeln!(diff, "+line {i}");
+        }
+        let bounded = bounded_diff(&diff);
+        assert_eq!(bounded.lines().filter(|l| l.starts_with('+')).count(), 100);
+        assert!(
+            bounded.contains("50 more line(s) omitted"),
+            "missing truncation note: {bounded}"
         );
     }
 

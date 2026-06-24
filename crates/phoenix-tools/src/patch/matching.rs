@@ -15,13 +15,32 @@ enum MatchOutcome {
     Duplicate(DuplicateMatchDiagnostics),
 }
 
+/// Find every non-overlapping exact occurrence of `old_text` in `content`.
+///
+/// Used by `replace` with `replace_all`: the fuzzy cascade is deliberately not
+/// consulted, because "single best candidate" has no meaning across many sites.
+/// An empty `old_text` yields no matches (rather than one per byte boundary).
+#[must_use]
+pub(super) fn find_all_exact(content: &str, old_text: &str) -> Vec<EditSpec> {
+    if old_text.is_empty() {
+        return Vec::new();
+    }
+    content
+        .match_indices(old_text)
+        .map(|(offset, _)| EditSpec {
+            offset,
+            length: old_text.len(),
+        })
+        .collect()
+}
+
 /// Find a unique match for `old_text` in `content`
 ///
 /// Tries in order:
 /// 1. Exact match
 /// 2. Dedent matching (different indentation levels)
 /// 3. Trimmed line matching (first/last line variations)
-/// 4. NFKC-normalised match (handles Unicode lookalike characters)
+/// 4. Unicode confusable-skeleton match (handles lookalike characters)
 pub fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpec, PatchError> {
     let mut duplicate: Option<DuplicateMatchDiagnostics> = None;
 
@@ -414,6 +433,21 @@ mod tests {
     }
 
     #[test]
+    fn test_find_all_exact() {
+        let specs = find_all_exact("foo bar foo baz foo", "foo");
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].offset, 0);
+        assert_eq!(specs[1].offset, 8);
+        assert_eq!(specs[2].offset, 16);
+        assert!(specs.iter().all(|s| s.length == 3));
+    }
+
+    #[test]
+    fn test_find_all_exact_empty_needle_yields_nothing() {
+        assert!(find_all_exact("anything", "").is_empty());
+    }
+
+    #[test]
     fn test_no_match() {
         let content = "hello world";
         let err = find_unique_match(content, "foo").unwrap_err();
@@ -438,6 +472,7 @@ mod tests {
             | PatchError::ClipboardNotFound(_)
             | PatchError::OldTextNotFound
             | PatchError::EditOutOfBounds
+            | PatchError::OverlappingEdits
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => panic!("unexpected error: {other:?}"),
         }
@@ -507,6 +542,7 @@ mod tests {
             | PatchError::ClipboardNotFound(_)
             | PatchError::OldTextNotFound
             | PatchError::EditOutOfBounds
+            | PatchError::OverlappingEdits
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => {
                 panic!("expected fuzzy duplicate diagnostics, got {other:?}")
@@ -531,6 +567,7 @@ mod tests {
             | PatchError::ClipboardNotFound(_)
             | PatchError::OldTextNotFound
             | PatchError::EditOutOfBounds
+            | PatchError::OverlappingEdits
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => {
                 panic!("expected normalised duplicate diagnostics, got {other:?}")

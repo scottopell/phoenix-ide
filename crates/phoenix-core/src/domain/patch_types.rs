@@ -8,6 +8,8 @@ use std::path::PathBuf;
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Replace,
+    InsertBefore,
+    InsertAfter,
     AppendEof,
     PrependBof,
     Overwrite,
@@ -27,6 +29,12 @@ pub struct PatchRequest {
     pub operation: Operation,
     pub old_text: Option<String>,
     pub new_text: Option<String>,
+    /// Replace operation only: substitute every exact occurrence of `old_text`
+    /// instead of requiring a unique match.
+    // owned: predates the field; absent means single-match replace, which is the
+    // correct default for every pre-feature request, so no migration is owed.
+    #[serde(default)]
+    pub replace_all: bool,
     pub to_clipboard: Option<String>,
     pub from_clipboard: Option<String>,
     pub reindent: Option<Reindent>,
@@ -122,10 +130,10 @@ impl std::fmt::Display for DuplicateMatchDiagnostics {
 /// Errors that can occur during patch planning
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PatchError {
-    #[error("Cannot use replace operation on non-existent file")]
+    #[error("Cannot use anchor-based operations (replace, insert_before, insert_after) on non-existent file")]
     ReplaceOnNonexistent,
 
-    #[error("Replace operation requires oldText")]
+    #[error("Operation requires oldText")]
     MissingOldText,
 
     #[error("Clipboard '{0}' not found")]
@@ -139,6 +147,9 @@ pub enum PatchError {
 
     #[error("Edit extends beyond file content")]
     EditOutOfBounds,
+
+    #[error("Two edits in this call target overlapping regions of the file; split them into separate patch calls")]
+    OverlappingEdits,
 
     #[error("Line does not start with expected prefix '{prefix}':\n{line}")]
     ReindentPrefixMismatch { prefix: String, line: String },
