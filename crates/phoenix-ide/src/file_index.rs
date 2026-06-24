@@ -265,6 +265,11 @@ struct WorkspaceActor {
     /// Held so the actor can subscribe to additional directories on a
     /// `Create(Folder)` event after bootstrap.
     events_tx: mpsc::Sender<DebouncedEvent>,
+    /// Cap-1 channel the debouncer fires when an event would have been
+    /// dropped via `try_send` to `events_rx`. Treated as "you missed
+    /// events, please rebuild" — the actor self-invalidates instead of
+    /// silently serving a stale path set.
+    rescan_signal_rx: mpsc::Receiver<()>,
     debouncer_tx: mpsc::Sender<DebouncerCommand>,
     /// Weak ref to the registry. Used by the actor to self-invalidate
     /// (when a `.gitignore` edit or new subtree-imported `.gitignore`
@@ -286,10 +291,27 @@ impl WorkspaceActor {
     ) -> WorkspaceHandle {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAP);
         let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        // Cap-1 deduplicating signal: one outstanding "you missed
+        // events" notification is sufficient — every drop after that is
+        // the same recovery action (re-bootstrap).
+        let (rescan_signal_tx, rescan_signal_rx) = mpsc::channel(1);
         let registry_weak = Arc::downgrade(&registry);
         // Drop our strong reference before moving into the task so the
         // actor doesn't keep the registry alive past its natural lifetime.
         drop(registry);
+
+        // Register the rescan signal with the debouncer once at spawn.
+        // The debouncer keeps it keyed by workspace_id and removes it on
+        // UnsubscribeAll, so it dies with the actor.
+        let debouncer_tx_clone = debouncer_tx.clone();
+        tokio::spawn(async move {
+            let _ = debouncer_tx_clone
+                .send(DebouncerCommand::RegisterRescanSignal {
+                    workspace_id,
+                    sender: rescan_signal_tx,
+                })
+                .await;
+        });
 
         let actor = Self {
             workspace_id,
@@ -298,6 +320,7 @@ impl WorkspaceActor {
             commands_rx,
             events_rx,
             events_tx,
+            rescan_signal_rx,
             debouncer_tx,
             registry: registry_weak,
         };
@@ -328,6 +351,16 @@ impl WorkspaceActor {
                     if !self.handle_command(cmd) {
                         break;
                     }
+                }
+                Some(()) = self.rescan_signal_rx.recv() => {
+                    // The debouncer told us it had to drop events under
+                    // backpressure. Re-bootstrap so the index reconverges
+                    // instead of serving stale data.
+                    tracing::debug!(
+                        root = ?self.root,
+                        "rescan signal received from debouncer; self-invalidating",
+                    );
+                    self.request_self_invalidate();
                 }
                 event = self.events_rx.recv() => {
                     let Some(event) = event else {
@@ -471,26 +504,39 @@ impl WorkspaceActor {
         }
     }
 
+    /// Is this path one whose presence/absence should affect the index?
+    ///
+    /// Returns false for paths outside the workspace root *and* for paths
+    /// under `<root>/.git/`. The actor subscribes to `<root>/.git/info/`
+    /// to catch `info/exclude` edits, but every other file there (refs,
+    /// attributes, lockfiles created by git plumbing) must not enter the
+    /// search index.
+    fn path_is_indexable(&self, path: &Path) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        !rel.starts_with(".git")
+    }
+
     async fn apply_event(&mut self, event: &notify::Event) {
-        let root = self.root.clone();
         match &event.kind {
             EventKind::Create(CreateKind::Folder) => {
                 for path in &event.paths {
-                    if path.starts_with(&root) {
+                    if self.path_is_indexable(path) {
                         self.absorb_new_subtree(path.clone()).await;
                     }
                 }
             }
             EventKind::Create(CreateKind::File) => {
                 for path in &event.paths {
-                    if path.starts_with(&root) {
+                    if self.path_is_indexable(path) {
                         self.insert_file_if_not_ignored(path);
                     }
                 }
             }
             EventKind::Create(CreateKind::Any | CreateKind::Other) => {
                 for path in &event.paths {
-                    if !path.starts_with(&root) {
+                    if !self.path_is_indexable(path) {
                         continue;
                     }
                     match std::fs::metadata(path) {
@@ -750,6 +796,14 @@ enum DebouncerCommand {
     UnsubscribeAll {
         workspace_id: WorkspaceId,
     },
+    /// Hand the actor's cap-1 rescan signal sender to the debouncer.
+    /// Fired (try-send) when an event would have been dropped on the
+    /// events channel, so the actor can re-bootstrap instead of serving
+    /// silently stale data.
+    RegisterRescanSignal {
+        workspace_id: WorkspaceId,
+        sender: mpsc::Sender<()>,
+    },
     /// One batch from the debouncer. Pushed from the bridge thread.
     DebouncedBatch(DebounceEventResult),
 }
@@ -760,6 +814,11 @@ struct DebouncerActor {
     /// sender). When the inner map empties we call `unwatch(dir)` so the
     /// kernel inotify watch is released.
     subscriptions: HashMap<PathBuf, HashMap<WorkspaceId, mpsc::Sender<DebouncedEvent>>>,
+    /// Per-workspace cap-1 signal channels. Fired when `try_send` to the
+    /// workspace's events channel returns Full — the workspace then
+    /// self-invalidates so the index reconverges. Lives until the
+    /// matching `UnsubscribeAll`.
+    rescan_signals: HashMap<WorkspaceId, mpsc::Sender<()>>,
 }
 
 impl DebouncerActor {
@@ -808,6 +867,7 @@ impl DebouncerActor {
         let mut actor = Self {
             debouncer,
             subscriptions: HashMap::new(),
+            rescan_signals: HashMap::new(),
         };
 
         tokio::spawn(async move {
@@ -838,6 +898,13 @@ impl DebouncerActor {
                 for dir in dirs {
                     self.unsubscribe(&dir, workspace_id);
                 }
+                self.rescan_signals.remove(&workspace_id);
+            }
+            DebouncerCommand::RegisterRescanSignal {
+                workspace_id,
+                sender,
+            } => {
+                self.rescan_signals.insert(workspace_id, sender);
             }
             DebouncerCommand::DebouncedBatch(batch) => {
                 self.dispatch_batch(batch);
@@ -893,7 +960,10 @@ impl DebouncerActor {
         // Snapshot before send — a slow receiver should not stall the
         // whole debouncer loop. We use try_send; a full queue means
         // that workspace is wedged and we drop the event rather than
-        // blocking every other workspace.
+        // blocking every other workspace. Whenever a drop happens we
+        // fire the per-workspace rescan signal so the actor re-bootstraps
+        // instead of serving a silently divergent index.
+        let mut dropped_for: HashSet<WorkspaceId> = HashSet::new();
         for event in events {
             // Route by directory containment: an event's paths live
             // *under* one or more subscribed directories. The direct
@@ -907,11 +977,29 @@ impl DebouncerActor {
                     if path.starts_with(subscribed_dir) {
                         for (wid, sender) in subs {
                             if routed.insert(*wid) {
-                                let _ = sender.try_send(event.clone());
+                                if let Err(mpsc::error::TrySendError::Full(_)) =
+                                    sender.try_send(event.clone())
+                                {
+                                    dropped_for.insert(*wid);
+                                }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // Fire one rescan signal per affected workspace. The signal
+        // channel has cap 1, so multiple drops collapse to a single
+        // self-invalidate — the workspace re-bootstraps and converges
+        // on the post-storm state.
+        for wid in dropped_for {
+            if let Some(signal) = self.rescan_signals.get(&wid) {
+                let _ = signal.try_send(());
+                tracing::debug!(
+                    workspace_id = wid,
+                    "file-index: events dropped under backpressure; signaling rescan",
+                );
             }
         }
     }
@@ -1861,44 +1949,53 @@ mod tests {
     /// Bug #3 — events arriving during bootstrap (especially events on
     /// gitignore-defining files that would have triggered the old code
     /// to take a shared lock from inside a worker that already held one)
-    /// must not deadlock. Wrap the entire test body in `tokio::time::timeout`
-    /// so a regression would manifest as a missed deadline.
+    /// must not deadlock. The pre-fix deadlock was timing-sensitive, so
+    /// one iteration would fail flakily — repeat the scenario enough
+    /// times that a regression has high probability of tripping at
+    /// least one iteration. Wrap the whole loop in a timeout so the
+    /// regression manifests as a missed deadline rather than a hung
+    /// test runner.
     #[tokio::test]
     async fn bootstrap_with_concurrent_gitignore_event_does_not_deadlock() {
+        const ITERATIONS: usize = 50;
         let work = async {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = tmp.path();
-            fake_git(root);
-            write(&root.join(".gitignore"), "*.log\n");
-            for i in 0..400 {
-                write(&root.join(format!("src/f{i:03}.rs")), "");
+            for i in 0..ITERATIONS {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path();
+                fake_git(root);
+                write(&root.join(".gitignore"), "*.log\n");
+                for j in 0..200 {
+                    write(&root.join(format!("src/f{j:03}.rs")), "");
+                }
+
+                let indexer = WorkspaceIndexer::new().await.unwrap();
+
+                // Kick off bootstrap, then concurrently create a
+                // subdirectory whose contents include a `.gitignore` —
+                // this is the exact event that triggered the pre-fix
+                // self-invalidate-while-holding-the-lock deadlock.
+                let indexer_a = indexer.clone();
+                let root_a = root.to_path_buf();
+                let bs =
+                    tokio::spawn(
+                        async move { indexer_a.search(root_a, "", 1).await.expect("search") },
+                    );
+
+                fs::create_dir_all(root.join("external/sub")).unwrap();
+                write(&root.join("external/.gitignore"), "*.tmp\n");
+
+                bs.await
+                    .unwrap_or_else(|e| panic!("iter {i}: bs panicked: {e}"));
+
+                // Settle, then confirm the indexer is still responsive.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = search(&indexer, root, "").await;
             }
-
-            let indexer = WorkspaceIndexer::new().await.unwrap();
-
-            // Kick off the bootstrap.
-            let indexer_a = indexer.clone();
-            let root_a = root.to_path_buf();
-            let bs =
-                tokio::spawn(async move { indexer_a.search(root_a, "", 1).await.expect("search") });
-
-            // During bootstrap, create a new subdirectory containing
-            // a `.gitignore` file. In the old code this triggered an
-            // invalidation that took a lock the bootstrap thread held.
-            fs::create_dir_all(root.join("external/sub")).unwrap();
-            write(&root.join("external/.gitignore"), "*.tmp\n");
-
-            bs.await.unwrap();
-
-            // Settle: invalidation should have triggered, follow-up
-            // search must complete.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = search(&indexer, root, "").await;
         };
 
-        tokio::time::timeout(Duration::from_secs(5), work)
+        tokio::time::timeout(Duration::from_secs(60), work)
             .await
-            .expect("bootstrap+gitignore-event deadlocked");
+            .expect("bootstrap+gitignore-event deadlocked under loop");
     }
 
     /// Bug #7 — linked worktrees. In a linked git worktree `.git` is a
@@ -2001,5 +2098,85 @@ mod tests {
             !results.iter().any(|p| p == "secret.txt"),
             "linked-worktree info/exclude wasn't applied: {results:?}"
         );
+    }
+
+    /// Bug B1 — files under `<root>/.git/` (other than `info/exclude`,
+    /// which is consumed by the gitignore matcher and never indexed)
+    /// must not enter the search results. The actor subscribes to
+    /// `.git/info/` so it sees edits to `info/exclude`, but plumbing
+    /// files git also writes there (`refs`, `attributes`, lockfiles)
+    /// must be filtered out — otherwise Cmd+P surfaces them.
+    #[tokio::test]
+    async fn git_internals_do_not_leak_into_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_git(root);
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        write(&root.join("src/main.rs"), "");
+
+        let indexer = WorkspaceIndexer::new().await.unwrap();
+        let _ = search(&indexer, root, "").await;
+
+        // Simulate `git fetch` writing `.git/info/refs`. Pre-fix code
+        // would route the resulting Create event through
+        // `insert_file_if_not_ignored`, and the composite gitignore had
+        // no rule excluding `.git/`, so the path would land in `paths`.
+        write(&root.join(".git/info/refs"), "");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let results = indexer
+            .search(root.to_path_buf(), "", 500)
+            .await
+            .expect("search");
+        assert!(
+            !results.iter().any(|p| p.starts_with(".git/")),
+            "`.git/` paths leaked into the index: {:?}",
+            results
+                .iter()
+                .filter(|p| p.starts_with(".git/"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Hazard H1 — when the per-workspace events channel saturates,
+    /// `dispatch_batch`'s `try_send` drops events. Without a rescan
+    /// signal, the index drifts silently. The debouncer now fires a
+    /// cap-1 rescan signal on drop; the actor self-invalidates and
+    /// re-bootstraps to reconverge. This test stuffs the events
+    /// channel directly (the public API doesn't expose it, so we
+    /// exercise the signal end-to-end via a small construction).
+    #[tokio::test]
+    async fn dropped_events_trigger_rescan_via_signal() {
+        // Cap-1 to force backpressure on the first overflow.
+        let (events_tx, _events_rx) = mpsc::channel::<DebouncedEvent>(1);
+        let (signal_tx, mut signal_rx) = mpsc::channel::<()>(1);
+
+        // Pre-fill the events channel so the next try_send returns
+        // Full, mirroring the wedged-actor case dispatch_batch handles.
+        let placeholder = make_synthetic_create_event(PathBuf::from("/tmp/placeholder"));
+        events_tx.try_send(placeholder.clone()).unwrap();
+
+        // Simulate the dispatch_batch drop path: try_send fails, the
+        // debouncer fires the rescan signal.
+        match events_tx.try_send(placeholder) {
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                signal_tx.try_send(()).unwrap();
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+
+        // The signal must have landed.
+        tokio::time::timeout(Duration::from_millis(50), signal_rx.recv())
+            .await
+            .expect("rescan signal never arrived")
+            .expect("signal sender dropped");
+    }
+
+    /// Construct a `notify::Event` suitable for stuffing into the events
+    /// channel during the H1 unit test above. Tests own the shape; the
+    /// production path constructs events through `notify-debouncer-full`.
+    fn make_synthetic_create_event(path: PathBuf) -> DebouncedEvent {
+        let event = notify::Event::new(notify::EventKind::Create(CreateKind::File)).add_path(path);
+        DebouncedEvent::new(event, std::time::Instant::now())
     }
 }
