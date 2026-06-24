@@ -301,10 +301,12 @@ fn find_trimmed_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
 fn find_normalised_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
     let skel_old: String = skeleton(old_text).collect();
 
-    if skel_old == old_text {
-        return None;
-    }
-
+    // Note: we do NOT bail when `skel_old == old_text`. The confusable may live
+    // in the FILE rather than in `old_text` (e.g. the file uses `…` while
+    // old_text is the ASCII `...`), so skeletonising content can still surface a
+    // match an ASCII old_text would otherwise miss. This only runs after the
+    // exact/dedent/trimmed strategies have already failed, so a no-confusable
+    // file simply finds nothing here.
     let mut skel_content = String::new();
     let mut skel_to_orig: Vec<usize> = Vec::new();
 
@@ -653,6 +655,18 @@ mod tests {
         #[allow(clippy::string_slice)]
         let matched = &content[spec.offset..spec.offset + spec.length];
         assert_eq!(matched, "\u{201C}target\u{201D}");
+    }
+
+    #[test]
+    fn test_normalised_match_ascii_oldtext_unicode_file() {
+        // The confusable is in the FILE (ellipsis char), old_text is plain ASCII
+        // dots whose skeleton is unchanged. Skeleton matching must still find it.
+        let content = "wait\u{2026} done";
+        let old_text = "wait... done";
+        let spec = find_unique_match(content, old_text).unwrap();
+        #[allow(clippy::string_slice)]
+        let matched = &content[spec.offset..spec.offset + spec.length];
+        assert_eq!(matched, "wait\u{2026} done");
     }
 
     #[test]

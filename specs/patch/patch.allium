@@ -270,14 +270,17 @@ rule StoreToClipboardFromOldText {
     when: BuildEdit(planner, patch, original)
     requires: patch.to_clipboard != null
     requires: patch.to_clipboard != ""
-    requires: patch.operation != replace
+    requires: patch.operation != replace or patch.replace_all = true
     requires: patch.old_text != null
 
     ensures: ClipboardWrite(planner, patch.to_clipboard, patch.old_text)
 
     @guidance
         -- Clipboard write happens during edit building, before edit
-        -- application.
+        -- application. The non-replace operations and replace_all all store
+        -- the requested old_text: for replace_all every exact occurrence
+        -- equals old_text, and the insert/append/prepend operations have no
+        -- separately-matched text to prefer.
 }
 
 rule BuildReplaceEdit {
@@ -303,8 +306,8 @@ rule BuildReplaceAllEdits {
         -- is not consulted, because "best single candidate" has no meaning across
         -- many sites. One edit is emitted per occurrence; match_indices yields
         -- non-overlapping occurrences, so the emitted edits never overlap each
-        -- other. replace_all does not write a to_clipboard (there is no single
-        -- matched text to store).
+        -- other. A to_clipboard on replace_all stores old_text: every exact
+        -- occurrence equals it, so the stored value is well-defined.
         --
         -- Zero exact occurrences splits two ways, so an exact-only miss is never
         -- surfaced as a misleading "not found" when the text is visibly present:

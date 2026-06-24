@@ -128,15 +128,14 @@ impl PatchPlanner {
                 new_text = apply_reindent(&new_text, reindent)?;
             }
 
-            // Store to clipboard if requested (ignore empty string names).
-            // replace_all has no single matched text, so it never writes a clipboard.
-            let replace_all = matches!(patch.operation, Operation::Replace) && patch.replace_all;
-            if !replace_all {
-                if let Some(name) = &patch.to_clipboard {
-                    if !name.is_empty() {
-                        if let Some(old_text) = &patch.old_text {
-                            self.clipboards.insert(name.clone(), old_text.clone());
-                        }
+            // Store to clipboard if requested (ignore empty string names). For
+            // replace_all every exact occurrence equals old_text, so old_text is
+            // the well-defined stored value. The single-replace arm below overrides
+            // this with the actually-matched bytes when fuzzy matching diverged.
+            if let Some(name) = &patch.to_clipboard {
+                if !name.is_empty() {
+                    if let Some(old_text) = &patch.old_text {
+                        self.clipboards.insert(name.clone(), old_text.clone());
                     }
                 }
             }
@@ -226,14 +225,25 @@ impl PatchPlanner {
     }
 
     /// Apply edits to content (in reverse order to maintain offsets)
-    fn apply_edits(original: &str, mut edits: Vec<Edit>) -> Result<String, PatchError> {
+    fn apply_edits(original: &str, edits: Vec<Edit>) -> Result<String, PatchError> {
         let original_len = original.len();
         let mut result = original.to_string();
 
         // Sort by offset descending so we can apply without adjusting offsets.
-        // Ties break by length descending so a replace at offset O applies before
-        // a zero-length insert at O (the insert then lands before the replacement).
-        edits.sort_by_key(|b| (std::cmp::Reverse(b.offset), std::cmp::Reverse(b.length)));
+        // Ties break by length descending (a replace at offset O applies before a
+        // zero-length insert at O, so the insert lands before the replacement),
+        // then by request index descending. The index tiebreaker matters for two
+        // zero-length inserts at the same offset (e.g. two insert_before on one
+        // anchor): applying the later-requested one first leaves it after the
+        // earlier one, preserving request order in the output.
+        let mut indexed: Vec<(usize, Edit)> = edits.into_iter().enumerate().collect();
+        indexed.sort_by_key(|(i, e)| {
+            (
+                std::cmp::Reverse(e.offset),
+                std::cmp::Reverse(e.length),
+                std::cmp::Reverse(*i),
+            )
+        });
 
         // Bounds and overlap are validated against the ORIGINAL content, since
         // every edit's offset was computed there. Walking high-to-low, each edit
@@ -241,7 +251,7 @@ impl PatchPlanner {
         // shared endpoint (zero-length insert at a boundary) is allowed, any true
         // overlap is rejected before writing.
         let mut prev_start: Option<usize> = None;
-        for edit in &edits {
+        for (_, edit) in &indexed {
             if edit.offset + edit.length > original_len {
                 return Err(PatchError::EditOutOfBounds);
             }
@@ -634,6 +644,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.resulting_content, "line1\nanchor\ninserted\nline3");
+    }
+
+    #[test]
+    fn test_two_inserts_same_anchor_preserve_request_order() {
+        let mut planner = PatchPlanner::new();
+        let plan = planner
+            .plan(
+                &path("test.txt"),
+                Some("anchor"),
+                &[
+                    PatchRequest {
+                        operation: Operation::InsertBefore,
+                        old_text: Some("anchor".to_string()),
+                        new_text: Some("A".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                    PatchRequest {
+                        operation: Operation::InsertBefore,
+                        old_text: Some("anchor".to_string()),
+                        new_text: Some("B".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        // Request order A then B -> "AB" before the anchor, not "BA".
+        assert_eq!(plan.resulting_content, "ABanchor");
+    }
+
+    #[test]
+    fn test_replace_all_with_clipboard_stores_old_text() {
+        let mut planner = PatchPlanner::new();
+        let plan = planner
+            .plan(
+                &path("test.txt"),
+                Some("foo foo foo"),
+                &[PatchRequest {
+                    operation: Operation::Replace,
+                    old_text: Some("foo".to_string()),
+                    new_text: Some("bar".to_string()),
+                    replace_all: true,
+                    to_clipboard: Some("clip".to_string()),
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(plan.resulting_content, "bar bar bar");
+        // Every occurrence equals old_text, so the clipboard holds it.
+        assert_eq!(planner.clipboards().get("clip"), Some(&"foo".to_string()));
     }
 
     #[test]
