@@ -36,7 +36,7 @@ impl ExploreReadOnlyPolicy {
         protected_dirs.extend(runtime_protected_dirs(&runtime_env));
         protected_dirs.sort();
         protected_dirs.dedup();
-        let scratch_root = runtime_env.tmp_subdir("explore-bash")?;
+        let scratch_root = runtime_env.tmp_root().join("explore-bash");
         let scratch_dir = scratch_dir(&scratch_root, &protected_dirs)?;
         let sandbox_home = scratch_dir.join("home");
         std::fs::create_dir_all(&sandbox_home)?;
@@ -237,7 +237,6 @@ fn paths_overlap(a: &Path, b: &Path) -> bool {
 
 fn runtime_protected_dirs(runtime_env: &PhoenixRuntimeEnvironment) -> Vec<PathBuf> {
     let mut dirs = vec![
-        runtime_env.home().to_path_buf(),
         runtime_env.codex_home().to_path_buf(),
         runtime_env.data_dir().to_path_buf(),
         runtime_env.phoenix_home(),
@@ -359,6 +358,19 @@ mod tests {
             ),
             scratch.join("platform-temp")
         );
+    }
+
+    #[test]
+    fn scratch_dir_allows_phoenix_scratch_sibling_of_protected_state() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let scratch_root = temp.path().join("phoenix-ide").join("explore-bash");
+        let protected_state = temp.path().join("phoenix-data");
+        std::fs::create_dir_all(&scratch_root).expect("scratch root");
+        std::fs::create_dir_all(&protected_state).expect("protected state");
+
+        let scratch = scratch_dir(&scratch_root, &[protected_state.canonicalize().unwrap()])
+            .expect("scratch sibling should be allowed");
+        assert!(scratch.starts_with(scratch_root.canonicalize().unwrap()));
     }
 
     #[test]

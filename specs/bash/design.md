@@ -848,12 +848,14 @@ buffer, and response shaping as writable `BashTool`. The only divergent path is
 applies `nono::Sandbox::apply()` to itself, and then it execs `/bin/bash -c
 <cmd>`. The server process never applies the sandbox to itself.
 
-The Explore policy grants broad filesystem read access, task proposal
-directories read-write, a Phoenix-owned scratch directory read-write, a
-synthetic sandbox home under scratch, and platform-compatible temporary
-directory writes. If the worktree itself is under the platform temp root, the
-temp capability falls back to a Phoenix-owned scratch child so the temp grant
-cannot cover source files. `PHOENIX_SANDBOX_SCRATCH` names scratch,
+The Explore policy grants broad filesystem read access, Phoenix-owned scratch
+read-write, a synthetic sandbox home under scratch, and platform-compatible
+temporary directory writes. Task proposal directories are read-only to bash;
+task drafts go through scoped non-bash proposal tools. If the platform temp root
+would cover the worktree, resolved Git metadata, or Phoenix-owned runtime state,
+the temp capability falls back to a Phoenix-owned scratch child so the temp grant
+cannot cover protected state. The scratch root itself is rejected when it overlaps
+protected repo/Git/Phoenix paths. `PHOENIX_SANDBOX_SCRATCH` names scratch,
 `PHOENIX_SANDBOX_HOME` and `HOME` name the synthetic home, and `TMPDIR` names
 the platform temp directory. Network access is blocked and the child
 environment is rebuilt from a small allowlist that preserves `PATH` while
@@ -894,8 +896,8 @@ process's lifetime regardless of subsequent peek/wait/kill calls.
 ### Integration tests
 - Top-level Explore bash on a supported host: `git log`, `git status`,
   `git blame`, `rg`, and `cat` can read the worktree and other readable local
-  files; source writes fail with kernel permission errors; task proposal,
-  scratch, synthetic-home, and platform-temp writes succeed; network commands
+  files; source writes fail with kernel permission errors; task proposal writes
+  fail; scratch, synthetic-home, and platform-temp writes succeed; network commands
   fail; configured ambient credential variables are absent; Phoenix-owned
   scratch/home directories are reaped after terminal state.
 - Spawn → exits within wait_seconds → `status: "exited"` with exit code.
