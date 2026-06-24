@@ -597,7 +597,7 @@ impl ModelRegistry {
             return Self::new(config);
         };
 
-        tracing::info!("Discovering models via credential_helper auth");
+        tracing::info!("Discovering models from configured base URL endpoints");
         let discovered = discover_models(&discovery).await;
 
         if !discovered.any_listed() {
@@ -613,7 +613,11 @@ impl ModelRegistry {
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
 
         for spec in Self::model_specs(config) {
-            if discovered.was_listed(spec.backend)
+            let uses_codex_bridge = config.use_codex_auth
+                && spec.backend == ModelBackend::OpenAIResponses
+                && spec.source == ModelSource::BuiltIn;
+            if !uses_codex_bridge
+                && discovered.was_listed(spec.backend)
                 && !Self::spec_matches_discovered_model(&spec, &discovered)
             {
                 continue;
@@ -690,29 +694,32 @@ impl ModelRegistry {
         let anthropic_auth_headers = if anthropic_models_url.is_some() {
             discovery_auth_headers(
                 ModelBackend::Anthropic,
-                config.anthropic_api_key.as_deref(),
                 helper_token.as_deref(),
+                config.anthropic_api_key.as_deref(),
                 auth_style,
-            )?
+            )
         } else {
-            Vec::new()
+            None
         };
         let openai_auth_headers = if openai_models_url.is_some() {
             discovery_auth_headers(
                 ModelBackend::OpenAIResponses,
-                config.openai_api_key.as_deref(),
                 helper_token.as_deref(),
+                config.openai_api_key.as_deref(),
                 auth_style,
-            )?
+            )
         } else {
-            Vec::new()
+            None
         };
+        if anthropic_auth_headers.is_none() && openai_auth_headers.is_none() {
+            return None;
+        }
 
         Some(DiscoveryConfig {
-            anthropic_models_url,
-            openai_models_url,
-            anthropic_auth_headers,
-            openai_auth_headers,
+            anthropic_models_url: anthropic_auth_headers.as_ref().and(anthropic_models_url),
+            openai_models_url: openai_auth_headers.as_ref().and(openai_models_url),
+            anthropic_auth_headers: anthropic_auth_headers.unwrap_or_default(),
+            openai_auth_headers: openai_auth_headers.unwrap_or_default(),
             custom_headers: config.custom_headers.clone(),
         })
     }
@@ -781,7 +788,12 @@ impl ModelRegistry {
                         .anthropic_api_key
                         .as_deref()
                         .filter(|k| !k.is_empty())?;
-                    LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
+                    let style = if config.anthropic_base_url.is_some() {
+                        config.auth_style
+                    } else {
+                        AuthStyle::ApiKey
+                    };
+                    LlmAuth::new(Arc::new(StaticCredential::new(key)), style)
                 }
                 ModelBackend::OpenAIResponses => {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
@@ -1478,6 +1490,49 @@ mod tests {
         assert_eq!(
             discovery.openai_auth_headers,
             vec![("Authorization".to_string(), "Bearer openai-key".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_keeps_backend_with_available_credentials() {
+        let config = LlmConfig {
+            anthropic_base_url: Some("https://stale.example/v1/messages".to_string()),
+            openai_api_key: Some("openai-key".to_string()),
+            openai_base_url: Some("https://proxy.example/v1/responses".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("OpenAI credentials should keep OpenAI discovery enabled");
+
+        assert!(discovery.anthropic_models_url.is_none());
+        assert_eq!(
+            discovery.openai_models_url.as_deref(),
+            Some("https://proxy.example/v1/models")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_prefers_cached_helper_over_static_key() {
+        let helper =
+            crate::CredentialHelper::new("echo helper-token".to_string(), Duration::from_hours(1));
+        assert!(helper.get().await.is_none());
+        helper.wait_for_settlement().await;
+        let config = LlmConfig {
+            credential_helper: Some(helper),
+            anthropic_api_key: Some("static-key".to_string()),
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("cached helper token should produce discovery config");
+
+        assert_eq!(
+            discovery.anthropic_auth_headers,
+            vec![("x-api-key".to_string(), "helper-token".to_string())]
         );
     }
 
