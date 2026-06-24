@@ -239,6 +239,9 @@ WHEN replaceAll is requested
 THE SYSTEM SHALL match exact occurrences only
 AND NOT apply the fuzzy recovery strategies (dedent, trimmed-line, skeleton)
 
+WHEN replaceAll is set on any operation other than replace
+THE SYSTEM SHALL reject the operation rather than silently ignore the flag
+
 WHEN replaceAll finds no exact occurrence and oldText is genuinely absent
 THE SYSTEM SHALL return the "old text not found" error
 

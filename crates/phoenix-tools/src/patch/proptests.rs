@@ -538,6 +538,7 @@ fn test_replace_not_unique() {
             | PatchError::EditOutOfBounds
             | PatchError::OverlappingEdits
             | PatchError::ReplaceAllInexact
+            | PatchError::ReplaceAllRequiresReplace
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches),
         ) => panic!("expected duplicate diagnostic, got {other:?}"),

@@ -301,12 +301,17 @@ fn find_trimmed_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
 fn find_normalised_match(content: &str, old_text: &str) -> Option<MatchOutcome> {
     let skel_old: String = skeleton(old_text).collect();
 
-    // Note: we do NOT bail when `skel_old == old_text`. The confusable may live
-    // in the FILE rather than in `old_text` (e.g. the file uses `…` while
-    // old_text is the ASCII `...`), so skeletonising content can still surface a
-    // match an ASCII old_text would otherwise miss. This only runs after the
-    // exact/dedent/trimmed strategies have already failed, so a no-confusable
-    // file simply finds nothing here.
+    // Fast path: when old_text carries no confusable AND the file is pure ASCII,
+    // skeletonising cannot surface anything the exact/dedent/trim strategies
+    // didn't already see, so skip the allocation-heavy skeleton map entirely.
+    // This keeps a typo in a large ASCII file cheap. We do NOT bail merely on
+    // `skel_old == old_text`: the confusable may live in the FILE (e.g. the file
+    // uses `…` while old_text is the ASCII `...`) — a non-ASCII file still runs
+    // the full pass so that recovery works.
+    if skel_old == old_text && content.is_ascii() {
+        return None;
+    }
+
     let mut skel_content = String::new();
     let mut skel_to_orig: Vec<usize> = Vec::new();
 
@@ -482,6 +487,7 @@ mod tests {
             | PatchError::EditOutOfBounds
             | PatchError::OverlappingEdits
             | PatchError::ReplaceAllInexact
+            | PatchError::ReplaceAllRequiresReplace
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => panic!("unexpected error: {other:?}"),
         }
@@ -553,6 +559,7 @@ mod tests {
             | PatchError::EditOutOfBounds
             | PatchError::OverlappingEdits
             | PatchError::ReplaceAllInexact
+            | PatchError::ReplaceAllRequiresReplace
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => {
                 panic!("expected fuzzy duplicate diagnostics, got {other:?}")
@@ -579,6 +586,7 @@ mod tests {
             | PatchError::EditOutOfBounds
             | PatchError::OverlappingEdits
             | PatchError::ReplaceAllInexact
+            | PatchError::ReplaceAllRequiresReplace
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => {
                 panic!("expected normalised duplicate diagnostics, got {other:?}")

@@ -9,6 +9,7 @@ use super::types::{Edit, Operation, PatchEffect, PatchError, PatchPlan, PatchReq
 use similar::TextDiff;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Pure patch planner - no IO operations
 ///
@@ -144,6 +145,13 @@ impl PatchPlanner {
         let mut edits = Vec::new();
 
         for patch in patches {
+            // replaceAll is only meaningful for replace; reject other combinations
+            // rather than silently ignoring the flag (which could mask a malformed
+            // call such as overwrite + replaceAll).
+            if patch.replace_all && !matches!(patch.operation, Operation::Replace) {
+                return Err(PatchError::ReplaceAllRequiresReplace);
+            }
+
             // Get new text (from clipboard if specified)
             // Treat empty string as None (LLMs sometimes pass "" instead of omitting)
             let mut new_text = match &patch.from_clipboard {
@@ -159,6 +167,11 @@ impl PatchPlanner {
             if let Some(reindent) = &patch.reindent {
                 new_text = apply_reindent(&new_text, reindent)?;
             }
+
+            // Share the replacement across every emitted edit. Cloning the Arc is
+            // O(1), so a replaceAll over many occurrences never duplicates the
+            // replacement text per match.
+            let replacement: Arc<str> = Arc::from(new_text);
 
             // Store to clipboard if requested (ignore empty string names). For
             // replace_all every exact occurrence equals old_text, so old_text is
@@ -177,17 +190,17 @@ impl PatchPlanner {
                 Operation::PrependBof => edits.push(Edit {
                     offset: 0,
                     length: 0,
-                    replacement: new_text,
+                    replacement: replacement.clone(),
                 }),
                 Operation::AppendEof => edits.push(Edit {
                     offset: original.len(),
                     length: 0,
-                    replacement: new_text,
+                    replacement: replacement.clone(),
                 }),
                 Operation::Overwrite => edits.push(Edit {
                     offset: 0,
                     length: original.len(),
-                    replacement: new_text,
+                    replacement: replacement.clone(),
                 }),
                 Operation::InsertBefore => {
                     let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
@@ -195,7 +208,7 @@ impl PatchPlanner {
                     edits.push(Edit {
                         offset: spec.offset,
                         length: 0,
-                        replacement: new_text,
+                        replacement: replacement.clone(),
                     });
                 }
                 Operation::InsertAfter => {
@@ -204,7 +217,7 @@ impl PatchPlanner {
                     edits.push(Edit {
                         offset: spec.offset + spec.length,
                         length: 0,
-                        replacement: new_text,
+                        replacement: replacement.clone(),
                     });
                 }
                 Operation::Replace if patch.replace_all => {
@@ -224,7 +237,7 @@ impl PatchPlanner {
                         edits.push(Edit {
                             offset: spec.offset,
                             length: spec.length,
-                            replacement: new_text.clone(),
+                            replacement: replacement.clone(),
                         });
                     }
                 }
@@ -247,7 +260,7 @@ impl PatchPlanner {
                     edits.push(Edit {
                         offset: spec.offset,
                         length: spec.length,
-                        replacement: new_text,
+                        replacement: replacement.clone(),
                     });
                 }
             }
@@ -803,6 +816,28 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err, PatchError::ReplaceAllInexact);
+    }
+
+    #[test]
+    fn test_replace_all_on_non_replace_is_rejected() {
+        let mut planner = PatchPlanner::new();
+        let err = planner
+            .plan(
+                &path("test.txt"),
+                Some("content"),
+                &[PatchRequest {
+                    operation: Operation::Overwrite,
+                    old_text: None,
+                    new_text: Some("new".to_string()),
+                    replace_all: true,
+                    to_clipboard: None,
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap_err();
+
+        assert_eq!(err, PatchError::ReplaceAllRequiresReplace);
     }
 
     #[test]

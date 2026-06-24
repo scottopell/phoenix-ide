@@ -408,6 +408,12 @@ invariant EmptyClipboardNameIgnored {
     "" not in planner.clipboard_names
 }
 
+invariant ReplaceAllRestrictedToReplace {
+    -- replace_all is meaningful only for the replace operation. A patch that
+    -- sets replace_all with any other operation is rejected
+    -- (ReplaceAllRequiresReplace), never silently applied with the flag ignored.
+}
+
 invariant ReplaceRequiresExistingFile {
     -- Replace on a file with current_content = null always fails.
     -- Other operations (Overwrite, Append, Prepend) work on null content

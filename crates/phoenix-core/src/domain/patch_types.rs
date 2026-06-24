@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// A patch operation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -55,11 +56,15 @@ pub struct EditSpec {
 }
 
 /// An edit to apply
+///
+/// `replacement` is an `Arc<str>` so a single value can be shared cheaply across
+/// many edits — a `replaceAll` over thousands of occurrences must not clone the
+/// replacement text once per match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
     pub offset: usize,
     pub length: usize,
-    pub replacement: String,
+    pub replacement: Arc<str>,
 }
 
 /// Effects produced by patch planning
@@ -150,6 +155,9 @@ pub enum PatchError {
 
     #[error("Two edits in this call target overlapping regions of the file; split them into separate patch calls")]
     OverlappingEdits,
+
+    #[error("replaceAll is only valid with the replace operation")]
+    ReplaceAllRequiresReplace,
 
     #[error(
         "replaceAll found no exact occurrence of oldText, but it nearly matches existing text \

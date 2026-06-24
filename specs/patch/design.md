@@ -239,10 +239,18 @@ fn apply_patch(
         }
         // replaceAll substitutes every exact occurrence (no fuzzy cascade). Zero
         // exact matches => OldTextNotFound, unless the text is present only as a
-        // fuzzy/near match, in which case => ReplaceAllInexact.
+        // fuzzy/near match, in which case => ReplaceAllInexact. It must never
+        // succeed as a no-op.
         Operation::Replace if patch.replace_all => {
             let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
-            for spec in find_all_exact(original, old_text) {
+            let specs = find_all_exact(original, old_text);
+            if specs.is_empty() {
+                return Err(match find_unique_match(original, old_text, &new_text) {
+                    Err(PatchError::OldTextNotFound(_)) => PatchError::OldTextNotFound(old_text.clone()),
+                    _ => PatchError::ReplaceAllInexact,
+                });
+            }
+            for spec in specs {
                 buffer.replace(spec.offset, spec.length, &new_text);
             }
         }
