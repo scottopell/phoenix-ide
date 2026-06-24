@@ -19,7 +19,7 @@
 --
 -- Excludes: The internal vocabulary and error taxonomy (see llm.allium).
 --           The OpenAI Responses wire format (see responses.allium).
---           Model registry, model discovery, gateway model listing.
+--           Model registry, model discovery.
 --           HTTP/TLS transport, SSE byte framing (see sse_wire.allium
 --           for the *server-emitted* SSE contract — unrelated to this
 --           file, which consumes a *provider-emitted* SSE stream).
@@ -48,9 +48,8 @@ use "./llm.allium" as llm
 ------------------------------------------------------------
 
 -- How the Anthropic endpoint URL was resolved. Precedence is strict: an
--- explicit base-url override is used verbatim; otherwise a gateway gets
--- the provider path suffix appended; otherwise the public default.
-enum AnthropicEndpointSource { base_url_override | gateway | provider_default }
+-- explicit base-url override is used verbatim; otherwise the public default.
+enum AnthropicEndpointSource { base_url_override | provider_default }
 
 -- Lifecycle of a streaming SSE accumulation. `accumulating` is the only
 -- non-terminal state; a stream ends either `done` (finalized normally)
@@ -93,8 +92,7 @@ value AnthropicRawResponse {
 -- The resolved Anthropic endpoint for one request.
 entity AnthropicEndpoint {
     source: AnthropicEndpointSource
-    -- True when the provider path suffix (/anthropic/v1/messages) was
-    -- appended. False only for the verbatim base-url override.
+    -- Always false: Phoenix never appends hidden provider path suffixes.
     path_suffix_appended: Boolean
 }
 
@@ -174,27 +172,22 @@ entity AnthropicWireToolResultPart {
 ------------------------------------------------------------
 
 -- Endpoint precedence (resolve_anthropic_url): an ANTHROPIC_BASE_URL
--- override wins and is used verbatim with no path appended; otherwise a
--- configured gateway gets `/anthropic/v1/messages` appended after its
--- trailing slash is trimmed; otherwise the public API default.
+-- override wins and is used verbatim with no path appended; otherwise the
+-- public API default is used. Phoenix never treats a configured URL as a
+-- gateway root and never appends `/anthropic/v1/messages`.
 rule AnthropicEndpointResolved {
-    when: ResolveAnthropicEndpoint(gateway_url?, override_url?)
+    when: ResolveAnthropicEndpoint(override_url?)
 
     ensures:
         if override_url != null:
             AnthropicEndpoint.created(source: base_url_override, path_suffix_appended: false)
         else:
-            if gateway_url != null:
-                AnthropicEndpoint.created(source: gateway, path_suffix_appended: true)
-            else:
-                AnthropicEndpoint.created(source: provider_default, path_suffix_appended: true)
+            AnthropicEndpoint.created(source: provider_default, path_suffix_appended: false)
 
     @guidance
         -- The override branch is used as-is precisely because a
-        -- datacenter AI gateway exposes a full `/v1/messages` URL that
-        -- is not under an `/anthropic/...` prefix. Appending a suffix
-        -- there would 404. The gateway branch trims one trailing slash
-        -- before appending so `gw/` and `gw` resolve identically.
+        -- provider-compatible proxy exposes a full `/v1/messages` URL.
+        -- Appending a suffix there would address a different endpoint.
 }
 
 ------------------------------------------------------------

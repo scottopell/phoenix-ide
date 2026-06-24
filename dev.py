@@ -6062,27 +6062,33 @@ def _configure_llm_env(env: dict[str, str]) -> str:
     """Configure LLM environment variables. Returns a human-readable mode string.
 
     Priority:
-    1. .phoenix-ide.env overrides (LLM_API_KEY_HELPER, ANTHROPIC_API_KEY, etc.)
-    2. Provider-compatible base URL overrides
-    3. ANTHROPIC_API_KEY from shell environment
+    1. .phoenix-ide.env overrides (LLM_API_KEY_HELPER, API keys, Codex auth, etc.)
+    2. ANTHROPIC_API_KEY / OPENAI_API_KEY from shell environment
+    3. Codex auth from Phoenix or Codex CLI
     """
     # If env file provided LLM config, respect it — skip auto-detection
     if env.get("LLM_API_KEY_HELPER"):
         helper = env["LLM_API_KEY_HELPER"]
         return f"api_key_helper ({helper})"
-    if env.get("ANTHROPIC_API_KEY"):
-        return "direct API key (ANTHROPIC_API_KEY)"
+    keys = [k for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY") if env.get(k)]
+    if keys:
+        return f"direct API key ({' + '.join(keys)})"
+    if codex := _detect_codex_auth(env):
+        return codex
 
-    # Last resort: check shell env for API key
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        env["ANTHROPIC_API_KEY"] = api_key
-        return "direct API key (ANTHROPIC_API_KEY)"
+    # Last resort: check shell env for API keys
+    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        api_key = os.environ.get(key)
+        if api_key:
+            env[key] = api_key
+            return f"direct API key ({key})"
+    if codex := _detect_codex_auth(env):
+        return codex
 
     print("ERROR: No LLM configuration found.", file=sys.stderr)
     print("  Options:", file=sys.stderr)
-    print("    1. Create .phoenix-ide.env with LLM_API_KEY_HELPER or ANTHROPIC_API_KEY", file=sys.stderr)
-    print("    2. Set ANTHROPIC_API_KEY in your environment", file=sys.stderr)
+    print("    1. Create .phoenix-ide.env with LLM_API_KEY_HELPER, ANTHROPIC_API_KEY, or OPENAI_API_KEY", file=sys.stderr)
+    print("    2. Sign in with Codex or set OPENAI_USE_CODEX_AUTH=1 with Codex CLI auth", file=sys.stderr)
     sys.exit(1)
 
 

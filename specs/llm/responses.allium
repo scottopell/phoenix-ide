@@ -59,9 +59,8 @@ use "./llm.allium" as llm
 ------------------------------------------------------------
 
 -- How the Responses endpoint URL was resolved. Same precedence shape as
--- the Anthropic provider: explicit override verbatim, else gateway with
--- `/openai/v1/responses` appended, else the public default.
-enum ResponsesEndpointSource { base_url_override | gateway | provider_default }
+-- the Anthropic provider: explicit override verbatim, else the public default.
+enum ResponsesEndpointSource { base_url_override | provider_default }
 
 -- Lifecycle of a streaming SSE accumulation. `accumulating` is the only
 -- non-terminal state. `done` is reached by response.completed; `failed`
@@ -112,8 +111,7 @@ value ResponsesRawResponse {
 -- The resolved Responses endpoint for one request.
 entity ResponsesEndpoint {
     source: ResponsesEndpointSource
-    -- True when the provider path suffix (/openai/v1/responses) was
-    -- appended. False only for the verbatim base-url override.
+    -- Always false: Phoenix never appends hidden provider path suffixes.
     path_suffix_appended: Boolean
 }
 
@@ -180,20 +178,17 @@ entity ResponsesDroppedServerBlock {
 ------------------------------------------------------------
 
 -- Endpoint precedence (resolve_endpoint): an explicit base-url override
--- is used verbatim; otherwise a gateway gets `/openai/v1/responses`
--- appended after its trailing slash is trimmed; otherwise the public API
--- default.
+-- is used verbatim; otherwise the public API default is used. Phoenix never
+-- treats a configured URL as a gateway root and never appends
+-- `/openai/v1/responses`.
 rule ResponsesEndpointResolved {
-    when: ResolveResponsesEndpoint(gateway_url?, override_url?)
+    when: ResolveResponsesEndpoint(override_url?)
 
     ensures:
         if override_url != null:
             ResponsesEndpoint.created(source: base_url_override, path_suffix_appended: false)
         else:
-            if gateway_url != null:
-                ResponsesEndpoint.created(source: gateway, path_suffix_appended: true)
-            else:
-                ResponsesEndpoint.created(source: provider_default, path_suffix_appended: true)
+            ResponsesEndpoint.created(source: provider_default, path_suffix_appended: false)
 }
 
 ------------------------------------------------------------

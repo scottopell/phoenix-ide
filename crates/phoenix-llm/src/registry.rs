@@ -887,16 +887,23 @@ impl ModelRegistry {
     /// # Panics
     /// Panics if the internal specs or services lock is poisoned.
     pub fn cheap_model_id_for_provider(&self, parent_model_id: &str) -> String {
-        let parent_backend = {
+        let parent = {
             let specs = self.specs.read().expect("specs lock poisoned");
-            specs.get(parent_model_id).map(|s| s.backend)
+            specs.get(parent_model_id).map(|s| (s.backend, s.source))
         };
 
+        let Some((parent_backend, parent_source)) = parent else {
+            return parent_model_id.to_string();
+        };
+
+        if parent_source == ModelSource::External {
+            return parent_model_id.to_string();
+        }
+
         let candidates: &[&str] = match parent_backend {
-            Some(ModelBackend::Anthropic) => &["claude-haiku-4-5"],
-            Some(ModelBackend::OpenAIResponses) => &["gpt-5.4-mini"],
-            Some(ModelBackend::Mock) => return "mock".to_string(),
-            None => return parent_model_id.to_string(),
+            ModelBackend::Anthropic => &["claude-haiku-4-5"],
+            ModelBackend::OpenAIResponses => &["gpt-5.4-mini"],
+            ModelBackend::Mock => return "mock".to_string(),
         };
 
         let services = self.services.read().expect("services lock poisoned");
@@ -1373,6 +1380,21 @@ mod tests {
                 .expect("external OpenAI-compatible model should register")
                 .uses_codex_bridge(),
             "external OpenAI-compatible models must use explicit endpoint/auth config"
+        );
+    }
+
+    #[test]
+    fn cheap_model_for_external_parent_stays_on_external_model() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            external_models: vec![external_baseten_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert_eq!(
+            registry.cheap_model_id_for_provider("baseten/moonshotai/Kimi-K2.6"),
+            "baseten/moonshotai/Kimi-K2.6"
         );
     }
 
