@@ -50,6 +50,28 @@ function cachedPrToStatus(cachedPr: CachedPrSummary, attemptedAt = new Date().to
   };
 }
 
+function cachedSeedMatchesStatus(cachedSeed: PrStatusResponse, prStatus: PrStatusResponse): boolean {
+  return prStatus.found === true
+    && (prStatus.number ?? prStatus.pr?.number) === cachedSeed.number
+    && (prStatus.title ?? prStatus.pr?.title) === cachedSeed.title
+    && (prStatus.url ?? prStatus.pr?.url) === cachedSeed.url
+    && prStatus.display_state === cachedSeed.display_state
+    && (prStatus.base ?? prStatus.pr?.base) === cachedSeed.base
+    && (prStatus.head ?? prStatus.pr?.head) === cachedSeed.head;
+}
+
+function shouldShowCachedSeed(
+  internalState: InternalConversationPrStatusState,
+  cachedSeed: PrStatusResponse | null,
+): cachedSeed is PrStatusResponse {
+  if (!cachedSeed) return false;
+  if (internalState.status !== 'ready') return true;
+  if (internalState.prStatus.found && internalState.prStatus.refresh.state === 'fresh' && !internalState.prStatus.refresh.stale) {
+    return false;
+  }
+  return !cachedSeedMatchesStatus(cachedSeed, internalState.prStatus);
+}
+
 function publicStateForScope(
   internalState: InternalConversationPrStatusState,
   scopeKey: string | null,
@@ -57,8 +79,7 @@ function publicStateForScope(
 ): ConversationPrStatusState {
   if (!scopeKey) return { status: 'disabled', prStatus: null };
   if (internalState.scopeKey === scopeKey) {
-    if (internalState.status === 'ready') return internalState;
-    if (cachedSeed) return { status: 'ready', prStatus: cachedSeed };
+    if (shouldShowCachedSeed(internalState, cachedSeed)) return { status: 'ready', prStatus: cachedSeed };
     return internalState;
   }
   if (cachedSeed) return { status: 'ready', prStatus: cachedSeed };

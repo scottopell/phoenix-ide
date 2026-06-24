@@ -644,6 +644,16 @@ pub struct ConversationMetadataUpdate {
     pub task_title: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CachedPrSummary {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub display_state: phoenix_core::domain::pr_display_state::PrDisplayState,
+    pub base: String,
+    pub head: String,
+}
+
 /// A conversation enriched with derived display fields for the API layer.
 ///
 /// Produces the same JSON shape as the old `conversation_to_json()` `Value`:
@@ -704,7 +714,7 @@ pub struct EnrichedConversation {
     /// Rich status still comes from the PR status endpoint; this snapshot is
     /// only enough to render a stable PR link before that refresh completes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cached_pr: Option<serde_json::Value>,
+    pub cached_pr: Option<CachedPrSummary>,
 }
 
 /// Events sent to SSE clients.

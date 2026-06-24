@@ -141,10 +141,49 @@ describe('useConversationPrStatus', () => {
       expect(screen.getByTestId('pr-title')).toHaveTextContent('Fresh PR 8');
     });
 
-    rerender(<Probe conversationId="conv-8" cached={{ ...cachedPr(8) }} />);
+    rerender(<Probe conversationId="conv-8" cached={cachedPr(99)} />);
 
     expect(screen.getByTestId('pr-title')).toHaveTextContent('Fresh PR 8');
     expect(getPrStatus).toHaveBeenCalledTimes(1);
+  });
+
+
+
+  it('shows a semantically new cached PR while current status is a stale seed', async () => {
+    const fresh = deferred<PrStatusResponse>();
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockReturnValue(fresh.promise);
+
+    const { rerender } = render(<Probe conversationId="conv-10" cached={cachedPr(10)} />);
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('10');
+
+    rerender(<Probe conversationId="conv-10" cached={cachedPr(11)} />);
+
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('11');
+    expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 11');
+  });
+
+  it('shows a cached PR that arrives after a not-found refresh result', async () => {
+    const getPrStatus = api.getPrStatus as ReturnType<typeof vi.fn>;
+    getPrStatus.mockResolvedValue({
+      found: false,
+      refresh: {
+        state: 'not_found',
+        last_attempted_at: '2026-01-01T00:00:00Z',
+        stale: false,
+      },
+      work_change: { kind: 'clean' },
+    } satisfies PrStatusResponse);
+
+    const { rerender } = render(<Probe conversationId="conv-12" cached={null} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('refresh-state')).toHaveTextContent('not_found');
+    });
+
+    rerender(<Probe conversationId="conv-12" cached={cachedPr(12)} />);
+
+    expect(screen.getByTestId('pr-number')).toHaveTextContent('12');
+    expect(screen.getByTestId('pr-title')).toHaveTextContent('Cached PR 12');
   });
 
   it('keeps the cached PR link when the fresh status request fails', async () => {

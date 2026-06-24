@@ -552,21 +552,23 @@ fn conversation_work_scope(conv: &crate::db::Conversation) -> crate::work_scope:
     )
 }
 
-fn sidebar_cached_pr_summary(pr: &crate::db::WorkScopePrAssociation) -> Value {
-    serde_json::json!({
-        "number": pr.pr_number,
-        "title": pr.title,
-        "url": pr.url,
-        "display_state": pr.display_state,
-        "base": pr.base,
-        "head": pr.head,
-    })
+fn sidebar_cached_pr_summary(
+    pr: &crate::db::WorkScopePrAssociation,
+) -> crate::runtime::CachedPrSummary {
+    crate::runtime::CachedPrSummary {
+        number: pr.pr_number,
+        title: pr.title.clone(),
+        url: pr.url.clone(),
+        display_state: pr.display_state.clone(),
+        base: pr.base.clone(),
+        head: pr.head.clone(),
+    }
 }
 
 async fn cached_pr_summary_for_conversation(
     state: &AppState,
     conv: &crate::db::Conversation,
-) -> Result<Option<Value>, AppError> {
+) -> Result<Option<crate::runtime::CachedPrSummary>, AppError> {
     let scope = conversation_work_scope(conv);
     Ok(state
         .runtime
@@ -580,7 +582,7 @@ async fn cached_pr_summary_for_conversation(
 async fn cached_pr_summaries_for_conversations(
     state: &AppState,
     conversations: &[crate::db::Conversation],
-) -> Result<HashMap<String, Value>, AppError> {
+) -> Result<HashMap<String, crate::runtime::CachedPrSummary>, AppError> {
     let scopes: Vec<_> = conversations.iter().map(conversation_work_scope).collect();
     let associations = state
         .runtime
@@ -604,7 +606,7 @@ async fn cached_pr_summaries_for_conversations(
 fn conversation_to_json(
     state: &AppState,
     conv: &crate::db::Conversation,
-    cached_pr: Option<&Value>,
+    cached_pr: Option<&crate::runtime::CachedPrSummary>,
 ) -> Value {
     let mut val =
         serde_json::to_value(enrich_conversation_with_runtime(state, conv)).unwrap_or(Value::Null);
@@ -618,7 +620,10 @@ fn conversation_to_json(
             Value::Bool(conv_requires_action(conv)),
         );
         if let Some(pr) = cached_pr {
-            map.insert("cached_pr".to_string(), pr.clone());
+            map.insert(
+                "cached_pr".to_string(),
+                serde_json::to_value(pr).unwrap_or(Value::Null),
+            );
         }
     }
     val
@@ -645,7 +650,10 @@ async fn conversation_to_json_with_seed(
             Value::Bool(conv_requires_action(conv)),
         );
         if let Some(pr) = enriched.cached_pr.clone() {
-            map.insert("cached_pr".to_string(), pr);
+            map.insert(
+                "cached_pr".to_string(),
+                serde_json::to_value(pr).unwrap_or(Value::Null),
+            );
         }
     }
     Ok(val)
@@ -5633,7 +5641,7 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect("enriched conversation");
         let init_cached_pr = enriched.cached_pr.expect("init cached_pr");
-        assert_eq!(init_cached_pr["number"], serde_json::json!(44));
+        assert_eq!(init_cached_pr.number, 44);
 
         let token = state
             .db
