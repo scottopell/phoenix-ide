@@ -170,11 +170,11 @@ impl Tool for SpawnAgentsTool {
             "mode": {
                 "type": "string",
                 "enum": ["explore", "work"],
-                "description": "Sub-agent mode. Explore (default): read-only tools, haiku model. Work: full tool suite, inherits parent model. Work mode requires the parent to be in Work mode."
+                "description": "Sub-agent mode. Explore (default): read-only tools, registry/provider-selected cheap model. Work: full tool suite, inherits the parent model. Work mode requires the parent to be in Work mode."
             },
             "model": {
                 "type": "string",
-                "description": "LLM model override (e.g., 'claude-haiku-4-5', 'claude-sonnet-4-6'). Defaults based on mode."
+                "description": "LLM model override. When set, it must be one of the model IDs available in this environment's model registry. Defaults based on mode."
             },
             "max_turns": {
                 "type": "integer",
@@ -390,6 +390,34 @@ mod tests {
         );
         assert!(desc.contains("docs-writer: Writes docs"));
         assert!(desc.contains("security-reviewer: Finds vulns"));
+    }
+
+    #[test]
+    fn schema_model_guidance_is_provider_neutral() {
+        let schema = SpawnAgentsTool::new().input_schema();
+        let props = &schema["properties"]["tasks"]["items"]["properties"];
+        let mode_guidance = props["mode"]["description"].as_str().unwrap();
+        let override_guidance = props["model"]["description"].as_str().unwrap();
+        let guidance = format!("{mode_guidance}\n{override_guidance}");
+
+        assert!(
+            mode_guidance.contains("registry/provider-selected cheap model"),
+            "mode guidance should describe the provider-neutral explore default: {mode_guidance}"
+        );
+        assert!(
+            mode_guidance.contains("inherits the parent model"),
+            "mode guidance should describe the work-mode default: {mode_guidance}"
+        );
+        assert!(
+            override_guidance.contains("model IDs available in this environment's model registry"),
+            "model override guidance should describe registry validation: {override_guidance}"
+        );
+        for provider_specific_alias in ["claude-haiku-4-5", "claude-sonnet-4-6", "haiku model"] {
+            assert!(
+                !guidance.contains(provider_specific_alias),
+                "spawn_agents schema guidance should not mention provider-specific alias {provider_specific_alias:?}: {guidance}"
+            );
+        }
     }
 
     #[test]
