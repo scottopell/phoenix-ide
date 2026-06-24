@@ -217,12 +217,10 @@ values are `anthropic` (Anthropic Messages-compatible) and `openai_responses`
 Example Anthropic-compatible provider POC:
 
 ```env
-LLM_API_KEY_HELPER=ddtool auth token rapid-ai-platform --datacenter us1.staging.dog
-LLM_AUTH_HEADER=bearer
-ANTHROPIC_BASE_URL=https://ai-gateway.us1.staging.dog/v1/messages
-LLM_CUSTOM_HEADERS=source: openweight-restricted-poc-<firstname>-<lastname>\norg-id: 2\nx-target-account: eval
-DEFAULT_MODEL=baseten/moonshotai/Kimi-K2.6
-PHOENIX_LLM_MODELS=[{"id":"baseten/moonshotai/Kimi-K2.6","backend":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]
+ANTHROPIC_BASE_URL=https://provider.example/v1/messages
+LLM_CUSTOM_HEADERS=source: my-provider-poc
+DEFAULT_MODEL=example/provider-model
+PHOENIX_LLM_MODELS=[{"id":"example/provider-model","backend":"anthropic","description":"Example Anthropic-compatible POC","context_window":200000,"recommended":false,"supports_tool_search":false}]
 ```
 
 ### TLS

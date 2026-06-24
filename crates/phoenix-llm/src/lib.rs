@@ -16,9 +16,10 @@
 //!
 //! ## Authentication
 //!
-//! Direct Anthropic calls use `x-api-key` unless `LLM_AUTH_HEADER=bearer` is set
-//! for helper-issued tokens. `OpenAI` Responses calls use bearer auth. The
-//! ChatGPT/Codex bridge only applies to built-in `OpenAI` Responses models.
+//! Direct Anthropic calls use `x-api-key`. Helper-issued credentials may choose
+//! an alternate header style for provider-compatible endpoints. `OpenAI`
+//! Responses calls use bearer auth. The ChatGPT/Codex bridge only applies to
+//! built-in `OpenAI` Responses models.
 //!
 //! ## Discovery
 //!
