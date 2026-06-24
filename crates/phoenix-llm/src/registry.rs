@@ -395,6 +395,33 @@ impl LlmConfig {
     }
 }
 
+fn discovery_auth_headers(
+    backend: ModelBackend,
+    static_key: Option<&str>,
+    helper_token: Option<&str>,
+    auth_style: AuthStyle,
+) -> Option<Vec<(String, String)>> {
+    let credential = static_key
+        .filter(|value| !value.is_empty())
+        .or(helper_token.filter(|value| !value.is_empty()))?;
+    let headers = match backend {
+        ModelBackend::Anthropic => match (static_key.filter(|value| !value.is_empty()), auth_style)
+        {
+            (Some(_), _) | (None, AuthStyle::ApiKey) => {
+                vec![("x-api-key".to_string(), credential.to_string())]
+            }
+            (None, AuthStyle::PlainBearer) => {
+                vec![("Authorization".to_string(), format!("Bearer {credential}"))]
+            }
+        },
+        ModelBackend::OpenAIResponses => {
+            vec![("Authorization".to_string(), format!("Bearer {credential}"))]
+        }
+        ModelBackend::Mock => return None,
+    };
+    Some(headers)
+}
+
 fn warn_if_endpoint_url_has_no_path(name: &str, url: &str) {
     let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let has_path = without_scheme
@@ -573,7 +600,7 @@ impl ModelRegistry {
         tracing::info!("Discovering models via credential_helper auth");
         let discovered = discover_models(&discovery).await;
 
-        if discovered.is_empty() {
+        if !discovered.any_listed() {
             tracing::warn!(
                 "Model discovery returned no models, falling back to configured model list"
             );
@@ -586,11 +613,14 @@ impl ModelRegistry {
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
 
         for spec in Self::model_specs(config) {
-            if Self::spec_matches_discovered_model(&spec, &discovered) {
-                if let Some(service) = Self::try_create_model(&spec, config) {
-                    services.insert(spec.id.clone(), service);
-                    specs.insert(spec.id.clone(), spec);
-                }
+            if discovered.was_listed(spec.backend)
+                && !Self::spec_matches_discovered_model(&spec, &discovered)
+            {
+                continue;
+            }
+            if let Some(service) = Self::try_create_model(&spec, config) {
+                services.insert(spec.id.clone(), service);
+                specs.insert(spec.id.clone(), spec);
             }
         }
 
@@ -652,14 +682,37 @@ impl ModelRegistry {
             return None;
         }
 
-        let helper = config.credential_helper.as_ref()?;
-        let auth_token = helper.cached_credential().await;
-        auth_token.as_ref()?;
+        let helper_token = match config.credential_helper.as_ref() {
+            Some(helper) => helper.cached_credential().await,
+            None => None,
+        };
+        let auth_style = config.auth_style;
+        let anthropic_auth_headers = if anthropic_models_url.is_some() {
+            discovery_auth_headers(
+                ModelBackend::Anthropic,
+                config.anthropic_api_key.as_deref(),
+                helper_token.as_deref(),
+                auth_style,
+            )?
+        } else {
+            Vec::new()
+        };
+        let openai_auth_headers = if openai_models_url.is_some() {
+            discovery_auth_headers(
+                ModelBackend::OpenAIResponses,
+                config.openai_api_key.as_deref(),
+                helper_token.as_deref(),
+                auth_style,
+            )?
+        } else {
+            Vec::new()
+        };
 
         Some(DiscoveryConfig {
             anthropic_models_url,
             openai_models_url,
-            auth_token,
+            anthropic_auth_headers,
+            openai_auth_headers,
             custom_headers: config.custom_headers.clone(),
         })
     }
@@ -1263,7 +1316,9 @@ mod tests {
     fn discovery_matcher_allows_configured_model_id_and_backend_prefix() {
         let model = external_baseten_model();
         let discovered = DiscoveredModels {
+            anthropic_listed: true,
             anthropic: HashSet::from(["anthropic/baseten/moonshotai/Kimi-K2.6".to_string()]),
+            openai_responses_listed: false,
             openai_responses: HashSet::new(),
         };
 
@@ -1277,7 +1332,9 @@ mod tests {
     fn discovery_matcher_does_not_cross_backend_boundaries() {
         let model = external_baseten_model();
         let discovered = DiscoveredModels {
+            anthropic_listed: true,
             anthropic: HashSet::new(),
+            openai_responses_listed: true,
             openai_responses: HashSet::from(["baseten/moonshotai/Kimi-K2.6".to_string()]),
         };
 
@@ -1390,10 +1447,37 @@ mod tests {
             .await
             .expect("cached helper token should produce discovery config");
 
-        assert_eq!(discovery.auth_token.as_deref(), Some("test-token"));
+        assert_eq!(
+            discovery.anthropic_auth_headers,
+            vec![("x-api-key".to_string(), "test-token".to_string())]
+        );
         assert_eq!(
             discovery.anthropic_models_url.as_deref(),
             Some("https://proxy.example/v1/models")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_uses_static_provider_keys() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("anthropic-key".to_string()),
+            openai_api_key: Some("openai-key".to_string()),
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            openai_base_url: Some("https://proxy.example/v1/responses".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("static keys should produce discovery config");
+
+        assert_eq!(
+            discovery.anthropic_auth_headers,
+            vec![("x-api-key".to_string(), "anthropic-key".to_string())]
+        );
+        assert_eq!(
+            discovery.openai_auth_headers,
+            vec![("Authorization".to_string(), "Bearer openai-key".to_string())]
         );
     }
 

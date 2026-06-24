@@ -14,8 +14,10 @@ pub struct DiscoveryConfig {
     pub anthropic_models_url: Option<String>,
     /// URL for `OpenAI` models endpoint
     pub openai_models_url: Option<String>,
-    /// Auth token to send as Authorization: Bearer (if any)
-    pub auth_token: Option<String>,
+    /// Auth headers to send to the Anthropic models endpoint.
+    pub anthropic_auth_headers: Vec<(String, String)>,
+    /// Auth headers to send to the `OpenAI` models endpoint.
+    pub openai_auth_headers: Vec<(String, String)>,
     /// Custom headers to inject on discovery requests
     pub custom_headers: Vec<(String, String)>,
 }
@@ -33,7 +35,9 @@ struct ModelData {
 
 #[derive(Debug, Default)]
 pub struct DiscoveredModels {
+    pub anthropic_listed: bool,
     pub anthropic: HashSet<String>,
+    pub openai_responses_listed: bool,
     pub openai_responses: HashSet<String>,
 }
 
@@ -44,6 +48,11 @@ fn empty_ids() -> &'static HashSet<String> {
 
 impl DiscoveredModels {
     #[must_use]
+    pub fn any_listed(&self) -> bool {
+        self.anthropic_listed || self.openai_responses_listed
+    }
+
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.anthropic.is_empty() && self.openai_responses.is_empty()
     }
@@ -51,6 +60,15 @@ impl DiscoveredModels {
     #[must_use]
     pub fn len(&self) -> usize {
         self.anthropic.len() + self.openai_responses.len()
+    }
+
+    #[must_use]
+    pub fn was_listed(&self, backend: ModelBackend) -> bool {
+        match backend {
+            ModelBackend::Anthropic => self.anthropic_listed,
+            ModelBackend::OpenAIResponses => self.openai_responses_listed,
+            ModelBackend::Mock => false,
+        }
     }
 
     #[must_use]
@@ -73,13 +91,16 @@ pub async fn discover_models(config: &DiscoveryConfig) -> DiscoveredModels {
         match discover_provider(
             url,
             "anthropic",
-            config.auth_token.as_deref(),
+            config.anthropic_auth_headers.as_slice(),
             &config.custom_headers,
             &[("anthropic-version", "2023-06-01")],
         )
         .await
         {
-            Ok(m) => models.anthropic.extend(m),
+            Ok(m) => {
+                models.anthropic_listed = true;
+                models.anthropic.extend(m);
+            }
             Err(e) => tracing::warn!(provider = "anthropic", error = %e, "Discovery failed"),
         }
     }
@@ -88,13 +109,16 @@ pub async fn discover_models(config: &DiscoveryConfig) -> DiscoveredModels {
         match discover_provider(
             url,
             "openai",
-            config.auth_token.as_deref(),
+            config.openai_auth_headers.as_slice(),
             &config.custom_headers,
             &[],
         )
         .await
         {
-            Ok(m) => models.openai_responses.extend(m),
+            Ok(m) => {
+                models.openai_responses_listed = true;
+                models.openai_responses.extend(m);
+            }
             Err(e) => tracing::warn!(provider = "openai", error = %e, "Discovery failed"),
         }
     }
@@ -106,7 +130,7 @@ pub async fn discover_models(config: &DiscoveryConfig) -> DiscoveredModels {
 async fn discover_provider(
     url: &str,
     provider_name: &str,
-    auth_token: Option<&str>,
+    auth_headers: &[(String, String)],
     custom_headers: &[(String, String)],
     extra_headers: &[(&str, &str)],
 ) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
@@ -119,8 +143,8 @@ async fn discover_provider(
     for &(key, value) in extra_headers {
         request = request.header(key, value);
     }
-    if let Some(token) = auth_token {
-        request = request.header("Authorization", format!("Bearer {token}"));
+    for (key, value) in auth_headers {
+        request = request.header(key.as_str(), value.as_str());
     }
     for (key, value) in custom_headers {
         request = request.header(key.as_str(), value.as_str());
