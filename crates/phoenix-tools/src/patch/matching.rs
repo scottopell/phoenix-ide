@@ -473,6 +473,7 @@ mod tests {
             | PatchError::OldTextNotFound
             | PatchError::EditOutOfBounds
             | PatchError::OverlappingEdits
+            | PatchError::ReplaceAllInexact
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => panic!("unexpected error: {other:?}"),
         }
@@ -543,6 +544,7 @@ mod tests {
             | PatchError::OldTextNotFound
             | PatchError::EditOutOfBounds
             | PatchError::OverlappingEdits
+            | PatchError::ReplaceAllInexact
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => {
                 panic!("expected fuzzy duplicate diagnostics, got {other:?}")
@@ -568,6 +570,7 @@ mod tests {
             | PatchError::OldTextNotFound
             | PatchError::EditOutOfBounds
             | PatchError::OverlappingEdits
+            | PatchError::ReplaceAllInexact
             | PatchError::ReindentPrefixMismatch { .. }
             | PatchError::NoPatches) => {
                 panic!("expected normalised duplicate diagnostics, got {other:?}")

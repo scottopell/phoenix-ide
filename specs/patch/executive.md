@@ -22,4 +22,4 @@ Implemented as a Tool trait with schema for path and patches array. Each patch s
 | **REQ-PATCH-008:** Size Limits | ✅ Complete | 60KB input limit enforced |
 | **REQ-PATCH-009:** Mode-Based Availability | ❌ Not Started | Disabled in Explore mode; scoped to worktree in Work mode |
 | **REQ-PATCH-010:** Anchored Insertion | ✅ Complete | insert_before/insert_after as zero-length edits at matched anchor |
-| **REQ-PATCH-011:** Replace All Occurrences | ✅ Complete | replaceAll waives uniqueness; exact matches only |
+| **REQ-PATCH-011:** Replace All Occurrences | ✅ Complete | replaceAll waives uniqueness; exact matches only; near-match miss reported as inexact, not "not found" |

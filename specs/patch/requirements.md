@@ -229,12 +229,15 @@ WHEN replace operation is requested with replaceAll
 THE SYSTEM SHALL substitute every exact occurrence of oldText with newText
 AND waive the single-occurrence uniqueness requirement
 
-WHEN replaceAll is requested and no exact occurrence exists
-THE SYSTEM SHALL return the "old text not found" error
-
 WHEN replaceAll is requested
 THE SYSTEM SHALL match exact occurrences only
 AND NOT apply the fuzzy recovery strategies (dedent, trimmed-line, skeleton)
+
+WHEN replaceAll finds no exact occurrence and oldText is genuinely absent
+THE SYSTEM SHALL return the "old text not found" error
+
+WHEN replaceAll finds no exact occurrence but oldText matches existing text under the fuzzy strategies (a near match differing by whitespace or Unicode lookalikes)
+THE SYSTEM SHALL return an inexact-match diagnostic that says the text is present only as a near match, that replaceAll is exact-only, and that the agent should copy the exact bytes or use per-site replace patches
 
 **Rationale:** Mechanical refactors that change every copy of a repeated block to the same new
 text are otherwise impossible in one call: the uniqueness rule rejects them, and widening context
@@ -243,3 +246,7 @@ that case, and being opt-in keeps the default safe — a multi-site replacement 
 accident. Fuzzy recovery is deliberately excluded: it exists to pin down a single best candidate
 when the agent's text is slightly off, a notion that has no well-defined meaning across many
 occurrences, and applying it to "all" risks rewriting bytes the agent never intended to touch.
+Because exact-only matching would otherwise surface a slightly-off oldText as a misleading "not
+found" when the text is plainly in the file, the inexact-match case is reported distinctly — the
+failure itself tells the agent how to recover rather than requiring prior knowledge of the
+exact-only rule.

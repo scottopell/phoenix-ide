@@ -151,6 +151,13 @@ pub enum PatchError {
     #[error("Two edits in this call target overlapping regions of the file; split them into separate patch calls")]
     OverlappingEdits,
 
+    #[error(
+        "replaceAll found no exact occurrence of oldText, but it nearly matches existing text \
+         (differs by whitespace or Unicode lookalikes). replaceAll substitutes exact matches only \
+         — copy the exact bytes from the file, or use a separate replace patch per site (those fuzzy-recover)."
+    )]
+    ReplaceAllInexact,
+
     #[error("Line does not start with expected prefix '{prefix}':\n{line}")]
     ReindentPrefixMismatch { prefix: String, line: String },
 

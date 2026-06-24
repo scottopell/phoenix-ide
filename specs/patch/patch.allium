@@ -301,10 +301,18 @@ rule BuildReplaceAllEdits {
     @guidance
         -- Exact occurrences only: the fuzzy cascade (dedent, trimmed, skeleton)
         -- is not consulted, because "best single candidate" has no meaning across
-        -- many sites. Zero exact occurrences -> OldTextNotFound. One edit is emitted
-        -- per occurrence; match_indices yields non-overlapping occurrences, so the
-        -- emitted edits never overlap each other. replace_all does not write a
-        -- to_clipboard (there is no single matched text to store).
+        -- many sites. One edit is emitted per occurrence; match_indices yields
+        -- non-overlapping occurrences, so the emitted edits never overlap each
+        -- other. replace_all does not write a to_clipboard (there is no single
+        -- matched text to store).
+        --
+        -- Zero exact occurrences splits two ways, so an exact-only miss is never
+        -- surfaced as a misleading "not found" when the text is visibly present:
+        --   * genuinely absent (the fuzzy cascade also finds nothing) ->
+        --     OldTextNotFound.
+        --   * present only as a near match (the fuzzy cascade would have matched)
+        --     -> ReplaceAllInexact, which tells the agent to copy the exact bytes
+        --     or use per-site replace patches.
 }
 
 -- insert_before / insert_after locate a unique anchor exactly as replace does

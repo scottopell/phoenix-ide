@@ -180,7 +180,14 @@ impl PatchPlanner {
                     let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
                     let specs = find_all_exact(original, old_text);
                     if specs.is_empty() {
-                        return Err(PatchError::OldTextNotFound);
+                        // Distinguish "genuinely absent" from "present only as a
+                        // fuzzy/near match": replaceAll is exact-only, so a near
+                        // match would otherwise surface as a misleading "not
+                        // found". find_unique_match runs the full fuzzy cascade.
+                        return match find_unique_match(original, old_text) {
+                            Err(PatchError::OldTextNotFound) => Err(PatchError::OldTextNotFound),
+                            _ => Err(PatchError::ReplaceAllInexact),
+                        };
                     }
                     for spec in specs {
                         edits.push(Edit {
@@ -671,6 +678,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.resulting_content, "X bar X baz X");
+    }
+
+    #[test]
+    fn test_replace_all_near_match_reports_inexact() {
+        // The file uses a tab indent; the agent's oldText uses spaces. No exact
+        // match exists, but the fuzzy cascade would have matched — replaceAll must
+        // say so rather than claim the text is absent.
+        let mut planner = PatchPlanner::new();
+        let err = planner
+            .plan(
+                &path("test.txt"),
+                Some("\tneedle\nother\n\tneedle"),
+                &[PatchRequest {
+                    operation: Operation::Replace,
+                    old_text: Some("  needle".to_string()),
+                    new_text: Some("X".to_string()),
+                    replace_all: true,
+                    to_clipboard: None,
+                    from_clipboard: None,
+                    reindent: None,
+                }],
+            )
+            .unwrap_err();
+
+        assert_eq!(err, PatchError::ReplaceAllInexact);
     }
 
     #[test]
