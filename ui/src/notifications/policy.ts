@@ -138,6 +138,7 @@ function eventTypeEnabled(type: NotificationEventType, settings: NotificationSet
 export function eventForState(state: ConversationState, conversation: Conversation): PolicyNotificationEvent | null {
   switch (state.type) {
     case 'awaiting_task_approval':
+    case 'awaiting_commission_review_approval':
       return { type: 'task_approval_needed', title: 'Task approval needed', conversation };
     case 'awaiting_user_response':
       return { type: 'question_asked', title: 'Question asked', conversation };
