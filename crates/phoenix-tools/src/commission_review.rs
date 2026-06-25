@@ -1091,29 +1091,44 @@ async fn git_capture_limited(
         .spawn()
         .map_err(|e| format!("failed to run git {}: {e}", args.join(" ")))?;
 
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| format!("failed to capture git {} stdout", args.join(" ")))?;
-    let mut buf = vec![0_u8; max_bytes.saturating_add(1)];
-    let n = stdout
-        .read(&mut buf)
+
+    // Drain stdout by looping to EOF, bounded at `max_bytes + 1` bytes. A single
+    // `read()` returns only what currently sits in the OS pipe buffer (a few KB
+    // to ~64KB), never the whole diff. Reading once and then waiting for the
+    // child deadlocks the instant the diff exceeds the pipe buffer: git blocks
+    // writing the remainder into a pipe nobody drains, so it never exits and the
+    // wait never returns. Draining to EOF keeps the pipe moving; the bound caps
+    // memory and lets us detect an over-cap diff.
+    let read_cap = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut buf = Vec::new();
+    let bytes_read = stdout
+        .take(read_cap)
+        .read_to_end(&mut buf)
         .await
         .map_err(|e| format!("failed reading git {} stdout: {e}", args.join(" ")))?;
-    let truncated = n > max_bytes;
-    if truncated {
+
+    if bytes_read > max_bytes {
+        // Over the cap. We hold the read end and stop draining, so git would
+        // wedge on its next write — SIGKILL reaps it regardless of pipe state,
+        // which cannot deadlock (unlike waiting for a normal exit).
         let _ = child.kill().await;
         return Ok((String::new(), true));
     }
+
+    // EOF under the cap means git closed stdout and is exiting, so this wait
+    // completes promptly and yields the exit status plus any stderr.
     let output = child
         .wait_with_output()
         .await
         .map_err(|e| format!("failed waiting for git {}: {e}", args.join(" ")))?;
     if output.status.success() {
-        Ok((
-            String::from_utf8_lossy(&buf[..n]).trim_end().to_string(),
-            false,
-        ))
+        Ok((String::from_utf8_lossy(&buf).trim_end().to_string(), false))
     } else {
         Err(format!(
             "git {} failed: {}",
@@ -1130,6 +1145,94 @@ fn pretty_json<T: Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `git` in `cwd`, asserting success. Test helper for repo setup.
+    async fn git_ok(cwd: &Path, args: &[&str]) {
+        let out = git_command()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .await
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A committed file whose diff far exceeds the OS pipe buffer must return
+    /// promptly as truncated, not deadlock. Regression: a single `read()` then
+    /// `wait_with_output()` on the taken stdout wedged git on its next write
+    /// once the diff outgrew the pipe buffer, parking the tool indefinitely.
+    #[tokio::test]
+    async fn large_diff_returns_truncated_without_deadlock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        // ~1MB single-line-free blob: orders of magnitude past any pipe buffer.
+        let big = "x\n".repeat(512 * 1024);
+        std::fs::write(repo.join("big.txt"), &big).expect("write");
+        git_ok(repo, &["add", "."]).await;
+        git_ok(repo, &["commit", "-qm", "add big"]).await;
+
+        // Diff of the whole file against the empty tree, capped at 64KB.
+        let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let args = [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            empty_tree,
+            "--",
+            "big.txt",
+        ];
+        let fut = git_capture_limited(repo, &args, 64 * 1024);
+        let (body, truncated) = tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+            .await
+            .expect("git_capture_limited must not hang on a large diff")
+            .expect("git diff should succeed");
+        assert!(truncated, "a >cap diff must be reported truncated");
+        assert!(body.is_empty(), "truncated diffs return an empty body");
+    }
+
+    /// A diff comfortably under the cap is returned whole — the bounded drain
+    /// must not silently truncate output that arrives across multiple reads.
+    #[tokio::test]
+    async fn small_diff_is_captured_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        let body_text = "line\n".repeat(2000); // ~10KB, well under the 64KB cap
+        std::fs::write(repo.join("small.txt"), &body_text).expect("write");
+        git_ok(repo, &["add", "."]).await;
+        git_ok(repo, &["commit", "-qm", "add small"]).await;
+
+        let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let (body, truncated) = git_capture_limited(
+            repo,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                empty_tree,
+                "--",
+                "small.txt",
+            ],
+            64 * 1024,
+        )
+        .await
+        .expect("git diff should succeed");
+        assert!(!truncated, "an under-cap diff must not be truncated");
+        assert!(
+            body.matches("+line").count() >= 2000,
+            "every added line must survive the capture, got {} lines",
+            body.matches("+line").count()
+        );
+    }
 
     #[test]
     fn parse_json_findings() {
