@@ -26,4 +26,4 @@ kind of persisted human approval surface that task approval uses.
 | REQ-CR-007 | Hide Review Where Phoenix Cannot Infer Scope | 🔄 In Progress | Registry boundaries exist; stale replay handling needs approval-runtime polish. |
 | REQ-CR-008 | Keep Review Read-Only | ✅ Complete | Harness uses read-only git commands. |
 | REQ-CR-009 | Honor Cancellation | ✅ Complete | Cancellation token is checked during collection and LLM wait. |
-| REQ-CR-010 | Report Skipped Review Material | ✅ Complete | Skipped and truncated files produce warnings. |
+| REQ-CR-010 | Report Skipped Review Material | ✅ Complete | Size-cap exclusions surfaced in a typed `unreviewed` result (forces completed_with_warnings); binary/unsupported produce warnings. |

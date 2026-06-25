@@ -287,8 +287,26 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     }
 
     if collection.files_reviewed == 0 {
+        // Nothing was reviewed, but distinguish "no reviewable text diff" from
+        // "every changed file was excluded by a size cap". The latter is a
+        // coverage gap, not a clean no-op, so it must not read as an ordinary
+        // Skipped run with no findings.
+        let (status, reviewer_summary) = if collection.unreviewed.is_empty() {
+            (
+                ReviewStatus::Skipped,
+                "No reviewable text diff was found".to_string(),
+            )
+        } else {
+            (
+                ReviewStatus::CompletedWithWarnings,
+                format!(
+                    "No files were reviewed: all {} changed file(s) exceeded a size cap",
+                    collection.unreviewed.len()
+                ),
+            )
+        };
         return Ok(ReviewOutput {
-            status: ReviewStatus::Skipped,
+            status,
             summary: ReviewSummary {
                 target: target.summary,
                 files_changed: collection.files_changed,
@@ -300,7 +318,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 usage: phoenix_core::domain::llm_types::Usage::default(),
                 input_tokens: None,
                 output_tokens: None,
-                reviewer_summary: Some("No reviewable text diff was found".to_string()),
+                reviewer_summary: Some(reviewer_summary),
             },
             unreviewed: collection.unreviewed,
             findings: Vec::new(),
@@ -1310,6 +1328,58 @@ mod tests {
         // Once origin/main exists, it must win.
         git_ok(repo, &["update-ref", "refs/remotes/origin/main", &head]).await;
         assert_eq!(effective_base_ref(repo, "main").await, "origin/main");
+    }
+
+    /// A diff whose only changed files all exceed the per-file cap reviews
+    /// nothing, but must report the coverage gap (`completed_with_warnings` +
+    /// unreviewed list), not look like an ordinary empty-diff skip.
+    #[tokio::test]
+    async fn all_files_over_cap_reports_coverage_gap_not_skip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]).await;
+        let base = git_capture(repo, &["rev-parse", "HEAD"])
+            .await
+            .expect("base");
+        git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base]).await;
+        // One changed file, far over MAX_FILE_BYTES, on a committed branch.
+        let big = "let x = 0;\n".repeat(MAX_FILE_BYTES / 5);
+        std::fs::write(repo.join("big.rs"), &big).expect("write");
+        git_ok(repo, &["add", "."]).await;
+        git_ok(repo, &["commit", "-qm", "huge"]).await;
+
+        let ctx = ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            repo.to_path_buf(),
+            std::sync::Arc::new(crate::BrowserSessionManager::default()),
+            std::sync::Arc::new(crate::BashHandleRegistry::new()),
+            std::sync::Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            std::sync::Arc::new(crate::TmuxRegistry::new()),
+            Some(repo.to_path_buf()),
+        );
+        let target = resolve_target(
+            &ctx,
+            &CommissionReviewInput {
+                brief: "ready".to_string(),
+                focus: None,
+                allow_dirty_working_tree: false,
+            },
+            Some("main"),
+        )
+        .await
+        .expect("resolve");
+        let collection = collect_diff(&target, &ctx).await.expect("collect");
+
+        assert_eq!(collection.files_reviewed, 0, "the only file is over-cap");
+        assert!(
+            !collection.unreviewed.is_empty(),
+            "over-cap file must be recorded as unreviewed"
+        );
     }
 
     #[test]

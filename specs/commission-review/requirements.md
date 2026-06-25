@@ -151,11 +151,22 @@ long-running Phoenix operations.
 
 ### REQ-CR-010: Report Skipped Review Material
 
-WHEN commission review excludes a large, binary, unsupported, or truncated file
+WHEN commission review excludes a changed file because its diff exceeds the
+per-file or total review size cap
+THE SYSTEM SHALL record the file and the cap it exceeded in a dedicated
+`unreviewed` result, separate from advisory warnings
+
+WHEN commission review excludes a binary, unsupported, or otherwise undiffable
+changed file
 THE SYSTEM SHALL include a warning identifying the skipped material and the
 reason it was skipped
 
-THE SYSTEM SHALL NOT silently omit changed files from the review result
+WHEN any changed file is excluded for any reason
+THE SYSTEM SHALL NOT report the run as fully successful, and SHALL NOT silently
+omit the file from the review result
 
-**Rationale:** Users and agents need to know the limits of a review. Explicit
-warnings prevent over-trusting a review that did not examine all changed files.
+**Rationale:** Users and agents need to know the limits of a review. A
+size-driven coverage gap is a distinct, actionable fact — which files were too
+large to review — so it is surfaced as its own typed result rather than buried
+among advisory warnings, and it forces a non-success status so an incomplete
+review can never be mistaken for a clean one.

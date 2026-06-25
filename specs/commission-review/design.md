@@ -9,7 +9,8 @@ approval gate allows spending tokens.
 
 The review prompt asks the model to return JSON with typed findings. Phoenix
 parses those findings into Rust structs before serializing the tool result, so
-review comments, warnings, and summary metadata have one authoritative shape.
+review comments, warnings, unreviewed-file records, and summary metadata have
+one authoritative shape.
 
 ```mermaid
 flowchart TD
@@ -20,7 +21,7 @@ flowchart TD
   E -->|rejected| F[structured rejected result]
   E -->|approved| G[bounded diff collection]
   G --> H[Phoenix default LLM review]
-  H --> I[typed findings and warnings]
+  H --> I[typed findings, warnings, and unreviewed-file records]
 ```
 
 ## REQ-CR-002: Brief validation
@@ -62,9 +63,21 @@ The tool checks the cancellation token before review execution, during per-file
 diff collection, and while awaiting the LLM response. Cancellation returns a
 failure result instead of partial or fabricated findings.
 
-## REQ-CR-010: Filtering and warnings
+## REQ-CR-010: Filtering and coverage reporting
 
-Changed files are filtered before review. Binary numstat entries, unsupported
-extensions, per-file size cap overages, and total review-budget truncation all
-produce explicit warnings. Reviewed-file counts and changed-file counts are
-reported separately so the user can see whether the review covered every change.
+Changed files are filtered before review through two channels, so an incomplete
+review is never silently presented as complete:
+
+- Files excluded by a size cap — a per-file diff overage or total review-budget
+  truncation — are recorded in a typed top-level `unreviewed` list, each tagged
+  with the cap it exceeded (`per_file_cap` or `total_review_cap`). A non-empty
+  list forces a `completed_with_warnings` status, so a run that skipped files
+  can never report success. This holds even in the degenerate case where every
+  changed file was excluded and none were reviewed: the result reports the
+  coverage gap rather than reading as an ordinary empty-diff skip.
+- Binary numstat entries and unsupported extensions produce advisory
+  `warnings`. They are not reviewable as text, so they are reported separately
+  from the size-driven coverage gap rather than conflated with it.
+
+Reviewed-file and changed-file counts are reported separately so the user can
+see whether the review covered every change.
