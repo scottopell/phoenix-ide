@@ -397,20 +397,21 @@ impl LlmConfig {
 
 fn discovery_auth_headers(
     backend: ModelBackend,
-    static_key: Option<&str>,
     helper_token: Option<&str>,
+    static_key: Option<&str>,
     auth_style: AuthStyle,
 ) -> Option<Vec<(String, String)>> {
-    let credential = static_key
-        .filter(|value| !value.is_empty())
-        .or(helper_token.filter(|value| !value.is_empty()))?;
+    let helper_token = helper_token.filter(|value| !value.is_empty());
+    let static_key = static_key.filter(|value| !value.is_empty());
+    let (credential, from_helper) = helper_token
+        .map(|token| (token, true))
+        .or_else(|| static_key.map(|key| (key, false)))?;
     let headers = match backend {
-        ModelBackend::Anthropic => match (static_key.filter(|value| !value.is_empty()), auth_style)
-        {
-            (Some(_), _) | (None, AuthStyle::ApiKey) => {
+        ModelBackend::Anthropic => match (from_helper, auth_style) {
+            (false, _) | (true, AuthStyle::ApiKey) => {
                 vec![("x-api-key".to_string(), credential.to_string())]
             }
-            (None, AuthStyle::PlainBearer) => {
+            (true, AuthStyle::PlainBearer) => {
                 vec![("Authorization".to_string(), format!("Bearer {credential}"))]
             }
         },
@@ -611,6 +612,7 @@ impl ModelRegistry {
 
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
+        let mut registered_non_mock = false;
 
         for spec in Self::model_specs(config) {
             let uses_codex_bridge = config.use_codex_auth
@@ -623,12 +625,15 @@ impl ModelRegistry {
                 continue;
             }
             if let Some(service) = Self::try_create_model(&spec, config) {
+                if spec.backend != ModelBackend::Mock {
+                    registered_non_mock = true;
+                }
                 services.insert(spec.id.clone(), service);
                 specs.insert(spec.id.clone(), spec);
             }
         }
 
-        if services.is_empty() {
+        if !registered_non_mock {
             tracing::warn!(
                 discovered = discovered.len(),
                 "No configured known models found in discovery; falling back to configured model list"
@@ -1533,6 +1538,32 @@ mod tests {
         assert_eq!(
             discovery.anthropic_auth_headers,
             vec![("x-api-key".to_string(), "helper-token".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_preserves_bearer_for_cached_helper_token() {
+        let helper =
+            crate::CredentialHelper::new("echo bearer-token".to_string(), Duration::from_hours(1));
+        assert!(helper.get().await.is_none());
+        helper.wait_for_settlement().await;
+        let config = LlmConfig {
+            credential_helper: Some(helper),
+            auth_style: AuthStyle::PlainBearer,
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("cached helper token should produce discovery config");
+
+        assert_eq!(
+            discovery.anthropic_auth_headers,
+            vec![(
+                "Authorization".to_string(),
+                "Bearer bearer-token".to_string()
+            )]
         );
     }
 
