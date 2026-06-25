@@ -403,15 +403,13 @@ fn discovery_auth_headers(
 ) -> Option<Vec<(String, String)>> {
     let helper_token = helper_token.filter(|value| !value.is_empty());
     let static_key = static_key.filter(|value| !value.is_empty());
-    let (credential, from_helper) = helper_token
+    let (credential, _from_helper) = helper_token
         .map(|token| (token, true))
         .or_else(|| static_key.map(|key| (key, false)))?;
     let headers = match backend {
-        ModelBackend::Anthropic => match (from_helper, auth_style) {
-            (false, _) | (true, AuthStyle::ApiKey) => {
-                vec![("x-api-key".to_string(), credential.to_string())]
-            }
-            (true, AuthStyle::PlainBearer) => {
+        ModelBackend::Anthropic => match auth_style {
+            AuthStyle::ApiKey => vec![("x-api-key".to_string(), credential.to_string())],
+            AuthStyle::PlainBearer => {
                 vec![("Authorization".to_string(), format!("Bearer {credential}"))]
             }
         },
@@ -612,28 +610,27 @@ impl ModelRegistry {
 
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
-        let mut registered_non_mock = false;
+        let mut registered_listed_non_mock = false;
 
         for spec in Self::model_specs(config) {
             let uses_codex_bridge = config.use_codex_auth
                 && spec.backend == ModelBackend::OpenAIResponses
                 && spec.source == ModelSource::BuiltIn;
-            if !uses_codex_bridge
-                && discovered.was_listed(spec.backend)
-                && !Self::spec_matches_discovered_model(&spec, &discovered)
-            {
+            let listed_backend_match = discovered.was_listed(spec.backend)
+                && Self::spec_matches_discovered_model(&spec, &discovered);
+            if !uses_codex_bridge && discovered.was_listed(spec.backend) && !listed_backend_match {
                 continue;
             }
             if let Some(service) = Self::try_create_model(&spec, config) {
-                if spec.backend != ModelBackend::Mock {
-                    registered_non_mock = true;
+                if spec.backend != ModelBackend::Mock && listed_backend_match {
+                    registered_listed_non_mock = true;
                 }
                 services.insert(spec.id.clone(), service);
                 specs.insert(spec.id.clone(), spec);
             }
         }
 
-        if !registered_non_mock {
+        if !registered_listed_non_mock {
             tracing::warn!(
                 discovered = discovered.len(),
                 "No configured known models found in discovery; falling back to configured model list"
@@ -1557,6 +1554,28 @@ mod tests {
         let discovery = ModelRegistry::build_discovery_config(&config)
             .await
             .expect("cached helper token should produce discovery config");
+
+        assert_eq!(
+            discovery.anthropic_auth_headers,
+            vec![(
+                "Authorization".to_string(),
+                "Bearer bearer-token".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_config_preserves_bearer_for_static_anthropic_key() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("bearer-token".to_string()),
+            auth_style: AuthStyle::PlainBearer,
+            anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
+            ..Default::default()
+        };
+
+        let discovery = ModelRegistry::build_discovery_config(&config)
+            .await
+            .expect("static bearer key should produce discovery config");
 
         assert_eq!(
             discovery.anthropic_auth_headers,
