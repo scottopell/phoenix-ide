@@ -74,9 +74,11 @@ Two layers cooperate:
 
 ## Mode rules (summary)
 
-- **Explore parent** → can spawn Explore sub-agents only when the process-wide
-  Explore policy has OS sandbox support. A Work spawn request from an Explore
-  parent is rejected at spawn time.
+- **Explore parent** → can spawn Explore sub-agents regardless of whether
+  sandboxed bash is available. A Work spawn request from an Explore parent is
+  rejected at spawn time. Sandbox support gates bash only: with support, the
+  parent and spawned Explore sub-agents receive sandboxed bash; without support,
+  both keep delegation with read/browser/submit tools and no bash.
 - **Work / Branch / Direct parent** → can spawn either mode; at most one
   Work sub-agent active at a time per parent (one-writer invariant), and
   per single `spawn_agents` call. Multiple Explore sub-agents in parallel

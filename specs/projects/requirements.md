@@ -422,20 +422,22 @@ THE SYSTEM SHALL re-check capabilities on every startup
 
 WHILE sandbox is not available
 THE SYSTEM SHALL provide top-level Explore mode with read-only/planning tools,
-browser tools, scoped task-proposal `patch`, `propose_task`, and non-spawning
-coordination tools
-AND SHALL NOT provide `bash`, `tmux`, `tmux_run`, `spawn_agents`,
+browser tools, scoped task-proposal `patch`, `propose_task`, and parent
+coordination tools including `spawn_agents`
+AND SHALL NOT provide `bash`, `tmux`, `tmux_run`,
 or any tool that can execute arbitrary unsandboxed commands
 
 WHILE sandbox is available
 THE SYSTEM SHALL provide top-level Explore mode with read-only/planning tools,
-scoped task-proposal `patch`, `propose_task`, parent coordination tools including
-`spawn_agents`, and sandboxed `bash`
-AND SHALL NOT provide `tmux`, `tmux_run`, or browser tools in
-the first-pass sandboxed Explore registry
+scoped task-proposal `patch`, `propose_task`, browser tools, parent coordination
+tools including `spawn_agents`, and sandboxed `bash`
+AND SHALL NOT provide `tmux` or `tmux_run`
 
 **Rationale:** Capabilities are a property of the running environment, not the
-application. On systems with OS-level sandboxing, bash is useful in Explore mode
+application. Sandbox capability gates bash, not delegation: `spawn_agents` is a
+read-only coordination tool in Explore, and spawned Explore sub-agents fall back
+to read/browser/submit tools without bash when sandboxing is unavailable. On
+systems with OS-level sandboxing, bash is useful in Explore mode
 for local investigation while preserving the read-only promise. On systems
 without sandboxing, withholding bash prevents writes structurally. Re-checking on
 startup ensures the tool set matches the current host.

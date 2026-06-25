@@ -619,7 +619,7 @@ impl ToolRegistry {
             ExploreBashCapability::Sandboxed => {
                 Self::explore_with_sandbox(tasks_dir_name, agents, policy)
             }
-            ExploreBashCapability::Unavailable => Self::explore_no_sandbox(tasks_dir_name),
+            ExploreBashCapability::Unavailable => Self::explore_no_sandbox(tasks_dir_name, agents),
         }
     }
 
@@ -630,10 +630,13 @@ impl ToolRegistry {
     /// task files under the project's tasks dir before calling
     /// `propose_task`; writes outside that dir are rejected at runtime.
     #[must_use]
-    pub fn explore_no_sandbox(tasks_dir_name: &str) -> Self {
+    pub fn explore_no_sandbox(
+        tasks_dir_name: &str,
+        agents: Vec<phoenix_agents::AgentDefinition>,
+    ) -> Self {
         let mut tools = read_only_tools();
         tools.extend(browser_tools());
-        tools.extend(explore_coordination_tools());
+        tools.extend(parent_coordination_tools(agents));
         tools.push(Arc::new(PatchTool::for_task_proposal_drafts(
             tasks_dir_name,
         )));
@@ -1063,7 +1066,7 @@ mod tests {
         assert!(explore.contains("propose_task"));
         assert!(explore.contains("ask_user_question"));
         assert!(explore.contains("browser_wait_for_selector"));
-        assert!(!explore.contains("spawn_agents"));
+        assert!(explore.contains("spawn_agents"));
         assert!(explore.contains("patch"));
         assert!(!explore.contains("bash"));
         assert!(!explore.contains("tmux_run"));

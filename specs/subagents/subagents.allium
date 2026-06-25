@@ -387,6 +387,10 @@ rule SubAgentSpecsResolved {
 -- submit_result/submit_error). Work => `subagent_work`
 -- (Explore set + Work bash + patch). Both modes get the parent's MCP tool set.
 --
+-- Top-level Explore delegation is independent of sandbox support: the parent may
+-- call `spawn_agents` even when platform capability omits bash. The spawned
+-- Explore sub-agent then receives this same `subagent_explore` registry shape
+-- without bash.
 -- The Explore registry never grants write-capable `patch`, and its bash entry
 -- is the same OS-sandboxed, network-blocked, scratch-only bash available to a
 -- top-level Explore conversation. If the platform cannot enforce that sandbox,

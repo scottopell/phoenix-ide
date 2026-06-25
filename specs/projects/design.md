@@ -43,8 +43,12 @@ The result gates which tool registry top-level Explore conversations receive:
 
 | `has_sandbox()` | Explore tool set | Bash available? |
 |-----------------|-----------------|-----------------|
-| `true` | read-only/planning tools, parent coordination tools including `spawn_agents`, scoped `patch`, `propose_task`, and sandboxed `bash`; browser and tmux are omitted | Yes |
-| `false` | read-only/planning tools, browser tools, non-spawning coordination tools, scoped `patch`, and `propose_task`; tmux, `spawn_agents`, and bash are omitted | No |
+| `true` | read-only/planning tools, browser tools, parent coordination tools including `spawn_agents`, scoped `patch`, `propose_task`, and sandboxed `bash`; tmux is omitted | Yes |
+| `false` | read-only/planning tools, browser tools, parent coordination tools including `spawn_agents`, scoped `patch`, and `propose_task`; tmux and bash are omitted | No |
+
+Sandbox support gates only bash. Delegation is still a read-only Explore
+capability: when sandboxing is unavailable, top-level Explore can spawn Explore
+sub-agents, and those sub-agents receive read/browser/submit tools without bash.
 
 The sandboxed bash path uses a Phoenix child-process launcher. The child applies
 `nono` to itself and then execs `bash -c <cmd>` using `PATH`, preserving the
