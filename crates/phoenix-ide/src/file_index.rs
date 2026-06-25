@@ -148,8 +148,22 @@ impl WorkspaceIndexer {
         limit: usize,
     ) -> Result<Vec<String>, String> {
         let canonical = canonicalize_or_self(&root);
+        // One retry handles the brief invalidation window: when an
+        // ignore-file edit fires while the handle is still live, the
+        // actor sets `invalidating` and returns "re-bootstrapping" for
+        // any in-flight search. By the time we retry, the registry has
+        // dropped the stale handle and `handle_for` spawns a fresh
+        // actor whose bootstrap reflects the new gitignore state. Cap
+        // the retry at one — a Failed actor should surface its error,
+        // not loop.
         let handle = self.handle_for(&canonical);
-        handle.search(query.to_string(), limit).await
+        match handle.search(query.to_string(), limit).await {
+            Err(e) if e == "workspace re-bootstrapping" => {
+                let fresh = self.handle_for(&canonical);
+                fresh.search(query.to_string(), limit).await
+            }
+            other => other,
+        }
     }
 
     /// Get-or-create the handle for `canonical`. Spawns the workspace
@@ -483,10 +497,23 @@ impl WorkspaceActor {
                 limit,
                 reply,
             } => {
-                let result = match &self.state {
-                    WorkspaceState::Ready { paths, .. } => Ok(score_paths(paths, &query, limit)),
-                    WorkspaceState::Failed(e) => Err(e.clone()),
-                    WorkspaceState::Loading => Err("workspace still loading".to_string()),
+                let result = if self.invalidating {
+                    // The `Ready` snapshot under `self.state` is already
+                    // stale — an ignore-file edit or rescan signal told
+                    // us so. Returning it here would surface paths from
+                    // rules the actor has already declared invalid.
+                    // Caller's next search will hit the registry, find
+                    // the handle gone, and spawn a fresh actor with a
+                    // fresh bootstrap.
+                    Err("workspace re-bootstrapping".to_string())
+                } else {
+                    match &self.state {
+                        WorkspaceState::Ready { paths, .. } => {
+                            Ok(score_paths(paths, &query, limit))
+                        }
+                        WorkspaceState::Failed(e) => Err(e.clone()),
+                        WorkspaceState::Loading => Err("workspace still loading".to_string()),
+                    }
                 };
                 let _ = reply.send(result);
                 true
@@ -1118,6 +1145,25 @@ fn canonicalize_or_self(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Yield each directory from `from` down to and including `to`, where
+/// `from` is an ancestor of `to`. Returns `[from, from+c1, ..., to]`.
+///
+/// When `to` is not under `from` (the toplevel-discovery fallback ended
+/// up using `to` as its own matcher root), this returns just `[to]` so
+/// the caller still seeds the `to`-level `.gitignore`.
+fn ancestors_from_to_inclusive(from: &Path, to: &Path) -> Vec<PathBuf> {
+    let Ok(rel) = to.strip_prefix(from) else {
+        return vec![to.to_path_buf()];
+    };
+    let mut acc = vec![from.to_path_buf()];
+    let mut current = from.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        acc.push(current.clone());
+    }
+    acc
+}
+
 /// Run `git -C <root> rev-parse --show-toplevel` and return the toplevel
 /// directory if it differs from `root`. Used to detect that the
 /// conversation cwd is a subdirectory of a repo so parent `.gitignore`
@@ -1220,8 +1266,16 @@ fn walk_workspace(root: &Path) -> (BTreeSet<String>, HashSet<PathBuf>, Option<Gi
     let mut gi_builder = GitignoreBuilder::new(&matcher_root);
 
     if in_git_repo {
-        // Pull in the repo-level .gitignore if it exists.
-        let _ = gi_builder.add(matcher_root.join(".gitignore"));
+        // Seed every `.gitignore` from the matcher root (toplevel) down
+        // to and including `root`. The bootstrap `WalkBuilder` honors
+        // each one with its containing directory as scope; the cached
+        // event-time matcher must mirror that, or a `Create(File)` for a
+        // path matched only by an *intermediate* parent rule (e.g.
+        // `/repo/packages/.gitignore` ignoring `dist/`, when cwd is
+        // `/repo/packages/app`) would slip through and surface in Cmd+P.
+        for ancestor in ancestors_from_to_inclusive(&matcher_root, root) {
+            let _ = gi_builder.add(ancestor.join(".gitignore"));
+        }
 
         // `info/exclude` and the global excludes file are NOT
         // directory-scoped to themselves — git applies their patterns
@@ -2329,6 +2383,123 @@ mod tests {
         assert!(
             saw,
             "indexer wedged after event storm against an invalidating actor"
+        );
+    }
+
+    /// Round-5 #1 — intermediate parent `.gitignore` files (between the
+    /// toplevel and the workspace cwd) must seed the matcher. Without
+    /// this, a monorepo with per-package gitignores would let watcher
+    /// events for files matched only by an intermediate rule slip into
+    /// the index even though the bootstrap walker correctly excluded
+    /// them.
+    #[tokio::test]
+    async fn intermediate_parent_gitignore_is_seeded() {
+        if which::which("git").is_err() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let toplevel = tmp.path();
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(toplevel)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init failed");
+
+        // Intermediate level — between toplevel and cwd — owns the rule.
+        std::fs::create_dir_all(toplevel.join("packages/app")).unwrap();
+        write(&toplevel.join("packages/.gitignore"), "dist/\n");
+        write(&toplevel.join("packages/app/src/main.ts"), "");
+
+        let cwd = toplevel.join("packages/app");
+        let indexer = WorkspaceIndexer::new().await.unwrap();
+        let _ = search(&indexer, &cwd, "").await;
+
+        // Create a `dist/` file via the watcher. The intermediate
+        // `packages/.gitignore` excludes it — the cached matcher must
+        // too. Pre-fix code only seeded the toplevel `.gitignore` and
+        // any `.gitignore` at/below cwd, missing the layer in between.
+        std::fs::create_dir_all(cwd.join("dist")).unwrap();
+        write(&cwd.join("dist/bundle.js"), "");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let results = search(&indexer, &cwd, "").await;
+        assert!(
+            !results.iter().any(|p| p.starts_with("dist/")),
+            "intermediate parent .gitignore not honored: {results:?}"
+        );
+    }
+
+    /// Round-5 #2 — once `invalidating` is set, queued or racing
+    /// `Search` commands must NOT be answered from the (already-stale)
+    /// `Ready` snapshot. The actor returns an error; the registry-side
+    /// `search()` retries against a fresh actor whose bootstrap
+    /// reflects the new gitignore state.
+    #[tokio::test]
+    async fn search_during_invalidate_window_returns_fresh_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_git(root);
+        // Bootstrap with no gitignore at all so /dist/x.js IS indexed.
+        write(&root.join("dist/x.js"), "");
+        write(&root.join("src/keep.rs"), "");
+
+        let indexer = WorkspaceIndexer::new().await.unwrap();
+        let initial = search(&indexer, root, "").await;
+        assert!(
+            initial.iter().any(|p| p == "dist/x.js"),
+            "pre-invalidate search should see dist/x.js: {initial:?}"
+        );
+
+        // Write a `.gitignore` that excludes dist/. The actor's
+        // `handle_event` sees `.gitignore` → sets `invalidating` and
+        // tells the registry to forget the handle. Any Search command
+        // arriving in the gap before Shutdown lands must NOT return
+        // dist/x.js from the stale snapshot.
+        write(&root.join(".gitignore"), "dist/\n");
+        // Race a search against the invalidation window. The retry in
+        // `WorkspaceIndexer::search` will spawn a fresh actor whose
+        // bootstrap respects the new gitignore.
+        let saw = wait_for_path(&indexer, root, "", Duration::from_secs(3), |results| {
+            !results.iter().any(|p| p == "dist/x.js") && results.iter().any(|p| p == "src/keep.rs")
+        })
+        .await;
+        assert!(
+            saw,
+            "search served stale results from invalidating actor or never converged"
+        );
+    }
+
+    /// Unit test for the ancestor-path helper used by the intermediate-
+    /// gitignore fix above. Verifies the inclusive endpoints + ordering.
+    #[test]
+    fn ancestors_from_to_inclusive_yields_each_directory() {
+        let from = PathBuf::from("/repo");
+        let to = PathBuf::from("/repo/packages/app");
+        let result = ancestors_from_to_inclusive(&from, &to);
+        assert_eq!(
+            result,
+            vec![
+                PathBuf::from("/repo"),
+                PathBuf::from("/repo/packages"),
+                PathBuf::from("/repo/packages/app"),
+            ]
+        );
+
+        // Same path — returns just that one element.
+        let same = PathBuf::from("/repo");
+        assert_eq!(
+            ancestors_from_to_inclusive(&same, &same),
+            vec![PathBuf::from("/repo")]
+        );
+
+        // `to` not under `from` — returns `[to]` as a safe fallback.
+        let unrelated = PathBuf::from("/other");
+        assert_eq!(
+            ancestors_from_to_inclusive(&PathBuf::from("/repo"), &unrelated),
+            vec![PathBuf::from("/other")]
         );
     }
 }
