@@ -210,6 +210,7 @@ enum ValidReadiness {
     WaitForText { text: String, timeout: Duration },
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_readiness(readiness: Readiness) -> Result<ValidReadiness, ToolOutput> {
     match readiness {
         Readiness::ReturnImmediately {} => Ok(ValidReadiness::ReturnImmediately),
@@ -436,6 +437,7 @@ async fn wait_for_text_response(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn normalize_window_name(name: &str) -> Result<String, ToolOutput> {
     let trimmed = name.trim();
     if trimmed.is_empty() {

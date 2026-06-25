@@ -1020,6 +1020,7 @@ struct ScenarioPlan {
 /// Pure, no-browser validation of a `run_scenario` request. Mirrors the
 /// preconditions in `browser-profiling.allium`
 /// (`RunScenarioCollectsRawSamples` / `RunScenarioRejectsInlineNavigation`).
+#[allow(clippy::result_large_err)]
 fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutput> {
     let steps = match &input.steps {
         Some(s) if !s.is_empty() => s.clone(),
