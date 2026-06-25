@@ -111,10 +111,33 @@ struct ReviewTargetSummary {
     allow_dirty_working_tree: bool,
 }
 
+/// Why a changed file was excluded from the review entirely. Distinct from a
+/// `ReviewWarning`: an unreviewed file is a coverage gap the requester must see,
+/// not advisory noise, so it is surfaced as a top-level result rather than
+/// buried in the warnings stream.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OversizedReason {
+    /// The file's own diff exceeded `MAX_FILE_BYTES`.
+    PerFileCap,
+    /// The cumulative review body would exceed `MAX_REVIEW_BYTES`, so this file
+    /// was dropped even though it fit the per-file cap.
+    TotalReviewCap,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UnreviewedFile {
+    file: String,
+    reason: OversizedReason,
+}
+
 #[derive(Debug, Serialize)]
 struct ReviewOutput {
     status: ReviewStatus,
     summary: ReviewSummary,
+    /// Files changed by the diff that were NOT sent to the reviewer because they
+    /// exceeded a size cap. Non-empty means the review did not cover everything.
+    unreviewed: Vec<UnreviewedFile>,
     findings: Vec<ReviewFinding>,
     warnings: Vec<ReviewWarning>,
 }
@@ -143,6 +166,7 @@ struct DiffCollection {
     deletions: u64,
     body: String,
     warnings: Vec<ReviewWarning>,
+    unreviewed: Vec<UnreviewedFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,6 +229,7 @@ impl Tool for CommissionReviewTool {
                     "kind": "commission_review",
                     "status": &out.status,
                     "summary": &out.summary,
+                    "unreviewed": &out.unreviewed,
                     "findings": &out.findings,
                     "warnings": &out.warnings,
                 });
@@ -277,6 +302,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 output_tokens: None,
                 reviewer_summary: Some("No reviewable text diff was found".to_string()),
             },
+            unreviewed: collection.unreviewed,
             findings: Vec::new(),
             warnings: collection.warnings,
         });
@@ -377,7 +403,10 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
 
     normalize_findings(&mut findings, &mut warnings);
     warnings.extend(collection.warnings);
-    let status = if warnings.is_empty() {
+    let unreviewed = collection.unreviewed;
+    // Unreviewed files are a coverage gap, not advisory noise: a clean run that
+    // nonetheless skipped files must not report Success and read as full coverage.
+    let status = if warnings.is_empty() && unreviewed.is_empty() {
         ReviewStatus::Success
     } else {
         ReviewStatus::CompletedWithWarnings
@@ -407,6 +436,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 Some(reviewer_summaries.join("\n\n"))
             },
         },
+        unreviewed,
         findings,
         warnings,
     })
@@ -447,6 +477,7 @@ fn failed_review_output(
             output_tokens: Some(output_tokens),
             reviewer_summary: Some(reason.to_string()),
         },
+        unreviewed: collection.unreviewed.clone(),
         findings,
         warnings,
     }
@@ -541,6 +572,7 @@ async fn resolve_target(
 async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCollection, String> {
     let repo = Path::new(&target.summary.repo_root);
     let mut warnings = Vec::new();
+    let mut unreviewed = Vec::new();
     let effective_range_base = match &target.diff_spec {
         DiffSpec::Range { base, head, .. } => {
             Some(git_capture_cancel(repo, &["merge-base", base, head], &ctx.cancel).await?)
@@ -700,11 +732,10 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                     }
                 };
                 if truncated {
-                    warnings.push(warning(
-                        "file_too_large",
-                        "file diff exceeded per-file review cap",
-                        Some(file),
-                    ));
+                    unreviewed.push(UnreviewedFile {
+                        file: file.clone(),
+                        reason: OversizedReason::PerFileCap,
+                    });
                     continue;
                 }
                 diff_output
@@ -729,30 +760,27 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
                     }
                 };
                 if truncated {
-                    warnings.push(warning(
-                        "file_too_large",
-                        "file diff exceeded per-file review cap",
-                        Some(file),
-                    ));
+                    unreviewed.push(UnreviewedFile {
+                        file: file.clone(),
+                        reason: OversizedReason::PerFileCap,
+                    });
                     continue;
                 }
                 diff_output
             }
         };
         if diff.len() > MAX_FILE_BYTES {
-            warnings.push(warning(
-                "file_too_large",
-                "file diff exceeded per-file review cap",
-                Some(file),
-            ));
+            unreviewed.push(UnreviewedFile {
+                file: file.clone(),
+                reason: OversizedReason::PerFileCap,
+            });
             continue;
         }
         if body.len() + diff.len() > MAX_REVIEW_BYTES {
-            warnings.push(warning(
-                "review_truncated",
-                "file diff skipped because total review cap was already reached",
-                Some(file),
-            ));
+            unreviewed.push(UnreviewedFile {
+                file: file.clone(),
+                reason: OversizedReason::TotalReviewCap,
+            });
             continue;
         }
         if !diff.trim().is_empty() {
@@ -768,6 +796,7 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
         deletions,
         body,
         warnings,
+        unreviewed,
     })
 }
 
@@ -1232,6 +1261,49 @@ mod tests {
             "every added line must survive the capture, got {} lines",
             body.matches("+line").count()
         );
+    }
+
+    #[test]
+    fn unreviewed_files_serialize_as_top_level_snake_case() {
+        let out = ReviewOutput {
+            status: ReviewStatus::CompletedWithWarnings,
+            summary: ReviewSummary {
+                target: ReviewTargetSummary {
+                    kind: ReviewTargetKind::WorktreeDiff,
+                    repo_root: "/r".to_string(),
+                    base: "main".to_string(),
+                    head: "HEAD".to_string(),
+                    dirty: false,
+                    allow_dirty_working_tree: false,
+                },
+                files_changed: 2,
+                files_reviewed: 0,
+                insertions: 0,
+                deletions: 0,
+                findings_count: 0,
+                elapsed_ms: 0,
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                input_tokens: None,
+                output_tokens: None,
+                reviewer_summary: None,
+            },
+            unreviewed: vec![
+                UnreviewedFile {
+                    file: "big.rs".to_string(),
+                    reason: OversizedReason::PerFileCap,
+                },
+                UnreviewedFile {
+                    file: "also_big.rs".to_string(),
+                    reason: OversizedReason::TotalReviewCap,
+                },
+            ],
+            findings: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let v = serde_json::to_value(&out).expect("serialize");
+        assert_eq!(v["unreviewed"][0]["file"], "big.rs");
+        assert_eq!(v["unreviewed"][0]["reason"], "per_file_cap");
+        assert_eq!(v["unreviewed"][1]["reason"], "total_review_cap");
     }
 
     #[test]
