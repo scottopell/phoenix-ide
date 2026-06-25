@@ -599,8 +599,10 @@ export function ConversationList({
     const latestMember = item.members.find(m => m.id === item.latestMemberId);
     const isCompleted = getConvDisplayState(latestMember) === 'terminal';
     if (effectiveListDensity === 'mobile') {
-      const hasActiveMember = item.members.some((m) => m.slug === activeSlug);
-      return hasActiveMember ? false : !collapsedChains.has(item.rootId);
+      const hasPriorityMember = item.members.some((m) =>
+        m.slug === activeSlug || isActionableDisplayState(getConvDisplayState(m))
+      );
+      return hasPriorityMember ? false : !collapsedChains.has(item.rootId);
     }
     return isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
   }, [activeSlug, collapsedChains, effectiveListDensity]);

@@ -944,7 +944,7 @@ describe('Mobile conversation list redesign', () => {
     expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(2);
   });
 
-  it('shows actionable state labels in collapsed mobile chain summaries', () => {
+  it('auto-expands mobile chains with actionable latest members', () => {
     const root = makeConv('needs-root', 'needs-root', {
       continued_in_conv_id: 'needs-leaf',
       presentation_mode: 'done',
@@ -963,9 +963,9 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
-    const summary = container.querySelector('.conv-chain-latest-summary') as HTMLButtonElement;
-    expect(summary).not.toBeNull();
-    expect(summary.querySelector('.conv-state-chip')?.textContent).toBe('Needs approval');
+    expect(container.querySelector('.conv-chain-block')).toHaveClass('expanded');
+    expect(container.querySelector('.conv-chain-latest-summary')).toBeNull();
+    expect(container.querySelector('[data-id="needs-leaf"] .conv-state-chip')?.textContent).toBe('Needs approval');
   });
 
   it('labels context-full mobile rows distinctly from task approvals', () => {
@@ -996,6 +996,26 @@ describe('Mobile conversation list redesign', () => {
     );
 
     expect(container.querySelector('[data-id="needs-reply"] .conv-state-chip')?.textContent).toBe('Needs reply');
+  });
+
+  it('auto-expands mobile chains with actionable historical members', () => {
+    const root = makeConv('historical-needs-action', 'historical-needs-action', {
+      continued_in_conv_id: 'quiet-leaf',
+      presentation_mode: 'needs_action',
+      state: { type: 'awaiting_user_response', questions: [] },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const leaf = makeConv('quiet-leaf', 'quiet-leaf', { updated_at: '2024-02-01T00:00:00Z' });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[leaf, root]} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.conv-chain-block')).toHaveClass('expanded');
+    expect(container.querySelector('[data-id="historical-needs-action"] .conv-item-title')?.textContent).toBe('historical-needs-action');
+    expect(container.querySelector('[data-id="historical-needs-action"] .conv-state-chip')?.textContent).toBe('Needs reply');
   });
 
   it('mobile keyboard navigation targets collapsed chain summaries, not hidden history rows', () => {
