@@ -208,15 +208,16 @@ impl Tool for SandboxedBashTool {
     }
 
     fn description(&self) -> String {
-        format!(
-            "{}\n\nExplore mode sandbox: commands run under an OS-enforced nono sandbox. \
-             The repository/worktree, Git metadata, and task files are read-only \
-             to bash; use non-bash tools available in the current context for \
-             task drafts or other writes. $PHOENIX_SANDBOX_SCRATCH, HOME, and \
-             TMPDIR point at writable Phoenix-owned scratch/temp locations; \
-             network access is blocked.",
-            BashTool.description()
-        )
+        sandboxed_bash_description(&BashTool.description())
+    }
+
+    fn description_for_language(
+        &self,
+        language: phoenix_core::llm_language::LlmLanguage,
+    ) -> String {
+        let base = phoenix_core::llm_language::tool_description_override(self.name(), language)
+            .map_or_else(|| BashTool.description(), str::to_string);
+        sandboxed_bash_description(&base)
     }
 
     fn input_schema(&self) -> Value {
@@ -226,6 +227,17 @@ impl Tool for SandboxedBashTool {
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         operations::dispatch_sandboxed(input, ctx).await
     }
+}
+
+fn sandboxed_bash_description(base: &str) -> String {
+    format!(
+        "{base}\n\nExplore mode sandbox: commands run under an OS-enforced nono sandbox. \
+         The repository/worktree, Git metadata, and task files are read-only \
+         to bash; use non-bash tools available in the current context for \
+         task drafts or other writes. $PHOENIX_SANDBOX_SCRATCH, HOME, and \
+         TMPDIR point at writable Phoenix-owned scratch/temp locations; \
+         network access is blocked."
+    )
 }
 
 #[cfg(test)]

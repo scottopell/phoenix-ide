@@ -66,9 +66,11 @@ dangerous rm) is enforced by the permission seam (specs/permissions/) before
 the bash tool runs, not inside the tool. In Explore, `SandboxedBashTool` routes
 `op="run"` through a Phoenix child process that applies `nono` before execing
 bash; filesystem reads are broad, worktree and Git metadata writes are denied,
-task proposal/scratch/synthetic-home/platform-temp writes are allowed,
-per-command scratch is reaped at terminal state, network is blocked, and
-unsupported hosts omit Explore bash entirely.
+task proposal writes are denied (task drafts use scoped non-bash proposal tools),
+scratch/synthetic-home/platform-temp writes are allowed only when their roots do
+not overlap protected repo/Git/Phoenix paths, per-command scratch is reaped at
+terminal state, network is blocked, and unsupported hosts omit Explore bash
+entirely.
 
 ## Status Summary
 

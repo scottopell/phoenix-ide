@@ -642,9 +642,8 @@ impl ToolRegistry {
     }
 
     /// Create tool registry for Explore mode WITH sandbox.
-    /// REQ-PROJ-013: read-only/planning tools plus OS-sandboxed bash. Browser
-    /// and tmux tools are intentionally omitted for this first sandboxed
-    /// Explore slice.
+    /// REQ-PROJ-013: read-only/planning tools plus browser tools and
+    /// OS-sandboxed bash.
     #[must_use]
     pub fn explore_with_sandbox(
         tasks_dir_name: &str,
@@ -653,6 +652,7 @@ impl ToolRegistry {
     ) -> Self {
         debug_assert!(policy.has_sandboxed_bash());
         let mut tools = read_only_tools();
+        tools.extend(browser_tools());
         tools.push(Arc::new(SandboxedBashTool));
         if policy.allow_top_level_spawn_agents() {
             tools.extend(parent_coordination_tools(agents));
@@ -1036,6 +1036,7 @@ mod tests {
             sandbox_policy(),
         ));
         assert!(work.contains("bash"));
+        assert!(work.contains("browser_wait_for_selector"));
         assert!(work.contains("patch"));
         assert!(!work.contains("tmux_run"));
         assert!(!work.contains("tmux"));
@@ -1061,6 +1062,7 @@ mod tests {
         ));
         assert!(explore.contains("propose_task"));
         assert!(explore.contains("ask_user_question"));
+        assert!(explore.contains("browser_wait_for_selector"));
         assert!(!explore.contains("spawn_agents"));
         assert!(explore.contains("patch"));
         assert!(!explore.contains("bash"));
@@ -1078,6 +1080,7 @@ mod tests {
         // no ask_user, no propose_task, no parent-terminal tools.
         let sub_explore = names(&ToolRegistry::for_subagent_explore(sandbox_policy()));
         assert!(sub_explore.contains("bash"));
+        assert!(sub_explore.contains("browser_wait_for_selector"));
         assert!(
             !sub_explore.contains("tmux_run"),
             "sub-agent explore must not have tmux_run (task 94001)"

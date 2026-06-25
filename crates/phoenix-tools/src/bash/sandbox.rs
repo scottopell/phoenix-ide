@@ -28,10 +28,12 @@ impl ExploreReadOnlyPolicy {
     /// or the scratch/home directories cannot be created.
     pub fn discover(working_dir: &Path) -> std::io::Result<Self> {
         let runtime_env = PhoenixRuntimeEnvironment::detect();
-        let repo_root = working_dir.canonicalize()?;
-        let git_dirs = git_state_dirs(&repo_root);
-        let mut protected_dirs = Vec::with_capacity(5 + git_dirs.len());
-        protected_dirs.push(repo_root.clone());
+        let cwd_root = working_dir.canonicalize()?;
+        let worktree_root = git_worktree_root(&cwd_root).unwrap_or_else(|| cwd_root.clone());
+        let git_dirs = git_state_dirs(&cwd_root);
+        let mut protected_dirs = Vec::with_capacity(6 + git_dirs.len());
+        protected_dirs.push(cwd_root.clone());
+        protected_dirs.push(worktree_root);
         protected_dirs.extend(git_dirs);
         protected_dirs.extend(runtime_protected_dirs(&runtime_env));
         protected_dirs.sort();
@@ -45,7 +47,7 @@ impl ExploreReadOnlyPolicy {
         std::fs::create_dir_all(&platform_temp)?;
         let path = inherited_path();
         Ok(Self {
-            repo_root,
+            repo_root: cwd_root,
             scratch_dir,
             sandbox_home,
             platform_temp,
@@ -274,6 +276,10 @@ fn db_parent_for_protection(db_path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+fn git_worktree_root(repo_root: &Path) -> Option<PathBuf> {
+    git_rev_parse_path(repo_root, "--show-toplevel")
+}
+
 fn git_state_dirs(repo_root: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for arg in ["--absolute-git-dir", "--git-common-dir"] {
@@ -320,6 +326,30 @@ fn system_writable_files() -> &'static [PathBuf] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_worktree_root_resolves_from_subdirectory() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let subdir = repo.join("src").join("nested");
+        std::fs::create_dir_all(&subdir).expect("subdir");
+        run_git_for_test(&repo, &["init"]);
+
+        assert_eq!(
+            git_worktree_root(&subdir),
+            Some(repo.canonicalize().unwrap())
+        );
+    }
+
+    fn run_git_for_test(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git command starts");
+        assert!(status.success(), "git {args:?} failed with {status}");
+    }
 
     #[test]
     fn db_parent_for_protection_ignores_bare_relative_filename() {

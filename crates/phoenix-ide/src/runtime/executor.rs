@@ -3718,7 +3718,15 @@ where
     async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
-            return self.handle_spawn_agents_tool(tool).await;
+            let advertised = self
+                .tool_executor
+                .definitions()
+                .await
+                .iter()
+                .any(|definition| definition.name == "spawn_agents");
+            if advertised {
+                return self.handle_spawn_agents_tool(tool).await;
+            }
         }
 
         // REQ-WPV-002: stamp the per-tool start time into the parent
