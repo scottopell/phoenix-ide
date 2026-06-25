@@ -37,6 +37,20 @@ directory. Worktree-backed conversations review the active branch against the
 base branch used for the task or worktree. Direct conversations inside a git
 repository review workspace changes against `HEAD`.
 
+The base comparator is resolved to the remote-tracking ref `origin/<base>` when
+it exists, falling back to the bare local `<base>` ref otherwise. The local
+`<base>` ref is only as current as the worktree last fast-forwarded it, so on a
+long-lived clone it can be far behind; diffing a feature branch against a stale
+local base pulls in every commit merged upstream since, inflating the review
+with already-landed code and, for large files, fabricating diffs large enough to
+exceed the size caps. `origin/<base>` is what the branch actually merges into,
+so it is the correct comparator and matches the diff the conversation diff
+endpoint shows the user. The comparator is resolved freshly at review execution
+time rather than cached on the approval scope, so it cannot go stale between a
+review being proposed and approved; the approval card therefore presents the
+base as a proposal that resolves to its tracked remote at review time, and the
+result records the concrete resolved comparator.
+
 For worktree-backed reviews, `git status --porcelain` determines cleanliness. A
 dirty worktree is rejected unless `allow_dirty_working_tree` is true. When dirty
 review is allowed, the target summary records both `dirty: true` and

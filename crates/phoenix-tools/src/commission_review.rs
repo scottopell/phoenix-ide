@@ -538,17 +538,10 @@ fn assert_approved_paths_match(
     Ok(())
 }
 
-/// Resolve the review comparator, preferring the remote-tracking ref
-/// `origin/<base>` over the bare local branch.
-///
-/// The local `<base>` ref (e.g. `main`) is whatever the worktree last
-/// fast-forwarded it to, which on a long-lived clone is routinely months
-/// behind. Diffing a feature branch against a stale local base pulls in every
-/// commit merged upstream since — inflating the review with already-landed code
-/// and, on large files, fabricating diffs big enough to matter. `origin/<base>`
-/// is what the branch actually merges into, so it is the correct comparator and
-/// matches what the conversation diff endpoint shows the user. Falls back to the
-/// local ref when no remote-tracking ref exists (no remote, never fetched).
+/// Prefer the remote-tracking ref `origin/<base>` over the bare local branch,
+/// falling back to the local ref when no remote-tracking ref exists. See
+/// `specs/commission-review/design.md` (REQ-CR-004..006) for why the remote ref
+/// is the correct comparator.
 async fn effective_base_ref(repo: &Path, base_branch: &str) -> String {
     let remote = format!("origin/{base_branch}");
     if git_capture(repo, &["rev-parse", "--verify", "--quiet", &remote])
