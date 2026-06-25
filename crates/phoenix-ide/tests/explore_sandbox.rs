@@ -126,6 +126,22 @@ fn explore_sandbox_enforces_read_only_policy() {
     );
     assert!(scratch_write.stdout.contains("ok"));
 
+    let rng_write = sandbox_run(
+        bin,
+        &SandboxFixture {
+            repo: &repo,
+            scratch: &scratch,
+            sandbox_home: &sandbox_home,
+            platform_temp: &platform_temp,
+            sensitive: &sensitive,
+        },
+        "printf x >/dev/urandom",
+    );
+    assert!(
+        !rng_write.status.success(),
+        "RNG device write unexpectedly succeeded: {rng_write:?}"
+    );
+
     let env_probe = sandbox_run(
         bin,
         &SandboxFixture {

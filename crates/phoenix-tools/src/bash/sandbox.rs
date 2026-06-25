@@ -96,7 +96,7 @@ impl ExploreReadOnlyPolicy {
             .allow_path(&self.scratch_dir, AccessMode::ReadWrite)
             .map_err(|e| e.to_string())?;
 
-        for path in system_read_write_files() {
+        for path in system_writable_files() {
             if path.exists() {
                 caps.allow_file_mut(path, AccessMode::ReadWrite)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -259,12 +259,19 @@ fn runtime_protected_dirs(runtime_env: &PhoenixRuntimeEnvironment) -> Vec<PathBu
         runtime_env.data_dir().to_path_buf(),
         runtime_env.phoenix_home(),
     ];
-    if let Some(parent) = runtime_env.db_path().parent() {
-        dirs.push(parent.to_path_buf());
+    if let Some(parent) = db_parent_for_protection(&runtime_env.db_path()) {
+        dirs.push(parent);
     }
     dirs.sort();
     dirs.dedup();
     dirs
+}
+
+fn db_parent_for_protection(db_path: &Path) -> Option<PathBuf> {
+    db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
 }
 
 fn git_state_dirs(repo_root: &Path) -> Vec<PathBuf> {
@@ -304,20 +311,29 @@ fn git_rev_parse_path(repo_root: &Path, arg: &str) -> Option<PathBuf> {
     absolute.canonicalize().ok()
 }
 
-fn system_read_write_files() -> &'static [PathBuf] {
+fn system_writable_files() -> &'static [PathBuf] {
     use std::sync::OnceLock;
     static PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    PATHS.get_or_init(|| {
-        ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"]
-            .into_iter()
-            .map(PathBuf::from)
-            .collect()
-    })
+    PATHS.get_or_init(|| ["/dev/null"].into_iter().map(PathBuf::from).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_parent_for_protection_ignores_bare_relative_filename() {
+        assert_eq!(db_parent_for_protection(Path::new("phoenix.db")), None);
+        assert_eq!(
+            db_parent_for_protection(Path::new("state/phoenix.db")),
+            Some(PathBuf::from("state"))
+        );
+    }
+
+    #[test]
+    fn system_writable_files_only_grants_dev_null() {
+        assert_eq!(system_writable_files(), &[PathBuf::from("/dev/null")]);
+    }
 
     #[test]
     fn platform_temp_falls_back_under_scratch_when_repo_is_under_temp() {
