@@ -15,7 +15,7 @@ pub struct ModelInfo {
 }
 
 /// Backend route + wire protocol used for a model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelBackend {
     /// Anthropic Messages-compatible backend.
     Anthropic,

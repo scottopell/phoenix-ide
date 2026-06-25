@@ -6,7 +6,7 @@ use super::{
     ModelBackend, ModelInfo, ModelSource,
 };
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -608,29 +608,31 @@ impl ModelRegistry {
 
         tracing::info!("Discovered {} models", discovered.len());
 
+        let configured_specs = Self::model_specs(config);
+        let fallback_backends = Self::discovery_fallback_backends(&configured_specs, &discovered);
+
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
-        let mut registered_listed_non_mock = false;
 
-        for spec in Self::model_specs(config) {
+        for spec in configured_specs {
             let uses_codex_bridge = config.use_codex_auth
                 && spec.backend == ModelBackend::OpenAIResponses
                 && spec.source == ModelSource::BuiltIn;
             let listed_backend_match = discovered.was_listed(spec.backend)
                 && Self::spec_matches_discovered_model(&spec, &discovered);
-            if !uses_codex_bridge && discovered.was_listed(spec.backend) && !listed_backend_match {
+            let should_filter = !uses_codex_bridge
+                && discovered.was_listed(spec.backend)
+                && !fallback_backends.contains(&spec.backend);
+            if should_filter && !listed_backend_match {
                 continue;
             }
             if let Some(service) = Self::try_create_model(&spec, config) {
-                if spec.backend != ModelBackend::Mock && listed_backend_match {
-                    registered_listed_non_mock = true;
-                }
                 services.insert(spec.id.clone(), service);
                 specs.insert(spec.id.clone(), spec);
             }
         }
 
-        if !registered_listed_non_mock {
+        if services.is_empty() {
             tracing::warn!(
                 discovered = discovered.len(),
                 "No configured known models found in discovery; falling back to configured model list"
@@ -655,6 +657,22 @@ impl ModelRegistry {
     /// Return built-in model specs plus valid external additions from config.
     fn model_specs(config: &LlmConfig) -> Vec<super::ModelSpec> {
         merge_model_specs(all_models(), &config.external_models)
+    }
+
+    fn discovery_fallback_backends(
+        specs: &[super::ModelSpec],
+        discovered: &DiscoveredModels,
+    ) -> HashSet<ModelBackend> {
+        [ModelBackend::Anthropic, ModelBackend::OpenAIResponses]
+            .into_iter()
+            .filter(|backend| {
+                discovered.was_listed(*backend)
+                    && !specs.iter().any(|spec| {
+                        spec.backend == *backend
+                            && Self::spec_matches_discovered_model(spec, discovered)
+                    })
+            })
+            .collect()
     }
 
     fn spec_matches_discovered_model(
@@ -1356,6 +1374,22 @@ mod tests {
             &model,
             &discovered
         ));
+    }
+
+    #[test]
+    fn discovery_fallback_is_backend_specific() {
+        let specs = vec![external_baseten_model(), external_openai_model()];
+        let discovered = DiscoveredModels {
+            anthropic_listed: true,
+            anthropic: HashSet::from(["unmatched-anthropic".to_string()]),
+            openai_responses_listed: true,
+            openai_responses: HashSet::from(["openai-compatible/custom".to_string()]),
+        };
+
+        let fallback = ModelRegistry::discovery_fallback_backends(&specs, &discovered);
+
+        assert!(fallback.contains(&ModelBackend::Anthropic));
+        assert!(!fallback.contains(&ModelBackend::OpenAIResponses));
     }
 
     #[test]
