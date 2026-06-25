@@ -520,6 +520,29 @@ fn assert_approved_paths_match(
     Ok(())
 }
 
+/// Resolve the review comparator, preferring the remote-tracking ref
+/// `origin/<base>` over the bare local branch.
+///
+/// The local `<base>` ref (e.g. `main`) is whatever the worktree last
+/// fast-forwarded it to, which on a long-lived clone is routinely months
+/// behind. Diffing a feature branch against a stale local base pulls in every
+/// commit merged upstream since — inflating the review with already-landed code
+/// and, on large files, fabricating diffs big enough to matter. `origin/<base>`
+/// is what the branch actually merges into, so it is the correct comparator and
+/// matches what the conversation diff endpoint shows the user. Falls back to the
+/// local ref when no remote-tracking ref exists (no remote, never fetched).
+async fn effective_base_ref(repo: &Path, base_branch: &str) -> String {
+    let remote = format!("origin/{base_branch}");
+    if git_capture(repo, &["rev-parse", "--verify", "--quiet", &remote])
+        .await
+        .is_ok()
+    {
+        remote
+    } else {
+        base_branch.to_string()
+    }
+}
+
 async fn resolve_target(
     ctx: &ToolContext,
     input: &CommissionReviewInput,
@@ -537,7 +560,7 @@ async fn resolve_target(
         if dirty && !input.allow_dirty_working_tree {
             return Err("commission_review refused dirty worktree review. Commit/stash changes, or set allow_dirty_working_tree=true to include uncommitted changes.".to_string());
         }
-        let base = runtime_base_branch.unwrap_or("main").to_string();
+        let base = effective_base_ref(&repo, runtime_base_branch.unwrap_or("main")).await;
         Ok(ReviewTarget {
             summary: ReviewTargetSummary {
                 kind: ReviewTargetKind::WorktreeDiff,
@@ -1261,6 +1284,32 @@ mod tests {
             "every added line must survive the capture, got {} lines",
             body.matches("+line").count()
         );
+    }
+
+    /// The review comparator must prefer origin/<base> over the (often stale)
+    /// local base ref, and fall back to the local ref only when no
+    /// remote-tracking ref exists. Diffing against a stale local base is what
+    /// inflated a 3-commit PR into a 118-commit review in production.
+    #[tokio::test]
+    async fn effective_base_ref_prefers_remote_tracking_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        std::fs::write(repo.join("f.txt"), "x").expect("write");
+        git_ok(repo, &["add", "."]).await;
+        git_ok(repo, &["commit", "-qm", "c1"]).await;
+        let head = git_capture(repo, &["rev-parse", "HEAD"])
+            .await
+            .expect("head");
+
+        // No remote-tracking ref yet: fall back to the bare local branch.
+        assert_eq!(effective_base_ref(repo, "main").await, "main");
+
+        // Once origin/main exists, it must win.
+        git_ok(repo, &["update-ref", "refs/remotes/origin/main", &head]).await;
+        assert_eq!(effective_base_ref(repo, "main").await, "origin/main");
     }
 
     #[test]
