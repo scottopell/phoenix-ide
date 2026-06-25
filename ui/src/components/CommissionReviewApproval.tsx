@@ -75,7 +75,12 @@ export function CommissionReviewApproval({
               <ul>
                 <li>Target: {scope.kind}</li>
                 <li>Repo: {scope.repo_root}</li>
-                <li>Base/head: {scope.base} → {scope.head}</li>
+                <li>
+                  Proposed base → head: {scope.base} → {scope.head}{' '}
+                  <span style={{ color: 'var(--text-muted)' }}>
+                    (base resolves to its tracked remote at review time)
+                  </span>
+                </li>
                 <li>Stats: {scope.changed_files} files, +{scope.insertions}/-{scope.deletions}</li>
               </ul>
             )}
