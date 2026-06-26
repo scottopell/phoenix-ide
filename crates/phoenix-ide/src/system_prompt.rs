@@ -103,9 +103,6 @@ pub fn snapshot_next_taskmd_id_hint(
     })
 }
 
-const MERMAID_RENDERING_HINT: &str =
-    "Phoenix renders Markdown mermaid code fences as diagrams; prefer them for diagrams when useful.";
-
 /// Build the complete system prompt for a conversation.
 pub fn build_system_prompt(
     working_dir: &Path,
@@ -154,7 +151,7 @@ pub fn build_system_prompt_with_options(
         None => String::from(llm_language::base_prompt(language)),
     };
     prompt.push_str("\n\n");
-    prompt.push_str(MERMAID_RENDERING_HINT);
+    prompt.push_str(llm_language::mermaid_rendering_hint(language));
 
     // Add guidance from discovered files
     let guidance_files = discover_guidance_files(working_dir);
@@ -339,7 +336,9 @@ mod tests {
         );
 
         assert!(prompt.contains("helpful AI assistant"));
-        assert!(prompt.contains(MERMAID_RENDERING_HINT));
+        assert!(prompt.contains(llm_language::mermaid_rendering_hint(
+            crate::llm_language::LlmLanguage::default()
+        )));
         assert!(!prompt.contains("<project_guidance>"));
         assert!(!prompt.contains("sub-agent"));
     }

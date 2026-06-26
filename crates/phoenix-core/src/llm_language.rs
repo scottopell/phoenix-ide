@@ -36,6 +36,7 @@ pub struct LlmLanguagePromptCatalog {
     pub sub_agent_suffix: String,
     pub next_task_hint_template: String,
     pub pr_autofix_instruction_template: String,
+    pub mermaid_rendering_hint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +111,7 @@ impl LlmLanguage {
                 sub_agent_suffix: sub_agent_suffix(self).to_string(),
                 next_task_hint_template: next_taskmd_id_hint(self, TASKS_DIR, NEXT_ID),
                 pr_autofix_instruction_template: pr_auto_fix_instruction(self, ARTIFACT_PATH),
+                mermaid_rendering_hint: mermaid_rendering_hint(self).to_string(),
             },
         }
     }
@@ -149,6 +151,22 @@ Be concise in your responses. When using tools, explain what you're doing briefl
         }
         LlmLanguage::Caveman => {
             "You smart caveman. You have tools. Use tools do task. Why use many word when few word do trick. Use word like cave. Talk short. Do thing. Reply short."
+        }
+    }
+}
+
+/// Appended to every system prompt: tells the agent Phoenix renders mermaid
+/// code fences as diagrams, and how to keep node labels parseable. The quoting
+/// guidance pre-empts the most common render failure -- raw parentheses or
+/// quotes inside an unquoted label, which Mermaid reads as shape syntax.
+#[must_use]
+pub fn mermaid_rendering_hint(lang: LlmLanguage) -> &'static str {
+    match lang {
+        LlmLanguage::PhoenixNative => {
+            "Phoenix renders Markdown mermaid code fences as diagrams; prefer them for diagrams when useful. When a node label contains parentheses, quotes, or other punctuation, wrap the label text in double quotes (e.g. `A[\"svc.Get(\\\"x\\\")\"]`) so Mermaid does not read the punctuation as diagram syntax."
+        }
+        LlmLanguage::Caveman => {
+            "Phoenix draw mermaid code fence as picture. Use for picture. Label have `(` or quote inside? Wrap label in double quote (like `A[\"svc.Get(\\\"x\\\")\"]`) or parser break."
         }
     }
 }
@@ -473,6 +491,7 @@ mod tests {
                 .pr_autofix_instruction_template
                 .trim()
                 .is_empty());
+            assert!(!entry.prompts.mermaid_rendering_hint.trim().is_empty());
         }
     }
 

@@ -742,6 +742,7 @@ export interface LlmLanguagePrompts {
   sub_agent_suffix: string;
   next_task_hint_template: string;
   pr_autofix_instruction_template: string;
+  mermaid_rendering_hint: string;
 }
 
 export interface LlmLanguageCatalogEntry {
