@@ -405,7 +405,8 @@ Rules:
 /// System prompt for the end-of-context continuation handoff: the agent writes
 /// a note for the next agent, which continues the work with no memory of this
 /// session.
-pub const CONTINUATION_SYSTEM_PROMPT: &str = "You are an agent writing a handoff note for the next \
+pub const CONTINUATION_SYSTEM_PROMPT: &str =
+    "You are an agent writing a handoff note for the next \
     agent, who will continue this work in the same working directory with no memory of this \
     session, with the same tools available to you now. Be precise and concrete: real file paths, \
     real commands, and an honest split between what you verified and what you only assumed.";
