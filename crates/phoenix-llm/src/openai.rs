@@ -1192,7 +1192,7 @@ pub async fn complete_chat(
         LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
     })?;
 
-    normalize_chat_response(chat_response)
+    normalize_chat_response(chat_response, &spec.api_name)
 }
 
 /// Complete using the `OpenAI` Chat Completions API (streaming).
@@ -1465,23 +1465,51 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
     }
 }
 
-fn normalize_chat_response(resp: ChatCompletionsResponse) -> Result<LlmResponse, LlmError> {
+fn is_chat_reasoning_marker_content(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '<')
+}
+
+fn log_dropped_reasoning_content(model: &str, text: &str) {
+    if !text.is_empty() {
+        tracing::debug!(
+            model,
+            bytes = text.len(),
+            "dropping chat completions reasoning_content — reasoning display is unsupported"
+        );
+    }
+}
+
+fn normalize_chat_response(
+    resp: ChatCompletionsResponse,
+    model: &str,
+) -> Result<LlmResponse, LlmError> {
     let Some(choice) = resp.choices.into_iter().next() else {
         return Err(LlmError::invalid_response(
             "Chat completions returned no choices",
         ));
     };
-    chat_message_to_response(choice.message, resp.usage)
+    chat_message_to_response(choice.message, resp.usage, model)
 }
 
 fn chat_message_to_response(
     message: ChatResponseMessage,
     usage: Option<ChatUsage>,
+    model: &str,
 ) -> Result<LlmResponse, LlmError> {
     let mut content = Vec::new();
+    if let Some(reasoning) = message.reasoning_content {
+        log_dropped_reasoning_content(model, &reasoning);
+    }
     if let Some(text) = message.content {
-        if !text.is_empty() {
+        if !text.is_empty() && !is_chat_reasoning_marker_content(&text) {
             content.push(ContentBlock::Text { text });
+        } else if is_chat_reasoning_marker_content(&text) {
+            tracing::debug!(
+                model,
+                bytes = text.len(),
+                "dropping chat completions marker content"
+            );
         }
     }
     for call in message.tool_calls.unwrap_or_default() {
@@ -1582,15 +1610,23 @@ impl ChatStreamAccumulator {
         }
         self.usage = event.usage.or(self.usage.take());
         for choice in event.choices {
+            if let Some(reasoning) = choice.delta.reasoning_content {
+                log_dropped_reasoning_content("<streaming-chat-completions>", &reasoning);
+            }
             if choice.finish_reason.as_deref() == Some("length") {
                 return Err(LlmError::server_error(
                     "Chat completions response incomplete: length".to_string(),
                 ));
             }
             if let Some(delta) = choice.delta.content {
-                if !delta.is_empty() {
+                if !delta.is_empty() && !is_chat_reasoning_marker_content(&delta) {
                     self.content.push_str(&delta);
                     let _ = chunk_tx.send(super::TokenChunk::Text(delta));
+                } else if is_chat_reasoning_marker_content(&delta) {
+                    tracing::debug!(
+                        bytes = delta.len(),
+                        "dropping chat completions marker content"
+                    );
                 }
             }
             for tool_delta in choice.delta.tool_calls.unwrap_or_default() {
@@ -1623,6 +1659,7 @@ impl ChatStreamAccumulator {
             );
         }
         let message = ChatResponseMessage {
+            reasoning_content: None,
             content: if self.content.is_empty() {
                 None
             } else {
@@ -1639,7 +1676,7 @@ impl ChatStreamAccumulator {
                 )
             },
         };
-        chat_message_to_response(message, self.usage)
+        chat_message_to_response(message, self.usage, "<streaming-chat-completions>")
     }
 }
 
@@ -1763,6 +1800,8 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ChatResponseMessage {
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ChatToolCall>>,
@@ -1802,6 +1841,8 @@ struct ChatStreamChoice {
 
 #[derive(Debug, Deserialize)]
 struct ChatDelta {
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
@@ -2703,6 +2744,7 @@ mod tests {
             let resp = ChatCompletionsResponse {
                 choices: vec![ChatChoice {
                     message: ChatResponseMessage {
+                        reasoning_content: None,
                         content: Some("Hello!".to_string()),
                         tool_calls: None,
                     },
@@ -2712,7 +2754,7 @@ mod tests {
                     completion_tokens: 5,
                 }),
             };
-            let result = normalize_chat_response(resp).unwrap();
+            let result = normalize_chat_response(resp, "test-model").unwrap();
             assert!(result.end_turn);
             assert_eq!(result.usage.input_tokens, 10);
             assert_eq!(result.usage.output_tokens, 5);
@@ -2720,10 +2762,46 @@ mod tests {
         }
 
         #[test]
+        fn chat_normalize_drops_reasoning_and_marker_content() {
+            use crate::LlmErrorKind;
+            let resp = ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatResponseMessage {
+                        reasoning_content: Some("internal reasoning".to_string()),
+                        content: Some("<\n\n".to_string()),
+                        tool_calls: None,
+                    },
+                }],
+                usage: None,
+            };
+            let err = normalize_chat_response(resp, "deepseek-ai/DeepSeek-V4-Pro").unwrap_err();
+            assert_eq!(err.kind, LlmErrorKind::InvalidResponse);
+        }
+
+        #[test]
+        fn chat_normalize_keeps_final_content_when_reasoning_present() {
+            let resp = ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatResponseMessage {
+                        reasoning_content: Some("internal reasoning".to_string()),
+                        content: Some("Final answer".to_string()),
+                        tool_calls: None,
+                    },
+                }],
+                usage: None,
+            };
+            let result = normalize_chat_response(resp, "deepseek-ai/DeepSeek-V4-Pro").unwrap();
+            assert!(
+                matches!(&result.content[0], ContentBlock::Text { text } if text == "Final answer")
+            );
+        }
+
+        #[test]
         fn chat_normalize_tool_call_response() {
             let resp = ChatCompletionsResponse {
                 choices: vec![ChatChoice {
                     message: ChatResponseMessage {
+                        reasoning_content: None,
                         content: None,
                         tool_calls: Some(vec![ChatToolCall {
                             id: "call_1".to_string(),
@@ -2737,7 +2815,7 @@ mod tests {
                 }],
                 usage: None,
             };
-            let result = normalize_chat_response(resp).unwrap();
+            let result = normalize_chat_response(resp, "test-model").unwrap();
             assert!(!result.end_turn, "tool calls should not be end_turn");
             assert!(matches!(
                 &result.content[0],
@@ -2750,6 +2828,7 @@ mod tests {
             let resp = ChatCompletionsResponse {
                 choices: vec![ChatChoice {
                     message: ChatResponseMessage {
+                        reasoning_content: None,
                         content: None,
                         tool_calls: Some(vec![ChatToolCall {
                             id: "call_1".to_string(),
@@ -2763,7 +2842,7 @@ mod tests {
                 }],
                 usage: None,
             };
-            let result = normalize_chat_response(resp).unwrap();
+            let result = normalize_chat_response(resp, "test-model").unwrap();
             if let ContentBlock::ToolUse { input, .. } = &result.content[0] {
                 assert_eq!(input, &serde_json::Value::Object(serde_json::Map::new()));
             } else {
@@ -2777,13 +2856,14 @@ mod tests {
             let resp = ChatCompletionsResponse {
                 choices: vec![ChatChoice {
                     message: ChatResponseMessage {
+                        reasoning_content: None,
                         content: None,
                         tool_calls: None,
                     },
                 }],
                 usage: None,
             };
-            let err = normalize_chat_response(resp).unwrap_err();
+            let err = normalize_chat_response(resp, "test-model").unwrap_err();
             assert_eq!(err.kind, LlmErrorKind::InvalidResponse);
         }
 
@@ -2794,7 +2874,7 @@ mod tests {
                 choices: vec![],
                 usage: None,
             };
-            let err = normalize_chat_response(resp).unwrap_err();
+            let err = normalize_chat_response(resp, "test-model").unwrap_err();
             assert_eq!(err.kind, LlmErrorKind::InvalidResponse);
         }
 
@@ -2902,6 +2982,35 @@ mod tests {
             assert_eq!(err.kind, LlmErrorKind::InvalidResponse);
             assert!(err.message.contains("rate limit"));
             assert!(err.message.contains("rate_limit_exceeded"));
+        }
+
+        #[test]
+        fn chat_stream_drops_reasoning_and_marker_content() {
+            let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+            let mut acc = ChatStreamAccumulator::new();
+            let reasoning_chunk = serde_json::json!({
+                "choices": [{"delta": {"content": null, "reasoning_content": "internal"}}]
+            })
+            .to_string();
+            let marker_chunk = serde_json::json!({
+                "choices": [{"delta": {"content": "<\n\n"}}]
+            })
+            .to_string();
+            let final_chunk = serde_json::json!({
+                "choices": [{"delta": {"content": "Final"}}]
+            })
+            .to_string();
+            acc.process_event(&reasoning_chunk, &tx).unwrap();
+            acc.process_event(&marker_chunk, &tx).unwrap();
+            acc.process_event(&final_chunk, &tx).unwrap();
+            let streamed = rx.try_recv().expect("final text should stream");
+            assert!(matches!(streamed, crate::TokenChunk::Text(text) if text == "Final"));
+            assert!(
+                rx.try_recv().is_err(),
+                "reasoning and marker chunks must not stream"
+            );
+            let resp = acc.into_response().unwrap();
+            assert!(matches!(&resp.content[0], ContentBlock::Text { text } if text == "Final"));
         }
 
         #[test]
