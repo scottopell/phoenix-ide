@@ -884,6 +884,19 @@ impl ModelRegistry {
         }
     }
 
+    /// Get the max output tokens for a model.
+    ///
+    /// Returns the model spec's declared cap, or [`super::DEFAULT_MAX_OUTPUT_TOKENS`]
+    /// when the model is unknown or the spec lock cannot be acquired.
+    pub fn max_output_tokens(&self, model_id: &str) -> u32 {
+        let default = super::DEFAULT_MAX_OUTPUT_TOKENS;
+        self.specs
+            .read()
+            .ok()
+            .and_then(|specs| specs.get(model_id).map(|s| s.max_output_tokens))
+            .unwrap_or(default)
+    }
+
     /// List all available model IDs
     ///
     /// # Panics
@@ -2120,6 +2133,30 @@ mod tests {
         assert!(
             haiku.max_output_tokens > 0,
             "claude-haiku-4-5 must have nonzero max_output_tokens"
+        );
+    }
+    #[test]
+    fn max_output_tokens_returns_spec_value_for_registered_model() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        let got = registry.max_output_tokens("claude-haiku-4-5");
+        assert!(got > 0, "registered model must have nonzero max_output_tokens");
+
+        // Haiku is 16_384 in the built-in specs.
+        assert_eq!(got, 16_384, "claude-haiku-4-5 max_output_tokens mismatch");
+    }
+
+    #[test]
+    fn max_output_tokens_defaults_for_unknown_model() {
+        let registry = ModelRegistry::new(&LlmConfig::default());
+        assert_eq!(
+            registry.max_output_tokens("no-such-model"),
+            super::super::DEFAULT_MAX_OUTPUT_TOKENS,
+            "unknown model must return DEFAULT_MAX_OUTPUT_TOKENS"
         );
     }
 

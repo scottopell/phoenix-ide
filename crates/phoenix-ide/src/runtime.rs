@@ -1763,13 +1763,15 @@ impl RuntimeManager {
         let root_conversation_id =
             find_root_conversation_id(&self.db, &parent_conversation_id).await;
         let context_window = self.llm_registry.context_window(&spec.model_id);
+        let max_output_tokens = self.llm_registry.max_output_tokens(&spec.model_id);
         let mut conv_context = ConvContext::sub_agent(
             &conv.id,
             spec_cwd.path_buf(),
             &spec.model_id,
             context_window,
             root_conversation_id,
-        );
+        )
+        .with_max_output_tokens(max_output_tokens);
         conv_context.max_turns = spec.max_turns;
         conv_context.mode_context = Some(conv_mode_to_context(&sub_conv_mode));
         conv_context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();
@@ -2009,6 +2011,7 @@ impl RuntimeManager {
             .clone()
             .unwrap_or_else(|| self.llm_registry.default_model_id().to_string());
         let context_window = self.llm_registry.context_window(&model_id);
+        let max_output_tokens = self.llm_registry.max_output_tokens(&model_id);
         let mode_context = conv_mode_to_context(&conv.conv_mode);
         let mut context = if is_sub_agent {
             let root_id = find_root_conversation_id(&self.db, conversation_id).await;
@@ -2019,8 +2022,10 @@ impl RuntimeManager {
                 context_window,
                 root_id,
             )
+            .with_max_output_tokens(max_output_tokens)
         } else {
             ConvContext::new(&conv.id, conv_cwd.path_buf(), &model_id, context_window)
+                .with_max_output_tokens(max_output_tokens)
         };
         context.mode_context = Some(mode_context);
         context.explore_bash = ExploreToolPolicy::from_platform(&self.platform).bash();

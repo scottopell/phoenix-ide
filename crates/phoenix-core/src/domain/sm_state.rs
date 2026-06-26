@@ -2044,6 +2044,10 @@ pub struct ConvContext {
     /// typed capability (not inferred from tool names) so sandboxed and
     /// unavailable bash cannot be conflated.
     pub explore_bash: ExploreBashCapability,
+    /// Maximum output tokens the model may generate in a single response.
+    /// Drives the `max_tokens` field of every outbound LLM request and the
+    /// continuation threshold computation.
+    pub max_output_tokens: u32,
     /// Maximum LLM turns for this conversation (0 = unlimited, for parent conversations)
     pub max_turns: u32,
     /// Desired base branch for Managed mode (set at creation, consumed at task approval)
@@ -2078,6 +2082,9 @@ pub struct ConvContext {
 /// Default context window for unknown models (conservative)
 pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
+/// Default max output tokens for models that do not declare an explicit cap.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
 impl ConvContext {
     pub fn new(
         conversation_id: impl Into<String>,
@@ -2093,6 +2100,7 @@ impl ConvContext {
             model_id: model_id.into(),
             is_sub_agent: false,
             context_window,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
             mode_context: None,
             explore_bash: ExploreBashCapability::Unavailable,
@@ -2121,6 +2129,7 @@ impl ConvContext {
             model_id: model_id.into(),
             is_sub_agent: true,
             context_window,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             mode_context: None,
             explore_bash: ExploreBashCapability::Unavailable,
@@ -2132,5 +2141,13 @@ impl ConvContext {
             llm_language: crate::llm_language::LlmLanguage::default(),
             persona: None,
         }
+    }
+
+    /// Override the per-model max output token cap on this context. Called by the
+    /// runtime after resolving the model's cap from the registry.
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, tokens: u32) -> Self {
+        self.max_output_tokens = tokens;
+        self
     }
 }

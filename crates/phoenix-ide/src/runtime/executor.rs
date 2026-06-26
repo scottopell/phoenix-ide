@@ -3541,6 +3541,7 @@ where
         let llm_language = self.context.llm_language;
         let persona = self.context.persona.clone();
         let explore_bash = self.context.explore_bash;
+        let max_output_tokens = self.context.max_output_tokens;
 
         // Token streaming channel (REQ-BED-025).
         //
@@ -3680,7 +3681,7 @@ where
                 system: vec![SystemContent::cached(&system_prompt)],
                 messages,
                 tools,
-                max_tokens: Some(16_384),
+                max_tokens: Some(max_output_tokens),
                 // Every turn in a conversation reuses the same prefix
                 // (system prompt + earlier turns), so all turns share one key.
                 cache_key: PromptCacheKey::stable(&conv_id),

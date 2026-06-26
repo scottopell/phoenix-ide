@@ -2316,7 +2316,7 @@ pub fn transition_parent(
                 // below) parks into awaiting_continuation instead, replaying the
                 // propose_task call after continuation. Without this guard a fork
                 // would be recorded while the origin is over-budget.
-                if should_trigger_continuation(&usage_data, context.context_window) {
+                if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -2468,7 +2468,7 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
 
-                if should_trigger_continuation(&usage_data, context.context_window) {
+                if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -2613,7 +2613,7 @@ pub fn transition_parent(
             }
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
-            if should_trigger_continuation(&usage_data, context.context_window) {
+            if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -3031,7 +3031,7 @@ pub fn transition_sub_agent(
         ) => {
             let final_attempt = *attempt;
             // Context exhaustion check first (sub-agent fails immediately)
-            if should_trigger_continuation(&usage_data, context.context_window) {
+            if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -3438,19 +3438,27 @@ fn current_attempt(state: &ConvState) -> u32 {
 
 // Helper functions
 
-/// Threshold as fraction of context window for triggering continuation (REQ-BED-019)
-const CONTINUATION_THRESHOLD: f64 = 0.90;
+/// Tokens reserved between the continuation threshold and the model's max output cap.
+/// Chosen to absorb token-count estimation noise without materially shrinking
+/// usable headroom on any supported context size.
+const CONTINUATION_SAFETY_MARGIN: usize = 2_000;
 
-/// Check if context usage has exceeded the continuation threshold (REQ-BED-019)
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
-fn should_trigger_continuation(usage: &UsageData, context_window: usize) -> bool {
+/// Check if context usage has exceeded the continuation threshold (REQ-BED-019).
+///
+/// The threshold is `context_window - max_output_tokens - CONTINUATION_SAFETY_MARGIN`,
+/// using saturating subtraction so a tiny context window can never underflow.
+/// A larger `max_output_tokens` lowers the threshold (triggers earlier); a
+/// smaller cap leaves more of the window available for input before continuation fires.
+fn should_trigger_continuation(
+    usage: &UsageData,
+    context_window: usize,
+    max_output_tokens: u32,
+) -> bool {
     let used = usage.context_window_used();
-    let threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
-    used >= threshold
+    let threshold = context_window
+        .saturating_sub(max_output_tokens as usize)
+        .saturating_sub(CONTINUATION_SAFETY_MARGIN);
+    used >= threshold as u64
 }
 
 /// Handle context exhaustion based on conversation type (REQ-BED-019, REQ-BED-024)
@@ -4169,52 +4177,64 @@ mod tests {
 
     #[test]
     fn test_threshold_boundary_below() {
-        // 89.9% should NOT trigger continuation
+        // One token below threshold (100_000 - 16_384 - 2_000 - 1 = 81_615) should NOT trigger
         let usage = UsageData {
-            input_tokens: 89_900,
+            input_tokens: 81_615,
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         };
         assert!(
-            !should_trigger_continuation(&usage, 100_000),
-            "89.9% should not trigger continuation"
+            !should_trigger_continuation(
+                &usage,
+                100_000,
+                phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            "one token below threshold should not trigger continuation"
         );
     }
 
     #[test]
     fn test_threshold_boundary_at() {
-        // Exactly 90% SHOULD trigger continuation
+        // Exactly at threshold (100_000 - 16_384 - 2_000 = 81_616) SHOULD trigger
         let usage = UsageData {
-            input_tokens: 90_000,
+            input_tokens: 81_616,
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000),
-            "90% should trigger continuation"
+            should_trigger_continuation(
+                &usage,
+                100_000,
+                phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            "token count at threshold should trigger continuation"
         );
     }
 
     #[test]
     fn test_threshold_boundary_above() {
-        // 90.1% should trigger continuation
+        // One token above threshold (81_617) should trigger continuation
         let usage = UsageData {
-            input_tokens: 90_100,
+            input_tokens: 81_617,
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000),
-            "90.1% should trigger continuation"
+            should_trigger_continuation(
+                &usage,
+                100_000,
+                phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            "one token above threshold should trigger continuation"
         );
     }
 
     #[test]
     fn test_threshold_with_output_tokens() {
-        // 45k input + 45k output = 90k total >= 90% of 100k
+        // 45k input + 45k output = 90k total, well above the 81_616 threshold
         let usage = UsageData {
             input_tokens: 45_000,
             output_tokens: 45_000,
@@ -4222,8 +4242,38 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000),
-            "Combined tokens should count toward threshold"
+            should_trigger_continuation(
+                &usage,
+                100_000,
+                phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            "combined input+output tokens should count toward threshold"
+        );
+    }
+
+    #[test]
+    fn test_threshold_smaller_max_output_allows_more_headroom() {
+        // A smaller output cap raises the threshold, leaving more room before continuation fires.
+        // default cap threshold: 100_000 - 16_384 - 2_000 = 81_616
+        // small cap threshold:   100_000 -  8_192 - 2_000 = 89_808
+        let context_window = 100_000;
+        let usage = UsageData {
+            input_tokens: 89_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert!(
+            should_trigger_continuation(
+                &usage,
+                context_window,
+                phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            "default cap: 89k tokens exceeds threshold of 81_616 and should trigger"
+        );
+        assert!(
+            !should_trigger_continuation(&usage, context_window, 8_192),
+            "small cap: 89k tokens is below threshold of 89_808 and should not trigger"
         );
     }
 
@@ -4242,6 +4292,7 @@ mod tests {
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 100_000,
+            max_output_tokens: phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -4310,6 +4361,7 @@ mod tests {
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 100_000,
+            max_output_tokens: phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -4634,6 +4686,7 @@ mod tests {
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
+            max_output_tokens: phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -4742,6 +4795,7 @@ mod tests {
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
+            max_output_tokens: phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -4796,6 +4850,7 @@ mod tests {
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
+            max_output_tokens: phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -4857,6 +4912,7 @@ mod tests {
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
+            max_output_tokens: phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
