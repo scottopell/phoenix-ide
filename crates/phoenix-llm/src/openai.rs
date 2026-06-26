@@ -29,27 +29,12 @@ fn resolve_endpoint(base_url_override: Option<&str>) -> String {
 }
 
 /// Determine the full endpoint URL for the Chat Completions API.
-///
-/// When a `base_url_override` is present the suffix (`/v1/responses`,
-/// `/v1/chat/completions`, etc.) is replaced with `/v1/chat/completions`
-/// so that the same gateway base URL works for both Responses and Chat
-/// Completions models. If the override contains no `/v1/` segment it is
-/// used as-is.
+/// Priority: `base_url_override` (used as-is) > provider default.
 fn resolve_chat_endpoint(base_url_override: Option<&str>) -> String {
-    match base_url_override {
-        None => "https://api.openai.com/v1/chat/completions".to_string(),
-        Some(url) => derive_sibling_endpoint(url, "chat/completions"),
-    }
-}
-
-/// Replace the path suffix after the last `/v1/` segment.
-/// Returns `base_url` unchanged when no `/v1/` segment is found.
-fn derive_sibling_endpoint(base_url: &str, suffix: &str) -> String {
-    let path = base_url.split('?').next().unwrap_or(base_url);
-    let Some((prefix, _)) = path.split_once("/v1/") else {
-        return base_url.to_string();
-    };
-    format!("{prefix}/v1/{suffix}")
+    base_url_override.map_or_else(
+        || "https://api.openai.com/v1/chat/completions".to_string(),
+        std::string::ToString::to_string,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2475,13 +2460,17 @@ mod tests {
         }
 
         #[test]
-        fn chat_endpoint_derives_sibling_from_responses_url() {
+        fn chat_endpoint_preserves_responses_override_exactly() {
             let url =
-                resolve_chat_endpoint(Some("https://gateway.example.com/openai/v1/responses"));
-            assert_eq!(
-                url,
-                "https://gateway.example.com/openai/v1/chat/completions"
-            );
+                resolve_chat_endpoint(Some("https://gw.example.com/openai/v1/responses"));
+            assert_eq!(url, "https://gw.example.com/openai/v1/responses");
+        }
+
+        #[test]
+        fn chat_endpoint_preserves_chat_completions_override_exactly() {
+            let url =
+                resolve_chat_endpoint(Some("https://gw.example.com/v1/chat/completions"));
+            assert_eq!(url, "https://gw.example.com/v1/chat/completions");
         }
 
         #[test]
