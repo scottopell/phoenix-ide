@@ -13,6 +13,7 @@ use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,39 @@ fn resolve_chat_endpoint(base_url_override: Option<&str>) -> String {
         || "https://api.openai.com/v1/chat/completions".to_string(),
         std::string::ToString::to_string,
     )
+}
+
+fn raw_chat_debug_enabled() -> bool {
+    std::env::var("PHOENIX_LLM_DEBUG_RAW_CHAT")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn raw_chat_debug_path() -> String {
+    std::env::var("PHOENIX_LLM_DEBUG_RAW_CHAT_PATH")
+        .unwrap_or_else(|_| "phoenix-llm-chat-raw.jsonl".to_string())
+}
+
+fn maybe_log_raw_chat_response(model: &str, kind: &str, body: &str) {
+    if !raw_chat_debug_enabled() {
+        return;
+    }
+    let path = raw_chat_debug_path();
+    let record = serde_json::json!({
+        "ts": Utc::now().to_rfc3339(),
+        "model": model,
+        "kind": kind,
+        "body": body,
+    });
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{record}"))
+    {
+        Ok(()) => {}
+        Err(error) => tracing::warn!(%error, path, "failed to write raw chat debug response"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,6 +1182,7 @@ pub async fn complete_chat(
         .text()
         .await
         .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
+    maybe_log_raw_chat_response(&spec.api_name, "chat.completions.response", &body);
 
     if !status.is_success() {
         return Err(openai_http_error(status.as_u16(), status.as_str(), &body));
@@ -1210,6 +1245,7 @@ pub async fn complete_streaming_chat(
             .text()
             .await
             .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
+        maybe_log_raw_chat_response(&spec.api_name, "chat.completions.stream.http_error", &body);
         return Err(openai_http_error(status.as_u16(), status.as_str(), &body));
     }
 
@@ -1220,6 +1256,11 @@ pub async fn complete_streaming_chat(
     'outer: while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| LlmError::network(format!("Stream error: {e}")))?;
         for event in sse.push(&chunk) {
+            maybe_log_raw_chat_response(
+                &spec.api_name,
+                "chat.completions.stream.event",
+                &event.data,
+            );
             if let Err(e) = acc.process_event(&event.data, chunk_tx) {
                 tracing::error!(
                     data_len = event.data.len(),
@@ -1235,6 +1276,7 @@ pub async fn complete_streaming_chat(
     }
 
     for event in sse.finish() {
+        maybe_log_raw_chat_response(&spec.api_name, "chat.completions.stream.event", &event.data);
         acc.process_event(&event.data, chunk_tx)?;
     }
 
