@@ -92,6 +92,11 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
     let cancelled = false;
     setRenderState({ status: 'rendering' });
 
+    // mermaid.render injects a temporary measuring node into <body> with id
+    // `d${diagramId}`. It removes it on success, but on a syntax error it throws
+    // before cleanup, orphaning an error-diagram SVG that inflates page height.
+    const removeOrphanedNode = () => document.getElementById(`d${diagramId}`)?.remove();
+
     import('mermaid')
       .then(({ default: mermaid }: { default: Mermaid }) => {
         if (cancelled) return;
@@ -120,11 +125,13 @@ export function MermaidDiagram({ code, className = '' }: MermaidDiagramProps) {
         });
       })
       .catch((error: unknown) => {
+        removeOrphanedNode();
         if (!cancelled) setRenderState({ status: 'error', message: errorMessage(error) });
       });
 
     return () => {
       cancelled = true;
+      removeOrphanedNode();
     };
   }, [diagramId, source, theme]);
 
