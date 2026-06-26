@@ -413,7 +413,11 @@ fn discovery_auth_headers(
                 vec![("Authorization".to_string(), format!("Bearer {credential}"))]
             }
         },
-        ModelBackend::OpenAIResponses => {
+        // Both OpenAI Responses and Chat Completions use Bearer auth for
+        // gateway discovery. Phase 1: Chat Completions models are not filtered
+        // by discovery (see `DiscoveredModels::was_listed`), so this arm is
+        // mainly defensive / future-proof.
+        ModelBackend::OpenAIResponses | ModelBackend::OpenAIChatCompletions => {
             vec![("Authorization".to_string(), format!("Bearer {credential}"))]
         }
         ModelBackend::Mock => return None,
@@ -819,6 +823,18 @@ impl ModelRegistry {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
                     LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
                 }
+                // Phase 1: Chat Completions uses the same openai_api_key /
+                // openai_base_url as the Responses backend. Service dispatch
+                // will return an unimplemented error until Phase 2.
+                ModelBackend::OpenAIChatCompletions => {
+                    let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
+                    let style = if config.openai_base_url.is_some() {
+                        config.auth_style
+                    } else {
+                        AuthStyle::ApiKey
+                    };
+                    LlmAuth::new(Arc::new(StaticCredential::new(key)), style)
+                }
                 ModelBackend::Mock => unreachable!("handled above"),
             }
         };
@@ -891,7 +907,10 @@ impl ModelRegistry {
             if let Some(service) = services.get(model_id) {
                 model_infos.push(ModelInfo {
                     id: spec.id.clone(),
-                    provider: spec.backend.display_name().to_string(),
+                    // Use the user-facing family name, not the wire-protocol
+                    // backend name, so gateway-routed models (e.g. Gemini via
+                    // OpenAI Chat Completions) display their true provider.
+                    provider: spec.family.display_name().to_string(),
                     description: spec.description.clone(),
                     context_window: spec.context_window_for(service.as_ref()),
                     recommended: spec.recommended,
@@ -902,6 +921,10 @@ impl ModelRegistry {
     }
 
     /// Resolve a registered model id to a provider display name.
+    ///
+    /// Uses the model's [`ModelFamily`] for display so gateway-routed models
+    /// (e.g. Gemini via Chat Completions) show their true provider, not the
+    /// wire-protocol backend name.
     ///
     /// Returns `"Unknown"` when the model is not currently registered.
     ///
@@ -915,7 +938,7 @@ impl ModelRegistry {
             .get(model_id)
             .cloned()
         {
-            return spec.backend.display_name().to_string();
+            return spec.family.display_name().to_string();
         }
 
         Self::model_specs(&self.config)
@@ -923,7 +946,7 @@ impl ModelRegistry {
             .find(|spec| spec.id == model_id)
             .map_or_else(
                 || infer_provider_display_from_model_id(model_id),
-                |spec| spec.backend.display_name().to_string(),
+                |spec| spec.family.display_name().to_string(),
             )
     }
 
@@ -1022,6 +1045,9 @@ impl ModelRegistry {
         let candidates: &[&str] = match parent_backend {
             ModelBackend::Anthropic => &["claude-haiku-4-5"],
             ModelBackend::OpenAIResponses => &["gpt-5.4-mini"],
+            // Phase 1: no built-in Chat Completions cheap model; stay on the
+            // same external model (external source already handled above).
+            ModelBackend::OpenAIChatCompletions => return parent_model_id.to_string(),
             ModelBackend::Mock => return "mock".to_string(),
         };
 
@@ -2014,6 +2040,102 @@ mod tests {
         assert_eq!(
             derive_models_url("https://host/v1/messages?foo=bar"),
             Some("https://host/v1/models".to_string())
+        );
+    }
+
+    // --- Phase 1 new tests: ModelFamily / max_output_tokens / Chat Completions ---
+
+    fn external_google_model() -> super::super::ModelSpec {
+        parse_external_models(
+            r#"[{"id":"gateway/gemini-2.5-pro","backend":"openai_chat_completions","family":"google","description":"Gemini 2.5 Pro via OpenAI-compatible gateway","context_window":1000000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+    }
+
+    #[test]
+    fn model_info_provider_uses_family_for_google_chat_completions_model() {
+        let config = LlmConfig {
+            openai_api_key: Some("test-key".to_string()),
+            external_models: vec![external_google_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        let info = registry
+            .available_model_info()
+            .into_iter()
+            .find(|m| m.id == "gateway/gemini-2.5-pro")
+            .expect("Google Chat Completions model should register and appear in model info");
+
+        // Must show "Google" (family), not "OpenAI" (backend wire protocol)
+        assert_eq!(info.provider, "Google");
+    }
+
+    #[test]
+    fn provider_display_name_uses_family_for_registered_google_model() {
+        let config = LlmConfig {
+            openai_api_key: Some("test-key".to_string()),
+            external_models: vec![external_google_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert_eq!(
+            registry.provider_display_name("gateway/gemini-2.5-pro"),
+            "Google"
+        );
+    }
+
+    #[test]
+    fn provider_display_name_uses_family_for_unregistered_external_model() {
+        // External model in config but no credential — it won't register, but
+        // provider_display_name should still consult the config specs.
+        let registry = ModelRegistry::new(&LlmConfig {
+            external_models: vec![external_google_model()],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            registry.provider_display_name("gateway/gemini-2.5-pro"),
+            "Google"
+        );
+    }
+
+    #[test]
+    fn model_info_max_output_tokens_populated_for_builtin_anthropic() {
+        let config = LlmConfig {
+            anthropic_api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        // The spec is stored in registry.specs; probe via context_window helper
+        // to confirm the spec round-tripped. max_output_tokens is part of ModelSpec
+        // returned by model_specs() — we verify it's nonzero via the registry's spec store.
+        let specs = registry.specs.read().expect("lock");
+        let haiku = specs.get("claude-haiku-4-5").expect("haiku should be registered");
+        assert!(
+            haiku.max_output_tokens > 0,
+            "claude-haiku-4-5 must have nonzero max_output_tokens"
+        );
+    }
+
+    #[test]
+    fn external_chat_completions_model_registers_with_openai_key() {
+        // Chat Completions model should register when openai_api_key is present.
+        let config = LlmConfig {
+            openai_api_key: Some("test-key".to_string()),
+            external_models: vec![external_google_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+
+        assert!(
+            registry.get("gateway/gemini-2.5-pro").is_some(),
+            "Chat Completions external model should register with openai_api_key"
         );
     }
 }

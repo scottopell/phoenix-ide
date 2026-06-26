@@ -2,6 +2,36 @@
 //!
 use std::collections::HashSet;
 
+/// Default maximum output tokens applied when a model spec does not provide an
+/// explicit override. External model configs that omit `max_output_tokens` get
+/// this value; a nonzero explicit value is accepted as-is.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
+/// User-facing provider family. Distinct from [`ModelBackend`] (wire protocol)
+/// so gateway-routed models (e.g. Gemini served over an OpenAI-compatible
+/// Chat Completions endpoint) display their actual originating provider in the
+/// UI rather than the wire protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum ModelFamily {
+    Anthropic,
+    OpenAI,
+    Google,
+    Mock,
+}
+
+impl ModelFamily {
+    /// User-facing display name used in `/api/models` responses and the model picker.
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ModelFamily::Anthropic => "Anthropic",
+            ModelFamily::OpenAI => "OpenAI",
+            ModelFamily::Google => "Google",
+            ModelFamily::Mock => "Mock",
+        }
+    }
+}
+
 /// Per-model metadata surfaced to API consumers (the `/api/models` response and
 /// the model picker). Built by [`super::ModelRegistry::available_model_info`]
 /// from a [`ModelSpec`] plus the live service's effective context window.
@@ -21,17 +51,25 @@ pub enum ModelBackend {
     Anthropic,
     /// `OpenAI` Responses-compatible backend.
     OpenAIResponses,
+    /// `OpenAI` Chat Completions-compatible backend. Metadata/config only in
+    /// Phase 1 — service dispatch returns an unimplemented error until the
+    /// actual request path is wired up.
+    OpenAIChatCompletions,
     /// In-process deterministic mock backend.
     Mock,
 }
 
 impl ModelBackend {
     /// Display name surfaced in `/api/models` and usage reports.
+    /// NOTE: prefer [`ModelFamily::display_name`] for the user-facing provider
+    /// label — this method returns the wire-protocol name, which may differ
+    /// from the originating model family (e.g. Gemini served over an OpenAI
+    /// Chat Completions gateway).
     #[must_use]
     pub fn display_name(self) -> &'static str {
         match self {
             ModelBackend::Anthropic => "Anthropic",
-            ModelBackend::OpenAIResponses => "OpenAI",
+            ModelBackend::OpenAIResponses | ModelBackend::OpenAIChatCompletions => "OpenAI",
             ModelBackend::Mock => "Mock",
         }
     }
@@ -41,8 +79,20 @@ impl ModelBackend {
     pub fn header_value(self) -> &'static str {
         match self {
             ModelBackend::Anthropic => "anthropic",
-            ModelBackend::OpenAIResponses => "openai",
+            ModelBackend::OpenAIResponses | ModelBackend::OpenAIChatCompletions => "openai",
             ModelBackend::Mock => "mock",
+        }
+    }
+
+    /// Default user-facing [`ModelFamily`] for this backend. External model
+    /// configs may override this (e.g. specifying `family: "google"` for a
+    /// model served over `openai_chat_completions`).
+    #[must_use]
+    pub fn default_family(self) -> ModelFamily {
+        match self {
+            ModelBackend::Anthropic => ModelFamily::Anthropic,
+            ModelBackend::OpenAIResponses | ModelBackend::OpenAIChatCompletions => ModelFamily::OpenAI,
+            ModelBackend::Mock => ModelFamily::Mock,
         }
     }
 
@@ -51,17 +101,20 @@ impl ModelBackend {
         match self {
             ModelBackend::Anthropic | ModelBackend::Mock => ApiFormat::Anthropic,
             ModelBackend::OpenAIResponses => ApiFormat::OpenAIResponses,
+            ModelBackend::OpenAIChatCompletions => ApiFormat::OpenAIChatCompletions,
         }
     }
 }
 
 #[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
 enum ExternalBackend {
     #[serde(rename = "anthropic", alias = "anthropic_messages")]
     Anthropic,
     #[serde(rename = "openai_responses")]
     OpenAIResponses,
+    /// `openai_chat_completions` — Phase 1: metadata/config only.
+    #[serde(rename = "openai_chat_completions")]
+    OpenAIChatCompletions,
 }
 
 impl From<ExternalBackend> for ModelBackend {
@@ -69,6 +122,34 @@ impl From<ExternalBackend> for ModelBackend {
         match value {
             ExternalBackend::Anthropic => ModelBackend::Anthropic,
             ExternalBackend::OpenAIResponses => ModelBackend::OpenAIResponses,
+            ExternalBackend::OpenAIChatCompletions => ModelBackend::OpenAIChatCompletions,
+        }
+    }
+}
+
+/// Serde-only enum for the optional `family` field in external model config.
+/// Maps to [`ModelFamily`] so external configs can declare that a model
+/// hosted behind an OpenAI-compatible gateway (e.g. Chat Completions) actually
+/// originates from Google, Anthropic, etc.
+#[derive(Debug, serde::Deserialize)]
+enum ExternalFamily {
+    #[serde(rename = "anthropic")]
+    Anthropic,
+    #[serde(rename = "openai")]
+    OpenAI,
+    #[serde(rename = "google")]
+    Google,
+    #[serde(rename = "mock")]
+    Mock,
+}
+
+impl From<ExternalFamily> for ModelFamily {
+    fn from(value: ExternalFamily) -> Self {
+        match value {
+            ExternalFamily::Anthropic => ModelFamily::Anthropic,
+            ExternalFamily::OpenAI => ModelFamily::OpenAI,
+            ExternalFamily::Google => ModelFamily::Google,
+            ExternalFamily::Mock => ModelFamily::Mock,
         }
     }
 }
@@ -80,6 +161,10 @@ pub(crate) enum ApiFormat {
     Anthropic,
     /// `OpenAI` Responses API
     OpenAIResponses,
+    /// `OpenAI` Chat Completions API — Phase 1: metadata/config only.
+    /// Service dispatch returns an unimplemented error until the request
+    /// path is implemented.
+    OpenAIChatCompletions,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -87,8 +172,17 @@ struct ExternalModelSpec {
     id: String,
     api_name: Option<String>,
     backend: ExternalBackend,
+    /// Optional user-facing provider family. When absent, defaults to the
+    /// backend's default family (e.g. `openai_chat_completions` → `OpenAI`).
+    /// Set explicitly to `"google"` when a Gemini model is served over an
+    /// OpenAI-compatible endpoint so the UI displays "Google" not "OpenAI".
+    family: Option<ExternalFamily>,
     description: String,
     context_window: usize,
+    /// Maximum output tokens for this model. Defaults to
+    /// [`DEFAULT_MAX_OUTPUT_TOKENS`] when absent. A nonzero value is required
+    /// when this field is present.
+    max_output_tokens: Option<u32>,
     recommended: bool,
     supports_tool_search: bool,
 }
@@ -108,6 +202,10 @@ pub struct ModelSpec {
     pub api_name: String,
     /// Backend route + wire protocol for this model.
     pub backend: ModelBackend,
+    /// User-facing provider family. Distinct from `backend` so gateway-routed
+    /// models (e.g. Gemini via an OpenAI Chat Completions endpoint) can show
+    /// their true originating provider in the UI. See [`ModelFamily`].
+    pub family: ModelFamily,
     /// Human-readable description
     pub description: String,
     /// Platform-API context window ceiling. **Not** route-aware — the codex
@@ -117,6 +215,10 @@ pub struct ModelSpec {
     /// (which know whether they're on a bridge route) can still read it
     /// directly when needed; external callers must go through the method.
     pub(super) context_window: usize,
+    /// Maximum tokens the model may produce in a single response. Populated
+    /// for all built-in models; external configs default to
+    /// [`DEFAULT_MAX_OUTPUT_TOKENS`] when omitted.
+    pub max_output_tokens: u32,
     /// Recommended for most users (shown by default in UI)
     pub recommended: bool,
     /// Whether this model supports Anthropic's tool search feature
@@ -191,12 +293,24 @@ fn external_model_spec_from_config(
     if spec.context_window == 0 {
         return Err(format!("model '{id}' has invalid context_window 0"));
     }
+    let max_output_tokens = match spec.max_output_tokens {
+        Some(0) => return Err(format!("model '{id}' has invalid max_output_tokens 0")),
+        Some(n) => n,
+        None => DEFAULT_MAX_OUTPUT_TOKENS,
+    };
+    // Derive family from backend, but honour an explicit override so
+    // Google/etc. models behind an OpenAI-compatible gateway show the right
+    // provider label.
+    let backend: ModelBackend = spec.backend.into();
+    let family = spec.family.map(ModelFamily::from).unwrap_or_else(|| backend.default_family());
     Ok(ModelSpec {
         id,
         api_name,
-        backend: spec.backend.into(),
+        backend,
+        family,
         description,
         context_window: spec.context_window,
+        max_output_tokens,
         recommended: spec.recommended,
         supports_tool_search: spec.supports_tool_search,
         source: ModelSource::External,
@@ -238,8 +352,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-opus-4-8".into(),
             api_name: "claude-opus-4-8".into(),
             backend: ModelBackend::Anthropic,
+            family: ModelFamily::Anthropic,
             description: "Claude Opus 4.8 (most capable, slower)".into(),
             context_window: 1_000_000,
+            max_output_tokens: 32_768,
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -248,8 +364,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-opus-4-7".into(),
             api_name: "claude-opus-4-7".into(),
             backend: ModelBackend::Anthropic,
+            family: ModelFamily::Anthropic,
             description: "Claude Opus 4.7 (legacy)".into(),
             context_window: 1_000_000,
+            max_output_tokens: 32_768,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -258,8 +376,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-opus-4-6".into(),
             api_name: "claude-opus-4-6".into(),
             backend: ModelBackend::Anthropic,
+            family: ModelFamily::Anthropic,
             description: "Claude Opus 4.6 (legacy)".into(),
             context_window: 1_000_000,
+            max_output_tokens: 32_768,
             recommended: false,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -268,8 +388,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-sonnet-4-6".into(),
             api_name: "claude-sonnet-4-6".into(),
             backend: ModelBackend::Anthropic,
+            family: ModelFamily::Anthropic,
             description: "Claude Sonnet 4.6 (balanced performance)".into(),
             context_window: 1_000_000,
+            max_output_tokens: 32_768,
             recommended: true,
             supports_tool_search: true,
             source: ModelSource::BuiltIn,
@@ -278,8 +400,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "claude-haiku-4-5".into(),
             api_name: "claude-haiku-4-5-20251001".into(),
             backend: ModelBackend::Anthropic,
+            family: ModelFamily::Anthropic,
             description: "Claude Haiku 4.5 (fast, efficient)".into(),
             context_window: 200_000,
+            max_output_tokens: 16_384,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -294,8 +418,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.5".into(),
             api_name: "gpt-5.5".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: ModelFamily::OpenAI,
             description: "GPT-5.5 (frontier, 1M context)".into(),
             context_window: 1_000_000,
+            max_output_tokens: 32_768,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -304,8 +430,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.4".into(),
             api_name: "gpt-5.4".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: ModelFamily::OpenAI,
             description: "GPT-5.4 (frontier, native computer use)".into(),
             context_window: 400_000,
+            max_output_tokens: 32_768,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -314,8 +442,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.4-mini".into(),
             api_name: "gpt-5.4-mini".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: ModelFamily::OpenAI,
             description: "GPT-5.4 Mini (fast, efficient)".into(),
             context_window: 400_000,
+            max_output_tokens: 32_768,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -325,8 +455,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "gpt-5.3-codex".into(),
             api_name: "gpt-5.3-codex".into(),
             backend: ModelBackend::OpenAIResponses,
+            family: ModelFamily::OpenAI,
             description: "GPT-5.3 Codex (latest code model)".into(),
             context_window: 200_000,
+            max_output_tokens: 32_768,
             recommended: true,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -336,8 +468,10 @@ pub fn all_models() -> Vec<ModelSpec> {
             id: "mock".into(),
             api_name: "mock".into(),
             backend: ModelBackend::Mock,
+            family: ModelFamily::Mock,
             description: "Mock (lorem ipsum for UI dev)".into(),
             context_window: 200_000,
+            max_output_tokens: 4_096,
             recommended: false,
             supports_tool_search: false,
             source: ModelSource::BuiltIn,
@@ -420,5 +554,117 @@ mod tests {
 
         assert_ne!(sonnet.api_name, "other-wire-name");
         assert_ne!(sonnet.context_window, 123);
+    }
+
+    // --- Phase 1 new tests ---
+
+    #[test]
+    fn external_chat_completions_backend_parses_and_gets_openai_family() {
+        let models = parse_external_models(
+            r#"[{"id":"gateway/gemini-2.5-pro","backend":"openai_chat_completions","description":"Gemini 2.5 Pro via gateway","context_window":1000000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("openai_chat_completions backend should parse");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].backend, ModelBackend::OpenAIChatCompletions);
+        assert_eq!(models[0].backend.api_format(), ApiFormat::OpenAIChatCompletions);
+        // Default family from backend is OpenAI
+        assert_eq!(models[0].family, ModelFamily::OpenAI);
+    }
+
+    #[test]
+    fn external_model_explicit_google_family_overrides_backend_default() {
+        let models = parse_external_models(
+            r#"[{"id":"gateway/gemini-2.5-pro","backend":"openai_chat_completions","family":"google","description":"Gemini 2.5 Pro via gateway","context_window":1000000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("explicit google family should parse");
+
+        assert_eq!(models[0].backend, ModelBackend::OpenAIChatCompletions);
+        assert_eq!(models[0].family, ModelFamily::Google);
+        assert_eq!(models[0].family.display_name(), "Google");
+    }
+
+    #[test]
+    fn external_model_max_output_defaults_to_const_when_omitted() {
+        let models = parse_external_models(
+            r#"[{"id":"test","backend":"anthropic","description":"Test","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(models[0].max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn external_model_explicit_max_output_accepted() {
+        let models = parse_external_models(
+            r#"[{"id":"test","backend":"anthropic","description":"Test","context_window":128000,"max_output_tokens":8192,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(models[0].max_output_tokens, 8_192);
+    }
+
+    #[test]
+    fn external_model_zero_max_output_is_rejected() {
+        let models = parse_external_models(
+            r#"[{"id":"test","backend":"anthropic","description":"Test","context_window":128000,"max_output_tokens":0,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("array should parse; the invalid entry should be skipped");
+
+        assert!(models.is_empty(), "zero max_output_tokens must be rejected");
+    }
+
+    #[test]
+    fn builtin_anthropic_models_have_anthropic_family() {
+        let models = all_models();
+        for spec in models.iter().filter(|m| m.backend == ModelBackend::Anthropic) {
+            assert_eq!(
+                spec.family,
+                ModelFamily::Anthropic,
+                "Anthropic model {} should have Anthropic family",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_openai_models_have_openai_family() {
+        let models = all_models();
+        for spec in models
+            .iter()
+            .filter(|m| m.backend == ModelBackend::OpenAIResponses)
+        {
+            assert_eq!(
+                spec.family,
+                ModelFamily::OpenAI,
+                "OpenAI model {} should have OpenAI family",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_models_all_have_nonzero_max_output_tokens() {
+        for spec in all_models() {
+            assert!(
+                spec.max_output_tokens > 0,
+                "model {} has zero max_output_tokens",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn model_family_display_names_are_distinct() {
+        let names: std::collections::HashSet<_> = [
+            ModelFamily::Anthropic,
+            ModelFamily::OpenAI,
+            ModelFamily::Google,
+            ModelFamily::Mock,
+        ]
+        .iter()
+        .map(|f| f.display_name())
+        .collect();
+        assert_eq!(names.len(), 4, "each family must have a unique display name");
     }
 }
