@@ -670,12 +670,14 @@ mod tests {
                 pending: vec![],
                 completed_results: vec![],
                 spawn_tool_id: None,
+                spawn_tool_result_message_id: None,
             },
             ConvState::CancellingSubAgents {
                 pending: vec![],
                 completed_results: vec![],
                 cause: crate::domain::sm_event::CancelCause::UserRequested,
                 spawn_tool_id: None,
+                spawn_tool_result_message_id: None,
             },
             ConvState::Completed {
                 result: "ok".into(),
@@ -960,8 +962,10 @@ pub enum ConvState {
         /// Sub-agents still running (id + task co-located)
         pending: Vec<PendingSubAgent>,
         completed_results: Vec<SubAgentResult>,
-        /// `tool_use_id` of the `spawn_agents` call (to update `display_data` when done)
+        /// Provider `tool_use_id` of the `spawn_agents` call.
         spawn_tool_id: Option<String>,
+        /// Durable message id of the `spawn_agents` placeholder tool-result row.
+        spawn_tool_result_message_id: Option<String>,
     },
 
     /// User requested cancellation while waiting for sub-agents.
@@ -976,11 +980,11 @@ pub enum ConvState {
         /// on startup, so it is strict-deserialized like its siblings (no
         /// `serde(default)`), and no migration is owed.
         cause: crate::domain::sm_event::CancelCause,
-        /// `tool_use_id` of the originating `spawn_agents` call, when teardown
-        /// began from `AwaitingSubAgents`. `None` for the `CancellingTool`-origin
-        /// path (no spawn id exists), which suppresses result persistence to
-        /// avoid an orphaned `tool_result`. Transient/owned like `cause`.
+        /// Provider `tool_use_id` of the originating `spawn_agents` call, when
+        /// teardown began from `AwaitingSubAgents`.
         spawn_tool_id: Option<String>,
+        /// Durable message id of the originating `spawn_agents` placeholder row.
+        spawn_tool_result_message_id: Option<String>,
     },
 
     /// Sub-agent completed successfully (terminal state, sub-agent only)
@@ -1113,6 +1117,7 @@ pub enum CoreState {
         pending: Vec<PendingSubAgent>,
         completed_results: Vec<SubAgentResult>,
         spawn_tool_id: Option<String>,
+        spawn_tool_result_message_id: Option<String>,
     },
     CancellingSubAgents {
         pending: Vec<PendingSubAgent>,
@@ -1121,6 +1126,8 @@ pub enum CoreState {
         cause: crate::domain::sm_event::CancelCause,
         /// See `ConvState::CancellingSubAgents::spawn_tool_id`.
         spawn_tool_id: Option<String>,
+        /// See `ConvState::CancellingSubAgents::spawn_tool_result_message_id`.
+        spawn_tool_result_message_id: Option<String>,
     },
     Error {
         message: String,
@@ -1291,21 +1298,25 @@ impl From<CoreState> for ConvState {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             } => ConvState::AwaitingSubAgents {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             },
             CoreState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             } => ConvState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             },
             CoreState::Error {
                 message,
@@ -1388,21 +1399,25 @@ impl TryFrom<ConvState> for ParentState {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             } => Ok(ParentState::Core(CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             })),
             ConvState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             } => Ok(ParentState::Core(CoreState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             })),
             ConvState::Error {
                 message,
@@ -1518,21 +1533,25 @@ impl TryFrom<ConvState> for SubAgentState {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             } => Ok(SubAgentState::Core(CoreState::AwaitingSubAgents {
                 pending,
                 completed_results,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             })),
             ConvState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             } => Ok(SubAgentState::Core(CoreState::CancellingSubAgents {
                 pending,
                 completed_results,
                 cause,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             })),
             ConvState::Error {
                 message,

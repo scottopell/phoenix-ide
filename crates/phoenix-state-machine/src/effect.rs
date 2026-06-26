@@ -78,15 +78,14 @@ impl CheckpointData {
     }
 }
 
-/// Derive the message ID used to persist a tool result.
+/// Derive the durable message ID used to persist one tool result.
 ///
-/// Both `persist_checkpoint` and `persist_sub_agent_results` must agree on
-/// this ID: the former creates the message, the latter updates it in-place
-/// when sub-agent results arrive. Single-sourcing the convention here
-/// prevents silent divergence.
+/// Provider `tool_use_id` values are protocol correlation keys and may be reused
+/// across assistant turns. Durable message identity is therefore derived from the
+/// Phoenix-owned assistant message plus the tool's ordinal within that turn.
 #[must_use]
-pub fn tool_result_message_id(tool_use_id: &str) -> String {
-    format!("{tool_use_id}-result")
+pub fn tool_result_message_id(assistant_message_id: &str, tool_ordinal: usize) -> String {
+    format!("{assistant_message_id}-tool-result-{tool_ordinal}")
 }
 
 /// Effects to be executed after state transition
@@ -181,8 +180,10 @@ pub enum Effect {
     /// Persist aggregated sub-agent results as a message
     PersistSubAgentResults {
         results: Vec<SubAgentResult>,
-        /// `tool_use_id` of `spawn_agents` call - used to update its `display_data`
+        /// Provider `tool_use_id` of `spawn_agents`, retained in the tool-result content.
         spawn_tool_id: Option<String>,
+        /// Durable message id for the `spawn_agents` placeholder row to update.
+        spawn_tool_result_message_id: Option<String>,
     },
 
     /// Request continuation summary from LLM (no tools) - REQ-BED-020
@@ -348,7 +349,7 @@ impl Effect {
         images: Vec<ToolContentImage>,
     ) -> Self {
         let tool_use_id = tool_use_id.into();
-        let message_id = tool_result_message_id(&tool_use_id);
+        let message_id = format!("{tool_use_id}-result");
         Effect::PersistMessage {
             content: MessageContent::Tool(ToolContent {
                 tool_use_id: tool_use_id.clone(),

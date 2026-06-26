@@ -11,7 +11,7 @@
 //! REQ-BED-005: Cancellation Handling
 //! REQ-BED-006: Error Recovery
 
-use super::effect::{compute_bash_display_data, CheckpointData};
+use super::effect::{compute_bash_display_data, tool_result_message_id, CheckpointData};
 use super::event::{
     CancelCause, CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent,
 };
@@ -1017,6 +1017,7 @@ fn handle_core_tool_complete(
                 pending: pending_sub_agents.clone(),
                 completed_results: vec![],
                 spawn_tool_id: None,
+                spawn_tool_result_message_id: None,
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
@@ -1059,6 +1060,8 @@ fn handle_core_tool_complete(
             let mut all_pending = pending_sub_agents.clone();
             all_pending.extend(spawned);
 
+            let spawn_tool_result_message_id =
+                tool_result_message_id(&assistant_message.message_id, completed_results.len());
             let mut all_results = completed_results.clone();
             let spawn_id = result.tool_use_id.clone();
             all_results.push(result);
@@ -1070,6 +1073,7 @@ fn handle_core_tool_complete(
                 pending: all_pending.clone(),
                 completed_results: vec![],
                 spawn_tool_id: Some(spawn_id),
+                spawn_tool_result_message_id: Some(spawn_tool_result_message_id),
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
@@ -1110,6 +1114,7 @@ fn handle_core_cancellation(
                 pending,
                 completed_results,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             },
             CoreEvent::UserCancel { cause, .. },
         ) => {
@@ -1119,6 +1124,7 @@ fn handle_core_cancellation(
                 completed_results: completed_results.clone(),
                 cause,
                 spawn_tool_id: spawn_tool_id.clone(),
+                spawn_tool_result_message_id: spawn_tool_result_message_id.clone(),
             })
             .with_effect(Effect::CancelSubAgents { ids })
             .with_effect(Effect::PersistState))
@@ -1200,6 +1206,7 @@ fn handle_core_cancellation(
                     completed_results: vec![],
                     cause: CancelCause::UserRequested,
                     spawn_tool_id: None,
+                    spawn_tool_result_message_id: None,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState))
@@ -1241,6 +1248,7 @@ fn handle_core_cancellation(
                     completed_results: vec![],
                     cause: CancelCause::UserRequested,
                     spawn_tool_id: None,
+                    spawn_tool_result_message_id: None,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                 .with_effect(Effect::PersistState))
@@ -1331,6 +1339,7 @@ fn handle_core_sub_agents(
                 pending,
                 completed_results,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() > 1 => {
@@ -1357,6 +1366,7 @@ fn handle_core_sub_agents(
                 pending: new_pending,
                 completed_results: new_results,
                 spawn_tool_id: spawn_tool_id.clone(),
+                spawn_tool_result_message_id: spawn_tool_result_message_id.clone(),
             })
             .with_effect(Effect::PersistState)
             .with_effect(notify))
@@ -1368,6 +1378,7 @@ fn handle_core_sub_agents(
                 pending,
                 completed_results,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() == 1 => {
@@ -1388,6 +1399,7 @@ fn handle_core_sub_agents(
                     .with_effect(Effect::PersistSubAgentResults {
                         results: new_results,
                         spawn_tool_id: spawn_tool_id.clone(),
+                        spawn_tool_result_message_id: spawn_tool_result_message_id.clone(),
                     })
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::notify_state_change())
@@ -1402,6 +1414,7 @@ fn handle_core_sub_agents(
                 completed_results,
                 cause,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() > 1 => {
@@ -1428,6 +1441,7 @@ fn handle_core_sub_agents(
                 completed_results: new_results,
                 cause: *cause,
                 spawn_tool_id: spawn_tool_id.clone(),
+                spawn_tool_result_message_id: spawn_tool_result_message_id.clone(),
             })
             .with_effect(Effect::PersistState))
         }
@@ -1441,6 +1455,7 @@ fn handle_core_sub_agents(
                 completed_results,
                 cause,
                 spawn_tool_id,
+                spawn_tool_result_message_id,
             },
             CoreEvent::SubAgentResult { agent_id, outcome },
         ) if pending.iter().any(|p| p.agent_id == agent_id) && pending.len() == 1 => {
@@ -1470,6 +1485,7 @@ fn handle_core_sub_agents(
                             .with_effect(Effect::PersistSubAgentResults {
                                 results: new_results,
                                 spawn_tool_id: spawn_tool_id.clone(),
+                                spawn_tool_result_message_id: spawn_tool_result_message_id.clone(),
                             })
                             .with_effect(Effect::PersistState)
                             .with_effect(Effect::notify_state_change())
@@ -1480,6 +1496,7 @@ fn handle_core_sub_agents(
                     .with_effect(Effect::PersistSubAgentResults {
                         results: new_results,
                         spawn_tool_id: spawn_tool_id.clone(),
+                        spawn_tool_result_message_id: spawn_tool_result_message_id.clone(),
                     })
                     .with_effect(Effect::PersistState)
                     .with_effect(Effect::notify_agent_done())),
@@ -6967,6 +6984,7 @@ mod teardown_tests {
             completed_results: vec![],
             cause: CancelCause::Timeout,
             spawn_tool_id: Some("spawn-1".to_string()),
+            spawn_tool_result_message_id: Some("spawn-1-result".to_string()),
         };
         let result = transition(
             &state,
@@ -7008,6 +7026,7 @@ mod teardown_tests {
             completed_results: vec![],
             cause: CancelCause::Timeout,
             spawn_tool_id: Some("spawn-1".to_string()),
+            spawn_tool_result_message_id: Some("spawn-1-result".to_string()),
         };
         let result = transition(
             &state,
@@ -7037,6 +7056,7 @@ mod teardown_tests {
             completed_results: vec![],
             cause: CancelCause::Timeout,
             spawn_tool_id: Some("spawn-1".to_string()),
+            spawn_tool_result_message_id: Some("spawn-1-result".to_string()),
         };
         let result = transition(
             &state,
@@ -7079,6 +7099,7 @@ mod teardown_tests {
             completed_results: vec![],
             cause: CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+            spawn_tool_result_message_id: Some("spawn-1-result".to_string()),
         };
         let reported = SubAgentOutcome::Failure {
             error: "cancelled by user".to_string(),
@@ -7120,6 +7141,7 @@ mod teardown_tests {
             pending: vec![pending("a"), pending("b")],
             completed_results: vec![],
             spawn_tool_id: None,
+            spawn_tool_result_message_id: None,
         };
         let result = transition(
             &state,
@@ -7182,6 +7204,7 @@ mod teardown_tests {
             pending: vec![pending("a")],
             completed_results: vec![],
             spawn_tool_id: None,
+            spawn_tool_result_message_id: None,
         };
         let cancelling = transition(
             &awaiting,
@@ -7233,6 +7256,7 @@ mod teardown_tests {
                 if let Effect::PersistSubAgentResults {
                     results,
                     spawn_tool_id,
+                    ..
                 } = e
                 {
                     Some((results.clone(), spawn_tool_id.clone()))
@@ -7269,6 +7293,7 @@ mod teardown_tests {
             completed_results: vec![],
             cause: CancelCause::Timeout,
             spawn_tool_id: Some("spawn-1".to_string()),
+            spawn_tool_result_message_id: Some("spawn-1-result".to_string()),
         };
         let first = transition(
             &state,

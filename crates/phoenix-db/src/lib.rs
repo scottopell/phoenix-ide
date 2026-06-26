@@ -4806,10 +4806,10 @@ async fn insert_conversation_tx(
 /// `message_id` makes a crash-retry a no-op rather than a duplicate.
 /// Derive the message ID used to persist a tool result. Must match the
 /// runtime executor's convention (`phoenix-state-machine`'s
-/// `tool_result_message_id`) so the restart-materialized result shares identity
-/// with the row the live path would have written: `{tool_use_id}-result`.
-fn tool_result_message_id(tool_use_id: &str) -> String {
-    format!("{tool_use_id}-result")
+/// `tool_result_message_id`) so restart-materialized results share identity
+/// with rows the live path would have written.
+fn tool_result_message_id(assistant_message_id: &str, tool_ordinal: usize) -> String {
+    format!("{assistant_message_id}-tool-result-{tool_ordinal}")
 }
 
 /// Fold a tool result's `duration_ms` into its `display_data` JSON, mirroring
@@ -5125,7 +5125,7 @@ fn build_materialized_tool_round(
     // Completed tools keep their real output — except a `spawn_agents`
     // placeholder whose sub-agents were still pending, which is rewritten into
     // the interrupted fan-in (content + display) computed above.
-    for result in completed_results {
+    for (tool_ordinal, result) in completed_results.iter().enumerate() {
         let (output, is_error, display): (String, bool, Option<serde_json::Value>) =
             match spawn_fan_ins.get(&result.tool_use_id) {
                 Some((content, display)) => (content.clone(), false, Some(display.clone())),
@@ -5142,7 +5142,7 @@ fn build_materialized_tool_round(
             result.images().to_vec(),
         );
         tool_msgs.push(Message {
-            message_id: tool_result_message_id(&result.tool_use_id),
+            message_id: tool_result_message_id(&assistant_message.message_id, tool_ordinal),
             conversation_id: conv_id.to_string(),
             sequence_id: next_seq,
             message_type: content.message_type(),
@@ -5156,14 +5156,15 @@ fn build_materialized_tool_round(
 
     // The in-flight/cancelling tool and every queued-but-unstarted tool were
     // interrupted.
-    for tool_id in interrupted_tool_ids {
+    for (interrupted_index, tool_id) in interrupted_tool_ids.iter().enumerate() {
+        let tool_ordinal = completed_results.len() + interrupted_index;
         let content = MessageContent::tool(
             tool_id,
             "[Tool execution interrupted by server restart]",
             true,
         );
         tool_msgs.push(Message {
-            message_id: tool_result_message_id(tool_id),
+            message_id: tool_result_message_id(&assistant_message.message_id, tool_ordinal),
             conversation_id: conv_id.to_string(),
             sequence_id: next_seq,
             message_type: content.message_type(),
@@ -8705,6 +8706,84 @@ mod tests {
         assert!(
             ids.contains(&"tool-b-result"),
             "second tool result must be durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_tool_round_tolerates_provider_tool_id_reuse_across_turns() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-reuse", "ctr", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let reused_provider_tool_id = "functions.read_file:0";
+        let first_assistant = Message {
+            message_id: "asst-reuse-1".to_string(),
+            conversation_id: "conv-reuse".to_string(),
+            sequence_id: 10,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let first_result = Message {
+            message_id: tool_result_message_id("asst-reuse-1", 0),
+            conversation_id: "conv-reuse".to_string(),
+            sequence_id: 11,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool(reused_provider_tool_id, "first output", false),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        db.persist_tool_round("conv-reuse", &first_assistant, &[first_result])
+            .await
+            .unwrap();
+
+        let second_assistant = Message {
+            message_id: "asst-reuse-2".to_string(),
+            conversation_id: "conv-reuse".to_string(),
+            sequence_id: 20,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let second_result = Message {
+            message_id: tool_result_message_id("asst-reuse-2", 0),
+            conversation_id: "conv-reuse".to_string(),
+            sequence_id: 21,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool(reused_provider_tool_id, "second output", false),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        db.persist_tool_round("conv-reuse", &second_assistant, &[second_result])
+            .await
+            .unwrap();
+
+        let msgs = db.get_messages("conv-reuse").await.unwrap();
+        let tool_outputs: Vec<String> = msgs
+            .iter()
+            .filter(|message| message.message_type == MessageType::Tool)
+            .map(|message| match &message.content {
+                MessageContent::Tool(tool) => tool.content.clone(),
+                other @ (MessageContent::User(_)
+                | MessageContent::Agent(_)
+                | MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Continuation(_)
+                | MessageContent::Skill(_)) => panic!("expected tool message, got {other:?}"),
+            })
+            .collect();
+
+        assert_eq!(
+            tool_outputs,
+            vec!["first output".to_string(), "second output".to_string()],
+            "provider tool_use_id reuse across assistant turns must not collapse durable tool results"
         );
     }
 

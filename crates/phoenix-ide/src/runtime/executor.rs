@@ -3295,7 +3295,11 @@ where
             Effect::PersistSubAgentResults {
                 results,
                 spawn_tool_id,
-            } => self.persist_sub_agent_results(results, spawn_tool_id).await,
+                spawn_tool_result_message_id,
+            } => {
+                self.persist_sub_agent_results(results, spawn_tool_id, spawn_tool_result_message_id)
+                    .await
+            }
 
             Effect::RequestContinuation { request } => {
                 self.request_continuation(request.rejected_tool_calls);
@@ -4054,7 +4058,7 @@ where
 
                 // Build all tool-result rows.
                 let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
-                for result in &tool_results {
+                for (tool_ordinal, result) in tool_results.iter().enumerate() {
                     let tool_content = MessageContent::tool_with_images(
                         &result.tool_use_id,
                         result.output(),
@@ -4065,7 +4069,10 @@ where
                         merge_duration_into_display_data(result.display_data(), result.duration_ms);
                     let tool_seq = self.broadcast_tx.next_seq();
                     tool_msgs.push(crate::db::Message {
-                        message_id: tool_result_message_id(&result.tool_use_id),
+                        message_id: tool_result_message_id(
+                            &assistant_message.message_id,
+                            tool_ordinal,
+                        ),
                         conversation_id: conv_id.clone(),
                         sequence_id: tool_seq,
                         message_type: tool_content.message_type(),
@@ -4155,7 +4162,7 @@ where
         // `fork_proposal_id` in its display_data (UI-only) per the interception
         // contract; `merge_duration_into_display_data` preserves it.
         let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
-        for result in &tool_results {
+        for (tool_ordinal, result) in tool_results.iter().enumerate() {
             let tool_content = MessageContent::tool_with_images(
                 &result.tool_use_id,
                 result.output(),
@@ -4166,7 +4173,7 @@ where
                 merge_duration_into_display_data(result.display_data(), result.duration_ms);
             let tool_seq = self.broadcast_tx.next_seq();
             tool_msgs.push(crate::db::Message {
-                message_id: tool_result_message_id(&result.tool_use_id),
+                message_id: tool_result_message_id(&assistant_message.message_id, tool_ordinal),
                 conversation_id: conv_id.clone(),
                 sequence_id: tool_seq,
                 message_type: tool_content.message_type(),
@@ -4222,6 +4229,7 @@ where
         &mut self,
         results: Vec<SubAgentResult>,
         spawn_tool_id: Option<String>,
+        spawn_tool_result_message_id: Option<String>,
     ) -> Result<Option<Event>, String> {
         // Build the display_data for subagent results
         let display_data = serde_json::json!({
@@ -4236,9 +4244,7 @@ where
 
         // If we have a spawn_tool_id, update its message's content (for LLM history)
         // and display_data (for UI).
-        if let Some(tool_id) = spawn_tool_id {
-            let message_id = tool_result_message_id(&tool_id);
-
+        if let Some((tool_id, message_id)) = spawn_tool_id.zip(spawn_tool_result_message_id) {
             // This summary replaces the initial "Spawning N sub-agents..."
             // acknowledgement so build_llm_messages_static feeds the actual
             // results to the model.
@@ -7655,6 +7661,7 @@ mod steer_drain_detector_tests {
             }],
             completed_results: vec![],
             spawn_tool_id: None,
+            spawn_tool_result_message_id: None,
         }
     }
 
@@ -7931,7 +7938,7 @@ mod steer_drain_detector_tests {
             task: "investigate".to_string(),
             outcome: SubAgentOutcome::TimedOut,
         }];
-        rt.persist_sub_agent_results(results, None)
+        rt.persist_sub_agent_results(results, None, None)
             .await
             .expect("persist must succeed");
 
@@ -8048,6 +8055,7 @@ mod steer_drain_detector_tests {
             }],
             completed_results: vec![],
             spawn_tool_id: None,
+            spawn_tool_result_message_id: None,
         }
     }
 
@@ -8187,6 +8195,7 @@ mod steer_drain_detector_tests {
             // Default to a real spawn id so the last-one drain still persists
             // results (exercising the common AwaitingSubAgents-origin path).
             spawn_tool_id: Some("spawn-1".to_string()),
+            spawn_tool_result_message_id: Some("spawn-1-result".to_string()),
         }
     }
 
@@ -9738,7 +9747,7 @@ mod fork_proposal_persist_tests {
         );
         let ack = msgs
             .iter()
-            .find(|m| m.message_id == tool_result_message_id("tool-fork-1"))
+            .find(|m| m.message_id == tool_result_message_id("asst-fork", 0))
             .expect("synthetic success ack must be persisted");
         assert!(
             matches!(&ack.content, MessageContent::Tool(tc) if !tc.is_error),

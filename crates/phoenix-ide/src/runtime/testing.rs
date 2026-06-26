@@ -1766,6 +1766,7 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+            spawn_tool_result_message_id: Some("spawn-1-result".to_string()),
         };
 
         let runtime = ConversationRuntime::new(
@@ -2764,6 +2765,7 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+            spawn_tool_result_message_id: Some("spawn-1-result".to_string()),
         };
 
         // Real result for X → Idle.
@@ -2833,6 +2835,7 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+            spawn_tool_result_message_id: Some("spawn-1-result".to_string()),
         };
 
         // Duplicate TimedOut for X (not in pending) → InvalidTransition.
@@ -2976,6 +2979,7 @@ mod tests {
             ],
             completed_results: vec![],
             spawn_tool_id: None,
+            spawn_tool_result_message_id: None,
         };
         let one = ConvState::AwaitingSubAgents {
             pending: vec![PendingSubAgent {
@@ -2985,6 +2989,7 @@ mod tests {
             }],
             completed_results: vec![],
             spawn_tool_id: None,
+            spawn_tool_result_message_id: None,
         };
 
         // Same variant → discriminant equal → manage_deadline keeps the clock.
@@ -3006,6 +3011,7 @@ mod tests {
             completed_results: vec![],
             cause: crate::state_machine::event::CancelCause::UserRequested,
             spawn_tool_id: Some("spawn-1".to_string()),
+            spawn_tool_result_message_id: Some("spawn-1-result".to_string()),
         };
         assert_ne!(
             std::mem::discriminant(&one),

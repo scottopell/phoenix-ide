@@ -680,13 +680,18 @@ impl ModelRegistry {
         discovered: &DiscoveredModels,
     ) -> bool {
         let ids = discovered.ids_for_backend(spec.backend);
-        let provider = spec.provider_header_value();
-        let prefixed_id = format!("{provider}/{}", spec.id);
-        let prefixed_api = format!("{provider}/{}", spec.api_name);
+        let route_provider = spec.provider_header_value();
+        let route_prefixed_id = format!("{route_provider}/{}", spec.id);
+        let route_prefixed_api = format!("{route_provider}/{}", spec.api_name);
+        let backend_provider = spec.backend.header_value();
+        let backend_prefixed_id = format!("{backend_provider}/{}", spec.id);
+        let backend_prefixed_api = format!("{backend_provider}/{}", spec.api_name);
         ids.contains(&spec.id)
             || ids.contains(&spec.api_name)
-            || ids.contains(&prefixed_id)
-            || ids.contains(&prefixed_api)
+            || ids.contains(&route_prefixed_id)
+            || ids.contains(&route_prefixed_api)
+            || ids.contains(&backend_prefixed_id)
+            || ids.contains(&backend_prefixed_api)
     }
 
     /// Build a `DiscoveryConfig` from credential-helper auth and base URL overrides.
