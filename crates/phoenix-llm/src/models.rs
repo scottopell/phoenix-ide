@@ -53,8 +53,7 @@ pub enum ModelBackend {
     Anthropic,
     /// `OpenAI` Responses-compatible backend.
     OpenAIResponses,
-    /// `OpenAI` Chat Completions-compatible backend. Service dispatch returns
-    /// an unsupported-backend error; only metadata and configuration use this path.
+    /// `OpenAI` Chat Completions-compatible backend.
     OpenAIChatCompletions,
     /// In-process deterministic mock backend.
     Mock,
@@ -161,8 +160,7 @@ pub(crate) enum ApiFormat {
     Anthropic,
     /// `OpenAI` Responses API
     OpenAIResponses,
-    /// `OpenAI` Chat Completions API. Service dispatch returns an
-    /// unsupported-backend error; only metadata and configuration use this path.
+    /// `OpenAI` Chat Completions API.
     OpenAIChatCompletions,
 }
 

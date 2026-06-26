@@ -249,11 +249,19 @@ impl LlmServiceImpl {
                 )
                 .await
             }
-            // Chat Completions dispatch is unsupported on this build path.
-            ApiFormat::OpenAIChatCompletions => Err(LlmError::invalid_response(
-                "OpenAI Chat Completions backend is unsupported on this dispatch path; \
-                 configure an openai_responses model for this endpoint",
-            )),
+            ApiFormat::OpenAIChatCompletions => {
+                let key = self.auth.resolve().await?.credential;
+                let headers = self.headers_for_provider();
+                openai::complete_chat(
+                    &self.spec,
+                    &key,
+                    self.openai_base_url.as_deref(),
+                    &headers,
+                    self.effective_request_tags(self.openai_base_url.as_deref()),
+                    request,
+                )
+                .await
+            }
         }
     }
 
@@ -292,11 +300,20 @@ impl LlmServiceImpl {
                 )
                 .await
             }
-            // Chat Completions dispatch is unsupported on this build path.
-            ApiFormat::OpenAIChatCompletions => Err(LlmError::invalid_response(
-                "OpenAI Chat Completions backend is unsupported on this dispatch path; \
-                 configure an openai_responses model for this endpoint",
-            )),
+            ApiFormat::OpenAIChatCompletions => {
+                let key = self.auth.resolve().await?.credential;
+                let headers = self.headers_for_provider();
+                openai::complete_streaming_chat(
+                    &self.spec,
+                    &key,
+                    self.openai_base_url.as_deref(),
+                    &headers,
+                    self.effective_request_tags(self.openai_base_url.as_deref()),
+                    request,
+                    chunk_tx,
+                )
+                .await
+            }
         }
     }
 
