@@ -105,19 +105,7 @@ pub async fn complete(
     // means we're on the platform Responses API path, which doesn't emit the
     // codex `x-codex-*` headers or `usage_limit_reached` envelopes.
     if !status.is_success() {
-        if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
-            let message = error_resp.error.message;
-            return Err(match status.as_u16() {
-                401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
-                429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
-                400..=499 => {
-                    LlmError::invalid_request(format!("Bad request ({status}): {message}"))
-                }
-                500..=599 => LlmError::server_error(format!("Server error: {message}")),
-                _ => LlmError::server_error(format!("Unexpected HTTP {status}: {message}")),
-            });
-        }
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(openai_http_error(status.as_u16(), status.as_str(), &body));
     }
 
     let responses_response: ResponsesApiResponse = serde_json::from_str(&body).map_err(|e| {
@@ -337,8 +325,7 @@ impl ResponsesStreamAccumulator {
                     LlmError::server_error(format!("Response incomplete: {reason}"))
                 });
             }
-            // OpenAI Responses API terminal event. Task 583 spec incorrectly named
-            // this "response.done" — the actual OpenAI spec uses "response.completed".
+            // OpenAI Responses API terminal event; the wire spec uses "response.completed".
             "response.completed" => {
                 if let Some(usage) = v.pointer("/response/usage") {
                     tracing::debug!(usage = %usage, "responses_api usage extracted");
@@ -1120,7 +1107,7 @@ pub(crate) struct ResponsesApiUsage {
 // Chat Completions API
 // ===========================================================================
 
-/// Complete using the OpenAI Chat Completions API (non-streaming).
+/// Complete using the `OpenAI` Chat Completions API (non-streaming).
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_chat(
     spec: &ModelSpec,
@@ -1163,19 +1150,7 @@ pub async fn complete_chat(
         .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
 
     if !status.is_success() {
-        if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
-            let message = error_resp.error.message;
-            return Err(match status.as_u16() {
-                401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
-                429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
-                400..=499 => {
-                    LlmError::invalid_request(format!("Bad request ({status}): {message}"))
-                }
-                500..=599 => LlmError::server_error(format!("Server error: {message}")),
-                _ => LlmError::server_error(format!("Unexpected HTTP {status}: {message}")),
-            });
-        }
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(openai_http_error(status.as_u16(), status.as_str(), &body));
     }
 
     let chat_response: ChatCompletionsResponse = serde_json::from_str(&body).map_err(|e| {
@@ -1185,7 +1160,7 @@ pub async fn complete_chat(
     normalize_chat_response(chat_response)
 }
 
-/// Complete using the OpenAI Chat Completions API (streaming).
+/// Complete using the `OpenAI` Chat Completions API (streaming).
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming_chat(
     spec: &ModelSpec,
@@ -1201,7 +1176,9 @@ pub async fn complete_streaming_chat(
     let url = resolve_chat_endpoint(base_url_override);
     let mut chat_request = translate_to_chat_request(&spec.api_name, request);
     chat_request.stream = Some(true);
-    chat_request.stream_options = Some(ChatStreamOptions { include_usage: true });
+    chat_request.stream_options = Some(ChatStreamOptions {
+        include_usage: true,
+    });
     if !request_tags.is_empty() {
         chat_request.tags = Some(request_tags.clone());
     }
@@ -1233,7 +1210,7 @@ pub async fn complete_streaming_chat(
             .text()
             .await
             .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
-        return Err(LlmError::from_http_status(status.as_u16(), &body));
+        return Err(openai_http_error(status.as_u16(), status.as_str(), &body));
     }
 
     let mut acc = ChatStreamAccumulator::new();
@@ -1508,6 +1485,22 @@ struct ChatStreamAccumulator {
     done: bool,
 }
 
+fn openai_http_error(status_code: u16, status_display: &str, body: &str) -> LlmError {
+    if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(body) {
+        let message = error_resp.error.message;
+        return match status_code {
+            401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
+            429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
+            400..=499 => {
+                LlmError::invalid_request(format!("Bad request ({status_display}): {message}"))
+            }
+            500..=599 => LlmError::server_error(format!("Server error: {message}")),
+            _ => LlmError::server_error(format!("Unexpected HTTP {status_display}: {message}")),
+        };
+    }
+    LlmError::from_http_status(status_code, body)
+}
+
 impl ChatStreamAccumulator {
     fn new() -> Self {
         Self {
@@ -1547,6 +1540,11 @@ impl ChatStreamAccumulator {
         }
         self.usage = event.usage.or(self.usage.take());
         for choice in event.choices {
+            if choice.finish_reason.as_deref() == Some("length") {
+                return Err(LlmError::server_error(
+                    "Chat completions response incomplete: length".to_string(),
+                ));
+            }
             if let Some(delta) = choice.delta.content {
                 if !delta.is_empty() {
                     self.content.push_str(&delta);
@@ -1756,6 +1754,8 @@ struct ChatStreamError {
 #[derive(Debug, Deserialize)]
 struct ChatStreamChoice {
     delta: ChatDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2461,15 +2461,13 @@ mod tests {
 
         #[test]
         fn chat_endpoint_preserves_responses_override_exactly() {
-            let url =
-                resolve_chat_endpoint(Some("https://gw.example.com/openai/v1/responses"));
+            let url = resolve_chat_endpoint(Some("https://gw.example.com/openai/v1/responses"));
             assert_eq!(url, "https://gw.example.com/openai/v1/responses");
         }
 
         #[test]
         fn chat_endpoint_preserves_chat_completions_override_exactly() {
-            let url =
-                resolve_chat_endpoint(Some("https://gw.example.com/v1/chat/completions"));
+            let url = resolve_chat_endpoint(Some("https://gw.example.com/v1/chat/completions"));
             assert_eq!(url, "https://gw.example.com/v1/chat/completions");
         }
 
@@ -2648,7 +2646,9 @@ mod tests {
             let req = empty_request();
             let mut chat_req = translate_to_chat_request("gpt-4o", &req);
             chat_req.stream = Some(true);
-            chat_req.stream_options = Some(ChatStreamOptions { include_usage: true });
+            chat_req.stream_options = Some(ChatStreamOptions {
+                include_usage: true,
+            });
             let json = serde_json::to_value(&chat_req).unwrap();
             assert_eq!(json["stream"], true);
             assert_eq!(json["stream_options"]["include_usage"], true);
@@ -2674,9 +2674,7 @@ mod tests {
             assert!(result.end_turn);
             assert_eq!(result.usage.input_tokens, 10);
             assert_eq!(result.usage.output_tokens, 5);
-            assert!(
-                matches!(&result.content[0], ContentBlock::Text { text } if text == "Hello!")
-            );
+            assert!(matches!(&result.content[0], ContentBlock::Text { text } if text == "Hello!"));
         }
 
         #[test]
@@ -2725,10 +2723,7 @@ mod tests {
             };
             let result = normalize_chat_response(resp).unwrap();
             if let ContentBlock::ToolUse { input, .. } = &result.content[0] {
-                assert_eq!(
-                    input,
-                    &serde_json::Value::Object(serde_json::Map::new())
-                );
+                assert_eq!(input, &serde_json::Value::Object(serde_json::Map::new()));
             } else {
                 panic!("expected ToolUse content block");
             }
@@ -2868,6 +2863,30 @@ mod tests {
         }
 
         #[test]
+        fn chat_stream_length_finish_reason_is_error() {
+            use crate::LlmErrorKind;
+            let (tx, _rx) = tokio::sync::broadcast::channel(8);
+            let mut acc = ChatStreamAccumulator::new();
+            let length_chunk = serde_json::json!({
+                "choices": [{"delta": {}, "finish_reason": "length"}]
+            })
+            .to_string();
+            let err = acc.process_event(&length_chunk, &tx).unwrap_err();
+            assert_eq!(err.kind, LlmErrorKind::ServerError);
+            assert!(err.message.contains("length"));
+        }
+
+        #[test]
+        fn openai_http_error_extracts_provider_message() {
+            use crate::LlmErrorKind;
+            let body = r#"{"error":{"message":"context too long"}}"#;
+            let err = openai_http_error(400, "400 Bad Request", body);
+            assert_eq!(err.kind, LlmErrorKind::InvalidRequest);
+            assert!(err.message.contains("context too long"));
+            assert!(!err.message.contains("{\"error\""));
+        }
+
+        #[test]
         fn chat_stream_empty_stream_returns_invalid_response() {
             use crate::LlmErrorKind;
             let acc = ChatStreamAccumulator::new();
@@ -2896,7 +2915,6 @@ mod tests {
             assert_eq!(resp.usage.output_tokens, 2);
         }
     }
-
 }
 
 #[cfg(test)]

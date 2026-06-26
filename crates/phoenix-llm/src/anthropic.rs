@@ -564,7 +564,9 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
 
     AnthropicRequest {
         model: spec.api_name.clone(),
-        max_tokens: request.max_tokens.unwrap_or(16_384),
+        max_tokens: request
+            .max_tokens
+            .unwrap_or(crate::DEFAULT_MAX_OUTPUT_TOKENS),
         system,
         messages,
         tools: if tools.is_empty() { None } else { Some(tools) },

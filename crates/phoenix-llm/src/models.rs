@@ -63,7 +63,7 @@ impl ModelBackend {
     /// Display name surfaced in `/api/models` and usage reports.
     /// NOTE: prefer [`ModelFamily::display_name`] for the user-facing provider
     /// label — this method returns the wire-protocol name, which may differ
-    /// from the originating model family (e.g. Gemini served over an OpenAI
+    /// from the originating model family (e.g. Gemini served over an `OpenAI`
     /// Chat Completions gateway).
     #[must_use]
     pub fn display_name(self) -> &'static str {
@@ -91,7 +91,9 @@ impl ModelBackend {
     pub fn default_family(self) -> ModelFamily {
         match self {
             ModelBackend::Anthropic => ModelFamily::Anthropic,
-            ModelBackend::OpenAIResponses | ModelBackend::OpenAIChatCompletions => ModelFamily::OpenAI,
+            ModelBackend::OpenAIResponses | ModelBackend::OpenAIChatCompletions => {
+                ModelFamily::OpenAI
+            }
             ModelBackend::Mock => ModelFamily::Mock,
         }
     }
@@ -172,7 +174,7 @@ struct ExternalModelSpec {
     /// Optional user-facing provider family. When absent, defaults to the
     /// backend's default family (e.g. `openai_chat_completions` → `OpenAI`).
     /// Set explicitly to `"google"` when a Gemini model is served over an
-    /// OpenAI-compatible endpoint so the UI displays "Google" not "OpenAI".
+    /// `OpenAI`-compatible endpoint so the UI displays "Google" not "`OpenAI`".
     family: Option<ExternalFamily>,
     description: String,
     context_window: usize,
@@ -200,7 +202,7 @@ pub struct ModelSpec {
     /// Backend route + wire protocol for this model.
     pub backend: ModelBackend,
     /// User-facing provider family. Distinct from `backend` so gateway-routed
-    /// models (e.g. Gemini via an OpenAI Chat Completions endpoint) can show
+    /// models (e.g. Gemini via an `OpenAI` Chat Completions endpoint) can show
     /// their true originating provider in the UI. See [`ModelFamily`].
     pub family: ModelFamily,
     /// Human-readable description
@@ -299,7 +301,9 @@ fn external_model_spec_from_config(
     // Google/etc. models behind an OpenAI-compatible gateway show the right
     // provider label.
     let backend: ModelBackend = spec.backend.into();
-    let family = spec.family.map(ModelFamily::from).unwrap_or_else(|| backend.default_family());
+    let family = spec
+        .family
+        .map_or_else(|| backend.default_family(), ModelFamily::from);
     Ok(ModelSpec {
         id,
         api_name,
@@ -562,7 +566,10 @@ mod tests {
 
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].backend, ModelBackend::OpenAIChatCompletions);
-        assert_eq!(models[0].backend.api_format(), ApiFormat::OpenAIChatCompletions);
+        assert_eq!(
+            models[0].backend.api_format(),
+            ApiFormat::OpenAIChatCompletions
+        );
         // Default family from backend is OpenAI
         assert_eq!(models[0].family, ModelFamily::OpenAI);
     }
@@ -612,7 +619,10 @@ mod tests {
     #[test]
     fn builtin_anthropic_models_have_anthropic_family() {
         let models = all_models();
-        for spec in models.iter().filter(|m| m.backend == ModelBackend::Anthropic) {
+        for spec in models
+            .iter()
+            .filter(|m| m.backend == ModelBackend::Anthropic)
+        {
             assert_eq!(
                 spec.family,
                 ModelFamily::Anthropic,
@@ -660,6 +670,10 @@ mod tests {
         .iter()
         .map(|f| f.display_name())
         .collect();
-        assert_eq!(names.len(), 4, "each family must have a unique display name");
+        assert_eq!(
+            names.len(),
+            4,
+            "each family must have a unique display name"
+        );
     }
 }

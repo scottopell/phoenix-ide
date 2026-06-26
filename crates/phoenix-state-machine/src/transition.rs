@@ -2316,7 +2316,11 @@ pub fn transition_parent(
                 // below) parks into awaiting_continuation instead, replaying the
                 // propose_task call after continuation. Without this guard a fork
                 // would be recorded while the origin is over-budget.
-                if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
+                if should_trigger_continuation(
+                    &usage_data,
+                    context.context_window,
+                    context.max_output_tokens,
+                ) {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -2468,7 +2472,11 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
 
-                if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
+                if should_trigger_continuation(
+                    &usage_data,
+                    context.context_window,
+                    context.max_output_tokens,
+                ) {
                     let tr = handle_context_exhaustion(
                         context,
                         content,
@@ -2613,7 +2621,11 @@ pub fn transition_parent(
             }
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
-            if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
+            if should_trigger_continuation(
+                &usage_data,
+                context.context_window,
+                context.max_output_tokens,
+            ) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,
@@ -3031,7 +3043,11 @@ pub fn transition_sub_agent(
         ) => {
             let final_attempt = *attempt;
             // Context exhaustion check first (sub-agent fails immediately)
-            if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
+            if should_trigger_continuation(
+                &usage_data,
+                context.context_window,
+                context.max_output_tokens,
+            ) {
                 let tr = handle_context_exhaustion(
                     context,
                     content,

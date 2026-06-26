@@ -413,10 +413,6 @@ fn discovery_auth_headers(
                 vec![("Authorization".to_string(), format!("Bearer {credential}"))]
             }
         },
-        // Both OpenAI Responses and Chat Completions use Bearer auth for
-        // gateway discovery. Phase 1: Chat Completions models are not filtered
-        // by discovery (see `DiscoveredModels::was_listed`), so this arm is
-        // mainly defensive / future-proof.
         ModelBackend::OpenAIResponses | ModelBackend::OpenAIChatCompletions => {
             vec![("Authorization".to_string(), format!("Bearer {credential}"))]
         }
@@ -488,9 +484,9 @@ fn derive_models_url(base_url: &str) -> Option<String> {
 /// Most state is frozen at construction. The Codex/ChatGPT bridge bits are
 /// interior-mutable (RwLock-protected) so [`Self::reload_codex_credential`]
 /// can swap the `OpenAI` bridge services in atomically after an in-app login —
-/// no Phoenix restart needed (task 13005). Reads of the bridged services go
-/// through the same `services` map readers already use; the lock gates a
-/// per-OpenAI-model rebuild on the write side only.
+/// no Phoenix restart needed. Reads of the bridged services go through the
+/// same `services` map readers already use; the lock gates a per-OpenAI-model
+/// rebuild on the write side only.
 pub struct ModelRegistry {
     services: std::sync::RwLock<HashMap<String, Arc<dyn LlmService>>>,
     specs: std::sync::RwLock<HashMap<String, super::ModelSpec>>,
@@ -821,11 +817,13 @@ impl ModelRegistry {
                 }
                 ModelBackend::OpenAIResponses => {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
-                    LlmAuth::new(Arc::new(StaticCredential::new(key)), AuthStyle::ApiKey)
+                    let style = if config.openai_base_url.is_some() {
+                        config.auth_style
+                    } else {
+                        AuthStyle::ApiKey
+                    };
+                    LlmAuth::new(Arc::new(StaticCredential::new(key)), style)
                 }
-                // Phase 1: Chat Completions uses the same openai_api_key /
-                // openai_base_url as the Responses backend. Service dispatch
-                // will return an unimplemented error until Phase 2.
                 ModelBackend::OpenAIChatCompletions => {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
                     let style = if config.openai_base_url.is_some() {
@@ -1058,8 +1056,6 @@ impl ModelRegistry {
         let candidates: &[&str] = match parent_backend {
             ModelBackend::Anthropic => &["claude-haiku-4-5"],
             ModelBackend::OpenAIResponses => &["gpt-5.4-mini"],
-            // Phase 1: no built-in Chat Completions cheap model; stay on the
-            // same external model (external source already handled above).
             ModelBackend::OpenAIChatCompletions => return parent_model_id.to_string(),
             ModelBackend::Mock => return "mock".to_string(),
         };
@@ -1801,10 +1797,10 @@ mod tests {
         );
     }
 
-    /// Task 13005: hot reload after in-app login. A registry that booted
-    /// with no Codex credential must register `OpenAI` bridge services after
-    /// `reload_codex_credential_with` resolves to a valid auth file — no
-    /// Phoenix restart required for the next `OpenAI` request to succeed.
+    /// A registry that booted with no Codex credential must register `OpenAI`
+    /// bridge services after `reload_codex_credential_with` resolves to a valid
+    /// auth file — no Phoenix restart required for the next `OpenAI` request to
+    /// succeed.
     #[test]
     fn reload_registers_openai_after_first_login() {
         // Boot with no Codex creds.
@@ -2056,8 +2052,6 @@ mod tests {
         );
     }
 
-    // --- Phase 1 new tests: ModelFamily / max_output_tokens / Chat Completions ---
-
     fn external_google_model() -> super::super::ModelSpec {
         parse_external_models(
             r#"[{"id":"gateway/gemini-2.5-pro","backend":"openai_chat_completions","family":"google","description":"Gemini 2.5 Pro via OpenAI-compatible gateway","context_window":1000000,"recommended":false,"supports_tool_search":false}]"#,
@@ -2129,7 +2123,9 @@ mod tests {
         // to confirm the spec round-tripped. max_output_tokens is part of ModelSpec
         // returned by model_specs() — we verify it's nonzero via the registry's spec store.
         let specs = registry.specs.read().expect("lock");
-        let haiku = specs.get("claude-haiku-4-5").expect("haiku should be registered");
+        let haiku = specs
+            .get("claude-haiku-4-5")
+            .expect("haiku should be registered");
         assert!(
             haiku.max_output_tokens > 0,
             "claude-haiku-4-5 must have nonzero max_output_tokens"
@@ -2144,7 +2140,10 @@ mod tests {
         let registry = ModelRegistry::new(&config);
 
         let got = registry.max_output_tokens("claude-haiku-4-5");
-        assert!(got > 0, "registered model must have nonzero max_output_tokens");
+        assert!(
+            got > 0,
+            "registered model must have nonzero max_output_tokens"
+        );
 
         // Haiku is 16_384 in the built-in specs.
         assert_eq!(got, 16_384, "claude-haiku-4-5 max_output_tokens mismatch");
