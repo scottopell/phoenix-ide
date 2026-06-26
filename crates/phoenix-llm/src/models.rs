@@ -244,6 +244,21 @@ impl ModelSpec {
     }
 }
 
+impl ModelSpec {
+    /// Provider header value for gateway-compatible endpoints.
+    ///
+    /// Gateway model identifiers may carry their provider as an `api_name`
+    /// prefix, e.g. `baseten/moonshotai/Kimi-K2.7-Code`. That prefix is the
+    /// routing authority. Built-in direct-provider models have bare API names
+    /// and fall back to the backend's compatibility header value.
+    #[must_use]
+    pub fn provider_header_value(&self) -> &str {
+        self.api_name
+            .split_once('/')
+            .map_or_else(|| self.backend.header_value(), |(prefix, _)| prefix)
+    }
+}
+
 /// Parse additional model specs from the `PHOENIX_LLM_MODELS` inline JSON format.
 ///
 /// `api_name` defaults to `id`, so compatible backend aliases can be trialled
@@ -572,6 +587,25 @@ mod tests {
         );
         // Default family from backend is OpenAI
         assert_eq!(models[0].family, ModelFamily::OpenAI);
+    }
+
+    #[test]
+    fn provider_header_value_uses_api_name_prefix() {
+        let mut models = parse_external_models(
+            r#"[{"id":"baseten/moonshotai/Kimi-K2.7-Code","backend":"openai_chat_completions","description":"Kimi via gateway","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("model should parse");
+        let model = models.pop().expect("one model");
+        assert_eq!(model.provider_header_value(), "baseten");
+    }
+
+    #[test]
+    fn provider_header_value_falls_back_to_backend() {
+        let model = all_models()
+            .into_iter()
+            .find(|spec| spec.id == "gpt-5.5")
+            .expect("gpt-5.5 exists");
+        assert_eq!(model.provider_header_value(), "openai");
     }
 
     #[test]

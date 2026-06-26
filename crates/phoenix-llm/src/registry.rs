@@ -680,8 +680,9 @@ impl ModelRegistry {
         discovered: &DiscoveredModels,
     ) -> bool {
         let ids = discovered.ids_for_backend(spec.backend);
-        let prefixed_id = format!("{}/{}", spec.backend.header_value(), spec.id);
-        let prefixed_api = format!("{}/{}", spec.backend.header_value(), spec.api_name);
+        let provider = spec.provider_header_value();
+        let prefixed_id = format!("{provider}/{}", spec.id);
+        let prefixed_api = format!("{provider}/{}", spec.api_name);
         ids.contains(&spec.id)
             || ids.contains(&spec.api_name)
             || ids.contains(&prefixed_id)

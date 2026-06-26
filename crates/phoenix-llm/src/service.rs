@@ -179,7 +179,7 @@ impl LlmServiceImpl {
             {
                 headers.push((
                     "provider".to_string(),
-                    self.spec.backend.header_value().to_string(),
+                    self.spec.provider_header_value().to_string(),
                 ));
             }
         }
@@ -353,6 +353,55 @@ mod tests {
         let mut t = BTreeMap::new();
         t.insert("disable_data_logging".to_string(), "true".to_string());
         t
+    }
+
+    fn chat_gateway_service_with_api_name(api_name: &str) -> LlmServiceImpl {
+        let mut spec = all_models()
+            .into_iter()
+            .find(|s| s.id == "gpt-5.5")
+            .expect("gpt-5.5 must be in the model registry");
+        spec.backend = crate::ModelBackend::OpenAIChatCompletions;
+        spec.api_name = api_name.to_string();
+        let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::PlainBearer);
+        LlmServiceImpl::new(
+            spec,
+            auth,
+            None,
+            Some("https://gateway.example/v1/chat/completions".to_string()),
+            vec![
+                ("org-id".to_string(), "2".to_string()),
+                ("source".to_string(), "test-source".to_string()),
+            ],
+            BTreeMap::new(),
+        )
+    }
+
+    #[test]
+    fn provider_header_uses_api_name_prefix_for_gateway_models() {
+        let svc = chat_gateway_service_with_api_name("baseten/moonshotai/Kimi-K2.7-Code");
+        let headers = svc.headers_for_provider();
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("provider"))
+                .map(|(_, value)| value.as_str()),
+            Some("baseten")
+        );
+    }
+
+    #[test]
+    fn explicit_provider_header_still_wins() {
+        let mut svc = chat_gateway_service_with_api_name("baseten/moonshotai/Kimi-K2.7-Code");
+        svc.custom_headers
+            .push(("provider".to_string(), "custom".to_string()));
+        let headers = svc.headers_for_provider();
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("provider"))
+                .map(|(_, value)| value.as_str()),
+            Some("custom")
+        );
     }
 
     #[test]
