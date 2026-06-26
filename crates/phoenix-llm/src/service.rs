@@ -249,11 +249,9 @@ impl LlmServiceImpl {
                 )
                 .await
             }
-            // Phase 1: Chat Completions request path not yet implemented.
-            // Registry registers the model for metadata/config purposes;
-            // reaching dispatch here is a configuration error until Phase 2.
+            // Chat Completions dispatch is unsupported on this build path.
             ApiFormat::OpenAIChatCompletions => Err(LlmError::invalid_response(
-                "OpenAI Chat Completions backend is not yet implemented; \
+                "OpenAI Chat Completions backend is unsupported on this dispatch path; \
                  configure an openai_responses model for this endpoint",
             )),
         }
@@ -294,9 +292,9 @@ impl LlmServiceImpl {
                 )
                 .await
             }
-            // Phase 1: Chat Completions streaming not yet implemented.
+            // Chat Completions dispatch is unsupported on this build path.
             ApiFormat::OpenAIChatCompletions => Err(LlmError::invalid_response(
-                "OpenAI Chat Completions backend is not yet implemented; \
+                "OpenAI Chat Completions backend is unsupported on this dispatch path; \
                  configure an openai_responses model for this endpoint",
             )),
         }

@@ -51,9 +51,8 @@ pub enum ModelBackend {
     Anthropic,
     /// `OpenAI` Responses-compatible backend.
     OpenAIResponses,
-    /// `OpenAI` Chat Completions-compatible backend. Metadata/config only in
-    /// Phase 1 — service dispatch returns an unimplemented error until the
-    /// actual request path is wired up.
+    /// `OpenAI` Chat Completions-compatible backend. Service dispatch returns
+    /// an unsupported-backend error; only metadata and configuration use this path.
     OpenAIChatCompletions,
     /// In-process deterministic mock backend.
     Mock,
@@ -112,7 +111,6 @@ enum ExternalBackend {
     Anthropic,
     #[serde(rename = "openai_responses")]
     OpenAIResponses,
-    /// `openai_chat_completions` — Phase 1: metadata/config only.
     #[serde(rename = "openai_chat_completions")]
     OpenAIChatCompletions,
 }
@@ -161,9 +159,8 @@ pub(crate) enum ApiFormat {
     Anthropic,
     /// `OpenAI` Responses API
     OpenAIResponses,
-    /// `OpenAI` Chat Completions API — Phase 1: metadata/config only.
-    /// Service dispatch returns an unimplemented error until the request
-    /// path is implemented.
+    /// `OpenAI` Chat Completions API. Service dispatch returns an
+    /// unsupported-backend error; only metadata and configuration use this path.
     OpenAIChatCompletions,
 }
 
@@ -555,8 +552,6 @@ mod tests {
         assert_ne!(sonnet.api_name, "other-wire-name");
         assert_ne!(sonnet.context_window, 123);
     }
-
-    // --- Phase 1 new tests ---
 
     #[test]
     fn external_chat_completions_backend_parses_and_gets_openai_family() {
