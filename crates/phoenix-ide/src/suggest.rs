@@ -17,14 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
-const SUGGEST_SYSTEM: &str = r"You are a shell-command suggester embedded in a terminal. Given a request in natural language, reply with the shell command(s) that accomplish it.
-
-Rules:
-- Output ONLY commands, one per line.
-- No prose, no explanations, no surrounding markdown code fences.
-- A line beginning with `#` is a short comment; use one sparingly only when a step genuinely needs context.
-- Prefer a single command; emit multiple lines only when the task truly needs several steps.
-- Use angle-bracket placeholders (e.g. <branch>) for values you cannot know.";
+use phoenix_core::llm_language::SUGGEST_SYSTEM;
 
 const SUGGEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SUGGEST_TOKENS: u32 = 400;

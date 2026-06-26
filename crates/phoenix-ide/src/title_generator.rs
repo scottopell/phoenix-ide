@@ -9,25 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
-const TITLE_PROMPT: &str = r#"Generate a very short (3-6 words) title summarizing this request. Output only the title, no quotes or punctuation. Examples:
-- "Fix login page CSS bug" -> Fix Login Page CSS
-- "Help me write a Python script to parse CSV files" -> Python CSV Parser Script
-- "What's the best way to implement caching?" -> Implementing Caching Strategy
-
-Request:"#;
+use phoenix_core::llm_language::{CHAIN_NAME_PROMPT, TITLE_PROMPT};
 
 const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_TITLE_LENGTH: usize = 60;
-
-/// Prompt for the prose chain-name summary (REQ-CHN-010). Distinct from
-/// `TITLE_PROMPT`: it summarizes *every* chain member's first user message into
-/// one short prose display name, and the output is Title-Case prose, not a slug.
-const CHAIN_NAME_PROMPT: &str = r"Below are the opening messages of a sequence of related coding conversations, in order. Generate a single very short (3-6 words) human-readable name that summarizes the whole sequence as a unit. Output only the name in Title Case prose, no quotes, no punctuation, no kebab-case. Examples:
-- Auth Refactor And Tests
-- CSV Parser And Cleanup
-- Database Migration Rollout
-
-Conversations:";
 
 /// Per-message input cap for chain-name generation — mirrors `generate_title`'s
 /// 500-char truncation so a few huge first-messages don't dominate the prompt.

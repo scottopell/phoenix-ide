@@ -19,10 +19,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_REVIEW_BYTES: usize = 180_000;
 const MAX_FILE_BYTES: usize = 80_000;
 const MAX_CHUNK_BYTES: usize = 60_000;
-const REVIEW_SYSTEM: &str = r#"You are an independent senior code reviewer for Phoenix IDE.
-Return only JSON matching this shape:
-{"findings":[{"severity":"critical|high|medium|low","confidence":"high|medium|low","file":"path","line":1,"title":"short","rationale":"why this matters","suggested_fix":"concrete fix"}],"summary":"short review summary"}
-Focus on correctness, regressions, security, data loss, race conditions, and maintainability. Do not comment on unchanged code unless the diff makes it relevant."#;
+use phoenix_core::llm_language::COMMISSION_REVIEW_SYSTEM as REVIEW_SYSTEM;
 
 #[derive(Debug, Deserialize)]
 struct CommissionReviewInput {

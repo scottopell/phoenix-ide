@@ -4775,13 +4775,10 @@ const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 /// cannot slip under the budget at an estimated zero cost each.
 const MESSAGE_OVERHEAD_TOKENS: usize = 4;
 
-/// System prompt for the continuation request. A module const so the budget
-/// estimate and the request that is actually sent draw from the same text and
-/// cannot drift.
-const CONTINUATION_SYSTEM_PROMPT: &str = "You are an agent writing a handoff note for the next \
-    agent, who will continue this work in the same working directory with no memory of this \
-    session, with the same tools available to you now. Be precise and concrete: real file paths, \
-    real commands, and an honest split between what you verified and what you only assumed.";
+// System prompt for the continuation request, imported from the central prompt
+// module so the budget estimate and the request actually sent draw from the
+// same text and cannot drift.
+use phoenix_core::llm_language::CONTINUATION_SYSTEM_PROMPT;
 
 /// Estimate the token cost of a string for the proactive budget. Ceiling
 /// division so a sub-`CHARS_PER_TOKEN_ESTIMATE` string still costs at least one

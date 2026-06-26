@@ -361,6 +361,94 @@ pub fn mode_branch(
 }
 
 // =============================================================================
+// Language-agnostic prompts.
+//
+// These feed LLM-driven features (title/name generation, command suggestion,
+// keyword-search relevance filtering, code review, continuation handoff) that
+// are not yet keyed by `LlmLanguage` -- their call sites carry no language. They
+// live here so every string sent to a model has one home; when a feature gains
+// language awareness, promote the relevant const to a `match lang` function
+// alongside the others above.
+// =============================================================================
+
+/// System prompt for conversation title generation. The trailing `Request:`
+/// label is the cue the caller appends the user's first message under.
+pub const TITLE_PROMPT: &str = r#"Generate a very short (3-6 words) title summarizing this request. Output only the title, no quotes or punctuation. Examples:
+- "Fix login page CSS bug" -> Fix Login Page CSS
+- "Help me write a Python script to parse CSV files" -> Python CSV Parser Script
+- "What's the best way to implement caching?" -> Implementing Caching Strategy
+
+Request:"#;
+
+/// System prompt for the prose chain-name summary. Distinct from
+/// [`TITLE_PROMPT`]: it summarizes every chain member's first user message into
+/// one short Title-Case prose display name, not a slug.
+pub const CHAIN_NAME_PROMPT: &str = r"Below are the opening messages of a sequence of related coding conversations, in order. Generate a single very short (3-6 words) human-readable name that summarizes the whole sequence as a unit. Output only the name in Title Case prose, no quotes, no punctuation, no kebab-case. Examples:
+- Auth Refactor And Tests
+- CSV Parser And Cleanup
+- Database Migration Rollout
+
+Conversations:";
+
+/// System prompt for one-shot shell-command suggestion. The model is a pure
+/// suggester -- it has no bash tool, the terminal renders each line as a
+/// click-to-run affordance.
+pub const SUGGEST_SYSTEM: &str = r"You are a shell-command suggester embedded in a terminal. Given a request in natural language, reply with the shell command(s) that accomplish it.
+
+Rules:
+- Output ONLY commands, one per line.
+- No prose, no explanations, no surrounding markdown code fences.
+- A line beginning with `#` is a short comment; use one sparingly only when a step genuinely needs context.
+- Prefer a single command; emit multiple lines only when the task truly needs several steps.
+- Use angle-bracket placeholders (e.g. <branch>) for values you cannot know.";
+
+/// System prompt for the end-of-context continuation handoff: the agent writes
+/// a note for the next agent, which continues the work with no memory of this
+/// session.
+pub const CONTINUATION_SYSTEM_PROMPT: &str = "You are an agent writing a handoff note for the next \
+    agent, who will continue this work in the same working directory with no memory of this \
+    session, with the same tools available to you now. Be precise and concrete: real file paths, \
+    real commands, and an honest split between what you verified and what you only assumed.";
+
+/// System prompt for the keyword-search relevance filter: an LLM ranks ripgrep
+/// matches by relevance to the query and drops the noise.
+pub const KEYWORD_SEARCH_FILTER_SYSTEM: &str = r#"You are a code search relevance evaluator. Your task is to analyze ripgrep results and determine which files are most relevant to the user's query.
+
+INPUT FORMAT:
+- You will receive ripgrep output containing file matches for keywords with 10 lines of context
+- At the end will be the original search query
+
+ANALYSIS INSTRUCTIONS:
+1. Examine each file match and its surrounding context
+2. Evaluate relevance to the query based on:
+   - Direct relevance to concepts in the query
+   - Implementation of functionality described in the query
+   - Evidence of patterns or systems related to the query
+3. Exercise strict judgment - only return files that are genuinely relevant
+
+OUTPUT FORMAT:
+Respond with a plain text list of the most relevant files in decreasing order of relevance:
+
+/path/to/most/relevant/file: Concise relevance explanation
+/path/to/second/file: Concise relevance explanation
+...
+
+IMPORTANT:
+- Only include files with meaningful relevance to the query
+- Keep it short, don't blather
+- Do NOT list all files that had keyword matches
+- Focus on quality over quantity
+- If no files are truly relevant, return "No relevant files found"
+- Use absolute file paths"#;
+
+/// System prompt for the commissioned code-review tool. The model returns
+/// strict JSON findings; the shape is part of the contract.
+pub const COMMISSION_REVIEW_SYSTEM: &str = r#"You are an independent senior code reviewer for Phoenix IDE.
+Return only JSON matching this shape:
+{"findings":[{"severity":"critical|high|medium|low","confidence":"high|medium|low","file":"path","line":1,"title":"short","rationale":"why this matters","suggested_fix":"concrete fix"}],"summary":"short review summary"}
+Focus on correctness, regressions, security, data loss, race conditions, and maintainability. Do not comment on unchanged code unless the diff makes it relevant."#;
+
+// =============================================================================
 // Chain Q&A system prompts.
 // =============================================================================
 
