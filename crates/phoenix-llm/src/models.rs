@@ -5,7 +5,9 @@ use std::collections::HashSet;
 /// Default maximum output tokens applied when a model spec does not provide an
 /// explicit override. External model configs that omit `max_output_tokens` get
 /// this value; a nonzero explicit value is accepted as-is.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+///
+/// Single source of truth: defined in `phoenix-core` and re-exported here.
+pub use phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS;
 
 /// User-facing provider family. Distinct from [`ModelBackend`] (wire protocol)
 /// so gateway-routed models (e.g. Gemini served over an OpenAI-compatible
