@@ -1,4 +1,3 @@
-import mermaid from 'mermaid';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import { MermaidDiagram } from './MermaidDiagram';
