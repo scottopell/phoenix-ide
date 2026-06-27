@@ -50,7 +50,7 @@ jobs:
             needs-chrome: false
           # Everything that reads the committed UI tree + the spec lanes.
           - lane-group: ui
-            lanes: tsc,ui-lint,vitest,ast-grep,allium,spec-anchors,pkglock
+            lanes: tsc,ui-lint,vitest,ui-build,ast-grep,allium,spec-anchors,pkglock
             needs-ui: true
             needs-chrome: false
 

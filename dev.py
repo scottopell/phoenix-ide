@@ -2957,6 +2957,7 @@ _LANE_DEFS = [
     ("tsc", {"UI"}, "tsc -b --noEmit project typecheck"),
     ("ui-lint", {"UI"}, "eslint + stylelint"),
     ("vitest", {"UI"}, "vitest run"),
+    ("ui-build", {"UI"}, "vite build (production bundle)"),
     ("ast-grep", {"UI", "RUST", "ASTGREP"}, "structural lint rules over ui/src/ + crates/"),
     ("allium", {"SPECS"}, "allium spec validation"),
     # spec-anchors cross-validates REQ-* anchors in code against specs/, so a
@@ -3520,7 +3521,7 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
     # Corepack/pnpm (ensure_ui_deps); cargo lanes need the rustc/sccache env
     # and the env-classification probes. Only `rust` consumes the nextest
     # probe + thread sizing + codegen commands.
-    ui_active = bool(active & {"tsc", "ui-lint", "vitest"})
+    ui_active = bool(active & {"tsc", "ui-lint", "vitest", "ui-build"})
     cargo_active = bool(active & {"rust", "e2e"})
 
     # Stage 3 / per-crate gating: when the rust lane runs under gating, try to
@@ -4222,6 +4223,7 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         ("tsc", lambda: run_step("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR)),
         ("ui-lint", lane_ui_lint),
         ("vitest", lambda: run_step("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
+        ("ui-build", lambda: run_step("vite build", ["pnpm", "run", "build"], UI_DIR)),
         ("fast", lane_fast),
         ("ast-grep", check_ast_grep),
         ("allium", check_allium),
@@ -4909,6 +4911,7 @@ _GRAPH_LANE_STEPS = {
     "tsc": ["tsc -b --noEmit"],
     "ui-lint": ["eslint", "stylelint"],
     "vitest": ["vitest run"],
+    "ui-build": ["pnpm run build"],
     "ast-grep": ["structural rules over ui/src/ + crates/"],
     "allium": ["allium check specs/*/*.allium"],
     "spec-anchors": ["REQ-* anchor cross-validation"],
