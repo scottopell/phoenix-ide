@@ -35,8 +35,9 @@ on demand.
 
 ## Limits & gotchas
 
-- **Discovery:** `.claude/skills/` and `.agents/skills/` from the working dir up
-  to root (plus `$HOME`); the **closest** definition wins.
+- **Discovery:** `.claude/skills/` and `.agents/skills/` — from the working dir
+  up to root, in its immediate subdirectories, and under `$HOME`; the **closest**
+  definition wins.
 - An unknown name errors **for the agent's `skill` tool**. An unknown composer
   `/typo` is **not** an error — it's sent through as literal text.
 

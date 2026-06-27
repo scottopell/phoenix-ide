@@ -16,7 +16,7 @@ related: [concepts/conversations.md, reference/glossary.md]
 | Key | Action |
 |-----|--------|
 | `Ctrl+P` | Command palette |
-| `?` | Toggle the shortcut help panel |
+| `?` | Toggle this help panel |
 | `Escape` | Close panel / navigate back |
 
 ## Conversation
@@ -48,7 +48,7 @@ related: [concepts/conversations.md, reference/glossary.md]
 | `Shift+Tab` | Previous question |
 | `n` | Add notes (preview questions) |
 | `Ctrl+Enter` | Submit answers |
-| `Escape` | Dismiss the question (with confirmation) |
+| `Escape` | Dismiss structured question (with confirmation) |
 
 ## Related
 

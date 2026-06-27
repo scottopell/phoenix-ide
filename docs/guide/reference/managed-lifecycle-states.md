@@ -61,8 +61,9 @@ has no merge/PR-create API, so these are honest GitHub link-outs:
 | `Clean up` (→ `Cleaning...`) | *"Mark as merged. Deletes the worktree and the task branch Phoenix created. No confirmation — use Abandon if you want a diff snapshot first."* |
 | `Abandon` (→ `Abandoning...`) | *"Captures a diff snapshot, then deletes the worktree and the task branch. Asks for confirmation."* |
 
-In Branch mode both hints instead read *"…your branch is kept."* `Abandon` also
-asks to confirm, differing by mode:
+In **Branch** mode both hints instead say the worktree is deleted but *"your
+branch is kept"* (e.g. Clean up: *"Mark as merged. Deletes the worktree; your
+branch is kept. …"*). `Abandon` also asks to confirm, differing by mode:
 
 | Mode | Confirmation (verbatim) | Branch kept? |
 |------|-------------------------|--------------|

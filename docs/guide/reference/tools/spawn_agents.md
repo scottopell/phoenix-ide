@@ -26,7 +26,7 @@ conversations — each running its task to completion and submitting one result.
 | `model` | cheapest (Explore) / parent's (Work) | model override |
 | `max_turns` | 20 (Explore) / 50 (Work) | turn budget |
 | `cwd` | parent's dir | Work sub-agents must stay inside the worktree |
-| `agent_type` | — | a named agent persona |
+| `agent_type` | — | a named agent — only offered when the project defines named agents (chosen from that set) |
 
 ## What you'll see
 

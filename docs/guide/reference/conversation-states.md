@@ -19,9 +19,9 @@ related: [concepts/conversations.md, reference/managed-lifecycle-states.md, refe
 | Thinking | awaiting / streaming the LLM's response |
 | Running a tool | executing a tool (bash, patch, browser, …) |
 | Awaiting sub-agents | waiting for spawned [sub-agents](../concepts/sub-agents.md) to finish |
-| Summarizing | context is full — writing a continuation summary |
+| Compacting | context is full — compacting the conversation to continue |
 | Cancelling | stopping at your request |
-| Recovering | recovering from an error mid-run |
+| Authenticating | completing a credential / sign-in flow |
 
 ## Waiting on you
 

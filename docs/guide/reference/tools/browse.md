@@ -25,7 +25,7 @@ These are **separate tools**, each named `browser_*` (there is no single
 
 | Group | Tools |
 |-------|-------|
-| Navigate | `browser_navigate`, `browser_resize` (default viewport 1280×720) |
+| Navigate | `browser_navigate`, `browser_resize` (default viewport 1024×768) |
 | Interact | `browser_click`, `browser_type`, `browser_key_press` |
 | Observe | `browser_take_screenshot`, `browser_eval`, `browser_recent_console_logs`, `browser_clear_console_logs`, `browser_wait_for_selector` |
 | Profile | `browser_profile` (scenarios, CPU/heap/coverage, raw per-run samples) |
