@@ -104,10 +104,15 @@ impl CredentialHelper {
     /// Wait until the helper transitions out of Running (to Valid or Failed).
     /// Returns immediately if not currently Running.
     pub async fn wait_for_settlement(&self) {
-        // Register the notification future BEFORE checking the lock.
-        // If we checked first then registered, a settlement between
-        // the check and the registration would be lost (TOCTOU).
+        // `enable()` registers this waiter before the lock check so that a
+        // notify_waiters() call that fires between enable() and notified.await
+        // is not silently dropped.  Without enable(), notify_waiters() only
+        // wakes tasks already in Waiting state (i.e., already polling the
+        // Notified future); a notification between creation and first poll
+        // would be lost.
         let notified = self.settled.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if !matches!(&*self.inner.lock().await, HelperInner::Running { .. }) {
             return;
         }
@@ -226,6 +231,7 @@ impl CredentialHelper {
                             stderr: e.to_string(),
                         },
                     );
+                    this.settled.notify_waiters();
                     drop(inner);
                     for sub in subs {
                         let _ = sub
@@ -321,8 +327,13 @@ impl CredentialHelper {
                         expires_at,
                     },
                 );
-                drop(inner);
+                // Notify while the lock is still held so that the state write
+                // and the wakeup are atomic from a waiter's perspective: any
+                // concurrent wait_for_settlement() caller that acquires the
+                // lock after this point sees Valid and returns early; one
+                // already blocked on notified.await is woken here.
                 this.settled.notify_waiters();
+                drop(inner);
                 for sub in subs {
                     let _ = sub.send(HelperEvent::Complete).await;
                 }
@@ -334,8 +345,8 @@ impl CredentialHelper {
                         stderr: stderr_str.clone(),
                     },
                 );
-                drop(inner);
                 this.settled.notify_waiters();
+                drop(inner);
                 for sub in subs {
                     let _ = sub
                         .send(HelperEvent::Error {
@@ -440,7 +451,17 @@ mod tests {
     /// Drain a stream up to and including its first terminal event
     /// (`Complete` or `Error`), bounding each read so a hung helper
     /// fails the test instead of hanging the suite.
-    async fn drain(mut s: tokio_stream::wrappers::ReceiverStream<HelperEvent>) -> Vec<HelperEvent> {
+    ///
+    /// After draining, waits for settlement so that callers can immediately
+    /// read `credential_status()` and observe the post-run state.  Receiving
+    /// `Complete` already implies the background task wrote `Valid` before
+    /// sending it, but the settlement wait makes the happens-before explicit
+    /// and guards against early stream close (e.g. channel closed before
+    /// the terminal event) in edge cases.
+    async fn drain(
+        h: &CredentialHelper,
+        mut s: tokio_stream::wrappers::ReceiverStream<HelperEvent>,
+    ) -> Vec<HelperEvent> {
         let mut out = Vec::new();
         while let Ok(Some(ev)) = timeout(TICK, s.next()).await {
             let terminal = matches!(ev, HelperEvent::Complete | HelperEvent::Error { .. });
@@ -449,6 +470,10 @@ mod tests {
                 break;
             }
         }
+        // Wait for Running→{Valid,Failed} to be visible before returning.
+        timeout(TICK, h.wait_for_settlement())
+            .await
+            .expect("helper did not settle within TICK after stream drained");
         out
     }
 
@@ -472,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn successful_run_streams_complete_and_caches_last_line() {
         let h = helper("printf 'tok\\n'", LONG_TTL);
-        let events = drain(Arc::clone(&h).run_and_stream().await).await;
+        let events = drain(&h, Arc::clone(&h).run_and_stream().await).await;
 
         assert!(
             matches!(events.last(), Some(HelperEvent::Complete)),
@@ -485,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn non_final_stdout_lines_become_line_events() {
         let h = helper("printf 'a\\nb\\nTOK\\n'", LONG_TTL);
-        let events = drain(Arc::clone(&h).run_and_stream().await).await;
+        let events = drain(&h, Arc::clone(&h).run_and_stream().await).await;
 
         assert_eq!(lines(&events), vec!["a", "b"]);
         assert!(matches!(events.last(), Some(HelperEvent::Complete)));
@@ -501,7 +526,7 @@ mod tests {
             "printf 'visit https://x\\n' 1>&2; printf 'TOK\\n'",
             LONG_TTL,
         );
-        let events = drain(Arc::clone(&h).run_and_stream().await).await;
+        let events = drain(&h, Arc::clone(&h).run_and_stream().await).await;
 
         assert_eq!(lines(&events), vec!["visit https://x"]);
         assert!(matches!(events.last(), Some(HelperEvent::Complete)));
@@ -511,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn blank_lines_are_skipped() {
         let h = helper("printf '\\n\\nTOK\\n'", LONG_TTL);
-        let events = drain(Arc::clone(&h).run_and_stream().await).await;
+        let events = drain(&h, Arc::clone(&h).run_and_stream().await).await;
 
         assert!(lines(&events).is_empty(), "blank lines must not stream");
         assert_eq!(h.get().await.as_deref(), Some("TOK"));
@@ -520,7 +545,7 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_streams_error_and_sets_failed() {
         let h = helper("printf 'boom\\n' 1>&2; exit 3", LONG_TTL);
-        let events = drain(Arc::clone(&h).run_and_stream().await).await;
+        let events = drain(&h, Arc::clone(&h).run_and_stream().await).await;
 
         match events.last() {
             Some(HelperEvent::Error { exit_code, stderr }) => {
@@ -537,7 +562,7 @@ mod tests {
     async fn stdout_token_with_nonzero_exit_is_a_failure() {
         // A printed token does not count if the helper itself exits non-zero.
         let h = helper("printf 'tok\\n'; exit 1", LONG_TTL);
-        let events = drain(Arc::clone(&h).run_and_stream().await).await;
+        let events = drain(&h, Arc::clone(&h).run_and_stream().await).await;
 
         assert!(
             matches!(
@@ -555,12 +580,12 @@ mod tests {
     #[tokio::test]
     async fn cached_valid_credential_replays_complete_without_respawn() {
         let h = helper("printf 'first\\nTOK\\n'", LONG_TTL);
-        let first = drain(Arc::clone(&h).run_and_stream().await).await;
+        let first = drain(&h, Arc::clone(&h).run_and_stream().await).await;
         assert_eq!(lines(&first), vec!["first"]);
 
         // Second call must short-circuit on the cached Valid state: only a
         // single Complete, no re-run (which would re-emit the "first" line).
-        let second = drain(Arc::clone(&h).run_and_stream().await).await;
+        let second = drain(&h, Arc::clone(&h).run_and_stream().await).await;
         assert!(
             matches!(second.as_slice(), [HelperEvent::Complete]),
             "got {second:?}"
@@ -570,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn ttl_zero_expires_valid_to_idle() {
         let h = helper("printf 'TOK\\n'", Duration::ZERO);
-        drain(Arc::clone(&h).run_and_stream().await).await;
+        drain(&h, Arc::clone(&h).run_and_stream().await).await;
 
         // expires_at == issue instant, so any later observation is expired.
         assert_eq!(h.credential_status().await, CredentialStatus::Idle);
@@ -580,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn expire_if_needed_is_noop_while_valid() {
         let h = helper("printf 'TOK\\n'", LONG_TTL);
-        drain(Arc::clone(&h).run_and_stream().await).await;
+        drain(&h, Arc::clone(&h).run_and_stream().await).await;
 
         h.expire_if_needed().await;
         assert_eq!(h.credential_status().await, CredentialStatus::Valid);
@@ -589,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn invalidate_clears_valid_then_reports_already_idle() {
         let h = helper("printf 'TOK\\n'", LONG_TTL);
-        drain(Arc::clone(&h).run_and_stream().await).await;
+        drain(&h, Arc::clone(&h).run_and_stream().await).await;
 
         assert!(h.invalidate().await, "first invalidate should clear Valid");
         assert_eq!(h.credential_status().await, CredentialStatus::Idle);
