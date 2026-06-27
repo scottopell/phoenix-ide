@@ -24,13 +24,14 @@ The agent has made (or is making) edits — typically in Work or Branch mode.
    of diff / file / browser at a time — opening one closes the others.
 3. **Annotate a line.** Click a line and add a note (**Add your note… (Cmd/Ctrl+Enter
    to save)**). Notes collect in the **Notes** panel, each anchored to its line.
-4. **Send the feedback.** **Send All** hands your notes to the agent; **Clear
-   All** discards them. The agent revises against your notes.
+4. **Insert, then send.** **Send All** drops your notes into the composer
+   (focused and ready) — it does **not** deliver them on its own; **press Send**
+   to hand them to the agent. **Clear All** discards them.
 
 ## Result
 
-The agent receives your annotations tied to specific lines and iterates — the
-same notes mechanism the [task-approval](../reference/managed-lifecycle-states.md#task-approval-reader)
+Once you send, the agent receives your annotations tied to specific lines and
+iterates — the same notes mechanism the [task-approval](../reference/managed-lifecycle-states.md#task-approval-reader)
 review uses.
 
 ## See also

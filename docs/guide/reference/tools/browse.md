@@ -41,7 +41,9 @@ with the diff/prose viewers.
 - **One session per work scope**, shared across a continuation; **30-minute** idle
   timeout (held open while the conversation is live).
 - `eval` results and console output over ~4 KB spill to a temp file.
-- Browser-native chords (Ctrl+P/W/T/Tab) can't be sent — Chrome intercepts them.
+- Browser-native chords (Ctrl+P/W/T) are intercepted by Chrome on the default
+  dispatch — but `browser_key_press` with `method: "js"` reaches the page anyway
+  (it fires a synthetic event, so `isTrusted=false`).
 
 ## Related
 

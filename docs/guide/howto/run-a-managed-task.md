@@ -29,7 +29,9 @@ appears once the working directory resolves as one.
    - *From an existing task instead:* **"Start from a task"** appears when the
      repo has active task files (any status but `done`/`wont-do`). Pick a **Base
      branch for planning** and a **Task file**; your first message is seeded to
-     propose that task.
+     propose that task. Note the picker lists `blocked` tasks too, but
+     `propose_task` only accepts `ready`/`in-progress`/`brainstorming` — move a
+     blocked task to one of those first, or it's rejected before the review screen.
 3. **Write your request and press Send.** The conversation opens in **Explore**
    (badge `Explore`); the agent investigates read-only and drafts a task file
    under `tasks/` — that file is the plan.

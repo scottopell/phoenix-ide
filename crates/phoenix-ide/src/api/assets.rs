@@ -59,11 +59,16 @@ pub async fn serve_static(req: Request<Body>) -> impl IntoResponse {
 /// covers the dev filesystem fallback below.
 pub async fn serve_help_file(req: Request<Body>) -> impl IntoResponse {
     let rel = req.uri().path().trim_start_matches("/api/help/");
-    // Reject empty, parent-traversal, and absolute paths. An absolute `rel`
-    // (e.g. `/api/help//etc/passwd`, or a drive-qualified `C:/...` on Windows)
-    // would make `PathBuf::join` below discard the `docs/guide` base and read an
-    // arbitrary server file. `Path::is_absolute` is platform-aware.
-    if rel.is_empty() || rel.contains("..") || std::path::Path::new(rel).is_absolute() {
+    // Only serve a pure relative path of *normal* components. This rejects
+    // absolute (`/etc/passwd`), rooted (`/Windows/win.ini`), drive-qualified
+    // (`C:/...`), and `..` traversal — any of which `PathBuf::join` below would
+    // use to escape the `docs/guide` base in the filesystem fallback and read an
+    // arbitrary server file. Component-based so it's correct on every platform.
+    let safe = !rel.is_empty()
+        && std::path::Path::new(rel)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !safe {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not found"))
