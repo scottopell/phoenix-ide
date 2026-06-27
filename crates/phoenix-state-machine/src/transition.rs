@@ -1133,7 +1133,7 @@ fn handle_core_cancellation(
                 pending_sub_agents,
                 assistant_message,
             },
-            CoreEvent::UserCancel { .. },
+            CoreEvent::UserCancel { cause, .. },
         ) => {
             let mut result = CoreTransitionResult::new(CoreState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
@@ -1141,6 +1141,7 @@ fn handle_core_cancellation(
                 completed_results: completed_results.clone(),
                 assistant_message: assistant_message.clone(),
                 pending_sub_agents: pending_sub_agents.clone(),
+                cause,
             })
             .with_effect(Effect::AbortTool {
                 tool_use_id: current_tool.id.clone(),
@@ -1174,6 +1175,7 @@ fn handle_core_cancellation(
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
+                cause,
             },
             CoreEvent::ToolAborted {
                 tool_use_id: aborted_id,
@@ -1198,7 +1200,7 @@ fn handle_core_cancellation(
                 Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
-                    cause: CancelCause::UserRequested,
+                    cause: *cause,
                     spawn_tool_id: None,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
@@ -1214,6 +1216,7 @@ fn handle_core_cancellation(
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
+                cause,
             },
             CoreEvent::ToolComplete {
                 tool_use_id: completed_id,
@@ -1239,7 +1242,7 @@ fn handle_core_cancellation(
                 Ok(CoreTransitionResult::new(CoreState::CancellingSubAgents {
                     pending: pending_sub_agents.clone(),
                     completed_results: vec![],
-                    cause: CancelCause::UserRequested,
+                    cause: *cause,
                     spawn_tool_id: None,
                 })
                 .with_effect(Effect::PersistCheckpoint { data: checkpoint })
@@ -1255,6 +1258,7 @@ fn handle_core_cancellation(
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
+                cause,
             },
             CoreEvent::SubAgentResult { agent_id, .. },
         ) if pending_sub_agents.iter().any(|p| p.agent_id == agent_id) => {
@@ -1269,6 +1273,7 @@ fn handle_core_cancellation(
                 completed_results: completed_results.clone(),
                 assistant_message: assistant_message.clone(),
                 pending_sub_agents: new_pending,
+                cause: *cause,
             })
             .with_effect(Effect::PersistState))
         }
@@ -2818,6 +2823,35 @@ pub fn transition_parent(
 // transition_sub_agent — sub-agent-specific transitions, delegates core
 // ============================================================================
 
+/// Maps a `CancelCause` to the sub-agent terminal state and parent notification
+/// outcome. `Timeout` → `TimedOut`; `UserRequested` → `Failure { Cancelled }`.
+fn sub_agent_cancel_outcome(
+    cause: &CancelCause,
+) -> (SubAgentState, SubAgentOutcome) {
+    match cause {
+        CancelCause::Timeout => (
+            SubAgentState::Failed {
+                error: "Sub-agent timed out".to_string(),
+                error_kind: ErrorKind::Cancelled,
+            },
+            SubAgentOutcome::TimedOut,
+        ),
+        CancelCause::UserRequested => {
+            let error = "Cancelled by parent".to_string();
+            (
+                SubAgentState::Failed {
+                    error: error.clone(),
+                    error_kind: ErrorKind::Cancelled,
+                },
+                SubAgentOutcome::Failure {
+                    error,
+                    error_kind: ErrorKind::Cancelled,
+                },
+            )
+        }
+    }
+}
+
 /// Sub-agent transition function. Handles sub-agent-only states and events,
 /// intercepts core events with sub-agent-specific behavior, delegates the
 /// rest to `transition_core`.
@@ -2901,7 +2935,7 @@ pub fn transition_sub_agent(
                 assistant_message,
                 pending_sub_agents,
             }),
-            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, .. }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _, cause }),
         ) => Ok(
             SubAgentTransitionResult::new(SubAgentState::Core(CoreState::CancellingTool {
                 tool_use_id: current_tool.id.clone(),
@@ -2909,6 +2943,7 @@ pub fn transition_sub_agent(
                 completed_results: completed_results.clone(),
                 assistant_message: assistant_message.clone(),
                 pending_sub_agents: pending_sub_agents.clone(),
+                cause,
             }))
             .with_effect(Effect::AbortTool {
                 tool_use_id: current_tool.id.clone(),
@@ -2927,7 +2962,11 @@ pub fn transition_sub_agent(
         // being cancelled, not checkpointed. Guarded on id match so a stale
         // outcome for a different tool_use does not settle the wrong round.
         (
-            SubAgentState::Core(CoreState::CancellingTool { tool_use_id, .. }),
+            SubAgentState::Core(CoreState::CancellingTool {
+                tool_use_id,
+                cause,
+                ..
+            }),
             SubAgentEvent::Core(
                 CoreEvent::ToolAborted {
                     tool_use_id: settled_id,
@@ -2938,18 +2977,12 @@ pub fn transition_sub_agent(
                 },
             ),
         ) if *tool_use_id == settled_id => {
-            let error = "Cancelled by parent".to_string();
-            Ok(SubAgentTransitionResult::new(SubAgentState::Failed {
-                error: error.clone(),
-                error_kind: ErrorKind::Cancelled,
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::NotifyParent {
-                outcome: SubAgentOutcome::Failure {
-                    error,
-                    error_kind: ErrorKind::Cancelled,
-                },
-            }))
+            let (failed_state, notify_outcome) = sub_agent_cancel_outcome(cause);
+            Ok(SubAgentTransitionResult::new(failed_state)
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::NotifyParent {
+                    outcome: notify_outcome,
+                }))
         }
 
         // ============================================================
@@ -2969,21 +3002,16 @@ pub fn transition_sub_agent(
         // ============================================================
         // Sub-agent UserCancel -> Failed (from any other non-terminal core state)
         // ============================================================
-        (SubAgentState::Core(_), SubAgentEvent::Core(CoreEvent::UserCancel { reason, .. })) => {
-            let error = reason
-                .clone()
-                .unwrap_or_else(|| "Cancelled by parent".to_string());
-            Ok(SubAgentTransitionResult::new(SubAgentState::Failed {
-                error: error.clone(),
-                error_kind: ErrorKind::Cancelled,
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::NotifyParent {
-                outcome: SubAgentOutcome::Failure {
-                    error,
-                    error_kind: ErrorKind::Cancelled,
-                },
-            }))
+        (
+            SubAgentState::Core(_),
+            SubAgentEvent::Core(CoreEvent::UserCancel { cause, .. }),
+        ) => {
+            let (failed_state, notify_outcome) = sub_agent_cancel_outcome(&cause);
+            Ok(SubAgentTransitionResult::new(failed_state)
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::NotifyParent {
+                    outcome: notify_outcome,
+                }))
         }
 
         // ============================================================
@@ -4428,6 +4456,7 @@ mod tests {
             completed_results: vec![],
             assistant_message,
             pending_sub_agents: vec![],
+            cause: CancelCause::UserRequested,
         };
 
         // ToolAborted (the cancel-branch outcome) settles the round.
@@ -4520,6 +4549,108 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::NotifyParent { .. })),
             "a repeated cancel must NOT notify the parent before the tool settles"
+        );
+    }
+
+    /// A per-agent timeout cancel (`CancelCause::Timeout`) produces
+    /// `SubAgentOutcome::TimedOut`, not `Failure { Cancelled }`.
+    /// Covers both the direct-cancel path (non-tool state) and the deferred
+    /// path (tool in flight → `CancellingTool` → tool settles → `TimedOut`).
+    #[test]
+    fn test_subagent_timeout_cancel_produces_timed_out_outcome() {
+        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        // Path 1: timeout while in LlmRequesting (no tool in flight) →
+        // immediate TimedOut.
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &sub_agent_context(),
+            Event::UserCancel {
+                reason: Some("Sub-agent timed out".to_string()),
+                cause: CancelCause::Timeout,
+            },
+        )
+        .expect("sub-agent LlmRequesting + Timeout cancel must transition");
+
+        assert!(
+            matches!(result.new_state, ConvState::Failed { .. }),
+            "timed-out sub-agent must reach Failed, got {:?}",
+            result.new_state
+        );
+        let timed_out = result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyParent { outcome: SubAgentOutcome::TimedOut }));
+        assert!(
+            timed_out,
+            "timeout cancel must notify parent with TimedOut, got effects {:?}",
+            result.effects
+        );
+
+        // Path 2: timeout while ToolExecuting → routes through CancellingTool,
+        // then ToolAborted → TimedOut.
+        let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::tool_use(
+                "timeout-tool",
+                "bash",
+                serde_json::json!({"op": "run", "cmd": "sleep 9999"}),
+            )],
+            None,
+            None,
+        );
+
+        let after_cancel = transition(
+            &ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    "timeout-tool",
+                    ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                        "sleep 9999",
+                    )),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message,
+            },
+            &sub_agent_context(),
+            Event::UserCancel {
+                reason: Some("Sub-agent timed out".to_string()),
+                cause: CancelCause::Timeout,
+            },
+        )
+        .expect("sub-agent ToolExecuting + Timeout cancel must transition to CancellingTool");
+
+        assert!(
+            matches!(after_cancel.new_state, ConvState::CancellingTool { .. }),
+            "timeout cancel mid-tool must go through CancellingTool, got {:?}",
+            after_cancel.new_state
+        );
+
+        let after_abort = transition(
+            &after_cancel.new_state,
+            &sub_agent_context(),
+            Event::ToolAborted {
+                tool_use_id: "timeout-tool".to_string(),
+            },
+        )
+        .expect("sub-agent CancellingTool(Timeout) + ToolAborted must transition");
+
+        assert!(
+            matches!(after_abort.new_state, ConvState::Failed { .. }),
+            "settled timeout-cancel sub-agent must reach Failed, got {:?}",
+            after_abort.new_state
+        );
+        let timed_out_deferred = after_abort
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyParent { outcome: SubAgentOutcome::TimedOut }));
+        assert!(
+            timed_out_deferred,
+            "CancellingTool(Timeout) + ToolAborted must notify parent with TimedOut, \
+             got effects {:?}",
+            after_abort.effects
         );
     }
 
