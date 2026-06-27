@@ -77,13 +77,14 @@ impl ErrorPresentation {
 }
 
 /// A message enriched for API output: bash `tool_use` blocks have their
-/// `display` field merged into `content`. This is what `EnrichedMessage`
+/// `display` field merged into `content`, and `display_data.bash` is then
+/// stripped before the message is shipped. This is what `EnrichedMessage`
 /// carries on the wire; `crate::db::Message` (the DB record) is the input.
 ///
-/// The transformation is implemented by [`enrich_content`] below, which
-/// walks the `content` JSON and merges `display_data.bash[*].display` into
-/// matching `tool_use` blocks. The semantics match the old
-/// `enrich_message_for_api(&Message) -> Value` helper byte-for-byte.
+/// The transformation is implemented by [`enrich_content`] + `From<&Message>`:
+/// `enrich_content` walks `content` and merges `display_data.bash[*].display`
+/// into matching `tool_use` blocks; then `From<&Message>` removes the `bash`
+/// key from `display_data` so the same string is not duplicated on the wire.
 ///
 /// `content` and `display_data` stay as `serde_json::Value` — see the module
 /// docs for the rationale.
@@ -105,13 +106,26 @@ pub struct EnrichedMessage {
 impl From<&Message> for EnrichedMessage {
     fn from(msg: &Message) -> Self {
         let content = enrich_content(msg);
+        // `enrich_content` bakes `display_data.bash[*].display` into the
+        // matching `content` tool_use blocks. Strip the `bash` key before
+        // shipping so the display string isn't duplicated on the wire.
+        let display_data = msg.display_data.as_ref().and_then(|dd| {
+            let mut dd = dd.clone();
+            if let Some(obj) = dd.as_object_mut() {
+                obj.remove("bash");
+                if obj.is_empty() {
+                    return None;
+                }
+            }
+            Some(dd)
+        });
         Self {
             message_id: msg.message_id.clone(),
             conversation_id: msg.conversation_id.clone(),
             sequence_id: msg.sequence_id,
             message_type: msg.message_type,
             content,
-            display_data: msg.display_data.clone(),
+            display_data,
             usage_data: msg.usage_data.clone(),
             created_at: msg.created_at,
         }
@@ -658,6 +672,134 @@ impl From<ChainSseEvent> for ChainSseWireEvent {
 // plumbing). `./dev.py check` runs `cargo test` followed by
 // `git diff --exit-code ui/src/generated/` so a developer who edits a
 // Rust type here without running tests will see the check fail.
+
+#[cfg(test)]
+mod enriched_message_tests {
+    use super::*;
+    use crate::db::{Message, MessageContent, MessageType, UsageData};
+    use chrono::Utc;
+    use phoenix_llm::ContentBlock;
+    use serde_json::json;
+
+    fn ts() -> chrono::DateTime<Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 4, 23, 12, 0, 0).unwrap()
+    }
+
+    /// After `From<&Message>`, `display_data.bash` must not appear on the
+    /// wire: `enrich_content` has already baked the display string into the
+    /// matching `content` tool_use block, so shipping it again would violate
+    /// the no-parallel-representations invariant.
+    #[test]
+    fn bash_stripped_from_display_data_after_content_merge() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "Running ls".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "tu-1".to_string(),
+                name: "bash".to_string(),
+                input: json!({"cmd": "ls"}),
+            },
+        ];
+        let msg = Message {
+            message_id: "msg-1".to_string(),
+            conversation_id: "conv-1".to_string(),
+            sequence_id: 1,
+            message_type: MessageType::Agent,
+            content: MessageContent::Agent(blocks),
+            display_data: Some(json!({
+                "bash": [{ "tool_use_id": "tu-1", "display": "file.txt" }]
+            })),
+            usage_data: Some(UsageData {
+                input_tokens: 5,
+                output_tokens: 3,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            }),
+            created_at: ts(),
+        };
+
+        let enriched = EnrichedMessage::from(&msg);
+
+        // `display_data.bash` must be absent — stripped before shipping.
+        assert!(
+            enriched.display_data.is_none(),
+            "display_data must be None when bash was the only key; got: {:?}",
+            enriched.display_data
+        );
+
+        // The display string must have been merged into the content block.
+        let tool_use = enriched
+            .content
+            .as_array()
+            .expect("content is an array")
+            .iter()
+            .find(|b| b.get("type") == Some(&json!("tool_use")))
+            .expect("tool_use block present");
+        assert_eq!(
+            tool_use.get("display"),
+            Some(&json!("file.txt")),
+            "display must be merged into the tool_use block in content"
+        );
+    }
+
+    /// When `display_data` contains other keys besides `bash`, they must be
+    /// preserved after the bash key is stripped.
+    #[test]
+    fn non_bash_display_data_keys_preserved() {
+        let blocks = vec![ContentBlock::ToolUse {
+            id: "tu-2".to_string(),
+            name: "bash".to_string(),
+            input: json!({"cmd": "pwd"}),
+        }];
+        let msg = Message {
+            message_id: "msg-2".to_string(),
+            conversation_id: "conv-1".to_string(),
+            sequence_id: 2,
+            message_type: MessageType::Agent,
+            content: MessageContent::Agent(blocks),
+            display_data: Some(json!({
+                "bash": [{ "tool_use_id": "tu-2", "display": "/home/alice" }],
+                "subagent_summary": { "status": "ok" }
+            })),
+            usage_data: None,
+            created_at: ts(),
+        };
+
+        let enriched = EnrichedMessage::from(&msg);
+
+        let dd = enriched
+            .display_data
+            .as_ref()
+            .expect("display_data must be Some when non-bash keys remain");
+        assert!(
+            dd.get("bash").is_none(),
+            "bash key must be stripped; got: {dd}"
+        );
+        assert_eq!(
+            dd.get("subagent_summary"),
+            Some(&json!({ "status": "ok" })),
+            "subagent_summary must be preserved"
+        );
+    }
+
+    /// A message with no `display_data` at all must produce `None`.
+    #[test]
+    fn no_display_data_stays_none() {
+        let msg = Message {
+            message_id: "msg-3".to_string(),
+            conversation_id: "conv-1".to_string(),
+            sequence_id: 3,
+            message_type: MessageType::User,
+            content: MessageContent::user("hello"),
+            display_data: None,
+            usage_data: None,
+            created_at: ts(),
+        };
+        let enriched = EnrichedMessage::from(&msg);
+        assert!(enriched.display_data.is_none());
+    }
+}
 
 #[cfg(test)]
 mod chain_wire_tests {
