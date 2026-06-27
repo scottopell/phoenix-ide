@@ -611,21 +611,21 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
                 is_error,
             } => {
                 let wire_content = if images.is_empty() {
-                    serde_json::Value::String(content.clone())
+                    AnthropicToolResultContent::Text(content.clone())
                 } else {
-                    let mut blocks = vec![serde_json::json!({"type": "text", "text": content})];
+                    let mut parts =
+                        vec![AnthropicToolResultPart::Text { text: content.clone() }];
                     for img in images {
                         let ImageSource::Base64 { media_type, data } = img;
-                        blocks.push(serde_json::json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": data
-                            }
-                        }));
+                        parts.push(AnthropicToolResultPart::Image {
+                            source: AnthropicImageSource {
+                                r#type: "base64".to_string(),
+                                media_type: media_type.clone(),
+                                data: data.clone(),
+                            },
+                        });
                     }
-                    serde_json::Value::Array(blocks)
+                    AnthropicToolResultContent::Parts(parts)
                 };
                 AnthropicContentBlock::ToolResult {
                     tool_use_id: tool_use_id.clone(),
@@ -970,8 +970,7 @@ pub(crate) enum AnthropicContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        /// String for text-only results; array of content blocks when images are present.
-        content: serde_json::Value,
+        content: AnthropicToolResultContent,
         #[serde(default)]
         is_error: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1026,11 +1025,29 @@ pub(crate) enum AnthropicContentBlock {
     Unknown,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AnthropicImageSource {
     pub(crate) r#type: String,
     pub(crate) media_type: String,
     pub(crate) data: String,
+}
+
+/// Wire content for a `tool_result` block: plain string when text-only, array of typed
+/// parts when images are included alongside text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum AnthropicToolResultContent {
+    Text(String),
+    Parts(Vec<AnthropicToolResultPart>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub(crate) enum AnthropicToolResultPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: AnthropicImageSource },
 }
 
 const TOOL_SEARCH_VARIANT: &str = "tool_search_tool_regex_20251119";
@@ -1560,6 +1577,32 @@ mod tests {
             crate::LlmErrorKind::ServerError,
             "Empty response without end_turn should be a retryable ServerError"
         );
+    }
+
+    #[test]
+    fn parity_tool_result_text() {
+        let typed = AnthropicToolResultContent::Text("hello".to_string());
+        let expected: serde_json::Value = serde_json::json!("hello");
+        assert_eq!(serde_json::to_value(&typed).unwrap(), expected);
+    }
+
+    #[test]
+    fn parity_tool_result_with_image() {
+        let typed = AnthropicToolResultContent::Parts(vec![
+            AnthropicToolResultPart::Text { text: "see attached".to_string() },
+            AnthropicToolResultPart::Image {
+                source: AnthropicImageSource {
+                    r#type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "abc123".to_string(),
+                },
+            },
+        ]);
+        let expected = serde_json::json!([
+            {"type": "text", "text": "see attached"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc123"}}
+        ]);
+        assert_eq!(serde_json::to_value(&typed).unwrap(), expected);
     }
 }
 

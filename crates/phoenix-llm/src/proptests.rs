@@ -262,8 +262,8 @@ proptest! {
             &translated.content[0]
         {
             prop_assert!(
-                wire_content.is_string(),
-                "Expected string content for no-image ToolResult, got: {:?}",
+                matches!(wire_content, super::anthropic::AnthropicToolResultContent::Text(_)),
+                "Expected Text variant for no-image ToolResult, got: {:?}",
                 wire_content
             );
         } else {
@@ -292,18 +292,20 @@ proptest! {
         if let super::anthropic::AnthropicContentBlock::ToolResult { content: wire_content, .. } =
             &translated.content[0]
         {
-            prop_assert!(
-                wire_content.is_array(),
-                "Expected array content for image-bearing ToolResult, got: {:?}",
-                wire_content
-            );
-            let arr = wire_content.as_array().unwrap();
-            prop_assert_eq!(arr.len(), 1 + n_images, "Expected 1 text + {} image blocks", n_images);
-            prop_assert_eq!(&arr[0]["type"], "text", "First block must be text");
-            prop_assert_eq!(&arr[0]["text"], content.as_str(), "Text content must match");
-            for block in &arr[1..] {
-                prop_assert_eq!(&block["type"], "image", "Remaining blocks must be images");
-                prop_assert_eq!(&block["source"]["type"], "base64");
+            if let super::anthropic::AnthropicToolResultContent::Parts(parts) = wire_content {
+                prop_assert_eq!(parts.len(), 1 + n_images, "Expected 1 text + {} image parts", n_images);
+                prop_assert!(
+                    matches!(&parts[0], super::anthropic::AnthropicToolResultPart::Text { text } if text == &content),
+                    "First part must be text matching content"
+                );
+                for part in &parts[1..] {
+                    prop_assert!(
+                        matches!(part, super::anthropic::AnthropicToolResultPart::Image { .. }),
+                        "Remaining parts must be images"
+                    );
+                }
+            } else {
+                prop_assert!(false, "Expected Parts variant for image-bearing ToolResult, got: {:?}", wire_content);
             }
         } else {
             prop_assert!(false, "Expected ToolResult block");
