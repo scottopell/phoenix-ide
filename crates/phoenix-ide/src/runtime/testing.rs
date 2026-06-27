@@ -3233,6 +3233,7 @@ mod tests {
             completed_results: vec![],
             assistant_message,
             pending_sub_agents: vec![],
+            cause: crate::state_machine::event::CancelCause::UserRequested,
         };
         let runtime = ConversationRuntime::new(
             context,

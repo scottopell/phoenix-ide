@@ -665,6 +665,7 @@ mod tests {
                 completed_results: vec![],
                 assistant_message: AssistantMessage::default(),
                 pending_sub_agents: vec![],
+                cause: crate::domain::sm_event::CancelCause::UserRequested,
             },
             ConvState::AwaitingSubAgents {
                 pending: vec![],
@@ -936,7 +937,7 @@ pub enum ConvState {
         assistant_message: AssistantMessage,
     },
 
-    /// User requested cancellation of tool execution, waiting for abort confirmation.
+    /// Cancellation of tool execution in progress, waiting for abort confirmation.
     /// Carries the assistant message and completed results so the checkpoint can
     /// be persisted atomically on abort.
     CancellingTool {
@@ -951,6 +952,12 @@ pub enum ConvState {
         /// Sub-agents spawned earlier in this tool round, awaiting cancellation.
         /// Empty when no `spawn_agents` ran before the cancel.
         pending_sub_agents: Vec<PendingSubAgent>,
+        /// Why cancellation was initiated — drives the sub-agent outcome on
+        /// teardown: `Timeout` → `SubAgentOutcome::TimedOut`,
+        /// `UserRequested` → `SubAgentOutcome::Failure { Cancelled }`.
+        /// Transient/owned: reset to Idle on startup, strict-deserialized like
+        /// siblings (`ToolExecuting`, `CancellingSubAgents`), no migration owed.
+        cause: crate::domain::sm_event::CancelCause,
     },
 
     /// Waiting for sub-agents to complete.
@@ -1108,6 +1115,7 @@ pub enum CoreState {
         completed_results: Vec<ToolResult>,
         assistant_message: AssistantMessage,
         pending_sub_agents: Vec<PendingSubAgent>,
+        cause: crate::domain::sm_event::CancelCause,
     },
     AwaitingSubAgents {
         pending: Vec<PendingSubAgent>,
@@ -1280,12 +1288,14 @@ impl From<CoreState> for ConvState {
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
+                cause,
             } => ConvState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
+                cause,
             },
             CoreState::AwaitingSubAgents {
                 pending,
@@ -1377,12 +1387,14 @@ impl TryFrom<ConvState> for ParentState {
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
+                cause,
             } => Ok(ParentState::Core(CoreState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
+                cause,
             })),
             ConvState::AwaitingSubAgents {
                 pending,
@@ -1507,12 +1519,14 @@ impl TryFrom<ConvState> for SubAgentState {
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
+                cause,
             } => Ok(SubAgentState::Core(CoreState::CancellingTool {
                 tool_use_id,
                 skipped_tools,
                 completed_results,
                 assistant_message,
                 pending_sub_agents,
+                cause,
             })),
             ConvState::AwaitingSubAgents {
                 pending,

@@ -164,6 +164,7 @@ fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
                     None,
                 ),
                 pending_sub_agents: vec![],
+                cause: CancelCause::UserRequested,
             }
         },
     )
@@ -948,6 +949,7 @@ proptest! {
             completed_results: vec![],
             assistant_message,
             pending_sub_agents: vec![],
+            cause: CancelCause::UserRequested,
         };
 
         let result = transition(
@@ -1003,6 +1005,7 @@ proptest! {
             completed_results: vec![],
             assistant_message,
             pending_sub_agents: vec![],
+            cause: CancelCause::UserRequested,
         };
 
         // Tool completes naturally before abort takes effect
@@ -2228,6 +2231,7 @@ proptest! {
             completed_results: vec![],
             assistant_message: AssistantMessage::new(uuid::Uuid::new_v4().to_string(), content_blocks, None, None),
             pending_sub_agents: vec![],
+            cause: CancelCause::UserRequested,
         };
         let outcome = EffectOutcome::Tool(ToolExecOutcome::Aborted {
             tool_use_id,
