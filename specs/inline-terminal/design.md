@@ -143,13 +143,18 @@ as a parallel "is_user" boolean alongside an agent/user enum elsewhere. A single
 
 ### Why output is not a bare string
 
-`CommandRecord.output` is ANSI-stripped text today, which is correct for ordinary
-commands but degrades to a stream of control sequences for full-screen TUI
-programs (out of scope, REQ-IT-005 / Out of Scope). The tool-result content is
-therefore modeled as the existing typed `ToolResult` content, not a bare
-`String`, so a future screen-snapshot variant (a vt100 final-screen capture, as
-`read_terminal` already produces) can be added without migrating persisted
-rounds.
+`CommandRecord.output` is ANSI-stripped text, which is correct for line-oriented
+commands but degrades to a smear of paint traffic for cursor-addressing programs
+(out of scope; see `TuiCursorAddressedOutput`). The resolution differs by kind:
+an alternate-screen program (`vim`, `htop`) restores the main screen and
+discards its scratch buffer on exit, so its truthful output is *empty* — an edit
+is a filesystem side effect, observed as for an agent `bash` edit, not captured
+text; an in-place-rewriting program (progress bars) wants the vt100-parser-
+resolved screen text so `\r`-overwrites collapse to the final line. Both are a
+`specs/terminal` `CommandTracker` concern the inline terminal inherits, not an
+inline-terminal-specific fix. The tool-result content is therefore modeled as
+the existing typed `ToolResult`, not a bare `String`, so either resolution fits
+without migrating persisted rounds.
 
 ## Persistence
 

@@ -386,13 +386,26 @@ deferred BedrockInlineTerminalBusyState
     -- bedrock's enum; the variant and its idle-return transition are added in
     -- `specs/bedrock` (`Conversation.core_status`, `Conversation.is_busy`).
 
-deferred TuiOutputSnapshot
-    -- For full-screen programs (vim, htop) the OSC-133-captured output is a
-    -- stream of terminal control sequences, not meaningful text. A future
-    -- variant captures a vt100 final-screen snapshot (as the `read_terminal`
-    -- tool already produces) as the round's result. The InlineCommandRound
-    -- `result` is the typed tool-result for exactly this reason — the variant
-    -- fits without migrating persisted rounds. Behaviour not yet specified.
+deferred TuiCursorAddressedOutput
+    -- The OSC-133 output capture concatenates ANSI-stripped printable bytes
+    -- between C and D, which is correct for line-oriented commands but produces
+    -- a smear of paint traffic for cursor-addressing programs. Two sub-cases,
+    -- both ultimately a `specs/terminal` CommandTracker concern (the panel
+    -- terminal's read_terminal hits the same limitation) that the inline
+    -- terminal inherits rather than re-solves:
+    --   1. Alternate-screen programs (vim, htop, less, full-screen fzf) emit
+    --      ?1049h on entry and ?1049l on exit, restoring the main screen and
+    --      discarding their scratch buffer. Their truthful captured output is
+    --      EMPTY — the program cleaned up after itself; any file edit is a
+    --      filesystem side effect, observable as for an agent bash edit. The
+    --      tracker (a vte::Perform fed every byte) can detect the alt-screen
+    --      enter/leave and elide the output (or store an "[interactive
+    --      program]" marker).
+    --   2. In-place main-screen rewriting (progress bars/spinners using \r and
+    --      cursor moves) wants the vt100-parser-resolved screen text, not the
+    --      raw concatenation, so overwrites collapse to the final line state.
+    -- The InlineCommandRound `result` is the typed tool-result so either
+    -- resolution fits without migrating persisted rounds.
 
 deferred PanelTerminalSharing
     -- Reconciling the inline session with the per-WorkScope panel terminal
@@ -402,5 +415,6 @@ deferred PanelTerminalSharing
 deferred GeneralUserToolInvocation
     -- A general `$tool` / `T.tool` syntax for invoking other worker tools
     -- (patch, keyword_search, …) directly as the user. Shares the user-origin
-    -- attribution model (Origin, InlineRoundCommitted's provenance) but is a
-    -- separate surface, specified elsewhere.
+    -- attribution model (Origin, InlineRoundCommitted's provenance); the inline
+    -- terminal is its `bash` specialization. The umbrella requirements live in
+    -- `specs/user-tool-invocation`.

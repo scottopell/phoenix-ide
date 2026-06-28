@@ -35,8 +35,10 @@ conversation rather than an out-of-band side channel the agent never sees.
 - User origin as the single source of truth for round attribution
 
 **Excluded / deferred:**
-- Interactive/TUI output snapshotting (`vim`, `htop`) — the result type leaves
-  room for a screen-snapshot variant; the behaviour is not specified
+- Cursor-addressing program output (`vim`, `htop`, progress bars) — alt-screen
+  programs want an empty result, in-place rewriting wants vt100-resolved text; a
+  shared `specs/terminal` `CommandTracker` concern, and the result type leaves
+  room for either
 - Backgrounded command operations (the `bash` wait/kill/handle model)
 - Sharing one session with the per-WorkScope panel terminal
 - The general `$tool` / `T.tool` user-invocation syntax for other worker tools
@@ -53,7 +55,7 @@ conversation rather than an out-of-band side channel the agent never sees.
 | Conversation state while live | Busy (`inline_terminal`), never requests LLM | Mutual exclusion with agent tool rounds prevents two writers interleaving into history |
 | Session vs panel terminal | Separate, short-lived | Preserves `specs/terminal` "one panel terminal per WorkScope" |
 | Attribution | Single `origin` discriminator | LLM-history role and UI attribution are both derived; no parallel representations (mirrors `MessageContent::Skill`) |
-| Result content type | Typed `ToolResult` content, not bare `String` | Leaves room for a future TUI screen-snapshot variant without migration |
+| Result content type | Typed `ToolResult` content, not bare `String` | Leaves room for cursor-addressing-program resolution (empty for alt-screen, vt100-resolved for in-place rewriting) without migration |
 | Deny-gate | Not applied | User's own shell, ungated like the panel terminal; honesty comes from `origin: user` provenance |
 
 ## The Central Invariant

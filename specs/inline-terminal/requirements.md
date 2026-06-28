@@ -108,12 +108,14 @@ commands are never mistaken for commands the agent chose to run.
 These are deliberate non-goals; the design must leave room for them but does not
 deliver them.
 
-- **Interactive/TUI output capture.** For full-screen programs (`vim`, `htop`),
-  OSC 133 brackets a command whose captured output is a stream of terminal
-  control sequences rather than meaningful text. The result representation is
-  chosen so a screen-snapshot variant can be added later without a schema
-  change, but snapshotting is not implemented; the precise user expectation is
-  not yet settled.
+- **Cursor-addressing program output.** For full-screen programs (`vim`,
+  `htop`) and in-place-rewriting output (progress bars), the bytes OSC 133
+  brackets are screen-painting traffic, not line output, so ANSI-stripping them
+  yields a smear. The correct result for an alternate-screen program is empty
+  (it restores the main screen on exit); in-place rewriting wants vt100-resolved
+  screen text. This is a shared `specs/terminal` `CommandTracker` concern the
+  inline terminal inherits; the result type leaves room for either resolution
+  without a schema change. Not delivered here.
 - **Backgrounded command operations.** The `bash` tool's wait-handle model
   (`wait`, `kill`, polling partial output) has no inline analog (REQ-IT-004).
 - **Sharing identity with the panel terminal.** The inline session is a
@@ -121,4 +123,6 @@ deliver them.
   `specs/terminal`. Reconciling the two into one shared session is not in scope.
 - **The general user-tool-invocation syntax.** A general `$tool` / `T.tool`
   syntax for invoking other worker tools (`patch`, `keyword_search`, …) directly
-  as the user shares the user-origin attribution model but is not specified here.
+  as the user shares the user-origin attribution model; its umbrella
+  requirements live in `specs/user-tool-invocation`, of which the inline
+  terminal is the `bash` specialization.
