@@ -79,8 +79,9 @@ when the user kills a command or closes the session mid-run.
 ### REQ-IT-006 — Closing the session never triggers an agent turn
 
 Closing the inline terminal session — by ending the shell (`exit`, `Ctrl-D`) or
-leaving the terminal to return to the prose composer — returns the conversation
-to idle. No rule on the inline terminal path issues an LLM request. Driving the
+the deliberate return-to-composer gesture (a debounced backspace on an empty
+input line, distinguished from clearing input) — returns the conversation to
+idle. No rule on the inline terminal path issues an LLM request. Driving the
 conversation through the inline terminal advances it without any agent turn.
 
 ### REQ-IT-007 — User origin is the single source of truth for attribution

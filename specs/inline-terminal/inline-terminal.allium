@@ -128,6 +128,20 @@ entity InlineTerminalSession {
 }
 
 ------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    return_to_composer_idle_debounce: Duration = 600.ms
+    -- The terminal input line must sit empty and idle (no edits) for at least
+    -- this long before a backspace on it is read as the deliberate
+    -- return-to-composer gesture rather than the tail of a hold-to-delete burst
+    -- that just emptied the line (REQ-IT-006). A tuning parameter: the
+    -- disambiguation intent is the stable contract; the exact window is
+    -- calibrated against real typing.
+}
+
+------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
 
@@ -195,12 +209,20 @@ rule UserClosesInlineTerminal {
     ensures: session.status = closed
 
     @guidance
-        -- Triggered by ending the shell (exit, Ctrl-D) or an explicit
-        -- return-to-composer affordance. The conversation returns to idle
-        -- WITHOUT an LLM request (REQ-IT-006); see the NoAgentTurn guarantee
-        -- and Deferred: BedrockInlineTerminalBusyState for the core_status
-        -- return-to-idle coupling. The PTY is torn down (`specs/terminal`
-        -- teardown path).
+        -- Two trigger sources, both ending at session closed:
+        --   1. The shell process terminates (exit, Ctrl-D).
+        --   2. The return-to-composer gesture: a backspace on an empty terminal
+        --      input line that has been idle (no edits) for at least
+        --      return_to_composer_idle_debounce. The debounce disambiguates a
+        --      deliberate, isolated backspace-on-empty (exit) from the final
+        --      backspaces of a hold-to-delete burst that just emptied the line
+        --      (not exit) — a backspace within the debounce window after the
+        --      line empties is consumed by the terminal, not read as the exit
+        --      gesture.
+        -- The conversation returns to idle WITHOUT an LLM request (REQ-IT-006);
+        -- see the NoAgentTurn guarantee and Deferred:
+        -- BedrockInlineTerminalBusyState for the core_status return-to-idle
+        -- coupling. The PTY is torn down (`specs/terminal` teardown path).
 }
 
 -- ===========================================================

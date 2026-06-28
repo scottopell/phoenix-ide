@@ -26,10 +26,30 @@ distinction is structural: a prose message flows through bedrock's
 `UserSendsMessage` (which requests the LLM); opening the inline terminal does
 not.
 
-Leaving terminal mode — ending the shell (`exit`, `Ctrl-D`) or an explicit
-return-to-composer affordance — closes the session. There is no half-open state:
-returning to the prose composer is a guaranteed terminal flush point for any
-open command bracket (REQ-IT-005).
+Leaving terminal mode closes the session, from either of two sources: the shell
+process terminating (`exit`, `Ctrl-D`), or the return-to-composer gesture
+(below). There is no half-open state — returning to the prose composer is a
+guaranteed terminal flush point for any open command bracket (REQ-IT-005).
+
+### Return-to-composer gesture
+
+The deliberate way back to prose without ending the shell is **backspace on an
+empty terminal input line**. A naive "backspace on empty means exit" collides
+with the common "hold backspace to clear the whole line" motion: the keystrokes
+that empty the line — and the ones still arriving as the user releases the key —
+would fire the exit by accident. The gesture is therefore debounced. A
+backspace-on-empty returns to the composer only when the input line has been
+continuously empty and idle for `return_to_composer_idle_debounce`, making the
+exit an isolated, intentional press rather than the tail of a delete burst.
+Backspaces that land within the debounce window after the line empties are
+consumed by the terminal, not read as the gesture.
+
+Detecting "the input line is empty" depends on what the terminal layer can
+observe — the cursor position relative to the shell's command-start column, or
+the OSC 133 prompt/command-start markers (`specs/terminal`) — and the debounce
+window is a tuning parameter calibrated against real typing. The stable contract
+is the disambiguation intent: a deliberate, isolated backspace-on-empty returns
+to the composer; clearing input never does.
 
 ## Session lifecycle and conversation gating
 
