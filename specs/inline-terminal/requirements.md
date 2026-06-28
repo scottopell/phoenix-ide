@@ -122,7 +122,8 @@ deliver them.
   separate, short-lived terminal, not the per-WorkScope panel terminal of
   `specs/terminal`. Reconciling the two into one shared session is not in scope.
 - **The general user-tool-invocation syntax.** A general `$tool` / `T.tool`
-  syntax for invoking other worker tools (`patch`, `keyword_search`, …) directly
-  as the user shares the user-origin attribution model; its umbrella
-  requirements live in `specs/user-tool-invocation`, of which the inline
-  terminal is the `bash` specialization.
+  syntax for invoking other eligible tools (chiefly MCP / project integrations
+  with no shell equivalent) directly as the user shares the user-origin
+  attribution model; its umbrella requirements live in
+  `specs/user-tool-invocation`, of which the inline terminal is the `bash`
+  specialization.

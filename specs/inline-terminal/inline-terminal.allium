@@ -413,8 +413,9 @@ deferred PanelTerminalSharing
     -- here to preserve the one-panel-terminal-per-WorkScope invariant.
 
 deferred GeneralUserToolInvocation
-    -- A general `$tool` / `T.tool` syntax for invoking other worker tools
-    -- (patch, keyword_search, …) directly as the user. Shares the user-origin
-    -- attribution model (Origin, InlineRoundCommitted's provenance); the inline
-    -- terminal is its `bash` specialization. The umbrella requirements live in
+    -- A general `$tool` / `T.tool` syntax for invoking other eligible tools
+    -- (chiefly MCP / project integrations with no shell equivalent) directly as
+    -- the user. Shares the user-origin attribution model (Origin,
+    -- InlineRoundCommitted's provenance); the inline terminal is its `bash`
+    -- specialization. The umbrella requirements live in
     -- `specs/user-tool-invocation`.

@@ -41,7 +41,7 @@ conversation rather than an out-of-band side channel the agent never sees.
   room for either
 - Backgrounded command operations (the `bash` wait/kill/handle model)
 - Sharing one session with the per-WorkScope panel terminal
-- The general `$tool` / `T.tool` user-invocation syntax for other worker tools
+- The general `$tool` / `T.tool` user-invocation syntax for other eligible tools (`specs/user-tool-invocation`)
 
 ## Key Design Decisions
 
