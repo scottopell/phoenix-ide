@@ -83,17 +83,38 @@ pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     run_git_with_env(cwd, args, &[])
 }
 
+/// Inject the config every Phoenix git invocation needs so output does not
+/// depend on the user's `~/.gitconfig`. Uses the
+/// `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` mechanism so it
+/// composes with caller `extra_env` (e.g. `GIT_INDEX_FILE`) without clobbering.
+///
+/// - `commit.gpgsign=false`: read-only captures must never block on a signing key.
+/// - `diff.noprefix=false` + `diff.mnemonicPrefix=false` + `diff.srcPrefix=a/`
+///   + `diff.dstPrefix=b/`: force standard `a/`+`b/` path prefixes. A user with
+///   `diff.mnemonicPrefix=true` otherwise gets `c/`+`w/` on `git diff HEAD`,
+///   which the UI diff parser rejects (it only recognises `a/`+`b/`).
+fn apply_git_base_config(cmd: &mut std::process::Command) {
+    cmd.env("GIT_CONFIG_COUNT", "5")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "diff.noprefix")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .env("GIT_CONFIG_KEY_2", "diff.mnemonicPrefix")
+        .env("GIT_CONFIG_VALUE_2", "false")
+        .env("GIT_CONFIG_KEY_3", "diff.srcPrefix")
+        .env("GIT_CONFIG_VALUE_3", "a/")
+        .env("GIT_CONFIG_KEY_4", "diff.dstPrefix")
+        .env("GIT_CONFIG_VALUE_4", "b/");
+}
+
 /// Like [`run_git`], but returns raw stdout bytes — no trimming, no UTF-8
 /// lossy conversion. Required when the output is file content (e.g.
 /// `git cat-file -p <ref>:<path>`) where trailing whitespace is significant
 /// and binary detection needs the exact bytes.
 pub(crate) fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let mut cmd = std::process::Command::new("git");
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false");
+    cmd.args(args).current_dir(cwd);
+    apply_git_base_config(&mut cmd);
     let output = cmd
         .output()
         .map_err(|e| format!("Failed to run git {}: {e}", args.join(" ")))?;
@@ -115,11 +136,8 @@ pub(crate) fn run_git_with_env(
     extra_env: &[(&str, &str)],
 ) -> Result<String, String> {
     let mut cmd = std::process::Command::new("git");
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false");
+    cmd.args(args).current_dir(cwd);
+    apply_git_base_config(&mut cmd);
     for (k, v) in extra_env {
         cmd.env(*k, *v);
     }
@@ -161,11 +179,9 @@ pub(crate) fn run_git_capped(
     let mut cmd = Command::new("git");
     cmd.args(args)
         .current_dir(cwd)
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_git_base_config(&mut cmd);
     for (k, v) in extra_env {
         cmd.env(*k, *v);
     }
