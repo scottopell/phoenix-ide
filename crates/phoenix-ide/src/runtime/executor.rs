@@ -95,9 +95,25 @@ const KEEP_RECENT_ROUNDS: usize = 3;
 const CLEAR_TRIGGER_NUM: usize = 7;
 const CLEAR_TRIGGER_DEN: usize = 10;
 
-/// Minimum tokens a sweep must free or the watermark holds this turn, bounding
-/// how often a sweep disturbs the cached prefix (REQ-STR-006).
+/// Absolute floor for tokens a sweep must free or the watermark holds this turn
+/// (REQ-STR-006).
 const CLEAR_AT_LEAST_TOKENS: usize = 8192;
+
+/// Proportional floor for tokens a sweep must free, expressed as a fraction of
+/// the reported prompt size that acts as the planner's pressure signal.
+const CLEAR_GAIN_FRACTION_NUM: usize = 1;
+const CLEAR_GAIN_FRACTION_DEN: usize = 20;
+
+fn proportional_gain_tokens(reported_prompt_tokens: i64) -> usize {
+    let prompt = usize::try_from(reported_prompt_tokens).unwrap_or(usize::MAX);
+    prompt
+        .saturating_mul(CLEAR_GAIN_FRACTION_NUM)
+        .div_ceil(CLEAR_GAIN_FRACTION_DEN)
+}
+
+fn required_clear_gain_tokens(reported_prompt_tokens: i64) -> usize {
+    CLEAR_AT_LEAST_TOKENS.max(proportional_gain_tokens(reported_prompt_tokens))
+}
 
 /// Placeholder body sent in place of a cleared tool result. The paired
 /// `tool_use` block is preserved, so this is never a silent gap (REQ-STR-004).
@@ -463,9 +479,9 @@ fn collect_tool_result_facts(
 ///
 /// `reported_prompt_tokens` is the previous turn's actual prompt size — the
 /// pressure signal; `None` (no prior turn) is treated as not under pressure.
-/// When it exceeds the trigger and at least `CLEAR_AT_LEAST_TOKENS` are freeable
-/// outside the recency floor, the sweep clears *everything* outside the floor in
-/// one move.
+/// When it exceeds the trigger and the freeable tokens outside the recency floor
+/// meet the absolute/proportional worthwhile-gain gate, the sweep clears
+/// *everything* outside the floor in one move.
 fn plan_tool_result_clearing(
     db_messages: &[crate::db::Message],
     clearable_tool_names: &std::collections::HashSet<String>,
@@ -488,10 +504,10 @@ fn plan_tool_result_clearing(
 
     let trigger = context_window * CLEAR_TRIGGER_NUM / CLEAR_TRIGGER_DEN;
     let trigger = i64::try_from(trigger).unwrap_or(i64::MAX);
-    let over_pressure = reported_prompt_tokens.is_some_and(|tokens| tokens > trigger);
+    let pressure_tokens = reported_prompt_tokens.filter(|tokens| *tokens > trigger);
 
     let mut new_watermark = prior_watermark;
-    if over_pressure && eligible_freed >= CLEAR_AT_LEAST_TOKENS {
+    if pressure_tokens.is_some_and(|tokens| eligible_freed >= required_clear_gain_tokens(tokens)) {
         // Maximal sweep (REQ-STR-007): advance the watermark to the newest
         // result below the floor, clearing the whole pre-floor prefix at once.
         if let Some(floor_boundary) = results
@@ -9451,6 +9467,103 @@ mod stale_tool_result_clearing_tests {
         }
         assert!(plan.freed_tokens >= CLEAR_AT_LEAST_TOKENS);
         assert_eq!(plan.cleared_count, 1);
+    }
+
+    /// A candidate sweep above the absolute 8192-token floor still holds when it
+    /// is too small relative to the prompt whose cached prefix it would disturb.
+    #[tokio::test]
+    async fn holds_when_gain_is_above_absolute_floor_but_below_proportional_gate() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-proportional-hold";
+        add_round(&storage, conv, "old", "read_file", 6).await; // 9000 tokens
+        add_round(&storage, conv, "r1", "read_file", 1).await;
+        add_round(&storage, conv, "r2", "read_file", 1).await;
+        add_round(&storage, conv, "r3", "read_file", 1).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        let prompt_tokens = 190_000;
+        assert!(9_000 < required_clear_gain_tokens(prompt_tokens));
+        let plan = plan_tool_result_clearing(
+            &db,
+            &clearable(&["read_file"]),
+            0,
+            Some(prompt_tokens),
+            200_000,
+        );
+
+        assert_eq!(plan.new_watermark, 0);
+        assert!(plan.cleared_sequence_ids.is_empty());
+        assert_eq!(plan.freed_tokens, 0);
+        assert_eq!(plan.cleared_count, 0);
+    }
+
+    /// A patch-heavy tail that offers only one newly-aged 9k-token clearable
+    /// result at a ~200k-token prompt no longer ratchets the watermark forward on
+    /// that low-yield sweep.
+    #[tokio::test]
+    async fn patch_heavy_tail_holds_on_repeated_low_yield_candidates() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-ratchet-hold";
+        let names = clearable(&["read_file"]);
+
+        for i in 0..5 {
+            add_round(&storage, conv, &format!("old{i}"), "read_file", 6).await;
+        }
+        add_round(&storage, conv, "patch0", "patch", 1).await;
+        add_round(&storage, conv, "patch1", "patch", 1).await;
+        add_round(&storage, conv, "patch2", "patch", 1).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        let first = plan_tool_result_clearing(&db, &names, 0, Some(200_000), 272_000);
+        assert!(
+            first.new_watermark > 0,
+            "large initial sweep still advances"
+        );
+        assert_eq!(first.cleared_count, 5);
+
+        let mut prior_watermark = first.new_watermark;
+        for turn in 0..2 {
+            add_round(
+                &storage,
+                conv,
+                &format!("tail-clearable-{turn}"),
+                "read_file",
+                6,
+            )
+            .await;
+            add_round(&storage, conv, &format!("tail-patch-{turn}"), "patch", 1).await;
+            add_round(
+                &storage,
+                conv,
+                &format!("tail-patch-extra-{turn}"),
+                "patch",
+                1,
+            )
+            .await;
+            add_round(
+                &storage,
+                conv,
+                &format!("tail-patch-extra-2-{turn}"),
+                "patch",
+                1,
+            )
+            .await;
+
+            let db = storage.get_messages(conv).await.unwrap();
+            let plan = plan_tool_result_clearing(
+                &db,
+                &names,
+                prior_watermark,
+                Some(400_000 + i64::from(turn) * 1_000),
+                500_000,
+            );
+            assert_eq!(
+                plan.new_watermark, prior_watermark,
+                "low-yield tail candidate must not advance on turn {turn}",
+            );
+            assert_eq!(plan.freed_tokens, 0);
+            prior_watermark = plan.new_watermark;
+        }
     }
 
     /// Below the high-water mark nothing is cleared, however old the rounds.

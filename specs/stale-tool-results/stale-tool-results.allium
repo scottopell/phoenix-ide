@@ -15,7 +15,7 @@
 --        cleared request prefix stable across turns for cache reuse.
 --
 -- Includes: The clear watermark and its monotonic, pressure-gated,
---           worthwhile-gain-gated advancement; the recency floor the
+--           absolute/proportional worthwhile-gain-gated advancement; the recency floor the
 --           watermark may not cross; the per-result verdict derived from
 --           watermark and tool clearability; the unified text+image
 --           treatment; and the invariants that make clearing recoverable,
@@ -167,6 +167,7 @@ entity HistoryAssembly {
     prior_watermark: Integer
     new_watermark: Integer
     eligible_freed_tokens: Integer
+    required_gain_tokens: Integer
     freed_tokens: Integer
     cleared_count: Integer
     renderings: List<ToolResultRendering>
@@ -189,6 +190,13 @@ config {
     -- sized so the one-time cache-write cost is recovered by the ongoing
     -- savings. Deployment-tunable (REQ-STR-010).
     clear_at_least_tokens: Integer = 8192
+
+    -- Proportional minimum gain as a fraction of reported_prompt_tokens.
+    -- Together with clear_at_least_tokens this rejects low-yield sweeps that
+    -- would rewrite a large cached prefix for only a small saving. The default
+    -- is 1/20 (5%). Deployment-tunable (REQ-STR-010).
+    clear_gain_fraction_numerator: Integer = 1
+    clear_gain_fraction_denominator: Integer = 20
 }
 
 ------------------------------------------------------------
@@ -232,6 +240,12 @@ actor HistoryAssembler {
 -- The candidate (eligible) sweep is the same helpers evaluated to the
 -- floor: eligible_freed_tokens = clearable_tokens_between(
 --     a, a.prior_watermark, a.floor_sequence_id).
+--
+-- required_gain_tokens = max(clear_at_least_tokens,
+--     ceil(a.reported_prompt_tokens * clear_gain_fraction_numerator /
+--     clear_gain_fraction_denominator)). It uses the same reported prompt size
+--     as the pressure gate so the proportional floor tracks provider-observed
+--     prompt/reprocessing size.
 
 ------------------------------------------------------------
 -- Rules — watermark advancement
@@ -253,15 +267,15 @@ rule WatermarkHeldBelowPressure {
 
 -- Over the high-water mark, but even sweeping every clearable result up to
 -- the recency floor (the candidate eligible_freed_tokens) would free less
--- than clear_at_least: the watermark holds rather than pay a cache
--- invalidation too small to be worth it (REQ-STR-006). It waits for more
+-- than the required absolute/proportional gain: the watermark holds rather than
+-- pay a cache invalidation too small to be worth it (REQ-STR-006). It waits for more
 -- clearable output to accumulate. The gate is on the candidate, not on
 -- freed_tokens — no sweep is taken, so freed_tokens is zero.
 rule WatermarkHeldInsufficientGain {
     when: HistoryAssembled(assembly)
 
     requires: assembly.reported_prompt_tokens > assembly.clear_trigger_tokens
-    requires: assembly.eligible_freed_tokens < clear_at_least_tokens
+    requires: assembly.eligible_freed_tokens < assembly.required_gain_tokens
 
     ensures: assembly.new_watermark = assembly.prior_watermark
     ensures: assembly.freed_tokens = 0
@@ -279,10 +293,10 @@ rule WatermarkAdvancedUnderPressure {
     when: HistoryAssembled(assembly)
 
     requires: assembly.reported_prompt_tokens > assembly.clear_trigger_tokens
-    requires: assembly.eligible_freed_tokens >= clear_at_least_tokens
+    requires: assembly.eligible_freed_tokens >= assembly.required_gain_tokens
 
     ensures: assembly.new_watermark = assembly.floor_sequence_id
-    ensures: assembly.freed_tokens >= clear_at_least_tokens
+    ensures: assembly.freed_tokens >= assembly.required_gain_tokens
     ensures: assembly.cleared_count > 0
 
     @guidance
@@ -293,8 +307,8 @@ rule WatermarkAdvancedUnderPressure {
         -- tool_use/tool_result pairing is never split. freed_tokens =
         -- sum_token_estimate_newly_cleared(assembly) and cleared_count =
         -- count_newly_cleared(assembly). The eligible candidate covers exactly
-        -- this range and already clears >= clear_at_least, so freed_tokens >=
-        -- clear_at_least. The watermark is persisted back to the conversation
+        -- this range and already clears >= required_gain_tokens, so
+        -- freed_tokens >= required_gain_tokens. The watermark is persisted back to the conversation
         -- row; next turn reads it as prior_watermark.
 }
 

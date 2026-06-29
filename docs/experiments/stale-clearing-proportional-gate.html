@@ -1,0 +1,178 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Stale clearing proportional gate — Codex context drawdown model</title>
+<style>
+  :root { color-scheme: light; --ok:#047857; --bad:#b91c1c; --warn:#b45309; --ink:#172033; --muted:#64748b; --line:#d8dee9; --blue:#2563eb; }
+  body { font: 15px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; margin: 28px; color: var(--ink); background: #fff; }
+  h1 { margin: 0 0 4px; font-size: 28px; }
+  h2 { margin: 0 0 10px; font-size: 18px; }
+  h3 { margin: 14px 0 8px; font-size: 15px; }
+  p { max-width: 1050px; }
+  code { background:#f1f5f9; padding:1px 4px; border-radius:4px; }
+  .muted { color: var(--muted); }
+  .controls, .card { border: 1px solid var(--line); border-radius: 12px; padding: 14px; background: #fff; box-shadow: 0 1px 2px #0000000a; }
+  .controls { display:flex; flex-wrap:wrap; gap: 18px; align-items: end; margin: 18px 0; }
+  label { display:grid; gap: 4px; font-weight: 600; }
+  select, input { font: inherit; padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 7px; }
+  input { width: 8em; }
+  details { flex-basis: 100%; }
+  details .advanced { display:flex; flex-wrap:wrap; gap: 14px; margin-top: 10px; }
+  .compare { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card.old { border-top: 5px solid #ef4444; }
+  .card.new { border-top: 5px solid #059669; }
+  .callout { font-size: 17px; padding: 12px; border-radius: 10px; background:#f8fafc; border:1px solid #e2e8f0; margin-bottom: 12px; }
+  .ok { color: var(--ok); font-weight: 700; }
+  .bad { color: var(--bad); font-weight: 700; }
+  .warn { color: var(--warn); font-weight: 700; }
+  .metric { display:flex; justify-content:space-between; gap:12px; padding:7px 0; border-bottom:1px solid #eef2f7; }
+  .metric:last-child { border-bottom: 0; }
+  .metric b { font-variant-numeric: tabular-nums; }
+  svg { width: 100%; height: 185px; border: 1px solid #eef2f7; border-radius: 8px; background: #fbfdff; }
+  table { width:100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { border-bottom: 1px solid #e5e7eb; padding: 5px 6px; text-align: right; }
+  th:first-child, td:first-child, .left { text-align:left; }
+  .bar { height: 13px; border-radius:999px; background:#e2e8f0; overflow:hidden; margin: 4px 0 10px; }
+  .bar span { display:block; height:100%; }
+  .bar .draw { background:#dc2626; }
+  .bar .save { background:#059669; }
+  .legend { display:flex; gap: 14px; flex-wrap:wrap; font-size: 12.5px; color: var(--muted); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:999px; margin-right:4px; }
+  @media (max-width: 950px) { .compare { grid-template-columns: 1fr; } }
+</style>
+
+<h1>Stale clearing: old gate vs proportional gate</h1>
+<p class="muted">Left vs right model of how each policy draws down an illustrative Codex 5-hour context budget. Phoenix does not currently track quota at this depth; this artifact treats each accepted sweep as a cache-busting prompt re-encode and visualizes the relative burn.</p>
+
+<div class="controls">
+  <label>Scenario
+    <select id="preset"></select>
+  </label>
+  <label>Gain fraction
+    <input id="gainFraction" type="number" step="0.005">
+  </label>
+  <label>Illustrative 5h context budget
+    <input id="quotaBudget" type="number">
+  </label>
+  <details>
+    <summary class="muted">Advanced model inputs</summary>
+    <div class="advanced">
+      <label>Context window <input id="contextWindow" type="number"></label>
+      <label>Trigger fraction <input id="triggerFraction" type="number" step="0.01"></label>
+      <label>Keep recent rounds <input id="keepRecent" type="number"></label>
+      <label>Absolute min gain <input id="absoluteMin" type="number"></label>
+      <label>Turns <input id="turns" type="number"></label>
+      <label>Clearable / turn <input id="clearableRate" type="number"></label>
+      <label>Unclearable / turn <input id="unclearableRate" type="number"></label>
+      <label>Initial prompt <input id="initialPrompt" type="number"></label>
+    </div>
+  </details>
+</div>
+
+<div class="compare">
+  <section class="card old">
+    <h2>Left: old absolute gate</h2>
+    <div id="storyAbs" class="callout"></div>
+    <svg id="chartAbs"></svg>
+    <h3>Illustrative Codex 5h drawdown</h3>
+    <div id="drawAbs"></div>
+    <h3>Recent sweep candidates</h3>
+    <table id="eventsAbs"></table>
+  </section>
+
+  <section class="card new">
+    <h2>Right: new proportional gate</h2>
+    <div id="storyProp" class="callout"></div>
+    <svg id="chartProp"></svg>
+    <h3>Illustrative Codex 5h drawdown</h3>
+    <div id="drawProp"></div>
+    <h3>Recent sweep candidates</h3>
+    <table id="eventsProp"></table>
+  </section>
+</div>
+
+<p class="muted">Cost model: <b>context drawdown</b> is the sum of prompt tokens disturbed by accepted sweeps. <b>Tokens saved</b> is the candidate tool-result content removed from future prompts. This intentionally exaggerates neither provider internals nor exact billing; it is a planner intuition model for comparing churn.</p>
+
+<script>
+const presets = {
+  "Patch-heavy ratchet": { contextWindow: 272000, triggerFraction: 0.70, keepRecent: 3, absoluteMin: 8192, gainFraction: 0.05, quotaBudget: 10000000, turns: 260, clearableRate: 1450, unclearableRate: 850, initialPrompt: 45000 },
+  "Short clean win": { contextWindow: 120000, triggerFraction: 0.70, keepRecent: 3, absoluteMin: 8192, gainFraction: 0.05, quotaBudget: 10000000, turns: 90, clearableRate: 2200, unclearableRate: 150, initialPrompt: 25000 },
+  "Read/search-heavy": { contextWindow: 200000, triggerFraction: 0.70, keepRecent: 3, absoluteMin: 8192, gainFraction: 0.05, quotaBudget: 10000000, turns: 180, clearableRate: 2600, unclearableRate: 150, initialPrompt: 30000 },
+  "Mixed long coding": { contextWindow: 200000, triggerFraction: 0.70, keepRecent: 3, absoluteMin: 8192, gainFraction: 0.05, quotaBudget: 10000000, turns: 220, clearableRate: 1300, unclearableRate: 650, initialPrompt: 35000 },
+  "Prod tail approximation": { contextWindow: 272000, triggerFraction: 0.70, keepRecent: 3, absoluteMin: 8192, gainFraction: 0.05, quotaBudget: 10000000, turns: 180, clearableRate: 1180, unclearableRate: 980, initialPrompt: 54000 }
+};
+const ids = ["contextWindow","triggerFraction","keepRecent","absoluteMin","gainFraction","quotaBudget","turns","clearableRate","unclearableRate","initialPrompt"];
+const $ = id => document.getElementById(id);
+for (const name of Object.keys(presets)) preset.add(new Option(name, name));
+preset.onchange = () => { for (const [k,v] of Object.entries(presets[preset.value])) $(k).value = v; run(); };
+ids.forEach(id => $(id).oninput = run);
+preset.value = "Patch-heavy ratchet"; preset.onchange();
+
+function cfg(){ const o={}; ids.forEach(id => o[id]=Number($(id).value)); return o; }
+function fmt(n){ return Math.round(n).toLocaleString(); }
+function pct(n){ return `${(100*n).toFixed(n < 0.1 ? 1 : 0)}%`; }
+function simulate(policyName){
+  const c = cfg(), trigger = c.contextWindow * c.triggerFraction;
+  const rounds=[]; let watermark=-1, prompt=c.initialPrompt;
+  const points=[], events=[]; let disturbedTotal=0, savedTotal=0;
+  for(let turn=0; turn<c.turns; turn++){
+    rounds.push({clearable:c.clearableRate, unclearable:c.unclearableRate});
+    prompt += c.clearableRate + c.unclearableRate;
+    const floor = Math.max(-1, rounds.length - c.keepRecent - 1);
+    let eligible=0; for(let i=watermark+1; i<=floor; i++) eligible += rounds[i]?.clearable || 0;
+    const required = policyName === "absolute" ? c.absoluteMin : Math.max(c.absoluteMin, Math.ceil(prompt * c.gainFraction));
+    const over = prompt > trigger;
+    if(over && eligible > 0){
+      const decision = eligible >= required && floor > watermark ? "sweep" : "hold";
+      const pre = prompt;
+      if(decision === "sweep"){
+        disturbedTotal += pre;
+        savedTotal += eligible;
+        prompt -= eligible;
+        watermark = floor;
+      }
+      events.push({turn, pre, post:prompt, eligible, required, decision, ratio: pre / Math.max(1, eligible), disturbedTotal, savedTotal});
+    }
+    points.push(prompt);
+  }
+  return {points, events, trigger, disturbedTotal, savedTotal, sweeps: events.filter(e => e.decision === 'sweep').length, holds: events.filter(e => e.decision === 'hold').length};
+}
+function draw(svg, r){
+  const w=560,h=185,max=Math.max(...r.points,r.trigger)*1.05, y=v=>h-(v/max)*(h-22)-10, x=i=>10+i*(w-20)/Math.max(1,r.points.length-1);
+  svg.setAttribute("viewBox",`0 0 ${w} ${h}`); svg.innerHTML="";
+  svg.insertAdjacentHTML("beforeend",`<line x1="10" x2="${w-10}" y1="${y(r.trigger)}" y2="${y(r.trigger)}" stroke="#ef4444" stroke-dasharray="4 3"/><text x="14" y="${y(r.trigger)-4}" font-size="11" fill="#ef4444">pressure trigger</text>`);
+  svg.insertAdjacentHTML("beforeend",`<path d="${r.points.map((p,i)=>`${i?'L':'M'}${x(i).toFixed(1)},${y(p).toFixed(1)}`).join(' ')}" fill="none" stroke="#2563eb" stroke-width="2"/>`);
+  r.events.filter(e=>e.decision==='sweep').forEach(e=>svg.insertAdjacentHTML("beforeend",`<circle cx="${x(e.turn)}" cy="${y(e.post)}" r="3" fill="#059669"/>`));
+  r.events.filter(e=>e.decision==='hold').slice(-35).forEach(e=>svg.insertAdjacentHTML("beforeend",`<circle cx="${x(e.turn)}" cy="${y(e.pre)}" r="2" fill="#b45309" opacity=".45"/>`));
+}
+function story(el, r, policyName){
+  const last = r.events[r.events.length - 1];
+  const headline = policyName === 'absolute'
+    ? `Accepts sweeps once they clear ${fmt(cfg().absoluteMin)} tokens, even if the prompt is huge.`
+    : `Requires each sweep to clear at least ${fmt(cfg().absoluteMin)} tokens and ${pct(cfg().gainFraction)} of the prompt.`;
+  el.innerHTML = `${headline}<br>Sweeps: <b>${r.sweeps}</b>. Held candidates: <b>${r.holds}</b>.${last ? ` Latest candidate would save <b>${fmt(last.eligible)}</b> tokens while disturbing <b>${fmt(last.pre)}</b>.` : ''}`;
+}
+function drawdown(el, r){
+  const c = cfg();
+  const drawPct = Math.min(1, r.disturbedTotal / Math.max(1, c.quotaBudget));
+  const savePct = Math.min(1, r.savedTotal / Math.max(1, c.quotaBudget));
+  const net = r.savedTotal - r.disturbedTotal;
+  el.innerHTML = `
+    <div class="metric"><span>Context drawdown from accepted sweeps</span><b class="bad">${fmt(r.disturbedTotal)} (${pct(drawPct)})</b></div>
+    <div class="bar"><span class="draw" style="width:${100*drawPct}%"></span></div>
+    <div class="metric"><span>Tool-result tokens removed</span><b class="ok">${fmt(r.savedTotal)} (${pct(savePct)})</b></div>
+    <div class="bar"><span class="save" style="width:${100*savePct}%"></span></div>
+    <div class="metric"><span>Illustrative net vs sweep re-encode</span><b class="${net >= 0 ? 'ok' : 'bad'}">${fmt(net)}</b></div>
+    <div class="legend"><span><span class="dot" style="background:#dc2626"></span>cache-bust prompt re-encode</span><span><span class="dot" style="background:#059669"></span>tokens removed from future prompts</span></div>`;
+}
+function eventTable(el, r){
+  el.innerHTML = `<tr><th>turn</th><th>prompt disturbed</th><th>saved</th><th>required</th><th>disturbed/saved</th><th class="left">decision</th></tr>` +
+    r.events.slice(-10).map(e=>`<tr><td>${e.turn}</td><td>${fmt(e.pre)}</td><td>${fmt(e.eligible)}</td><td>${fmt(e.required)}</td><td>${e.ratio.toFixed(1)}×</td><td class="left ${e.decision==='sweep'?'ok':'warn'}">${e.decision}</td></tr>`).join('');
+}
+function run(){
+  const abs=simulate('absolute'), prop=simulate('proportional');
+  draw(chartAbs, abs); draw(chartProp, prop);
+  story(storyAbs, abs, 'absolute'); story(storyProp, prop, 'proportional');
+  drawdown(drawAbs, abs); drawdown(drawProp, prop);
+  eventTable(eventsAbs, abs); eventTable(eventsProp, prop);
+}
+</script>

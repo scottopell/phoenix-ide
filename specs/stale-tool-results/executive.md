@@ -65,26 +65,31 @@ on the main LLM request path via `assemble_cleared_messages` (called from
 `dispatch_llm_request`), which reads the watermark and the last turn's reported
 prompt size, plans a sweep, persists any advance, and logs the cleared count and
 freed tokens. A sweep is maximal — it clears the whole prefix outside the recency
-floor at once. `Tool::clearable()` sources the recoverable set, surfaced via
-`ToolRegistry::clearable_tool_names()` (cached per conversation, refreshed on the
-Explore→Work upgrade).
+floor at once, but only when the candidate frees at least the greater of the
+absolute floor and a fraction of the reported prompt size. `Tool::clearable()`
+sources the recoverable set, surfaced via `ToolRegistry::clearable_tool_names()`
+(cached per conversation, refreshed on the Explore→Work upgrade).
 
-REQ-STR-010 is partially met (🔄): the three retention parameters exist as named
-constants (`KEEP_RECENT_ROUNDS`, `CLEAR_TRIGGER_*`, `CLEAR_AT_LEAST_TOKENS`),
-tunable by editing, but there is not yet a runtime or per-deployment configuration
-surface that overrides them. The remaining work is to thread these from deployment
-config.
+REQ-STR-010 is partially met (🔄): the retention parameters exist as named
+constants (`KEEP_RECENT_ROUNDS`, `CLEAR_TRIGGER_*`, `CLEAR_AT_LEAST_TOKENS`,
+`CLEAR_GAIN_FRACTION_*`), tunable by editing, but there is not yet a runtime or
+per-deployment configuration surface that overrides them. The remaining work is
+to thread these from deployment config.
 
 ## Default Parameters
 
-The retention parameters are deployment-tunable per REQ-STR-010. Two have
+The retention parameters are deployment-tunable per REQ-STR-010. Three have
 provisional starting values carried as config defaults in `stale-tool-results.allium`
-— `keep_recent_rounds = 3` and `clear_at_least_tokens = 8192` — chosen as
-reasonable starting points (the floor keeps at least the two rounds of visual
-context the prior image window preserved, plus one). They are the implementation's
-initial values, to be tuned against benchmarks, not frozen constants; this note
-is the single place that records their status, so the config defaults and this
-document do not disagree.
+— `keep_recent_rounds = 3`, `clear_at_least_tokens = 8192`, and
+`clear_gain_fraction = 1/20` — chosen as reasonable starting points. The recency
+floor keeps at least the two rounds of visual context the prior image window
+preserved, plus one. The 5% proportional gate rejects the observed tail case of
+freeing about 8–9k tokens on a ~190k prompt while preserving clean large sweeps
+and clearable-heavy sessions in the modeling artifact
+`docs/experiments/stale-clearing-proportional-gate.html`. They are the
+implementation's initial values, to be tuned against benchmarks, not frozen
+constants; this note is the single place that records their status, so the config
+defaults and this document do not disagree.
 
 One further parameter is derived per request rather than fixed config, so it
 carries no Allium default: `clear_trigger` (the high-water mark, a fraction of the

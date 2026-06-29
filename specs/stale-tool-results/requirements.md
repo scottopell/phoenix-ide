@@ -99,7 +99,8 @@ model to reprocess the surrounding context at full price. A removal that frees
 only a handful of tokens costs more than it saves.
 
 WHEN removing tool results, THE SYSTEM SHALL remove enough at once that the
-tokens freed exceed a minimum threshold; otherwise THE SYSTEM SHALL remove
+tokens freed exceed both an absolute minimum threshold and a minimum fraction of
+the prompt whose cached prefix is disturbed; otherwise THE SYSTEM SHALL remove
 nothing on that turn.
 
 ### REQ-STR-007 — Keep Reuse Savings Stable Across Turns

@@ -84,18 +84,19 @@ when all of these hold:
    below).
 
 3. **A worthwhile sweep (REQ-STR-006).** Advancing the watermark to the candidate
-   position must clear clearable results worth at least `clear_at_least` tokens.
-   If the rounds newly swept would free less, the watermark holds this turn and
-   waits for more clearable output to accumulate. This bounds how often a sweep
-   disturbs the cached prefix.
+   position must clear clearable results worth at least the greater of the
+   absolute `clear_at_least` floor and `reported_prompt_tokens ×
+   clear_gain_fraction`. If the rounds newly swept would free less, the
+   watermark holds this turn and waits for more clearable output to accumulate.
+   This bounds how often a sweep disturbs the cached prefix, and prevents a thin
+   late sweep from invalidating a large prompt for only a small gain.
 
 When it advances, the watermark moves forward — over whole rounds, never
-splitting a round's tool-use/result pairing — far enough that estimated usage
-drops under a target below the trigger (so the next sweep is many turns away), or
-to the recency floor if the target cannot be reached without crossing it. Within
-a conversation, input usage only grows, so after a sweep usage climbs back toward
-`clear_trigger` over subsequent turns and the next sweep fires once; the result is
-roughly one cache-invalidating sweep per refill interval, not one per turn.
+splitting a round's tool-use/result pairing — to the recency-floor boundary. The
+maximal move creates the longest stable interval available without clearing the
+agent's working set. Within a conversation, input usage then climbs back toward
+`clear_trigger` over subsequent turns; the proportional worthwhile-gain gate
+prevents that climb from devolving into repeated thin cache-invalidating sweeps.
 
 ## Recoverability is a tool capability (REQ-STR-002)
 
@@ -267,15 +268,25 @@ clearing could not remove in any case.
 Whether a sweep is *worthwhile* is a separate question, answered with the
 **image-aware** per-result estimator `estimate_tool_result_tokens` (text
 character count plus a fixed cost per image block). The tokens freeable by
-clearing every eligible result must reach `clear_at_least`, or the watermark
-holds — so a screenshot-heavy round registers its true weight and a sweep that
-would save little never disturbs the cache. A text-only estimate must not be used
-here: a stale screenshot round would contribute almost nothing and starve
-clearing in exactly the image-heavy sessions it exists for. This per-result
-estimate also produces the freed-token / cleared-count figures logged for an
-advance (REQ-STR-008). It is approximate by design — the consequence of a
-slightly-off estimate is sweeping one round early or late, never a dropped result
-or a 400.
+clearing every eligible result must reach `max(clear_at_least,
+reported_prompt_tokens × clear_gain_fraction)`, or the watermark holds — so a
+screenshot-heavy round registers its true weight and a sweep that would save
+little relative to the prompt it rewrites never disturbs the cache. The same
+reported prompt size used for pressure is used for the proportional side of this
+gate, so the threshold tracks the provider-observed reprocessing cost rather
+than an incomplete local estimate.
+
+The proportional floor stops a patch-heavy or otherwise unclearable-heavy tail
+from ratcheting into repeated low-yield sweeps: once the clearable layer below
+the recency floor becomes thin, freeing a few thousand tokens is no longer enough
+to rewrite a prompt near the high-water mark. Clearable-heavy sessions still
+sweep because their candidate gain remains large relative to the prompt. A
+text-only estimate must not be used here: a stale screenshot round would
+contribute almost nothing and starve clearing in exactly the image-heavy sessions
+it exists for. This per-result estimate also produces the freed-token /
+cleared-count figures logged for an advance (REQ-STR-008). It is approximate by
+design — the consequence of a slightly-off estimate is sweeping one round early
+or late, never a dropped result or a 400.
 
 ## Retention ladder
 
@@ -310,7 +321,8 @@ context window and deployment configuration:
 |---|---|---|
 | `clear_trigger` | Reported-prompt-size high-water mark that triggers a sweep | A fraction of `context_window`, leaving headroom for the reply |
 | `keep_recent_rounds` | Recency floor the watermark may not cross | Enough rounds to cover the working set and the trailing breakpoint |
-| `clear_at_least` | Minimum tokens a sweep must free, or it holds | Large enough that a cache write is recovered by the savings |
+| `clear_at_least` | Absolute minimum tokens a sweep must free, or it holds | Large enough that a cache write is recovered by the savings |
+| `clear_gain_fraction` | Proportional minimum gain as a fraction of the reported prompt size | Large enough to reject thin high-prompt tail sweeps without suppressing large clearable sweeps |
 
 A sweep always clears the entire prefix outside the recency floor, so there is no
 separate "target" parameter — `keep_recent_rounds` alone bounds how much is
