@@ -613,8 +613,9 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
                 let wire_content = if images.is_empty() {
                     AnthropicToolResultContent::Text(content.clone())
                 } else {
-                    let mut parts =
-                        vec![AnthropicToolResultPart::Text { text: content.clone() }];
+                    let mut parts = vec![AnthropicToolResultPart::Text {
+                        text: content.clone(),
+                    }];
                     for img in images {
                         let ImageSource::Base64 { media_type, data } = img;
                         parts.push(AnthropicToolResultPart::Image {
@@ -1589,7 +1590,9 @@ mod tests {
     #[test]
     fn parity_tool_result_with_image() {
         let typed = AnthropicToolResultContent::Parts(vec![
-            AnthropicToolResultPart::Text { text: "see attached".to_string() },
+            AnthropicToolResultPart::Text {
+                text: "see attached".to_string(),
+            },
             AnthropicToolResultPart::Image {
                 source: AnthropicImageSource {
                     r#type: "base64".to_string(),

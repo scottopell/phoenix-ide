@@ -2825,9 +2825,7 @@ pub fn transition_parent(
 
 /// Maps a `CancelCause` to the sub-agent terminal state and parent notification
 /// outcome. `Timeout` → `TimedOut`; `UserRequested` → `Failure { Cancelled }`.
-fn sub_agent_cancel_outcome(
-    cause: CancelCause,
-) -> (SubAgentState, SubAgentOutcome) {
+fn sub_agent_cancel_outcome(cause: CancelCause) -> (SubAgentState, SubAgentOutcome) {
     match cause {
         CancelCause::Timeout => (
             SubAgentState::Failed {
@@ -2963,9 +2961,7 @@ pub fn transition_sub_agent(
         // outcome for a different tool_use does not settle the wrong round.
         (
             SubAgentState::Core(CoreState::CancellingTool {
-                tool_use_id,
-                cause,
-                ..
+                tool_use_id, cause, ..
             }),
             SubAgentEvent::Core(
                 CoreEvent::ToolAborted {
@@ -3002,10 +2998,7 @@ pub fn transition_sub_agent(
         // ============================================================
         // Sub-agent UserCancel -> Failed (from any other non-terminal core state)
         // ============================================================
-        (
-            SubAgentState::Core(_),
-            SubAgentEvent::Core(CoreEvent::UserCancel { cause, .. }),
-        ) => {
+        (SubAgentState::Core(_), SubAgentEvent::Core(CoreEvent::UserCancel { cause, .. })) => {
             let (failed_state, notify_outcome) = sub_agent_cancel_outcome(cause);
             Ok(SubAgentTransitionResult::new(failed_state)
                 .with_effect(Effect::PersistState)
@@ -4578,10 +4571,14 @@ mod tests {
             "timed-out sub-agent must reach Failed, got {:?}",
             result.new_state
         );
-        let timed_out = result
-            .effects
-            .iter()
-            .any(|e| matches!(e, Effect::NotifyParent { outcome: SubAgentOutcome::TimedOut }));
+        let timed_out = result.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::NotifyParent {
+                    outcome: SubAgentOutcome::TimedOut
+                }
+            )
+        });
         assert!(
             timed_out,
             "timeout cancel must notify parent with TimedOut, got effects {:?}",
@@ -4642,10 +4639,14 @@ mod tests {
             "settled timeout-cancel sub-agent must reach Failed, got {:?}",
             after_abort.new_state
         );
-        let timed_out_deferred = after_abort
-            .effects
-            .iter()
-            .any(|e| matches!(e, Effect::NotifyParent { outcome: SubAgentOutcome::TimedOut }));
+        let timed_out_deferred = after_abort.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::NotifyParent {
+                    outcome: SubAgentOutcome::TimedOut
+                }
+            )
+        });
         assert!(
             timed_out_deferred,
             "CancellingTool(Timeout) + ToolAborted must notify parent with TimedOut, \
