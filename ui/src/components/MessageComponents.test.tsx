@@ -190,6 +190,7 @@ describe('inline tool timers', () => {
           message={initialTurn.agent}
           toolResults={initialTurn.toolResultsByUseId}
           onOpenFile={undefined}
+          activeToolUseId="tool-read"
         />
       </MemoryRouter>,
     );
@@ -217,6 +218,7 @@ describe('inline tool timers', () => {
           message={liveTurn.agent}
           toolResults={liveTurn.toolResultsByUseId}
           onOpenFile={undefined}
+          activeToolUseId="tool-read"
         />
       </MemoryRouter>,
     );
@@ -232,6 +234,148 @@ describe('inline tool timers', () => {
     expect(document.querySelector('.tool-block-elapsed')).toBeNull();
     expect(screen.getByText('• 1.2s')).toBeInTheDocument();
     expect(screen.queryByText('• 40s')).not.toBeInTheDocument();
+  });
+
+
+  it('only shows live elapsed on the current tool when a later tool has started', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:24Z'));
+
+    const agent = agentMessage('agent-current-tool-only', [
+      {
+        type: 'tool_use',
+        id: 'tool-bash',
+        name: 'bash',
+        input: { op: 'run', cmd: 'ls -la', wait_seconds: 10 },
+      },
+      {
+        type: 'tool_use',
+        id: 'tool-read',
+        name: 'read_file',
+        input: { path: 'SPEARS.md' },
+      },
+    ]);
+    agent.display_data = {
+      tool_starts: {
+        'tool-bash': Date.parse('2026-01-01T00:00:00Z'),
+        'tool-read': Date.parse('2026-01-01T00:00:13Z'),
+      },
+    };
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agent}
+          toolResults={new Map()}
+          onOpenFile={undefined}
+          activeToolUseId="tool-read"
+        />
+      </MemoryRouter>,
+    );
+
+    const bashCard = document.querySelector('[data-tool-id="tool-bash"]');
+    const readCard = document.querySelector('[data-tool-id="tool-read"]');
+    expect(bashCard).not.toBeNull();
+    expect(readCard).not.toBeNull();
+    expect(bashCard?.querySelector('.tool-block-elapsed')).toBeNull();
+    expect(readCard?.querySelector('.tool-block-elapsed')).toHaveTextContent('• 11s');
+    expect(screen.queryByText('• 24s')).not.toBeInTheDocument();
+  });
+
+  it('does not leave any screenshot-style multi-tool cards in live elapsed state once their results are visible', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:24Z'));
+
+    const startedAtMs = Date.parse('2026-01-01T00:00:00Z');
+    const agent = agentMessage('agent-multi-tool-timer', [
+      {
+        type: 'text',
+        text: 'The sandbox remaps ~, so I will inspect the worktree.',
+      },
+      {
+        type: 'tool_use',
+        id: 'tool-bash-list',
+        name: 'bash',
+        input: { op: 'run', cmd: 'ls -la /Users/scottopell/dev | sort | head -250', wait_seconds: 10 },
+      },
+      {
+        type: 'tool_use',
+        id: 'tool-bash-find',
+        name: 'bash',
+        input: { op: 'run', cmd: "find . -maxdepth 5 -iname '*spear*' -print", wait_seconds: 10 },
+      },
+      {
+        type: 'text',
+        text: 'I found the v2 repo files and will inspect SPEARS.md.',
+      },
+      {
+        type: 'tool_use',
+        id: 'tool-read-root',
+        name: 'read_file',
+        input: { path: '/Users/scottopell/dev/spears/SPEARS.md' },
+      },
+      {
+        type: 'tool_use',
+        id: 'tool-read-range',
+        name: 'read_file',
+        input: { path: 'SPEARS.md', offset: 1, limit: 240 },
+      },
+    ]);
+    agent.display_data = {
+      tool_starts: {
+        'tool-bash-list': startedAtMs,
+        'tool-bash-find': startedAtMs,
+        'tool-read-root': Date.parse('2026-01-01T00:00:13Z'),
+        'tool-read-range': Date.parse('2026-01-01T00:00:13Z'),
+      },
+    };
+
+    const bashList = toolMessage('tool-bash-list', JSON.stringify({ status: 'exited', exit_code: 0, duration_ms: 2400, lines: [] }), 2);
+    bashList.display_data = { duration_ms: 2400 };
+    const bashFind = toolMessage('tool-bash-find', JSON.stringify({ status: 'exited', exit_code: 0, duration_ms: 2450, lines: [] }), 3);
+    bashFind.display_data = { duration_ms: 2450 };
+    const readRoot = toolMessage('tool-read-root', '1 # spEARS\n2\n3 spEARS (Simple Project with Agentic Requirements Syntax)\n4 more\n5 more\n6 more', 4);
+    readRoot.display_data = { duration_ms: 1100 };
+    const readRange = toolMessage('tool-read-range', 'SPEARS.md:1–240', 5);
+    readRange.display_data = { duration_ms: 1120 };
+
+    const units = buildRenderUnits({
+      messages: [agent, bashList, bashFind, readRoot, readRange],
+      pendingMessages: [],
+      convState: { type: 'tool_executing', tool: 'read_file' },
+      streamingHandle: null,
+    });
+    const turn = units.historicalUnits.find((u) => u.kind === 'agent_turn');
+    if (!turn || turn.kind !== 'agent_turn') throw new Error('missing agent turn');
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={turn.agent}
+          toolResults={turn.toolResultsByUseId}
+          onOpenFile={undefined}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('The sandbox remaps ~, so I will inspect the worktree.')).toBeInTheDocument();
+    expect(screen.getByText('I found the v2 repo files and will inspect SPEARS.md.')).toBeInTheDocument();
+    expect(screen.getByText(/# spEARS/)).toBeInTheDocument();
+    expect(screen.getByText(/SPEARS\.md:1–240/)).toBeInTheDocument();
+    expect(document.querySelectorAll('.tool-block')).toHaveLength(4);
+    expect(document.querySelectorAll('.tool-block-status.success')).toHaveLength(4);
+    expect(document.querySelectorAll('.tool-block-duration')).toHaveLength(4);
+    expect(document.querySelector('.tool-block-elapsed')).toBeNull();
+    expect(screen.queryByText('• 24s')).not.toBeInTheDocument();
+    expect(screen.queryByText('• 11s')).not.toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+
+    expect(document.querySelector('.tool-block-elapsed')).toBeNull();
+    expect(screen.queryByText('• 54s')).not.toBeInTheDocument();
+    expect(screen.queryByText('• 41s')).not.toBeInTheDocument();
   });
 });
 

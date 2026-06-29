@@ -99,6 +99,12 @@ function SkillFileChips({ files }: { files: { original_name: string; size_bytes:
 
 type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
 
+function activeToolUseIdFromState(convState: ConversationState): string | undefined {
+  if (convState.type !== 'tool_executing' && convState.type !== 'cancelling_tool') return undefined;
+  const id = convState.current_tool?.id;
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
+}
+
 function renderHistoricalUnit(
   unit: HistoricalUnit,
   onOpenFile: OnOpenFile,
@@ -106,6 +112,7 @@ function renderHistoricalUnit(
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
+  activeToolUseId: string | undefined,
 ): JSX.Element | null {
   switch (unit.kind) {
     case 'user':
@@ -146,6 +153,7 @@ function renderHistoricalUnit(
           onOpenFile={onOpenFile}
           filePathRootDir={filePathRootDir}
           workScopeKey={workScopeKey}
+          activeToolUseId={activeToolUseId}
           isFirstInTurn={unit.isFirstInTurn}
         />
       );
@@ -190,6 +198,7 @@ function renderUnit(
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
+  activeToolUseId: string | undefined,
 ): JSX.Element | null {
   if (
     unit.kind === 'sub_agent_status' ||
@@ -197,7 +206,7 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug);
   }
-  return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey);
+  return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId);
 }
 
 interface SystemPromptHeaderProps {
@@ -348,6 +357,7 @@ function MessageListImpl({
   }, [chapters]);
 
   const isEmpty = allUnits.length === 0;
+  const activeToolUseId = activeToolUseIdFromState(convState);
 
   const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
     setIsAtBottom(atBottom);
@@ -638,10 +648,10 @@ function MessageListImpl({
   const itemContent = useCallback(
     (_index: number, unit: RenderUnit) => (
       <div className="virtuoso-row" data-render-unit-key={unit.key}>
-        {renderUnit(unit, slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey)}
+        {renderUnit(unit, slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId)}
       </div>
     ),
-    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey],
+    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId],
   );
 
   const computeItemKey = useCallback(
