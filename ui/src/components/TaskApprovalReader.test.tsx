@@ -2,13 +2,13 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { TaskApprovalReader } from './TaskApprovalReader';
 
-function renderTaskApprovalReader(plan = '# Plan\n\nAdd the thing.') {
+function renderTaskApprovalReader(plan = '# Plan\n\nAdd the thing.', onApprove = vi.fn()) {
   return render(
     <TaskApprovalReader
       title="Review task"
       priority="p2"
       plan={plan}
-      onApprove={vi.fn()}
+      onApprove={onApprove}
       onReject={vi.fn()}
       onSendFeedback={vi.fn()}
     />
@@ -45,7 +45,8 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     expect(buttons.map((button) => button.textContent)).toEqual([
       'Discard',
       'Send Feedback (0)',
-      'Approve',
+      'Continue here',
+      'Start fresh conversation',
     ]);
 
     expect(buttons[1]).toBeDisabled();
@@ -56,6 +57,8 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     expect(buttons[1]).not.toHaveClass('task-approval-btn--recommended');
     expect(buttons[2]).toHaveClass('task-approval-btn--approve');
     expect(buttons[2]).not.toHaveClass('task-approval-btn--subdued');
+    expect(buttons[3]).toHaveClass('task-approval-btn--approve');
+    expect(buttons[3]).not.toHaveClass('task-approval-btn--subdued');
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
@@ -72,7 +75,8 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     expect(buttons.map((button) => button.textContent)).toEqual([
       'Discard',
       'Send Feedback (1)',
-      'Approve without sending feedback',
+      'Continue here',
+      'Start fresh conversation',
     ]);
 
     expect(buttons[1]).toBeEnabled();
@@ -80,8 +84,20 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     expect(buttons[1]).toHaveAttribute('title', 'Send 1 note as feedback');
     expect(buttons[2]).toHaveClass('task-approval-btn--approve');
     expect(buttons[2]).toHaveClass('task-approval-btn--subdued');
+    expect(buttons[3]).toHaveClass('task-approval-btn--approve');
+    expect(buttons[3]).toHaveClass('task-approval-btn--subdued');
     expect(screen.getByRole('status')).toHaveTextContent(
       'You have 1 note of unsent feedback'
     );
+  });
+
+  it('calls onApprove with the selected handoff', () => {
+    const onApprove = vi.fn();
+    renderTaskApprovalReader(undefined, onApprove);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Continue here' }));
+    expect(onApprove).toHaveBeenCalledWith('continue_in_current_conversation');
+
+    expect(screen.getByRole('button', { name: 'Start fresh conversation' })).toBeInTheDocument();
   });
 });

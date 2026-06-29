@@ -19,6 +19,7 @@ import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark } from '../utils/syntaxHighlighter';
 import { MermaidDiagram } from './MermaidDiagram';
 import { generateUUID } from '../utils/uuid';
+import type { TaskApprovalHandoff } from '../api';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import {
   X,
@@ -45,7 +46,7 @@ export interface TaskApprovalReaderProps {
   title: string;
   priority: string;
   plan: string;
-  onApprove: () => void;
+  onApprove: (handoff: TaskApprovalHandoff) => void;
   onReject: () => void;
   onSendFeedback: (annotations: string) => void;
 }
@@ -190,7 +191,7 @@ export function TaskApprovalReader({
 }: TaskApprovalReaderProps) {
   useRegisterFocusScope('task-approval');
 
-  const [approving, setApproving] = useState(false);
+  const [approvingHandoff, setApprovingHandoff] = useState<TaskApprovalHandoff | null>(null);
   const [notes, setNotes] = useState<ReviewNote[]>([]);
   const [annotatingLine, setAnnotatingLine] = useState<{
     lineNumber: number;
@@ -304,6 +305,14 @@ export function TaskApprovalReader({
   const handleDiscard = useCallback(() => {
     setDiscardConfirmOpen(true);
   }, []);
+
+  const handleApprove = useCallback(
+    (handoff: TaskApprovalHandoff) => {
+      setApprovingHandoff(handoff);
+      onApprove(handoff);
+    },
+    [onApprove]
+  );
 
   const confirmDiscard = useCallback(() => {
     setDiscardConfirmOpen(false);
@@ -478,13 +487,10 @@ export function TaskApprovalReader({
           ]
             .filter(Boolean)
             .join(' ')}
-          disabled={approving}
-          onClick={() => {
-            setApproving(true);
-            onApprove();
-          }}
+          disabled={approvingHandoff !== null}
+          onClick={() => handleApprove('continue_in_current_conversation')}
         >
-          {approving ? (
+          {approvingHandoff === 'continue_in_current_conversation' ? (
             <>
               <Loader2 size={18} className="spinning" />
               Approving...
@@ -492,7 +498,30 @@ export function TaskApprovalReader({
           ) : (
             <>
               <Check size={18} />
-              {hasUnsentNotes ? 'Approve without sending feedback' : 'Approve'}
+              Continue here
+            </>
+          )}
+        </button>
+        <button
+          className={[
+            'task-approval-btn',
+            'task-approval-btn--approve',
+            hasUnsentNotes && 'task-approval-btn--subdued',
+          ]
+            .filter(Boolean)
+            .join(' ')}
+          disabled={approvingHandoff !== null}
+          onClick={() => handleApprove('start_fresh_work_conversation')}
+        >
+          {approvingHandoff === 'start_fresh_work_conversation' ? (
+            <>
+              <Loader2 size={18} className="spinning" />
+              Approving...
+            </>
+          ) : (
+            <>
+              <Check size={18} />
+              Start fresh conversation
             </>
           )}
         </button>

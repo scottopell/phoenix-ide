@@ -874,10 +874,10 @@ function ConversationPageContent() {
     [conversation, navigate, createConversationWithStore],
   );
 
-  const handleApproveTask = async () => {
+  const handleApproveTask = async (handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation') => {
     if (!conversationId || isArchived) return;
     try {
-      const result = await api.approveTask(conversationId);
+      const result = await api.approveTask(conversationId, handoff);
       if (result.first_task) {
         setShowFirstTaskWelcome(true);
       }

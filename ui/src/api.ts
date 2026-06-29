@@ -942,6 +942,8 @@ export interface DiscoveryServicesResponse {
   services: DiscoveredService[];
 }
 
+export type TaskApprovalHandoff = 'continue_in_current_conversation' | 'start_fresh_work_conversation';
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -1625,7 +1627,7 @@ export const api = {
 
   async approveTask(
     convId: string,
-    handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation' = 'start_fresh_work_conversation',
+    handoff: TaskApprovalHandoff = 'start_fresh_work_conversation',
   ): Promise<{ success: boolean; first_task?: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/approve-task`, {
       method: 'POST',
