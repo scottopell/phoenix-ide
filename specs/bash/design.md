@@ -1,5 +1,13 @@
 # Bash Tool — Design Document
 
+## v2 Migration Note
+
+This document is legacy source material for the bash tool. ADR-001 captures the
+rationale for first-class process-local handles and wait windows. ADR-002
+captures the rationale for watch-backed exit observation and snapshot-based
+handle-state reads. Other sections remain legacy source material until migrated
+into requirements, Allium, ADRs, or executive status.
+
 ## Overview
 
 The bash tool executes shell commands as pipe-backed children of the Phoenix
