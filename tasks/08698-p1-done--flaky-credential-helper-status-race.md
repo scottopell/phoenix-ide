@@ -66,3 +66,20 @@ machine, not just a test fix.
 - The assertion is deterministic: no sleeps, no retry-until-Valid loops.
 - Root cause documented (is the production read path also racy?).
 - Run the module under stress to confirm: `cargo test -p phoenix-llm credential_helper -- --test-threads=8` repeated in a loop stays green.
+
+## Resolution
+
+Confirmed mechanism: `spawn_helper_task` sets the inner state to `Valid` (or `Failed`) before sending `Complete`/`Error` to subscribers and before notifying `settled`. Therefore, if a test observes `Running` after `drain` returns, `drain` must have exited without seeing a terminal event — its `timeout(TICK, s.next())` loop returns early when the subprocess is slow to spawn under parallel-test load.
+
+Production callers audited in `registry.rs`:
+- `LlmAuth::resolve()` calls `get()` then `is_recovering()`; it never assumes a post-stream status.
+- `CredentialHelper::get()` is explicitly fire-and-forget and returns `None` while `Running`.
+- `is_recovering()` only polls the current state.
+
+No production path requires a structural happens-before guarantee beyond what `wait_for_settlement()` already provides, so the fix is test-only.
+
+Fix: make the test helper `drain` take `&CredentialHelper` and call `wait_for_settlement()` internally after collecting events. This composes the production primitives (`run_and_stream` for event delivery + `wait_for_settlement` for the state transition) inside the helper, so any test that calls `drain` and then asserts `credential_status()` / `get()` is guaranteed to see a settled state — structurally, not by discipline. No new methods are added to the production `CredentialHelper` type; the settlement logic lives entirely in the test-local `drain` helper.
+
+Tests that need to observe the intermediate `Running` state (`second_subscriber_joins_running_helper_and_replays_buffer`) already use `run_and_stream()` directly and poll the stream manually — the production streaming API — without `drain`. This is the explicitly unsettled path; `drain` is the settled default.
+
+Stress validation: `cargo test -p phoenix-llm credential_helper -- --test-threads=8` passed 10/10 consecutive runs. `cargo fmt --all -- --check` and `cargo clippy -p phoenix-llm --tests -- -D warnings` are clean.
