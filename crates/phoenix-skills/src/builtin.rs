@@ -20,6 +20,7 @@
 //!   spears/
 //!     SKILL.md
 //!     references/
+//!     adrs/
 //! ```
 //!
 //! ## Override
@@ -136,7 +137,8 @@ mod tests {
             .join("allium/references/language-reference.md")
             .is_file());
         assert!(tmp.path().join("spears/SKILL.md").is_file());
-        assert!(tmp.path().join("spears/references/discover.md").is_file());
+        assert!(tmp.path().join("spears/references/discovery.md").is_file());
+        assert!(tmp.path().join("spears/adrs/_TEMPLATE.md").is_file());
     }
 
     #[test]

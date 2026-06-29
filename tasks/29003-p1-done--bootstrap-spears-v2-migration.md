@@ -88,3 +88,86 @@ This task should end with Phoenix on spEARS v2 for new work, plus a sequenced mi
 - A migration inventory and follow-up task set exists for legacy Phoenix specs.
 - Existing legacy specs are left intact unless deliberately touched for bootstrapping references.
 - Checks relevant to touched code/docs pass or any failures are documented with next steps.
+
+## Migration inventory
+
+This bootstrap leaves all legacy `specs/*/design.md` files in place. The current tree has 49 legacy design docs:
+
+### Legacy design docs with Allium already present
+
+These specs already have a precise behavior layer that can absorb or replace current-behavior prose during later decomposition:
+
+- `agents` → `agents.allium`
+- `auth` → `auth.allium`
+- `bash` → `bash.allium`
+- `bedrock` → `bedrock.allium`
+- `browser-tool` → `browser-lifecycle.allium`, `browser-profiling.allium`
+- `builtin-skills` → `builtin-skills.allium`
+- `command-suggestion` → `command-suggestion.allium`
+- `credential-helper` → `credential-helper.allium`
+- `inline-references` → `inline-references.allium`
+- `llm` → `anthropic.allium`, `llm.allium`, `responses.allium`
+- `llm-retry-visibility` → `llm-retry-visibility.allium`
+- `mcp` → `mcp.allium`
+- `messagelist-render-units` → `render_units.allium`
+- `notifications` → `notifications.allium`
+- `patch` → `patch.allium`
+- `permissions` → `permissions.allium`
+- `pr-association` → `pr-association.allium`
+- `projects` → `projects.allium`
+- `skills` → `skills.allium`
+- `stale-tool-results` → `stale-tool-results.allium`
+- `subagents` → `subagents.allium`
+- `terminal` → `terminal.allium`
+- `terminal-panel` → `terminal-panel.allium`
+- `tmux-integration` → `tmux-integration.allium`
+- `wake-contracts` → `wake-contracts.allium`
+- `work-actions-bar` → `work-actions-bar.allium`
+- `work-lifecycle` → `work-lifecycle.allium`
+- `working-phase-visibility` → `working-phase-visibility.allium`
+
+### Legacy design docs without Allium
+
+These specs need triage: many may be simple enough to retire design prose into requirements/executive/ADRs without Allium, while lifecycle or stateful areas need future Allium distillation.
+
+- `agent-identity`
+- `analytics`
+- `api`
+- `ask-user-question`
+- `chains`
+- `command-palette`
+- `commission-review`
+- `conversation-retrieval`
+- `conversation-ui`
+- `deployment-info`
+- `file-explorer`
+- `keyboard-interaction`
+- `keyword_search`
+- `process-inspector`
+- `prose-feedback`
+- `simple_client`
+- `skills-ui`
+- `tasks-ui`
+- `think`
+- `voice-input`
+- `work-scope-ui`
+
+### High-risk legacy design references
+
+Code and generated docs still cite `design.md` as an authority in several domains. These should be decomposed before deleting the corresponding design docs:
+
+- `bedrock`: Rust handlers and DB comments cite FM-7 and context-continuation design prose.
+- `projects`: `projects.allium` and historical tasks cite cross-domain design rules.
+- `bash`: tool implementation comments cite design sections for process, watch-channel, and output behavior.
+- `terminal` / `terminal-panel` / `tmux-integration`: terminal crates, generated wire types, and Allium comments cite design sections for auth, attach, HUD, tmux output, and environment handling.
+- `mcp`: tasks and design references describe the native HTTP transport boundary.
+- `chains`: backend, UI utilities, tests, and generated types cite sidebar grouping and work identity design prose.
+- `working-phase-visibility`, `wake-contracts`, `llm`, `stale-tool-results`, and `messagelist-render-units`: Allium files cite design prose for carrier fields, semantic exceptions, or unresolved confirmations.
+- Specs such as `process-inspector`, `work-scope-ui`, `deployment-info`, and `commission-review` cite their design docs for non-goals or exact wire/behavioral rationale despite lacking Allium.
+
+## Follow-up tasks created
+
+- `tasks/29004-p1-ready--spears-v2-validation.md` — update deterministic validation and authoring preflight for spEARS v2 shape.
+- `tasks/29005-p1-ready--decompose-core-design-docs.md` — decompose high-risk core design docs (`bedrock`, `projects`, `bash`, `terminal`, `mcp`).
+- `tasks/29006-p2-ready--cleanup-design-md-code-references.md` — replace code/generated/task-template design-doc authority citations with REQ IDs, Allium entities, symbols, or ADR links.
+- `tasks/29007-p2-ready--triage-non-allium-design-docs.md` — decide which non-Allium legacy specs need distillation versus lightweight retirement.

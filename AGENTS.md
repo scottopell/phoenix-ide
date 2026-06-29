@@ -45,7 +45,7 @@ phoenix-client.py  # CLI client — interact with the app without a browser
 
 `phoenix-client.py` is a standalone CLI for the Phoenix API (spec: `specs/simple_client/`). LLM agents should prefer it over browser automation for testing conversations.
 
-**Specs** live under `specs/<name>/`: spEARS prose (`requirements.md`, `design.md`, `executive.md`) plus optional Allium behavioural specs (`.allium`). Both are normative. See [Specifications](#specifications) below.
+**Specs** live under `specs/<name>/`: spEARS `requirements.md` and `executive.md`, optional Allium behavioural specs (`.allium`), and a shared project ADR chain under `specs/adrs/`. `requirements.md` and `.allium` are normative. See [Specifications](#specifications) below.
 
 ---
 
@@ -359,7 +359,8 @@ pub priority: Priority,
 
 **Move to spec, then delete:**
 ```rust
-// ❌ Design rationale belongs in spEARS design.md or Allium @guidance
+// ❌ Design rationale belongs in a specs/adrs/ decision record, or in
+// Allium @guidance when it is an operation sequence
 // "Commit after worktree creation so a worktree failure
 //  doesn't leave orphaned commits on main"
 
@@ -412,30 +413,36 @@ This is the filesystem facet of a boundary the MCP work meets on the network sid
 
 ### Specifications
 
-This project uses two complementary specification formats. **Both are normative** — code that contradicts either is wrong.
+This project uses spEARS v2 plus optional Allium. `requirements.md` and `.allium` are normative — code that contradicts either is wrong. ADRs are authoritative history for why decisions were made. `executive.md` is current status/current reality.
 
-- **spEARS** specs (`requirements.md`, `design.md`, `executive.md`) capture the *what* and *why*, plus the high-level *how*. They establish user need, named requirements (REQ-* IDs), design rationale, and track implementation status.
-- **Allium** specs (`.allium` files) capture *how specifically* — states, transitions, preconditions, postconditions, invariants — precisely enough to generate tests and catch ambiguities.
+- **spEARS requirements** (`requirements.md`) capture timeless user need and named requirements (REQ-* IDs). They do not contain implementation status or decision logs.
+- **Project ADRs** (`specs/adrs/*.md`) capture point-in-time design decisions and rationale in one shared chain. They are not nested under feature specs.
+- **Allium** specs (`.allium` files) capture precise current behavior — states, transitions, preconditions, postconditions, invariants — when that precision is worth its cost.
+- **Executive docs** (`executive.md`) track status, current reality, and verification coverage. They are the sole spEARS artifact allowed to be status-relative.
 
-The two formats complement each other. spEARS without Allium is vague about exact behaviour; Allium without spEARS is unmoored from user need. Together: user story → REQ-IDs → precise behavioural spec → testable implementation → status tracking, traceable end-to-end.
+spEARS v2 has no required living `design.md`. Existing `specs/*/design.md` files are legacy v1 artifacts: do not create new ones, and do not delete old ones until their requirements, behavioral rules, rationale, and status content have been deliberately moved to the right v2 home.
+
+Together: user story → REQ-IDs → optional precise behavioural spec → tests/code → executive status, with ADRs preserving the design decisions made along the way.
 
 #### When to write an Allium spec alongside spEARS
 
-Allium is a heavier tool; not every spEARS spec needs an Allium counterpart. Write one when the system has:
+Allium is precision-on-demand; not every spEARS spec needs an Allium counterpart. Write one when the system has:
 
 - **State machines** with multiple states and complex transitions (bedrock, projects)
 - **Lifecycle flows** with preconditions that must hold (task approval, complete, abandon)
 - **Multi-step operations** where ordering matters and partial failure is possible
 - **Cross-boundary contracts** where two specs interact (projects importing bedrock)
 
-Do NOT add Allium for: CRUD endpoints, pure data transformations, UI components, tool implementations with no lifecycle. spEARS alone is sufficient there.
+Do NOT add Allium for: CRUD endpoints, pure data transformations, UI components, or tools with no lifecycle. `requirements.md`, ADRs, and `executive.md` are sufficient there.
 
 #### Discovering specs
 
-Both formats live under `specs/<name>/`:
+Feature specs live under `specs/<name>/`; project-wide ADRs live under `specs/adrs/`:
 
-- spEARS: `requirements.md`, `design.md`, `executive.md`
-- Allium: `<name>.allium`
+- Requirements: `specs/<name>/requirements.md`
+- Optional Allium: `specs/<name>/<name>.allium` or similarly named `.allium` files
+- Status/current reality: `specs/<name>/executive.md`
+- ADR chain: `specs/adrs/NNN_<slug>.md`, indexed by `specs/adrs/README.md`
 
 Enumerate Allium specs with `ls specs/*/*.allium`. Cross-spec dependencies are declared in each file's header via `use "./other.allium" as other`. Validate with `allium check specs/<name>/<name>.allium` (install via `cargo install allium-cli`).
 
@@ -451,16 +458,16 @@ Enumerate Allium specs with `ls specs/*/*.allium`. Cross-spec dependencies are d
 
 **Resolving open questions is mandatory.** An open question in an Allium spec is not documentation — it's an unresolved ambiguity that may hide a bug. When distilling, present each open question to the user via `AskUserQuestion` with concrete options (not open-ended). The user decides; you implement the fix. Do not leave open questions as prose notes or "future work." Every ambiguity either becomes a code fix or an explicit design decision before the spec is merged.
 
-**Both formats are authoritative.** If the code disagrees with either spEARS or Allium, one of them is wrong. spEARS requirements (REQ-* IDs) define what must be built; Allium's transition graph, preconditions, and invariants define exact behaviour. `@guidance` blocks in Allium describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right.
+**Requirements and Allium are normative.** If the code disagrees with either, one of them is wrong. spEARS requirements (REQ-* IDs) define what must be built; Allium's transition graph, preconditions, and invariants define exact behaviour. `@guidance` blocks in Allium describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right. ADRs explain why a decision was made; if the decision changes, write a new ADR rather than rewriting history.
 
-**Specs are timeless.** A spec describes the ideal current state of the system as if it had always been that way — it is the guidebook a future reader uses to understand design *intent*, not a record of how the design got here. Write every spec as a standing description, never as a changelog or a snapshot of in-flight work. Concretely, the following do **not** belong in a spec file:
+**Specs are artifact-aware about time.** `requirements.md` and `.allium` describe the ideal current state of the system as if it had always been that way. ADRs are explicitly point-in-time records and should name the context, options, decision, and consequences as they were when the decision was made. `executive.md` is the status/current-reality exception. Concretely, the following do **not** belong in timeless artifacts (`requirements.md` and `.allium`):
 
 - **Task / PR / issue references** as the reason for a behaviour — `task 02679`, `PR #155`, `see #186`. Cite the *invariant* or *bug class* in timeless terms instead ("an emit-vs-persist race that drops a finalized message"), and cross-reference other **specs** by path, not tasks by ID.
 - **Time- or state-relative framing** of the design — `currently`, `for now`, `recently`, `previously`, `used to`, `will soon`, `Phase 1 (current)`, `landed in tasks/62001`, `MVP`. State what *is*. (Sequential phases *within a single operation* — "phase 1: snapshot, phase 2: apply pending" — are fine; they describe algorithm structure, not a rollout schedule.)
 - **Status / progress tracking** — `✅ Complete`, `Progress: 10 of 10`, "implemented in", per-rule completion columns. Implementation status lives in tasks and git, not the spec. A requirement-to-surface or rule-to-code-anchor map is fine; a *status* table is not. Singular exception, spEARS `executive.md` documents, status tracking is one of their goals. other spEARs documents and allium specifications adhere to this rule strictly.
 
 
-- **Decision logs and resolved "Open Questions"** — `Q3. RESOLVED 2026-05-10: …`, dated entries, "we decided", stream-of-consciousness ("actually no — see below"). Once a question is resolved, state the decision **as a fact** with its rationale (a "Design Decisions" section), and delete the question. An *unresolved* open question is never left as prose — resolve it per the rule above.
+- **Decision logs and resolved "Open Questions"** — `Q3. RESOLVED 2026-05-10: …`, dated entries, "we decided", stream-of-consciousness ("actually no — see below"). Once a question is resolved, state the outcome as a standing fact in the timeless artifact and put the deliberation/rationale in `specs/adrs/`. An *unresolved* open question is never left as prose — resolve it per the rule above.
 - **Line-number citations that rot** — prefer symbol names (`SseBroadcaster::send_seq`) over `runtime.rs:529`. See `specs/AUTHORING.md` §2.
 
 When you touch a spec, leave it more timeless than you found it, even for drift you didn't introduce.

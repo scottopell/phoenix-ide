@@ -1,333 +1,218 @@
 ---
 name: spears
-metadata:
-  author: scottopell
-  version: "1.0.0"
-description: >
-  spEARS (Simple Project with EARS) methodology for requirements-driven development.
-  Provides Socratic discovery of user needs, EARS-formatted specification writing,
-  implementation tracking, and spec validation -- all built on a strict three-document
-  pattern (requirements.md, design.md, executive.md). MUST BE USED when the user
-  mentions spEARS, EARS requirements, spec writing, requirements discovery, or
-  wants to create/update/validate feature specifications. Also use when the user
-  wants to plan a feature with clear acceptance criteria, track implementation
-  progress against requirements, or do a context-window reflection for spEARS work.
-  Use proactively when the user describes wanting to "spec out" or "define requirements"
-  for any feature, even if they don't mention spEARS by name. Also triggers for
-  "lint my specs", "clean up my design docs", or "check my requirements".
+description: >-
+  spEARS (Simple Project with EARS) is a requirements-first specification
+  methodology for AI agents and humans. It pairs timeless EARS requirements
+  (requirements.md) with point-in-time design decision records (ADRs), an
+  on-demand precise behavioral layer (Allium), and a status doc (executive.md),
+  giving a clear shared understanding of how a system should work with grep-able
+  traceability from requirement to test to code. Use this skill whenever the user
+  mentions spEARS or EARS specs; works with a specs/ directory or files named
+  requirements.md, executive.md, or adrs/; asks to write, plan, or validate
+  requirements; wants to capture an architecture or design decision; or asks how
+  requirements trace to tests and code — even if they don't say "spEARS" explicitly.
+auto_trigger:
+  - file_patterns: ["**/requirements.md", "**/executive.md", "**/adrs/*.md"]
+  - keywords: ["spEARS", "spears spec", "EARS requirement", "requirements.md", "ADR", "design decision record"]
 ---
-# spEARS: Requirements-Driven Development
+# spEARS: Simple Project with EARS
 
-spEARS provides explicit traceability from business requirements to tests to
-code using EARS (Easy Approach to Requirements Syntax) format.
+spEARS is a lightweight, requirements-first methodology for building software
+with AI agents. Its north star: **be explicit about design, so that humans and
+agents share a clear, accurate understanding of how the system should work** —
+and keep that understanding honest as the code evolves.
 
-## The Foundational Principle
+A feature is described by four kinds of artifact, each matched to a different
+relationship with time: timeless **requirements** (what, and why a user cares),
+point-in-time **ADRs** (why a decision was made), an on-demand precise
+**Allium** spec (how it behaves now), and an **executive** status doc (where
+things stand). Matching each kind of knowledge to a medium that fits it is the
+whole idea — and it is why spEARS has no always-current “design document,” the
+one artifact that reliably goes stale.
+The reasoning is the heart of the method; read
+[references/design-philosophy.md](references/design-philosophy.md) once before
+working with spEARS in earnest.
 
-**Specs without traceable user journeys are hollow.** EARS format compliance
-means nothing if you cannot answer: “Who does what, and why do they care?”
+## Core principles
 
-A structurally perfect spec that describes a feature nobody needs is worse than
-no spec at all -- it creates the illusion of rigor while wasting effort.
-Every requirement must trace back to a real person doing a real thing and
-experiencing a real benefit.
-If you cannot name the user, describe their journey, and explain why they care,
-the requirement is hollow regardless of how well-formatted it is.
+1. **Requirements first.** Define what needs to exist, and why a user cares,
+   before writing tests or code.
+2. **Match the medium to the job.** Timeless requirements in prose; precise
+   current behavior in a checkable DSL (Allium); point-in-time decisions in
+   prose ADRs. Never ask a prose document to be a live mirror of running code.
+3. **Immutable traceability.** Requirements get permanent IDs (`REQ-XX-###`)
+   that thread through specs, tests, and code and never change.
+4. **YAGNI made detectable.** Over-engineering has a precise definition here:
+   code that cannot be traced back to a `REQ-ID`. That makes it something you
+   can find, not just scold.
+5. **Specs stay timeless; status stays separate.** Every artifact except
+   `executive.md` describes a standing ideal, as if it had always been that way
+   — no changelogs, no “we recently switched,” no status tables.
 
-This matters especially when working with coding agents, which are prone to
-generating compliant-looking specs that satisfy structural rules while solving
-no real problem. An agent can produce a perfectly formatted requirements.md with
-EARS statements, immutable IDs, and user-benefit titles -- and still produce
-busywork if the requirements don’t trace to actual user needs.
-The structural rules in this skill exist to serve this principle, not the other
-way around.
+## The artifact model
 
-When writing, reviewing, or linting specs, always ask: **does this requirement
-exist because a real user has a real need, or does it exist because it seemed
-like something the system should do?** The latter is how hollow specs happen.
-
-## Workflow Selection
-
-Choose the right workflow based on what the user needs.
-When uncertain, default to **Discover** -- understanding the problem before
-writing anything is always the right first step.
-
-| User intent | Workflow | Reference |
-| --- | --- | --- |
-| “I want to build X” / new feature / vague idea | **Discover** | `references/discover.md` |
-| Writing or updating spec documents | **Write Specs** | `references/ears-format.md` |
-| Implementing requirements from existing specs | **Implement** | `references/implement.md` |
-| Checking spec status accuracy against codebase | **Validate** | `references/validate.md` |
-| Enforcing quality rules, fixing violations | **Lint** | `references/lint.md` |
-| Ending a session, need continuation prompt | **Reflect** | `references/reflect.md` |
-
-When transitioning between workflows (e.g., discovery complete, now writing
-specs), read the next reference file before proceeding.
-
-* * *
-
-## The Three-Document System
-
-Every feature gets a spec directory with three files that have strict,
-non-overlapping responsibilities:
+spEARS uses four kinds of artifact, each matched to a different relationship
+with time. Feature specs hold their requirements, status, and (on demand)
+behavior; **ADRs live in one shared, project-level chain**, because design
+decisions routinely cross features.
 
 ```text
-specs/feature-name/
-  requirements.md   # WHAT to build (EARS format, immutable IDs)
-  design.md         # HOW to build it (architecture, implementation)
-  executive.md      # WHERE we are (status, progress, milestones)
+specs/
+├── adrs/                        # ONE shared, cross-cutting ADR chain (sibling of features)
+│   ├── _TEMPLATE.md
+│   ├── README.md                # index: quick-ref table + task→ADR routing + dependency graph
+│   └── NNN_<slug>.md            # WHY — context, options, the call — point-in-time, frozen
+└── feature-name/
+    ├── requirements.md          # WHAT + user-facing why — EARS, immutable REQ-IDs, timeless
+    ├── feature-name.allium      # HOW, EXACTLY — states/transitions/invariants — present tense, on demand
+    └── executive.md             # WHERE ARE WE — status — the one "now" document
 ```
 
-### Document Boundaries
+An ADR names its scope in an `Affects:` field (`REQ-TA-001`, or several), never
+by which folder it sits in — every ADR shares the one `specs/adrs/` directory.
+The `specs/` prefix is a recommended default, not a mandate: `docs/specs/…` or
+`docs/{adrs, specs/…}` are equally fine.
+The one invariant is that ADRs are a *sibling* of feature specs, never nested
+inside a feature.
 
-This is the most-violated principle.
-Getting content in the wrong document corrupts the entire system because each
-document has a different relationship with time and serves a different audience.
-
-| Document | Contains | NEVER contains |
+| Document | Contains | Never contains |
 | --- | --- | --- |
-| **requirements.md** | EARS requirements, rationale, user stories | Status, implementation details, progress, milestones, future ideas |
-| **design.md** | Architecture, data models, API contracts, trade-offs | Status, requirement definitions, content without a REQ-* trace |
-| **executive.md** | Status table, summaries, milestones, MVP scope | Code blocks, detailed requirements, architecture details |
+| `requirements.md` | EARS requirements, user-facing rationale, REQ-IDs | Status, implementation detail, decision logs |
+| `adrs/*.md` | One decision: context, options weighed, the call, consequences | Timeless rule claims, Allium syntax, feature-implementation status |
+| `*.allium` | Allium declarations of current behavior (normative) | Defer to Allium conventions |
+| `executive.md` | Status table, brief summaries, verification coverage | Code blocks, decision logs, path-dependent narrative |
 
-### The Temporal Model
+**What is normative** (the code must obey it): `requirements.md` and `.allium`.
+If the code disagrees with either, something is wrong — fix the code, or, if the
+spec is wrong, correct it deliberately (a real change of decision earns an ADR).
+Do not silently “fix” the spec to match the code.
+ADRs are authoritative *history*, not a third contract; you read them to
+understand intent, not to check compliance.
 
-Each document has a different relationship with time.
-Understanding this prevents most errors:
+For the full reasoning on why each artifact has the temporal character it does,
+see [references/design-philosophy.md](references/design-philosophy.md).
 
-- **requirements.md** is **timeless**. It defines the ideal end state.
-  Unimplemented requirements (with ❌ status in executive.md) are still valid
-  scope -- they just aren’t built yet.
-  Requirements never describe current system state, migration paths, or
-  backwards compatibility.
-  They describe what the system should do, period.
+## When to reach for Allium
 
-- **design.md** is **slightly ahead of reality**. It describes HOW to build
-  requirements. It may document approaches for not-yet-implemented requirements.
-  But every section must trace to a REQ-* in requirements.md.
-  Content without a corresponding requirement is scope creep.
+Allium is a heavier, precise tool.
+It is **precision-on-demand**, not required on every feature.
+Reach for a `.allium` file when the feature has real behavioral complexity:
 
-- **executive.md** is **the temporal link**. It is the ONLY document that must
-  reflect current reality.
-  This is where status indicators, milestone tracking, MVP scope, “Phase 1 /
-  Phase 2” breakdowns, and progress notes live.
-  It tracks where the spec is in its development journey.
+- **State machines** — multiple states with non-trivial transitions
+- **Lifecycle flows** — preconditions that must hold (approve, complete,
+  abandon)
+- **Multi-step operations** — ordering matters and partial failure is possible
+- **Cross-boundary contracts** — two specs interact
 
-* * *
+Skip Allium when `requirements.md` already says enough: CRUD endpoints, pure
+data transformations, UI components, tools with no lifecycle.
+Adding Allium there is cost without payoff.
+When you do write one, defer to the `allium` skill for syntax and the `elicit` /
+`propagate` / `weed` workflow.
 
-## Critical Guardrails
+**spEARS is complete on its own.** Allium is an *optional* companion for the
+complex minority of features — install it when you want formal behavioral specs
+and generated tests.
+Everything else (requirements, ADRs, executive status, open questions,
+validation) works with spEARS alone.
+The references note the few places that gain extra power when Allium is present.
 
-These rules exist because they address the most common failures observed in
-practice. They are not style preferences -- violating them makes specs actively
-misleading.
+## The workflow: layered handoff
 
-### 1. Self-Containment (Most Violated)
-
-Every spec document must be fully understandable without external context.
-If someone reads it in two years, they should understand it completely without
-reading git history, other docs, or the codebase.
-
-**The failure pattern**: An agent participates in a planning process where a
-problem is discussed (e.g., thread safety issues), then writes design.md content
-that references the discussion rather than the problem.
-The result: “This design avoids thread safety violations” -- which is
-meaningless to a future reader who wasn’t in that conversation.
-
-**The fix**: Describe the constraints and properties of the problem objectively,
-then explain how the design addresses them.
-“The worker pool processes items concurrently across N threads.
-Shared state is confined to the job queue, which uses a mutex-guarded channel.
-Workers hold no references to each other’s state.”
-
-**Banned phrases** (rewrite immediately if you catch yourself writing these):
-
-- “as before” / “as currently implemented” / “previously”
-- “maintain existing behavior” / “continue to work as expected”
-- “unlike the old approach” / “the improved version”
-- “same as [other feature]” / “following the established pattern”
-- “standard validation rules” / “default timeout values”
-- “backwards compatible” / “migration from current”
-
-These all require the reader to know something that isn’t in the document.
-Replace each with a concrete, self-contained description of the actual behavior
-or constraint.
-
-**Design.md phasing language** is a distinct failure pattern that deserves its
-own callout. design.md describes HOW to build the system -- the stated technical
-approach. It is not a project plan.
-Phrases that describe sequencing, prioritization, or incremental delivery are
-status/planning concerns that belong in executive.md.
-
-Banned in design.md:
-
-- “Start with X and add Y later” / “initially, just do X”
-- “Deferred” / “deferred to Phase 2” / “future work”
-- “Prioritize getting X working early”
-- “For now, use X” / “as a first pass”
-- “Once X is stable, add Y”
-
-These are phasing decisions, not design decisions.
-design.md should describe the full technical approach for each requirement.
-If a requirement has a simpler fallback mode when data is unavailable, describe
-both modes as part of the design -- that’s a real architectural property.
-But “start simple and add complexity later” is a scheduling choice that belongs
-in executive.md’s milestone tracking.
-
-**Example:**
-
-Bad (phasing in design.md): “Start with SQLite-only data and add LevelDB parsing
-incrementally.”
-
-Good (design with fallback): “The data layer reads from both SQLite
-(transactions, balances) and LevelDB (account metadata, investment holdings).
-When LevelDB data is unavailable, the system operates in reduced-fidelity mode:
-accounts display as raw IDs and per-security allocation is unavailable.”
-
-Good (phasing in executive.md): “MVP uses SQLite-only.
-LevelDB parsing is planned for the next iteration.”
-
-The distinction: the design describes what the system does in each state.
-The executive tracks which state we’re currently targeting.
-
-### 2. Requirements Describe the Ideal End State
-
-Requirements define WHAT the system should do.
-They never reference:
-
-- Current system state ("backwards compatible with existing API")
-- Migration concerns ("supports both old and new format during transition")
-- Implementation technology ("uses Redis", “JWT tokens”, “HTTP 429”)
-- Data structure internals ("the geohash field", “user_sessions table”)
-- How the system achieves the behavior (belongs in design.md)
-
-**Test**: Could someone implement this requirement from scratch, with no
-knowledge of the current system, and get the right result?
-If the requirement only makes sense in the context of an existing system, it
-contains implementation leak.
-
-**Bad**: “WHEN user authenticates, THE SYSTEM SHALL maintain backwards
-compatibility with the v1 token format”
-
-**Good**: “WHEN user authenticates, THE SYSTEM SHALL issue a signed session
-token that expires after 24 hours of inactivity”
-
-### 3. Design Traces to Requirements
-
-Every section of design.md must trace to a REQ-* in requirements.md.
-If you cannot annotate a section with the requirement it supports, that content
-belongs in an issue tracker, not the spec.
-
-This prevents design.md from becoming a roadmap for undefined work.
-Sections like “Future Considerations”, “Phase 2 Enhancements”, or
-“Extensibility” that describe capabilities without corresponding requirements
-are violations.
-
-**Unimplemented requirements** (REQ-* with ❌ status) are fine to design for.
-**Undefined features** (no REQ-* anywhere) are scope creep.
-
-### 4. Before Creating a New Spec
-
-Before creating a new spec directory, check whether an existing spec covers this
-domain. The anti-pattern: creating a new spec for each work batch, producing
-scattered context across multiple directories that all describe the same system.
-
-**Check**: Does an existing spec cover the same user-facing capability?
-Could this be a new requirement added to that spec?
-Do the requirements share the same ID abbreviation namespace?
-
-If yes, expand the existing spec.
-Create a new spec only when the feature is genuinely independent -- different
-users, different domain boundary, different codebase area.
-
-### 5. Executive.md Constraints
-
-- 250 words max per summary section
-- ZERO code blocks (no triple backticks).
-  Inline backticks for technical terms (`config.yaml`, `REQ-XX-001`,
-  `src/auth.ts`) are fine.
-- Status table must include requirement titles, not just IDs
-- Status symbols: ✅ Complete | 🔄 In Progress | ⏭️ Planned | ❌ Not Started | ⚠️
-  Manual verification only
-
-### 6. Requirement Quality
-
-**Titles** describe USER BENEFITS, not system features:
-- Good: “Prevent Abuse Attacks”, “View Current Status Without Waiting”
-- Bad: “IP-Based Rate Limiting”, “Cache Data Layer”
-
-**Rationale** answers “Why does the USER care?”
-not “Why is this technically interesting?”
-
-**EARS statements** must be specific and testable:
-- Bad: “THE SYSTEM SHALL be fast”
-- Good: “THE SYSTEM SHALL respond within 2 seconds for cached data”
-
-* * *
-
-## Requirement ID Format
-
-IDs are immutable. Once assigned, they never change, even if the requirement is
-deprecated.
-
-Format: `REQ-[ABBREV]-###`
-
-- `[ABBREV]`: Short abbreviation for the feature (e.g., RL for Rate Limiting)
-- `###`: Zero-padded sequential number (001, 002, etc.)
-
-Examples: `REQ-RL-001`, `REQ-UA-003`, `REQ-BI-001`
-
-* * *
-
-## EARS Patterns (Quick Reference)
-
-Full format guide with templates in `references/ears-format.md`.
-
-| Pattern | Structure | Use when |
-| --- | --- | --- |
-| Ubiquitous | THE SYSTEM SHALL [behavior] | Always true |
-| Event-driven | WHEN [trigger] THE SYSTEM SHALL [behavior] | State change triggers action |
-| State-driven | WHILE [condition] THE SYSTEM SHALL [behavior] | Behavior depends on state |
-| Unwanted | IF [condition] THE SYSTEM SHALL NOT [behavior] | Explicit prohibition |
-| Optional | WHERE [config] THE SYSTEM SHALL [behavior] | Configurable behavior |
-
-* * *
-
-## Spec Directory Structure
+spEARS owns the requirements → ADR → executive markdown layer and hands off to
+Allium at the behavioral-spec boundary.
+The `REQ-ID` is the suture running through every layer.
 
 ```text
-project/
-  specs/
-    feature-one/
-      requirements.md
-      design.md
-      executive.md
-    feature-two/
-      requirements.md
-      design.md
-      executive.md
-  src/
-  tests/
+discover ──► requirements.md (REQ-IDs, EARS, user-why) + executive.md (skeleton, all ❌)
+   │
+   ▼  GATE: state-machine-complex? (lifecycle / preconditions / ordering / cross-boundary)
+   │
+   ├─ NO  ──► implement directly against REQ-IDs, stay in spEARS
+   │
+   └─ YES ──► allium elicit ─► feature.allium (references the REQ-IDs)
+              allium propagate ─► tests (must fail first)
+              implement ─► code with // REQ-XX-### comments
+              allium weed ─► .allium ↔ code divergence check
+   │
+   ▼
+write an ADR in specs/adrs/ for any significant decision made along the way, and for
+every REQ deprecation (Affects: names the REQ-IDs it touches)
+   │
+   ▼
+validate (markdown layer) ──► executive.md status  ❌ → 🔄 → ✅
 ```
 
-Use **kebab-case** for directory names.
-Match names to user-facing concepts (`quota-visibility`, not `redis-storage`).
+## Routing table
 
-* * *
+This SKILL.md is the hub.
+Each task below has a home — a reference file in this skill, or the sibling
+`allium` skill. Read the reference when you are doing that task.
 
-## Traceability
+| Task | Go to | When |
+| --- | --- | --- |
+| Understand *why* spEARS is shaped this way | [references/design-philosophy.md](references/design-philosophy.md) | Before working with spEARS the first time |
+| Discover user need, write requirements | [references/discovery.md](references/discovery.md) | New feature, or an existing spec feels hollow |
+| Write EARS requirements correctly | [references/ears-guide.md](references/ears-guide.md) | Authoring or reviewing `requirements.md` |
+| Author/update requirements & executive | [references/authoring.md](references/authoring.md) | Writing the markdown layer |
+| Capture a design decision | [references/adr-guide.md](references/adr-guide.md) | A decision has a real “why”; any REQ deprecation |
+| Specify exact behavior, generate tests | `allium` skill (`elicit`, `propagate`) | The Allium gate fired YES |
+| Validate the markdown layer | [references/validation.md](references/validation.md) | Before merge |
+| Check spec ↔ code divergence | `allium` skill (`weed`) | The feature carries a `.allium` |
+| Establish/verify traceability | [references/traceability.md](references/traceability.md) | Linking requirement → test → code |
+| See a full feature worked end-to-end | [references/worked-examples.md](references/worked-examples.md) | You want a concrete model to follow |
 
-The system is designed for grep-based traceability.
-Every requirement ID should appear in:
+## Traceability in one line
 
-```text
-REQ-RL-001
-  requirements.md   (definition)
-  design.md         (implementation approach)
-  executive.md      (status)
-  tests/            (@requirement REQ-RL-001)
-  src/              (// REQ-RL-001: description)
-  git log           (--grep="REQ-RL-001")
-```
+Every requirement gets an immutable `REQ-XX-###` that you can grep across the
+whole system: `requirements.md` defines it, `executive.md` tracks it, `.allium`
+references it, ADRs cite the ones they affect, code and tests carry it in
+comments. One `rg REQ-RL-001` shows you the requirement, its status, its precise
+behavior, the decisions behind it, and every line of code that implements it.
+Details and verification commands in
+[references/traceability.md](references/traceability.md).
 
-Code references: `// REQ-RL-001: Rate limiting implementation` Test references:
-`@requirement REQ-RL-001` or `// REQ-RL-001` Commit messages:
-`Implement rate limiting (REQ-RL-001)`
+## A few rules worth stating up front
+
+These are the ones that, when violated, quietly corrupt the system:
+
+- **REQ-IDs are immutable.** Never renumber, never reuse.
+  Deprecate (don’t delete), and back every deprecation with an ADR.
+- **Status lives only in `executive.md`.** Not in requirements, not in ADRs, not
+  in Allium.
+- **Specs are timeless; ADRs are not.** Keep dates, “we decided,” and
+  option-weighing *inside* ADRs and *out of* everything else.
+  When you resolve a question, state the outcome as a standing fact in the spec
+  and let the ADR hold the deliberation.
+- **Don’t invent scope.** Code with no `REQ-ID` behind it is the definition of
+  over-engineering here.
+  If a capability is worth building, it is worth a requirement first.
+
+## References
+
+- [references/design-philosophy.md](references/design-philosophy.md) — why there
+  is no `design.md`, and the temporal model behind the four artifacts
+- [references/ears-guide.md](references/ears-guide.md) — the EARS format,
+  patterns, and good vs.
+  bad requirements *(stage 2)*
+- [references/authoring.md](references/authoring.md) — writing `requirements.md`
+  and `executive.md`; document-separation rules *(stage 2)*
+- [references/adr-guide.md](references/adr-guide.md) — ADR format, lifecycle,
+  supersession, the shared-chain model, and the index pattern.
+  The format lives in [adrs/_TEMPLATE.md](adrs/_TEMPLATE.md);
+  [adrs/README.md](adrs/README.md) is the worked index; and
+  [adrs/000_no-design-document.md](adrs/000_no-design-document.md) is spEARS’s
+  own founding ADR — the worked exemplar, and proof the method is built with
+  itself.
+- [references/discovery.md](references/discovery.md) — Socratic discovery of
+  user need *(stage 3)*
+- [references/validation.md](references/validation.md) — validating the markdown
+  layer *(stage 3)*
+- [references/traceability.md](references/traceability.md) — grep-based
+  traceability and verification *(stage 3)*
+- [references/worked-examples.md](references/worked-examples.md) — full features
+  worked end-to-end *(stage 3)*
+
+Sibling skill: **allium** — the precise behavioral layer.
+spEARS without Allium is vague about exact behavior; Allium without spEARS is
+unmoored from user need.
