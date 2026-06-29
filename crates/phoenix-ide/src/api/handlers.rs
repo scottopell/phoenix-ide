@@ -4240,27 +4240,35 @@ async fn search_conversation_files(
     }
 
     let limit = query.limit.unwrap_or(50);
-    let indexer = state.file_indexer.as_ref().ok_or_else(|| {
-        AppError::Internal(
-            "file search unavailable: the filesystem watcher failed to initialize at startup"
-                .to_string(),
-        )
-    })?;
-    let paths = indexer
-        .search(root.clone(), &query.q, limit)
-        .await
-        .map_err(AppError::Internal)?;
-
-    let items: Vec<FileSearchEntry> = paths
-        .into_iter()
-        .map(|rel_path| {
-            let viewer = FileViewerKind::for_path(std::path::Path::new(&rel_path));
-            FileSearchEntry {
-                path: rel_path,
-                viewer,
-            }
-        })
-        .collect();
+    // Fast path: the per-workspace indexer is healthy. Serve from the
+    // in-memory path set; events keep it current.
+    //
+    // Fallback: notify failed to initialize at startup (typically the
+    // host exhausted `fs.inotify.max_user_instances`). Returning a 500
+    // here would regress Cmd+P from "slow but working" to "broken" in
+    // exactly the low-resource environment where init is most likely
+    // to fail, so fall through to the gitignore-aware walk that the
+    // /new composer's search already uses. Latency goes back to
+    // pre-cache levels until the operator can fix the host.
+    let items: Vec<FileSearchEntry> = match state.file_indexer.as_ref() {
+        Some(indexer) => {
+            let paths = indexer
+                .search(root.clone(), &query.q, limit)
+                .await
+                .map_err(AppError::Internal)?;
+            paths
+                .into_iter()
+                .map(|rel_path| {
+                    let viewer = FileViewerKind::for_path(std::path::Path::new(&rel_path));
+                    FileSearchEntry {
+                        path: rel_path,
+                        viewer,
+                    }
+                })
+                .collect()
+        }
+        None => search_files_in_root(&root, &query.q, limit),
+    };
 
     Ok(Json(FileSearchResponse { items }))
 }
