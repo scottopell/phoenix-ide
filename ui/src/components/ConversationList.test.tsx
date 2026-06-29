@@ -972,7 +972,7 @@ describe('Mobile conversation list redesign', () => {
   it('labels context-full mobile rows distinctly from task approvals', () => {
     const conv = makeConv('context-full', 'context-full', {
       presentation_mode: 'needs_action',
-      state: { type: 'context_exhausted' },
+      state: { type: 'context_exhausted', summary: 'Context is full' },
     });
 
     const { container } = render(

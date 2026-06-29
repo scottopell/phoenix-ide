@@ -98,7 +98,7 @@ const activeConversations: Conversation[] = [
   }),
   conv('direct', 'direct-mode-no-pr-with-long-path-context', {
     conv_mode_label: 'DIRECT',
-    project_name: undefined,
+    project_name: null,
     project_id: null,
     cwd: '/very/long/path/to/phoenix-mobile-fixture',
     updated_at: isoAgo(90),
