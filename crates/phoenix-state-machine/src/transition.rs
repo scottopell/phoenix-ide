@@ -2826,7 +2826,7 @@ pub fn transition_parent(
 /// Maps a `CancelCause` to the sub-agent terminal state and parent notification
 /// outcome. `Timeout` → `TimedOut`; `UserRequested` → `Failure { Cancelled }`.
 fn sub_agent_cancel_outcome(
-    cause: &CancelCause,
+    cause: CancelCause,
 ) -> (SubAgentState, SubAgentOutcome) {
     match cause {
         CancelCause::Timeout => (
@@ -2977,7 +2977,7 @@ pub fn transition_sub_agent(
                 },
             ),
         ) if *tool_use_id == settled_id => {
-            let (failed_state, notify_outcome) = sub_agent_cancel_outcome(cause);
+            let (failed_state, notify_outcome) = sub_agent_cancel_outcome(*cause);
             Ok(SubAgentTransitionResult::new(failed_state)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::NotifyParent {
@@ -3006,7 +3006,7 @@ pub fn transition_sub_agent(
             SubAgentState::Core(_),
             SubAgentEvent::Core(CoreEvent::UserCancel { cause, .. }),
         ) => {
-            let (failed_state, notify_outcome) = sub_agent_cancel_outcome(&cause);
+            let (failed_state, notify_outcome) = sub_agent_cancel_outcome(cause);
             Ok(SubAgentTransitionResult::new(failed_state)
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::NotifyParent {

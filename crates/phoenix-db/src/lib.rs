@@ -4863,6 +4863,7 @@ fn normalize_in_flight_round(
         completed_results,
         assistant_message,
         pending_sub_agents,
+        cause: _,
     } = state
     {
         let interrupted_tool_ids = std::iter::once(tool_use_id)
@@ -6862,6 +6863,7 @@ mod tests {
     async fn test_reset_materializes_cancelling_tool_round() {
         use phoenix_core::domain::db_schema::ToolResult;
         use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_event::CancelCause;
         use phoenix_core::domain::sm_state::{
             AssistantMessage, ConvState, ThinkInput, ToolCall, ToolInput,
         };
@@ -6910,6 +6912,7 @@ mod tests {
             )],
             assistant_message: assistant,
             pending_sub_agents: vec![],
+            cause: CancelCause::UserRequested,
         };
         db.update_conversation_state("conv-c", &state)
             .await
