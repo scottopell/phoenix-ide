@@ -4,13 +4,14 @@ import type { UsageData } from "./UsageData";
 
 /**
  * A message enriched for API output: bash `tool_use` blocks have their
- * `display` field merged into `content`. This is what `EnrichedMessage`
+ * `display` field merged into `content`, and `display_data.bash` is then
+ * stripped before the message is shipped. This is what `EnrichedMessage`
  * carries on the wire; `crate::db::Message` (the DB record) is the input.
  *
- * The transformation is implemented by [`enrich_content`] below, which
- * walks the `content` JSON and merges `display_data.bash[*].display` into
- * matching `tool_use` blocks. The semantics match the old
- * `enrich_message_for_api(&Message) -> Value` helper byte-for-byte.
+ * The transformation is implemented by [`enrich_content`] + `From<&Message>`:
+ * `enrich_content` walks `content` and merges `display_data.bash[*].display`
+ * into matching `tool_use` blocks; then `From<&Message>` removes the `bash`
+ * key from `display_data` so the same string is not duplicated on the wire.
  *
  * `content` and `display_data` stay as `serde_json::Value` — see the module
  * docs for the rationale.
