@@ -169,10 +169,10 @@ pub enum ExitState {
 /// A bash handle: identity + lifecycle state + watch-channel for exit notification.
 ///
 /// The handle is owned by exactly one `WorkScopeHandles` registry entry.
-/// `state` is `RwLock<Arc<HandleState>>` (per design.md) — peek and wait
-/// readers clone the `Arc` without holding the outer lock while they
-/// shape responses. Writers hold the outer lock for write to swap the
-/// `Arc`.
+/// `state` is `RwLock<Arc<HandleState>>` (ADR-002; `Handle` in
+/// `specs/bash/bash.allium`) so peek and wait readers can clone a stable
+/// snapshot without holding the outer lock while they shape responses.
+/// Writers hold the outer lock for write to swap the `Arc`.
 // `handle_id` and `work_scope` mirror the Allium `Handle` entity's
 // field names; renaming them to satisfy clippy's struct-name-prefix lint
 // would diverge from the spec.
@@ -267,8 +267,9 @@ impl Handle {
         *self.kill_attempt.read().await
     }
 
-    /// Receiver for the exit watch. Each `wait`/`spawn` call MUST clone
-    /// a fresh receiver from this method (see design.md "Watch-channel rule").
+    /// Receiver for the exit watch. Each `wait`/`run` call clones a fresh
+    /// receiver from this method so late subscribers still observe the most
+    /// recent terminal transition (`tokio::sync::watch` semantics; ADR-002).
     pub fn exit_observer(&self) -> watch::Receiver<Option<ExitState>> {
         self.exit_observer.clone()
     }

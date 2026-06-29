@@ -4,8 +4,8 @@
 //! four operation kinds. Each operation produces a structured JSON envelope
 //! delivered through [`ToolOutput`]. Errors use stable string identifiers
 //! (REQ-BASH-008); successful operations carry `status` + handle metadata
-//! per the design.md "Output Capture and Display" and bash.allium response
-//! rules.
+//! per the response rules in `specs/bash/bash.allium` and the requirement-side
+//! wire contracts in `specs/bash/requirements.md`.
 //!
 //! The request is a tagged enum (`BashRequest`) where each variant
 //! corresponds to exactly one of `cmd / peek / wait / kill` — making the
@@ -557,8 +557,9 @@ fn spawn_child(
     // Per bash.allium @guidance on HandleSpawned:
     //   "Spawn child via Command::new(\"bash\").args([\"-c\", cmd]) with
     //    pre_exec(setpgid(0,0))"
-    // The schema description and design.md text mention an `exec <cmd>`
-    // wrapping for the "user command replaces the bash shell" benefit.
+    // The user-facing bash contract still runs `bash -c <cmd>` (REQ-BASH-001),
+    // and the legacy design material's `exec <cmd>` variant is intentionally
+    // not used here for the reasons below.
     // That wrapping fundamentally breaks compound commands like
     // `cd /foo && cargo test` (`exec cd ...` errors because cd is a
     // builtin; even when the first word IS a program, the `&& <rest>`
@@ -901,8 +902,9 @@ async fn run_wait(
     };
 
     // Tombstone fast-path: if already terminal, return the tombstoned
-    // response immediately. Avoids the watch-channel-already-fired pitfall
-    // (design.md "Watch-channel rule").
+    // response immediately. Avoids parking on a receiver cloned after the
+    // terminal watch update already published (ADR-002 / `wait` rules in
+    // `specs/bash/bash.allium`).
     if handle.state().await.is_terminal() {
         return shape_handle_response(&handle, &read_args, ResponseKind::Wait, None).await;
     }
