@@ -687,7 +687,7 @@ mod enriched_message_tests {
 
     /// After `From<&Message>`, `display_data.bash` must not appear on the
     /// wire: `enrich_content` has already baked the display string into the
-    /// matching `content` tool_use block, so shipping it again would violate
+    /// matching `content` `tool_use` block, so shipping it again would violate
     /// the no-parallel-representations invariant.
     #[test]
     fn bash_stripped_from_display_data_after_content_merge() {
