@@ -912,6 +912,7 @@ describe('Mobile conversation list redesign', () => {
     expect(container.querySelector('[data-id="done-root"]')).toHaveClass('conv-item-chain-completed');
     expect(container.querySelector('[data-id="done-root"] .conv-item-title')?.textContent).toBe('done-root');
     expect(container.querySelector('[data-id="done-root"] .conv-project-label')?.textContent).toBe('project');
+    expect(container.querySelector('[data-id="done-leaf"] .conv-item-title')?.textContent).toBe('done-leaf');
   });
 
   it('keeps the active mobile chain expanded even for completed chains', async () => {
@@ -1045,7 +1046,9 @@ describe('Mobile conversation list redesign', () => {
     expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(0);
 
     fireEvent.keyDown(window, { key: 'j' });
-    expect(container.querySelector('.conv-chain-latest-summary')).toHaveClass('keyboard-selected');
+    const summary = container.querySelector('.conv-chain-latest-summary');
+    expect(summary).toHaveClass('keyboard-selected');
+    expect(summary).toHaveAttribute('data-id', 'kbd-leaf');
 
     fireEvent.keyDown(window, { key: 'Enter' });
     const calls = onPath.mock.calls;

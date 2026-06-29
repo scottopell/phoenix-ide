@@ -184,7 +184,7 @@ export const ConversationRow = memo(function ConversationRow({
   const visibleStateLabel = stateLabel(conv, displayState);
   const shouldShowMobileChainTitle = isMobileList
     && isChainMember
-    && (isCompactCompletedChainMember || isActive || isActionableDisplayState(displayState));
+    && (isCompactCompletedChainMember || isChainLatest || isActive || isActionableDisplayState(displayState));
 
   return (
     <li className={classes} data-id={conv.id}>
@@ -481,6 +481,7 @@ export const ChainBlock = memo(function ChainBlock({
       {collapsed && listDensity === 'mobile' && latestMember && (
         <button
           className={`conv-chain-latest-summary ${keyboardSelectedId === latestMember.id ? 'keyboard-selected' : ''}`}
+          data-id={latestMember.id}
           onClick={() => onRowClick(latestMember)}
           title={latestMember.slug ? `Open latest conversation "${latestMember.slug}"` : 'Open latest conversation'}
         >
