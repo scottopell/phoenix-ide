@@ -427,15 +427,17 @@ compact-mode inline tool strip and `ConversationNav`. Each passes its own
 color, prompt vs prose styling) lives at the call site while the keyboard,
 separator, and scroll behavior live once in the primitive.
 
-### Significance threshold — one definition for both features
+### Significance threshold — one definition of substantial prose
 
 `SIGNIFICANCE_THRESHOLD` (280 characters, in `useDensity.ts`) and its predicate
 `isSignificantText` are the single definition of "significant assistant prose".
-Compact density uses it to decide which assistant text blocks stay full versus
-fold into a faded one-liner (REQ-CONV-022); chapter derivation uses the *same*
-predicate to decide which assistant prose becomes a navigable chapter
-(REQ-CONV-023). One constant means a substantial finding is exactly the content
-the user can both skim past in compact mode and jump to from the nav strip.
+Chapter derivation uses the predicate to decide which assistant prose becomes a
+navigable chapter (REQ-CONV-023). Compact density uses it as the upper bound for
+prose that may fold into a faded one-liner, then applies a content-loss check:
+only previews that omit non-empty later lines or truncate the first non-empty
+line collapse (REQ-CONV-022). One constant means a substantial finding is always
+full-fidelity prose in compact mode and jumpable from the nav strip, while short
+single-line prose is not muted when the preview would show the same content.
 
 ### Compact density (REQ-CONV-022)
 
@@ -446,13 +448,12 @@ read via `useDensity` so `MessageComponents` consumes it without prop-drilling
 
 Density is purely presentational: `buildRenderUnits` remains the single source of
 truth for which messages render and how they group. Density changes only how an
-already-built `agent_turn` and short text block *paint*. The compact tool strip
-is derived by `deriveToolStripItems` from the turn's own `ContentBlock[]`
-tool_use blocks paired with `toolResultsByUseId` — never from phase
-state, so the strip reflects what the turn actually did. `think` blocks are
-excluded (model reasoning, already a self-collapsing aside). A streaming turn
-renders full regardless of density; compaction applies only once the turn is
-finalized.
+already-built `agent_turn` and eligible text block *paint*. The compact tool
+strip is derived by `deriveToolStripItems` from the turn's own `ContentBlock[]`
+tool_use blocks paired with `toolResultsByUseId` — never from phase state, so the
+strip reflects what the turn actually did. `think` blocks are excluded (model
+reasoning, already a self-collapsing aside). A streaming turn renders full
+regardless of density; compaction applies only once the turn is finalized.
 
 ### Conversation navigation over a virtualized list (REQ-CONV-023)
 

@@ -749,8 +749,8 @@ const AgentTextBlock = memo(function AgentTextBlock({
 });
 
 /**
- * An assistant text block that, in compact mode, is below the significance
- * threshold. Renders as a faded clickable one-liner that expands to the full
+ * An assistant text block that, in compact mode, has content hidden by its
+ * preview. Renders as a faded clickable one-liner that expands to the full
  * markdown on click — never destructive, the full text is always one click
  * away (and the title attr carries the first line for hover).
  */
@@ -1038,7 +1038,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
                 return null;
               }
               const remarkPlugins = usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
-              // Compact: short prose folds to a faded expandable one-liner.
+              // Compact: only previews that hide content fold to an expandable one-liner.
               // Substantial prose (>= threshold) always renders full.
               if (compact && shouldCollapseCompactText(block.text)) {
                 return (

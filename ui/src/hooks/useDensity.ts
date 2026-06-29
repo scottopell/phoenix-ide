@@ -17,15 +17,15 @@ export interface DensityContextValue {
 export const DENSITY_STORAGE_KEY = 'phoenix-conv-density';
 
 /**
- * Assistant `text` blocks shorter than this many characters are treated
- * as insignificant in compact mode and collapse to a faded one-liner;
- * prose at or above it always renders full. A single named constant so
- * the threshold has one home and can be tuned in one place.
+ * Assistant `text` blocks at or above this many characters are substantial:
+ * they always render full in compact mode and become conversation chapters.
+ * Shorter compact prose may still render full when its preview would not hide
+ * content.
  */
 export const SIGNIFICANCE_THRESHOLD = 280;
 
 /** True when an assistant text block is substantial enough to always
- *  render full, even in compact mode. */
+ *  render full and become a conversation chapter. */
 export function isSignificantText(text: string): boolean {
   return text.length >= SIGNIFICANCE_THRESHOLD;
 }
