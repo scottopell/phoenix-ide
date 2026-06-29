@@ -342,7 +342,11 @@ describe('inline tool timers', () => {
     const units = buildRenderUnits({
       messages: [agent, bashList, bashFind, readRoot, readRange],
       pendingMessages: [],
-      convState: { type: 'tool_executing', tool: 'read_file' },
+      convState: {
+        type: 'tool_executing',
+        current_tool: { id: 'tool-read-range', name: 'read_file', input: { path: 'SPEARS.md', offset: 1, limit: 240 } },
+        remaining_tools: [],
+      },
       streamingHandle: null,
     });
     const turn = units.historicalUnits.find((u) => u.kind === 'agent_turn');

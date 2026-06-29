@@ -1087,10 +1087,13 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
               const toolStartsMap = (message.display_data as Record<string, unknown> | undefined)?.[
                 'tool_starts'
               ] as Record<string, number> | undefined;
-              const isActiveTool = block.id !== undefined && block.id === activeToolUseId;
+              const toolUseId = block.id;
               const toolStartedAtMs =
-                isActiveTool && toolStartsMap && typeof toolStartsMap[block.id] === 'number'
-                  ? (toolStartsMap[block.id] as number)
+                toolUseId !== undefined &&
+                  toolUseId === activeToolUseId &&
+                  toolStartsMap &&
+                  typeof toolStartsMap[toolUseId] === 'number'
+                  ? (toolStartsMap[toolUseId] as number)
                   : undefined;
               return (
                 <ToolUseBlock
