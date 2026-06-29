@@ -1184,7 +1184,6 @@ function ConversationPageContent() {
     />
   );
   const showTerminal =
-    isDesktop &&
     !!conversationId &&
     !isArchived &&
     convStateForChildren.type !== 'terminal' &&
@@ -1242,6 +1241,38 @@ function ConversationPageContent() {
     isDesktop
     && isWideDesktop
     && (splitPanePrs !== null || paneDiffOpen || browserViewerOpen || inspectViewerOpen);
+
+  const terminalSplitPane = showTerminal ? (
+    <>
+      <PaneDivider
+        orientation="horizontal"
+        title="Drag to resize • Double-click to collapse/expand"
+        onPointerDown={(e) => terminalPane.startDrag(e, 'y', true, handleTerminalLiveResize)}
+        onDoubleClick={() => {
+          if (terminalPane.collapsed) {
+            terminalPane.expandFromCollapsed();
+          } else {
+            terminalPane.setCollapsed(true);
+          }
+        }}
+      />
+      <Suspense fallback={null}>
+        <TerminalPanel
+          scope={{ kind: 'conversation', conversationId: conversationId! }}
+          height={terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}
+          collapsed={terminalPane.collapsed}
+          onExpand={terminalPane.expandFromCollapsed}
+          onCollapse={() => terminalPane.setCollapsed(true)}
+          cwd={conversation.cwd}
+          shell={conversation.shell ?? undefined}
+          homeDir={conversation.home_dir ?? undefined}
+          onAssistSetup={handleAssistShellSetup}
+          showError={showError}
+          onSendSelectionToDraft={handleSendTerminalSelection}
+        />
+      </Suspense>
+    </>
+  ) : null;
 
   return (
     <ForkProposalsProvider
@@ -1562,6 +1593,7 @@ function ConversationPageContent() {
         </RenderProfiler>
         </>
       ) : null}
+      {!isDesktop && terminalSplitPane}
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
         slug={slug!}
@@ -1588,37 +1620,7 @@ function ConversationPageContent() {
 
       {/* Terminal split-pane (REQ-TERM-001) — collapsed = 32px header strip.
           Lazy-loaded so xterm (~200KB) stays out of the main bundle. */}
-      {showTerminal && (
-        <>
-          <PaneDivider
-            orientation="horizontal"
-            title="Drag to resize • Double-click to collapse/expand"
-            onPointerDown={(e) => terminalPane.startDrag(e, 'y', true, handleTerminalLiveResize)}
-            onDoubleClick={() => {
-              if (terminalPane.collapsed) {
-                terminalPane.expandFromCollapsed();
-              } else {
-                terminalPane.setCollapsed(true);
-              }
-            }}
-          />
-          <Suspense fallback={null}>
-            <TerminalPanel
-              scope={{ kind: 'conversation', conversationId: conversationId! }}
-              height={terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}
-              collapsed={terminalPane.collapsed}
-              onExpand={terminalPane.expandFromCollapsed}
-              onCollapse={() => terminalPane.setCollapsed(true)}
-              cwd={conversation.cwd}
-              shell={conversation.shell ?? undefined}
-              homeDir={conversation.home_dir ?? undefined}
-              onAssistSetup={handleAssistShellSetup}
-              showError={showError}
-              onSendSelectionToDraft={handleSendTerminalSelection}
-            />
-          </Suspense>
-        </>
-      )}
+      {isDesktop && terminalSplitPane}
 
       {/* Task approval overlay — browser back navigates away; SSE restores state on return. */}
       {showTaskApproval && !isArchived && atom.phase.type === 'awaiting_task_approval' && (

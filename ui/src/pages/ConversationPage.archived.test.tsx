@@ -177,7 +177,7 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(screen.getByRole('button', { name: /Work/ })).toBeInTheDocument();
   });
 
-  it('keeps mobile conversation chrome contiguous by hiding the terminal split pane', async () => {
+  it('keeps the conversation terminal inside mobile conversation chrome', async () => {
     viewportFlags.isDesktop = false;
     viewportFlags.isWideDesktop = false;
 
@@ -185,7 +185,8 @@ describe('ConversationPage archived read-only rendering', () => {
 
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
     expect(await screen.findByRole('textbox')).toBeInTheDocument();
-    expect(screen.queryByTestId('terminal-panel')).not.toBeInTheDocument();
+    expect(await screen.findByTestId('terminal-panel')).toBeInTheDocument();
+    expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('[data-testid="terminal-panel"]'));
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('#state-bar'));
   });
 });
