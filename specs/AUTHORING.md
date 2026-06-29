@@ -103,16 +103,21 @@ grep -oE '[a-z_]+\([a-z_]+' specs/<your-spec>/*.allium | sort -u
 Cross-reference with the Helpers block; anything missing is a typo
 or an undeclared helper.
 
-## 6. All four spec files agree on every named field / state / event
+## 6. The v2 artifacts agree on every named field / state / event
 
-The failure mode that ate the most rounds on PR #155.
-`requirements.md`, `design.md`, `executive.md`, and `<name>.allium`
-describe the same model from four angles. When you change a name in
-one, the others must follow.
+The failure mode that ate the most rounds on PR #155 was cross-artifact drift.
+Under spEARS v2 the current artifacts are `requirements.md`, optional
+`<name>.allium`, `executive.md`, and project-level ADRs under `specs/adrs/`.
+Existing `design.md` files are legacy source material, not a required current
+artifact for new specs.
+
+When you change a load-bearing name, grep the current artifacts and any legacy
+source material you touched:
 
 ```bash
-grep -n '<the-name>' specs/<your-spec>/*
-# Look for discrepancies: same name with different shapes
+grep -n '<the-name>' specs/<your-spec>/requirements.md specs/<your-spec>/executive.md specs/<your-spec>/*.allium specs/adrs/*.md
+# If the feature still has a legacy design.md, inspect it as source material too:
+grep -n '<the-name>' specs/<your-spec>/design.md
 ```
 
 Particularly load-bearing names:
@@ -121,8 +126,10 @@ Particularly load-bearing names:
 - Wire field names + types
 - Allium enum values referenced in rules
 - Helper function names
-- REQ-* identifiers (every REQ-ID should be referenced in the
-  Allium rule that models it, and in the executive.md status table)
+- REQ-* identifiers (every implemented REQ-ID should be referenced in the
+  Allium rule that models it when an Allium layer exists, and in the
+  executive.md status table)
+- ADR numbers that explain a design choice
 
 ## 7. Cross-spec whitelist audit
 
@@ -149,24 +156,38 @@ here. Grep your diff for the language that betrays a changelog:
 grep -nE 'task [0-9]{3,}|tasks/[0-9]|PR #|see #[0-9]|RESOLVED [0-9]|Open Question|Q[0-9]\. |Progress:|Status Summary|✅|currently|for now|at the moment|recently|previously|landed|MVP|rollout|stopgap' specs/<your-spec>/*
 ```
 
-For each hit, rewrite to a standing fact (see AGENTS.md "Specs are
-timeless" for the full list of what to excise):
+For each hit, rewrite according to the artifact's relationship with time (see
+AGENTS.md "Specs are artifact-aware about time" for the full list of what to
+excise):
 
-- Task/PR/bug references → name the **invariant or bug class** in
-  timeless terms; cross-reference other **specs by path**, not tasks
-  by ID.
-- `currently` / `for now` / `Phase 1 (current)` / `landed` → state
-  what *is*. (Sequential phases *within one operation* are fine.)
-- `✅ Complete` / `Progress: N of M` / per-rule status columns →
-  delete. A rule-to-code-anchor map is fine; a *status* table is not.
-- Resolved "Open Questions" / `RESOLVED <date>` decision logs →
-  restate the decision **as a fact with rationale** ("Design
-  Decisions" section) and delete the question.
+- Task/PR/bug references in `requirements.md` or `.allium` → name the
+  **invariant or bug class** in timeless terms; cross-reference other
+  **specs by path**, not tasks by ID.
+- `currently` / `for now` / `Phase 1 (current)` / `landed` in timeless
+  artifacts → state what *is*. (Sequential phases *within one operation* are
+  fine.)
+- `✅ Complete` / `Progress: N of M` / per-rule status columns outside
+  `executive.md` → delete. A rule-to-code-anchor map is fine; a *status* table
+  is not.
+- Resolved "Open Questions" / `RESOLVED <date>` decision logs in timeless
+  artifacts → restate the outcome as a standing fact and put the deliberation
+  in `specs/adrs/` when the rationale is durable.
 
 When you touch a spec, leave it more timeless than you found it — fix
 adjacent drift in the same file even if you didn't introduce it.
 
-## 9. `./dev.py tasks validate` passes
+## 9. spEARS v2 artifact shape validates
+
+```bash
+./dev.py check --lanes spec-shape
+```
+
+This validates the shared ADR chain (`specs/adrs/README.md`, `_TEMPLATE.md`, and
+numbered `NNN_<slug>.md` files) and classifies legacy `specs/*/design.md` files
+without treating them as required current artifacts. New specs do not need a
+`design.md`.
+
+## 10. `./dev.py tasks validate` passes
 
 ```bash
 ./dev.py tasks validate
@@ -175,7 +196,7 @@ adjacent drift in the same file even if you didn't introduce it.
 If the spec change is tied to a new task, validate the task file
 follows the canonical filename pattern.
 
-## 10. PR description matches the branch state
+## 11. PR description matches the branch state
 
 If your PR description claims a cross-spec import that the branch
 intentionally doesn't have (sibling spec in follow-up commit),

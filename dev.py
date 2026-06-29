@@ -2969,6 +2969,7 @@ _LANE_DEFS = [
     ("vitest", {"UI"}, "vitest run"),
     ("ast-grep", {"UI", "RUST", "ASTGREP"}, "structural lint rules over ui/src/ + crates/"),
     ("allium", {"SPECS"}, "allium spec validation"),
+    ("spec-shape", {"SPECS"}, "spEARS v2 artifact-shape validation"),
     # spec-anchors cross-validates REQ-* anchors in code against specs/, so a
     # change to either side can orphan or satisfy an anchor.
     ("spec-anchors", {"SPECS", "RUST", "UI"}, "REQ-* anchor cross-validation"),
@@ -4078,6 +4079,36 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
                 results.append(("spec anchors", 0, elapsed, ""))
             reporter.step_done("spec-anchors", "spec anchors", 0, elapsed)
 
+    def check_spec_shape():
+        """spEARS v2 artifact-shape validator. Fails on malformed shared
+        ADR-chain structure, but treats existing specs/*/design.md files
+        as legacy inventory rather than current-shape failures."""
+        t0 = time.monotonic()
+        reporter.step_start("spec-shape", "spec shape")
+        try:
+            result = _validate_spears_v2_shape(ROOT / "specs")
+        except Exception as e:
+            elapsed = time.monotonic() - t0
+            with results_lock:
+                results.append(("spec shape", 1, elapsed, f"scan failed: {e}"))
+            reporter.step_done("spec-shape", "spec shape", 1, elapsed)
+            return
+
+        elapsed = time.monotonic() - t0
+        if result.errors:
+            out = "\n".join(["spEARS v2 shape errors:", *[f"  {e}" for e in result.errors]])
+            with results_lock:
+                results.append(("spec shape", 1, elapsed, out))
+            reporter.step_done("spec-shape", "spec shape", 1, elapsed)
+        else:
+            detail = ""
+            if result.legacy_design_docs:
+                detail = f"legacy design.md files classified: {len(result.legacy_design_docs)}"
+            with results_lock:
+                results.append(("spec shape", 0, elapsed, detail))
+            reporter.step_done("spec-shape", "spec shape", 0, elapsed)
+            run_step("spec shape unit tests", [sys.executable, "-m", "unittest", "tests/devpy/test_spears_shape.py"])
+
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
     if ui_active:
@@ -4293,6 +4324,7 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         ("fast", lane_fast),
         ("ast-grep", check_ast_grep),
         ("allium", check_allium),
+        ("spec-shape", check_spec_shape),
         ("spec-anchors", check_spec_anchors),
         ("pkglock", check_package_lock_clean),
         ("e2e", lane_e2e),
@@ -4549,6 +4581,100 @@ def _scan_for_canonical_req_decls(specs_root: Path):
                         found[m.group(1)].append((rel, line_num))
                         break
     return found
+
+
+@dataclasses.dataclass
+class SpearsV2ShapeResult:
+    errors: list[str]
+    legacy_design_docs: list[str]
+
+
+def _validate_spears_v2_shape(specs_root: Path) -> SpearsV2ShapeResult:
+    """Validate repository-level spEARS v2 artifact shape.
+
+    This is deliberately narrow: it enforces the shared ADR-chain contract
+    and records legacy design docs as inventory. It does not require feature
+    specs to have design.md, and it does not fail the existing legacy corpus
+    just because design.md is present.
+    """
+    errors: list[str] = []
+    legacy_design_docs: list[str] = []
+
+    def rel(path: Path) -> str:
+        try:
+            return str(path.relative_to(ROOT))
+        except ValueError:
+            return str(path)
+
+    if not specs_root.is_dir():
+        return SpearsV2ShapeResult(errors=[f"{specs_root}: specs directory not found"], legacy_design_docs=[])
+
+    for design in sorted(specs_root.glob("*/design.md")):
+        legacy_design_docs.append(rel(design))
+
+    adrs = specs_root / "adrs"
+    if not adrs.is_dir():
+        errors.append("specs/adrs/: shared ADR chain directory is required")
+        return SpearsV2ShapeResult(errors=errors, legacy_design_docs=legacy_design_docs)
+
+    template = adrs / "_TEMPLATE.md"
+    readme = adrs / "README.md"
+    if not template.is_file():
+        errors.append("specs/adrs/_TEMPLATE.md is required")
+    if not readme.is_file():
+        errors.append("specs/adrs/README.md is required")
+
+    adr_re = re.compile(r"^(\d{3})_[a-z0-9][a-z0-9-]*\.md$")
+    numbered: list[tuple[int, Path]] = []
+    for path in sorted(adrs.glob("*.md")):
+        if path.name in {"README.md", "_TEMPLATE.md"}:
+            continue
+        m = adr_re.match(path.name)
+        if not m:
+            errors.append(f"{rel(path)}: ADR filename must be NNN_<slug>.md")
+            continue
+        numbered.append((int(m.group(1)), path))
+
+    if numbered:
+        nums = [n for n, _ in numbered]
+        expected = list(range(min(nums), max(nums) + 1))
+        if nums != expected:
+            errors.append(
+                "specs/adrs/: ADR numbers must be sequential without gaps "
+                f"(found {', '.join(f'{n:03d}' for n in nums)})"
+            )
+    else:
+        errors.append("specs/adrs/: at least one numbered ADR is required")
+
+    for _num, path in numbered:
+        try:
+            text = path.read_text()
+        except (UnicodeDecodeError, OSError) as e:
+            errors.append(f"{rel(path)}: cannot read ADR: {e}")
+            continue
+        if not re.search(r"^- \*\*Status:\*\*\s+\S+", text, re.MULTILINE):
+            errors.append(f"{rel(path)}: missing '- **Status:** ...'")
+        if not re.search(r"^- \*\*Date:\*\*\s+\d{4}-\d{2}-\d{2}", text, re.MULTILINE):
+            errors.append(f"{rel(path)}: missing '- **Date:** YYYY-MM-DD'")
+        if not re.search(r"^- \*\*Affects:\*\*\s+\S+", text, re.MULTILINE):
+            errors.append(f"{rel(path)}: missing '- **Affects:** ...'")
+        for heading in ("## Context", "## Options considered", "## Decision", "## Consequences"):
+            if heading not in text:
+                errors.append(f"{rel(path)}: missing '{heading}'")
+
+    if readme.is_file():
+        try:
+            readme_text = readme.read_text()
+        except (UnicodeDecodeError, OSError) as e:
+            errors.append(f"specs/adrs/README.md: cannot read ADR index: {e}")
+        else:
+            indexed = set(re.findall(r"\[(\d{3})\]\((\d{3}_[^)]+\.md)\)", readme_text))
+            for num, path in numbered:
+                key = (f"{num:03d}", path.name)
+                if key not in indexed:
+                    errors.append(f"specs/adrs/README.md: missing index row/link for {path.name}")
+
+    return SpearsV2ShapeResult(errors=errors, legacy_design_docs=legacy_design_docs)
 
 
 def cmd_audit_specs(verbose: bool = False) -> bool:
@@ -4979,6 +5105,7 @@ _GRAPH_LANE_STEPS = {
     "vitest": ["vitest run"],
     "ast-grep": ["structural rules over ui/src/ + crates/"],
     "allium": ["allium analyse specs/*/*.allium"],
+    "spec-shape": ["spEARS v2 artifact-shape validation", "python unittest tests/devpy/test_spears_shape.py"],
     "spec-anchors": ["REQ-* anchor cross-validation"],
     "e2e": ["uv run tests/e2e/run.py (real binary)"],
     "fast": ["cargo fmt --check", "task validation"],
