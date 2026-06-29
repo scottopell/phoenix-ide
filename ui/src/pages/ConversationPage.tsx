@@ -1184,6 +1184,7 @@ function ConversationPageContent() {
     />
   );
   const showTerminal =
+    isDesktop &&
     !!conversationId &&
     !isArchived &&
     convStateForChildren.type !== 'terminal' &&

@@ -838,6 +838,33 @@ describe('Mobile conversation list redesign', () => {
     expect(desktop.querySelector('[data-id="with-pr"] a.sidebar-pr-badge')).not.toBeNull();
   });
 
+  it('keeps the mobile timestamp in a separate trailing slot from slug and badges', () => {
+    const conv = makeConv('with-long-mobile-row', 'very-long-mobile-conversation-title-that-must-truncate', {
+      cached_pr: pr(),
+      conv_mode_label: 'WORK',
+      presentation_mode: 'needs_action',
+      state: { type: 'awaiting_task_approval', title: 'Approve', priority: 'p2', plan: 'Plan' },
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[conv]} />
+      </MemoryRouter>,
+    );
+
+    const row = container.querySelector('[data-id="with-long-mobile-row"]')!;
+    const slugLine = row.querySelector<HTMLElement>('.conv-item-slug')!;
+    const slugMain = row.querySelector<HTMLElement>('.conv-item-slug-main')!;
+    const time = row.querySelector<HTMLElement>('.conv-item-time-mobile')!;
+
+    expect(Array.from(slugLine.children)).toEqual(expect.arrayContaining([slugMain, time]));
+    expect(slugMain).toContainElement(row.querySelector('.conv-item-title'));
+    expect(slugMain).toContainElement(row.querySelector('.conv-state-chip'));
+    expect(slugMain).toContainElement(row.querySelector('.conv-mode-badge'));
+    expect(slugMain).toContainElement(row.querySelector('.sidebar-pr-badge'));
+    expect(slugMain).not.toContainElement(time);
+  });
+
   it('defaults mobile chains to a compact summary with separate chain and latest-conversation targets', () => {
     const root = makeConv('root-id', 'root-slug', {
       updated_at: '2024-01-01T00:00:00Z',

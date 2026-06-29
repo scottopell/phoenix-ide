@@ -10,6 +10,8 @@ import { DraftStore } from '../conversation/DraftStore';
 import { api, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 
+const viewportFlags = vi.hoisted(() => ({ isDesktop: true, isWideDesktop: true }));
+
 vi.mock('../api', async () => {
   const actual = await vi.importActual<typeof import('../api')>('../api');
   return {
@@ -47,8 +49,8 @@ vi.mock('../hooks', async () => {
   return {
     ...actual,
     useConnection: () => ({ state: 'connected', attempt: 0, nextRetryIn: null, retryNow: vi.fn() }),
-    useIsDesktop: () => true,
-    useIsWideDesktop: () => true,
+    useIsDesktop: () => viewportFlags.isDesktop,
+    useIsWideDesktop: () => viewportFlags.isWideDesktop,
   };
 });
 
@@ -142,6 +144,8 @@ function renderPage(conversation: Conversation) {
 }
 
 afterEach(() => {
+  viewportFlags.isDesktop = true;
+  viewportFlags.isWideDesktop = true;
   vi.restoreAllMocks();
 });
 
@@ -171,5 +175,17 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(screen.getByTestId('work-control-bar')).toBeInTheDocument();
     expect(screen.getByTestId('file-tree')).toHaveTextContent('/repo/.phoenix/worktrees/conv-archived');
     expect(screen.getByRole('button', { name: /Work/ })).toBeInTheDocument();
+  });
+
+  it('keeps mobile conversation chrome contiguous by hiding the terminal split pane', async () => {
+    viewportFlags.isDesktop = false;
+    viewportFlags.isWideDesktop = false;
+
+    renderPage(makeConversation());
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(await screen.findByRole('textbox')).toBeInTheDocument();
+    expect(screen.queryByTestId('terminal-panel')).not.toBeInTheDocument();
+    expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('#state-bar'));
   });
 });

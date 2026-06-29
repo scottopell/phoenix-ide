@@ -121,3 +121,8 @@ export const mobileConversationListFixtureData: MobileConversationListFixtureDat
 export const mobileConversationListScenarios: MobileConversationListScenario[] = mobileConversationListScenarioDefinitions.map((scenario) => ({
   ...scenario,
 }));
+
+export function getMobileConversationListScenario(id: string | null | undefined): MobileConversationListScenario {
+  return mobileConversationListScenarios.find((scenario) => scenario.id === id)
+    ?? mobileConversationListScenarios[0]!;
+}

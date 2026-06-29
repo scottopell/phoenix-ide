@@ -194,53 +194,55 @@ export const ConversationRow = memo(function ConversationRow({
         title={conv.slug ? `Open conversation "${conv.slug}"` : 'Open conversation'}
       >
         <div className="conv-item-slug">
-          <span
-            className={`conv-state-dot ${displayState}`}
-            title={stateTitle}
-          />
-          {isMobileList && (displayState === 'working' || displayState === 'error' || displayState === 'awaiting-approval') && (
-            <span className={`conv-state-chip ${displayState}`}>{visibleStateLabel}</span>
-          )}
-          {chainIndex !== undefined ? (
-            shouldShowMobileChainTitle ? (
-              <>
+          <span className="conv-item-slug-main">
+            <span
+              className={`conv-state-dot ${displayState}`}
+              title={stateTitle}
+            />
+            {isMobileList && (displayState === 'working' || displayState === 'error' || displayState === 'awaiting-approval') && (
+              <span className={`conv-state-chip ${displayState}`}>{visibleStateLabel}</span>
+            )}
+            {chainIndex !== undefined ? (
+              shouldShowMobileChainTitle ? (
+                <>
+                  <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
+                    #{chainIndex + 1}
+                  </span>
+                  <span className="conv-item-title">{conv.slug}</span>
+                </>
+              ) : (
                 <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
                   #{chainIndex + 1}
                 </span>
-                <span className="conv-item-title">{conv.slug}</span>
-              </>
+              )
             ) : (
-              <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
-                #{chainIndex + 1}
+              <span className="conv-item-title">{conv.slug}</span>
+            )}
+            {isChainLatest && (
+              <span className="conv-chain-latest-badge" title="Latest in chain — click to continue">
+                latest
               </span>
-            )
-          ) : (
-            <span className="conv-item-title">{conv.slug}</span>
-          )}
-          {isChainLatest && (
-            <span className="conv-chain-latest-badge" title="Latest in chain — click to continue">
-              latest
-            </span>
-          )}
-          {conv.conv_mode_label && (
-            <span
-              className="conv-mode-badge"
-              title={
-                conv.conv_mode_label.toLowerCase() === 'explore'
-                  ? 'Managed mode (read-only exploration)'
-                  : conv.conv_mode_label.toLowerCase() === 'work'
-                    ? 'Managed mode (task branch)'
-                    : conv.conv_mode_label.toLowerCase() === 'direct'
-                      ? 'Full access (Direct mode)'
-                      : conv.conv_mode_label.toLowerCase() === 'branch'
-                        ? 'Branch mode (existing branch)'
-                        : conv.conv_mode_label
-              }
-            >
-              {conv.conv_mode_label}
-            </span>
-          )}
-          {cachedPrForBadge && <PrBadge pr={cachedPrForBadge} interactive={!isMobileList} />}
+            )}
+            {conv.conv_mode_label && (
+              <span
+                className="conv-mode-badge"
+                title={
+                  conv.conv_mode_label.toLowerCase() === 'explore'
+                    ? 'Managed mode (read-only exploration)'
+                    : conv.conv_mode_label.toLowerCase() === 'work'
+                      ? 'Managed mode (task branch)'
+                      : conv.conv_mode_label.toLowerCase() === 'direct'
+                        ? 'Full access (Direct mode)'
+                        : conv.conv_mode_label.toLowerCase() === 'branch'
+                          ? 'Branch mode (existing branch)'
+                          : conv.conv_mode_label
+                }
+              >
+                {conv.conv_mode_label}
+              </span>
+            )}
+            {cachedPrForBadge && <PrBadge pr={cachedPrForBadge} interactive={!isMobileList} />}
+          </span>
           {isMobileList && (
             <span
               className="conv-item-time conv-item-time-mobile"

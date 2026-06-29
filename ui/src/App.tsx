@@ -51,6 +51,9 @@ const LlmLanguagePage = lazy(() =>
 const GroundingPanelFixturePage = import.meta.env.DEV
   ? lazy(() => import('./pages/GroundingPanelFixturePage').then((m) => ({ default: m.GroundingPanelFixturePage })))
   : null;
+const MobileConversationListFixturePage = import.meta.env.DEV
+  ? lazy(() => import('./pages/MobileConversationListFixturePage').then((m) => ({ default: m.MobileConversationListFixturePage })))
+  : null;
 
 /** Route loading fallback — blank div sized to the viewport to avoid CLS. */
 function RouteFallback() {
@@ -88,6 +91,9 @@ function AppRoutes() {
         <Routes>
           {GroundingPanelFixturePage && (
             <Route path="/__qa/grounding-panel" element={<GroundingPanelFixturePage />} />
+          )}
+          {MobileConversationListFixturePage && (
+            <Route path="/__qa/mobile-conversation-list" element={<MobileConversationListFixturePage />} />
           )}
           {/* Share view: minimal layout, no sidebar, no auth required */}
           <Route path="/s/:token" element={<SharePage />} />
