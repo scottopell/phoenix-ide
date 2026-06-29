@@ -167,9 +167,12 @@ JSON shape; conceptually:
 
 Each spawned sub-agent has a stable terminal-wait handle: the child conversation /
 agent id already allocated for parent fan-in and inline status. Wake contracts use
-that identity directly. A sub-agent handle is not WorkScope-keyed: WorkScope
-inheritance may move bash/tmux resources to a continuation, but it does not move
-an already-spawned child conversation to a different parent transcript.
+that identity directly while the child runtime is active. A sub-agent handle is
+not WorkScope-keyed: WorkScope inheritance may move bash/tmux resources to a
+continuation, but it does not move an already-spawned child conversation to a
+different parent transcript. Because active sub-agent runtimes do not survive
+Phoenix restart, pending sub-agent wake contracts fire forgotten during wake
+router startup resync.
 
 A wake on a sub-agent handle delivers only terminal outcomes:
 

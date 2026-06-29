@@ -189,8 +189,9 @@ The watchable handle kinds fall into two keying classes:
   wake at the wrong conversation.
 
 `Forgotten` is the terminal cause when a watched handle is destroyed:
-a Phoenix restart that drops in-memory bash handles (see REQ-WAKE-002),
-or a hard-delete that tears down a WorkScope with no inheritor.
+a Phoenix restart that drops in-memory bash handles or active sub-agent runtimes
+(see REQ-WAKE-002), or a hard-delete that tears down a WorkScope with no
+inheritor.
 
 ### User-interrupt semantics during a wait
 

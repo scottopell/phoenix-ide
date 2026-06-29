@@ -66,10 +66,10 @@ truth for "is this conv waiting on something." (See design.md
 
 **Persistence boundary:** wake contracts are persisted to SQLite. They
 survive Phoenix restart. A contract registered against a handle that
-itself does not survive restart (e.g., bash handles per
-`specs/bash/`) MUST fire a terminal `forgotten` event on restart so the
-LLM is not left waiting on a signal that can no longer occur. The
-contract is a *Phoenix-side commitment to fire the conversation* — its
+itself does not survive restart (e.g., bash handles per `specs/bash/`, or active
+sub-agent runtimes per `specs/subagents/`) MUST fire a terminal `forgotten` event
+on restart so the LLM is not left waiting on a signal that can no longer occur.
+The contract is a *Phoenix-side commitment to fire the conversation* — its
 durability does not depend on the underlying handle's durability.
 
 **Scope:** wake contracts are conversation-scoped, not WorkScope-scoped.
@@ -467,8 +467,8 @@ THE SYSTEM SHALL deliver `outcome: failure` with the submitted error text and
 `error_kind`.
 
 WHEN the child reaches wall-clock timeout
-THE SYSTEM SHALL deliver `outcome: failure`, `error_kind: timeout`, and a message
-stating that the child exceeded its configured timeout.
+THE SYSTEM SHALL deliver `outcome: failure`, `error_kind: timed_out`, and a
+message stating that the child exceeded its configured timeout.
 
 WHEN the child is cancelled by the parent, user, or lifecycle cascade
 THE SYSTEM SHALL deliver `outcome: failure`, `error_kind: cancelled`, and the
@@ -506,27 +506,19 @@ router startup.
 
 A `SubAgent` wake handle SHALL be addressed by the child conversation / agent id
 created for the sub-agent. It is not WorkScope-keyed and SHALL NOT transfer across
-WorkScope inheritance. Parent cancellation and child cancellation produce a
-terminal cancelled payload; parent hard-delete deletes the child through normal
-conversation cascade and either cancels the pending wake before deletion or, if
-only the orphaned contract remains observable, fires forgotten.
+WorkScope inheritance. Because active sub-agent runtimes do not survive Phoenix
+restart, startup resync fires pending sub-agent waits as
+`Forgotten { reason: "phoenix_restart" }`. Parent cancellation and child
+cancellation produce a terminal cancelled payload; parent hard-delete deletes the
+child through normal conversation cascade and either cancels the pending wake
+before deletion or, if only the orphaned contract remains observable, fires
+forgotten.
 
 **Rationale:** The three v1 handle kinds deliberately use their existing stable
 identities. The wake plane does not invent a parallel handle namespace, and it
 does not treat sub-agents as WorkScope resources.
 
 ---
-
-## Implementation Sequence
-
-1. Improve the sub-agent grace-turn prompt so Work sub-agents do not present
-   incomplete implementation as success.
-2. Land the tightened wake-contract and sub-agent terminal-handle specs.
-3. Implement persisted wake contracts and the wake router for bash/tmux terminal
-   handles.
-4. Expose sub-agent terminal handles through the same wake plane.
-5. Evaluate whether blocking `AwaitingSubAgents` remains compatibility sugar or
-   lowers onto wake contracts internally.
 
 ## Status
 
@@ -548,7 +540,7 @@ does not treat sub-agents as WorkScope resources.
 | REQ-WAKE-014 | Proposed | Tool description discipline |
 | REQ-WAKE-015 | Proposed | Cost observability metrics |
 | REQ-WAKE-016 | Proposed | Unified `wait_until` tool, not per-substrate |
-| REQ-WAKE-017 | Proposed | Sub-agent terminal payloads for success, error, timeout, cancellation, turn-limit fallback, forgotten |
+| REQ-WAKE-017 | Proposed | Sub-agent terminal payloads for success, error, timed_out, cancellation, turn-limit fallback, forgotten |
 | REQ-WAKE-018 | Proposed | V1 handle identity/lifecycle for bash, tmux, and sub-agent handles |
 
 **Progress:** 0 of 18 implemented.

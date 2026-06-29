@@ -90,7 +90,7 @@ value SubAgentTerminalPayload {
     outcome: SubAgentTerminalOutcome
     result_text: String?           -- present for submit_result success
     error_text: String?            -- present for submitted/fallback failures
-    error_kind: String?            -- submit_error kind, timeout, cancelled, turn_limit_exhausted
+    error_kind: String?            -- submit_error kind, timed_out, cancelled, turn_limit_exhausted
     partial_text: String?          -- present when turn-limit hard-stop extracts assistant text
 }
 
@@ -204,11 +204,12 @@ config {
     -- Cadence at which the wake_router evaluates handle_terminal
     -- conditions. Other condition kinds may have different cadences.
 
-    forgotten_on_restart_for_kinds: Set<HandleKind> = {bash}
-    -- HandleKinds whose handles do not survive Phoenix restart. On
+    forgotten_on_restart_for_kinds: Set<HandleKind> = {bash, subagent}
+    -- HandleKinds whose active handles do not survive Phoenix restart. On
     -- restart, every pending contract referencing one of these kinds
-    -- fires forgotten with reason = "phoenix_restart". tmux_pane and
-    -- subagent are durable; bash handles are in-memory and are not.
+    -- fires forgotten with reason = "phoenix_restart". bash handles are
+    -- in-memory, and active sub-agent runtimes do not survive restart.
+    -- tmux_pane handles may survive and are re-registered when present.
 
     workscope_keyed_kinds: Set<HandleKind> = {bash, tmux_pane}
     -- HandleKinds whose handles are WorkScope-level resources and so
@@ -326,7 +327,7 @@ rule WakeRouterFiresOnConditionHold {
         --
         -- For handle.kind = subagent, payload.sub_agent_payload is populated with
         -- one of the REQ-WAKE-017 terminal outcomes: submit_result success,
-        -- submit_error failure, timeout, cancellation, turn-limit hard-stop fallback,
+        -- submit_error failure, timed_out, cancellation, turn-limit hard-stop fallback,
         -- or forgotten child handle. The wake payload never resumes the child or
         -- grants more budget.
         -- The synthetic tool result is appended to the conv message

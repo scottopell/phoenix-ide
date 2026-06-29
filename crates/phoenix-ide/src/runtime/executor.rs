@@ -4029,7 +4029,7 @@ where
                 // UI-only bookkeeping and not sent to the LLM).
                 let msg_id = uuid::Uuid::new_v4().to_string();
                 let grace_prompt = if matches!(
-                    self.context.mode_context,
+                    &self.context.mode_context,
                     Some(ModeContext::Explore { .. })
                 ) {
                     "You have reached your turn limit. Please call submit_result now \
@@ -4037,9 +4037,9 @@ where
                 } else {
                     "You have reached your turn limit. Do not call any tools except submit_result \
                          or submit_error. If your assigned task required code changes and you have \
-                         not made them, do not present the task as complete. Call submit_error, or \
-                         use submit_result only if it explicitly says the implementation is incomplete \
-                         and includes the useful analysis, plan, and blockers for the parent."
+                         not made them, call submit_error and include the useful analysis, plan, \
+                         blockers, and any partial progress for the parent. Only call submit_result \
+                         if the assigned implementation is actually complete."
                 };
                 let content = MessageContent::User(crate::db::UserContent::meta(grace_prompt));
                 if let Err(e) = self

@@ -75,7 +75,7 @@ only the architectural seams.
 | **REQ-SA-007:** Model Tier Selection | ✅ Superseded | Replaced by REQ-PROJ-008 mode defaults + explicit `model` override |
 | **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |
 | **REQ-SA-009:** Terminal Handle Identity for Wake Contracts | Proposed | Child conversation / agent id is the sub-agent wake handle |
-| **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Work grace prompt warns against reporting incomplete implementation as success |
+| **REQ-SA-010:** Turn-Limit Grace Prompt Integrity | ✅ Complete | Work grace prompt routes unfinished required edits through `submit_error` |
 
 **Progress:** 8 of 10 implemented (one explicitly superseded; one deferred; one proposed for wake runtime).
 

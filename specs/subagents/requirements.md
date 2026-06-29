@@ -183,6 +183,10 @@ THE SYSTEM SHALL report terminal outcomes for successful `submit_result`,
 `submit_error`, wall-clock timeout, cancellation, turn-limit hard-stop fallback,
 and forgotten child handle
 
+WHEN Phoenix restarts while a sub-agent wake contract is pending
+THE SYSTEM SHALL treat the sub-agent handle as forgotten because active sub-agent
+runtimes do not survive restart
+
 THE sub-agent wake handle SHALL NOT be keyed by the parent's WorkScope and SHALL
 NOT imply parent-to-child continuation or automatic budget extension
 
@@ -201,9 +205,8 @@ completion
 
 WHEN the assigned Work task required code changes and the sub-agent has not made
 them
-THE SYSTEM SHALL instruct it to call `submit_error` or explicitly report the
-implementation as incomplete while preserving useful analysis, plan details, and
-blockers for the parent
+THE SYSTEM SHALL instruct it to call `submit_error` while preserving useful
+analysis, plan details, blockers, and partial progress for the parent
 
 WHEN an Explore sub-agent reaches its turn limit
 THE SYSTEM MAY continue to use analysis-oriented grace guidance because Explore

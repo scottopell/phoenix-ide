@@ -69,8 +69,8 @@ consequence of continuation.
 
 Mandatory `expires_at` (default 600s, cap 1800s) prevents unbounded
 commitments. Restart resync re-registers non-fired contracts; any
-contract whose underlying handle did not survive the restart — bash handles,
-which are in-memory — immediately fires `Forgotten`, never silently
+contract whose underlying handle did not survive the restart — bash handles and
+active sub-agent runtimes — immediately fires `Forgotten`, never silently
 abandoned.
 
 The LLM-facing surface is a single unified `wait_until { handle: {
@@ -100,7 +100,7 @@ land separately.
 | REQ-WAKE-014 Tool Description | Proposed | Explicit cost model + when-to-use guidance |
 | REQ-WAKE-015 Cost Observability | Proposed | Metrics on registration / fire / forgotten breakdown |
 | REQ-WAKE-016 Unified Tool Surface | Proposed | Single `wait_until` tool, tagged-enum handle discriminator |
-| REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Success, error, timeout, cancellation, turn-limit fallback, forgotten child |
+| REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Success, error, timed_out, cancellation, turn-limit fallback, forgotten child |
 | REQ-WAKE-018 Handle Identity + Lifecycle | Proposed | Bash/tmux WorkScope-keyed; sub-agent keyed by child conversation / agent id |
 
 **Progress:** 0 of 18 implemented.
