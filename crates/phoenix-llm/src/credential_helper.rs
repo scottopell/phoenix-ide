@@ -459,7 +459,9 @@ mod tests {
                 break;
             }
         }
-        h.wait_for_settlement().await;
+        timeout(TICK, h.wait_for_settlement())
+            .await
+            .expect("helper should settle within the timeout");
         out
     }
 
