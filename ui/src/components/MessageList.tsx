@@ -458,7 +458,11 @@ function MessageListImpl({
   // `followOutput={false}` disables ALL of Virtuoso's built-in auto-scroll
   // (both the totalCount-based followOutput and the size-increase handler).
   // This callback is the SOLE auto-scroll mechanism. It is necessary because
-  // Virtuoso's built-in mechanisms don't handle streaming token growth:
+  // Virtuoso's built-in mechanisms don't handle streaming token growth.
+  // Verified against react-virtuoso 4.18.7 — re-evaluate on upgrade: a future
+  // version could change the `followOutput !== false` guard or the
+  // `notAtBottomBecause` priority order, silently re-enabling the buggy
+  // size-increase handler or altering atBottomStateChange semantics.
   //   - totalCount-based followOutput only fires when `data.length` grows
   //     (new items appended), not when the last item's height changes.
   //   - the size-increase handler fires on `atBottom` true→false transitions
@@ -533,6 +537,14 @@ function MessageListImpl({
       const subAgentsActive = convStateRef.current.type === 'awaiting_sub_agents';
       if (streamingActive || subAgentsActive) {
         setHasUnreadTailContent(true);
+      } else {
+        // Height grew, user is past the pin threshold, but no genuine tail
+        // activity was detected — the callback is intentionally not acting.
+        // Log so this silent no-op is distinguishable from a bug in production.
+        console.debug('[MessageList] height grew but not re-snapping (past threshold, no tail activity)', {
+          oldFromBottom,
+          heightDelta: newHeight - prevHeight,
+        });
       }
     }
   }, [conversationId]);
