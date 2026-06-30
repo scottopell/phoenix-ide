@@ -254,6 +254,7 @@ struct ModelFinding {
     confidence: Option<String>,
     file: Option<String>,
     line: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
     symbol: Option<String>,
     title: Option<String>,
     rationale: Option<String>,
@@ -390,11 +391,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
             findings_trust: FindingsTrust::Low,
             stage_status: ReviewStageStatus {
                 target_collection: StageStatus::Ok,
-                diff_collection: if has_unreviewed {
-                    StageStatus::Partial
-                } else {
-                    StageStatus::Ok
-                },
+                diff_collection: diff_stage_status(&collection.warnings, has_unreviewed),
                 llm_review: StageStatus::Skipped,
                 json_parse: StageStatus::Skipped,
                 finding_extraction: StageStatus::Skipped,
@@ -521,9 +518,12 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         cache_creation_tokens += response.usage.cache_creation_tokens;
         cache_read_tokens += response.usage.cache_read_tokens;
         let (mut chunk_findings, chunk_summary, chunk_warnings) = parse_findings(&response.text());
+        let chunk_parse_failed = has_warning(&chunk_warnings, "model_output_parse");
         findings.append(&mut chunk_findings);
-        if let Some(summary) = chunk_summary.filter(|s| !s.trim().is_empty()) {
-            reviewer_summaries.push(summary);
+        if !chunk_parse_failed {
+            if let Some(summary) = chunk_summary.filter(|s| !s.trim().is_empty()) {
+                reviewer_summaries.push(summary);
+            }
         }
         warnings.extend(chunk_warnings);
     }
@@ -532,34 +532,27 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     warnings.extend(collection.warnings);
     let unreviewed = collection.unreviewed;
     let has_unreviewed = !unreviewed.is_empty();
+    let (status, findings_status, findings_trust, retry_recommendation) =
+        completed_result_contract(&warnings, !findings.is_empty(), has_unreviewed);
     let review_status = if warnings.is_empty() && !has_unreviewed {
         ReviewCompletionStatus::Completed
     } else {
         ReviewCompletionStatus::CompletedWithWarnings
     };
-    let findings_trust = findings_trust_for_completed(&warnings);
 
     Ok(finalize_review_output(ReviewOutputDraft {
-        status: if has_unreviewed {
-            ReviewStatus::Partial
-        } else {
-            ReviewStatus::Success
-        },
+        status,
         review_status,
-        findings_status: FindingsStatus::Complete,
+        findings_status,
         findings_trust,
         stage_status: ReviewStageStatus {
             target_collection: StageStatus::Ok,
-            diff_collection: if has_unreviewed {
-                StageStatus::Partial
-            } else {
-                diff_stage_status(&warnings)
-            },
+            diff_collection: diff_stage_status(&warnings, has_unreviewed),
             llm_review: StageStatus::Ok,
             json_parse: json_parse_stage_status(&warnings),
             finding_extraction: finding_extraction_stage_status(&warnings),
         },
-        retry_recommendation: RetryRecommendation::DoNotRetry,
+        retry_recommendation,
         summary: ReviewSummary {
             target: target.summary,
             files_changed: collection.files_changed,
@@ -649,7 +642,10 @@ fn interrupted_review_output(
         findings_trust,
         stage_status: ReviewStageStatus {
             target_collection: StageStatus::Ok,
-            diff_collection: diff_stage_status(&interrupted.warnings),
+            diff_collection: diff_stage_status(
+                &interrupted.warnings,
+                !collection.unreviewed.is_empty(),
+            ),
             llm_review: match interrupted.interruption {
                 ReviewInterruption::Timeout => StageStatus::Timeout,
                 ReviewInterruption::Failed => StageStatus::Failed,
@@ -682,6 +678,49 @@ fn interrupted_review_output(
         findings: interrupted.findings,
         warnings: interrupted.warnings,
     })
+}
+
+fn completed_result_contract(
+    warnings: &[ReviewWarning],
+    has_findings: bool,
+    has_unreviewed: bool,
+) -> (
+    ReviewStatus,
+    FindingsStatus,
+    FindingsTrust,
+    RetryRecommendation,
+) {
+    if has_warning(warnings, "model_output_parse") {
+        if has_findings {
+            (
+                ReviewStatus::Partial,
+                FindingsStatus::Partial,
+                FindingsTrust::Low,
+                RetryRecommendation::ReviewFindingsFirst,
+            )
+        } else {
+            (
+                ReviewStatus::Failed,
+                FindingsStatus::Unavailable,
+                FindingsTrust::Low,
+                RetryRecommendation::Retry,
+            )
+        }
+    } else if has_unreviewed {
+        (
+            ReviewStatus::Partial,
+            FindingsStatus::Complete,
+            findings_trust_for_completed(warnings),
+            RetryRecommendation::DoNotRetry,
+        )
+    } else {
+        (
+            ReviewStatus::Success,
+            FindingsStatus::Complete,
+            findings_trust_for_completed(warnings),
+            RetryRecommendation::DoNotRetry,
+        )
+    }
 }
 
 fn interrupted_contract(
@@ -803,6 +842,7 @@ fn summarize_warnings(warnings: &[ReviewWarning]) -> Vec<String> {
             "review_truncated" => "review material was truncated".to_string(),
             "file_too_large" => "some file diffs exceeded review limits".to_string(),
             "unsupported_file" => "some changed files were not reviewable".to_string(),
+            "diff_capture_failed" => "some file diffs could not be captured".to_string(),
             "dropped_findings" => warning.message.clone(),
             _ => continue,
         };
@@ -823,13 +863,15 @@ fn findings_trust_for_completed(warnings: &[ReviewWarning]) -> FindingsTrust {
     }
 }
 
-fn diff_stage_status(warnings: &[ReviewWarning]) -> StageStatus {
-    if warnings.iter().any(|w| {
-        matches!(
-            w.kind.as_str(),
-            "review_truncated" | "file_too_large" | "unsupported_file" | "diff_capture_failed"
-        )
-    }) {
+fn diff_stage_status(warnings: &[ReviewWarning], has_unreviewed: bool) -> StageStatus {
+    if has_unreviewed
+        || warnings.iter().any(|w| {
+            matches!(
+                w.kind.as_str(),
+                "review_truncated" | "file_too_large" | "unsupported_file" | "diff_capture_failed"
+            )
+        })
+    {
         StageStatus::Partial
     } else {
         StageStatus::Ok
@@ -1247,6 +1289,17 @@ fn review_chunks(body: &str) -> Vec<String> {
         chunks.push(current);
     }
     chunks
+}
+
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(Value::String(value)) => Some(value),
+        _ => None,
+    })
 }
 
 fn parse_findings(text: &str) -> (Vec<ReviewFinding>, Option<String>, Vec<ReviewWarning>) {
@@ -1950,6 +2003,116 @@ mod tests {
             rationale: "bad".to_string(),
             suggested_fix: "fix".to_string(),
         }
+    }
+
+    #[test]
+    fn non_json_text_is_not_counted_as_parsed_partial_output() {
+        let (findings, summary, warnings) = parse_findings("plain reviewer prose");
+        let mut reviewer_summaries = Vec::new();
+        if !has_warning(&warnings, "model_output_parse") {
+            if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
+                reviewer_summaries.push(summary);
+            }
+        }
+        let output = interrupted_review_output(
+            Instant::now(),
+            sample_target(),
+            &sample_collection(),
+            InterruptedReview {
+                findings,
+                warnings,
+                reviewer_summaries,
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reason: "request timed out".to_string(),
+                interruption: ReviewInterruption::Timeout,
+            },
+        );
+
+        assert_eq!(output.status, ReviewStatus::Failed);
+        assert_eq!(output.findings_status, FindingsStatus::Unavailable);
+        assert_eq!(
+            output.review_status,
+            ReviewCompletionStatus::ModelTimeoutNoFindings
+        );
+    }
+
+    #[test]
+    fn completed_parse_failure_without_findings_is_failed_unavailable() {
+        let warnings = vec![warning(
+            "model_output_parse",
+            "reviewer returned non-JSON output",
+            None,
+        )];
+        let (status, findings_status, findings_trust, retry_recommendation) =
+            completed_result_contract(&warnings, false, false);
+
+        assert_eq!(status, ReviewStatus::Failed);
+        assert_eq!(findings_status, FindingsStatus::Unavailable);
+        assert_eq!(findings_trust, FindingsTrust::Low);
+        assert_eq!(retry_recommendation, RetryRecommendation::Retry);
+        assert_eq!(json_parse_stage_status(&warnings), StageStatus::Failed);
+        assert_eq!(
+            finding_extraction_stage_status(&warnings),
+            StageStatus::Failed
+        );
+    }
+
+    #[test]
+    fn malformed_symbol_does_not_discard_finding() {
+        let (findings, summary, warnings) = parse_findings(
+            r#"{"summary":"ok","findings":[{"severity":"high","confidence":"high","file":"src/lib.rs","line":7,"symbol":{"name":"parse_external_models"},"title":"bug","rationale":"bad","suggested_fix":"fix"}]}"#,
+        );
+
+        assert_eq!(summary.as_deref(), Some("ok"));
+        assert!(warnings.is_empty());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].symbol, None);
+    }
+
+    #[test]
+    fn interrupted_review_preserves_unreviewed_diff_stage_gap() {
+        let mut collection = sample_collection();
+        collection.unreviewed.push(UnreviewedFile {
+            file: "big.rs".to_string(),
+            reason: OversizedReason::PerFileCap,
+        });
+        let output = interrupted_review_output(
+            Instant::now(),
+            sample_target(),
+            &collection,
+            InterruptedReview {
+                findings: vec![sample_finding("high", "src/lib.rs", "Bug")],
+                warnings: Vec::new(),
+                reviewer_summaries: Vec::new(),
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reason: "request timed out".to_string(),
+                interruption: ReviewInterruption::Timeout,
+            },
+        );
+
+        assert_eq!(output.status, ReviewStatus::Partial);
+        assert_eq!(output.stage_status.diff_collection, StageStatus::Partial);
+        assert_eq!(output.unreviewed.len(), 1);
+    }
+
+    #[test]
+    fn skipped_unsupported_files_mark_diff_stage_partial() {
+        let warnings = vec![warning(
+            "unsupported_file",
+            "unsupported file type skipped",
+            Some("x.png"),
+        )];
+        assert_eq!(diff_stage_status(&warnings, false), StageStatus::Partial);
+    }
+
+    #[test]
+    fn diff_capture_failures_are_summarized_near_status() {
+        let summaries = summarize_warnings(&[warning(
+            "diff_capture_failed",
+            "failed to capture file diff",
+            Some("src/lib.rs"),
+        )]);
+        assert!(summaries.contains(&"some file diffs could not be captured".to_string()));
     }
 
     #[test]

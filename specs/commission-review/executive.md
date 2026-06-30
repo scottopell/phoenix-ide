@@ -26,4 +26,9 @@ kind of persisted human approval surface that task approval uses.
 | REQ-CR-007 | Hide Review Where Phoenix Cannot Infer Scope | 🔄 In Progress | Registry boundaries exist; stale replay handling needs approval-runtime polish. |
 | REQ-CR-008 | Keep Review Read-Only | ✅ Complete | Harness uses read-only git commands. |
 | REQ-CR-009 | Honor Cancellation | ✅ Complete | Cancellation token is checked during collection and LLM wait. |
-| REQ-CR-010 | Report Skipped Review Material | ✅ Complete | Size-cap exclusions surfaced in a typed `unreviewed` result (forces completed_with_warnings); binary/unsupported produce warnings. |
+| REQ-CR-010 | Report Skipped Review Material | ✅ Complete | Size-cap exclusions surfaced in a typed `unreviewed` result (forces partial top-level status); binary/unsupported produce warnings. |
+| REQ-CR-011 | Distinguish Partial Review Output From Failure | ✅ Complete | Interrupted reviews preserve parsed findings/summaries as partial; no parsed output reports failed/unavailable. |
+| REQ-CR-012 | Report Review Stage Status | ✅ Complete | Result includes typed stage status for target, diff, LLM, JSON parse, and finding extraction. |
+| REQ-CR-013 | Summarize Findings and Important Warnings | ✅ Complete | Severity counts and deterministic warning summaries are included near status. |
+| REQ-CR-014 | Keep User-Facing Results Free Of Token And Cost Metadata | ✅ Complete | LLM usage remains internal and skipped from serialized review/display payloads. |
+| REQ-CR-015 | Include Stable Finding Navigation Hints | ✅ Complete | Findings preserve optional `symbol` anchors without making them required. |
