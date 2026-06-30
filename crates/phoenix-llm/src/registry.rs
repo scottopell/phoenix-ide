@@ -1336,9 +1336,9 @@ mod tests {
         assert_eq!(tags.get("query"), Some(&"a=b=c".to_string()));
     }
 
-    fn external_baseten_model() -> super::super::ModelSpec {
+    fn external_gateway_model() -> super::super::ModelSpec {
         parse_external_models(
-            r#"[{"id":"baseten/moonshotai/Kimi-K2.6","backend":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"gateway-provider/example-org/Chat-Model","backend":"anthropic","description":"Gateway-hosted chat model POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
         )
         .unwrap()
         .into_iter()
@@ -1348,7 +1348,7 @@ mod tests {
 
     #[test]
     fn configured_anthropic_model_registers_and_can_be_default() {
-        let model = external_baseten_model();
+        let model = external_gateway_model();
         let config = LlmConfig {
             anthropic_api_key: Some("test-key".to_string()),
             default_model: Some(model.id.clone()),
@@ -1357,10 +1357,15 @@ mod tests {
         };
         let registry = ModelRegistry::new(&config);
 
-        assert!(registry.get("baseten/moonshotai/Kimi-K2.6").is_some());
-        assert_eq!(registry.default_model_id(), "baseten/moonshotai/Kimi-K2.6");
+        assert!(registry
+            .get("gateway-provider/example-org/Chat-Model")
+            .is_some());
         assert_eq!(
-            registry.context_window("baseten/moonshotai/Kimi-K2.6"),
+            registry.default_model_id(),
+            "gateway-provider/example-org/Chat-Model"
+        );
+        assert_eq!(
+            registry.context_window("gateway-provider/example-org/Chat-Model"),
             262_000
         );
     }
@@ -1369,7 +1374,7 @@ mod tests {
     fn configured_model_appears_in_model_info() {
         let config = LlmConfig {
             anthropic_api_key: Some("test-key".to_string()),
-            external_models: vec![external_baseten_model()],
+            external_models: vec![external_gateway_model()],
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
@@ -1377,7 +1382,7 @@ mod tests {
         let info = registry
             .available_model_info()
             .into_iter()
-            .find(|model| model.id == "baseten/moonshotai/Kimi-K2.6")
+            .find(|model| model.id == "gateway-provider/example-org/Chat-Model")
             .expect("external model should be included in /api/models data");
 
         assert_eq!(info.provider, "Anthropic");
@@ -1387,10 +1392,12 @@ mod tests {
 
     #[test]
     fn discovery_matcher_allows_configured_model_id_and_backend_prefix() {
-        let model = external_baseten_model();
+        let model = external_gateway_model();
         let discovered = DiscoveredModels {
             anthropic_listed: true,
-            anthropic: HashSet::from(["anthropic/baseten/moonshotai/Kimi-K2.6".to_string()]),
+            anthropic: HashSet::from([
+                "anthropic/gateway-provider/example-org/Chat-Model".to_string()
+            ]),
             openai_responses_listed: false,
             openai_responses: HashSet::new(),
         };
@@ -1403,12 +1410,14 @@ mod tests {
 
     #[test]
     fn discovery_matcher_does_not_cross_backend_boundaries() {
-        let model = external_baseten_model();
+        let model = external_gateway_model();
         let discovered = DiscoveredModels {
             anthropic_listed: true,
             anthropic: HashSet::new(),
             openai_responses_listed: true,
-            openai_responses: HashSet::from(["baseten/moonshotai/Kimi-K2.6".to_string()]),
+            openai_responses: HashSet::from(
+                ["gateway-provider/example-org/Chat-Model".to_string()],
+            ),
         };
 
         assert!(!ModelRegistry::spec_matches_discovered_model(
@@ -1419,7 +1428,7 @@ mod tests {
 
     #[test]
     fn discovery_fallback_is_backend_specific() {
-        let specs = vec![external_baseten_model(), external_openai_model()];
+        let specs = vec![external_gateway_model(), external_openai_model()];
         let discovered = DiscoveredModels {
             anthropic_listed: true,
             anthropic: HashSet::from(["unmatched-anthropic".to_string()]),
@@ -1436,12 +1445,12 @@ mod tests {
     #[test]
     fn provider_display_name_uses_external_model_metadata_even_when_unregistered() {
         let registry = ModelRegistry::new(&LlmConfig {
-            external_models: vec![external_baseten_model()],
+            external_models: vec![external_gateway_model()],
             ..Default::default()
         });
 
         assert_eq!(
-            registry.provider_display_name("baseten/moonshotai/Kimi-K2.6"),
+            registry.provider_display_name("gateway-provider/example-org/Chat-Model"),
             "Anthropic"
         );
         assert_eq!(registry.provider_display_name("unknown-model"), "Unknown");
@@ -1732,14 +1741,14 @@ mod tests {
     fn cheap_model_for_external_parent_stays_on_external_model() {
         let config = LlmConfig {
             anthropic_api_key: Some("test-key".to_string()),
-            external_models: vec![external_baseten_model()],
+            external_models: vec![external_gateway_model()],
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
 
         assert_eq!(
-            registry.cheap_model_id_for_provider("baseten/moonshotai/Kimi-K2.6"),
-            "baseten/moonshotai/Kimi-K2.6"
+            registry.cheap_model_id_for_provider("gateway-provider/example-org/Chat-Model"),
+            "gateway-provider/example-org/Chat-Model"
         );
     }
 

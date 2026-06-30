@@ -248,7 +248,7 @@ impl ModelSpec {
     /// Provider header value for gateway-compatible endpoints.
     ///
     /// Gateway model identifiers may carry their provider as an `api_name`
-    /// prefix, e.g. `baseten/moonshotai/Kimi-K2.7-Code`. That prefix is the
+    /// prefix, e.g. `gateway-provider/example-org/Code-Model`. That prefix is the
     /// routing authority. Built-in direct-provider models have bare API names
     /// and fall back to the backend's compatibility header value.
     #[must_use]
@@ -502,13 +502,13 @@ mod tests {
     #[test]
     fn parses_external_model_with_api_name_defaulting_to_id() {
         let models = parse_external_models(
-            r#"[{"id":"baseten/moonshotai/Kimi-K2.6","backend":"anthropic","description":"Baseten Kimi K2.6 open-weight POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"gateway-provider/example-org/Chat-Model","backend":"anthropic","description":"Gateway-hosted chat model POC","context_window":262000,"recommended":false,"supports_tool_search":false}]"#,
         )
         .expect("external model config should parse");
 
         assert_eq!(models.len(), 1);
         let model = &models[0];
-        assert_eq!(model.id, "baseten/moonshotai/Kimi-K2.6");
+        assert_eq!(model.id, "gateway-provider/example-org/Chat-Model");
         assert_eq!(model.api_name, model.id);
         assert_eq!(model.backend, ModelBackend::Anthropic);
         assert_eq!(model.backend.api_format(), ApiFormat::Anthropic);
@@ -592,11 +592,11 @@ mod tests {
     #[test]
     fn provider_header_value_uses_api_name_prefix() {
         let mut models = parse_external_models(
-            r#"[{"id":"baseten/moonshotai/Kimi-K2.7-Code","backend":"openai_chat_completions","description":"Kimi via gateway","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+            r#"[{"id":"gateway-provider/example-org/Code-Model","backend":"openai_chat_completions","description":"Code model via gateway","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
         )
         .expect("model should parse");
         let model = models.pop().expect("one model");
-        assert_eq!(model.provider_header_value(), "baseten");
+        assert_eq!(model.provider_header_value(), "gateway-provider");
     }
 
     #[test]

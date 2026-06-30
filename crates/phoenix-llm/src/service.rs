@@ -378,20 +378,20 @@ mod tests {
 
     #[test]
     fn provider_header_uses_api_name_prefix_for_gateway_models() {
-        let svc = chat_gateway_service_with_api_name("baseten/moonshotai/Kimi-K2.7-Code");
+        let svc = chat_gateway_service_with_api_name("gateway-provider/example-org/Code-Model");
         let headers = svc.headers_for_provider();
         assert_eq!(
             headers
                 .iter()
                 .find(|(key, _)| key.eq_ignore_ascii_case("provider"))
                 .map(|(_, value)| value.as_str()),
-            Some("baseten")
+            Some("gateway-provider")
         );
     }
 
     #[test]
     fn explicit_provider_header_still_wins() {
-        let mut svc = chat_gateway_service_with_api_name("baseten/moonshotai/Kimi-K2.7-Code");
+        let mut svc = chat_gateway_service_with_api_name("gateway-provider/example-org/Code-Model");
         svc.custom_headers
             .push(("provider".to_string(), "custom".to_string()));
         let headers = svc.headers_for_provider();
