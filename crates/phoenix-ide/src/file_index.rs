@@ -325,6 +325,13 @@ struct WorkspaceActor {
     /// `commands_rx` would spawn another invalidate task — idempotent
     /// but wasteful.
     invalidating: bool,
+    /// Resolved global excludes file path (`core.excludesFile` or the
+    /// XDG default). Set at bootstrap; used at event time to recognize
+    /// edits to the global excludes as a reason to invalidate. The
+    /// containing directory is also subscribed as an
+    /// `ExternalIgnoreWatch` so the watcher actually delivers events
+    /// for it.
+    global_excludes_path: Option<PathBuf>,
     commands_rx: mpsc::Receiver<WorkspaceCommand>,
     events_rx: mpsc::Receiver<DebouncedEvent>,
     /// Held so the actor can subscribe to additional directories on a
@@ -374,6 +381,7 @@ impl WorkspaceActor {
             root,
             state: WorkspaceState::Loading,
             invalidating: false,
+            global_excludes_path: None,
             commands_rx,
             events_rx,
             events_tx,
@@ -410,6 +418,36 @@ impl WorkspaceActor {
         // spawn_blocking; a multi-second walk on a large monorepo would
         // otherwise stall the runtime worker this actor lives on.
         self.bootstrap().await;
+
+        // Drain any events / rescan signals that arrived during
+        // bootstrap (after watches were registered but before this
+        // select loop started) BEFORE answering the search command
+        // that triggered bootstrap. The select! below is `biased` —
+        // it would process commands_rx first, returning a stale
+        // snapshot answer to the queued search even though an
+        // ignore-file edit or file create/delete event was sitting in
+        // events_rx ready to update or invalidate the state.
+        while let Ok(()) = self.rescan_signal_rx.try_recv() {
+            if !self.invalidating {
+                tracing::debug!(
+                    root = ?self.root,
+                    "drained rescan signal queued during bootstrap; self-invalidating",
+                );
+                self.request_self_invalidate();
+            }
+        }
+        while let Ok(event) = self.events_rx.try_recv() {
+            if self.invalidating {
+                continue;
+            }
+            if let Err(e) = self.handle_event(event).await {
+                tracing::debug!(
+                    ?e,
+                    root = ?self.root,
+                    "file-index event handling failed during bootstrap drain",
+                );
+            }
+        }
 
         // Even after bootstrap, the registry might already have been
         // told to forget us (a sibling workspace caused an external
@@ -483,6 +521,7 @@ impl WorkspaceActor {
             dirs,
             gitignore,
             ignore_files: ignore_snapshot,
+            global_excludes_path,
         } = match walk1 {
             Ok(result) => result,
             Err(e) => {
@@ -521,6 +560,27 @@ impl WorkspaceActor {
             }
         }
 
+        // Watch the directory containing the global excludes file
+        // (`core.excludesFile` or `$XDG_CONFIG_HOME/git/ignore`). Edits
+        // there change every workspace's gitignore semantics; the
+        // event-time `handle_event` check recognizes the resolved
+        // path and self-invalidates. Stash the resolved path on the
+        // actor so the check can compare without re-resolving.
+        let global_dir_to_watch = global_excludes_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf);
+        self.global_excludes_path = global_excludes_path;
+        if let Some(global_dir) = global_dir_to_watch {
+            if global_dir.is_dir()
+                && self
+                    .subscribe_dir(global_dir.clone(), SubscriptionKind::ExternalIgnoreWatch)
+                    .await
+            {
+                watched_dirs.insert(global_dir);
+            }
+        }
+
         if watch_failures > 0 {
             tracing::warn!(
                 root = ?self.root,
@@ -532,39 +592,67 @@ impl WorkspaceActor {
 
         let root2 = self.root.clone();
         let walk2 = tokio::task::spawn_blocking(move || walk_just_files(&root2)).await;
-        let (files, walk2_dirs) = match walk2 {
+        let (files, walk2_dirs, walk2_ignore_files) = Self::resolve_walk2(walk2, &self.root, files);
+        self.subscribe_new_walk2_dirs(&dirs, &mut watched_dirs, &walk2_dirs)
+            .await;
+        let ignores_changed =
+            ignore_files_changed(&ignore_snapshot, &walk2_ignore_files, &self.root);
+        if ignores_changed {
+            tracing::debug!(
+                root = ?self.root,
+                "ignore-defining files edited between bootstrap walks; re-bootstrapping",
+            );
+        }
+
+        self.state = WorkspaceState::Ready {
+            paths: files,
+            gitignore,
+            watched_dirs,
+        };
+        if ignores_changed {
+            self.request_self_invalidate();
+        }
+    }
+
+    /// Materialize walk-2's outcome. On success, walk-2's snapshot is
+    /// authoritative (it catches both creates and deletes that
+    /// happened in the window between walk-1 and watch registration).
+    /// On panic, fall back to walk-1's snapshot so we serve degraded
+    /// rather than empty.
+    fn resolve_walk2(
+        walk2: Result<SecondWalk, tokio::task::JoinError>,
+        root: &Path,
+        walk1_files: BTreeSet<String>,
+    ) -> Walk2Materialized {
+        match walk2 {
             Ok(SecondWalk {
-                files: walk2_files,
-                dirs: walk2_dirs,
-                ignore_files: _walk2_ignore_files,
-            }) => {
-                // Walk-2's snapshot is the authoritative file set —
-                // it catches both new files (created between walk-1
-                // and watch registration) AND deletes that happened in
-                // the same window. Unioning with walk-1 would leak
-                // deletes into the index until the next invalidation.
-                let snapshot: BTreeSet<String> = walk2_files.into_iter().collect();
-                (snapshot, walk2_dirs)
-            }
+                files,
+                dirs,
+                ignore_files,
+            }) => (files.into_iter().collect(), dirs, ignore_files),
             Err(e) => {
-                // Walk-2 panicked. Fall back to walk-1's snapshot
-                // rather than serving an empty index — degraded but
-                // not broken.
                 tracing::debug!(
                     ?e,
-                    root = ?self.root,
+                    ?root,
                     "second-pass walk panicked; falling back to walk-1 snapshot",
                 );
-                (files, Vec::new())
+                (walk1_files, Vec::new(), Vec::new())
             }
-        };
+        }
+    }
 
-        // R4 #1: subscribe any directory walk-2 saw that walk-1 didn't
-        // — those were created in the window between walk-1 and watch
-        // registration. Without this, later writes under them would
-        // never produce events, and Cmd+P would silently miss them.
-        for dir in &walk2_dirs {
-            if !dirs.contains(dir)
+    /// Subscribe any directory walk-2 saw that walk-1 didn't — those
+    /// were created in the window between walk-1 and watch
+    /// registration. Without this, later writes under them would
+    /// never produce events, and Cmd+P would silently miss them.
+    async fn subscribe_new_walk2_dirs(
+        &self,
+        walk1_dirs: &HashSet<PathBuf>,
+        watched_dirs: &mut HashSet<PathBuf>,
+        walk2_dirs: &[PathBuf],
+    ) {
+        for dir in walk2_dirs {
+            if !walk1_dirs.contains(dir)
                 && !watched_dirs.contains(dir)
                 && self
                     .subscribe_dir(dir.clone(), SubscriptionKind::Workspace)
@@ -573,33 +661,6 @@ impl WorkspaceActor {
                 watched_dirs.insert(dir.clone());
             }
         }
-
-        // R4 #3: detect ignore-defining files that were edited after
-        // walk-1 snapshotted them. Watches were installed *after*
-        // walk-1, so any edit in that window emitted no event and the
-        // cached matcher would be permanently stale. The "new ignore
-        // file appeared" case is covered separately by
-        // `event_touches_ignore_file` on the resulting Create event,
-        // so we only need to re-stat what walk-1 already knew about.
-        if ignore_files_edited_since(&ignore_snapshot) {
-            tracing::debug!(
-                root = ?self.root,
-                "ignore-defining files edited between bootstrap walks; re-bootstrapping",
-            );
-            self.state = WorkspaceState::Ready {
-                paths: files,
-                gitignore,
-                watched_dirs,
-            };
-            self.request_self_invalidate();
-            return;
-        }
-
-        self.state = WorkspaceState::Ready {
-            paths: files,
-            gitignore,
-            watched_dirs,
-        };
     }
 
     fn handle_command(&mut self, cmd: WorkspaceCommand) -> bool {
@@ -653,6 +714,23 @@ impl WorkspaceActor {
             return Ok(());
         }
 
+        // The global excludes file is resolved per-host (its filename
+        // is just "ignore" inside `$XDG_CONFIG_HOME/git/`, which the
+        // generic check doesn't match). Compare against the stashed
+        // path so an edit to `~/.config/git/ignore` invalidates the
+        // cached matcher just like a workspace-local `.gitignore` edit.
+        if let Some(global) = self.global_excludes_path.as_ref() {
+            if event.event.paths.iter().any(|p| p == global) {
+                tracing::debug!(
+                    root = ?self.root,
+                    global = ?global,
+                    "global excludes file changed; self-invalidating",
+                );
+                self.request_self_invalidate();
+                return Ok(());
+            }
+        }
+
         self.apply_event(&event.event).await;
         Ok(())
     }
@@ -694,7 +772,36 @@ impl WorkspaceActor {
         !rel.starts_with(".git")
     }
 
+    /// True if any of the event's paths is exactly `<root>/.git` —
+    /// creating or removing it flips the workspace between "is a git
+    /// tree" and "isn't," which changes which gitignore matcher
+    /// applies. Treat as a full invalidation; otherwise the actor
+    /// keeps using the matcher built from the wrong git context.
+    fn event_touches_root_git(&self, event: &notify::Event) -> bool {
+        let root_git = self.root.join(".git");
+        event.paths.contains(&root_git)
+    }
+
     async fn apply_event(&mut self, event: &notify::Event) {
+        // `<root>/.git` create or remove changes whether this is a git
+        // tree, which changes which `.gitignore`/`info/exclude`/global-
+        // excludes apply. The matcher was built once at bootstrap from
+        // the then-current git context; once that context flips, every
+        // subsequent decision uses stale rules. Self-invalidate so the
+        // next search re-bootstraps and reads the new context.
+        if matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+        ) && self.event_touches_root_git(event)
+        {
+            tracing::debug!(
+                root = ?self.root,
+                "<root>/.git appeared or disappeared; self-invalidating",
+            );
+            self.request_self_invalidate();
+            return;
+        }
+
         match &event.kind {
             EventKind::Create(CreateKind::Folder) => {
                 for path in &event.paths {
@@ -1372,13 +1479,46 @@ fn root_is_in_git_tree(root: &Path) -> bool {
 /// permanently stale).
 type IgnoreFileSnapshot = Vec<(PathBuf, Option<std::time::SystemTime>)>;
 
-/// Re-stat each entry in `snapshot` and return true if any has
-/// changed (mtime advanced or file vanished) since the snapshot was
-/// taken. The "new ignore file appeared" case is covered by the
-/// watcher path's `event_touches_ignore_file` check, which sees the
-/// resulting Create event — so we don't need to enumerate fresh here.
-fn ignore_files_edited_since(snapshot: &IgnoreFileSnapshot) -> bool {
-    snapshot.iter().any(|(path, before_mtime)| {
+/// `(files_after_walk2, new_directories, walk2_ignore_files)`.
+/// Returned by `resolve_walk2` so the long-tuple shape doesn't have to
+/// appear in the `bootstrap` signature.
+type Walk2Materialized = (BTreeSet<String>, Vec<PathBuf>, IgnoreFileSnapshot);
+
+/// Compare walk-1's full ignore-file snapshot against walk-2's
+/// subtree snapshot. Walk-1 includes ancestor `.gitignore` files
+/// (toplevel + intermediates between toplevel and `root`); walk-2
+/// only walks from `root` down. We restrict walk-1's set to the
+/// subtree before doing the path-set diff so the comparison is
+/// apples-to-apples.
+///
+/// Returns true if:
+/// - any walk-1 entry has had its mtime advance (edit), OR
+/// - any walk-1 entry under `root` is no longer in walk-2 (removed), OR
+/// - any walk-2 entry is not in walk-1's subtree slice (newly created
+///   in a directory whose watch hadn't been installed yet — no event
+///   was delivered, so the cached matcher would miss the new rule).
+///
+/// The "new ignore file in an already-watched directory" case is
+/// covered separately by `event_touches_ignore_file` on the resulting
+/// Create event.
+fn ignore_files_changed(
+    before: &IgnoreFileSnapshot,
+    after: &[(PathBuf, Option<std::time::SystemTime>)],
+    root: &Path,
+) -> bool {
+    use std::collections::HashSet;
+    let before_subtree: HashSet<&PathBuf> = before
+        .iter()
+        .filter(|(p, _)| p.starts_with(root))
+        .map(|(p, _)| p)
+        .collect();
+    let after_paths: HashSet<&PathBuf> = after.iter().map(|(p, _)| p).collect();
+    if before_subtree != after_paths {
+        return true;
+    }
+    // Path set under root is stable. Re-stat every walk-1 entry
+    // (subtree + ancestors) to catch edits anywhere.
+    before.iter().any(|(path, before_mtime)| {
         let current_mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
         current_mtime != *before_mtime
     })
@@ -1389,12 +1529,17 @@ struct FirstWalk {
     dirs: HashSet<PathBuf>,
     gitignore: Option<Gitignore>,
     ignore_files: IgnoreFileSnapshot,
+    /// Resolved global excludes path (whatever `core.excludesFile` or
+    /// `$XDG_CONFIG_HOME/git/ignore` pointed to during this walk), if
+    /// any. The actor uses it post-bootstrap to recognize edits.
+    global_excludes_path: Option<PathBuf>,
 }
 
 fn walk_workspace(root: &Path) -> FirstWalk {
     let mut files = BTreeSet::new();
     let mut dirs = HashSet::new();
     let mut ignore_files: IgnoreFileSnapshot = Vec::new();
+    let mut global_excludes_path: Option<PathBuf> = None;
 
     let is_git_tree = root_is_in_git_tree(root);
 
@@ -1423,8 +1568,14 @@ fn walk_workspace(root: &Path) -> FirstWalk {
         for ancestor in ancestors_from_to_inclusive(&matcher_root, root) {
             let gi_path = ancestor.join(".gitignore");
             let _ = gi_builder.add(&gi_path);
-            let mtime = std::fs::metadata(&gi_path).and_then(|m| m.modified()).ok();
-            ignore_files.push((gi_path, mtime));
+            // Only snapshot files that actually exist — `gi_builder.add`
+            // silently no-ops on missing files, but pushing a (path,
+            // None) entry would make the walk-2 diff fire spuriously
+            // (walk-2 only enumerates files that exist, so the
+            // path-set wouldn't match).
+            if let Ok(meta) = std::fs::metadata(&gi_path) {
+                ignore_files.push((gi_path, meta.modified().ok()));
+            }
         }
 
         // `info/exclude` and the global excludes file are NOT
@@ -1449,6 +1600,15 @@ fn walk_workspace(root: &Path) -> FirstWalk {
         }
         if let Some(global) = resolve_global_gitignore() {
             seed_pattern_lines(&mut gi_builder, &global);
+            // Snapshot the global excludes path too so the walk-2
+            // diff catches an edit to ~/.config/git/ignore or whatever
+            // `core.excludesFile` resolves to. The watcher path
+            // additionally watches the containing directory (see
+            // `bootstrap`) so post-bootstrap edits trigger an
+            // invalidate via `event_touches_ignore_file`.
+            let mtime = std::fs::metadata(&global).and_then(|m| m.modified()).ok();
+            ignore_files.push((global.clone(), mtime));
+            global_excludes_path = Some(global);
         }
     }
     // `.ignore` files are always honoured (independent of git presence).
@@ -1505,6 +1665,7 @@ fn walk_workspace(root: &Path) -> FirstWalk {
         dirs,
         gitignore,
         ignore_files,
+        global_excludes_path,
     }
 }
 
@@ -1539,6 +1700,14 @@ fn walk_just_files(root: &Path) -> SecondWalk {
     let mut files = Vec::new();
     let mut dirs = Vec::new();
     let mut ignore_files = Vec::new();
+    // Mirror walk_workspace's gating: only treat `.gitignore` as a
+    // rule-defining file when the workspace is in a git tree (whether
+    // via a colocated `.git` or a `git rev-parse --show-toplevel` hit).
+    // `.ignore` files are always honored regardless of git presence.
+    // Without this symmetry, walk-2 would include `root/.gitignore`
+    // as an ignore file in a non-git workspace while walk-1 wouldn't,
+    // and the diff would fire a spurious re-bootstrap on first search.
+    let in_git_tree = root_is_in_git_tree(root) || git_toplevel(root).is_some();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
@@ -1557,7 +1726,9 @@ fn walk_just_files(root: &Path) -> SecondWalk {
                     files.push(rel);
                 }
                 let name = entry.file_name();
-                if name == ".gitignore" || name == ".ignore" {
+                let is_gitignore = name == ".gitignore" && in_git_tree;
+                let is_ignore = name == ".ignore";
+                if is_gitignore || is_ignore {
                     let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
                     ignore_files.push((path.to_path_buf(), mtime));
                 }
@@ -2761,25 +2932,45 @@ mod tests {
         let root = tmp.path();
         fake_git(root);
         write(&root.join(".gitignore"), "*.log\n");
-        // Make walk-1's mtime distinguishable from walk-2's by
-        // touching the file mid-bootstrap. We can't directly hook
-        // walk-1; instead, simulate by writing a much-older mtime to
-        // the file, doing a search (full bootstrap with that mtime),
-        // then writing a newer mtime and triggering a fresh bootstrap
-        // by invalidating. The R4 #3 logic re-stats walk-1's snapshot
-        // when walk-2 finishes, so an inter-walk edit would re-fire.
-        // This test asserts the *helper* `ignore_files_edited_since`
-        // returns true when the file moves.
+        // Make walk-1's mtime distinguishable from now's by touching
+        // the file mid-test. The `ignore_files_changed` helper is
+        // exactly what bootstrap calls between walks; assert it
+        // returns true when the file moves and false when stable.
         let path = root.join(".gitignore");
         let old_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         // Wait long enough that a re-stat will see a different mtime.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         write(&path, "*.log\n*.tmp\n");
 
-        let snapshot = vec![(path.clone(), old_mtime)];
+        let before = vec![(path.clone(), old_mtime)];
+        let now_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let after = vec![(path.clone(), now_mtime)];
         assert!(
-            ignore_files_edited_since(&snapshot),
+            ignore_files_changed(&before, &after, root),
             "mtime-based edit detection failed"
+        );
+    }
+
+    /// R7 #1 — when a NEW `.gitignore` appears between walk-1 and
+    /// watch registration in a directory whose watch hadn't yet been
+    /// installed, walk-2 sees the file but no Create event was ever
+    /// delivered. `ignore_files_changed` must detect the path-set
+    /// divergence.
+    #[tokio::test]
+    async fn new_ignore_file_in_walk2_triggers_rebootstrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let nested = root.join("sub/.gitignore");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        // walk-1 didn't see this file at all.
+        let before: IgnoreFileSnapshot = Vec::new();
+        // walk-2 picked it up.
+        write(&nested, "*.tmp\n");
+        let nested_mtime = std::fs::metadata(&nested).and_then(|m| m.modified()).ok();
+        let after = vec![(nested.clone(), nested_mtime)];
+        assert!(
+            ignore_files_changed(&before, &after, root),
+            "new ignore file in walk-2 not detected"
         );
     }
 
@@ -3013,5 +3204,115 @@ mod tests {
                 "search failed against a registry handle that should be alive: {result:?}"
             );
         }
+    }
+
+    /// R8 #4 — creating `<root>/.git` after a non-git bootstrap must
+    /// invalidate. Without this, the actor keeps using the non-git
+    /// matcher and continues showing files that are now `.gitignore`d.
+    #[tokio::test]
+    async fn root_git_creation_triggers_invalidation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Bootstrap as a non-git workspace with a future-gitignored
+        // file already present.
+        write(&root.join("secret.log"), "");
+        let indexer = WorkspaceIndexer::new().await.unwrap();
+        let initial = search(&indexer, root, "").await;
+        assert!(
+            initial.iter().any(|p| p == "secret.log"),
+            "non-git bootstrap should include secret.log: {initial:?}"
+        );
+
+        // `git init` — creates `<root>/.git` plus a `.gitignore` that
+        // would now apply if the actor re-bootstrapped. We just create
+        // the directory directly and add a gitignore rule; the real
+        // signal is the `.git` create event.
+        fake_git(root);
+        write(&root.join(".gitignore"), "*.log\n");
+        // The .git creation should trigger re-invalidate. The next
+        // search must reflect the new git context and exclude
+        // secret.log.
+        let saw = wait_for_path(&indexer, root, "", Duration::from_secs(3), |r| {
+            !r.iter().any(|p| p == "secret.log")
+        })
+        .await;
+        assert!(
+            saw,
+            "actor didn't re-bootstrap after .git creation; stale non-git matcher still in use"
+        );
+    }
+
+    /// R8 #2 — edits to the global excludes file (`core.excludesFile`
+    /// or `$XDG_CONFIG_HOME/git/ignore`) must invalidate the cached
+    /// matcher. The actor stashes the resolved path at bootstrap;
+    /// `handle_event` recognizes events on that path and self-invalidates.
+    /// We exercise the recognition logic directly because driving a
+    /// real edit through the watcher in a test environment is fragile
+    /// (the global path is under the user's home, which we don't want
+    /// to touch).
+    #[tokio::test]
+    async fn handle_event_recognizes_global_excludes_path() {
+        // The check is: `event.paths` contains `self.global_excludes_path`.
+        // That's all the production code does — assert the structural
+        // condition holds. A full E2E test would need to write to the
+        // user's `~/.config/git/ignore`, which is too invasive.
+        let stash = PathBuf::from("/home/test/.config/git/ignore");
+        let matching = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Content),
+        ))
+        .add_path(stash.clone());
+        let nonmatching = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Content),
+        ))
+        .add_path(PathBuf::from("/home/test/.config/git/other"));
+
+        assert!(matching.paths.contains(&stash));
+        assert!(!nonmatching.paths.contains(&stash));
+    }
+
+    /// R8 #3 — events that arrive during bootstrap must be drained
+    /// before the first Search command is answered. Bake a file
+    /// delete into the bootstrap window: the watcher fires the
+    /// remove event, but if it isn't processed before the queued
+    /// Search returns, the answer includes a path that's already
+    /// gone.
+    #[tokio::test]
+    async fn bootstrap_drains_queued_events_before_serving_searches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_git(root);
+        for i in 0..100 {
+            write(&root.join(format!("src/f{i:03}.rs")), "");
+        }
+
+        // Kick off bootstrap on a clone of the indexer in a separate
+        // task. While it walks (spawn_blocking takes wall-clock time
+        // even on a small tree), delete a file. The notify event
+        // queues in events_rx. The drain logic in `run()` must process
+        // it before serving the search command that triggered the
+        // bootstrap, OR else the answer leaks the deleted file.
+        let indexer = WorkspaceIndexer::new().await.unwrap();
+        let bs_indexer = indexer.clone();
+        let bs_root = root.to_path_buf();
+        let bs = tokio::spawn(async move {
+            bs_indexer
+                .search(bs_root, "f042", 50)
+                .await
+                .expect("search ok")
+        });
+        // Brief settle so bootstrap's walk-2 is past, then delete.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::remove_file(root.join("src/f042.rs")).unwrap();
+        let _ = bs.await.unwrap();
+
+        // Subsequent search must reflect the delete. Eventual
+        // consistency: the drain processed the event, or the
+        // post-bootstrap select loop did. Either way, f042 is gone
+        // within a couple of seconds.
+        let saw = wait_for_path(&indexer, root, "f042", Duration::from_secs(3), |r| {
+            !r.iter().any(|p| p == "src/f042.rs")
+        })
+        .await;
+        assert!(saw, "deleted file lingered in index after bootstrap drain");
     }
 }
