@@ -155,23 +155,24 @@ impl WorkspaceIndexer {
         // map entry synchronously, so the retry's `handle_for` always
         // sees a fresh slot and spawns a fresh actor. Cap the retry at
         // one — a Failed actor should surface its error, not loop.
-        let handle = self.handle_for(&canonical).await;
+        let handle = self.handle_for(&canonical);
         match handle.search(query.to_string(), limit).await {
             Err(e) if e == "workspace re-bootstrapping" => {
-                let fresh = self.handle_for(&canonical).await;
+                let fresh = self.handle_for(&canonical);
                 fresh.search(query.to_string(), limit).await
             }
             other => other,
         }
     }
 
-    /// Get-or-create the handle for `canonical`. On a winning insert,
-    /// spawns the actor synchronously (await on its rescan-signal
-    /// registration) before returning. On a losing insert (concurrent
-    /// first-callers raced and someone else's handle is in the map),
-    /// we drop our pre-allocated channels and return the winner's
-    /// handle — no wasted bootstrap, no orphan inotify watches.
-    async fn handle_for(self: &Arc<Self>, canonical: &Path) -> WorkspaceHandle {
+    /// Get-or-create the handle for `canonical`. Synchronous: spawning
+    /// the actor doesn't await anything, so a cancelled `search` future
+    /// can't leave a handle in the map without an actor behind it. On
+    /// a losing insert (concurrent first-callers raced and someone
+    /// else's handle is in the map), we drop our pre-allocated channels
+    /// and return the winner's handle — no wasted bootstrap, no orphan
+    /// inotify watches.
+    fn handle_for(self: &Arc<Self>, canonical: &Path) -> WorkspaceHandle {
         // Fast path: handle already exists.
         {
             let pinned = self.handles.pin();
@@ -204,18 +205,15 @@ impl WorkspaceIndexer {
         };
 
         if inserted.workspace_id == workspace_id {
-            // We won. Register the rescan signal SYNCHRONOUSLY (so any
-            // Subscribes the bootstrap fires arrive at the debouncer
-            // after the signal channel is recorded), then spawn the
-            // actor. See `DebouncerCommand::RegisterRescanSignal` for
-            // the race this closes.
-            let _ = self
-                .debouncer_tx
-                .send(DebouncerCommand::RegisterRescanSignal {
-                    workspace_id,
-                    sender: rescan_signal_tx,
-                })
-                .await;
+            // We won. Spawn the actor SYNCHRONOUSLY (no await between
+            // papaya insert and spawn), so a cancelled `search` future
+            // can't leave the handle live in the map with no actor
+            // behind it. The actor's first operation is to send
+            // `RegisterRescanSignal` itself — since the mpsc to the
+            // debouncer is FIFO and the actor uses the same sender
+            // for the registration and for all bootstrap Subscribes,
+            // the signal still arrives at the debouncer before any
+            // Subscribe is processed.
             WorkspaceActor::spawn_with_channels(
                 workspace_id,
                 canonical_buf,
@@ -223,6 +221,7 @@ impl WorkspaceIndexer {
                 events_rx,
                 events_tx,
                 rescan_signal_rx,
+                rescan_signal_tx,
                 self.debouncer_tx.clone(),
                 Arc::downgrade(self),
             );
@@ -336,6 +335,11 @@ struct WorkspaceActor {
     /// events, please rebuild" — the actor self-invalidates instead of
     /// silently serving a stale path set.
     rescan_signal_rx: mpsc::Receiver<()>,
+    /// Held briefly until the actor's first operation registers it
+    /// with the debouncer (see `run()`). `Option` so we can `take()`
+    /// once on init and drop our reference after the registration is
+    /// in-flight — the debouncer keeps its own clone.
+    pending_rescan_signal_tx: Option<mpsc::Sender<()>>,
     debouncer_tx: mpsc::Sender<DebouncerCommand>,
     /// Weak ref to the registry. Used by the actor to self-invalidate
     /// (when a `.gitignore` edit or new subtree-imported `.gitignore`
@@ -361,6 +365,7 @@ impl WorkspaceActor {
         events_rx: mpsc::Receiver<DebouncedEvent>,
         events_tx: mpsc::Sender<DebouncedEvent>,
         rescan_signal_rx: mpsc::Receiver<()>,
+        rescan_signal_tx: mpsc::Sender<()>,
         debouncer_tx: mpsc::Sender<DebouncerCommand>,
         registry: std::sync::Weak<WorkspaceIndexer>,
     ) {
@@ -373,6 +378,7 @@ impl WorkspaceActor {
             events_rx,
             events_tx,
             rescan_signal_rx,
+            pending_rescan_signal_tx: Some(rescan_signal_tx),
             debouncer_tx,
             registry,
         };
@@ -380,11 +386,29 @@ impl WorkspaceActor {
     }
 
     async fn run(mut self) {
-        // Bootstrap first. Events fired during bootstrap queue in
-        // events_rx — we drain them after the state flip below, so no
-        // separate pending buffer is required. The bootstrap walk runs
-        // in spawn_blocking; a multi-second walk on a large monorepo
-        // would otherwise stall the runtime worker this actor lives on.
+        // First operation: register our rescan signal channel with the
+        // debouncer. The mpsc to the debouncer is FIFO and bootstrap's
+        // Subscribes use the same sender, so a Subscribe can't be
+        // processed before the signal is recorded. Doing this inside
+        // the actor (rather than in `handle_for`) means the registration
+        // doesn't sit between papaya insert and actor spawn as a
+        // cancellation point that could leave the handle live without
+        // an actor behind it.
+        if let Some(sender) = self.pending_rescan_signal_tx.take() {
+            let _ = self
+                .debouncer_tx
+                .send(DebouncerCommand::RegisterRescanSignal {
+                    workspace_id: self.workspace_id,
+                    sender,
+                })
+                .await;
+        }
+
+        // Bootstrap. Events fired during bootstrap queue in events_rx
+        // — we drain them after the state flip below, so no separate
+        // pending buffer is required. The bootstrap walk runs in
+        // spawn_blocking; a multi-second walk on a large monorepo would
+        // otherwise stall the runtime worker this actor lives on.
         self.bootstrap().await;
 
         // Even after bootstrap, the registry might already have been
@@ -455,7 +479,7 @@ impl WorkspaceActor {
         let root = self.root.clone();
         let walk1 = tokio::task::spawn_blocking(move || walk_workspace(&root)).await;
         let FirstWalk {
-            mut files,
+            files,
             dirs,
             gitignore,
             ignore_files: ignore_snapshot,
@@ -508,22 +532,32 @@ impl WorkspaceActor {
 
         let root2 = self.root.clone();
         let walk2 = tokio::task::spawn_blocking(move || walk_just_files(&root2)).await;
-        let SecondWalk {
-            files: extra_files,
-            dirs: walk2_dirs,
-            ignore_files: _walk2_ignore_files,
-        } = match walk2 {
-            Ok(result) => result,
+        let (files, walk2_dirs) = match walk2 {
+            Ok(SecondWalk {
+                files: walk2_files,
+                dirs: walk2_dirs,
+                ignore_files: _walk2_ignore_files,
+            }) => {
+                // Walk-2's snapshot is the authoritative file set —
+                // it catches both new files (created between walk-1
+                // and watch registration) AND deletes that happened in
+                // the same window. Unioning with walk-1 would leak
+                // deletes into the index until the next invalidation.
+                let snapshot: BTreeSet<String> = walk2_files.into_iter().collect();
+                (snapshot, walk2_dirs)
+            }
             Err(e) => {
-                tracing::debug!(?e, root = ?self.root, "second-pass walk panicked");
-                SecondWalk {
-                    files: Vec::new(),
-                    dirs: Vec::new(),
-                    ignore_files: Vec::new(),
-                }
+                // Walk-2 panicked. Fall back to walk-1's snapshot
+                // rather than serving an empty index — degraded but
+                // not broken.
+                tracing::debug!(
+                    ?e,
+                    root = ?self.root,
+                    "second-pass walk panicked; falling back to walk-1 snapshot",
+                );
+                (files, Vec::new())
             }
         };
-        files.extend(extra_files);
 
         // R4 #1: subscribe any directory walk-2 saw that walk-1 didn't
         // — those were created in the window between walk-1 and watch
@@ -2888,5 +2922,96 @@ mod tests {
             saw,
             "actor failed to come up after synchronous registration"
         );
+    }
+
+    /// Round-7 #1 — a file deleted between walk-1 and watch
+    /// registration emits no event (no watch was installed yet), so
+    /// the pre-fix union of walk-1 ∪ walk-2 would leak the deleted
+    /// path into the index. Walk-2's snapshot is now authoritative.
+    /// Direct test: build a workspace with two files, simulate the
+    /// "file deleted between walks" race by deleting one file before
+    /// the indexer ever sees it, and assert the post-bootstrap index
+    /// reflects only what's actually on disk.
+    #[tokio::test]
+    async fn walk2_snapshot_replaces_walk1_so_deletes_dont_leak() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_git(root);
+        write(&root.join("alpha.rs"), "");
+        write(&root.join("beta.rs"), "");
+
+        // Race we can't directly induce mid-bootstrap from a black-box
+        // test; instead exercise the structural guarantee: a file
+        // removed BEFORE search runs must not appear in the index.
+        // With the union-of-walks bug, walk-1 captures alpha+beta, the
+        // delete races between walk-1 and watches, walk-2 captures
+        // only beta, but the union still has alpha. With walk-2 as
+        // authoritative, the index ends up with only beta.
+        //
+        // Simulate by removing alpha.rs before any search hits the
+        // indexer. Bootstrap (both walks) runs after the delete, so
+        // both walks see the same state — alpha already gone. The
+        // index must reflect that.
+        std::fs::remove_file(root.join("alpha.rs")).unwrap();
+
+        let indexer = WorkspaceIndexer::new().await.unwrap();
+        let results = search(&indexer, root, "").await;
+        assert!(
+            !results.iter().any(|p| p == "alpha.rs"),
+            "alpha.rs leaked into index despite being deleted before bootstrap: {results:?}"
+        );
+        assert!(
+            results.iter().any(|p| p == "beta.rs"),
+            "beta.rs missing — bootstrap broke entirely: {results:?}"
+        );
+    }
+
+    /// Round-7 #2 — cancellation between papaya insert and actor
+    /// spawn must not leave a live handle in the registry with no
+    /// actor behind it. Pre-fix, the `RegisterRescanSignal` await sat
+    /// between insert and spawn; cancelling there left a dead handle
+    /// that every subsequent search would reuse, returning
+    /// "file-index actor exited" forever. The actor now sends
+    /// `RegisterRescanSignal` itself as its first op, so spawn happens
+    /// synchronously in `handle_for` (no await in between).
+    ///
+    /// We exercise the structural guarantee: after a search completes
+    /// against a freshly-inserted handle, that handle is alive and
+    /// responsive — there's no cancellation point in the path that
+    /// could split insert from spawn.
+    #[tokio::test]
+    async fn handle_for_is_cancellation_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(&root.join("hello.rs"), "");
+        let indexer = WorkspaceIndexer::new().await.unwrap();
+
+        // Spawn 8 concurrent search futures and drop half of them
+        // immediately (simulating cancelled HTTP requests). The
+        // surviving searches must succeed — a dead handle would
+        // surface as "file-index actor exited".
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let indexer = indexer.clone();
+            let root = root.to_path_buf();
+            joins.push(tokio::spawn(async move {
+                indexer.search(root, "hello", 1).await
+            }));
+        }
+        // Cancel half of them by aborting their join handles before
+        // they complete.
+        for j in joins.iter().take(4) {
+            j.abort();
+        }
+        // The remaining four must complete successfully — if a
+        // cancelled future left a dead handle, the survivors would
+        // reuse it and fail.
+        for j in joins.into_iter().skip(4) {
+            let result = j.await.unwrap();
+            assert!(
+                result.is_ok(),
+                "search failed against a registry handle that should be alive: {result:?}"
+            );
+        }
     }
 }
