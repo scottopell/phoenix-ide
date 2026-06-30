@@ -89,10 +89,10 @@ pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
 /// composes with caller `extra_env` (e.g. `GIT_INDEX_FILE`) without clobbering.
 ///
 /// - `commit.gpgsign=false`: read-only captures must never block on a signing key.
-/// - `diff.noprefix=false` + `diff.mnemonicPrefix=false` + `diff.srcPrefix=a/`
-///   + `diff.dstPrefix=b/`: force standard `a/`+`b/` path prefixes. A user with
-///   `diff.mnemonicPrefix=true` otherwise gets `c/`+`w/` on `git diff HEAD`,
-///   which the UI diff parser rejects (it only recognises `a/`+`b/`).
+/// - `diff.noprefix=false`, `diff.mnemonicPrefix=false`, `diff.srcPrefix=a/`, and
+///   `diff.dstPrefix=b/`: force standard `a/`/`b/` path prefixes. A user with
+///   `diff.mnemonicPrefix=true` otherwise gets `c/`/`w/` on `git diff HEAD`,
+///   which the UI diff parser rejects (it only recognises `a/`/`b/`).
 fn apply_git_base_config(cmd: &mut std::process::Command) {
     cmd.env("GIT_CONFIG_COUNT", "5")
         .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
