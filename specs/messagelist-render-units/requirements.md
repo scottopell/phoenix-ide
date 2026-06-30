@@ -338,7 +338,9 @@ WHEN a new render unit appears at the tail and the user is currently
 pinned to the bottom of the list
 THE SYSTEM SHALL keep the bottom of the list visible after the unit is
 appended
-(delegated to Virtuoso's `followOutput="auto"`)
+(implemented via the `totalListHeightChanged` callback, which re-snaps
+to the last item when the user's pre-growth distance from the bottom is
+within the pin threshold)
 
 WHEN a new render unit appears and the user is NOT pinned to the bottom
 (scrolled up)
@@ -355,13 +357,26 @@ THE SYSTEM SHALL determine "pinned to bottom" using Virtuoso's
 `atBottomStateChange` callback with `atBottomThreshold` configured to
 match the prior 100-pixel threshold.
 
+THE SYSTEM SHALL disable Virtuoso's built-in auto-scroll mechanisms
+(`followOutput={false}`) and rely solely on the `totalListHeightChanged`
+callback for auto-follow. Virtuoso's built-in `followOutput="auto"`
+enables a size-increase handler that misclassifies user scroll-up as
+content growth during streaming (its `notAtBottomBecause` priority
+order checks `scrollHeight` growth before scroll direction), yanking
+the user back to the bottom. The manual `totalListHeightChanged`
+callback uses the pre-growth scroll position to distinguish "user was
+near the bottom" from "user scrolled up," which is correct during
+streaming where Virtuoso's built-in handler is not.
+
 **Rationale:** Force-scroll-on-system-message (the prior implementation
 of this requirement) was an over-broad trigger that yanked the viewport
 on routine system messages (mode transitions, cancellations) as well as
 actionable ones (approval prompts). It is a hostile UX pattern not used
 by comparable chat-style products. Pinned-vs-scrolled-up is the only
 state that drives auto-scroll; the jump-to-newest button is the only
-escape hatch.
+escape hatch. Disabling `followOutput` eliminates the double-auto-scroll
+where Virtuoso's built-in handler and the manual `totalListHeightChanged`
+callback both fire and fight each other during streaming.
 
 ---
 
@@ -375,15 +390,24 @@ AND render each item via `itemContent={(_, unit) => renderUnit(unit, ...)}`
 AND key each item via `computeItemKey={(_, unit) => unit.key}`
 
 THE SYSTEM SHALL configure the Virtuoso instance with:
-- `followOutput="auto"` — pin to bottom only when the user is already
-  at the bottom (per REQ-MLRU-014); do not yank when scrolled up
+- `followOutput={false}` — disable ALL of Virtuoso's built-in auto-scroll
+  mechanisms (both the totalCount-based followOutput and the size-increase
+  handler). Auto-follow is handled solely by the `totalListHeightChanged`
+  callback (per REQ-MLRU-014), whose pre-growth `oldFromBottom` logic
+  correctly distinguishes "user was near the bottom" from "user scrolled
+  up" — unlike Virtuoso's built-in size-increase handler, which
+  misclassifies user scroll-up as content growth during streaming.
 - `initialTopMostItemIndex={allUnits.length - 1}` (or `0` when empty) —
   bottom-pinned mount (replaces REQ-MLRU-005)
 - `alignToBottom` — when total content height is less than viewport
   height, items pin to the bottom of the viewport rather than the top
 - `atBottomThreshold={100}` — match the prior pin-detection threshold
 - `atBottomStateChange={isAtBottom => …}` — wired to the
-  jump-to-newest button visibility state
+  jump-to-newest button visibility state (fires independently of
+  `followOutput`)
+- `totalListHeightChanged={handleTotalListHeightChanged}` — the sole
+  auto-scroll mechanism; re-snaps to the last item when the user's
+  pre-growth distance from the bottom is within the pin threshold
 - `increaseViewportBy={{ top: 600, bottom: 600 }}` — overscan distance
   matching the prior 600-pixel sentinel rootMargin
 - `key={conversationId}` on the React element — force a fresh Virtuoso

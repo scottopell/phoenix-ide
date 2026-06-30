@@ -237,8 +237,10 @@ MessageList renders a single `<Virtuoso>` instance from `react-virtuoso`
 with the concatenation `[...historicalUnits, ...tailUnits]` as its
 `data` prop. Virtuoso owns: windowing (which items are in DOM at any
 time), scroll-anchor compensation (preserving viewport when items mount
-above the viewport), item-height measurement, and follow-output (pin-
-to-bottom behavior).
+above the viewport), and item-height measurement. Auto-follow (pin-to-
+bottom behavior) is NOT delegated to Virtuoso; `followOutput={false}`
+disables Virtuoso's built-in auto-scroll, and the `totalListHeightChanged`
+callback is the sole auto-scroll mechanism (see REQ-MLRU-014).
 
 Key configuration:
 
@@ -253,9 +255,10 @@ Key configuration:
     </div>
   )}
   computeItemKey={(_, unit) => unit.key}
-  followOutput="auto"
+  followOutput={false}
   atBottomThreshold={100}
   atBottomStateChange={(atBottom) => setIsAtBottom(atBottom)}
+  totalListHeightChanged={handleTotalListHeightChanged}
   initialTopMostItemIndex={allUnits.length > 0 ? allUnits.length - 1 : 0}
   alignToBottom
   increaseViewportBy={{ top: 600, bottom: 600 }}
@@ -272,11 +275,19 @@ Rationale for each non-default knob:
   every switch without leakage from the prior conversation. Cost: a
   re-measure on return visits, acceptable given the sub-second visit
   cadence and small typical conversation size.
-- `followOutput="auto"` — when the user is already pinned to the bottom
-  and a new item arrives (or the streaming agent's item grows), Virtuoso
-  re-snaps. When the user has scrolled up, Virtuoso leaves the viewport
-  alone. This is the entire pin/no-pin policy (REQ-MLRU-014); no force-
-  scroll override exists.
+- `followOutput={false}` — disables ALL of Virtuoso's built-in auto-scroll
+  mechanisms (both the totalCount-based followOutput and the size-increase
+  handler). Auto-follow is handled solely by the `totalListHeightChanged`
+  callback. This is necessary because Virtuoso's built-in mechanisms don't
+  handle streaming token growth correctly: the totalCount-based followOutput
+  only fires on `data.length` changes (new items), not height-only changes
+  (streaming token growth); and the size-increase handler misclassifies user
+  scroll-up as content growth during streaming (its `notAtBottomBecause`
+  priority order checks `scrollHeight` growth before scroll direction),
+  yanking the user back to the bottom. The manual `totalListHeightChanged`
+  callback uses the pre-growth scroll position (`oldFromBottom`) to
+  distinguish "user was near the bottom" from "user scrolled up," which is
+  correct during streaming. See REQ-MLRU-014 for the full rationale.
 - `atBottomThreshold={100}` — matches the prior hand-rolled
   `scrollHeight - scrollTop - clientHeight <= 100` threshold so the
   pin/no-pin classification stays identical to user expectations

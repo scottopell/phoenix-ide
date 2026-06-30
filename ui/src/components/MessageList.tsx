@@ -455,11 +455,18 @@ function MessageListImpl({
     }
   }, [conversationId, messages.length, pendingMessages.length, streamingRequestId, isAtBottom]);
 
-  // virtuoso's `followOutput="auto"` only fires when `data.length` grows;
-  // it doesn't re-snap when the LAST item's height changes async after
-  // mount (markdown render, react-syntax-highlighter mounting, image
-  // loading). That leaves the user a few hundred pixels above true bottom
-  // — visually "not at the bottom" despite virtuoso's internal pin.
+  // `followOutput={false}` disables ALL of Virtuoso's built-in auto-scroll
+  // (both the totalCount-based followOutput and the size-increase handler).
+  // This callback is the SOLE auto-scroll mechanism. It is necessary because
+  // Virtuoso's built-in mechanisms don't handle streaming token growth:
+  //   - totalCount-based followOutput only fires when `data.length` grows
+  //     (new items appended), not when the last item's height changes.
+  //   - the size-increase handler fires on `atBottom` true→false transitions
+  //     classified as SIZE_INCREASED, but during streaming the user stays
+  //     within the atBottomThreshold so no transition fires — and when the
+  //     user scrolls up within the threshold, the `notAtBottomBecause`
+  //     priority order misclassifies it as SIZE_INCREASED (because
+  //     scrollHeight grew) and yanks them back, fighting the user.
   //
   // `totalListHeightChanged` fires on EVERY height delta, including:
   //   - new items appended
@@ -670,7 +677,7 @@ function MessageListImpl({
           context={virtuosoContext}
           itemContent={itemContent}
           computeItemKey={computeItemKey}
-          followOutput="auto"
+          followOutput={false}
           atBottomThreshold={PIN_TO_BOTTOM_THRESHOLD}
           atBottomStateChange={handleAtBottomStateChange}
           totalListHeightChanged={handleTotalListHeightChanged}
