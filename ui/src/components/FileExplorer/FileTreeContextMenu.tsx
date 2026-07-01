@@ -34,7 +34,7 @@ export function FileTreeContextMenu() {
     if (!target) return;
 
     // Only handle right-clicks within the file tree container
-    const treeContainer = target.closest('.ft-root');
+    const treeContainer = target.closest('.ft-root') as HTMLElement | null;
     if (!treeContainer) return;
 
     const itemEl = target.closest('.ft-item') as HTMLElement | null;
@@ -142,9 +142,11 @@ export function FileTreeContextMenu() {
         Copy absolute path
       </button>
       <div className="msg-context-divider" />
-      <button className="msg-context-item" onClick={() => insertDraft(`@${menu.relativePath} `)}>
-        Insert @file reference
-      </button>
+      {!menu.isDirectory && (
+        <button className="msg-context-item" onClick={() => insertDraft(`@${menu.relativePath} `)}>
+          Insert @file reference
+        </button>
+      )}
       <button className="msg-context-item" onClick={() => insertDraft(`./${menu.relativePath} `)}>
         Insert ./path reference
       </button>

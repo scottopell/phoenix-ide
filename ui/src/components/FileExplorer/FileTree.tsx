@@ -328,8 +328,8 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   const { pushScope, popScope } = useFocusScopeCommands();
   const [treeFocused, setTreeFocused] = useState(false);
   useEffect(() => {
-    if (treeFocused) pushScope('file-tree');
-    else popScope('file-tree');
+    if (!treeFocused) return;
+    pushScope('file-tree');
     return () => popScope('file-tree');
   }, [treeFocused, pushScope, popScope]);
 
@@ -428,9 +428,9 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
         // Move to parent directory (the nearest preceding item at a lower depth)
         e.preventDefault();
         e.stopPropagation();
-        const currentDepth = Number(el.style.paddingLeft || '0');
+        const currentDepth = parseInt(el.style.paddingLeft || '0', 10);
         for (let i = currentIndex - 1; i >= 0; i--) {
-          const prevDepth = Number(allItems[i]!.style.paddingLeft || '0');
+          const prevDepth = parseInt(allItems[i]!.style.paddingLeft || '0', 10);
           if (prevDepth < currentDepth) {
             allItems[i]!.focus();
             break;

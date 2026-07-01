@@ -313,7 +313,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const handleDrop = async (e: DragEvent) => {
     const types = Array.from(e.dataTransfer.types);
 
-    // File-tree → composer drag: insert an @file reference (include contents).
+    // File-tree → composer drag: insert an @file reference for files (include
+    // contents at send time) or a ./path reference for directories (point the
+    // AI at the path without expansion, since @ expansion rejects trailing /).
     // Checked before the OS Files path so the two drop modes don't conflict.
     if (types.includes(FILE_TREE_DRAG_TYPE)) {
       e.preventDefault();
@@ -323,7 +325,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         try {
           const payload = JSON.parse(raw) as { relativePath: string; isDirectory: boolean };
           const ref = payload.isDirectory
-            ? `@${payload.relativePath}/ `
+            ? `./${payload.relativePath} `
             : `@${payload.relativePath} `;
           window.dispatchEvent(new CustomEvent('phoenix:insert-draft', { detail: { text: ref } }));
         } catch {

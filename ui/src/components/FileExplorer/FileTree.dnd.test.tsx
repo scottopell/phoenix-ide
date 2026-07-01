@@ -124,10 +124,10 @@ describe('FileTree keyboard navigation', () => {
     await act(async () => { (items[0] as HTMLElement).focus(); });
     expect(document.activeElement).toBe(items[0]);
 
-    fireEvent.keyDown(items[0], { key: 'ArrowDown' });
+    fireEvent.keyDown(items[0]!, { key: 'ArrowDown' });
     expect(document.activeElement).toBe(items[1]);
 
-    fireEvent.keyDown(items[1], { key: 'ArrowDown' });
+    fireEvent.keyDown(items[1]!, { key: 'ArrowDown' });
     expect(document.activeElement).toBe(items[2]);
   });
 
@@ -138,10 +138,10 @@ describe('FileTree keyboard navigation', () => {
     const items = document.querySelectorAll('.ft-item');
     await act(async () => { (items[2] as HTMLElement).focus(); });
 
-    fireEvent.keyDown(items[2], { key: 'ArrowUp' });
+    fireEvent.keyDown(items[2]!, { key: 'ArrowUp' });
     expect(document.activeElement).toBe(items[1]);
 
-    fireEvent.keyDown(items[1], { key: 'ArrowUp' });
+    fireEvent.keyDown(items[1]!, { key: 'ArrowUp' });
     expect(document.activeElement).toBe(items[0]);
   });
 
@@ -153,7 +153,7 @@ describe('FileTree keyboard navigation', () => {
     await act(async () => { (items[0] as HTMLElement).focus(); });
     expect(document.activeElement).toBe(items[0]);
 
-    fireEvent.keyDown(items[0], { key: 'Escape' });
+    fireEvent.keyDown(items[0]!, { key: 'Escape' });
     expect(document.activeElement).not.toBe(items[0]);
   });
 
@@ -164,7 +164,7 @@ describe('FileTree keyboard navigation', () => {
     const items = document.querySelectorAll('.ft-item');
     await act(async () => { (items[2] as HTMLElement).focus(); });
 
-    fireEvent.keyDown(items[2], { key: 'ArrowDown' });
+    fireEvent.keyDown(items[2]!, { key: 'ArrowDown' });
     expect(document.activeElement).toBe(items[0]);
   });
 
@@ -175,7 +175,7 @@ describe('FileTree keyboard navigation', () => {
 
     const items = document.querySelectorAll('.ft-item');
     await act(async () => { (items[1] as HTMLElement).focus(); });
-    fireEvent.keyDown(items[1], { key: 'Enter' });
+    fireEvent.keyDown(items[1]!, { key: 'Enter' });
 
     expect(onFileSelect).toHaveBeenCalledWith('/repo/main.rs', '/repo');
   });
@@ -187,7 +187,7 @@ describe('FileTree keyboard navigation', () => {
     const items = document.querySelectorAll('.ft-item');
     await act(async () => { (items[2] as HTMLElement).focus(); });
 
-    fireEvent.keyDown(items[2], { key: 'Home' });
+    fireEvent.keyDown(items[2]!, { key: 'Home' });
     expect(document.activeElement).toBe(items[0]);
   });
 
@@ -198,7 +198,7 @@ describe('FileTree keyboard navigation', () => {
     const items = document.querySelectorAll('.ft-item');
     await act(async () => { (items[0] as HTMLElement).focus(); });
 
-    fireEvent.keyDown(items[0], { key: 'End' });
+    fireEvent.keyDown(items[0]!, { key: 'End' });
     expect(document.activeElement).toBe(items[items.length - 1]);
   });
 });
