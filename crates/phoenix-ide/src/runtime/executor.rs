@@ -6409,6 +6409,7 @@ fn llm_error_to_db_error(kind: phoenix_llm::LlmErrorKind) -> crate::db::ErrorKin
         phoenix_llm::LlmErrorKind::Auth => crate::db::ErrorKind::Auth,
         phoenix_llm::LlmErrorKind::RateLimit => crate::db::ErrorKind::RateLimit,
         phoenix_llm::LlmErrorKind::UsageLimitReached => crate::db::ErrorKind::UsageLimitReached,
+        phoenix_llm::LlmErrorKind::OutputLimitExceeded => crate::db::ErrorKind::OutputLimitExceeded,
         phoenix_llm::LlmErrorKind::Network => crate::db::ErrorKind::Network,
         phoenix_llm::LlmErrorKind::InvalidRequest => crate::db::ErrorKind::InvalidRequest,
         phoenix_llm::LlmErrorKind::InvalidResponse => crate::db::ErrorKind::InvalidResponse,
@@ -6468,6 +6469,9 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
             message: error.message,
         },
         LlmErrorKind::ContextWindowExceeded => LlmOutcome::TokenBudgetExceeded,
+        LlmErrorKind::OutputLimitExceeded => LlmOutcome::OutputLimitExceeded {
+            message: error.message,
+        },
         LlmErrorKind::Auth => LlmOutcome::AuthError {
             message: error.message,
             recovery_in_progress: error.recovery_in_progress,
@@ -6573,6 +6577,10 @@ mod error_mapping_tests {
             crate::db::ErrorKind::UsageLimitReached
         );
         assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::OutputLimitExceeded),
+            crate::db::ErrorKind::OutputLimitExceeded
+        );
+        assert_eq!(
             llm_error_to_db_error(LlmErrorKind::ServerOverloaded),
             crate::db::ErrorKind::ServerOverloaded
         );
@@ -6589,6 +6597,25 @@ mod error_mapping_tests {
         assert!(
             !db_kind.is_auto_retryable(),
             "ServerOverloaded must NOT be retryable after mapping"
+        );
+    }
+
+    #[test]
+    fn test_output_limit_exceeded_is_non_retryable_but_resumable_after_mapping() {
+        let db_kind = llm_error_to_db_error(LlmErrorKind::OutputLimitExceeded);
+        assert!(
+            !db_kind.is_auto_retryable(),
+            "OutputLimitExceeded must NOT be retryable after mapping"
+        );
+        assert!(
+            db_kind.is_user_resumable(),
+            "OutputLimitExceeded must be resumable after mapping"
+        );
+        let outcome = llm_error_to_outcome(phoenix_llm::LlmError::output_limit_exceeded(
+            "output limit hit",
+        ));
+        assert!(
+            matches!(outcome, LlmOutcome::OutputLimitExceeded { message } if message == "output limit hit")
         );
     }
 

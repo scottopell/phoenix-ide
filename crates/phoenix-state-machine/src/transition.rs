@@ -267,6 +267,7 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         // value rather than panicking the conversation).
         ErrorKind::Auth
         | ErrorKind::UsageLimitReached
+        | ErrorKind::OutputLimitExceeded
         | ErrorKind::ServerOverloaded
         | ErrorKind::InvalidRequest
         | ErrorKind::Cancelled
@@ -3377,6 +3378,16 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::OutputLimitExceeded { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::OutputLimitExceeded,
+                attempt,
+                recovery_in_progress: false,
+                resets_at: None,
+            }
+        }
         LlmOutcome::AuthError {
             message,
             recovery_in_progress,
@@ -3594,6 +3605,9 @@ pub fn llm_error_to_db_error(
         phoenix_core::domain::llm_error_kind::LlmErrorKind::RateLimit => ErrorKind::RateLimit,
         phoenix_core::domain::llm_error_kind::LlmErrorKind::UsageLimitReached => {
             ErrorKind::UsageLimitReached
+        }
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::OutputLimitExceeded => {
+            ErrorKind::OutputLimitExceeded
         }
         phoenix_core::domain::llm_error_kind::LlmErrorKind::Network => ErrorKind::Network,
         phoenix_core::domain::llm_error_kind::LlmErrorKind::InvalidRequest => {
@@ -6065,6 +6079,27 @@ mod tests {
         };
         let result = transition(&state, &test_context(), Event::DismissError)
             .expect("DismissError must be accepted from a resumable Error");
+
+        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistState)),
+            "must persist the idle transition, got {:?}",
+            result.effects
+        );
+    }
+
+    #[test]
+    fn dismiss_error_from_output_limit_exceeded_returns_to_idle() {
+        let state = ConvState::Error {
+            message: "hit the output cap".to_string(),
+            error_kind: ErrorKind::OutputLimitExceeded,
+            resets_at: None,
+        };
+        let result = transition(&state, &test_context(), Event::DismissError)
+            .expect("DismissError must be accepted from an output-limit Error");
 
         assert!(matches!(result.new_state, ConvState::Idle));
         assert!(

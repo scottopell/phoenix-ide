@@ -60,6 +60,11 @@ impl LlmError {
         }
     }
 
+    #[must_use]
+    pub fn output_limit_exceeded(message: impl Into<String>) -> Self {
+        Self::new(LlmErrorKind::OutputLimitExceeded, message)
+    }
+
     pub fn auth(message: impl Into<String>) -> Self {
         Self::new(LlmErrorKind::Auth, message)
     }
@@ -403,7 +408,7 @@ mod tests {
         use AutoRetryPolicy::{AutoRetryable, NoAutoRetry};
         use LlmErrorKind::{
             Auth, ContentFilter, ContextWindowExceeded, InvalidRequest, InvalidResponse, Network,
-            RateLimit, ServerError, ServerOverloaded, UsageLimitReached,
+            OutputLimitExceeded, RateLimit, ServerError, ServerOverloaded, UsageLimitReached,
         };
         use UserResumePolicy::{NotResumable, Resumable};
 
@@ -411,6 +416,7 @@ mod tests {
             (Network, AutoRetryable, Resumable),
             (RateLimit, AutoRetryable, Resumable),
             (UsageLimitReached, NoAutoRetry, Resumable),
+            (OutputLimitExceeded, NoAutoRetry, Resumable),
             (ServerError, AutoRetryable, Resumable),
             (InvalidResponse, AutoRetryable, Resumable),
             (ServerOverloaded, NoAutoRetry, Resumable),

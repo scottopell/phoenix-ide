@@ -215,6 +215,7 @@ const ERROR_KIND_OPTIONS = [
   'auth',
   'rate_limit',
   'usage_limit_reached',
+  'output_limit_exceeded',
   'network',
   'invalid_request',
   'invalid_response',

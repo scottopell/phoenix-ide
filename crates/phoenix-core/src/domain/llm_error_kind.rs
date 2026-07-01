@@ -21,6 +21,8 @@ pub enum LlmErrorKind {
     RateLimit,
     /// Quota window exhausted (plan-level cap hit, credits depleted, etc.) - NOT retryable
     UsageLimitReached,
+    /// Model output limit reached mid-generation - not retryable, but the user can resume with a narrower or shorter request.
+    OutputLimitExceeded,
     /// Server error (5xx) - retryable
     ServerError,
     /// Selected model is at capacity (`server_is_overloaded` / `slow_down`) - NOT retryable
@@ -92,6 +94,7 @@ impl LlmAttemptReason {
             LlmErrorKind::ServerError | LlmErrorKind::InvalidResponse => Some(Self::ServerError),
             // Non-retryable kinds never reach Effect::ScheduleRetry.
             LlmErrorKind::UsageLimitReached
+            | LlmErrorKind::OutputLimitExceeded
             | LlmErrorKind::ServerOverloaded
             | LlmErrorKind::Auth
             | LlmErrorKind::InvalidRequest
@@ -109,6 +112,7 @@ impl LlmErrorKind {
                 AutoRetryPolicy::AutoRetryable
             }
             Self::UsageLimitReached
+            | Self::OutputLimitExceeded
             | Self::ServerOverloaded
             | Self::Auth
             | Self::InvalidRequest
@@ -135,7 +139,8 @@ impl LlmErrorKind {
             | Self::ServerError
             | Self::InvalidResponse
             | Self::ServerOverloaded
-            | Self::UsageLimitReached => UserResumePolicy::Resumable,
+            | Self::UsageLimitReached
+            | Self::OutputLimitExceeded => UserResumePolicy::Resumable,
             Self::InvalidRequest | Self::ContentFilter | Self::ContextWindowExceeded => {
                 UserResumePolicy::NotResumable
             }

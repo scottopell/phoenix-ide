@@ -19,6 +19,7 @@ export function getErrorPresentation(errorKind?: ErrorKind): ErrorPresentation |
     // user can resume once it clears — user-resumable, never auto-retried.
     case 'server_overloaded':
     case 'usage_limit_reached':
+    case 'output_limit_exceeded':
       return { kind: errorKind, can_auto_retry: false, can_user_resume: true };
     case 'invalid_request':
     case 'cancelled':

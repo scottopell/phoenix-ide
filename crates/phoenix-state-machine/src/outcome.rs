@@ -66,6 +66,8 @@ pub enum LlmOutcome {
     NetworkError { message: String },
     /// Token budget exceeded
     TokenBudgetExceeded,
+    /// Model exhausted its output token budget before completing — non-retryable but resumable.
+    OutputLimitExceeded { message: String },
     /// Authentication error (401/403) — non-retryable.
     /// `recovery_in_progress` is true when a credential helper is actively running.
     AuthError {

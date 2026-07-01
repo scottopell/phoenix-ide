@@ -1489,7 +1489,35 @@ fn normalize_chat_response(
             "Chat completions returned no choices",
         ));
     };
+    if choice.finish_reason.as_deref() == Some("length") {
+        log_chat_completion_length(
+            model,
+            resp.usage.as_ref().and_then(ChatUsage::reasoning_tokens),
+        );
+        return Err(LlmError::output_limit_exceeded(
+            "Chat completions hit the output token limit before finishing. \
+             Try again with a larger max_tokens value or a model with a higher output budget."
+                .to_string(),
+        ));
+    }
     chat_message_to_response(choice.message, resp.usage, model)
+}
+
+fn log_chat_completion_length(model: &str, reasoning_tokens: Option<u32>) {
+    if let Some(tokens) = reasoning_tokens {
+        tracing::warn!(
+            model,
+            reasoning_tokens = tokens,
+            "chat completions hit output limit"
+        );
+        tracing::debug!(
+            model,
+            reasoning_tokens = tokens,
+            "chat completions usage included reasoning_tokens at length"
+        );
+    } else {
+        tracing::warn!(model, "chat completions hit output limit");
+    }
 }
 
 fn chat_message_to_response(
@@ -1610,13 +1638,17 @@ impl ChatStreamAccumulator {
             )));
         }
         self.usage = event.usage.or(self.usage.take());
+        let reasoning_tokens = self.usage.as_ref().and_then(ChatUsage::reasoning_tokens);
         for choice in event.choices {
             if let Some(reasoning) = choice.delta.reasoning_content {
                 log_dropped_reasoning_content("<streaming-chat-completions>", &reasoning);
             }
             if choice.finish_reason.as_deref() == Some("length") {
-                return Err(LlmError::server_error(
-                    "Chat completions response incomplete: length".to_string(),
+                log_chat_completion_length("<streaming-chat-completions>", reasoning_tokens);
+                return Err(LlmError::output_limit_exceeded(
+                    "Chat completions hit the output token limit before finishing. \
+                     Try again with a larger max_tokens value or a model with a higher output budget."
+                        .to_string(),
                 ));
             }
             if let Some(delta) = choice.delta.content {
@@ -1796,6 +1828,8 @@ struct ChatCompletionsResponse {
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: ChatResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1887,6 +1921,20 @@ struct ChatUsage {
     /// splits cached reads out before storing Phoenix's uncached input bucket.
     #[serde(default)]
     prompt_tokens_details: ChatPromptTokensDetails,
+    #[serde(default)]
+    completion_tokens_details: ChatCompletionTokensDetails,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatCompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+}
+
+impl ChatUsage {
+    fn reasoning_tokens(&self) -> Option<u32> {
+        self.completion_tokens_details.reasoning_tokens
+    }
 }
 
 #[cfg(test)]
@@ -2762,11 +2810,13 @@ mod tests {
                         content: Some("Hello!".to_string()),
                         tool_calls: None,
                     },
+                    finish_reason: Some("stop".to_string()),
                 }],
                 usage: Some(ChatUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                     prompt_tokens_details: ChatPromptTokensDetails::default(),
+                    completion_tokens_details: ChatCompletionTokensDetails::default(),
                 }),
             };
             let result = normalize_chat_response(resp, "test-model").unwrap();
@@ -2786,11 +2836,13 @@ mod tests {
                         content: Some("Hello!".to_string()),
                         tool_calls: None,
                     },
+                    finish_reason: Some("stop".to_string()),
                 }],
                 usage: Some(ChatUsage {
                     prompt_tokens: 1_000,
                     completion_tokens: 50,
                     prompt_tokens_details: ChatPromptTokensDetails { cached_tokens: 800 },
+                    completion_tokens_details: ChatCompletionTokensDetails::default(),
                 }),
             };
             let result = normalize_chat_response(resp, "baseten/deepseek-ai/DeepSeek-V4-Pro")
@@ -2812,6 +2864,7 @@ mod tests {
                         content: Some("<\n\n".to_string()),
                         tool_calls: None,
                     },
+                    finish_reason: Some("stop".to_string()),
                 }],
                 usage: None,
             };
@@ -2828,6 +2881,7 @@ mod tests {
                         content: Some("Final answer".to_string()),
                         tool_calls: None,
                     },
+                    finish_reason: Some("stop".to_string()),
                 }],
                 usage: None,
             };
@@ -2853,6 +2907,7 @@ mod tests {
                             },
                         }]),
                     },
+                    finish_reason: Some("tool_calls".to_string()),
                 }],
                 usage: None,
             };
@@ -2880,6 +2935,7 @@ mod tests {
                             },
                         }]),
                     },
+                    finish_reason: Some("tool_calls".to_string()),
                 }],
                 usage: None,
             };
@@ -2901,6 +2957,7 @@ mod tests {
                         content: None,
                         tool_calls: None,
                     },
+                    finish_reason: Some("stop".to_string()),
                 }],
                 usage: None,
             };
@@ -3055,17 +3112,96 @@ mod tests {
         }
 
         #[test]
-        fn chat_stream_length_finish_reason_is_error() {
+        fn chat_stream_length_finish_reason_is_output_limit_exceeded() {
             use crate::LlmErrorKind;
             let (tx, _rx) = tokio::sync::broadcast::channel(8);
             let mut acc = ChatStreamAccumulator::new();
             let length_chunk = serde_json::json!({
-                "choices": [{"delta": {}, "finish_reason": "length"}]
+                "choices": [{"delta": {}, "finish_reason": "length"}],
+                "usage": {"completion_tokens_details": {"reasoning_tokens": 12}}
             })
             .to_string();
             let err = acc.process_event(&length_chunk, &tx).unwrap_err();
-            assert_eq!(err.kind, LlmErrorKind::ServerError);
-            assert!(err.message.contains("length"));
+            assert_eq!(err.kind, LlmErrorKind::OutputLimitExceeded);
+            assert!(err.message.contains("output token limit"));
+        }
+
+        #[test]
+        fn chat_nonstream_length_finish_reason_is_output_limit_exceeded() {
+            use crate::LlmErrorKind;
+            let resp = ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatResponseMessage {
+                        reasoning_content: None,
+                        content: Some("partial".to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("length".to_string()),
+                }],
+                usage: Some(ChatUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 7,
+                    prompt_tokens_details: ChatPromptTokensDetails::default(),
+                    completion_tokens_details: ChatCompletionTokensDetails {
+                        reasoning_tokens: Some(3),
+                    },
+                }),
+            };
+            let err = normalize_chat_response(resp, "test-model").unwrap_err();
+            assert_eq!(err.kind, LlmErrorKind::OutputLimitExceeded);
+            assert!(err.message.contains("output token limit"));
+        }
+
+        #[test]
+        fn chat_normalize_stop_finish_reason_unchanged() {
+            let resp = ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatResponseMessage {
+                        reasoning_content: None,
+                        content: Some("Hello!".to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: None,
+            };
+            let result = normalize_chat_response(resp, "test-model").unwrap();
+            assert!(result.end_turn);
+        }
+
+        #[test]
+        fn chat_normalize_tool_calls_finish_reason_unchanged() {
+            let resp = ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatResponseMessage {
+                        reasoning_content: None,
+                        content: None,
+                        tool_calls: Some(vec![ChatToolCall {
+                            id: "call_1".to_string(),
+                            r#type: "function".to_string(),
+                            function: ChatFunctionCall {
+                                name: "read_file".to_string(),
+                                arguments: r#"{"path":"/tmp/foo"}"#.to_string(),
+                            },
+                        }]),
+                    },
+                    finish_reason: Some("tool_calls".to_string()),
+                }],
+                usage: None,
+            };
+            let result = normalize_chat_response(resp, "test-model").unwrap();
+            assert!(!result.end_turn);
+        }
+
+        #[test]
+        fn chat_usage_reasoning_tokens_defaults_without_breaking_old_responses() {
+            let usage = serde_json::from_value::<ChatUsage>(serde_json::json!({
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "prompt_tokens_details": {"cached_tokens": 0}
+            }))
+            .unwrap();
+            assert_eq!(usage.reasoning_tokens(), None);
         }
 
         #[test]

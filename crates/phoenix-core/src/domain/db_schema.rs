@@ -557,6 +557,8 @@ pub enum ErrorKind {
     RateLimit,
     /// Quota window exhausted (plan-level cap, depleted credits, etc.) - not retryable
     UsageLimitReached,
+    /// Model output limit reached mid-generation - not retryable, but user-resumable
+    OutputLimitExceeded,
     /// Network issues, connection failures - retryable
     Network,
     /// Bad request (400) - not retryable
@@ -592,6 +594,7 @@ impl ErrorKind {
             | Self::TimedOut => AutoRetryPolicy::AutoRetryable,
             Self::Auth
             | Self::UsageLimitReached
+            | Self::OutputLimitExceeded
             | Self::ServerOverloaded
             | Self::InvalidRequest
             | Self::Cancelled
@@ -621,6 +624,7 @@ impl ErrorKind {
             | Self::InvalidResponse
             | Self::ServerOverloaded
             | Self::UsageLimitReached
+            | Self::OutputLimitExceeded
             | Self::TimedOut => UserResumePolicy::Resumable,
             Self::InvalidRequest
             | Self::Cancelled
