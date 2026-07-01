@@ -3873,7 +3873,15 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         )])
 
     def check_ast_grep():
-        """Run structural lint rules via ast-grep (one result entry per rule file)."""
+        """Run every structural lint rule in a single ast-grep pass.
+
+        One `scan --inline-rules` (rule files joined with `---`) parses each
+        source file once and applies every applicable rule to it, instead of
+        one scan — and one full re-parse of the target tree — per rule file.
+        ast-grep routes rules by language internally, so Rust rules never run
+        against ui/src/ files and vice versa, and findings carry their rule
+        id, so per-rule attribution survives the batching.
+        """
         import shutil
         if not shutil.which("ast-grep"):
             with results_lock:
@@ -3886,18 +3894,11 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         rule_files = sorted(rules_dir.glob("*.yml"))
         if not rule_files:
             return
-        for rule_file in rule_files:
-            # Route each rule at the tree its language lives in: Rust rules
-            # scan crates/, everything else (Tsx/Ts) scans ui/src/.
-            is_rust = re.search(
-                r"^language:\s*Rust\b",
-                rule_file.read_text(),
-                re.MULTILINE,
-            )
-            target = "crates/" if is_rust else "ui/src/"
-            run_step(f"ast-grep:{rule_file.stem[:14]}", [
-                "ast-grep", "scan", "--rule", str(rule_file), target,
-            ])
+        inline_rules = "\n---\n".join(f.read_text() for f in rule_files)
+        run_step("ast-grep", [
+            "ast-grep", "scan", "--inline-rules", inline_rules,
+            "crates/", "ui/src/",
+        ])
 
     def check_allium():
         """Validate every specs/<name>/<name>.allium parses under v3 grammar.
