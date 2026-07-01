@@ -18,10 +18,10 @@
 --   - Tmux integration / TTY-backed processes (specs/tmux-integration/)
 --   - Browser tool, patch tool, etc. (each in its own spec)
 --   - Conversation lifecycle (specs/bedrock/)
---   - Display-simplification rules for the UI rendering layer (REQ-BASH-015
---     lives in design.md as a UI surface concern)
---   - Landlock kernel mechanics (REQ-BASH-012/013 covered in design.md;
---     here only the requires-clause for "Explore mode" gate is referenced)
+--   - Display-simplification rules for the UI rendering layer (REQ-BASH-015;
+--     see specs/bash/requirements.md)
+--   - Landlock kernel mechanics (REQ-BASH-012/013; see
+--     specs/bash/requirements.md and specs/permissions/)
 --   - Cross-restart persistence: handles survive a continuation boundary
 --     within a WorkScope but do NOT survive a Phoenix restart (see
 --     specs/tmux-integration/ for the persistent path)
@@ -1263,54 +1263,17 @@ deferred BashHandleOutputDiskSpill    -- see: src/tools/bash/ring.rs
     -- signalling for now.
     -- Location: src/tools/bash/ring.rs
 
-deferred BashHandleCrossRestartPersistence    -- see: src/tools/bash/
-    -- v1 deliberately does NOT persist handles across Phoenix restart;
-    -- agents see handle_not_found and re-run. The earlier draft proposed
-    -- a SQLite shadow store with `lost_in_restart` tombstones; the panel
-    -- review surfaced that the structured response wasn't worth the
-    -- complexity (7-column schema, reconciliation logic, unbounded growth
-    -- across restarts because the live-handle cap doesn't apply to
-    -- tombstones, and the underlying SIGHUP-cascade assumption was wrong
-    -- on Linux for non-TTY parents). Revisit only if telemetry shows
-    -- agents materially benefit from cross-restart structured responses;
-    -- the alternative (use the tmux tool for persistence) already covers
-    -- the same use case.
-    -- Location: would have lived in src/tools/bash/shadow.rs
+deferred BashHandleCrossRestartPersistence
+    -- Bash handles do not persist across Phoenix restart; agents see
+    -- handle_not_found and re-run, while agents that need restart-persistent
+    -- processes use the tmux tool. A SQLite shadow store with
+    -- lost_in_restart tombstones is excluded from this behavioral model
+    -- because it would add a second persistence path, reconciliation logic,
+    -- and unbounded tombstone growth outside the live-handle cap.
+    -- Location: not implemented; persistence belongs to specs/tmux-integration/
 
 ------------------------------------------------------------
 -- Open questions
 ------------------------------------------------------------
 
 -- No open questions remain.
--- Decisions resolved during the elicitation conversation dated April 2026
--- and confirmed by panel review:
---   - Renamed `timeout` → `wait_seconds`; old `timeout` aliased one or two
---     releases. Tool description uses explicit-negation framing because
---     POSIX-trained models default to the kill-on-timeout intuition
---     otherwise.
---   - Hard live-handle cap with structured failure (no LRU eviction).
---   - Demote-on-exit + tombstone retained until the owning WorkScope is
---     torn down (hard-delete with no inheritor) OR Phoenix process exit
---     (whichever comes first).
---   - In-memory tombstones only; no SQLite shadow store, no
---     lost_in_restart structured response. Agents that need persistence
---     across Phoenix restart use the tmux tool.
---   - Caller-controlled offsets (lines or since), mutually exclusive,
---     truncated_before flag explicit on every response.
---   - Same handle returned on wait re-timeout (no handle proliferation).
---   - kill does NOT auto-escalate TERM → KILL. Agent escalates explicitly.
---     A kill-response timeout (KILL_RESPONSE_TIMEOUT_SECONDS) bounds how
---     long Phoenix waits for exit before returning kill_pending_kernel
---     (covers D-state hangs). The wait-for-exit task survives the
---     response so a late-arriving exit still demotes correctly.
---   - PR_SET_CHILD_SUBREAPER at startup + SIGKILL kill-tree at shutdown
---     replaces the wrong assumption that SIGHUP cascade would clean up
---     children of a dying Phoenix.
---   - Handle id format is implementation detail (sequential within a
---     work scope, e.g. "b-1"); Allium contract is "unique within a
---     WorkScope."
---   - Handle registry keyed by WorkScope, matching the terminal, browser,
---     and tmux registries: conversations on one worktree share a handle
---     table, and the hard-delete cascade skips teardown when a live
---     conversation other than the deleted one still owns the scope
---     (REQ-BASH-WS-001, REQ-BASH-WS-002).

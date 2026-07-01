@@ -14,6 +14,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [000](000_adopt-spears-v2.md) | Phoenix adopts spEARS v2 for new specification work | Accepted | methodology-level |
 | [001](001_bash-first-class-handles.md) | Bash handles are first-class process-local entities with wait windows | Accepted | REQ-BASH-001, REQ-BASH-002, REQ-BASH-003, REQ-BASH-005, REQ-BASH-009, REQ-BASH-014, REQ-BASH-WS-001, REQ-BASH-WS-002 |
 | [002](002_bash-watch-backed-handle-state.md) | Bash handle state uses watch-backed exit notifications and snapshot shaping | Accepted | REQ-BASH-001, REQ-BASH-003, REQ-BASH-004, REQ-BASH-005, REQ-BASH-006, REQ-BASH-014, REQ-BASH-WS-002 |
+| [003](003_bash-process-cleanup-uses-subreaper-kill-tree.md) | Bash process cleanup uses subreaper plus shutdown kill-tree | Accepted | REQ-BASH-003, REQ-BASH-006, REQ-BASH-007 |
 
 ## For agents: which decisions bind your task
 
@@ -23,9 +24,10 @@ Consult the relevant ADRs before starting work of each kind.
 | --- | --- |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
-| Migrating legacy `specs/*/design.md` content | 000, 001, 002 |
+| Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003 |
 | Specifying bash command execution / wait-window semantics | 001 |
 | Specifying bash handle state observation or response shaping | 002 |
+| Specifying bash process cleanup, shutdown cleanup, or kill escalation policy | 003 |
 
 ## Decision dependencies
 
@@ -33,7 +35,8 @@ Consult the relevant ADRs before starting work of each kind.
 ADR-000 (adopt spEARS v2 for new work)
    └── establishes the shared ADR chain and incremental legacy-spec migration path
       └── ADR-001 (Bash handles are first-class process-local entities with wait windows)
-         └── ADR-002 (Bash handle state uses watch-backed exit notifications and snapshot shaping)
+         ├── ADR-002 (Bash handle state uses watch-backed exit notifications and snapshot shaping)
+         └── ADR-003 (Bash process cleanup uses subreaper plus shutdown kill-tree)
 ```
 
 ## Conventions

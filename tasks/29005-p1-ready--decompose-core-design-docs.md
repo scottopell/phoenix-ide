@@ -10,11 +10,10 @@ Prioritize these because code comments, Allium specs, generated docs, or active 
 
 1. `specs/bedrock/`
 2. `specs/projects/`
-3. `specs/bash/`
-4. `specs/terminal/` and `specs/terminal-panel/`
-5. `specs/tmux-integration/`
-6. `specs/mcp/`
-7. `specs/chains/` if it remains heavily cited after the first six are handled
+3. `specs/terminal/` and `specs/terminal-panel/`
+4. `specs/tmux-integration/`
+5. `specs/mcp/`
+6. `specs/chains/` if it remains heavily cited after the first five are handled
 
 ## Required method per spec
 
@@ -36,6 +35,7 @@ For each target spec:
 ## Non-goals
 
 - Do not perform a mechanical delete of all design docs.
+- Do not include `specs/bash/`; its v1 `design.md` has already been retired after migration into requirements, Allium, executive status, and ADR-001 through ADR-003.
 - Do not invent rationale where history cannot be reconstructed; if uncertain, either preserve the legacy note or ask for a decision.
 - Do not broaden feature behavior while migrating docs.
 

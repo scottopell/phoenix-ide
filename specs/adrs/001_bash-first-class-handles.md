@@ -68,8 +68,6 @@ out of scope for bash itself.
 
 - Related ADRs: ADR-002
 - Feature spec: `specs/bash/requirements.md`
-- Legacy source: `specs/bash/design.md` (`Overview`, `Description Template`,
-  `Run Flow`)
 - Behavioural spec: `specs/bash/bash.allium`
 - Executive summary: `specs/bash/executive.md`
 

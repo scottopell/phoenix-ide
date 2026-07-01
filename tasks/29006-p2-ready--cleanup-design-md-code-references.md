@@ -29,7 +29,6 @@ The bootstrap inventory found design-doc citations in Rust doc comments, inline 
 
 - `crates/phoenix-ide/src/api/handlers.rs` → `bedrock/design.md` FM-7.
 - `crates/phoenix-ide/src/chain_runtime.rs`, `crates/phoenix-ide/src/api/chains.rs`, `ui/src/utils/chains.ts`, and related tests/generated docs → `chains/design.md`.
-- `crates/phoenix-tools/src/bash/*` → `bash/design.md` process/watch/output sections.
 - `crates/phoenix-terminal/src/*`, `crates/phoenix-tools/src/tmux*`, generated tmux types → terminal/tmux design docs.
 - Allium comments in `llm`, `wake-contracts`, `working-phase-visibility`, `terminal-panel`, `stale-tool-results`, and `messagelist-render-units` that cite design prose for current behavior.
 

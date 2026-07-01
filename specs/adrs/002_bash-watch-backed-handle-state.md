@@ -65,8 +65,6 @@ memory, and avoids turning bash into a persistence system.
 
 - Related ADRs: ADR-001
 - Feature spec: `specs/bash/requirements.md`
-- Legacy source: `specs/bash/design.md` (`In-Memory Handle Registry`, `Watch-
-  channel rule`)
 - Behavioural spec: `specs/bash/bash.allium`
 - Executive summary: `specs/bash/executive.md`
 
