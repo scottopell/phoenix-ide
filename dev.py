@@ -3009,6 +3009,8 @@ def _categorize_changed_paths(paths) -> set:
             cats.add("TASKS")
         if p.startswith("specs/"):
             cats.add("SPECS")
+        if p.startswith("tests/devpy/"):
+            cats.add("SPECS")
         if p.startswith("ast-grep-rules/"):
             cats.add("ASTGREP")
         if p.startswith("tests/e2e/") or p == "phoenix-client.py":
@@ -4637,7 +4639,7 @@ def _validate_spears_v2_shape(specs_root: Path) -> SpearsV2ShapeResult:
 
     if numbered:
         nums = [n for n, _ in numbered]
-        expected = list(range(min(nums), max(nums) + 1))
+        expected = list(range(0, max(nums) + 1))
         if nums != expected:
             errors.append(
                 "specs/adrs/: ADR numbers must be sequential without gaps "

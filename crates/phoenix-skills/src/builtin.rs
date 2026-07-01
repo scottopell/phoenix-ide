@@ -31,6 +31,7 @@
 //! first-seen entry.
 
 use std::collections::BTreeSet;
+use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(rust_embed::RustEmbed)]
@@ -68,8 +69,8 @@ pub fn skill_names() -> Vec<String> {
 }
 
 /// Extract every embedded built-in file to `target_dir/<skill>/<...>`.
-/// Overwrites existing files; does not delete files that are no longer in
-/// the binary (rare, and a user can remove the target dir manually).
+/// Overwrites existing files and prunes files that used to belong to a built-in
+/// skill but are no longer embedded in the binary.
 ///
 /// # Errors
 ///
@@ -83,6 +84,7 @@ pub fn skill_names() -> Vec<String> {
 /// corrupt binary (the embed macro guarantees the iterator and lookup
 /// share the same compile-time set).
 pub fn extract_to(target_dir: &Path) -> std::io::Result<()> {
+    prune_removed_builtin_files(target_dir)?;
     for path in BuiltinAssets::iter() {
         let asset = BuiltinAssets::get(&path).expect("iterated asset must exist");
         let dest = target_dir.join(path.as_ref());
@@ -100,6 +102,48 @@ pub fn extract_to(target_dir: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn prune_removed_builtin_files(target_dir: &Path) -> io::Result<()> {
+    let mut expected = BTreeSet::new();
+    for path in BuiltinAssets::iter() {
+        expected.insert(PathBuf::from(path.as_ref()));
+    }
+
+    for skill in skill_names() {
+        let skill_dir = target_dir.join(&skill);
+        if !skill_dir.exists() {
+            continue;
+        }
+        prune_dir(&skill_dir, Path::new(&skill), &expected)?;
+    }
+    Ok(())
+}
+
+fn prune_dir(dir: &Path, rel_dir: &Path, expected: &BTreeSet<PathBuf>) -> io::Result<bool> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = rel_dir.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if prune_dir(&path, &rel, expected)? {
+                std::fs::remove_dir(&path)?;
+            }
+        } else if file_type.is_file() && !expected.contains(&rel) {
+            std::fs::remove_file(&path)?;
+        }
+    }
+
+    let is_empty = std::fs::read_dir(dir)?.next().is_none();
+    Ok(is_empty && !expected_dir_has_descendants(rel_dir, expected))
+}
+
+fn expected_dir_has_descendants(rel_dir: &Path, expected: &BTreeSet<PathBuf>) -> bool {
+    expected.iter().any(|path| {
+        path.parent()
+            .is_some_and(|parent| parent == rel_dir || parent.starts_with(rel_dir))
+    })
 }
 
 #[cfg(test)]
@@ -174,5 +218,21 @@ mod tests {
             "extraction should restore tampered file"
         );
         assert!(restored.contains("spEARS"));
+    }
+
+    #[test]
+    fn extract_prunes_removed_builtin_files() {
+        let tmp = TempDir::new().unwrap();
+        let stale = tmp.path().join("spears/references/discover.md");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "old v1 guidance").unwrap();
+
+        extract_to(tmp.path()).unwrap();
+
+        assert!(
+            !stale.exists(),
+            "removed built-in companion should be pruned"
+        );
+        assert!(tmp.path().join("spears/references/discovery.md").is_file());
     }
 }

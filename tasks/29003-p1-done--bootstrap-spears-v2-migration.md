@@ -11,7 +11,7 @@ spEARS v2 changes the artifact model in ways that affect both Phoenix-the-produc
 - the built-in Phoenix `spears` skill still teaches the v1 three-document model.
 - Phoenix’s own repo guidance and ~49 specs still assume `requirements.md` + `design.md` + `executive.md`.
 
-A read-only copy of the new v2 source is available at `/Users/scottopell/dev/spears/`.
+A read-only copy of the new v2 source was provided out-of-tree during task execution.
 
 ## Goal
 
@@ -20,7 +20,7 @@ Create the first safe migration slice: make Phoenix teach and follow spEARS v2 f
 ## Scope
 
 1. **Update the built-in product skill**
-   - Replace `crates/phoenix-skills/src/builtin/spears/` with the v2 skill content from `/Users/scottopell/dev/spears/skills/spears/`.
+   - Replace `crates/phoenix-skills/src/builtin/spears/` with the provided v2 skill content.
    - Preserve Phoenix packaging expectations for built-in skills and companion files.
    - Update any unit tests that assert v1 reference filenames such as `references/discover.md`.
 
@@ -72,10 +72,10 @@ This task should end with Phoenix on spEARS v2 for new work, plus a sequenced mi
 
 ## Notes from initial exploration
 
-- v2 source files found:
-  - `/Users/scottopell/dev/spears/skills/spears/SKILL.md`
-  - `/Users/scottopell/dev/spears/skills/spears/references/*.md`
-  - `/Users/scottopell/dev/spears/skills/spears/adrs/*.md`
+- v2 source files found in the provided out-of-tree source copy:
+  - `skills/spears/SKILL.md`
+  - `skills/spears/references/*.md`
+  - `skills/spears/adrs/*.md`
 - Phoenix built-in skill currently lives at `crates/phoenix-skills/src/builtin/spears/` and has v1 references: `discover.md`, `ears-format.md`, `implement.md`, `lint.md`, `reflect.md`, `validate.md`.
 - Phoenix currently has roughly 49 `design.md` files, 49 `requirements.md` files, 53 `executive.md` files, and 37 `.allium` files under `specs/`.
 - Rust comments and module docs still cite several `specs/*/design.md` files as authoritative design/current-behavior references; these should be handled in focused follow-ups.

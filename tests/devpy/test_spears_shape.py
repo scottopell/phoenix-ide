@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 spec = importlib.util.spec_from_file_location("phoenix_dev_py", ROOT / "dev.py")
+assert spec is not None
 dev = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(dev)
@@ -84,6 +85,23 @@ class SpearsV2ShapeTests(unittest.TestCase):
             result = dev._validate_spears_v2_shape(specs)
 
             self.assertTrue(any("missing index row/link for 000_test-decision.md" in e for e in result.errors))
+
+    def test_adr_chain_requires_numbering_to_start_at_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            specs = Path(td) / "specs"
+            self.write_valid_adrs(specs)
+            (specs / "adrs" / "000_test-decision.md").unlink()
+            (specs / "adrs" / "001_test-decision.md").write_text(ADR_TEXT.replace("ADR-000", "ADR-001"))
+            (specs / "adrs" / "README.md").write_text(
+                "# Architecture Decision Records\n\n"
+                "| ADR | Title | Status | Affects |\n"
+                "| --- | --- | --- | --- |\n"
+                "| [001](001_test-decision.md) | Test decision | Accepted | methodology-level |\n"
+            )
+
+            result = dev._validate_spears_v2_shape(specs)
+
+            self.assertTrue(any("sequential without gaps" in e for e in result.errors))
 
     def test_adr_chain_reports_numbering_gap(self):
         with tempfile.TemporaryDirectory() as td:

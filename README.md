@@ -80,7 +80,7 @@ disclosure: essentials visible by default, details on demand.
 
 | Tool | Description | Spec |
 |------|-------------|------|
-| bash | Shell command execution with timeout, truncation, background mode | [spec](specs/bash/executive.md) |
+| bash | Shell command execution with wait windows, truncation, and handle-based background observation | [spec](specs/bash/executive.md) |
 | patch | Structured file editing — create, modify, delete with fuzzy matching | [spec](specs/patch/executive.md) |
 | read_file | Read a file, or a line range of one (any path the server process can access) | — |
 | search | grep + glob over a directory tree, ripgrep-style (any path the server process can access) | — |

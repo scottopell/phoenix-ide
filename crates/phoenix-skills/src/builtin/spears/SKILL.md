@@ -107,13 +107,14 @@ Reach for a `.allium` file when the feature has real behavioral complexity:
 Skip Allium when `requirements.md` already says enough: CRUD endpoints, pure
 data transformations, UI components, tools with no lifecycle.
 Adding Allium there is cost without payoff.
-When you do write one, defer to the `allium` skill for syntax and the `elicit` /
-`propagate` / `weed` workflow.
+When you do write one, defer to the `allium` skill for syntax and to the
+project's available Allium workflows for elicitation, test propagation, and
+spec-code drift checks.
 
 **spEARS is complete on its own.** Allium is an *optional* companion for the
 complex minority of features — install it when you want formal behavioral specs
 and generated tests.
-Everything else (requirements, ADRs, executive status, open questions,
+Everything else (requirements, ADRs, executive status, question resolution,
 validation) works with spEARS alone.
 The references note the few places that gain extra power when Allium is present.
 
@@ -130,10 +131,10 @@ discover ──► requirements.md (REQ-IDs, EARS, user-why) + executive.md (ske
    │
    ├─ NO  ──► implement directly against REQ-IDs, stay in spEARS
    │
-   └─ YES ──► allium elicit ─► feature.allium (references the REQ-IDs)
-              allium propagate ─► tests (must fail first)
+   └─ YES ──► elicit exact behavior ─► feature.allium (references the REQ-IDs)
+              propagate tests from Allium (must fail first)
               implement ─► code with // REQ-XX-### comments
-              allium weed ─► .allium ↔ code divergence check
+              check .allium ↔ code divergence with available Allium tooling
    │
    ▼
 write an ADR in specs/adrs/ for any significant decision made along the way, and for
@@ -156,9 +157,9 @@ Each task below has a home — a reference file in this skill, or the sibling
 | Write EARS requirements correctly | [references/ears-guide.md](references/ears-guide.md) | Authoring or reviewing `requirements.md` |
 | Author/update requirements & executive | [references/authoring.md](references/authoring.md) | Writing the markdown layer |
 | Capture a design decision | [references/adr-guide.md](references/adr-guide.md) | A decision has a real “why”; any REQ deprecation |
-| Specify exact behavior, generate tests | `allium` skill (`elicit`, `propagate`) | The Allium gate fired YES |
+| Specify exact behavior, generate tests | `allium` skill and project Allium tooling | The Allium gate fired YES |
 | Validate the markdown layer | [references/validation.md](references/validation.md) | Before merge |
-| Check spec ↔ code divergence | `allium` skill (`weed`) | The feature carries a `.allium` |
+| Check spec ↔ code divergence | Project Allium tooling | The feature carries a `.allium` |
 | Establish/verify traceability | [references/traceability.md](references/traceability.md) | Linking requirement → test → code |
 | See a full feature worked end-to-end | [references/worked-examples.md](references/worked-examples.md) | You want a concrete model to follow |
 
@@ -214,5 +215,6 @@ These are the ones that, when violated, quietly corrupt the system:
   worked end-to-end *(stage 3)*
 
 Sibling skill: **allium** — the precise behavioral layer.
-spEARS without Allium is vague about exact behavior; Allium without spEARS is
-unmoored from user need.
+spEARS records user need and traceability; Allium records exact behavior when a
+formal layer is worth its cost. Allium without spEARS is unmoored from user
+need.
