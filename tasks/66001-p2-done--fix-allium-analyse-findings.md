@@ -53,7 +53,7 @@ These are wrong relative paths that prevent cross-spec resolution. Unresolved im
 
 ## Phase 2 — Fix the 4 missing version markers (trivial)
 
-Add `-- allium: 1` as the first line of:
+Add `-- allium: 3` as the first line of:
 
 - `specs/auth/auth.allium`
 - `specs/credential-helper/credential-helper.allium`
@@ -103,7 +103,7 @@ allium analyse specs/*/*.allium > /tmp/analyse.json 2>/dev/null
 # Findings count (should trend to 0):
 jq -s '[.[] | .findings[]] | length' /tmp/analyse.json
 # Warning count by code:
-jq -s -r '[.[] | .diagnostics[] | select(.severity=="warning") | .code] | group_by(.) | map("\(.[0] // "null": \(length))") | .[]' /tmp/analyse.json
+jq -s -r '[.[] | .diagnostics[] | select(.severity=="warning") | .code] | sort | group_by(.) | map("\(if .[0] == null then "null" else .[0] end): \(length)") | .[]' /tmp/analyse.json
 ```
 
 Final goal: `allium analyse` exits 0 (no findings), warnings reduced to hygiene-only items.

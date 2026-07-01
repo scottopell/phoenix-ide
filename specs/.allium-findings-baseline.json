@@ -1,75 +1,166 @@
 {
-  "version": 1,
+  "version": 2,
   "allium_version": "3.2.3",
-  "description": "Accepted allium analyse findings — cross-spec triggers (emitted by bedrock, invisible to per-spec analyser) and intentionally implicit system signals (established repo convention, see viewer_slot.allium). Regenerate: allium analyse specs/*/*.allium 2>/dev/null | jq -s (see dev.py check_allium)",
+  "description": "Accepted allium analyse findings — cross-spec triggers (emitted by bedrock, invisible to per-spec analyser), intentionally implicit system signals (established repo convention, see viewer_slot.allium), and pre-creation mode-selection events. Keyed on (spec, trigger, sorted listening_rules) so new rules listening on an already-baselined trigger are still caught. Regenerate: allium analyse specs/*/*.allium 2>/dev/null | jq -s (see dev.py check_allium)",
   "findings": [
     {
       "spec": "specs/projects/projects.allium",
-      "trigger": "ConversationBecameTerminal"
+      "trigger": "ConversationBecameTerminal",
+      "listening_rules": [
+        "ExploreWorktreeCleanupOnTerminal",
+        "ForkProposalsRetiredOnOriginTerminal"
+      ]
     },
     {
       "spec": "specs/projects/projects.allium",
-      "trigger": "ConversationCreated"
+      "trigger": "ConversationCreated",
+      "listening_rules": [
+        "ConversationRootCwdRejected",
+        "DefaultModeIsDirect",
+        "GitDirectoryDetected"
+      ]
     },
     {
       "spec": "specs/projects/projects.allium",
-      "trigger": "ConversationHardDeleted"
+      "trigger": "ConversationHardDeleted",
+      "listening_rules": [
+        "ForkProposalsRemovedOnOriginDelete",
+        "WorktreeRemovedByConversationDelete"
+      ]
     },
     {
       "spec": "specs/projects/projects.allium",
-      "trigger": "ForkProposalPersisted"
+      "trigger": "ForkProposalPersisted",
+      "listening_rules": [
+        "ForkProposalCreated"
+      ]
     },
     {
       "spec": "specs/projects/projects.allium",
-      "trigger": "ServerRestarted"
+      "trigger": "ServerRestarted",
+      "listening_rules": [
+        "ServerRestartWorktreeReconciliationBranch",
+        "ServerRestartWorktreeReconciliationExplore",
+        "ServerRestartWorktreeReconciliationWork"
+      ]
     },
     {
       "spec": "specs/projects/projects.allium",
-      "trigger": "SubAgentSpawned"
+      "trigger": "SubAgentSpawned",
+      "listening_rules": [
+        "ExploreSubAgentDirectory",
+        "WorkSubAgentInheritsWorktree"
+      ]
     },
     {
       "spec": "specs/projects/projects.allium",
-      "trigger": "TaskApprovalStarted"
+      "trigger": "TaskApprovalStarted",
+      "listening_rules": [
+        "MaterializeBranch"
+      ]
     },
     {
       "spec": "specs/projects/projects.allium",
-      "trigger": "UserStartsContinuationConversation"
+      "trigger": "UserApprovesTask",
+      "listening_rules": [
+        "TaskApprovalExecuted",
+        "TaskApprovalFreshHandoffExecuted"
+      ]
     },
     {
       "spec": "specs/projects/projects.allium",
-      "trigger": "WriteAttempted"
+      "trigger": "UserSelectsBranch",
+      "listening_rules": [
+        "BranchConflictDetected",
+        "BranchModeSelected"
+      ]
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "UserSelectsManaged",
+      "listening_rules": [
+        "ManagedModeSelected"
+      ]
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "UserSendsFirstMessage",
+      "listening_rules": [
+        "ManagedWorktreeOnFirstMessage"
+      ]
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "UserStartsContinuationConversation",
+      "listening_rules": [
+        "DirectContinuationInheritsCwd",
+        "WorkContinuationInheritsTaskId",
+        "WorktreeTransferredOnContinuation"
+      ]
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "WriteAttempted",
+      "listening_rules": [
+        "WriteBlockedOutsideWorktree"
+      ]
     },
     {
       "spec": "specs/terminal/terminal.allium",
-      "trigger": "BytesReadFromMaster"
+      "trigger": "BytesReadFromMaster",
+      "listening_rules": [
+        "PtyOutputForwarded"
+      ]
     },
     {
       "spec": "specs/terminal/terminal.allium",
-      "trigger": "ConversationBecameTerminal"
+      "trigger": "ConversationBecameTerminal",
+      "listening_rules": [
+        "TerminalAbandonedWithConversation"
+      ]
     },
     {
       "spec": "specs/terminal/terminal.allium",
-      "trigger": "DataFrameReceived"
+      "trigger": "DataFrameReceived",
+      "listening_rules": [
+        "UserInputForwarded"
+      ]
     },
     {
       "spec": "specs/terminal/terminal.allium",
-      "trigger": "EioOnMasterRead"
+      "trigger": "EioOnMasterRead",
+      "listening_rules": [
+        "ShellExited"
+      ]
     },
     {
       "spec": "specs/terminal/terminal.allium",
-      "trigger": "FirstResizeFrameReceived"
+      "trigger": "FirstResizeFrameReceived",
+      "listening_rules": [
+        "InitialResizeSent"
+      ]
     },
     {
       "spec": "specs/terminal/terminal.allium",
-      "trigger": "ResizeFrameReceived"
+      "trigger": "ResizeFrameReceived",
+      "listening_rules": [
+        "ResizeApplied",
+        "ResizeFrameRejected"
+      ]
     },
     {
       "spec": "specs/terminal/terminal.allium",
-      "trigger": "ShellIntegrationDetectionWindowElapsed"
+      "trigger": "ShellIntegrationDetectionWindowElapsed",
+      "listening_rules": [
+        "ShellIntegrationDetectionTimedOut"
+      ]
     },
     {
       "spec": "specs/terminal/terminal.allium",
-      "trigger": "WorkScopeCleaned"
+      "trigger": "WorkScopeCleaned",
+      "listening_rules": [
+        "TerminalTornDownWithWorkScopeCleanup"
+      ]
     }
   ]
 }

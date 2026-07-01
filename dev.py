@@ -3913,7 +3913,8 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
             if errs:
                 failures.append((doc.get("diagnostics", [{}])[0].get("location", {}).get("file") or "?", errs))
             for f in doc.get("findings", []):
-                all_findings.append((spec_file, f.get("trigger", "?")))
+                rules = tuple(sorted(f.get("listening_rules", [])))
+                all_findings.append((spec_file, f.get("trigger", "?"), rules))
         elapsed = time.monotonic() - t0
 
         # Hard-fail on any structural problem with the gate itself, even if
@@ -3942,8 +3943,10 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         # Compare findings against the accepted baseline.  The baseline is a
         # golden-file snapshot of known-accepted findings (cross-spec triggers
         # the per-spec analyser cannot resolve, and intentionally implicit
-        # system signals).  Fail only on findings NOT in the baseline so the
-        # gate catches regressions without blocking on the known set.
+        # system signals).  Each finding is keyed on (spec, trigger, sorted
+        # listening_rules) so a new rule listening on an already-baselined
+        # trigger is still caught as a regression.  Fail only on findings NOT
+        # in the baseline.
         baseline_path = ROOT / "specs" / ".allium-findings-baseline.json"
         new_findings = []
         if all_findings:
@@ -3951,14 +3954,14 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
                 try:
                     with open(baseline_path) as bf:
                         baseline = json.load(bf)
-                    baseline_keys = {
-                        (f.get("spec"), f.get("trigger"))
-                        for f in baseline.get("findings", [])
-                    }
-                except (json.JSONDecodeError, KeyError):
+                    baseline_keys = set()
+                    for f in baseline.get("findings", []):
+                        rules = tuple(sorted(f.get("listening_rules", [])))
+                        baseline_keys.add((f.get("spec"), f.get("trigger"), rules))
+                except Exception as e:
                     baseline_keys = set()
                     gate_problems.append(
-                        f"could not parse baseline {baseline_path.name}; "
+                        f"could not parse baseline {baseline_path.name} ({e}); "
                         f"all {len(all_findings)} finding(s) treated as new"
                     )
             else:
@@ -3998,12 +4001,13 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
                     lines.append(f"  … and {len(errs) - 5} more")
             if new_findings:
                 lines.append(f"{len(new_findings)} new finding(s) not in baseline:")
-                for spec, trigger in new_findings[:10]:
+                for spec, trigger, rules in new_findings[:10]:
                     try:
                         rel = str(Path(spec).relative_to(ROOT))
                     except (ValueError, TypeError):
                         rel = spec
-                    lines.append(f"  {rel}: trigger '{trigger}'")
+                    rule_names = ", ".join(rules) if rules else "?"
+                    lines.append(f"  {rel}: trigger '{trigger}' (rules: {rule_names})")
                 if len(new_findings) > 10:
                     lines.append(f"  … and {len(new_findings) - 10} more")
                 lines.append(
