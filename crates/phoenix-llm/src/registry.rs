@@ -154,8 +154,14 @@ pub struct LlmConfig {
     pub credential_helper: Option<Arc<crate::CredentialHelper>>,
     /// Direct URL override for the Anthropic endpoint.
     pub anthropic_base_url: Option<String>,
-    /// Direct URL override for the `OpenAI` endpoint.
+    /// Legacy direct URL override for an `OpenAI` endpoint. Prefer the
+    /// API-format-specific fields below so Responses and Chat Completions do not
+    /// share incompatible endpoint contracts.
     pub openai_base_url: Option<String>,
+    /// Direct URL override for the `OpenAI` Responses endpoint.
+    pub openai_responses_base_url: Option<String>,
+    /// Direct URL override for the `OpenAI` Chat Completions endpoint.
+    pub openai_chat_completions_base_url: Option<String>,
     /// Extra headers to inject on every LLM request (newline-separated "key: value").
     /// Parsed from `LLM_CUSTOM_HEADERS` env var. A `provider` header is auto-injected
     /// based on which provider is being called.
@@ -215,6 +221,11 @@ impl std::fmt::Debug for LlmConfig {
             .field("credential_helper", &self.credential_helper.is_some())
             .field("anthropic_base_url", &self.anthropic_base_url)
             .field("openai_base_url", &self.openai_base_url)
+            .field("openai_responses_base_url", &self.openai_responses_base_url)
+            .field(
+                "openai_chat_completions_base_url",
+                &self.openai_chat_completions_base_url,
+            )
             .field("custom_headers", &self.custom_headers)
             .field("request_tags", &self.request_tags)
             .field("auth_style", &self.auth_style)
@@ -236,6 +247,8 @@ impl Clone for LlmConfig {
             credential_helper: self.credential_helper.as_ref().map(Arc::clone),
             anthropic_base_url: self.anthropic_base_url.clone(),
             openai_base_url: self.openai_base_url.clone(),
+            openai_responses_base_url: self.openai_responses_base_url.clone(),
+            openai_chat_completions_base_url: self.openai_chat_completions_base_url.clone(),
             custom_headers: self.custom_headers.clone(),
             request_tags: self.request_tags.clone(),
             auth_style: self.auth_style,
@@ -257,6 +270,8 @@ impl Default for LlmConfig {
             credential_helper: None,
             anthropic_base_url: None,
             openai_base_url: None,
+            openai_responses_base_url: None,
+            openai_chat_completions_base_url: None,
             custom_headers: Vec::new(),
             request_tags: std::collections::BTreeMap::new(),
             auth_style: AuthStyle::ApiKey,
@@ -283,19 +298,12 @@ impl LlmConfig {
                 crate::CredentialHelper::new(command, Duration::from_millis(ttl_ms))
             });
 
-        let anthropic_base_url = std::env::var("ANTHROPIC_BASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty());
-        if let Some(url) = anthropic_base_url.as_deref() {
-            warn_if_endpoint_url_has_no_path("ANTHROPIC_BASE_URL", url);
-        }
-
-        let openai_base_url = std::env::var("OPENAI_BASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty());
-        if let Some(url) = openai_base_url.as_deref() {
-            warn_if_endpoint_url_has_no_path("OPENAI_BASE_URL", url);
-        }
+        let anthropic_base_url = endpoint_env("ANTHROPIC_BASE_URL");
+        let openai_base_url = endpoint_env("OPENAI_BASE_URL");
+        let openai_responses_base_url = endpoint_env("OPENAI_RESPONSES_BASE_URL")
+            .or_else(|| legacy_openai_base_url_for_responses(openai_base_url.as_deref()));
+        let openai_chat_completions_base_url = endpoint_env("OPENAI_CHAT_COMPLETIONS_BASE_URL")
+            .or_else(|| legacy_openai_base_url_for_chat(openai_base_url.as_deref()));
 
         // Parse newline-separated "key: value" pairs (supports real newlines and literal \n)
         let custom_headers = std::env::var("LLM_CUSTOM_HEADERS")
@@ -376,6 +384,8 @@ impl LlmConfig {
             credential_helper,
             anthropic_base_url,
             openai_base_url,
+            openai_responses_base_url,
+            openai_chat_completions_base_url,
             custom_headers,
             request_tags,
             auth_style: if std::env::var("LLM_AUTH_HEADER")
@@ -419,6 +429,40 @@ fn discovery_auth_headers(
         ModelBackend::Mock => return None,
     };
     Some(headers)
+}
+
+fn endpoint_env(name: &str) -> Option<String> {
+    let url = std::env::var(name).ok().filter(|s| !s.is_empty());
+    if let Some(value) = url.as_deref() {
+        warn_if_endpoint_url_has_no_path(name, value);
+    }
+    url
+}
+
+fn legacy_openai_base_url_for_responses(url: Option<&str>) -> Option<String> {
+    let url = url?;
+    if url.contains("/chat/completions") {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
+fn legacy_openai_base_url_for_chat(url: Option<&str>) -> Option<String> {
+    let url = url?;
+    if url.contains("/responses") {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
+fn legacy_openai_base_url_is_chat_only(config: &LlmConfig) -> bool {
+    config.openai_responses_base_url.is_none()
+        && config
+            .openai_base_url
+            .as_deref()
+            .is_some_and(|url| url.contains("/chat/completions"))
 }
 
 fn warn_if_endpoint_url_has_no_path(name: &str, url: &str) {
@@ -705,7 +749,7 @@ impl ModelRegistry {
             .as_deref()
             .and_then(derive_models_url);
         let openai_models_url = config
-            .openai_base_url
+            .openai_responses_base_url
             .as_deref()
             .and_then(derive_models_url);
         if anthropic_models_url.is_none() && openai_models_url.is_none() {
@@ -800,6 +844,16 @@ impl ModelRegistry {
         spec: &super::ModelSpec,
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
+        if spec.backend == ModelBackend::OpenAIResponses
+            && legacy_openai_base_url_is_chat_only(config)
+        {
+            tracing::debug!(
+                model = %spec.id,
+                "skipping OpenAI Responses model because OPENAI_BASE_URL points at Chat Completions and OPENAI_RESPONSES_BASE_URL is unset"
+            );
+            return None;
+        }
+
         let auth = if let Some(ref helper) = config.credential_helper {
             // credential_helper takes highest priority — dynamic credential for all providers
             LlmAuth::new(
@@ -823,7 +877,7 @@ impl ModelRegistry {
                 }
                 ModelBackend::OpenAIResponses => {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
-                    let style = if config.openai_base_url.is_some() {
+                    let style = if config.openai_responses_base_url.is_some() {
                         config.auth_style
                     } else {
                         AuthStyle::ApiKey
@@ -832,7 +886,7 @@ impl ModelRegistry {
                 }
                 ModelBackend::OpenAIChatCompletions => {
                     let key = config.openai_api_key.as_deref().filter(|k| !k.is_empty())?;
-                    let style = if config.openai_base_url.is_some() {
+                    let style = if config.openai_chat_completions_base_url.is_some() {
                         config.auth_style
                     } else {
                         AuthStyle::ApiKey
@@ -847,7 +901,8 @@ impl ModelRegistry {
             spec.clone(),
             auth,
             config.anthropic_base_url.clone(),
-            config.openai_base_url.clone(),
+            config.openai_responses_base_url.clone(),
+            config.openai_chat_completions_base_url.clone(),
             config.custom_headers.clone(),
             config.request_tags.clone(),
         ));
@@ -1708,6 +1763,16 @@ mod tests {
         .unwrap()
     }
 
+    fn external_chat_completions_model() -> super::super::ModelSpec {
+        parse_external_models(
+            r#"[{"id":"gateway-provider/example-org/Code-Model","backend":"openai_chat_completions","description":"Code model via gateway","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+    }
+
     #[test]
     fn external_openai_model_bypasses_codex_bridge_when_direct_configured() {
         let dir = tempfile::tempdir().unwrap();
@@ -2022,6 +2087,65 @@ mod tests {
         assert_eq!(opus.provider, "Anthropic");
         assert!(opus.description.contains("most capable"));
         assert_eq!(opus.context_window, 1_000_000);
+    }
+
+    #[test]
+    fn legacy_openai_base_url_does_not_cross_api_formats() {
+        let chat = Some("https://gw.example/v1/chat/completions");
+        assert_eq!(legacy_openai_base_url_for_responses(chat), None);
+        assert_eq!(
+            legacy_openai_base_url_for_chat(chat).as_deref(),
+            Some("https://gw.example/v1/chat/completions")
+        );
+
+        let responses = Some("https://gw.example/v1/responses");
+        assert_eq!(
+            legacy_openai_base_url_for_responses(responses).as_deref(),
+            Some("https://gw.example/v1/responses")
+        );
+        assert_eq!(legacy_openai_base_url_for_chat(responses), None);
+    }
+
+    #[test]
+    fn legacy_chat_only_openai_base_url_suppresses_responses_models() {
+        let config = LlmConfig {
+            credential_helper: Some(crate::CredentialHelper::new(
+                "echo gateway-token".to_string(),
+                Duration::from_hours(1),
+            )),
+            openai_base_url: Some("https://gateway.example/v1/chat/completions".to_string()),
+            openai_chat_completions_base_url: Some(
+                "https://gateway.example/v1/chat/completions".to_string(),
+            ),
+            external_models: vec![external_chat_completions_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(registry.get("gpt-5.5").is_none());
+        assert!(registry
+            .get("gateway-provider/example-org/Code-Model")
+            .is_some());
+    }
+
+    #[test]
+    fn responses_specific_base_url_allows_switching_between_responses_and_chat_models() {
+        let config = LlmConfig {
+            credential_helper: Some(crate::CredentialHelper::new(
+                "echo gateway-token".to_string(),
+                Duration::from_hours(1),
+            )),
+            openai_responses_base_url: Some("https://gateway.example/v1/responses".to_string()),
+            openai_chat_completions_base_url: Some(
+                "https://gateway.example/v1/chat/completions".to_string(),
+            ),
+            external_models: vec![external_chat_completions_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(registry.get("gpt-5.5").is_some());
+        assert!(registry
+            .get("gateway-provider/example-org/Code-Model")
+            .is_some());
     }
 
     #[test]

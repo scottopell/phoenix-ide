@@ -25,7 +25,8 @@ pub struct LlmServiceImpl {
     /// LLM auth: credential source + header style.
     pub auth: LlmAuth,
     pub anthropic_base_url: Option<String>,
-    pub openai_base_url: Option<String>,
+    pub openai_responses_base_url: Option<String>,
+    pub openai_chat_completions_base_url: Option<String>,
     pub custom_headers: Vec<(String, String)>,
     /// Free-form metadata pairs injected as a top-level `tags` object on
     /// every outbound request. Phoenix doesn't interpret these — they're a
@@ -53,7 +54,8 @@ impl LlmServiceImpl {
         spec: ModelSpec,
         auth: LlmAuth,
         anthropic_base_url: Option<String>,
-        openai_base_url: Option<String>,
+        openai_responses_base_url: Option<String>,
+        openai_chat_completions_base_url: Option<String>,
         custom_headers: Vec<(String, String)>,
         request_tags: BTreeMap<String, String>,
     ) -> Self {
@@ -61,7 +63,8 @@ impl LlmServiceImpl {
             spec,
             auth,
             anthropic_base_url,
-            openai_base_url,
+            openai_responses_base_url,
+            openai_chat_completions_base_url,
             custom_headers,
             request_tags,
             use_codex_backend: false,
@@ -83,7 +86,8 @@ impl LlmServiceImpl {
             spec,
             auth,
             anthropic_base_url: None,
-            openai_base_url: Some(CODEX_BACKEND_URL.to_string()),
+            openai_responses_base_url: Some(CODEX_BACKEND_URL.to_string()),
+            openai_chat_completions_base_url: None,
             custom_headers,
             // No proxy in front of the codex bridge — tags would be sent
             // directly to chatgpt.com which rejects unknown body fields.
@@ -99,7 +103,7 @@ impl LlmServiceImpl {
     /// calls go out untagged so unknown-field rejection can't break us. The
     /// codex bridge sets
     /// `request_tags = BTreeMap::new()` in its constructor, so it stays
-    /// untagged even though it does set `openai_base_url`.
+    /// untagged even though it does set `openai_responses_base_url`.
     fn effective_request_tags(&self, format_base_url: Option<&str>) -> &BTreeMap<String, String> {
         if format_base_url.is_some() {
             &self.request_tags
@@ -170,7 +174,8 @@ impl LlmServiceImpl {
         let mut headers = self.custom_headers.clone();
         if !headers.is_empty()
             || self.anthropic_base_url.is_some()
-            || self.openai_base_url.is_some()
+            || self.openai_responses_base_url.is_some()
+            || self.openai_chat_completions_base_url.is_some()
         {
             // Auto-inject provider header if not already present
             if !headers
@@ -241,9 +246,9 @@ impl LlmServiceImpl {
                 openai::complete(
                     &self.spec,
                     &key,
-                    self.openai_base_url.as_deref(),
+                    self.openai_responses_base_url.as_deref(),
                     &headers,
-                    self.effective_request_tags(self.openai_base_url.as_deref()),
+                    self.effective_request_tags(self.openai_responses_base_url.as_deref()),
                     request,
                     self.use_codex_backend,
                 )
@@ -255,9 +260,9 @@ impl LlmServiceImpl {
                 openai::complete_chat(
                     &self.spec,
                     &key,
-                    self.openai_base_url.as_deref(),
+                    self.openai_chat_completions_base_url.as_deref(),
                     &headers,
-                    self.effective_request_tags(self.openai_base_url.as_deref()),
+                    self.effective_request_tags(self.openai_chat_completions_base_url.as_deref()),
                     request,
                 )
                 .await
@@ -291,9 +296,9 @@ impl LlmServiceImpl {
                 openai::complete_streaming(
                     &self.spec,
                     &key,
-                    self.openai_base_url.as_deref(),
+                    self.openai_responses_base_url.as_deref(),
                     &headers,
-                    self.effective_request_tags(self.openai_base_url.as_deref()),
+                    self.effective_request_tags(self.openai_responses_base_url.as_deref()),
                     request,
                     chunk_tx,
                     self.use_codex_backend,
@@ -306,9 +311,9 @@ impl LlmServiceImpl {
                 openai::complete_streaming_chat(
                     &self.spec,
                     &key,
-                    self.openai_base_url.as_deref(),
+                    self.openai_chat_completions_base_url.as_deref(),
                     &headers,
-                    self.effective_request_tags(self.openai_base_url.as_deref()),
+                    self.effective_request_tags(self.openai_chat_completions_base_url.as_deref()),
                     request,
                     chunk_tx,
                 )
@@ -344,6 +349,7 @@ mod tests {
             auth,
             anthropic_base_url.map(String::from),
             openai_base_url.map(String::from),
+            None,
             vec![],
             tags,
         )
@@ -366,6 +372,7 @@ mod tests {
         LlmServiceImpl::new(
             spec,
             auth,
+            None,
             None,
             Some("https://gateway.example/v1/chat/completions".to_string()),
             vec![
@@ -405,6 +412,57 @@ mod tests {
     }
 
     #[test]
+    fn openai_format_base_urls_are_isolated() {
+        let mut responses_spec = all_models()
+            .into_iter()
+            .find(|s| s.id == "gpt-5.5")
+            .expect("gpt-5.5 must be in the model registry");
+        responses_spec.backend = crate::ModelBackend::OpenAIResponses;
+        let mut chat_spec = responses_spec.clone();
+        chat_spec.backend = crate::ModelBackend::OpenAIChatCompletions;
+        let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::PlainBearer);
+
+        let responses = LlmServiceImpl::new(
+            responses_spec,
+            auth.clone(),
+            None,
+            Some("https://gateway.example/v1/responses".to_string()),
+            Some("https://gateway.example/v1/chat/completions".to_string()),
+            vec![],
+            one_tag(),
+        );
+        let chat = LlmServiceImpl::new(
+            chat_spec,
+            auth,
+            None,
+            Some("https://gateway.example/v1/responses".to_string()),
+            Some("https://gateway.example/v1/chat/completions".to_string()),
+            vec![],
+            one_tag(),
+        );
+
+        assert_eq!(
+            responses.openai_responses_base_url.as_deref(),
+            Some("https://gateway.example/v1/responses")
+        );
+        assert_eq!(
+            chat.openai_chat_completions_base_url.as_deref(),
+            Some("https://gateway.example/v1/chat/completions")
+        );
+        assert_eq!(
+            responses
+                .effective_request_tags(responses.openai_responses_base_url.as_deref())
+                .len(),
+            1
+        );
+        assert_eq!(
+            chat.effective_request_tags(chat.openai_chat_completions_base_url.as_deref())
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn tags_attached_for_anthropic_base_url_only_path() {
         // Helper + ANTHROPIC_BASE_URL means a proxy is in front; tags must reach it.
         let svc = make_service(
@@ -437,7 +495,7 @@ mod tests {
             one_tag(),
         );
         assert!(
-            svc.effective_request_tags(svc.openai_base_url.as_deref())
+            svc.effective_request_tags(svc.openai_responses_base_url.as_deref())
                 .is_empty(),
             "OpenAI call must not inherit Anthropic's base-URL gate"
         );
