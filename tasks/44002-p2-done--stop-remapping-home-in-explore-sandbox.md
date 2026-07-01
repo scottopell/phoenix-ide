@@ -9,9 +9,10 @@ that is deleted after each command. This is surprising and harmful:
 - The user's real `~/.gitconfig`, `~/.cargo/config.toml`, `~/.npmrc`,
   `~/.ssh/...` are invisible to sandboxed bash — tools silently behave as
   unconfigured.
-- `HOME` (and its aliases `PHOENIX_SANDBOX_HOME` / `PHOENIX_SANDBOX_SCRATCH`)
-  churns on every `op="run"` (fresh UUID) and the old tree is deleted, so
-  nothing written to `$HOME` survives to the next call.
+- `HOME` (and its alias `PHOENIX_SANDBOX_HOME`) churns on every
+  `op="run"` (fresh UUID) and the old tree is deleted, so nothing written
+  to `$HOME` survives to the next call. (`PHOENIX_SANDBOX_SCRATCH` is a
+  separate writable scratch path, not a HOME alias.)
 - The synthetic home is inconsistent with the sandbox's own "broad read"
   threat model: `read_file` and `search` can already read `~/.ssh` etc.
   directly, so hiding `HOME` protects against config *auto-loading* but not

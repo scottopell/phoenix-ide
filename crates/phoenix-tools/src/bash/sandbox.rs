@@ -57,7 +57,6 @@ impl ExploreReadOnlyPolicy {
     fn to_command_env(&self, command: &mut Command) {
         command.env(REPO_ROOT_ENV, &self.repo_root);
         command.env(SCRATCH_ENV, &self.scratch_dir);
-        command.env("HOME", &self.home);
         command.env(PLATFORM_TEMP_ENV, &self.platform_temp);
         self.apply_child_env(command);
     }
@@ -75,6 +74,9 @@ impl ExploreReadOnlyPolicy {
     }
 
     fn from_env() -> Result<Self, String> {
+        // HOME is the IPC channel for the real user home: to_command_env sets
+        // it (via apply_child_env) on the launcher child, and we read it back
+        // here to reconstruct the policy. It is also the value bash sees.
         let repo_root = env_path(REPO_ROOT_ENV)?;
         let scratch_dir = env_path(SCRATCH_ENV)?;
         let home = env_path("HOME")?;

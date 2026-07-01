@@ -19,12 +19,13 @@ fn explore_sandbox_enforces_read_only_policy() {
     let repo = fixture_root.join("repo");
     let tasks = repo.join("tasks");
     let scratch = fixture_root.join("scratch");
-    let home = scratch.join("home");
+    let home = fixture_root.join("real-home");
     let platform_temp = std::env::temp_dir();
     let outside = fixture_root.join("outside.txt");
     let sensitive = fixture_root.join("sensitive");
     std::fs::create_dir_all(&tasks).expect("tasks dir");
     std::fs::create_dir_all(&scratch).expect("scratch dir");
+    std::fs::create_dir_all(&home).expect("home dir");
     std::fs::create_dir_all(&sensitive).expect("sensitive dir");
     std::fs::write(tasks.join("_TEMPLATE.md"), "# Template\n").expect("template");
     std::fs::write(repo.join("file.txt"), "hello\n").expect("source file");
