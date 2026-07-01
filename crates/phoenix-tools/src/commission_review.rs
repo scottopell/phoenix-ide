@@ -658,7 +658,6 @@ fn interrupted_review_output(
             finding_extraction: interrupted_finding_extraction_stage_status(
                 &interrupted.warnings,
                 has_output,
-                !interrupted.findings.is_empty(),
             ),
         },
         retry_recommendation,
@@ -709,6 +708,13 @@ fn completed_result_contract(
                 RetryRecommendation::Retry,
             )
         }
+    } else if has_warning(warnings, "dropped_findings") && !has_parsed_output {
+        (
+            ReviewStatus::Failed,
+            FindingsStatus::Unavailable,
+            FindingsTrust::Low,
+            RetryRecommendation::Retry,
+        )
     } else if has_diff_coverage_gap {
         (
             ReviewStatus::Partial,
@@ -848,6 +854,8 @@ fn summarize_warnings(warnings: &[ReviewWarning]) -> Vec<String> {
             "diff_capture_failed" => "some file diffs could not be captured".to_string(),
             "untracked_file" => "some untracked files were not reviewed".to_string(),
             "dropped_findings" => warning.message.clone(),
+            "invalid_severity" => "some finding severities were normalized".to_string(),
+            "invalid_confidence" => "some finding confidences were normalized".to_string(),
             _ => continue,
         };
         if seen.insert(summary.clone()) {
@@ -870,11 +878,17 @@ fn findings_trust_for_completed(warnings: &[ReviewWarning]) -> FindingsTrust {
         FindingsTrust::Low
     } else if has_warning(warnings, "dropped_findings") {
         FindingsTrust::Partial
-    } else if has_warning(warnings, "model_output_repaired") {
+    } else if has_normalized_finding_warning(warnings)
+        || has_warning(warnings, "model_output_repaired")
+    {
         FindingsTrust::Repaired
     } else {
         FindingsTrust::Complete
     }
+}
+
+fn has_normalized_finding_warning(warnings: &[ReviewWarning]) -> bool {
+    has_warning(warnings, "invalid_severity") || has_warning(warnings, "invalid_confidence")
 }
 
 fn diff_stage_status(warnings: &[ReviewWarning], has_unreviewed: bool) -> StageStatus {
@@ -930,13 +944,12 @@ fn interrupted_json_parse_stage_status(
 fn interrupted_finding_extraction_stage_status(
     warnings: &[ReviewWarning],
     has_output: bool,
-    has_findings: bool,
 ) -> StageStatus {
     if !has_output && !has_warning(warnings, "model_output_parse") {
         StageStatus::Skipped
     } else if has_warning(warnings, "model_output_parse") {
         StageStatus::Failed
-    } else if has_warning(warnings, "dropped_findings") || has_findings {
+    } else if has_warning(warnings, "dropped_findings") {
         StageStatus::Partial
     } else {
         StageStatus::Ok
@@ -2157,6 +2170,22 @@ mod tests {
     }
 
     #[test]
+    fn all_dropped_findings_without_summary_is_failed_unavailable() {
+        let warnings = vec![warning(
+            "dropped_findings",
+            "dropped 1 reviewer finding(s) without a file",
+            None,
+        )];
+        let (status, findings_status, findings_trust, retry_recommendation) =
+            completed_result_contract(&warnings, false, false);
+
+        assert_eq!(status, ReviewStatus::Failed);
+        assert_eq!(findings_status, FindingsStatus::Unavailable);
+        assert_eq!(findings_trust, FindingsTrust::Low);
+        assert_eq!(retry_recommendation, RetryRecommendation::Retry);
+    }
+
+    #[test]
     fn cancellation_after_output_is_not_a_deliverable_partial_result() {
         let (status, review_status, findings_status, findings_trust, retry_recommendation) =
             interrupted_contract(ReviewInterruption::Cancelled, true);
@@ -2329,6 +2358,7 @@ mod tests {
             output.findings[0].symbol.as_deref(),
             Some("parse_external_models")
         );
+        assert_eq!(output.stage_status.finding_extraction, StageStatus::Ok);
         assert!(output
             .warnings_summary
             .contains(&"review request timed out after partial output".to_string()));
@@ -2377,6 +2407,22 @@ mod tests {
             .warnings_summary
             .contains(&"model output repaired".to_string()));
         assert_eq!(output.findings[0].symbol.as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn normalized_findings_are_repaired_trust_and_summarized() {
+        let mut findings = vec![sample_finding("unexpected", "src/lib.rs", "Bug")];
+        findings[0].confidence = "certain".to_string();
+        let mut warnings = Vec::new();
+        normalize_findings(&mut findings, &mut warnings);
+
+        assert_eq!(
+            findings_trust_for_completed(&warnings),
+            FindingsTrust::Repaired
+        );
+        let summaries = summarize_warnings(&warnings);
+        assert!(summaries.contains(&"some finding severities were normalized".to_string()));
+        assert!(summaries.contains(&"some finding confidences were normalized".to_string()));
     }
 
     #[test]
