@@ -629,9 +629,9 @@ THE Explore bash sandbox SHALL provide:
 - broad filesystem read access matching Explore's existing read-only tool semantics
 - read-only Git metadata access sufficient for linked worktree commands such as
   `git status`, `git log`, and `git blame`
-- write access only to Phoenix-owned scratch, synthetic home, and writable temp
-  locations that do not overlap the worktree, resolved Git metadata, or
-  Phoenix-owned runtime state; task proposal files are created through scoped
+- write access only to Phoenix-owned scratch and writable temp locations
+  that do not overlap the worktree, resolved Git metadata, or Phoenix-owned
+  runtime state; task proposal files are created through scoped
   `patch`/`propose_task`, not through sandboxed bash
 - `HOME` is the user's real home directory, passed through unchanged; the nono
   sandbox blocks writes to it (only scratch and platform-temp are read-write),
