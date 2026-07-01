@@ -142,22 +142,34 @@ span objects. If nothing arrives:
 
 ### 4b. Expected span shape
 
-Each span should have:
+Each span should have (verified against actual captured spans):
 
 | Field | Expected value |
 |---|---|
-| `name` | `"http"` (from the `TraceLayer`'s `info_span!("http", ...)`) |
+| `name` | `"internal"` (OTel span kind, mapped by the Datadog exporter) |
+| `resource` | `"http"` (the `TraceLayer`'s `info_span!("http", ...)` name) |
 | `service` | `"phoenix-ide"` (from `DD_SERVICE`) |
-| `resource` | HTTP method + path, e.g. `"GET /api/conversations"` |
-| `type` | `"web"` or `"http"` (Datadog convention for HTTP server spans) |
+| `type` | `"custom"` (Datadog maps OTel `internal` kind to `custom`) |
 | `duration_ns` | > 0 (request latency in nanoseconds) |
-| `error` | `0` for 2xx responses |
-| `meta.http.method` | `"GET"` or `"POST"` |
-| `meta.http.path` | the request path |
-| `meta.http.status_code` | `"200"` (or other 2xx) |
-| `meta.http.latency_ms` | latency in milliseconds (string) |
-| `metrics.system.pid` | Phoenix process PID |
-| `metrics.system.process_id` | Phoenix process PID |
+| `error` | `null` for 2xx responses |
+| `meta.method` | `"GET"` or `"POST"` (no `http.` prefix) |
+| `meta.path` | the request path, e.g. `/api/conversations/new` |
+| `meta.env` | `"dev"` (from `DD_ENV`) |
+| `meta.deployment.environment.name` | `"dev"` |
+| `meta.span.kind` | `"internal"` |
+| `meta.otel.scope.name` | `"phoenix-ide"` |
+| `meta.telemetry.sdk.name` | `"datadog"` |
+| `meta.telemetry.sdk.language` | `"rust"` |
+| `meta.code.file.path` | `"crates/phoenix-ide/src/main.rs"` (TraceLayer location) |
+| `metrics._sampling_priority_v1` | `1.0` (sampled) |
+| `metrics.thread.id` | tokio worker thread ID |
+| `metrics.busy_ns` / `metrics.idle_ns` | busy/idle time within the span |
+
+Note: `meta.http.status_code` and `meta.http.latency_ms` are **not** present as
+span attributes — the `TraceLayer`'s `on_response` callback logs them as events,
+not span attributes. The method and path are in `meta.method` / `meta.path`
+(without the `http.` prefix) because the `TraceLayer` sets them as span fields
+directly, and the OTel bridge maps tracing fields to `meta.*`.
 
 ### 4c. Service name is correct
 
@@ -219,3 +231,57 @@ uv run phoenix-client.py --model mock "flush on shutdown"
 # Kill the mock trace agent (Ctrl-C in its terminal)
 unset DD_TRACE_AGENT_URL DD_SERVICE DD_ENV DD_TRACE_ENABLED DD_TRACE_DEBUG
 ```
+
+## Results (2026-07-01)
+
+All 6 steps executed. Summary:
+
+| Step | Result |
+|---|---|
+| 1. Mock trace agent | ✅ HTTP server on :9527, capturing `/v0.4/traces` POSTs |
+| 2. Phoenix startup | ✅ No tracer init errors in `phoenix.log`; server started cleanly |
+| 3. Drive conversation | ✅ `phoenix-client.py --model mock` completed; mock model responded |
+| 4. Span capture | ✅ 3 spans captured: `GET /api/auth/status`, `POST /api/conversations/new`, `GET /api/conversations/:id/stream` |
+| 5. Disabled no-op | ✅ `DD_TRACE_ENABLED=false` → zero trace spans in blackhole; conversation still worked |
+| 6. Shutdown flush | ✅ Clean shutdown, no tracer errors; final telemetry heartbeat sent |
+
+### Captured span example
+
+```json
+{
+  "name": "internal",
+  "service": "phoenix-ide",
+  "resource": "http",
+  "type": "custom",
+  "duration_ns": 547229000,
+  "error": null,
+  "meta": {
+    "method": "POST",
+    "path": "/api/conversations/new",
+    "env": "dev",
+    "span.kind": "internal",
+    "otel.scope.name": "phoenix-ide",
+    "telemetry.sdk.name": "datadog",
+    "telemetry.sdk.language": "rust",
+    "code.file.path": "crates/phoenix-ide/src/main.rs"
+  },
+  "metrics": {
+    "_sampling_priority_v1": 1.0,
+    "thread.id": 10.0,
+    "busy_ns": 546713289.0,
+    "idle_ns": 514586.0
+  }
+}
+```
+
+### Additional observations
+
+- The tracer also sends **telemetry** heartbeats (`/telemetry/proxy/api/v2/apmtelemetry`)
+  every ~60s and **remote config** polls (`/v0.7/config`) every ~5s to the same
+  agent URL. These are JSON, not msgpack, so the blackhole's msgpack decoder logs
+  harmless decode errors for them.
+- The exporter batches spans and flushes periodically (~every few seconds during
+  active requests). Spans arrive within a few seconds of the HTTP request completing.
+- With `DD_TRACE_ENABLED=false`, the tracer provider is still initialized (globals
+  are set) but no `DatadogSpanProcessor` is installed, so spans go nowhere — a
+  clean no-op with zero network traffic.
