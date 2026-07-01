@@ -170,10 +170,9 @@ const FileTreeItem = memo(function FileTreeItem({
   ].filter(Boolean).join(' ');
 
   const handleDragStart = useCallback((e: React.DragEvent) => {
-    if (isDisabled) {
-      e.preventDefault();
-      return;
-    }
+    // All items are draggable — opaque/binary files drag as ./path refs
+    // (isText: false in the payload), even though they can't be opened in
+    // the viewer. Only the click-to-open action is disabled for them.
     const root = rootPath.endsWith('/') ? rootPath.slice(0, -1) : rootPath;
     const prefix = root + '/';
     const relativePath = item.path.startsWith(prefix) ? item.path.slice(prefix.length) : item.path;
@@ -184,7 +183,7 @@ const FileTreeItem = memo(function FileTreeItem({
       isText: item.viewer.kind === 'text',
     }));
     e.dataTransfer.effectAllowed = 'copy';
-  }, [item.path, item.is_directory, item.viewer.kind, rootPath, isDisabled]);
+  }, [item.path, item.is_directory, item.viewer.kind, rootPath]);
 
   return (
     <div>
@@ -199,7 +198,7 @@ const FileTreeItem = memo(function FileTreeItem({
         data-is-directory={item.is_directory ? 'true' : 'false'}
         data-is-text={(!item.is_directory && item.viewer.kind === 'text') ? 'true' : 'false'}
         aria-expanded={item.is_directory ? isExpanded : undefined}
-        draggable={!isDisabled}
+        draggable
         onDragStart={handleDragStart}
       >
         {item.is_directory && (

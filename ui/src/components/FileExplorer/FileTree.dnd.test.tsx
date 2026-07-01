@@ -85,7 +85,7 @@ describe('FileTree drag-and-drop', () => {
     );
   });
 
-  it('prevents drag on disabled (opaque) files', async () => {
+  it('allows drag on opaque files as ./path refs', async () => {
     vi.stubGlobal('fetch', stubFilesSimple('/repo', [
       { name: 'binary.bin', is_directory: false, viewer: 'opaque' },
     ]));
@@ -93,7 +93,17 @@ describe('FileTree drag-and-drop', () => {
     await waitFor(() => expect(screen.getByText('binary.bin')).toBeInTheDocument());
     const fileItem = screen.getByText('binary.bin').closest('.ft-item') as HTMLElement;
 
-    expect(fileItem.getAttribute('draggable')).toBe('false');
+    // Opaque files are draggable (they insert ./path, not @file)
+    expect(fileItem.getAttribute('draggable')).toBe('true');
+
+    const setData = vi.fn();
+    const dataTransfer = { setData, effectAllowed: '' };
+    fireEvent.dragStart(fileItem, { dataTransfer });
+
+    expect(setData).toHaveBeenCalledWith(
+      FILE_TREE_DRAG_TYPE,
+      expect.stringContaining('"isText":false'),
+    );
   });
 });
 

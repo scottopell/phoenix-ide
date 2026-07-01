@@ -440,3 +440,114 @@ describe('bash tool rendering', () => {
     expect(screen.queryByRole('button', { name: /peek/i })).not.toBeInTheDocument();
   });
 });
+describe('InputArea file-tree drag-and-drop', () => {
+  const FILE_TREE_DRAG_TYPE = 'application/x-phoenix-file-path';
+
+  function renderForDnd() {
+    return renderInput({ cwd: '/repo', scopeKey: 'conv-dnd' });
+  }
+
+  function makeDropEvent(types: string[], data: Record<string, string> = {}, files: File[] = []) {
+    return {
+      preventDefault: vi.fn(),
+      dataTransfer: {
+        types,
+        getData: (type: string) => data[type] ?? '',
+        files,
+      },
+    };
+  }
+
+  it('inserts @file reference for text files on custom-type drop', () => {
+    const handler = vi.fn();
+    window.addEventListener('phoenix:insert-draft', handler);
+    renderForDnd();
+
+    const footer = document.getElementById('input-area')!;
+    const dropEvent = makeDropEvent(
+      [FILE_TREE_DRAG_TYPE],
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src/main.rs', isDirectory: false, isText: true }) },
+    );
+    fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ detail: { text: '@src/main.rs ' } }),
+    );
+    window.removeEventListener('phoenix:insert-draft', handler);
+  });
+
+  it('inserts ./path for directories on custom-type drop', () => {
+    const handler = vi.fn();
+    window.addEventListener('phoenix:insert-draft', handler);
+    renderForDnd();
+
+    const footer = document.getElementById('input-area')!;
+    const dropEvent = makeDropEvent(
+      [FILE_TREE_DRAG_TYPE],
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src', isDirectory: true, isText: false }) },
+    );
+    fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ detail: { text: './src ' } }),
+    );
+    window.removeEventListener('phoenix:insert-draft', handler);
+  });
+
+  it('inserts ./path for non-text files on custom-type drop', () => {
+    const handler = vi.fn();
+    window.addEventListener('phoenix:insert-draft', handler);
+    renderForDnd();
+
+    const footer = document.getElementById('input-area')!;
+    const dropEvent = makeDropEvent(
+      [FILE_TREE_DRAG_TYPE],
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'assets/logo.png', isDirectory: false, isText: false }) },
+    );
+    fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ detail: { text: './assets/logo.png ' } }),
+    );
+    window.removeEventListener('phoenix:insert-draft', handler);
+  });
+
+  it('inserts ./path for paths with whitespace on custom-type drop', () => {
+    const handler = vi.fn();
+    window.addEventListener('phoenix:insert-draft', handler);
+    renderForDnd();
+
+    const footer = document.getElementById('input-area')!;
+    const dropEvent = makeDropEvent(
+      [FILE_TREE_DRAG_TYPE],
+      { [FILE_TREE_DRAG_TYPE]: JSON.stringify({ relativePath: 'src/test data/input.ts', isDirectory: false, isText: true }) },
+    );
+    fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ detail: { text: './src/test data/input.ts ' } }),
+    );
+    window.removeEventListener('phoenix:insert-draft', handler);
+  });
+
+  it('activates drop highlight for custom-type drag', () => {
+    renderForDnd();
+    const footer = document.getElementById('input-area')!;
+
+    fireEvent.dragEnter(footer, makeDropEvent([FILE_TREE_DRAG_TYPE]) as unknown as React.DragEvent);
+    expect(footer.className).toContain('input-area--drag-over');
+  });
+
+  it('ignores drops without Files or custom type', () => {
+    const handler = vi.fn();
+    window.addEventListener('phoenix:insert-draft', handler);
+    renderForDnd();
+
+    const footer = document.getElementById('input-area')!;
+    const dropEvent = makeDropEvent(['text/plain'], { 'text/plain': 'hello' });
+    fireEvent.drop(footer, dropEvent as unknown as React.DragEvent);
+
+    expect(handler).not.toHaveBeenCalled();
+    window.removeEventListener('phoenix:insert-draft', handler);
+  });
+});

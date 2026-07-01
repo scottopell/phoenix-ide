@@ -333,10 +333,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       if (raw) {
         try {
           const payload = JSON.parse(raw) as { relativePath: string; isDirectory: boolean; isText: boolean };
-          // @ expansion is text-only — directories and non-text files (images,
-          // binaries) use ./path so the AI gets a pointer without a blocked
-          // expansion attempt at send time.
-          const useAtRef = !payload.isDirectory && payload.isText;
+          // @ expansion is text-only and tokenizes at whitespace — directories,
+          // non-text files, and paths with spaces use ./path so the AI gets a
+          // pointer without a blocked expansion attempt at send time.
+          const useAtRef = !payload.isDirectory && payload.isText && !/\s/.test(payload.relativePath);
           const ref = useAtRef
             ? `@${payload.relativePath} `
             : `./${payload.relativePath} `;

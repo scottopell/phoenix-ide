@@ -146,7 +146,7 @@ export function FileTreeContextMenu() {
         Copy absolute path
       </button>
       <div className="msg-context-divider" />
-      {menu.isText && (
+      {menu.isText && !/\s/.test(menu.relativePath) && (
         <button className="msg-context-item" onClick={() => insertDraft(`@${menu.relativePath} `)}>
           Insert @file reference
         </button>
