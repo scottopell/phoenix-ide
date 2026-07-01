@@ -17,8 +17,8 @@ function setupTree(rootPath = '/repo/project') {
   root.className = 'ft-root';
   root.dataset['rootPath'] = rootPath;
   root.innerHTML = `
-    <div class="ft-item" data-path="${rootPath}/src/main.rs" data-is-directory="false" role="button" tabindex="0">main.rs</div>
-    <div class="ft-item" data-path="${rootPath}/src" data-is-directory="true" role="button" tabindex="0" aria-expanded="true">src</div>
+    <div class="ft-item" data-path="${rootPath}/src/main.rs" data-is-directory="false" data-is-text="true" role="button" tabindex="0">main.rs</div>
+    <div class="ft-item" data-path="${rootPath}/src" data-is-directory="true" data-is-text="false" role="button" tabindex="0" aria-expanded="true">src</div>
   `;
   document.body.appendChild(root);
   return root;

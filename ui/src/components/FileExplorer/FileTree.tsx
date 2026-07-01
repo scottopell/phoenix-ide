@@ -181,6 +181,7 @@ const FileTreeItem = memo(function FileTreeItem({
       path: item.path,
       relativePath,
       isDirectory: item.is_directory,
+      isText: item.viewer.kind === 'text',
     }));
     e.dataTransfer.effectAllowed = 'copy';
   }, [item.path, item.is_directory, rootPath, isDisabled]);
@@ -196,6 +197,7 @@ const FileTreeItem = memo(function FileTreeItem({
         title={isDisabled ? 'Non-viewable file' : item.path}
         data-path={item.path}
         data-is-directory={item.is_directory ? 'true' : 'false'}
+        data-is-text={(!item.is_directory && item.viewer.kind === 'text') ? 'true' : 'false'}
         aria-expanded={item.is_directory ? isExpanded : undefined}
         draggable={!isDisabled}
         onDragStart={handleDragStart}
@@ -404,11 +406,18 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
           e.stopPropagation();
           el.click();
         } else {
-          // Move to first child
+          // Move to first child — but only if the next row is actually
+          // deeper (a child). If the directory is expanded but has no
+          // rendered children (empty, dotfiles only, still loading), the
+          // next row is a sibling, not a child, so stay put.
           e.preventDefault();
           e.stopPropagation();
           if (currentIndex < allItems.length - 1) {
-            allItems[currentIndex + 1]!.focus();
+            const currentDepth = parseInt(el.style.paddingLeft || '0', 10);
+            const nextDepth = parseInt(allItems[currentIndex + 1]!.style.paddingLeft || '0', 10);
+            if (nextDepth > currentDepth) {
+              allItems[currentIndex + 1]!.focus();
+            }
           }
         }
         break;
@@ -439,6 +448,9 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
         break;
       }
       case 'Escape': {
+        // If the file-tree context menu is open, let the event propagate so
+        // the menu's document-level Escape listener can close it.
+        if (document.querySelector('.file-tree-context-menu')) return;
         e.preventDefault();
         e.stopPropagation();
         (document.activeElement as HTMLElement | null)?.blur();

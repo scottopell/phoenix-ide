@@ -13,6 +13,7 @@ interface MenuState {
   absolutePath: string;
   relativePath: string;
   isDirectory: boolean;
+  isText: boolean;
 }
 
 function computeRelativePath(rootPath: string, absolutePath: string): string {
@@ -45,6 +46,7 @@ export function FileTreeContextMenu() {
 
     const rootPath = treeContainer.dataset['rootPath'] || '';
     const isDirectory = itemEl.dataset['isDirectory'] === 'true';
+    const isText = itemEl.dataset['isText'] === 'true';
 
     e.preventDefault();
     e.stopPropagation();
@@ -55,6 +57,7 @@ export function FileTreeContextMenu() {
       absolutePath,
       relativePath: computeRelativePath(rootPath, absolutePath),
       isDirectory,
+      isText,
     });
   }, []);
 
@@ -142,7 +145,7 @@ export function FileTreeContextMenu() {
         Copy absolute path
       </button>
       <div className="msg-context-divider" />
-      {!menu.isDirectory && (
+      {menu.isText && (
         <button className="msg-context-item" onClick={() => insertDraft(`@${menu.relativePath} `)}>
           Insert @file reference
         </button>

@@ -323,10 +323,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       const raw = e.dataTransfer.getData(FILE_TREE_DRAG_TYPE);
       if (raw) {
         try {
-          const payload = JSON.parse(raw) as { relativePath: string; isDirectory: boolean };
-          const ref = payload.isDirectory
-            ? `./${payload.relativePath} `
-            : `@${payload.relativePath} `;
+          const payload = JSON.parse(raw) as { relativePath: string; isDirectory: boolean; isText: boolean };
+          // @ expansion is text-only — directories and non-text files (images,
+          // binaries) use ./path so the AI gets a pointer without a blocked
+          // expansion attempt at send time.
+          const useAtRef = !payload.isDirectory && payload.isText;
+          const ref = useAtRef
+            ? `@${payload.relativePath} `
+            : `./${payload.relativePath} `;
           window.dispatchEvent(new CustomEvent('phoenix:insert-draft', { detail: { text: ref } }));
         } catch {
           // Malformed drag payload — silently ignore
