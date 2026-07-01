@@ -105,8 +105,9 @@ tracing-appender = "0.2"
 
 # Datadog tracing: the `datadog-opentelemetry` crate (the real name behind the
 # `ddtrace` docs.rs redirect) is an OTel SDK shim that exports spans to the
-# Datadog agent as OTLP. `tracing-opentelemetry` bridges the existing `tracing`
-# spans (notably the tower-http TraceLayer's per-request `http` span) into OTel.
+# Datadog agent using the native v0.4 traces format (msgpack over HTTP), not
+# OTLP. `tracing-opentelemetry` bridges the existing `tracing` spans (notably
+# the tower-http TraceLayer's per-request `http` span) into OTel.
 # Version pinning: published datadog-opentelemetry 0.4 uses opentelemetry 0.31,
 # so tracing-opentelemetry must be 0.32 (not 0.33, which needs otel 0.32).
 datadog-opentelemetry = "0.4"

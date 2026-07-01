@@ -19,7 +19,7 @@ use std::time::Duration;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 /// The resolved set of enabled log sinks.
 pub struct LogConfig {
@@ -90,22 +90,36 @@ impl LogConfig {
 /// what lets the deployment report derive its file path from [`LogConfig`]
 /// without ever advertising a sink the subscriber isn't writing (REQ-DEPLOY-006).
 pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "phoenix_ide=debug,tower_http=debug".into());
-
     // Initialize the Datadog tracer provider. This reads DD_* env vars
-    // (DD_SERVICE, DD_ENV, DD_AGENT_URL, DD_TRACE_ENABLED, …) and sets the
-    // global tracer provider + text-map propagator. On failure it falls back
-    // to a no-op provider, so tracing is always available.
-    let tracer_provider = datadog_opentelemetry::tracing().init();
+    // (DD_SERVICE, DD_ENV, DD_TRACE_AGENT_URL, DD_TRACE_ENABLED, …) and sets
+    // the global tracer provider + text-map propagator. On failure it falls
+    // back to a no-op provider, so tracing is always available.
+    //
+    // Fall back to "phoenix-ide" as the service name when DD_SERVICE is not
+    // set, so traces land under the expected service without requiring every
+    // deployment to set the env var.
+    let mut dd_config_builder = datadog_opentelemetry::configuration::Config::builder();
+    if std::env::var("DD_SERVICE").is_err() {
+        dd_config_builder.set_service("phoenix-ide".to_string());
+    }
+    let tracer_provider = datadog_opentelemetry::tracing()
+        .with_config(dd_config_builder.build())
+        .init();
+    // The OTel layer is intentionally unfiltered: it must always process
+    // spans for export regardless of RUST_LOG/EnvFilter, so that quiet logging
+    // configurations (e.g. RUST_LOG=warn) do not silently disable tracing.
     let otel_layer =
         tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("phoenix-ide"));
 
+    // EnvFilter is applied per-layer to the stdout/file sinks only, not to the
+    // OTel layer. EnvFilter does not implement Clone, so we create a fresh
+    // instance for each sink via make_env_filter().
     let stdout_layer = config.stdout.then(|| {
         fmt::layer()
             .json()
             .with_current_span(true)
             .with_span_list(false)
+            .with_filter(make_env_filter())
     });
 
     let (file_layer, guard) = match config.file.as_deref() {
@@ -121,14 +135,14 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
                 .json()
                 .with_current_span(true)
                 .with_span_list(false)
-                .with_writer(writer);
+                .with_writer(writer)
+                .with_filter(make_env_filter());
             (Some(layer), Some(guard))
         }
         None => (None, None),
     };
 
     tracing_subscriber::registry()
-        .with(env_filter)
         .with(otel_layer)
         .with(stdout_layer)
         .with(file_layer)
@@ -139,6 +153,13 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
         _log_guard: guard,
         tracer_provider,
     })
+}
+
+/// Create a fresh `EnvFilter` from the environment. Used per-sink because
+/// `EnvFilter` does not implement Clone.
+fn make_env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "phoenix_ide=debug,tower_http=debug".into())
 }
 
 /// Whether the stdout sink is enabled. Defaults on (unset); only explicit
