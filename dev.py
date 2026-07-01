@@ -3214,6 +3214,25 @@ def _workspace_metadata():
     return _workspace_metadata_memo[0]
 
 
+def _ts_export_crates():
+    """Workspace crates that can emit ts-rs `export_bindings_*` tests — i.e.
+    crates with a direct ts-rs dependency (`#[derive(ts_rs::TS)]` cannot
+    appear without one, and ts-rs emits each export test into the crate that
+    declares the type). Running the export tests of exactly these crates
+    therefore produces the complete generated tree — the same scratch export
+    a full-workspace codegen run would. Over-inclusion is safe (a ts-rs
+    dependent with no `#[ts(export)]` types just adds compile scope).
+    Returns None when metadata is unavailable (caller falls back to full
+    workspace)."""
+    meta = _workspace_metadata()
+    if meta is None:
+        return None
+    return {
+        p["name"] for p in meta["packages"]
+        if any(d["name"] == "ts-rs" for d in p["dependencies"])
+    }
+
+
 def _workspace_rdeps_map():
     """Map each workspace crate -> set of crates that (transitively) depend on
     it, INCLUDING the crate itself. Derived from `cargo metadata`. Returns None
@@ -4223,22 +4242,33 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         # test, so a new #[ts(export)] type is regenerated automatically with no
         # hand-maintained root list to forget.
         #
-        # The compile step is NOT narrowed by the rust scope: the codegen run
-        # is always full-workspace (a change anywhere could in principle touch
-        # a derived type's shape, and the staleness guard must see the whole
-        # generated tree), so the harness compile must be full-workspace too.
-        # `_pflags()` still narrows the verification run.
+        # Codegen must produce the COMPLETE generated tree (the staleness
+        # guard diffs it against every committed file), and the crates that
+        # can contribute to it are exactly the ts-rs dependents (see
+        # _ts_export_crates). When the lane is crate-scoped, the codegen run
+        # narrows to those crates and the harness compile to scope ∪ export
+        # crates — the identical scratch tree, without building test
+        # harnesses whose tests won't run. An undeterminable export set
+        # falls back to full workspace: narrowing must never guess.
+        codegen_scope = _ts_export_crates() if rust_scope else None
+        if rust_scope and codegen_scope is not None:
+            compile_p = [f for c in sorted(set(rust_scope) | codegen_scope)
+                         for f in ("-p", c)]
+            codegen_p = [f for c in sorted(codegen_scope) for f in ("-p", c)]
+        else:
+            compile_p, codegen_p = [], []
         if has_nextest:
-            compile_cmd = ["cargo", "nextest", "run", "--no-run"]
+            compile_cmd = ["cargo", "nextest", "run", *compile_p, "--no-run"]
             test_cmd = ["cargo", "nextest", "run", *_pflags(),
                         "-E", "not test(/export_bindings/)",
                         "--test-threads", str(test_threads)]
-            codegen_cmd = ["cargo", "nextest", "run", "-E", "test(/export_bindings/)"]
+            codegen_cmd = ["cargo", "nextest", "run", *codegen_p,
+                           "-E", "test(/export_bindings/)"]
         else:
-            compile_cmd = ["cargo", "test", "--no-run"]
+            compile_cmd = ["cargo", "test", *compile_p, "--no-run"]
             test_cmd = ["cargo", "test", *_pflags(), "--",
                         "--test-threads", str(test_threads), "--skip", "export_bindings"]
-            codegen_cmd = ["cargo", "test", "export_bindings"]
+            codegen_cmd = ["cargo", "test", *codegen_p, "export_bindings"]
 
         # Scratch base for the ts-rs export. Every `#[ts(export_to)]` in the
         # workspace uses a `../../../ui/src/generated/` path relative to the
