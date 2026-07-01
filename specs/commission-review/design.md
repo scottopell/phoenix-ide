@@ -115,8 +115,9 @@ and finding extraction as failed.
 Finding summaries are computed after normalization and deduplication. They count
 total findings and counts for critical, high, medium, and low severity without an
 additional model call. Warning summaries are deterministic strings derived from
-typed warnings and are serialized before the full warnings list in both the JSON
-result and display payload.
+typed warnings. The display payload includes an ordered `status_panel` array so
+status, review status, finding summary, and warning summary can be rendered near
+each other without relying on JSON object key order.
 
 ```mermaid
 flowchart TD

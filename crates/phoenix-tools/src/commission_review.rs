@@ -298,21 +298,7 @@ impl Tool for CommissionReviewTool {
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         match run_review(input, ctx).await {
             Ok(out) => {
-                let display = json!({
-                    "kind": "commission_review",
-                    "status": &out.status,
-                    "review_status": &out.review_status,
-                    "findings_status": &out.findings_status,
-                    "findings_trust": &out.findings_trust,
-                    "stage_status": &out.stage_status,
-                    "finding_summary": &out.finding_summary,
-                    "warnings_summary": &out.warnings_summary,
-                    "retry_recommendation": &out.retry_recommendation,
-                    "summary": &out.summary,
-                    "unreviewed": &out.unreviewed,
-                    "findings": &out.findings,
-                    "warnings": &out.warnings,
-                });
+                let display = review_display(&out);
                 ToolOutput::success(pretty_json(&out))
                     .with_display(display)
                     .with_llm_usage(ToolLlmUsage {
@@ -323,6 +309,33 @@ impl Tool for CommissionReviewTool {
             Err(err) => ToolOutput::error(err),
         }
     }
+}
+
+fn review_display(out: &ReviewOutput) -> Value {
+    json!({
+        "kind": "commission_review",
+        "status_panel": [
+            {"name": "status", "value": &out.status},
+            {"name": "review_status", "value": &out.review_status},
+            {"name": "findings_status", "value": &out.findings_status},
+            {"name": "findings_trust", "value": &out.findings_trust},
+            {"name": "finding_summary", "value": &out.finding_summary},
+            {"name": "warnings_summary", "value": &out.warnings_summary},
+            {"name": "retry_recommendation", "value": &out.retry_recommendation},
+        ],
+        "status": &out.status,
+        "review_status": &out.review_status,
+        "findings_status": &out.findings_status,
+        "findings_trust": &out.findings_trust,
+        "stage_status": &out.stage_status,
+        "finding_summary": &out.finding_summary,
+        "warnings_summary": &out.warnings_summary,
+        "retry_recommendation": &out.retry_recommendation,
+        "summary": &out.summary,
+        "unreviewed": &out.unreviewed,
+        "findings": &out.findings,
+        "warnings": &out.warnings,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -537,11 +550,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         diff_stage_status(&warnings, has_unreviewed) == StageStatus::Partial;
     let (status, findings_status, findings_trust, retry_recommendation) =
         completed_result_contract(&warnings, has_parsed_output, has_diff_coverage_gap);
-    let review_status = if warnings.is_empty() && !has_unreviewed {
-        ReviewCompletionStatus::Completed
-    } else {
-        ReviewCompletionStatus::CompletedWithWarnings
-    };
+    let review_status = completed_review_status(&status, warnings.is_empty() && !has_unreviewed);
 
     Ok(finalize_review_output(ReviewOutputDraft {
         status,
@@ -680,6 +689,16 @@ fn interrupted_review_output(
         findings: interrupted.findings,
         warnings: interrupted.warnings,
     })
+}
+
+fn completed_review_status(status: &ReviewStatus, clean_complete: bool) -> ReviewCompletionStatus {
+    if matches!(status, ReviewStatus::Failed) {
+        ReviewCompletionStatus::Unavailable
+    } else if clean_complete {
+        ReviewCompletionStatus::Completed
+    } else {
+        ReviewCompletionStatus::CompletedWithWarnings
+    }
 }
 
 fn completed_result_contract(
@@ -2118,6 +2137,22 @@ mod tests {
     }
 
     #[test]
+    fn completed_failed_result_uses_unavailable_review_status() {
+        assert_eq!(
+            completed_review_status(&ReviewStatus::Failed, false),
+            ReviewCompletionStatus::Unavailable
+        );
+        assert_eq!(
+            completed_review_status(&ReviewStatus::Success, true),
+            ReviewCompletionStatus::Completed
+        );
+        assert_eq!(
+            completed_review_status(&ReviewStatus::Partial, false),
+            ReviewCompletionStatus::CompletedWithWarnings
+        );
+    }
+
+    #[test]
     fn completed_parse_failure_with_parsed_summary_is_partial() {
         let warnings = vec![warning(
             "model_output_parse",
@@ -2443,6 +2478,58 @@ mod tests {
         assert_eq!(summary.high, 1);
         assert_eq!(summary.medium, 1);
         assert_eq!(summary.low, 1);
+    }
+
+    #[test]
+    fn display_status_panel_preserves_status_field_order() {
+        let output = finalize_review_output(ReviewOutputDraft {
+            status: ReviewStatus::Failed,
+            review_status: ReviewCompletionStatus::Unavailable,
+            findings_status: FindingsStatus::Unavailable,
+            findings_trust: FindingsTrust::Low,
+            stage_status: ReviewStageStatus {
+                target_collection: StageStatus::Ok,
+                diff_collection: StageStatus::Ok,
+                llm_review: StageStatus::Ok,
+                json_parse: StageStatus::Failed,
+                finding_extraction: StageStatus::Failed,
+            },
+            retry_recommendation: RetryRecommendation::Retry,
+            summary: ReviewSummary {
+                target: sample_target(),
+                files_changed: 1,
+                files_reviewed: 1,
+                insertions: 1,
+                deletions: 0,
+                findings_count: 0,
+                elapsed_ms: 0,
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reviewer_summary: None,
+            },
+            unreviewed: Vec::new(),
+            findings: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let display = review_display(&output);
+        let names: Vec<_> = display["status_panel"]
+            .as_array()
+            .expect("status panel is an array")
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("name is a string"))
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "status",
+                "review_status",
+                "findings_status",
+                "findings_trust",
+                "finding_summary",
+                "warnings_summary",
+                "retry_recommendation",
+            ]
+        );
     }
 
     #[test]
