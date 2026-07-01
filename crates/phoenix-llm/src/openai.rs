@@ -195,6 +195,12 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
         );
     }
 
+    let lower = format!(
+        "{} {}",
+        code.to_ascii_lowercase(),
+        message.to_ascii_lowercase()
+    );
+
     if lower.contains("rate_limit") || lower.contains("quota") || lower.contains("requests_per") {
         LlmError::rate_limit(detail)
     } else if lower.contains("auth")
@@ -203,6 +209,7 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
     {
         LlmError::auth(detail)
     } else if lower.contains("context_length")
+        || lower.contains("context length")
         || lower.contains("token_limit")
         || lower.contains("max_tokens")
     {
@@ -1312,14 +1319,26 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
             MessageRole::Assistant => "assistant",
         };
         let mut text_blocks: Vec<&str> = Vec::new();
-        let mut image_blocks: Vec<&ImageSource> = Vec::new();
+        let mut ordered_parts: Vec<ChatContentPart> = Vec::new();
+        let mut has_image = false;
         let mut tool_calls: Vec<ChatToolCall> = Vec::new();
         let mut tool_results: Vec<&super::types::ContentBlock> = Vec::new();
 
         for block in &msg.content {
             match block {
-                super::types::ContentBlock::Text { text } => text_blocks.push(text),
-                super::types::ContentBlock::Image { source } => image_blocks.push(source),
+                super::types::ContentBlock::Text { text } => {
+                    text_blocks.push(text);
+                    ordered_parts.push(ChatContentPart::Text { text: text.clone() });
+                }
+                super::types::ContentBlock::Image { source } => {
+                    let ImageSource::Base64 { media_type, data } = source;
+                    has_image = true;
+                    ordered_parts.push(ChatContentPart::ImageUrl {
+                        image_url: ChatImageUrl {
+                            url: format!("data:{media_type};base64,{data}"),
+                        },
+                    });
+                }
                 super::types::ContentBlock::ToolUse { id, name, input } => {
                     tool_calls.push(ChatToolCall {
                         id: id.clone(),
@@ -1363,27 +1382,12 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
             }
         }
 
-        if !text_blocks.is_empty() || !image_blocks.is_empty() || !tool_calls.is_empty() {
-            let content = if image_blocks.is_empty() && !text_blocks.is_empty() {
+        if !text_blocks.is_empty() || has_image || !tool_calls.is_empty() {
+            let content = if !has_image && !text_blocks.is_empty() {
                 Some(ChatContent::Text(text_blocks.join("\n")))
-            } else if !image_blocks.is_empty() {
-                let mut parts: Vec<ChatContentPart> = text_blocks
-                    .iter()
-                    .map(|text| ChatContentPart::Text {
-                        text: (*text).to_string(),
-                    })
-                    .collect();
-                for source in image_blocks {
-                    let ImageSource::Base64 { media_type, data } = source;
-                    parts.push(ChatContentPart::ImageUrl {
-                        image_url: ChatImageUrl {
-                            url: format!("data:{media_type};base64,{data}"),
-                        },
-                    });
-                }
-                Some(ChatContent::Parts(parts))
+            } else if has_image {
+                Some(ChatContent::Parts(ordered_parts))
             } else {
-                // tool_calls only, no text/images
                 None
             };
 
@@ -1489,16 +1493,25 @@ fn normalize_chat_response(
             "Chat completions returned no choices",
         ));
     };
-    if choice.finish_reason.as_deref() == Some("length") {
-        log_chat_completion_length(
-            model,
-            resp.usage.as_ref().and_then(ChatUsage::reasoning_tokens),
-        );
-        return Err(LlmError::output_limit_exceeded(
-            "Chat completions hit the output token limit before finishing. \
-             Try again with a larger max_tokens value or a model with a higher output budget."
-                .to_string(),
-        ));
+    match choice.finish_reason.as_deref() {
+        Some("length") => {
+            log_chat_completion_length(
+                model,
+                resp.usage.as_ref().and_then(ChatUsage::reasoning_tokens),
+            );
+            return Err(LlmError::output_limit_exceeded(
+                "Chat completions hit the output token limit before finishing. \
+                 Try again with a larger max_tokens value or a model with a higher output budget."
+                    .to_string(),
+            ));
+        }
+        Some("content_filter") => {
+            return Err(LlmError::new(
+                super::LlmErrorKind::ContentFilter,
+                "Chat completions response was blocked by the provider content filter",
+            ));
+        }
+        _ => {}
     }
     chat_message_to_response(choice.message, resp.usage, model)
 }
@@ -1582,17 +1595,25 @@ struct ChatStreamAccumulator {
     tool_calls: Vec<ChatToolCallBuilder>,
     usage: Option<ChatUsage>,
     done: bool,
+    terminal_finish_seen: bool,
+}
+
+fn chat_stream_error_code_as_string(code: Option<&serde_json::Value>) -> String {
+    match code {
+        Some(serde_json::Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+        None => String::new(),
+    }
 }
 
 fn openai_http_error(status_code: u16, status_display: &str, body: &str) -> LlmError {
     if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(body) {
         let message = error_resp.error.message;
+        let code = error_resp.error.code.as_deref().unwrap_or("");
         return match status_code {
             401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
             429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
-            400..=499 => {
-                LlmError::invalid_request(format!("Bad request ({status_display}): {message}"))
-            }
+            400..=499 => classify_responses_error(code, &message),
             500..=599 => LlmError::server_error(format!("Server error: {message}")),
             _ => LlmError::server_error(format!("Unexpected HTTP {status_display}: {message}")),
         };
@@ -1607,6 +1628,7 @@ impl ChatStreamAccumulator {
             tool_calls: Vec::new(),
             usage: None,
             done: false,
+            terminal_finish_seen: false,
         }
     }
 
@@ -1622,20 +1644,12 @@ impl ChatStreamAccumulator {
         let event: ChatStreamChunk = serde_json::from_str(data).map_err(|e| {
             LlmError::invalid_response(format!("Failed to parse chat SSE data: {e}"))
         })?;
-        // Gateway inline error events: `{"error": {"message": "...", "code": 400}}`.
-        // Surface the gateway's message/code rather than reporting an empty stream.
         if let Some(err) = event.error {
             let msg = err
                 .message
                 .unwrap_or_else(|| "gateway returned error chunk".to_string());
-            let code_suffix = err
-                .code
-                .as_ref()
-                .map(|c| format!(" (code: {c})"))
-                .unwrap_or_default();
-            return Err(LlmError::invalid_response(format!(
-                "Gateway error: {msg}{code_suffix}"
-            )));
+            let code = chat_stream_error_code_as_string(err.code.as_ref());
+            return Err(classify_responses_error(&code, &msg));
         }
         self.usage = event.usage.or(self.usage.take());
         let reasoning_tokens = self.usage.as_ref().and_then(ChatUsage::reasoning_tokens);
@@ -1643,13 +1657,28 @@ impl ChatStreamAccumulator {
             if let Some(reasoning) = choice.delta.reasoning_content {
                 log_dropped_reasoning_content("<streaming-chat-completions>", &reasoning);
             }
-            if choice.finish_reason.as_deref() == Some("length") {
-                log_chat_completion_length("<streaming-chat-completions>", reasoning_tokens);
-                return Err(LlmError::output_limit_exceeded(
-                    "Chat completions hit the output token limit before finishing. \
-                     Try again with a larger max_tokens value or a model with a higher output budget."
-                        .to_string(),
-                ));
+            if let Some(reason) = choice.finish_reason.as_deref() {
+                self.terminal_finish_seen = true;
+                match reason {
+                    "length" => {
+                        log_chat_completion_length(
+                            "<streaming-chat-completions>",
+                            reasoning_tokens,
+                        );
+                        return Err(LlmError::output_limit_exceeded(
+                            "Chat completions hit the output token limit before finishing. \
+                             Try again with a larger max_tokens value or a model with a higher output budget."
+                                .to_string(),
+                        ));
+                    }
+                    "content_filter" => {
+                        return Err(LlmError::new(
+                            super::LlmErrorKind::ContentFilter,
+                            "Chat completions response was blocked by the provider content filter",
+                        ));
+                    }
+                    _ => {}
+                }
             }
             if let Some(delta) = choice.delta.content {
                 if !delta.is_empty() && !is_chat_reasoning_marker_content(&delta) {
@@ -1685,6 +1714,11 @@ impl ChatStreamAccumulator {
     }
 
     fn into_response(self) -> Result<LlmResponse, LlmError> {
+        if !self.done && !self.terminal_finish_seen {
+            return Err(LlmError::invalid_response(
+                "Chat completions stream ended before a terminal finish_reason or [DONE] sentinel",
+            ));
+        }
         if self.content.is_empty() && self.tool_calls.is_empty() {
             tracing::warn!(
                 done = self.done,
@@ -2692,6 +2726,37 @@ mod tests {
         }
 
         #[test]
+        fn chat_request_preserves_interleaved_text_image_order() {
+            use crate::types::ImageSource;
+            let mut req = empty_request();
+            req.messages = vec![LlmMessage {
+                role: MessageRole::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "before".to_string(),
+                    },
+                    ContentBlock::Image {
+                        source: ImageSource::Base64 {
+                            media_type: "image/png".to_string(),
+                            data: "aGVsbG8=".to_string(),
+                        },
+                    },
+                    ContentBlock::Text {
+                        text: "after".to_string(),
+                    },
+                ],
+            }];
+            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let json = serde_json::to_value(&chat_req).unwrap();
+            let parts = &json["messages"][0]["content"];
+            assert_eq!(parts[0]["type"], "text");
+            assert_eq!(parts[0]["text"], "before");
+            assert_eq!(parts[1]["type"], "image_url");
+            assert_eq!(parts[2]["type"], "text");
+            assert_eq!(parts[2]["text"], "after");
+        }
+
+        #[test]
         fn chat_request_tool_use_maps_to_tool_calls() {
             let mut req = empty_request();
             req.messages = vec![LlmMessage {
@@ -3045,7 +3110,7 @@ mod tests {
         }
 
         #[test]
-        fn chat_stream_inline_error_chunk_propagation() {
+        fn chat_stream_inline_error_chunk_classifies_context_exhaustion() {
             use crate::LlmErrorKind;
             let (tx, _rx) = tokio::sync::broadcast::channel(8);
             let mut acc = ChatStreamAccumulator::new();
@@ -3054,17 +3119,8 @@ mod tests {
             })
             .to_string();
             let err = acc.process_event(&error_chunk, &tx).unwrap_err();
-            assert_eq!(err.kind, LlmErrorKind::InvalidResponse);
-            assert!(
-                err.message.contains("context length exceeded"),
-                "error message should contain gateway message, got: {}",
-                err.message
-            );
-            assert!(
-                err.message.contains("400"),
-                "error message should contain code, got: {}",
-                err.message
-            );
+            assert_eq!(err.kind, LlmErrorKind::ContextWindowExceeded);
+            assert!(err.message.contains("context length exceeded"));
         }
 
         #[test]
@@ -3077,7 +3133,7 @@ mod tests {
             })
             .to_string();
             let err = acc.process_event(&error_chunk, &tx).unwrap_err();
-            assert_eq!(err.kind, LlmErrorKind::InvalidResponse);
+            assert_eq!(err.kind, LlmErrorKind::RateLimit);
             assert!(err.message.contains("rate limit"));
             assert!(err.message.contains("rate_limit_exceeded"));
         }
@@ -3101,6 +3157,7 @@ mod tests {
             acc.process_event(&reasoning_chunk, &tx).unwrap();
             acc.process_event(&marker_chunk, &tx).unwrap();
             acc.process_event(&final_chunk, &tx).unwrap();
+            acc.process_event("[DONE]", &tx).unwrap();
             let streamed = rx.try_recv().expect("final text should stream");
             assert!(matches!(streamed, crate::TokenChunk::Text(text) if text == "Final"));
             assert!(
@@ -3127,6 +3184,34 @@ mod tests {
         }
 
         #[test]
+        fn chat_stream_content_filter_finish_reason_is_error() {
+            use crate::LlmErrorKind;
+            let (tx, _rx) = tokio::sync::broadcast::channel(8);
+            let mut acc = ChatStreamAccumulator::new();
+            let chunk = serde_json::json!({
+                "choices": [{"delta": {"content": "partial"}, "finish_reason": "content_filter"}]
+            })
+            .to_string();
+            let err = acc.process_event(&chunk, &tx).unwrap_err();
+            assert_eq!(err.kind, LlmErrorKind::ContentFilter);
+        }
+
+        #[test]
+        fn chat_stream_without_terminal_marker_is_invalid_response() {
+            use crate::LlmErrorKind;
+            let (tx, _rx) = tokio::sync::broadcast::channel(8);
+            let mut acc = ChatStreamAccumulator::new();
+            let chunk = serde_json::json!({
+                "choices": [{"delta": {"content": "partial"}}]
+            })
+            .to_string();
+            acc.process_event(&chunk, &tx).unwrap();
+            let err = acc.into_response().unwrap_err();
+            assert_eq!(err.kind, LlmErrorKind::InvalidResponse);
+            assert!(err.message.contains("terminal finish_reason"));
+        }
+
+        #[test]
         fn chat_nonstream_length_finish_reason_is_output_limit_exceeded() {
             use crate::LlmErrorKind;
             let resp = ChatCompletionsResponse {
@@ -3150,6 +3235,24 @@ mod tests {
             let err = normalize_chat_response(resp, "test-model").unwrap_err();
             assert_eq!(err.kind, LlmErrorKind::OutputLimitExceeded);
             assert!(err.message.contains("output token limit"));
+        }
+
+        #[test]
+        fn chat_nonstream_content_filter_finish_reason_is_content_filter() {
+            use crate::LlmErrorKind;
+            let resp = ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatResponseMessage {
+                        reasoning_content: None,
+                        content: Some("partial".to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("content_filter".to_string()),
+                }],
+                usage: None,
+            };
+            let err = normalize_chat_response(resp, "test-model").unwrap_err();
+            assert_eq!(err.kind, LlmErrorKind::ContentFilter);
         }
 
         #[test]
@@ -3207,11 +3310,21 @@ mod tests {
         #[test]
         fn openai_http_error_extracts_provider_message() {
             use crate::LlmErrorKind;
-            let body = r#"{"error":{"message":"context too long"}}"#;
+            let body = r#"{"error":{"message":"invalid input"}}"#;
             let err = openai_http_error(400, "400 Bad Request", body);
             assert_eq!(err.kind, LlmErrorKind::InvalidRequest);
-            assert!(err.message.contains("context too long"));
+            assert!(err.message.contains("invalid input"));
             assert!(!err.message.contains("{\"error\""));
+        }
+
+        #[test]
+        fn openai_http_error_classifies_context_length_code() {
+            use crate::LlmErrorKind;
+            let body =
+                r#"{"error":{"message":"too many tokens","code":"context_length_exceeded"}}"#;
+            let err = openai_http_error(400, "400 Bad Request", body);
+            assert_eq!(err.kind, LlmErrorKind::ContextWindowExceeded);
+            assert!(err.message.contains("context_length_exceeded"));
         }
 
         #[test]

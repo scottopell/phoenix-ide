@@ -4,10 +4,12 @@ use std::collections::HashSet;
 
 /// Default maximum output tokens applied when a model spec does not provide an
 /// explicit override. External model configs that omit `max_output_tokens` get
-/// this value; a nonzero explicit value is accepted as-is.
+/// this value capped below their context window.
 ///
 /// Single source of truth: defined in `phoenix-core` and re-exported here.
 pub use phoenix_core::domain::sm_state::DEFAULT_MAX_OUTPUT_TOKENS;
+
+const EXTERNAL_MODEL_DEFAULT_OUTPUT_RESERVE: usize = 2_000;
 
 /// User-facing provider family. Distinct from [`ModelBackend`] (wire protocol)
 /// so gateway-routed models (e.g. Gemini served over an OpenAI-compatible
@@ -178,9 +180,9 @@ struct ExternalModelSpec {
     family: Option<ExternalFamily>,
     description: String,
     context_window: usize,
-    /// Maximum output tokens for this model. Defaults to
-    /// [`DEFAULT_MAX_OUTPUT_TOKENS`] when absent. A nonzero value is required
-    /// when this field is present.
+    /// Maximum output tokens for this model. Defaults to the smaller of
+    /// [`DEFAULT_MAX_OUTPUT_TOKENS`] and a context-window-reserved cap when absent.
+    /// A nonzero value lower than `context_window` is required when present.
     max_output_tokens: Option<u32>,
     recommended: bool,
     supports_tool_search: bool,
@@ -307,10 +309,23 @@ fn external_model_spec_from_config(
     if spec.context_window == 0 {
         return Err(format!("model '{id}' has invalid context_window 0"));
     }
+    let default_max_output_tokens = u32::try_from(
+        spec.context_window
+            .saturating_sub(EXTERNAL_MODEL_DEFAULT_OUTPUT_RESERVE)
+            .max(1),
+    )
+    .unwrap_or(u32::MAX)
+    .min(DEFAULT_MAX_OUTPUT_TOKENS);
     let max_output_tokens = match spec.max_output_tokens {
         Some(0) => return Err(format!("model '{id}' has invalid max_output_tokens 0")),
+        Some(n) if usize::try_from(n).is_ok_and(|n| n >= spec.context_window) => {
+            return Err(format!(
+                "model '{id}' has max_output_tokens {n} >= context_window {}",
+                spec.context_window
+            ));
+        }
         Some(n) => n,
-        None => DEFAULT_MAX_OUTPUT_TOKENS,
+        None => default_max_output_tokens,
     };
     // Derive family from backend, but honour an explicit override so
     // Google/etc. models behind an OpenAI-compatible gateway show the right
@@ -621,13 +636,23 @@ mod tests {
     }
 
     #[test]
-    fn external_model_max_output_defaults_to_const_when_omitted() {
+    fn external_model_max_output_defaults_to_const_for_large_context_when_omitted() {
         let models = parse_external_models(
             r#"[{"id":"test","backend":"anthropic","description":"Test","context_window":128000,"recommended":false,"supports_tool_search":false}]"#,
         )
         .unwrap();
 
         assert_eq!(models[0].max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+    }
+
+    #[test]
+    fn external_model_default_max_output_reserves_context_for_small_windows() {
+        let models = parse_external_models(
+            r#"[{"id":"small","backend":"anthropic","description":"Small","context_window":8192,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(models[0].max_output_tokens, 6_192);
     }
 
     #[test]
@@ -648,6 +673,19 @@ mod tests {
         .expect("array should parse; the invalid entry should be skipped");
 
         assert!(models.is_empty(), "zero max_output_tokens must be rejected");
+    }
+
+    #[test]
+    fn external_model_max_output_at_or_above_context_is_rejected() {
+        let models = parse_external_models(
+            r#"[{"id":"test","backend":"anthropic","description":"Test","context_window":8192,"max_output_tokens":8192,"recommended":false,"supports_tool_search":false}]"#,
+        )
+        .expect("array should parse; the invalid entry should be skipped");
+
+        assert!(
+            models.is_empty(),
+            "max_output_tokens >= context_window must be rejected"
+        );
     }
 
     #[test]

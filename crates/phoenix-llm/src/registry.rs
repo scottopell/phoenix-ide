@@ -1616,7 +1616,7 @@ mod tests {
             anthropic_api_key: Some("anthropic-key".to_string()),
             openai_api_key: Some("openai-key".to_string()),
             anthropic_base_url: Some("https://proxy.example/v1/messages".to_string()),
-            openai_base_url: Some("https://proxy.example/v1/responses".to_string()),
+            openai_responses_base_url: Some("https://proxy.example/v1/responses".to_string()),
             ..Default::default()
         };
 
@@ -1639,7 +1639,7 @@ mod tests {
         let config = LlmConfig {
             anthropic_base_url: Some("https://stale.example/v1/messages".to_string()),
             openai_api_key: Some("openai-key".to_string()),
-            openai_base_url: Some("https://proxy.example/v1/responses".to_string()),
+            openai_responses_base_url: Some("https://proxy.example/v1/responses".to_string()),
             ..Default::default()
         };
 
@@ -1778,7 +1778,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = LlmConfig {
             openai_api_key: Some("test-openai-key".to_string()),
-            openai_base_url: Some("https://example.test/v1/responses".to_string()),
+            openai_responses_base_url: Some("https://example.test/v1/responses".to_string()),
             use_codex_auth: true,
             codex_credential: Some(fake_codex_credential(&dir)),
             external_models: vec![external_openai_model()],
