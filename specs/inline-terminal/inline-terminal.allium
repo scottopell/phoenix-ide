@@ -79,34 +79,44 @@ value InlineCommandRound {
 -- signatures and semantics.
 --
 --   inline_bracket_open(session: InlineTerminalSession) -> Boolean
---       True when the session's underlying terminal has a command that has
---       started (OSC 133;C) but not been committed by this session — i.e.
---       session.terminal.current_command != None. The inline session stores no
---       command record of its own; bracket state is read from the terminal to
---       avoid a parallel representation of terminal.current_command. (REQ-IT-005)
+--       True when the session holds a started-but-uncommitted command — i.e.
+--       session.open_command != None. Reads the session's OWN field, which is
+--       defined in every session state (including closed), so the bracket check
+--       never depends on the underlying terminal's transient current_command
+--       (undefined after terminal teardown). (REQ-IT-005)
 --
---   to_tool_result(record: terminal/CommandRecord) -> bedrock/ToolResult
---       Projects a terminal CommandRecord into a `bash` tool-result: the
---       captured output plus an exit-code annotation, using the bash tool's
---       existing result formatting. A None exit_code is rendered as "no exit
---       code" — never fabricated as 0 (matches terminal/CommandRecord).
+--   completed_round(record: terminal/CommandRecord) -> InlineCommandRound
+--       The round for a command that finished (OSC 133;D). command_text and the
+--       `bash` tool-result come from the finalized `record` (captured output +
+--       exit-code annotation, using the bash tool's existing result formatting;
+--       a None exit_code renders as "no exit code", never fabricated as 0).
+--       outcome = completed, origin = user (REQ-IT-007 — origin is fixed by this
+--       path, not a caller choice).
 --
---   inline_round(record: terminal/CommandRecord, outcome: CommandOutcome)
---           -> InlineCommandRound
---       Builds the round committed for `record`: command_text from the record,
---       result = to_tool_result(record), the given outcome, and origin = user
---       (REQ-IT-007 — origin is fixed by this path, not a caller choice).
+--   interrupted_round(command_text: String) -> InlineCommandRound
+--       The round for a command whose bracket was superseded or closed without a
+--       D. Carries the command text and a best-effort tool-result (output
+--       fidelity for a cut-off command is the shared CommandTracker concern,
+--       Deferred: TuiCursorAddressedOutput). outcome = interrupted, origin =
+--       user. The inline layer keeps only the command text for an open bracket
+--       (session.open_command), which is all this needs.
 
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
 
+-- The terminal's OSC 133 command tracking (`specs/terminal`) as observed by the
+-- inline session. Realized by the terminal CommandTracker fed the session PTY's
+-- byte stream; modeled here as the external source of the session's
+-- command-boundary events (Osc133CommandStart / Osc133CommandFinish on the
+-- InlineCommandBridge surface).
+external entity InlineCommandSource {
+}
+
 -- An inline PTY terminal hosted in the composer for one conversation, opened by
 -- the `!` sigil. Distinct from the per-WorkScope panel terminal of
 -- `specs/terminal` (REQ-TERM-003). Short-lived: spawned on open, torn down on
--- close. The session's only state is its lifecycle status; the live PTY, its
--- output buffer, and the in-flight command record all live on the underlying
--- `terminal` (read, never duplicated here).
+-- close.
 entity InlineTerminalSession {
     -- The conversation whose composer hosts this session and whose history
     -- receives the committed rounds.
@@ -125,6 +135,18 @@ entity InlineTerminalSession {
         closed -> live
         live -> closed
     }
+
+    -- The command text of the started-but-uncommitted command, if any: set on
+    -- Osc133CommandStart, cleared on every commit path. The inline commit
+    -- layer's OWN state, held so the bracket check and the interrupted flush
+    -- never read the terminal's transient current_command (undefined after
+    -- teardown, and overwritten by the terminal's own C handling). This is a
+    -- non-overlapping contract, not a parallel representation of
+    -- terminal.current_command: that field drives the terminal HUD ring
+    -- (capacity-5, ✓/✗); this holds only the text needed to commit the single
+    -- outstanding interrupted round. Not status-guarded — `None` in a closed
+    -- session, which the ClosedSessionHasNoOpenBracket invariant depends on.
+    open_command: String?
 }
 
 ------------------------------------------------------------
@@ -198,14 +220,16 @@ rule UserClosesInlineTerminal {
 
     -- Guaranteed terminal flush: an open bracket (a command with no D) is
     -- committed as interrupted before the session goes away, so it is never
-    -- lost (REQ-IT-005). Built from the terminal's in-flight command record.
+    -- lost (REQ-IT-005). Built from the session's own open_command, so it does
+    -- not depend on the terminal still being alive.
     ensures:
         if inline_bracket_open(session):
             InlineRoundCommitted(
                 session.conversation,
-                inline_round(session.terminal.current_command, interrupted)
+                interrupted_round(session.open_command)
             )
 
+    ensures: session.open_command = None
     ensures: session.status = closed
 
     @guidance
@@ -218,9 +242,14 @@ rule UserClosesInlineTerminal {
         --      backspaces of a hold-to-delete burst that just emptied the line
         --      (not exit) — a backspace within the debounce window after the
         --      line empties is consumed by the terminal, not read as the exit
-        --      gesture.
-        -- The conversation returns to idle WITHOUT an LLM request (REQ-IT-006);
-        -- see the NoAgentTurn guarantee and Deferred:
+        --      gesture. Detecting an empty input line depends on OSC 133 prompt
+        --      markers / cursor position; a shell without integration falls back
+        --      to shell exit (Ctrl-D) as the only close path (see the
+        --      ShellIntegrationPrerequisite note in design.md).
+        -- The interrupted flush reads session.open_command and commits BEFORE
+        -- the PTY teardown, so it does not race the terminal dropping its
+        -- current_command. The conversation returns to idle WITHOUT an LLM
+        -- request (REQ-IT-006); see the NoAgentTurn guarantee and Deferred:
         -- BedrockInlineTerminalBusyState for the core_status return-to-idle
         -- coupling. The PTY is torn down (`specs/terminal` teardown path).
 }
@@ -229,57 +258,64 @@ rule UserClosesInlineTerminal {
 -- 2. PER-COMMAND COMMIT (REQ-IT-003, REQ-IT-004, REQ-IT-005)
 -- ===========================================================
 --
--- The inline session observes the underlying terminal's OSC 133 command
--- boundaries (owned by `specs/terminal`: CommandExecutionStarted on C,
--- CommandExecutionFinished on D). It maintains no command state of its own;
--- the only inline-layer action is committing rounds at the right boundaries.
+-- The inline session commits rounds at the terminal's OSC 133 command
+-- boundaries, delivered as the Osc133CommandStart / Osc133CommandFinish events
+-- of the InlineCommandBridge surface (derived from `specs/terminal`'s
+-- CommandExecutionStarted on C / CommandExecutionFinished on D). The session's
+-- open_command holds the outstanding bracket between those events.
 
 -- REQ-IT-005: a new command starting supersedes any still-open bracket.
 rule InlineCommandStarting {
-    when: InlineCommandStarting(session, _command_text)
+    when: Osc133CommandStart(session, command_text)
 
     requires: session.status = live
 
     -- Supersession flush: if the previous command never produced a D, its
-    -- bracket is committed interrupted before the terminal overwrites
-    -- current_command with the new command. This is the "C then another C"
-    -- flush; the new command is `_command_text`, not the one being flushed.
+    -- bracket is committed interrupted here, then this same rule opens the new
+    -- bracket. Flush-then-reopen in one rule pins the ordering structurally —
+    -- the outgoing bracket is committed before it is overwritten, with no
+    -- cross-spec race against the terminal's own current_command handling. This
+    -- is the "C then another C" flush.
     ensures:
         if inline_bracket_open(session):
             InlineRoundCommitted(
                 session.conversation,
-                inline_round(session.terminal.current_command, interrupted)
+                interrupted_round(session.open_command)
             )
 
+    ensures: session.open_command = command_text
+
     @guidance
-        -- Corresponds to terminal/CommandExecutionStarted (OSC 133;C) for a
-        -- live inline session. Fires before the terminal's own rule overwrites
-        -- current_command (terminal/CommandExecutionStarted @guidance: a new C
-        -- overwrites a non-None current_command). The inline layer commits the
-        -- outgoing bracket here so the overwrite does not lose it.
+        -- Osc133CommandStart is derived from terminal/CommandExecutionStarted
+        -- (OSC 133;C). The bracket records only the command text. An interrupted
+        -- round built from it (interrupted_round) carries that text and
+        -- best-effort output — output fidelity for a cut-off command is the
+        -- shared CommandTracker concern (Deferred: TuiCursorAddressedOutput),
+        -- not a hard postcondition. The structural guarantee is that the bracket
+        -- exists and resolves to exactly one round.
 }
 
 -- REQ-IT-003, REQ-IT-004: a completed command commits as a completed round.
 rule InlineCommandCompleted {
-    when: InlineCommandCompleted(session, record)
+    when: Osc133CommandFinish(session, record)
 
     requires: session.status = live
 
     -- `record` is the finalized terminal CommandRecord: output captured between
     -- C and D, exit_code from the D payload (None when D omits it — never
     -- fabricated as 0, matching terminal/CommandRecord). Committed as a
-    -- user-originated bash-run round (Track B).
-    ensures: InlineRoundCommitted(session.conversation, inline_round(record, completed))
+    -- user-originated bash-run round (Track B), then the bracket is cleared.
+    ensures: InlineRoundCommitted(session.conversation, completed_round(record))
+    ensures: session.open_command = None
 
     @guidance
-        -- Corresponds to terminal/CommandExecutionFinished (OSC 133;D) for a
-        -- live inline session. InlineRoundCommitted persists the
-        -- InlineCommandRound as two messages on the conversation: an Agent
-        -- message carrying a `bash` tool-use ContentBlock (op run, cmd =
-        -- record.command_text) and a Tool message carrying the tool-result.
-        -- Only the `run` operation is ever produced (REQ-IT-004); the bash
-        -- wait/kill/handle operations have no inline analog. origin = user
-        -- (REQ-IT-007), fixed by inline_round.
+        -- Osc133CommandFinish is derived from terminal/CommandExecutionFinished
+        -- (OSC 133;D). InlineRoundCommitted persists the InlineCommandRound as
+        -- two messages on the conversation: an Agent message carrying a `bash`
+        -- tool-use ContentBlock (op run, cmd = record.command_text) and a Tool
+        -- message carrying the tool-result. Only the `run` operation is ever
+        -- produced (REQ-IT-004); the bash wait/kill/handle operations have no
+        -- inline analog. origin = user (REQ-IT-007), fixed by completed_round.
 }
 
 ------------------------------------------------------------
@@ -308,9 +344,11 @@ invariant LiveInlineSessionImpliesConversationBusy {
 -- REQ-IT-005: a closed session leaves no started-but-uncommitted command
 -- behind. Every bracket is closed exactly once — by its own D
 -- (InlineCommandCompleted), by the next command's C (InlineCommandStarting),
--- or by session close (UserClosesInlineTerminal) — so a closed session has no
--- open bracket. Together with those rules each committing exactly one round,
--- every started command resolves to exactly one committed round.
+-- or by session close (UserClosesInlineTerminal) — each of which clears
+-- open_command after committing exactly one round. The invariant is stated over
+-- the session's OWN open_command (defined in the closed state), not the
+-- terminal's transient current_command, so it holds independently of terminal
+-- teardown ordering.
 invariant ClosedSessionHasNoOpenBracket {
     for s in InlineTerminalSession:
         s.status = closed implies
@@ -372,6 +410,44 @@ surface UserInlineTerminalAccess {
         -- none is committed twice — see ClosedSessionHasNoOpenBracket.
 }
 
+-- The OSC 133 → commit bridge. The command-boundary events the commit rules
+-- fire on arrive here as external inputs, derived from the session terminal's
+-- OSC 133 tracking (`specs/terminal`). Modeling them as `expects:` on a surface
+-- makes the commit triggers reachable — they are provider inputs, not events
+-- some rule must emit — the same shape as terminal.allium's
+-- ShellIntegrationProtocol.
+surface InlineCommandBridge {
+    facing source: InlineCommandSource
+        -- The session terminal's OSC 133 command tracking. Phoenix derives the
+        -- two events below from terminal/CommandExecutionStarted (C) and
+        -- terminal/CommandExecutionFinished (D), scoped to the inline session.
+
+    context session: InlineTerminalSession
+
+    exposes:
+        session.status
+        session.open_command
+
+    expects:
+        Osc133CommandStart(session, command_text)
+            -- A command began (OSC 133;C). Payload is the typed command text
+            -- (may be empty). Drives InlineCommandStarting: supersede any open
+            -- bracket, then open the new one.
+
+        Osc133CommandFinish(session, record)
+            -- A command finished (OSC 133;D). Carries the finalized terminal
+            -- CommandRecord (output + exit_code, or None). Drives
+            -- InlineCommandCompleted: commit the completed round, clear bracket.
+
+    @guarantee CommitOrderingPinned
+        -- The commit layer holds its own open_command, so supersession
+        -- (flush-then-reopen in InlineCommandStarting) and the close flush both
+        -- resolve the outgoing bracket without reading the terminal's transient
+        -- current_command. There is no cross-spec ordering dependency on the
+        -- terminal's own C/D handling — the data-loss race REQ-IT-005 guards
+        -- against cannot occur.
+}
+
 ------------------------------------------------------------
 -- Deferred
 ------------------------------------------------------------
@@ -385,6 +461,18 @@ deferred BedrockInlineTerminalBusyState
     -- (core_status = idle on open; non-idle while live) but does not redefine
     -- bedrock's enum; the variant and its idle-return transition are added in
     -- `specs/bedrock` (`Conversation.core_status`, `Conversation.is_busy`).
+    -- Location: specs/bedrock/
+
+deferred OriginDiscriminatorSchema
+    -- REQ-IT-007's single `origin` marker (user | agent) is a new persisted
+    -- field on the tool round. `MessageContent` carries no `origin` today, so
+    -- while no new `MessageContent` variant is added (inline rounds reuse the
+    -- Agent + Tool messages), a schema change IS owed: the persisted tool round
+    -- gains an `origin` discriminator (default `agent` for existing rows — a
+    -- true-absence default, since pre-feature rounds were all agent-authored).
+    -- Tracked here so the schema addition is visible the way the core_status
+    -- coupling is, rather than implied by design.md.
+    -- Location: crates/phoenix-core/src/domain/db_schema.rs
 
 deferred TuiCursorAddressedOutput
     -- The OSC-133 output capture concatenates ANSI-stripped printable bytes
@@ -406,11 +494,13 @@ deferred TuiCursorAddressedOutput
     --      raw concatenation, so overwrites collapse to the final line state.
     -- The InlineCommandRound `result` is the typed tool-result so either
     -- resolution fits without migrating persisted rounds.
+    -- Location: specs/terminal/
 
 deferred PanelTerminalSharing
     -- Reconciling the inline session with the per-WorkScope panel terminal
     -- (`specs/terminal` REQ-TERM-003) into one shared session. Kept separate
     -- here to preserve the one-panel-terminal-per-WorkScope invariant.
+    -- Location: specs/terminal/
 
 deferred GeneralUserToolInvocation
     -- A general `$tool` / `T.tool` syntax for invoking other eligible tools
@@ -419,3 +509,4 @@ deferred GeneralUserToolInvocation
     -- InlineRoundCommitted's provenance); the inline terminal is its `bash`
     -- specialization. The umbrella requirements live in
     -- `specs/user-tool-invocation`.
+    -- Location: specs/user-tool-invocation/

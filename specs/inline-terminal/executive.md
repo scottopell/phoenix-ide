@@ -80,4 +80,4 @@ The feature is specified but not yet implemented.
 | REQ-IT-005: A started command is never dropped (interrupted round) | Planned |
 | REQ-IT-006: Closing the session never triggers an agent turn | Planned |
 | REQ-IT-007: User origin is the single source of truth for attribution | Planned |
-| REQ-IT-008: Inline commands run unprivileged, with honest provenance | Planned |
+| REQ-IT-008: Inline commands run un-gated, with honest provenance | Planned |

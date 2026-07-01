@@ -99,6 +99,17 @@ The inline session observes the underlying terminal's OSC 133 command boundaries
   committed as an interrupted round (the guaranteed terminal flush), then the
   session goes `closed`.
 
+Those boundaries arrive as the `InlineCommandBridge` surface's
+`Osc133CommandStart` / `Osc133CommandFinish` events, derived from the terminal's
+OSC 133 tracking. Modeling them as surface inputs (`expects:`) rather than events
+some rule emits is what makes the commit rules reachable. Because the open
+bracket is the session's **own** `open_command`, the supersession flush and the
+close flush resolve it without reading the terminal's transient
+`current_command`: flush-then-reopen happens inside one rule, so there is no
+cross-spec ordering race against the terminal's own `C` handling — the data-loss
+window REQ-IT-005 guards against is structurally closed, and the bracket check
+stays defined even after the terminal tears down.
+
 The result is a total contract: **every command that starts resolves to exactly
 one committed round**, `completed` or `interrupted` (REQ-IT-005). There is no
 separate garbage-collection of dangling brackets; each bracket is closed exactly
@@ -109,6 +120,18 @@ completed round; the interrupted path is reached only when no `D` arrives —
 session-teardown mid-command, or a session whose shell never had OSC 133
 integration. The interrupted outcome is therefore the uncommon case, which is
 the correct shape for it.
+
+### Shell integration prerequisite
+
+Per-command commit depends on OSC 133 command markers. In a shell with no
+integration (`shell_integration_status = absent` in `specs/terminal`), no `C` /
+`D` ever fires: the user gets a working interactive terminal, but no rounds are
+committed, and the empty-line detection the return-to-composer gesture relies on
+(cursor position / prompt markers) is unavailable, leaving shell `exit` / `Ctrl-D`
+as the only way out. Both degradations share the same population; the
+implementation surfaces them to the user with an actionable "enable shell
+integration" recommendation. The spec assumes integration is present rather than
+modeling the degraded mode.
 
 ## Track B: shaping a round into shared history
 
@@ -160,10 +183,14 @@ without migrating persisted rounds.
 
 Inline rounds persist through the same message path as agent tool rounds — an
 `Agent` message and a `Tool` message — with the `origin` discriminator on the
-round. No new top-level `MessageContent` variant is required: the rounds are
+round. No new top-level `MessageContent` *variant* is required: the rounds are
 ordinary agent/tool messages distinguished only by origin, which keeps the LLM
-history builder and crash recovery on their existing paths. The inline session
-itself (the live PTY) is ephemeral and not persisted, matching the panel
+history builder and crash recovery on their existing paths. There is still a
+schema change owed — the persisted tool round gains the `origin` field, which
+`MessageContent` does not carry today — tracked as the `OriginDiscriminatorSchema`
+deferred entry (default `agent` for pre-feature rows, a true-absence default
+since existing rounds were all agent-authored). The inline session itself (the
+live PTY) is ephemeral and not persisted, matching the panel
 terminal; only the committed rounds are durable.
 
 ## Deny-gate and provenance
@@ -181,9 +208,9 @@ attributing an un-gated user command to the agent (REQ-IT-008).
 |---|---|
 | REQ-IT-001 | `!` composer trigger; PTY session reusing `specs/terminal` transport |
 | REQ-IT-002 | `UserOpensInlineTerminal` gate on `core_status = idle`; `inline_terminal` busy state; `AtMostOneLiveInlineSessionPerConversation` |
-| REQ-IT-003 | `InlineCommandCompleted` → `Agent`+`Tool` round (Track B) |
+| REQ-IT-003 | `InlineCommandBridge` `expects: Osc133CommandFinish` → `InlineCommandCompleted` → `Agent`+`Tool` round (Track B) |
 | REQ-IT-004 | `BashToolInput { op: run }`; no `wait`/`kill`/handle ops emitted |
-| REQ-IT-005 | `InlineCommandStarting` (supersession) + close-with-open-bracket; `ClosedSessionHasNoOpenBracket`; `EveryStartedCommandResolvesOnce` guarantee |
+| REQ-IT-005 | `InlineCommandBridge` (`Osc133CommandStart`/`Finish`); `InlineCommandStarting` supersession-flush from session `open_command` + close-with-open-bracket; `ClosedSessionHasNoOpenBracket`; `CommitOrderingPinned` + `EveryStartedCommandResolvesOnce` guarantees |
 | REQ-IT-006 | `UserClosesInlineTerminal` → idle; `NoAgentTurn` guarantee |
 | REQ-IT-007 | single `origin` discriminator; `UserOriginated` guarantee |
 | REQ-IT-008 | provenance from REQ-IT-007; deny-gate non-application |

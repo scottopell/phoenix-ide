@@ -94,11 +94,11 @@ representations are never stored independently. This mirrors the existing
 `MessageContent::Skill` split, where one message is delivered to the LLM in a
 role distinct from its history attribution.
 
-### REQ-IT-008 — Inline commands run unprivileged in the user's shell, with honest provenance
+### REQ-IT-008 — Inline commands run un-gated in the user's shell, with honest provenance
 
-Inline commands run in the user's own interactive shell and are not subject to
-the agent command deny-gate (`specs/permissions`); the user authorizes each
-command by typing it. Because those commands enter history as `bash` tool
+Inline commands run in the user's own interactive shell with the user's full
+privileges, not subject to the agent command deny-gate (`specs/permissions`);
+the user authorizes each command by typing it. Because those commands enter history as `bash` tool
 rounds, their user origin (REQ-IT-007) keeps the record honest: a later audit
 distinguishes user-run commands from agent-issued ones, so un-gated user
 commands are never mistaken for commands the agent chose to run.
