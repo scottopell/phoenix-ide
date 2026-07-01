@@ -506,7 +506,14 @@ function MessageListImpl({
     if (lastSeenConvIdRef.current !== conversationId) {
       lastSeenConvIdRef.current = conversationId;
       prevTotalHeightRef.current = newHeight;
-      prevClientHeightRef.current = 0;
+      // Seed from the scroller so a viewport shrink before the next height
+      // delta (composer growth, panel expansion right after navigation)
+      // has a valid previous clientHeight to compare against. Setting 0
+      // here would make the shrink handler's `clientHeight < 0` check
+      // always false, causing it to use the new (smaller) height and
+      // misclassify a pinned user as scrolled-up.
+      const s = scrollerRef.current;
+      prevClientHeightRef.current = s ? s.clientHeight : 0;
       // Seed from allUnitsLengthRef: if the new conversation already has
       // messages, initialTopMostItemIndex handled placement and we must
       // NOT force a snap on the next height delta. Only an empty→non-empty
