@@ -83,6 +83,7 @@ We're starting conservatively to learn how agents consume skills:
 | [phoenix-deployment](phoenix-deployment/SKILL.md) | Production deployment across native launchd (macOS), native systemd, and daemon modes |
 | [phoenix-task-tracking](phoenix-task-tracking/SKILL.md) | Task file format, CLI commands, issue discovery protocol |
 | [phoenix-release](phoenix-release/SKILL.md) | Cut a version, push the tag, replace auto-notes with a sub-agent-drafted changelog |
+| [spears-v2-migrate](spears-v2-migrate/SKILL.md) | Temporary Phoenix workflow for retiring legacy `design.md` specs into spEARS v2 homes without keeping zombie artifacts |
 
 ---
 
