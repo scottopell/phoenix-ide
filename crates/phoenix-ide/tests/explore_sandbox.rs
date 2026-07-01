@@ -169,6 +169,29 @@ fn explore_sandbox_enforces_read_only_policy() {
         .contains(&format!("tmp={}", platform_temp.display())));
     assert!(env_probe.stdout.contains("gh=unset"));
 
+    // HOME is the user's real home, passed through unchanged. The nono
+    // sandbox must block writes to it — only scratch and platform-temp are
+    // read-write. This is the core security invariant of not remapping HOME.
+    let home_write_denied = sandbox_run(
+        bin,
+        &SandboxFixture {
+            repo: &repo,
+            scratch: &scratch,
+            home: &home,
+            platform_temp: &platform_temp,
+            sensitive: &sensitive,
+        },
+        "echo bad > \"$HOME/.phoenix-sandbox-test-write\"",
+    );
+    assert!(
+        !home_write_denied.status.success(),
+        "HOME write unexpectedly succeeded: {home_write_denied:?}"
+    );
+    assert!(
+        !home.join(".phoenix-sandbox-test-write").exists(),
+        "HOME write should have been blocked by the sandbox"
+    );
+
     let sensitive_read = sandbox_run(
         bin,
         &SandboxFixture {
