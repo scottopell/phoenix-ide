@@ -633,8 +633,9 @@ THE Explore bash sandbox SHALL provide:
   locations that do not overlap the worktree, resolved Git metadata, or
   Phoenix-owned runtime state; task proposal files are created through scoped
   `patch`/`propose_task`, not through sandboxed bash
-- a synthetic sandbox home under scratch, exposed as `PHOENIX_SANDBOX_HOME` and
-  `HOME`
+- `HOME` is the user's real home directory, passed through unchanged; the nono
+  sandbox blocks writes to it (only scratch and platform-temp are read-write),
+  consistent with the broad-read model
 - `PHOENIX_SANDBOX_SCRATCH` pointing at Phoenix-owned scratch
 - platform-compatible temporary directory writes, exposed as `TMPDIR`; when the
   platform temp root would cover the worktree, resolved Git metadata, or
@@ -646,7 +647,7 @@ THE Explore bash sandbox SHALL provide:
 - a reduced environment that strips ambient SCM/OAuth, LLM-provider, and
   cloud/vendor credential variables
 
-THE SYSTEM SHALL remove Phoenix-owned per-command scratch/home directories after
+THE SYSTEM SHALL remove Phoenix-owned per-command scratch directories after
 that sandboxed bash command reaches a terminal state
 
 WHEN `nono` blocks an operation in Explore mode

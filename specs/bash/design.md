@@ -849,19 +849,19 @@ applies `nono::Sandbox::apply()` to itself, and then it execs `/bin/bash -c
 <cmd>`. The server process never applies the sandbox to itself.
 
 The Explore policy grants broad filesystem read access, Phoenix-owned scratch
-read-write, a synthetic sandbox home under scratch, and platform-compatible
+read-write, and platform-compatible
 temporary directory writes. Task proposal directories are read-only to bash;
 task drafts go through scoped non-bash proposal tools. If the platform temp root
 would cover the worktree, resolved Git metadata, or Phoenix-owned runtime state,
 the temp capability falls back to a Phoenix-owned scratch child so the temp grant
 cannot cover protected state. The scratch root itself is rejected when it overlaps
 protected repo/Git/Phoenix paths. `PHOENIX_SANDBOX_SCRATCH` names scratch,
-`PHOENIX_SANDBOX_HOME` and `HOME` name the synthetic home, and `TMPDIR` names
-the platform temp directory. Network access is blocked and the child
+`HOME` is the user's real home directory, passed through unchanged,
+and `TMPDIR` names the platform temp directory. Network access is blocked and the child
 environment is rebuilt from a small allowlist that preserves `PATH` while
 stripping ambient credential variables.
 
-The waiter removes Phoenix-owned per-command scratch/home directories when the
+The waiter removes Phoenix-owned per-command scratch directories when the
 sandboxed command reaches a terminal state. Platform temp is intentionally left
 to the platform.
 

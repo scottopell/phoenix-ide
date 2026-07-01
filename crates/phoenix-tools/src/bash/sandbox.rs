@@ -7,14 +7,13 @@ use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 
 const REPO_ROOT_ENV: &str = "PHOENIX_SANDBOX_REPO_ROOT";
 const SCRATCH_ENV: &str = "PHOENIX_SANDBOX_SCRATCH";
-const HOME_ENV: &str = "PHOENIX_SANDBOX_HOME";
 const PLATFORM_TEMP_ENV: &str = "PHOENIX_SANDBOX_PLATFORM_TEMP";
 
 #[derive(Debug, Clone)]
 pub struct ExploreReadOnlyPolicy {
     repo_root: PathBuf,
     scratch_dir: PathBuf,
-    sandbox_home: PathBuf,
+    home: PathBuf,
     platform_temp: PathBuf,
     path: OsString,
 }
@@ -40,8 +39,8 @@ impl ExploreReadOnlyPolicy {
         protected_dirs.dedup();
         let scratch_root = runtime_env.tmp_root().join("explore-bash");
         let scratch_dir = scratch_dir(&scratch_root, &protected_dirs)?;
-        let sandbox_home = scratch_dir.join("home");
-        std::fs::create_dir_all(&sandbox_home)?;
+        std::fs::create_dir_all(&scratch_dir)?;
+        let home = runtime_env.home().to_path_buf();
         let platform_temp =
             platform_temp_dir(&protected_dirs, &scratch_dir, runtime_env.tmp_root());
         std::fs::create_dir_all(&platform_temp)?;
@@ -49,7 +48,7 @@ impl ExploreReadOnlyPolicy {
         Ok(Self {
             repo_root: cwd_root,
             scratch_dir,
-            sandbox_home,
+            home,
             platform_temp,
             path,
         })
@@ -58,15 +57,14 @@ impl ExploreReadOnlyPolicy {
     fn to_command_env(&self, command: &mut Command) {
         command.env(REPO_ROOT_ENV, &self.repo_root);
         command.env(SCRATCH_ENV, &self.scratch_dir);
-        command.env(HOME_ENV, &self.sandbox_home);
+        command.env("HOME", &self.home);
         command.env(PLATFORM_TEMP_ENV, &self.platform_temp);
         self.apply_child_env(command);
     }
 
     fn apply_child_env(&self, command: &mut Command) {
         command.env("PHOENIX_SANDBOX_SCRATCH", &self.scratch_dir);
-        command.env("PHOENIX_SANDBOX_HOME", &self.sandbox_home);
-        command.env("HOME", &self.sandbox_home);
+        command.env("HOME", &self.home);
         command.env("TMPDIR", &self.platform_temp);
         command.env("PATH", &self.path);
         command.env("GIT_CONFIG_NOSYSTEM", "1");
@@ -79,13 +77,13 @@ impl ExploreReadOnlyPolicy {
     fn from_env() -> Result<Self, String> {
         let repo_root = env_path(REPO_ROOT_ENV)?;
         let scratch_dir = env_path(SCRATCH_ENV)?;
-        let sandbox_home = env_path(HOME_ENV)?;
+        let home = env_path("HOME")?;
         let platform_temp = env_path(PLATFORM_TEMP_ENV)?;
         let path = inherited_path();
         Ok(Self {
             repo_root: repo_root.clone(),
             scratch_dir,
-            sandbox_home,
+            home,
             platform_temp,
             path,
         })

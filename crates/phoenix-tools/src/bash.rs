@@ -234,9 +234,10 @@ fn sandboxed_bash_description(base: &str) -> String {
         "{base}\n\nExplore mode sandbox: commands run under an OS-enforced nono sandbox. \
          The repository/worktree, Git metadata, and task files are read-only \
          to bash; use non-bash tools available in the current context for \
-         task drafts or other writes. $PHOENIX_SANDBOX_SCRATCH, HOME, and \
-         TMPDIR point at writable Phoenix-owned scratch/temp locations; \
-         network access is blocked."
+         task drafts or other writes. $PHOENIX_SANDBOX_SCRATCH and TMPDIR \
+         point at writable Phoenix-owned scratch/temp locations; HOME is \
+         the user's real home (read-only under the sandbox); network access \
+         is blocked."
     )
 }
 
