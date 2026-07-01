@@ -19,8 +19,8 @@ Wake contracts v1 is intentionally narrow. It supports terminal waits on concret
 Phoenix handles only:
 
 - **bash handles** returned by `bash op=run` when `wait_seconds` elapses;
-- **tmux pane/window handles** returned by `tmux_run` / referenced through the
-  tmux registry;
+- **tmux window handles** returned by `tmux_run` as `window_id` / referenced
+  through the tmux registry;
 - **sub-agent handles** identified by the child conversation / agent id.
 
 V1 does not define a general conversation-actor system, request/reply messaging,
@@ -190,9 +190,9 @@ For `Bash`, terminal states SHALL include exited, killed, signaled,
 `kill_pending_kernel`, forgotten, and the synchronous wait surface's other
 terminal statuses.
 
-For `TmuxPane`, terminal states SHALL include the watched pane/window process
-exiting, the pane/window being explicitly killed, or the tmux server/session
-being forgotten by lifecycle teardown.
+For `TmuxPane`, terminal states SHALL include the watched tmux `window_id` process
+exiting, the window being explicitly killed, or the tmux server/session being
+forgotten by lifecycle teardown.
 
 For `SubAgent`, terminal fired payloads SHALL include successful
 `submit_result`, `submit_error`, wall-clock timeout, parent/child cancellation,
@@ -229,10 +229,10 @@ status (`exited` / `killed` / `kill_pending_kernel` / `forgotten` and any other
 status exposed by `bash op=wait`), `exit_code`, `duration_ms`, and a final tail
 window per REQ-BASH-004.
 
-For `HandleTerminal/TmuxPane`, the tool result MUST carry the watched pane/window
+For `HandleTerminal/TmuxPane`, the tool result MUST carry the watched `window_id`
 identity, terminal status, exit information when available, and a final captured
 tail window equivalent to the information the LLM would gather by inspecting the
-pane after exit.
+window after exit.
 
 For `HandleTerminal/SubAgent`, the tool result MUST carry one sub-agent identity
 field — the child conversation / agent id — plus task label/description when

@@ -89,7 +89,7 @@ value BashTerminalPayload {
 }
 
 value TmuxTerminalPayload {
-    pane_id: String
+    window_id: String        -- unique tmux target returned by tmux_run
     terminal_status: TmuxTerminalStatus
     exit_code: Integer?
     duration_ms: Integer?

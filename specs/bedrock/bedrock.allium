@@ -1197,15 +1197,18 @@ rule SubAgentTurnLimitGraceTurn {
     when: TurnLimitReached(conversation)
     requires: not conversation.grace_turn_granted
     ensures: conversation.grace_turn_granted = true
-    ensures: SystemMessageInjected(conversation,
-        "You have reached your turn limit. Please call submit_result now.")
+    ensures: MetaUserMessageInjected(conversation, content: GraceTurnTerminalGuidance(conversation.mode))
+    ensures: GraceTurnAllowsOnlyTerminalTools(conversation, allowed: {"submit_result", "submit_error"})
     ensures: LlmRequestDispatched(conversation)
 
     @guidance
         -- Grace turn is an executor-level concern: the executor injects a
-        -- system message and allows one more LLM request. Status stays at
-        -- llm_requesting (no transition). If the model doesn't call
-        -- submit_result, GraceTurnExhausted fires.
+        -- user-role meta message so the guidance is visible to the LLM, then
+        -- allows one more LLM request. Status stays at llm_requesting (no
+        -- transition). Explore guidance asks for findings via submit_result;
+        -- Work guidance permits submit_result only for completed work and routes
+        -- unfinished required edits through submit_error. If the model doesn't
+        -- call submit_result or submit_error, GraceTurnExhausted fires.
 }
 
 rule SubAgentTurnLimitHardStop {

@@ -512,8 +512,9 @@ AND report timeout failure to parent conversation
 
 WHEN sub-agent reaches its turn limit without submitting a result
 THE SYSTEM SHALL grant one final "grace turn" in which tool use is disabled
-  (the sub-agent gets exactly one more LLM response to submit a result via the result-submission tool; any other output is ignored)
-AND if the grace turn does not produce a submitted result, terminate the sub-agent
+AND SHALL inject a user-role meta message visible to the LLM with mode-specific terminal guidance
+AND SHALL permit only `submit_result` or `submit_error` terminal actions during that grace turn
+AND if the grace turn does not produce a submitted terminal action, terminate the sub-agent
 AND report turn-limit failure to parent conversation
 
 WHEN sub-agent timeout or turn limit fires

@@ -3,7 +3,7 @@
 ## V1 Design Boundary
 
 Wake contracts v1 is a terminal-handle wait plane, not a general actor plane. The
-only supported condition is `HandleTerminal` on bash, tmux pane/window, and
+only supported condition is `HandleTerminal` on bash, tmux `window_id`, and
 sub-agent handles. The parent conversation registers the wait, returns to Idle,
 and is woken by a synthetic tool result when the watched handle reaches a
 terminal, expired, cancelled, or forgotten outcome. V1 does not add
@@ -104,9 +104,9 @@ contract."
 
 ### HandleTerminal is the sole condition kind
 
-`HandleTerminal` on bash, tmux pane/window, and sub-agent handles is the only
+`HandleTerminal` on bash, tmux `window_id`, and sub-agent handles is the only
 condition kind whose evaluator is a pure read of existing state — process handle
-status, tmux pane/window process status, or child-conversation terminal status.
+status, tmux window process status, or child-conversation terminal status.
 Other candidate kinds — `RegexInTmuxPane` (regex match in pane capture),
 `FileChanged` (file mtime advance) — require new poller infrastructure (tmux
 capture-pane scheduling, a file-watcher) and are out of scope. General

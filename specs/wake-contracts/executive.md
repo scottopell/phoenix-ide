@@ -20,7 +20,7 @@ consumes zero turns in between.
 
 V1 supports one condition kind over three concrete handle kinds:
 `HandleTerminal { handle_kind, handle_id }` — fires when a named bash, tmux
-pane/window, or sub-agent handle reaches a terminal state. For sub-agents, the
+`window_id`, or sub-agent handle reaches a terminal state. For sub-agents, the
 terminal payload covers `submit_result`, `submit_error`, wall-clock timeout,
 cancellation, and turn-limit hard-stop fallback. Missing child handles resolve as
 `Forgotten`, not as fired child payloads. V1 does not define parent-to-child
@@ -51,7 +51,7 @@ evaluation; lifecycle endpoints already do at least one read).
 The synthetic tool result delivered on fire is byte-shape-identical to the tool
 result the equivalent synchronous wait would have returned when such a
 synchronous surface exists. Bash delivery mirrors `bash op=wait`; tmux delivery
-includes the watched pane/window terminal status and final captured tail; sub-agent
+includes the watched `window_id` terminal status and final captured tail; sub-agent
 delivery uses the structured terminal outcome described above. This makes wake a
 drop-in replacement for polling from the LLM's vantage point: same payload, same
 `tool_use_id` correlation, just zero intervening turns.

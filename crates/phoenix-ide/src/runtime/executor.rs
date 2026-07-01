@@ -3996,7 +3996,7 @@ where
 
         // Max turns enforcement (REQ-PROJ-008, REQ-BED-026): sub-agents have a
         // finite turn budget. Grace turn mechanism gives the model one extra LLM
-        // turn to call submit_result before hard-stopping.
+        // turn to call submit_result or submit_error before hard-stopping.
         if self.context.max_turns > 0 {
             self.llm_turn_count += 1;
             if self.llm_turn_count > self.context.max_turns {
@@ -4023,7 +4023,7 @@ where
                     "Sub-agent reached turn limit, granting grace turn"
                 );
 
-                // Inject a meta user message prompting submit_result.
+                // Inject a meta user message with mode-specific terminal guidance.
                 // Uses UserContent::meta() so it appears in the LLM context
                 // via the existing User message path (not System, which is
                 // UI-only bookkeeping and not sent to the LLM).
