@@ -532,8 +532,11 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     warnings.extend(collection.warnings);
     let unreviewed = collection.unreviewed;
     let has_unreviewed = !unreviewed.is_empty();
+    let has_parsed_output = !findings.is_empty() || !reviewer_summaries.is_empty();
+    let has_diff_coverage_gap =
+        diff_stage_status(&warnings, has_unreviewed) == StageStatus::Partial;
     let (status, findings_status, findings_trust, retry_recommendation) =
-        completed_result_contract(&warnings, !findings.is_empty(), has_unreviewed);
+        completed_result_contract(&warnings, has_parsed_output, has_diff_coverage_gap);
     let review_status = if warnings.is_empty() && !has_unreviewed {
         ReviewCompletionStatus::Completed
     } else {
@@ -682,8 +685,8 @@ fn interrupted_review_output(
 
 fn completed_result_contract(
     warnings: &[ReviewWarning],
-    has_findings: bool,
-    has_unreviewed: bool,
+    has_parsed_output: bool,
+    has_diff_coverage_gap: bool,
 ) -> (
     ReviewStatus,
     FindingsStatus,
@@ -691,7 +694,7 @@ fn completed_result_contract(
     RetryRecommendation,
 ) {
     if has_warning(warnings, "model_output_parse") {
-        if has_findings {
+        if has_parsed_output {
             (
                 ReviewStatus::Partial,
                 FindingsStatus::Partial,
@@ -706,17 +709,17 @@ fn completed_result_contract(
                 RetryRecommendation::Retry,
             )
         }
-    } else if has_unreviewed {
+    } else if has_diff_coverage_gap {
         (
             ReviewStatus::Partial,
-            FindingsStatus::Complete,
+            findings_status_for_completed(warnings),
             findings_trust_for_completed(warnings),
             RetryRecommendation::DoNotRetry,
         )
     } else {
         (
             ReviewStatus::Success,
-            FindingsStatus::Complete,
+            findings_status_for_completed(warnings),
             findings_trust_for_completed(warnings),
             RetryRecommendation::DoNotRetry,
         )
@@ -763,11 +766,11 @@ fn interrupted_contract(
             RetryRecommendation::Retry,
         ),
         (ReviewInterruption::Cancelled, true) => (
-            ReviewStatus::Partial,
+            ReviewStatus::Failed,
             ReviewCompletionStatus::Cancelled,
-            FindingsStatus::Partial,
-            FindingsTrust::Partial,
-            RetryRecommendation::ReviewFindingsFirst,
+            FindingsStatus::Unavailable,
+            FindingsTrust::Low,
+            RetryRecommendation::DoNotRetry,
         ),
         (ReviewInterruption::Cancelled, false) => (
             ReviewStatus::Failed,
@@ -853,9 +856,19 @@ fn summarize_warnings(warnings: &[ReviewWarning]) -> Vec<String> {
     summaries
 }
 
+fn findings_status_for_completed(warnings: &[ReviewWarning]) -> FindingsStatus {
+    if has_warning(warnings, "dropped_findings") {
+        FindingsStatus::Partial
+    } else {
+        FindingsStatus::Complete
+    }
+}
+
 fn findings_trust_for_completed(warnings: &[ReviewWarning]) -> FindingsTrust {
     if has_warning(warnings, "model_output_parse") {
         FindingsTrust::Low
+    } else if has_warning(warnings, "dropped_findings") {
+        FindingsTrust::Partial
     } else if has_warning(warnings, "model_output_repaired") {
         FindingsTrust::Repaired
     } else {
@@ -2055,6 +2068,70 @@ mod tests {
             finding_extraction_stage_status(&warnings),
             StageStatus::Failed
         );
+    }
+
+    #[test]
+    fn completed_parse_failure_with_parsed_summary_is_partial() {
+        let warnings = vec![warning(
+            "model_output_parse",
+            "later reviewer chunk returned non-JSON output",
+            None,
+        )];
+        let (status, findings_status, findings_trust, retry_recommendation) =
+            completed_result_contract(&warnings, true, false);
+
+        assert_eq!(status, ReviewStatus::Partial);
+        assert_eq!(findings_status, FindingsStatus::Partial);
+        assert_eq!(findings_trust, FindingsTrust::Low);
+        assert_eq!(
+            retry_recommendation,
+            RetryRecommendation::ReviewFindingsFirst
+        );
+    }
+
+    #[test]
+    fn coverage_warnings_make_completed_result_partial() {
+        let warnings = vec![warning(
+            "unsupported_file",
+            "unsupported file type skipped",
+            Some("image.png"),
+        )];
+        let has_diff_coverage_gap = diff_stage_status(&warnings, false) == StageStatus::Partial;
+        let (status, findings_status, findings_trust, retry_recommendation) =
+            completed_result_contract(&warnings, true, has_diff_coverage_gap);
+
+        assert_eq!(status, ReviewStatus::Partial);
+        assert_eq!(findings_status, FindingsStatus::Complete);
+        assert_eq!(findings_trust, FindingsTrust::Complete);
+        assert_eq!(retry_recommendation, RetryRecommendation::DoNotRetry);
+    }
+
+    #[test]
+    fn dropped_findings_make_completed_findings_partial() {
+        let warnings = vec![warning(
+            "dropped_findings",
+            "dropped 1 reviewer finding(s) without a file",
+            None,
+        )];
+        let (status, findings_status, findings_trust, retry_recommendation) =
+            completed_result_contract(&warnings, true, false);
+
+        assert_eq!(status, ReviewStatus::Success);
+        assert_eq!(findings_status, FindingsStatus::Partial);
+        assert_eq!(findings_trust, FindingsTrust::Partial);
+        assert_eq!(retry_recommendation, RetryRecommendation::DoNotRetry);
+    }
+
+    #[test]
+    fn cancellation_after_output_is_not_a_deliverable_partial_result() {
+        let (status, review_status, findings_status, findings_trust, retry_recommendation) =
+            interrupted_contract(ReviewInterruption::Cancelled, true);
+
+        assert_eq!(status, ReviewStatus::Failed);
+        assert_eq!(review_status, ReviewCompletionStatus::Cancelled);
+        assert_eq!(findings_status, FindingsStatus::Unavailable);
+        assert_eq!(findings_trust, FindingsTrust::Low);
+        assert_eq!(retry_recommendation, RetryRecommendation::DoNotRetry);
     }
 
     #[test]

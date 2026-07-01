@@ -100,9 +100,10 @@ see whether the review covered every change.
 
 The tool result separates top-level actionability from stage-level execution
 state. Top-level `status: failed` is reserved for results with no actionable
-review output. If an LLM timeout, transport failure, or cancellation happens
-after Phoenix has parsed a finding or reviewer summary, the result is `partial`
-and preserves that output.
+review output. If an LLM timeout or transport failure happens after Phoenix has
+parsed a finding or reviewer summary, the result is `partial` and preserves that
+output. Conversation cancellation is handled by the runtime abort path, which
+discards returned tool output after the shared cancellation token is set.
 
 `review_status`, `findings_status`, `findings_trust`, and `stage_status` are
 typed enums rather than free-form strings. `stage_status` records target

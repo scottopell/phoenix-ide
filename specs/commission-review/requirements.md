@@ -175,14 +175,18 @@ review can never be mistaken for a clean one.
 
 ### REQ-CR-011: Distinguish Partial Review Output From Failure
 
-WHEN review execution is interrupted by model timeout, model transport failure, or
-cancellation after Phoenix has parsed at least one finding or reviewer summary
+WHEN review execution is interrupted by model timeout or model transport failure
+after Phoenix has parsed at least one finding or reviewer summary
 THE SYSTEM SHALL return a partial review result that preserves the parsed output
 AND SHALL NOT report the top-level status as failed
 
-WHEN the same interruption occurs before any finding or reviewer summary has been
-parsed
+WHEN the same model interruption occurs before any finding or reviewer summary
+has been parsed
 THE SYSTEM SHALL return a failed review result with unavailable findings
+
+WHEN the conversation is cancelled
+THE SYSTEM SHALL rely on the runtime cancellation path rather than promising a
+deliverable partial review result
 
 **Rationale:** Failed means no actionable review output is available. Returning
 populated findings with a failed top-level status makes callers choose between
