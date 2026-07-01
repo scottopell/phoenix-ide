@@ -654,12 +654,12 @@ fn interrupted_review_output(
                 ReviewInterruption::Failed => StageStatus::Failed,
                 ReviewInterruption::Cancelled => StageStatus::Cancelled,
             },
-            json_parse: json_parse_stage_status(&interrupted.warnings),
-            finding_extraction: if interrupted.findings.is_empty() {
-                StageStatus::Failed
-            } else {
-                StageStatus::Partial
-            },
+            json_parse: interrupted_json_parse_stage_status(&interrupted.warnings, has_output),
+            finding_extraction: interrupted_finding_extraction_stage_status(
+                &interrupted.warnings,
+                has_output,
+                !interrupted.findings.is_empty(),
+            ),
         },
         retry_recommendation,
         summary: ReviewSummary {
@@ -846,6 +846,7 @@ fn summarize_warnings(warnings: &[ReviewWarning]) -> Vec<String> {
             "file_too_large" => "some file diffs exceeded review limits".to_string(),
             "unsupported_file" => "some changed files were not reviewable".to_string(),
             "diff_capture_failed" => "some file diffs could not be captured".to_string(),
+            "untracked_file" => "some untracked files were not reviewed".to_string(),
             "dropped_findings" => warning.message.clone(),
             _ => continue,
         };
@@ -881,7 +882,11 @@ fn diff_stage_status(warnings: &[ReviewWarning], has_unreviewed: bool) -> StageS
         || warnings.iter().any(|w| {
             matches!(
                 w.kind.as_str(),
-                "review_truncated" | "file_too_large" | "unsupported_file" | "diff_capture_failed"
+                "review_truncated"
+                    | "file_too_large"
+                    | "unsupported_file"
+                    | "diff_capture_failed"
+                    | "untracked_file"
             )
         })
     {
@@ -906,6 +911,33 @@ fn finding_extraction_stage_status(warnings: &[ReviewWarning]) -> StageStatus {
         StageStatus::Partial
     } else if has_warning(warnings, "model_output_parse") {
         StageStatus::Failed
+    } else {
+        StageStatus::Ok
+    }
+}
+
+fn interrupted_json_parse_stage_status(
+    warnings: &[ReviewWarning],
+    has_output: bool,
+) -> StageStatus {
+    if !has_output && !has_warning(warnings, "model_output_parse") {
+        StageStatus::Skipped
+    } else {
+        json_parse_stage_status(warnings)
+    }
+}
+
+fn interrupted_finding_extraction_stage_status(
+    warnings: &[ReviewWarning],
+    has_output: bool,
+    has_findings: bool,
+) -> StageStatus {
+    if !has_output && !has_warning(warnings, "model_output_parse") {
+        StageStatus::Skipped
+    } else if has_warning(warnings, "model_output_parse") {
+        StageStatus::Failed
+    } else if has_warning(warnings, "dropped_findings") || has_findings {
+        StageStatus::Partial
     } else {
         StageStatus::Ok
     }
@@ -2047,6 +2079,8 @@ mod tests {
             output.review_status,
             ReviewCompletionStatus::ModelTimeoutNoFindings
         );
+        assert_eq!(output.stage_status.json_parse, StageStatus::Failed);
+        assert_eq!(output.stage_status.finding_extraction, StageStatus::Failed);
     }
 
     #[test]
@@ -2183,6 +2217,44 @@ mod tests {
     }
 
     #[test]
+    fn untracked_files_mark_diff_stage_partial_and_are_summarized() {
+        let warnings = vec![warning(
+            "untracked_file",
+            "untracked file not included in git diff",
+            Some("new.rs"),
+        )];
+        assert_eq!(diff_stage_status(&warnings, false), StageStatus::Partial);
+        assert!(summarize_warnings(&warnings)
+            .contains(&"some untracked files were not reviewed".to_string()));
+    }
+
+    #[test]
+    fn summary_only_interruption_does_not_fail_finding_extraction() {
+        let output = interrupted_review_output(
+            Instant::now(),
+            sample_target(),
+            &sample_collection(),
+            InterruptedReview {
+                findings: Vec::new(),
+                warnings: Vec::new(),
+                reviewer_summaries: vec!["No issues found in reviewed chunks.".to_string()],
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reason: "request timed out".to_string(),
+                interruption: ReviewInterruption::Timeout,
+            },
+        );
+
+        assert_eq!(output.status, ReviewStatus::Partial);
+        assert_eq!(
+            output.review_status,
+            ReviewCompletionStatus::ModelTimeoutAfterFindings
+        );
+        assert_eq!(output.stage_status.llm_review, StageStatus::Timeout);
+        assert_eq!(output.stage_status.json_parse, StageStatus::Ok);
+        assert_eq!(output.stage_status.finding_extraction, StageStatus::Ok);
+    }
+
+    #[test]
     fn diff_capture_failures_are_summarized_near_status() {
         let summaries = summarize_warnings(&[warning(
             "diff_capture_failed",
@@ -2216,6 +2288,8 @@ mod tests {
         assert_eq!(output.findings_status, FindingsStatus::Unavailable);
         assert_eq!(output.findings_trust, FindingsTrust::Low);
         assert_eq!(output.stage_status.llm_review, StageStatus::Timeout);
+        assert_eq!(output.stage_status.json_parse, StageStatus::Skipped);
+        assert_eq!(output.stage_status.finding_extraction, StageStatus::Skipped);
         assert!(output.findings.is_empty());
         assert!(output
             .warnings_summary

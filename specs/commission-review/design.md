@@ -120,16 +120,16 @@ result and display payload.
 
 ```mermaid
 flowchart TD
-  A[LLM chunk completes] --> B[parse JSON]
-  B --> C[normalize and dedupe findings]
-  C --> D[compute finding summary]
-  D --> E[success or completed_with_warnings]
+  A["LLM chunk completes"] --> B["parse JSON"]
+  B --> C["normalize and dedupe findings"]
+  C --> D["compute finding summary"]
+  D --> E["status success, review_status completed or completed_with_warnings"]
 
-  F[LLM interruption] --> G{parsed output exists?}
-  G -->|yes| H[partial result]
-  G -->|no| I[failed result]
-  H --> J[findings_status partial]
-  I --> K[findings_status unavailable]
+  F["LLM interruption"] --> G{"parsed output exists?"}
+  G -->|yes| H["status partial"]
+  G -->|no| I["status failed"]
+  H --> J["findings_status partial"]
+  I --> K["findings_status unavailable"]
 ```
 
 ## REQ-CR-014: User-facing cost metadata boundary
