@@ -552,10 +552,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize logging from the configured sinks (PHOENIX_LOG_STDOUT /
-    // PHOENIX_LOG_FILE). The guard must outlive the program so the file
-    // appender's worker flushes on shutdown; held until `main` returns.
+    // PHOENIX_LOG_FILE) and the Datadog tracer provider (DD_* env vars). The
+    // handles must outlive the program so the file appender worker and the
+    // tracer provider flush on shutdown; held until `main` returns.
     let log_config = logging::LogConfig::from_env();
-    let _log_guard = logging::init(&log_config)?;
+    let tracing_handles = logging::init(&log_config)?;
 
     // Install a rustls crypto provider explicitly. rustls 0.23 refuses
     // to auto-pick when both `ring` and `aws-lc-rs` end up in the dep
@@ -1012,6 +1013,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    // Flush in-flight Datadog spans to the agent before we kill child
+    // processes and exit. Bounded by a 1s timeout inside shutdown_tracer.
+    tracing_handles.shutdown_tracer();
 
     // REQ-BASH-007: after the server stops accepting requests, walk the
     // live bash handle table and SIGKILL every process group as a final

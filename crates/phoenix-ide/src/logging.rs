@@ -12,7 +12,10 @@
 //! subscriber writes and what `GET /api/deployment` reports (via
 //! [`LogConfig::to_log_info`]) — the report cannot drift from the wiring.
 
+use opentelemetry::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -24,6 +27,31 @@ pub struct LogConfig {
     pub stdout: bool,
     /// Path of the process-owned log file, when file logging is enabled.
     pub file: Option<PathBuf>,
+}
+
+/// Handles that must outlive the process so background workers flush on shutdown.
+///
+/// - `_log_guard` — the non-blocking file appender worker (when file logging is on).
+/// - `tracer_provider` — the Datadog `OTel` tracer provider, held so spans flush
+///   to the agent before exit. Call [`TracingHandles::shutdown_tracer`] during
+///   graceful shutdown.
+pub struct TracingHandles {
+    _log_guard: Option<WorkerGuard>,
+    tracer_provider: SdkTracerProvider,
+}
+
+impl TracingHandles {
+    /// Flush in-flight spans to the Datadog agent. Bounded by a 1s timeout so a
+    /// stuck agent cannot delay shutdown indefinitely. Logs a warning on error
+    /// but never fails shutdown.
+    pub fn shutdown_tracer(&self) {
+        if let Err(e) = self
+            .tracer_provider
+            .shutdown_with_timeout(Duration::from_secs(1))
+        {
+            tracing::warn!(error = ?e, "tracer shutdown error");
+        }
+    }
 }
 
 impl LogConfig {
@@ -52,18 +80,26 @@ impl LogConfig {
 
 /// Build and install the global tracing subscriber for the configured sinks.
 ///
-/// Returns the [`WorkerGuard`] for the file appender (when file logging is
-/// enabled); the caller MUST hold it for the process lifetime so buffered log
-/// lines are flushed on shutdown. Returns `Ok(None)` when no file sink is
-/// active.
+/// Returns [`TracingHandles`] which the caller MUST hold for the process
+/// lifetime so the file appender worker and the Datadog tracer provider flush
+/// on shutdown. Call [`TracingHandles::shutdown_tracer`] during graceful
+/// shutdown to flush in-flight spans.
 ///
 /// Fails (aborting startup) when `PHOENIX_LOG_FILE` is set but cannot be
 /// opened. Honoring the configured sinks exactly — or refusing to start — is
 /// what lets the deployment report derive its file path from [`LogConfig`]
 /// without ever advertising a sink the subscriber isn't writing (REQ-DEPLOY-006).
-pub fn init(config: &LogConfig) -> std::io::Result<Option<WorkerGuard>> {
+pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "phoenix_ide=debug,tower_http=debug".into());
+
+    // Initialize the Datadog tracer provider. This reads DD_* env vars
+    // (DD_SERVICE, DD_ENV, DD_AGENT_URL, DD_TRACE_ENABLED, …) and sets the
+    // global tracer provider + text-map propagator. On failure it falls back
+    // to a no-op provider, so tracing is always available.
+    let tracer_provider = datadog_opentelemetry::tracing().init();
+    let otel_layer =
+        tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("phoenix-ide"));
 
     let stdout_layer = config.stdout.then(|| {
         fmt::layer()
@@ -93,12 +129,16 @@ pub fn init(config: &LogConfig) -> std::io::Result<Option<WorkerGuard>> {
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(otel_layer)
         .with(stdout_layer)
         .with(file_layer)
         .init();
 
     install_panic_hook();
-    Ok(guard)
+    Ok(TracingHandles {
+        _log_guard: guard,
+        tracer_provider,
+    })
 }
 
 /// Whether the stdout sink is enabled. Defaults on (unset); only explicit
