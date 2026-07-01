@@ -1,16 +1,6 @@
 ---
 name: spears
-description: >-
-  spEARS (Simple Project with EARS) is a requirements-first specification
-  methodology for AI agents and humans. It pairs timeless EARS requirements
-  (requirements.md) with point-in-time design decision records (ADRs), an
-  on-demand precise behavioral layer (Allium), and a status doc (executive.md),
-  giving a clear shared understanding of how a system should work with grep-able
-  traceability from requirement to test to code. Use this skill whenever the user
-  mentions spEARS or EARS specs; works with a specs/ directory or files named
-  requirements.md, executive.md, or adrs/; asks to write, plan, or validate
-  requirements; wants to capture an architecture or design decision; or asks how
-  requirements trace to tests and code — even if they don't say "spEARS" explicitly.
+description: spEARS (Simple Project with EARS) is a requirements-first specification methodology for AI agents and humans, pairing timeless EARS requirements, point-in-time ADRs, optional Allium behavior specs, and executive status docs with grep-able traceability.
 auto_trigger:
   - file_patterns: ["**/requirements.md", "**/executive.md", "**/adrs/*.md"]
   - keywords: ["spEARS", "spears spec", "EARS requirement", "requirements.md", "ADR", "design decision record"]

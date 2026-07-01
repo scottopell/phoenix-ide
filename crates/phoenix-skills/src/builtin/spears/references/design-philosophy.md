@@ -93,9 +93,10 @@ describes current behavior — states, transitions, preconditions, invariants �
 a formal language with a checker.
 It earns its keep in three ways prose never could:
 
-- It is *verifiable*. The Allium checker and the `weed` divergence check mean a
-  `.allium` file cannot silently drift from the code the way prose does — drift
-  becomes a reported error, not an invisible lie.
+- It is *verifiable*. Allium syntax checks, generated tests, and available
+  spec↔code drift checks mean a `.allium` file is less likely to silently drift
+  from the code the way prose does — drift becomes something tooling can report,
+  not an invisible lie.
 - It is *dense*. A formal spec for a real feature fits comfortably in an agent’s
   context window, where the equivalent careful prose would not.
 - It is *only useful as an attempt at the current design*. There is no

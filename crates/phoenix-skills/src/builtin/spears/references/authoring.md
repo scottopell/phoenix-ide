@@ -185,8 +185,9 @@ What remains is small and mechanical:
 2. Implement, with `// REQ-XX-###` comments linking code back to the
    requirement. Build only what the requirement specifies — code with no `REQ-ID`
    behind it is the definition of over-engineering here.
-3. When tests pass (and, for a feature carrying a `.allium`, `weed` reports no
-   divergence), flip `🔄 → ✅` and note the verification method.
+3. When tests pass (and, for a feature carrying a `.allium`, available Allium
+   drift-check tooling reports no divergence), flip `🔄 → ✅` and note the
+   verification method.
 
 Status only ever moves in `executive.md`. The requirement text, the ADRs, and
 the Allium spec do not record progress.

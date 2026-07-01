@@ -3,8 +3,8 @@
 This guide is for checking a spEARS spec before it merges — catching the drift
 and shape failures that otherwise cost rounds of review.
 It validates the markdown layer (`requirements.md`, `executive.md`, `adrs/`);
-for a feature carrying a `.allium`, the behavioral checks (`allium check`,
-`weed`) are allium’s job and run only when allium is present.
+for a feature carrying a `.allium`, use the project’s available Allium tooling
+for syntax validation, generated-test coverage, and spec↔code drift checks.
 
 **This is a tool, not a process.** Skip the checks that do not apply to your
 change, but skip them deliberately.
@@ -86,11 +86,12 @@ No status or implementation detail in `requirements.md`; no code blocks in
 
 ### 6. The Allium layer — only when a `.allium` is present
 
-If, and only if, the feature carries a `.allium`, run allium’s own checks via
-the allium skill: `allium check` reports zero errors, `weed` reports no
-spec↔code divergence, and no Allium `open question` declarations remain
-unresolved. spEARS does not reimplement these — they are the behavioral layer’s
-contract, and they simply do not apply to a spec that has no `.allium`.
+If, and only if, the feature carries a `.allium`, run the Allium checks that are
+available in the project: syntax validation reports zero errors, generated-test
+coverage is up to date when propagation is used, and no Allium `open question`
+declarations remain unresolved. spEARS does not reimplement these — they are the
+behavioral layer’s contract, and they simply do not apply to a spec that has no
+`.allium`.
 
 ## Write check scripts to fail loudly
 

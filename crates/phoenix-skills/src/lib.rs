@@ -1104,6 +1104,18 @@ mod tests {
         assert_eq!(names, vec!["allium", "spears"]);
     }
 
+    #[test]
+    fn test_builtin_spears_description_is_parseable() {
+        let temp = TempDir::new().unwrap();
+        let extract_dir = temp.path().join("builtin-skills");
+        builtin::extract_to(&extract_dir).unwrap();
+        let skills =
+            discover_skills_with_options(temp.path(), Some(temp.path()), Some(&extract_dir));
+        let spears = skills.iter().find(|s| s.name == "spears").unwrap();
+        assert_ne!(spears.description, ">-");
+        assert!(spears.description.contains("spEARS"));
+    }
+
     // -------------------------------------------------------------------------
     // invoke_skill (integration with temp dir)
     // -------------------------------------------------------------------------

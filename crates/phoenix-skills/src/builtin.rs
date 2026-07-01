@@ -69,8 +69,8 @@ pub fn skill_names() -> Vec<String> {
 }
 
 /// Extract every embedded built-in file to `target_dir/<skill>/<...>`.
-/// Overwrites existing files and prunes files that used to belong to a built-in
-/// skill but are no longer embedded in the binary.
+/// Overwrites existing files and prunes stale files from currently bundled skill
+/// directories when those files are no longer embedded in the binary.
 ///
 /// # Errors
 ///
@@ -91,8 +91,7 @@ pub fn extract_to(target_dir: &Path) -> std::io::Result<()> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Skip the write if content already matches — avoids touching mtimes
-        // unnecessarily on every server restart.
+        ensure_regular_file_destination(&dest)?;
         let needs_write = match std::fs::read(&dest) {
             Ok(existing) => existing != asset.data.as_ref(),
             Err(_) => true,
@@ -100,6 +99,24 @@ pub fn extract_to(target_dir: &Path) -> std::io::Result<()> {
         if needs_write {
             std::fs::write(&dest, asset.data.as_ref())?;
         }
+    }
+    Ok(())
+}
+
+fn ensure_regular_file_destination(dest: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                std::fs::remove_file(dest)?;
+            } else if metadata.is_dir() {
+                std::fs::remove_dir_all(dest)?;
+            } else if !metadata.is_file() {
+                std::fs::remove_file(dest)?;
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     Ok(())
 }
@@ -130,7 +147,7 @@ fn prune_dir(dir: &Path, rel_dir: &Path, expected: &BTreeSet<PathBuf>) -> io::Re
             if prune_dir(&path, &rel, expected)? {
                 std::fs::remove_dir(&path)?;
             }
-        } else if file_type.is_file() && !expected.contains(&rel) {
+        } else if !expected.contains(&rel) {
             std::fs::remove_file(&path)?;
         }
     }
@@ -234,5 +251,52 @@ mod tests {
             "removed built-in companion should be pruned"
         );
         assert!(tmp.path().join("spears/references/discovery.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_prunes_stale_symlink_companion() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let stale = tmp.path().join("spears/references/discover.md");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        symlink(tmp.path().join("outside.md"), &stale).unwrap();
+
+        extract_to(tmp.path()).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&stale).is_err(),
+            "stale symlink companion should be pruned"
+        );
+        assert!(tmp.path().join("spears/references/discovery.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_replaces_embedded_file_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside.md");
+        let dest = tmp.path().join("spears/SKILL.md");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&outside, "do not overwrite").unwrap();
+        symlink(&outside, &dest).unwrap();
+
+        extract_to(tmp.path()).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&dest).unwrap();
+        assert!(
+            metadata.is_file(),
+            "embedded asset destination should be a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "do not overwrite"
+        );
+        assert!(std::fs::read_to_string(&dest)
+            .unwrap()
+            .contains("name: spears"));
     }
 }

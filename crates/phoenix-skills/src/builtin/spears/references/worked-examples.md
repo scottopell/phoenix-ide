@@ -146,9 +146,9 @@ Code carries the suture; tests verify; the behavioral layer is checked:
 pub fn approve(task: &mut Task) -> Result<()> { … }
 ```
 
-`weed` confirms the `.allium` matches the code; [validation.md](validation.md)
-confirms the markdown layer (EARS intact, ADR-004 present, no contradictions,
-status accurate).
+Available Allium drift-check tooling confirms the `.allium` matches the code;
+[validation.md](validation.md) confirms the markdown layer (EARS intact,
+ADR-004 present, no contradictions, status accurate).
 Then `executive.md` flips `REQ-TA-001` and `REQ-TA-002` to `✅`.
 
 * * *
@@ -174,7 +174,7 @@ that silently drops rows or omits headers quietly corrupts their analysis.
 
 You implement directly against `REQ-EX-001` (with `// REQ-EX-001` comments),
 write tests from the two EARS clauses, and track status in `executive.md`. There
-is no `.allium`, no `weed`, no behavioral layer — and nothing is missing.
+is no `.allium`, no formal behavioral layer — and nothing is missing.
 If a real decision arises (say, which delimiter to use for locales that reserve
 the comma), it earns an ADR; otherwise the markdown layer is the whole spec.
 
