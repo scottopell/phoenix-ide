@@ -405,46 +405,48 @@ pub fn create_router(state: AppState) -> Router {
         // HTTP access log + Datadog tracing: applied via `route_layer` so it
         // runs AFTER routing, making axum's `MatchedPath` (the route template,
         // e.g. `/api/conversations/:id/stream`) available in `make_span_with`.
+        //
         // The `otel.kind = "server"` field is read by the tracing-opentelemetry
         // bridge to set SpanKind::Server, which the datadog-opentelemetry
         // exporter maps to type=web. The `http.request.method` and `http.route`
         // fields are mapped to OTel HTTP semantic conventions, which the
         // exporter uses to set the operation name to "http.server.request" and
         // the resource to "METHOD /template". The `http.response.status_code`
-        // is recorded on the span in on_response so it appears as
-        // meta.http.status_code.
+        // field is declared as Empty in the span and recorded in on_response so
+        // it appears as meta.http.status_code.
         //
-        // Health check endpoint (/version) is suppressed from normal INFO logging.
+        // The raw `path` field is intentionally omitted from the span to avoid
+        // exporting sensitive URL segments (share tokens, file paths) to
+        // Datadog. The `http.route` template is sufficient for endpoint
+        // grouping; the `method` field is retained for local log output.
+        //
+        // Health check endpoint (/version) uses Span::none() to suppress it
+        // from both logging and OTel export entirely.
         .route_layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::http::Request<_>| {
                     let path = request.uri().path();
-                    // MatchedPath is the route template (e.g.
-                    // /api/conversations/:id/stream), available because
-                    // route_layer runs after routing. Fall back to the raw
-                    // path if MatchedPath is not in extensions (e.g. fallback
-                    // routes).
-                    let route = request
-                        .extensions()
-                        .get::<MatchedPath>()
-                        .map_or_else(|| path.to_string(), |m| m.as_str().to_string());
                     if path == "/version" {
-                        tracing::debug_span!(
-                            "http",
-                            otel.kind = "server",
-                            method = %request.method(),
-                            path = %path,
-                            "http.request.method" = %request.method(),
-                            "http.route" = %route,
-                        )
+                        // Suppress health-check spans entirely — no log output,
+                        // no OTel export.
+                        tracing::Span::none()
                     } else {
+                        // MatchedPath is the route template (e.g.
+                        // /api/conversations/:id/stream), available because
+                        // route_layer runs after routing. Fall back to the raw
+                        // path if MatchedPath is not in extensions (e.g.
+                        // fallback routes).
+                        let route = request
+                            .extensions()
+                            .get::<MatchedPath>()
+                            .map_or_else(|| path.to_string(), |m| m.as_str().to_string());
                         tracing::info_span!(
                             "http",
                             otel.kind = "server",
                             method = %request.method(),
-                            path = %path,
                             "http.request.method" = %request.method(),
                             "http.route" = %route,
+                            "http.response.status_code" = tracing::field::Empty,
                         )
                     }
                 })
@@ -454,7 +456,8 @@ pub fn create_router(state: AppState) -> Router {
                      span: &tracing::Span| {
                         // Record status code as a span attribute (not just an
                         // event) so the Datadog exporter maps it to
-                        // meta.http.status_code.
+                        // meta.http.status_code. The field was declared as
+                        // Empty in make_span_with, so record() updates it.
                         span.record("http.response.status_code", response.status().as_u16());
                         tracing::info!(
                             parent: span,

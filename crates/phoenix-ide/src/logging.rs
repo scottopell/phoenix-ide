@@ -37,19 +37,18 @@ pub struct LogConfig {
 ///   graceful shutdown.
 pub struct TracingHandles {
     _log_guard: Option<WorkerGuard>,
-    tracer_provider: SdkTracerProvider,
+    tracer_provider: Option<SdkTracerProvider>,
 }
 
 impl TracingHandles {
     /// Flush in-flight spans to the Datadog agent. Bounded by a 1s timeout so a
     /// stuck agent cannot delay shutdown indefinitely. Logs a warning on error
-    /// but never fails shutdown.
+    /// but never fails shutdown. No-op when tracing was not opted in.
     pub fn shutdown_tracer(&self) {
-        if let Err(e) = self
-            .tracer_provider
-            .shutdown_with_timeout(Duration::from_secs(1))
-        {
-            tracing::warn!(error = ?e, "tracer shutdown error");
+        if let Some(provider) = &self.tracer_provider {
+            if let Err(e) = provider.shutdown_with_timeout(Duration::from_secs(1)) {
+                tracing::warn!(error = ?e, "tracer shutdown error");
+            }
         }
     }
 }
@@ -90,26 +89,44 @@ impl LogConfig {
 /// what lets the deployment report derive its file path from [`LogConfig`]
 /// without ever advertising a sink the subscriber isn't writing (REQ-DEPLOY-006).
 pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
-    // Initialize the Datadog tracer provider. This reads DD_* env vars
-    // (DD_SERVICE, DD_ENV, DD_TRACE_AGENT_URL, DD_TRACE_ENABLED, …) and sets
-    // the global tracer provider + text-map propagator. On failure it falls
-    // back to a no-op provider, so tracing is always available.
-    //
-    // Fall back to "phoenix-ide" as the service name when DD_SERVICE is not
-    // set, so traces land under the expected service without requiring every
-    // deployment to set the env var.
-    let mut dd_config_builder = datadog_opentelemetry::configuration::Config::builder();
-    if std::env::var("DD_SERVICE").is_err() {
-        dd_config_builder.set_service("phoenix-ide".to_string());
-    }
-    let tracer_provider = datadog_opentelemetry::tracing()
-        .with_config(dd_config_builder.build())
-        .init();
+    // Only initialize the Datadog OTel layer when tracing is explicitly
+    // opted in. This prevents dev/self-hosted installs without a Datadog
+    // agent from creating an exporter that spams localhost:8126 with trace
+    // and telemetry traffic. Opt-in requires any of:
+    //   - DD_TRACE_ENABLED=true (explicit)
+    //   - DD_TRACE_AGENT_URL is set
+    //   - DD_AGENT_HOST is set
+    //   - DD_TRACE_AGENT_HOST is set
+    let dd_tracing_requested = std::env::var("DD_TRACE_ENABLED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+        || std::env::var("DD_TRACE_AGENT_URL").is_ok()
+        || std::env::var("DD_AGENT_HOST").is_ok()
+        || std::env::var("DD_TRACE_AGENT_HOST").is_ok();
+
+    let tracer_provider = if dd_tracing_requested {
+        // Fall back to "phoenix-ide" as the service name when DD_SERVICE is
+        // not set, so traces land under the expected service without
+        // requiring every deployment to set the env var.
+        let mut dd_config_builder = datadog_opentelemetry::configuration::Config::builder();
+        if std::env::var("DD_SERVICE").is_err() {
+            dd_config_builder.set_service("phoenix-ide".to_string());
+        }
+        Some(
+            datadog_opentelemetry::tracing()
+                .with_config(dd_config_builder.build())
+                .init(),
+        )
+    } else {
+        None
+    };
+
     // The OTel layer is intentionally unfiltered: it must always process
     // spans for export regardless of RUST_LOG/EnvFilter, so that quiet logging
     // configurations (e.g. RUST_LOG=warn) do not silently disable tracing.
-    let otel_layer =
-        tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("phoenix-ide"));
+    let otel_layer = tracer_provider
+        .as_ref()
+        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("phoenix-ide")));
 
     // EnvFilter is applied per-layer to the stdout/file sinks only, not to the
     // OTel layer. EnvFilter does not implement Clone, so we create a fresh
