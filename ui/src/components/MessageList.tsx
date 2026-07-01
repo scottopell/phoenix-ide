@@ -313,6 +313,11 @@ function MessageListImpl({
   // to detect "user was pinned to the previous bottom" — see the
   // handleTotalListHeightChanged comment.
   const prevTotalHeightRef = useRef(0);
+  // Previous viewport (scroller) clientHeight. Used to detect viewport
+  // shrinks (resize, panel expansion, composer growth) so a pinned user
+  // stays pinned — see the viewport-shrink handling in
+  // handleTotalListHeightChanged.
+  const prevClientHeightRef = useRef(0);
 
   // The streaming buffer's `requestId` IS the eventual agent message_id
   // (server uses the same uuid for both — see `AssistantMessage::new` in
@@ -488,6 +493,17 @@ function MessageListImpl({
   //     (token growth doesn't change the array).
   //   - past PIN threshold AND height shrank → unrelated render churn
   //     (e.g. an item collapsed); leave alone.
+  //
+  // Two additional cases that the old `followOutput="auto"` handled and
+  // this callback must replicate:
+  //   - First non-empty update: when Virtuoso mounts with empty data and
+  //     messages arrive later, `initialTopMostItemIndex` only controlled
+  //     the mount position. The first non-empty height measurement needs
+  //     an explicit bottom snap (prevHeight === 0 → scroll to LAST).
+  //   - Viewport shrink: when clientHeight decreases (resize, panel
+  //     expansion, composer growth), `oldFromBottom` is computed using
+  //     the previous (larger) clientHeight so a pinned user stays pinned
+  //     instead of being misclassified as scrolled-up.
   const handleTotalListHeightChanged = useCallback((newHeight: number) => {
     // Detect conversation switch synchronously. virtuoso re-keys to the
     // new conversation on `key={conversationId}` change and emits its
@@ -499,20 +515,44 @@ function MessageListImpl({
     if (lastSeenConvIdRef.current !== conversationId) {
       lastSeenConvIdRef.current = conversationId;
       prevTotalHeightRef.current = newHeight;
+      prevClientHeightRef.current = 0;
       return;
     }
     const prevHeight = prevTotalHeightRef.current;
     prevTotalHeightRef.current = newHeight;
     if (allUnitsLengthRef.current === 0) return;
-    // First non-empty render: initialTopMostItemIndex handles placement.
-    if (prevHeight === 0) return;
     const s = scrollerRef.current;
     if (!s) return;
+    // First non-empty height measurement: initialTopMostItemIndex only
+    // controls the MOUNT position. If Virtuoso mounted with empty data
+    // (fresh conversation, or cached metadata before messages arrive),
+    // the first real content needs an explicit bottom snap — otherwise a
+    // tall first batch renders at the top instead of showing the newest.
+    if (prevHeight === 0) {
+      prevClientHeightRef.current = s.clientHeight;
+      virtuosoRef.current?.scrollToIndex({
+        index: 'LAST',
+        align: 'end',
+        behavior: 'auto',
+      });
+      return;
+    }
     // virtuoso calls this synchronously when its internal height model
     // recomputes, before any compensatory scrollTop adjustment for the
     // new content — so scrollTop here still reflects the user's
     // pre-growth scroll position.
-    const oldFromBottom = prevHeight - s.scrollTop - s.clientHeight;
+    //
+    // Viewport shrink handling: when the scroller's clientHeight decreases
+    // (browser resize, terminal/panel expansion, composer growth), the
+    // oldFromBottom calculation would use the new (smaller) clientHeight,
+    // making a pinned user look like they scrolled up. Use the previous
+    // clientHeight to check if the user was pinned BEFORE the shrink.
+    const clientHeightForPinCheck =
+      s.clientHeight < prevClientHeightRef.current
+        ? prevClientHeightRef.current
+        : s.clientHeight;
+    const oldFromBottom = prevHeight - s.scrollTop - clientHeightForPinCheck;
+    prevClientHeightRef.current = s.clientHeight;
     if (oldFromBottom <= PIN_TO_BOTTOM_THRESHOLD) {
       virtuosoRef.current?.scrollToIndex({
         index: 'LAST',

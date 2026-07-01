@@ -368,6 +368,21 @@ callback uses the pre-growth scroll position to distinguish "user was
 near the bottom" from "user scrolled up," which is correct during
 streaming where Virtuoso's built-in handler is not.
 
+WHEN the Virtuoso instance mounts with empty data and the first
+messages arrive later (fresh conversation, or cached metadata before
+messages load)
+THE SYSTEM SHALL explicitly scroll to the bottom on the first
+non-empty height measurement, because `initialTopMostItemIndex` only
+controls the mount position and does not re-apply when data arrives
+after mount.
+
+WHEN the viewport height decreases (browser resize, terminal/panel
+expansion, composer growth) and the user was pinned to the bottom
+before the shrink
+THE SYSTEM SHALL re-snap to the bottom using the previous (pre-shrink)
+viewport height for the pin-distance calculation, so a pinned user is
+not misclassified as scrolled-up by the smaller viewport.
+
 **Rationale:** Force-scroll-on-system-message (the prior implementation
 of this requirement) was an over-broad trigger that yanked the viewport
 on routine system messages (mode transitions, cancellations) as well as
