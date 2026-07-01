@@ -541,14 +541,22 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   // Auto-refresh every ~10s while page is visible. Only `setItems` if the
   // fingerprint changes — otherwise a tree of unchanged files would re-render
   // the entire subtree every 10 seconds for no reason.
+  //
+  // The `cancelled` flag prevents a timer leak: without it, an async callback
+  // that is mid-execution when the cleanup runs would call `scheduleRefresh()`
+  // and create a new timer that the cleanup can't cancel — an infinite chain
+  // of leaked timers that survive unmount and eventually exhaust the heap.
   useEffect(() => {
+    let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     function scheduleRefresh() {
       const jitter = Math.random() * 4000 - 2000; // +/- 2s
       timer = setTimeout(async () => {
+        if (cancelled) return;
         if (document.visibilityState === 'visible') {
           try {
             const result = await listFiles(rootPath);
+            if (cancelled) return;
             setItems(prev => {
               if (fingerprintFiles(prev) === fingerprintFiles(result)) {
                 return prev; // unchanged — skip re-render
@@ -557,11 +565,15 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
             });
           } catch { /* silent -- next tick will retry */ }
         }
+        if (cancelled) return;
         scheduleRefresh();
       }, 10000 + jitter);
     }
     scheduleRefresh();
-    return () => clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [rootPath]);
 
   // Load children for expanded folder

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, cleanup, fireEvent, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { FileTree, FILE_TREE_DRAG_TYPE } from './FileTree';
 
@@ -34,14 +34,8 @@ function renderTree(rootPath = '/repo', overrides: { onFileSelect?: (path: strin
 
 describe('FileTree drag-and-drop', () => {
   let visibilitySpy: ReturnType<typeof vi.spyOn>;
-  let originalSetTimeout: typeof setTimeout;
   beforeEach(() => {
     visibilitySpy = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
-    originalSetTimeout = globalThis.setTimeout;
-    globalThis.setTimeout = ((fn: () => void, ms?: number) => {
-      if (ms !== undefined && ms >= 5000) return 0 as unknown as ReturnType<typeof setTimeout>;
-      return originalSetTimeout(fn, ms);
-    }) as typeof setTimeout;
     vi.stubGlobal('fetch', stubFilesSimple('/repo', [
       { name: 'src', is_directory: true },
       { name: 'main.rs', is_directory: false },
@@ -49,7 +43,6 @@ describe('FileTree drag-and-drop', () => {
   });
 
   afterEach(() => {
-    globalThis.setTimeout = originalSetTimeout;
     visibilitySpy.mockRestore();
     cleanup();
     vi.unstubAllGlobals();
@@ -106,14 +99,8 @@ describe('FileTree drag-and-drop', () => {
 
 describe('FileTree keyboard navigation', () => {
   let visibilitySpy: ReturnType<typeof vi.spyOn>;
-  let originalSetTimeout: typeof setTimeout;
   beforeEach(() => {
     visibilitySpy = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
-    originalSetTimeout = globalThis.setTimeout;
-    globalThis.setTimeout = ((fn: () => void, ms?: number) => {
-      if (ms !== undefined && ms >= 5000) return 0 as unknown as ReturnType<typeof setTimeout>;
-      return originalSetTimeout(fn, ms);
-    }) as typeof setTimeout;
     vi.stubGlobal('fetch', stubFilesSimple('/repo', [
       { name: 'src', is_directory: true },
       { name: 'main.rs', is_directory: false },
@@ -122,7 +109,6 @@ describe('FileTree keyboard navigation', () => {
   });
 
   afterEach(() => {
-    globalThis.setTimeout = originalSetTimeout;
     visibilitySpy.mockRestore();
     cleanup();
     vi.unstubAllGlobals();
@@ -135,7 +121,7 @@ describe('FileTree keyboard navigation', () => {
     const items = document.querySelectorAll('.ft-item');
     expect(items.length).toBe(3);
 
-    (items[0] as HTMLElement).focus();
+    await act(async () => { (items[0] as HTMLElement).focus(); });
     expect(document.activeElement).toBe(items[0]);
 
     fireEvent.keyDown(items[0], { key: 'ArrowDown' });
@@ -150,7 +136,7 @@ describe('FileTree keyboard navigation', () => {
     await waitFor(() => expect(screen.getByText('test.rs')).toBeInTheDocument());
 
     const items = document.querySelectorAll('.ft-item');
-    (items[2] as HTMLElement).focus();
+    await act(async () => { (items[2] as HTMLElement).focus(); });
 
     fireEvent.keyDown(items[2], { key: 'ArrowUp' });
     expect(document.activeElement).toBe(items[1]);
@@ -164,10 +150,55 @@ describe('FileTree keyboard navigation', () => {
     await waitFor(() => expect(screen.getByText('src')).toBeInTheDocument());
 
     const items = document.querySelectorAll('.ft-item');
-    (items[0] as HTMLElement).focus();
+    await act(async () => { (items[0] as HTMLElement).focus(); });
     expect(document.activeElement).toBe(items[0]);
 
     fireEvent.keyDown(items[0], { key: 'Escape' });
     expect(document.activeElement).not.toBe(items[0]);
+  });
+
+  it('wraps ArrowDown at the bottom', async () => {
+    renderTree();
+    await waitFor(() => expect(screen.getByText('test.rs')).toBeInTheDocument());
+
+    const items = document.querySelectorAll('.ft-item');
+    await act(async () => { (items[2] as HTMLElement).focus(); });
+
+    fireEvent.keyDown(items[2], { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(items[0]);
+  });
+
+  it('opens a file on Enter', async () => {
+    const onFileSelect = vi.fn();
+    renderTree('/repo', { onFileSelect });
+    await waitFor(() => expect(screen.getByText('main.rs')).toBeInTheDocument());
+
+    const items = document.querySelectorAll('.ft-item');
+    await act(async () => { (items[1] as HTMLElement).focus(); });
+    fireEvent.keyDown(items[1], { key: 'Enter' });
+
+    expect(onFileSelect).toHaveBeenCalledWith('/repo/main.rs', '/repo');
+  });
+
+  it('jumps to first item on Home', async () => {
+    renderTree();
+    await waitFor(() => expect(screen.getByText('test.rs')).toBeInTheDocument());
+
+    const items = document.querySelectorAll('.ft-item');
+    await act(async () => { (items[2] as HTMLElement).focus(); });
+
+    fireEvent.keyDown(items[2], { key: 'Home' });
+    expect(document.activeElement).toBe(items[0]);
+  });
+
+  it('jumps to last item on End', async () => {
+    renderTree();
+    await waitFor(() => expect(screen.getByText('src')).toBeInTheDocument());
+
+    const items = document.querySelectorAll('.ft-item');
+    await act(async () => { (items[0] as HTMLElement).focus(); });
+
+    fireEvent.keyDown(items[0], { key: 'End' });
+    expect(document.activeElement).toBe(items[items.length - 1]);
   });
 });
