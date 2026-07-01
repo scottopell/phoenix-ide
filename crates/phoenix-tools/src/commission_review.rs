@@ -150,7 +150,6 @@ struct ReviewSummary {
     files_reviewed: usize,
     insertions: u64,
     deletions: u64,
-    findings_count: usize,
     elapsed_ms: u128,
     #[serde(skip)]
     usage: phoenix_core::domain::llm_types::Usage,
@@ -416,7 +415,6 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
                 files_reviewed: 0,
                 insertions: collection.insertions,
                 deletions: collection.deletions,
-                findings_count: 0,
                 elapsed_ms: started.elapsed().as_millis(),
                 usage: phoenix_core::domain::llm_types::Usage::default(),
                 reviewer_summary: Some(reviewer_summary),
@@ -571,7 +569,6 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
             files_reviewed: collection.files_reviewed,
             insertions: collection.insertions,
             deletions: collection.deletions,
-            findings_count: findings.len(),
             elapsed_ms: started.elapsed().as_millis(),
             usage: phoenix_core::domain::llm_types::Usage {
                 input_tokens,
@@ -676,7 +673,6 @@ fn interrupted_review_output(
             files_reviewed: collection.files_reviewed,
             insertions: collection.insertions,
             deletions: collection.deletions,
-            findings_count: interrupted.findings.len(),
             elapsed_ms: started.elapsed().as_millis(),
             usage: interrupted.usage,
             reviewer_summary: if interrupted.reviewer_summaries.is_empty() {
@@ -807,8 +803,7 @@ fn interrupted_contract(
     }
 }
 
-fn finalize_review_output(mut draft: ReviewOutputDraft) -> ReviewOutput {
-    draft.summary.findings_count = draft.findings.len();
+fn finalize_review_output(draft: ReviewOutputDraft) -> ReviewOutput {
     let finding_summary = summarize_findings(&draft.findings);
     let warnings_summary = summarize_warnings(&draft.warnings);
     ReviewOutput {
@@ -1906,7 +1901,6 @@ mod tests {
                 files_reviewed: 0,
                 insertions: 0,
                 deletions: 0,
-                findings_count: 0,
                 elapsed_ms: 0,
                 usage: phoenix_core::domain::llm_types::Usage::default(),
                 reviewer_summary: None,
@@ -2426,7 +2420,6 @@ mod tests {
                 files_reviewed: 1,
                 insertions: 1,
                 deletions: 0,
-                findings_count: 0,
                 elapsed_ms: 0,
                 usage: phoenix_core::domain::llm_types::Usage::default(),
                 reviewer_summary: None,
@@ -2501,7 +2494,6 @@ mod tests {
                 files_reviewed: 1,
                 insertions: 1,
                 deletions: 0,
-                findings_count: 0,
                 elapsed_ms: 0,
                 usage: phoenix_core::domain::llm_types::Usage::default(),
                 reviewer_summary: None,
@@ -2553,7 +2545,6 @@ mod tests {
                 files_reviewed: 1,
                 insertions: 1,
                 deletions: 0,
-                findings_count: 0,
                 elapsed_ms: 0,
                 usage: phoenix_core::domain::llm_types::Usage {
                     input_tokens: 10,
@@ -2572,6 +2563,8 @@ mod tests {
 
         assert!(value.get("summary").is_some());
         assert!(!serialized.contains("input_tokens"));
+        assert_eq!(value["finding_summary"]["total"], 0);
+        assert!(!serialized.contains("findings_count"));
         assert!(!serialized.contains("output_tokens"));
         assert!(!serialized.contains("cache_creation_tokens"));
         assert!(!serialized.contains("cost"));
