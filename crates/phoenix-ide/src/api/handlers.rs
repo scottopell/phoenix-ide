@@ -43,7 +43,7 @@ use crate::state_machine::{check_user_message_acceptable, ConvState, Event, Tran
 use super::browser_view::browser_view_ws_handler;
 
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, MatchedPath, Multipart, Path, Query, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -61,6 +61,7 @@ use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
+use tower_http::trace::TraceLayer;
 
 async fn trajectory_export_handler(
     State(state): State<AppState>,
@@ -401,6 +402,72 @@ pub fn create_router(state: AppState) -> Router {
             state.clone(),
             super::auth::auth_middleware,
         ))
+        // HTTP access log + Datadog tracing: applied via `route_layer` so it
+        // runs AFTER routing, making axum's `MatchedPath` (the route template,
+        // e.g. `/api/conversations/:id/stream`) available in `make_span_with`.
+        // The `otel.kind = "server"` field is read by the tracing-opentelemetry
+        // bridge to set SpanKind::Server, which the datadog-opentelemetry
+        // exporter maps to type=web. The `http.request.method` and `http.route`
+        // fields are mapped to OTel HTTP semantic conventions, which the
+        // exporter uses to set the operation name to "http.server.request" and
+        // the resource to "METHOD /template". The `http.response.status_code`
+        // is recorded on the span in on_response so it appears as
+        // meta.http.status_code.
+        //
+        // Health check endpoint (/version) is suppressed from normal INFO logging.
+        .route_layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    let path = request.uri().path();
+                    // MatchedPath is the route template (e.g.
+                    // /api/conversations/:id/stream), available because
+                    // route_layer runs after routing. Fall back to the raw
+                    // path if MatchedPath is not in extensions (e.g. fallback
+                    // routes).
+                    let route = request
+                        .extensions()
+                        .get::<MatchedPath>()
+                        .map_or_else(|| path.to_string(), |m| m.as_str().to_string());
+                    if path == "/version" {
+                        tracing::debug_span!(
+                            "http",
+                            otel.kind = "server",
+                            method = %request.method(),
+                            path = %path,
+                            "http.request.method" = %request.method(),
+                            "http.route" = %route,
+                        )
+                    } else {
+                        tracing::info_span!(
+                            "http",
+                            otel.kind = "server",
+                            method = %request.method(),
+                            path = %path,
+                            "http.request.method" = %request.method(),
+                            "http.route" = %route,
+                        )
+                    }
+                })
+                .on_response(
+                    |response: &axum::http::Response<_>,
+                     latency: std::time::Duration,
+                     span: &tracing::Span| {
+                        // Record status code as a span attribute (not just an
+                        // event) so the Datadog exporter maps it to
+                        // meta.http.status_code.
+                        span.record("http.response.status_code", response.status().as_u16());
+                        tracing::info!(
+                            parent: span,
+                            status = response.status().as_u16(),
+                            latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+                        );
+                    },
+                )
+                .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::DEBUG))
+                .on_failure(
+                    tower_http::trace::DefaultOnFailure::new().level(tracing::Level::ERROR),
+                ),
+        )
         .with_state(state)
 }
 

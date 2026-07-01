@@ -70,7 +70,6 @@ use std::sync::Arc;
 use tower_http::{
     compression::CompressionLayer,
     cors::{Any, CorsLayer},
-    trace::TraceLayer,
 };
 mod hot_restart;
 mod logging;
@@ -907,58 +906,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let compression = CompressionLayer::new().gzip(true).br(true);
 
-    // HTTP access log + Datadog tracing: one span per request with method,
-    // path, status, latency. The `otel.kind = "server"` field is read by the
-    // tracing-opentelemetry bridge to set SpanKind::Server, which the
-    // datadog-opentelemetry exporter maps to type=web. The `http.request.method`
-    // and `http.route` fields are mapped to OTel HTTP semantic conventions,
-    // which the exporter uses to set the operation name to "http.server.request"
-    // and the resource to "METHOD /path". The `http.response.status_code` is
-    // recorded on the span in on_response so it appears as meta.http.status_code.
-    //
-    // Health check endpoint (/version) is suppressed from normal INFO logging.
-    let trace_layer = TraceLayer::new_for_http()
-        .make_span_with(|request: &axum::http::Request<_>| {
-            // Create a span at INFO level; health checks get a separate disabled span
-            // to suppress them from normal log output.
-            let path = request.uri().path();
-            if path == "/version" {
-                tracing::debug_span!(
-                    "http",
-                    otel.kind = "server",
-                    method = %request.method(),
-                    path = %path,
-                    "http.request.method" = %request.method(),
-                    "http.route" = %path,
-                )
-            } else {
-                tracing::info_span!(
-                    "http",
-                    otel.kind = "server",
-                    method = %request.method(),
-                    path = %path,
-                    "http.request.method" = %request.method(),
-                    "http.route" = %path,
-                )
-            }
-        })
-        .on_response(
-            |response: &axum::http::Response<_>,
-             latency: std::time::Duration,
-             span: &tracing::Span| {
-                // Record status code as a span attribute (not just an event) so
-                // the Datadog exporter maps it to meta.http.status_code.
-                span.record("http.response.status_code", response.status().as_u16());
-                tracing::info!(
-                    parent: span,
-                    status = response.status().as_u16(),
-                    latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
-                );
-            },
-        )
-        .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::DEBUG))
-        .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::ERROR));
-
     // Clear-to-ready sweep: once a usage-limit window elapses, return the
     // errored conversation to Idle so it is usable again without a manual
     // dismiss. Detached for the process lifetime; the first tick fires
@@ -971,10 +918,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pass (REQ-BASH-007) can reach it after `state` moves into the router.
     let bash_handles_for_shutdown = state.runtime.bash_handles().clone();
 
-    let app = create_router(state)
-        .layer(trace_layer)
-        .layer(cors)
-        .layer(compression);
+    let app = create_router(state).layer(cors).layer(compression);
 
     // The listener was bound earlier so the deployment report could record the
     // real bind address (see above).
