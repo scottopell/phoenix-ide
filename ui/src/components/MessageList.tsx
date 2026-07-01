@@ -318,6 +318,14 @@ function MessageListImpl({
   // stays pinned — see the viewport-shrink handling in
   // handleTotalListHeightChanged.
   const prevClientHeightRef = useRef(0);
+  // Tracks whether this conversation instance has seen non-empty content.
+  // Used to force a bottom snap on the first non-empty height measurement
+  // (when Virtuoso mounted with empty data and messages arrive later).
+  // Not reset by the passive conversation-switch useEffect — only by the
+  // callback's synchronous conversation-switch handler, which seeds it
+  // from `allUnitsLengthRef` so a reopened conversation with messages
+  // doesn't get a forced snap.
+  const hasSeenContentRef = useRef(false);
 
   // The streaming buffer's `requestId` IS the eventual agent message_id
   // (server uses the same uuid for both — see `AssistantMessage::new` in
@@ -444,11 +452,12 @@ function MessageListImpl({
     prevPendingLengthRef.current = pendingMessages.length;
     if (conversationChanged) {
       setHasUnreadTailContent(false);
-      // The handleTotalListHeightChanged baseline must reset alongside
-      // the rest of the per-conversation state. Otherwise the first
-      // callback in conversation B compares against conversation A's
-      // total list height and can spuriously fire re-snap or unread.
-      prevTotalHeightRef.current = 0;
+      // The handleTotalListHeightChanged baseline is managed by the
+      // callback's own conversation-switch handler (lastSeenConvIdRef
+      // check), which fires synchronously during Virtuoso's measurement
+      // — before this passive useEffect runs. Resetting prevTotalHeightRef
+      // here would overwrite the seeded baseline and re-introduce a
+      // `prevHeight === 0` condition on the next async height delta.
       return;
     }
     if (isAtBottom) return;
@@ -460,50 +469,32 @@ function MessageListImpl({
     }
   }, [conversationId, messages.length, pendingMessages.length, streamingRequestId, isAtBottom]);
 
-  // `followOutput={false}` disables ALL of Virtuoso's built-in auto-scroll
-  // (both the totalCount-based followOutput and the size-increase handler).
-  // This callback is the SOLE auto-scroll mechanism. It is necessary because
-  // Virtuoso's built-in mechanisms don't handle streaming token growth.
-  // Verified against react-virtuoso 4.18.7 — re-evaluate on upgrade: a future
-  // version could change the `followOutput !== false` guard or the
-  // `notAtBottomBecause` priority order, silently re-enabling the buggy
-  // size-increase handler or altering atBottomStateChange semantics.
-  //   - totalCount-based followOutput only fires when `data.length` grows
-  //     (new items appended), not when the last item's height changes.
-  //   - the size-increase handler fires on `atBottom` true→false transitions
-  //     classified as SIZE_INCREASED, but during streaming the user stays
-  //     within the atBottomThreshold so no transition fires — and when the
-  //     user scrolls up within the threshold, the `notAtBottomBecause`
-  //     priority order misclassifies it as SIZE_INCREASED (because
-  //     scrollHeight grew) and yanks them back, fighting the user.
+  // `followOutput={false}` disables Virtuoso's built-in auto-scroll; this
+  // callback is the sole auto-follow mechanism. See REQ-MLRU-014 for the
+  // full rationale (why Virtuoso's built-in handler misclassifies scroll-up
+  // during streaming, and why the manual `oldFromBottom` check is correct).
   //
-  // `totalListHeightChanged` fires on EVERY height delta, including:
-  //   - new items appended
-  //   - existing items resizing (markdown render, code highlighter mount,
-  //     streaming token text growth, MessageUpdated mutating existing
-  //     content like spawn_agents → sub-agent results)
-  //
-  // Use the user's pre-growth scroll position vs the pre-growth bottom
-  // (captured via `prevTotalHeightRef`) to fork:
+  // `totalListHeightChanged` fires on EVERY height delta. Use the user's
+  // pre-growth scroll position vs the pre-growth bottom (captured via
+  // `prevTotalHeightRef`) to fork:
   //   - within PIN threshold of old bottom → render-drift, re-snap
-  //   - past PIN threshold AND height grew → user intentionally
-  //     scrolled up while tail content kept arriving → mark unread
-  //     content so the jump-to-newest button appears. This is the
-  //     streaming-in-flight path that `messages.length` cannot catch
-  //     (token growth doesn't change the array).
-  //   - past PIN threshold AND height shrank → unrelated render churn
-  //     (e.g. an item collapsed); leave alone.
+  //   - past PIN threshold AND height grew → user intentionally scrolled
+  //     up while tail content kept arriving → mark unread so the
+  //     jump-to-newest button appears (streaming-in-flight path that
+  //     `messages.length` cannot catch — token growth doesn't change
+  //     the array).
+  //   - past PIN threshold AND height shrank → unrelated render churn;
+  //     leave alone.
   //
-  // Two additional cases that the old `followOutput="auto"` handled and
-  // this callback must replicate:
+  // Two edge cases the old `followOutput="auto"` handled and this callback
+  // must replicate:
   //   - First non-empty update: when Virtuoso mounts with empty data and
   //     messages arrive later, `initialTopMostItemIndex` only controlled
-  //     the mount position. The first non-empty height measurement needs
-  //     an explicit bottom snap (prevHeight === 0 → scroll to LAST).
+  //     the mount position. Tracked via `hasSeenContentRef` (not
+  //     `prevHeight === 0`, which can also fire after a baseline reset).
   //   - Viewport shrink: when clientHeight decreases (resize, panel
-  //     expansion, composer growth), `oldFromBottom` is computed using
-  //     the previous (larger) clientHeight so a pinned user stays pinned
-  //     instead of being misclassified as scrolled-up.
+  //     expansion, composer growth), `oldFromBottom` uses the previous
+  //     (larger) clientHeight so a pinned user stays pinned.
   const handleTotalListHeightChanged = useCallback((newHeight: number) => {
     // Detect conversation switch synchronously. virtuoso re-keys to the
     // new conversation on `key={conversationId}` change and emits its
@@ -516,6 +507,12 @@ function MessageListImpl({
       lastSeenConvIdRef.current = conversationId;
       prevTotalHeightRef.current = newHeight;
       prevClientHeightRef.current = 0;
+      // Seed from allUnitsLengthRef: if the new conversation already has
+      // messages, initialTopMostItemIndex handled placement and we must
+      // NOT force a snap on the next height delta. Only an empty→non-empty
+      // transition (conversation was empty at switch time, content arrived
+      // later) should trigger the forced snap.
+      hasSeenContentRef.current = allUnitsLengthRef.current > 0;
       return;
     }
     const prevHeight = prevTotalHeightRef.current;
@@ -523,12 +520,16 @@ function MessageListImpl({
     if (allUnitsLengthRef.current === 0) return;
     const s = scrollerRef.current;
     if (!s) return;
-    // First non-empty height measurement: initialTopMostItemIndex only
-    // controls the MOUNT position. If Virtuoso mounted with empty data
-    // (fresh conversation, or cached metadata before messages arrive),
-    // the first real content needs an explicit bottom snap — otherwise a
-    // tall first batch renders at the top instead of showing the newest.
-    if (prevHeight === 0) {
+    // First non-empty height measurement for this conversation instance:
+    // initialTopMostItemIndex only controls the MOUNT position. If Virtuoso
+    // mounted with empty data (fresh conversation, or cached metadata before
+    // messages arrive), the first real content needs an explicit bottom
+    // snap. Tracked via `hasSeenContentRef` rather than `prevHeight === 0`
+    // because the baseline can be reset to 0 by the conversation-switch
+    // useEffect after the callback already seeded it — using the ref would
+    // re-introduce a scroll-yank on the next async height delta.
+    if (!hasSeenContentRef.current) {
+      hasSeenContentRef.current = true;
       prevClientHeightRef.current = s.clientHeight;
       virtuosoRef.current?.scrollToIndex({
         index: 'LAST',
@@ -577,10 +578,10 @@ function MessageListImpl({
       const subAgentsActive = convStateRef.current.type === 'awaiting_sub_agents';
       if (streamingActive || subAgentsActive) {
         setHasUnreadTailContent(true);
-      } else {
+      } else if (import.meta.env.DEV) {
         // Height grew, user is past the pin threshold, but no genuine tail
         // activity was detected — the callback is intentionally not acting.
-        // Log so this silent no-op is distinguishable from a bug in production.
+        // Logged only in dev to avoid noise on this hot callback in production.
         console.debug('[MessageList] height grew but not re-snapping (past threshold, no tail activity)', {
           oldFromBottom,
           heightDelta: newHeight - prevHeight,

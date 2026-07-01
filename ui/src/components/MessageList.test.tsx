@@ -1,7 +1,7 @@
 import '../index.css';
 import { readFileSync } from 'node:fs';
 import { createRef, forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent } from '@testing-library/react';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
@@ -58,6 +58,20 @@ vi.mock('./MessageContextMenu', () => ({
 //   - render-unit construction (buildRenderUnits)
 //   - per-unit component dispatch
 //   - keyed in-place reconciliation across the pending → sent transition
+//
+// The mock captures `totalListHeightChanged` and shares a `scrollToIndex`
+// mock so tests can exercise the manual auto-follow callback (see the
+// `handleTotalListHeightChanged` test group).
+const virtuosoMock = {
+  scrollToIndex: vi.fn(),
+  totalListHeightChanged: null as ((height: number) => void) | null,
+};
+
+beforeEach(() => {
+  virtuosoMock.scrollToIndex = vi.fn();
+  virtuosoMock.totalListHeightChanged = null;
+});
+
 vi.mock('react-virtuoso', () => ({
   Virtuoso: forwardRef(<T, C>({
     data,
@@ -66,6 +80,7 @@ vi.mock('react-virtuoso', () => ({
     components,
     computeItemKey,
     scrollerRef,
+    totalListHeightChanged,
   }: {
     data: T[];
     context?: C;
@@ -74,10 +89,14 @@ vi.mock('react-virtuoso', () => ({
     components?: { Header?: React.ComponentType<{ context: C }> };
     computeItemKey?: (index: number, data: T) => React.Key;
     scrollerRef?: (ref: HTMLElement | Window | null) => void;
+    totalListHeightChanged?: (height: number) => void;
   }, ref: React.Ref<{ scrollToIndex: (options: unknown) => void }>) => {
     const Header = components?.Header;
     const containerRef = useRef<HTMLDivElement>(null);
-    useImperativeHandle(ref, () => ({ scrollToIndex: vi.fn() }), []);
+    if (totalListHeightChanged) {
+      virtuosoMock.totalListHeightChanged = totalListHeightChanged;
+    }
+    useImperativeHandle(ref, () => ({ scrollToIndex: virtuosoMock.scrollToIndex }), []);
     useLayoutEffect(() => {
       scrollerRef?.(containerRef.current);
       return () => scrollerRef?.(null);
@@ -427,5 +446,215 @@ describe('MessageList', () => {
     expect(container.querySelector('.system-prompt-content')).toHaveTextContent(
       'SENTINEL SYSTEM PROMPT',
     );
+  });
+});
+
+// Tests for the manual auto-follow callback (handleTotalListHeightChanged).
+// Virtuoso is mocked as a passthrough, so these tests call the captured
+// `totalListHeightChanged` callback directly and assert whether the shared
+// `scrollToIndex` mock was called. This exercises the pin/no-pin logic,
+// first-non-empty snap, and viewport-shrink handling without a real
+// virtualization layer.
+describe('handleTotalListHeightChanged', () => {
+  function setupScroller(scroller: HTMLElement, opts: {
+    scrollHeight: number;
+    scrollTop: number;
+    clientHeight: number;
+  }) {
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => opts.scrollHeight });
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, get: () => opts.scrollTop, set: () => {} });
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => opts.clientHeight });
+  }
+
+  it('re-snaps to bottom when pinned and height grows', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-reSnap"
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    // Simulate: user at bottom, height grows from 500 to 600
+    setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 500 });
+    // First call seeds the baseline (prevHeight) and triggers first-non-empty snap
+    act(() => virtuosoMock.totalListHeightChanged?.(500));
+    // Clear the first-non-empty snap so we only observe the re-snap
+    virtuosoMock.scrollToIndex.mockClear();
+    // Second call: height grew, user was at bottom (oldFromBottom = 500 - 100 - 500 = -100 <= 100)
+    setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 500 });
+    act(() => virtuosoMock.totalListHeightChanged?.(600));
+
+    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+  });
+
+  it('does NOT re-snap when scrolled up past threshold and height grows', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-no-yank"
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    // Seed baseline (first call triggers the first-non-empty snap)
+    setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
+    act(() => virtuosoMock.totalListHeightChanged?.(1000));
+    // Clear the first-non-empty snap call so we only observe subsequent calls
+    virtuosoMock.scrollToIndex.mockClear();
+
+    // User scrolled up: scrollTop = 0, but content is tall (prevHeight = 1000)
+    // oldFromBottom = 1000 - 0 - 400 = 600 > 100 — well past the threshold.
+    // Height grows further, but user is scrolled up, so no re-snap.
+    setupScroller(scroller, { scrollHeight: 1200, scrollTop: 0, clientHeight: 400 });
+    act(() => virtuosoMock.totalListHeightChanged?.(1200));
+
+    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it('snaps to bottom on first non-empty update after mounting empty', () => {
+    // Mount with empty messages, then add messages
+    const { container, rerender } = render(
+      withConvContext(
+        <MessageList
+          messages={[]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-empty-first"
+        />,
+      ),
+    );
+
+    // No content yet — callback should not snap
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 0, scrollTop: 0, clientHeight: 500 });
+    act(() => virtuosoMock.totalListHeightChanged?.(0));
+    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+
+    // Messages arrive
+    rerender(
+      withConvContext(
+        <MessageList
+          messages={Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'))}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-empty-first"
+        />,
+      ),
+    );
+
+    // First non-empty height measurement — should snap
+    setupScroller(scroller, { scrollHeight: 600, scrollTop: 0, clientHeight: 500 });
+    act(() => virtuosoMock.totalListHeightChanged?.(600));
+    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+  });
+
+  it('does NOT snap on delayed height delta after conversation switch (no scroll-yank)', () => {
+    // Mount conversation A with messages
+    const historicalA = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container, rerender } = render(
+      withConvContext(
+        <MessageList
+          messages={historicalA}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-A"
+        />,
+      ),
+    );
+
+    // Seed baseline for conversation A
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+    act(() => virtuosoMock.totalListHeightChanged?.(500));
+    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+
+    // Clear mock to track new calls
+    virtuosoMock.scrollToIndex.mockClear();
+
+    // Switch to conversation B (also has messages)
+    const historicalB = Array.from({ length: 3 }, (_, i) => makeMessage(i + 10, 'user'));
+    rerender(
+      withConvContext(
+        <MessageList
+          messages={historicalB}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-B"
+        />,
+      ),
+    );
+
+    // Virtuoso re-keys and fires first measurement for B
+    setupScroller(scroller, { scrollHeight: 400, scrollTop: 0, clientHeight: 400 });
+    act(() => virtuosoMock.totalListHeightChanged?.(400));
+    // The conversation-switch handler seeds the baseline; should NOT snap
+    // because hasSeenContentRef is seeded true (B already has messages)
+    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+
+    // Now a delayed height delta arrives (e.g. code highlighter mount)
+    // User has scrolled up in conversation B
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 0, clientHeight: 300 });
+    // oldFromBottom = 400 - 0 - 300 = 100... let's make it clearly past
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 0, clientHeight: 200 });
+    // oldFromBottom = 400 - 0 - 200 = 200 > 100
+    act(() => virtuosoMock.totalListHeightChanged?.(500));
+    // Should NOT snap — user is scrolled up, this is not a first-content case
+    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it('re-snaps when viewport shrinks while pinned', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-shrink"
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    // Seed baseline: user at bottom with tall viewport
+    setupScroller(scroller, { scrollHeight: 800, scrollTop: 100, clientHeight: 700 });
+    act(() => virtuosoMock.totalListHeightChanged?.(800));
+    // oldFromBottom = 800 - 100 - 700 = 0 (pinned)
+
+    // Clear the first-non-empty snap call so we only observe subsequent calls
+    virtuosoMock.scrollToIndex.mockClear();
+
+    // Viewport shrinks from 700 to 500 (200px shrink > 100px threshold)
+    // Without viewport-shrink handling, oldFromBottom = 800 - 100 - 500 = 200 > 100
+    // With shrink handling, uses prevClientHeight (700): oldFromBottom = 800 - 100 - 700 = 0 <= 100
+    setupScroller(scroller, { scrollHeight: 800, scrollTop: 100, clientHeight: 500 });
+    act(() => virtuosoMock.totalListHeightChanged?.(800));
+
+    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
   });
 });
