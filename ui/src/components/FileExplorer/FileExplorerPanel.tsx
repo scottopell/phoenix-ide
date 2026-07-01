@@ -5,6 +5,7 @@
 
 import { useState, useCallback, useEffect, useMemo } from 'react';
 import { FileTree } from './FileTree';
+import { FileTreeContextMenu } from './FileTreeContextMenu';
 import { McpStatusPanel } from '../McpStatusPanel';
 import { SkillsPanel } from '../SkillsPanel';
 import { SkillViewer } from '../SkillViewer';
@@ -153,6 +154,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
               />
             </div>
           )}
+          <FileTreeContextMenu />
           <McpStatusPanel showToast={showToast} showError={showError} readOnly={!rootPath} />
           <SkillsPanel
             conversationId={conversationId}

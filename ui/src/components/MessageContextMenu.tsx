@@ -4,6 +4,7 @@ import { copyToClipboard } from '../utils/clipboard';
 import {
   FILE_PATH_CONTEXT_MENU_OPEN_EVENT,
   MESSAGE_CONTEXT_MENU_OPEN_EVENT,
+  FILE_TREE_CONTEXT_MENU_OPEN_EVENT,
 } from './contextMenuEvents';
 import './MessageContextMenu.css';
 
@@ -119,7 +120,11 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
   useEffect(() => {
     const closeMenu = () => setMenu(null);
     window.addEventListener(FILE_PATH_CONTEXT_MENU_OPEN_EVENT, closeMenu);
-    return () => window.removeEventListener(FILE_PATH_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+    window.addEventListener(FILE_TREE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+    return () => {
+      window.removeEventListener(FILE_PATH_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+      window.removeEventListener(FILE_TREE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+    };
   }, []);
 
   // Close on click outside or Escape

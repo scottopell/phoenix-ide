@@ -22,5 +22,6 @@ Extends DesktopLayout to three columns with CSS flexbox. FileExplorerPanel compo
 | **REQ-FE-008:** Prose Reader Integration | ✅ Complete | Inline on desktop, overlay on mobile |
 | **REQ-FE-009:** Visual Feedback | ✅ Complete | Active file highlight + loading spinners |
 | **REQ-FE-010:** Mobile File Browser Overlay | ✅ Complete | FileBrowserOverlay hosts FileTree |
+| **REQ-FE-011:** Context Menu, Drag-and-Drop, Keyboard Nav | ✅ Complete | FileTreeContextMenu + custom drag type + focus scope |
 
-**Progress:** 10 of 10 complete
+**Progress:** 11 of 11 complete

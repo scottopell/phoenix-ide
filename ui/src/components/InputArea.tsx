@@ -20,6 +20,7 @@ import { canCancelConversationState, isAgentWorking, isCancellingState } from '.
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
+import { FILE_TREE_DRAG_TYPE } from './FileExplorer/FileTree';
 
 export interface InputAreaHandle {
   focus: () => void;
@@ -288,14 +289,16 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   };
 
   const handleDragEnter = (e: DragEvent) => {
-    if (Array.from(e.dataTransfer.types).includes('Files')) {
+    const types = Array.from(e.dataTransfer.types);
+    if (types.includes(FILE_TREE_DRAG_TYPE) || types.includes('Files')) {
       e.preventDefault();
       setIsDragOver(true);
     }
   };
 
   const handleDragOver = (e: DragEvent) => {
-    if (Array.from(e.dataTransfer.types).includes('Files')) {
+    const types = Array.from(e.dataTransfer.types);
+    if (types.includes(FILE_TREE_DRAG_TYPE) || types.includes('Files')) {
       e.preventDefault();
       e.dataTransfer.dropEffect = 'copy';
     }
@@ -308,7 +311,29 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   };
 
   const handleDrop = async (e: DragEvent) => {
-    if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+    const types = Array.from(e.dataTransfer.types);
+
+    // File-tree → composer drag: insert an @file reference (include contents).
+    // Checked before the OS Files path so the two drop modes don't conflict.
+    if (types.includes(FILE_TREE_DRAG_TYPE)) {
+      e.preventDefault();
+      setIsDragOver(false);
+      const raw = e.dataTransfer.getData(FILE_TREE_DRAG_TYPE);
+      if (raw) {
+        try {
+          const payload = JSON.parse(raw) as { relativePath: string; isDirectory: boolean };
+          const ref = payload.isDirectory
+            ? `@${payload.relativePath}/ `
+            : `@${payload.relativePath} `;
+          window.dispatchEvent(new CustomEvent('phoenix:insert-draft', { detail: { text: ref } }));
+        } catch {
+          // Malformed drag payload — silently ignore
+        }
+      }
+      return;
+    }
+
+    if (!types.includes('Files')) return;
     e.preventDefault();
     setIsDragOver(false);
     if (isUploadingFiles) {

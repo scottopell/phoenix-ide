@@ -17,7 +17,13 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { computeAncestors, isUnderRoot } from './computeAncestors';
+import { useFocusScopeCommands } from '../../hooks/useFocusScope';
 import type { FileViewerKind } from '../../generated/FileViewerKind';
+
+/** Custom drag type for file-tree → composer drag-and-drop. The InputArea
+ *  drop handler checks this before the OS `Files` type so the two drop
+ *  modes don't conflict. */
+export const FILE_TREE_DRAG_TYPE = 'application/x-phoenix-file-path';
 
 // Types
 export interface FileItem {
@@ -128,6 +134,7 @@ function computeDirLabel(rootPath: string): string {
 
 interface FileTreeItemProps {
   item: FileItem;
+  rootPath: string;
   depth: number;
   isExpanded: boolean;
   isLoadingChildren: boolean;
@@ -142,6 +149,7 @@ interface FileTreeItemProps {
 
 const FileTreeItem = memo(function FileTreeItem({
   item,
+  rootPath,
   depth,
   isExpanded,
   isLoadingChildren,
@@ -161,6 +169,22 @@ const FileTreeItem = memo(function FileTreeItem({
     item.is_gitignored && 'ft-item--dimmed',
   ].filter(Boolean).join(' ');
 
+  const handleDragStart = useCallback((e: React.DragEvent) => {
+    if (isDisabled) {
+      e.preventDefault();
+      return;
+    }
+    const root = rootPath.endsWith('/') ? rootPath.slice(0, -1) : rootPath;
+    const prefix = root + '/';
+    const relativePath = item.path.startsWith(prefix) ? item.path.slice(prefix.length) : item.path;
+    e.dataTransfer.setData(FILE_TREE_DRAG_TYPE, JSON.stringify({
+      path: item.path,
+      relativePath,
+      isDirectory: item.is_directory,
+    }));
+    e.dataTransfer.effectAllowed = 'copy';
+  }, [item.path, item.is_directory, rootPath, isDisabled]);
+
   return (
     <div>
       <div
@@ -171,6 +195,10 @@ const FileTreeItem = memo(function FileTreeItem({
         tabIndex={isDisabled ? -1 : 0}
         title={isDisabled ? 'Non-viewable file' : item.path}
         data-path={item.path}
+        data-is-directory={item.is_directory ? 'true' : 'false'}
+        aria-expanded={item.is_directory ? isExpanded : undefined}
+        draggable={!isDisabled}
+        onDragStart={handleDragStart}
       >
         {item.is_directory && (
           <span className="ft-expand-icon">
@@ -211,6 +239,7 @@ const FileTreeItem = memo(function FileTreeItem({
                 <FileTreeItem
                   key={child.path}
                   item={child}
+                  rootPath={rootPath}
                   depth={depth + 1}
                   isExpanded={childExpanded}
                   isLoadingChildren={childLoading}
@@ -234,6 +263,7 @@ const FileTreeItem = memo(function FileTreeItem({
 function areFileTreeItemPropsEqual(prev: FileTreeItemProps, next: FileTreeItemProps): boolean {
   if (
     prev.item !== next.item ||
+    prev.rootPath !== next.rootPath ||
     prev.depth !== next.depth ||
     prev.isExpanded !== next.isExpanded ||
     prev.isLoadingChildren !== next.isLoadingChildren ||
@@ -290,6 +320,132 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   // childItems map (from any later directory load) doesn't yank scroll
   // position back to the same row over and over.
   const lastRevealedRef = useRef<string | null>(null);
+
+  // Focus scope: while a tree item has keyboard focus, push a scope so the
+  // sidebar's useKeyboardNav defers (REQ-KB-001 / REQ-KB-008). Unlike modal
+  // panels that register on mount, the tree is persistent — so we push/pop
+  // based on whether any item is focused.
+  const { pushScope, popScope } = useFocusScopeCommands();
+  const [treeFocused, setTreeFocused] = useState(false);
+  useEffect(() => {
+    if (treeFocused) pushScope('file-tree');
+    else popScope('file-tree');
+    return () => popScope('file-tree');
+  }, [treeFocused, pushScope, popScope]);
+
+  const handleTreeFocus = useCallback((e: React.FocusEvent<HTMLDivElement>) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+      setTreeFocused(true);
+    }
+  }, []);
+  const handleTreeBlur = useCallback((e: React.FocusEvent<HTMLDivElement>) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+      setTreeFocused(false);
+    }
+  }, []);
+
+  // Keyboard navigation: move focus between visible tree items (REQ-KB-003).
+  // All .ft-item elements in the DOM are visible — collapsed directories
+  // don't render their children.
+  const handleTreeKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    const root = treeRootRef.current;
+    if (!root) return;
+    const allItems = Array.from(root.querySelectorAll<HTMLElement>('.ft-item'));
+    if (allItems.length === 0) return;
+    const currentIndex = allItems.findIndex(el => el === document.activeElement);
+
+    switch (e.key) {
+      case 'ArrowDown': {
+        e.preventDefault();
+        e.stopPropagation();
+        const next = currentIndex >= 0 && currentIndex < allItems.length - 1
+          ? allItems[currentIndex + 1]!
+          : allItems[0]!;
+        next.focus();
+        break;
+      }
+      case 'ArrowUp': {
+        e.preventDefault();
+        e.stopPropagation();
+        const prev = currentIndex > 0
+          ? allItems[currentIndex - 1]!
+          : allItems[allItems.length - 1]!;
+        prev.focus();
+        break;
+      }
+      case 'Home': {
+        e.preventDefault();
+        e.stopPropagation();
+        allItems[0]!.focus();
+        break;
+      }
+      case 'End': {
+        e.preventDefault();
+        e.stopPropagation();
+        allItems[allItems.length - 1]!.focus();
+        break;
+      }
+      case 'Enter':
+      case ' ': {
+        if (currentIndex >= 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          allItems[currentIndex]!.click();
+        }
+        break;
+      }
+      case 'ArrowRight': {
+        if (currentIndex < 0) return;
+        const el = allItems[currentIndex]!;
+        if (el.dataset['isDirectory'] !== 'true') return;
+        const isExpanded = el.getAttribute('aria-expanded') === 'true';
+        if (!isExpanded) {
+          e.preventDefault();
+          e.stopPropagation();
+          el.click();
+        } else {
+          // Move to first child
+          e.preventDefault();
+          e.stopPropagation();
+          if (currentIndex < allItems.length - 1) {
+            allItems[currentIndex + 1]!.focus();
+          }
+        }
+        break;
+      }
+      case 'ArrowLeft': {
+        if (currentIndex < 0) return;
+        const el = allItems[currentIndex]!;
+        if (el.dataset['isDirectory'] === 'true') {
+          const isExpanded = el.getAttribute('aria-expanded') === 'true';
+          if (isExpanded) {
+            e.preventDefault();
+            e.stopPropagation();
+            el.click();
+            break;
+          }
+        }
+        // Move to parent directory (the nearest preceding item at a lower depth)
+        e.preventDefault();
+        e.stopPropagation();
+        const currentDepth = Number(el.style.paddingLeft || '0');
+        for (let i = currentIndex - 1; i >= 0; i--) {
+          const prevDepth = Number(allItems[i]!.style.paddingLeft || '0');
+          if (prevDepth < currentDepth) {
+            allItems[i]!.focus();
+            break;
+          }
+        }
+        break;
+      }
+      case 'Escape': {
+        e.preventDefault();
+        e.stopPropagation();
+        (document.activeElement as HTMLElement | null)?.blur();
+        break;
+      }
+    }
+  }, []);
 
   // When conversation changes, atomically load new expansion state
   useEffect(() => {
@@ -507,7 +663,15 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   }
 
   return (
-    <div className="ft-root" ref={treeRootRef}>
+    <div
+      className="ft-root"
+      ref={treeRootRef}
+      data-root-path={rootPath}
+      tabIndex={-1}
+      onFocus={handleTreeFocus}
+      onBlur={handleTreeBlur}
+      onKeyDown={handleTreeKeyDown}
+    >
       <div className="ft-dir-label" title={rootPath}>{dirLabel}</div>
       {visibleItems.map(item => {
         const isExpanded = expandedPaths.has(item.path);
@@ -518,6 +682,7 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
           <FileTreeItem
             key={item.path}
             item={item}
+            rootPath={rootPath}
             depth={0}
             isExpanded={isExpanded}
             isLoadingChildren={isLoadingChildren}

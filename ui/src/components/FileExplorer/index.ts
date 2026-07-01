@@ -1,5 +1,7 @@
 export { FileTree } from './FileTree';
 export type { FileItem } from './FileTree';
+export { FILE_TREE_DRAG_TYPE } from './FileTree';
+export { FileTreeContextMenu } from './FileTreeContextMenu';
 export { FileExplorerPanel } from './FileExplorerPanel';
 export { FileBrowserOverlay } from './FileBrowserOverlay';
 export { RecentFilesStrip } from './RecentFilesStrip';

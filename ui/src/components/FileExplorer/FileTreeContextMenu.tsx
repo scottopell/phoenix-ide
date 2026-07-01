@@ -1,20 +1,29 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { copyToClipboard } from '../utils/clipboard';
+import { copyToClipboard } from '../../utils/clipboard';
 import {
   FILE_PATH_CONTEXT_MENU_OPEN_EVENT,
   MESSAGE_CONTEXT_MENU_OPEN_EVENT,
   FILE_TREE_CONTEXT_MENU_OPEN_EVENT,
-} from './contextMenuEvents';
-import './MessageContextMenu.css';
+} from '../contextMenuEvents';
+import '../MessageContextMenu.css';
 
 interface MenuState {
   x: number;
   y: number;
   absolutePath: string;
   relativePath: string;
+  isDirectory: boolean;
 }
 
-export function FilePathContextMenu() {
+function computeRelativePath(rootPath: string, absolutePath: string): string {
+  const root = rootPath.endsWith('/') ? rootPath.slice(0, -1) : rootPath;
+  const prefix = root + '/';
+  if (absolutePath.startsWith(prefix)) return absolutePath.slice(prefix.length);
+  if (absolutePath === root) return '.';
+  return absolutePath;
+}
+
+export function FileTreeContextMenu() {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -22,20 +31,31 @@ export function FilePathContextMenu() {
     if (e.shiftKey) return;
 
     const target = e.target as HTMLElement | null;
-    const messagesContainer = document.getElementById('messages');
-    if (!target || !messagesContainer?.contains(target)) return;
+    if (!target) return;
 
-    const filePathEl = target.closest('.file-path-link') as HTMLElement | null;
-    if (!filePathEl) return;
+    // Only handle right-clicks within the file tree container
+    const treeContainer = target.closest('.ft-root');
+    if (!treeContainer) return;
 
-    const absolutePath = filePathEl.dataset['fileAbsolutePath'];
-    const relativePath = filePathEl.dataset['fileRelativePath'];
-    if (!absolutePath || !relativePath) return;
+    const itemEl = target.closest('.ft-item') as HTMLElement | null;
+    if (!itemEl) return;
+
+    const absolutePath = itemEl.dataset['path'];
+    if (!absolutePath) return;
+
+    const rootPath = treeContainer.dataset['rootPath'] || '';
+    const isDirectory = itemEl.dataset['isDirectory'] === 'true';
 
     e.preventDefault();
     e.stopPropagation();
-    window.dispatchEvent(new Event(FILE_PATH_CONTEXT_MENU_OPEN_EVENT));
-    setMenu({ x: e.clientX, y: e.clientY, absolutePath, relativePath });
+    window.dispatchEvent(new Event(FILE_TREE_CONTEXT_MENU_OPEN_EVENT));
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      absolutePath,
+      relativePath: computeRelativePath(rootPath, absolutePath),
+      isDirectory,
+    });
   }, []);
 
   useEffect(() => {
@@ -43,16 +63,18 @@ export function FilePathContextMenu() {
     return () => document.removeEventListener('contextmenu', handleContextMenu, { capture: true });
   }, [handleContextMenu]);
 
+  // Close when other context menus open
   useEffect(() => {
     const closeMenu = () => setMenu(null);
     window.addEventListener(MESSAGE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
-    window.addEventListener(FILE_TREE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+    window.addEventListener(FILE_PATH_CONTEXT_MENU_OPEN_EVENT, closeMenu);
     return () => {
       window.removeEventListener(MESSAGE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
-      window.removeEventListener(FILE_TREE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+      window.removeEventListener(FILE_PATH_CONTEXT_MENU_OPEN_EVENT, closeMenu);
     };
   }, []);
 
+  // Close on click outside or Escape
   useEffect(() => {
     if (!menu) return;
 
@@ -72,6 +94,7 @@ export function FilePathContextMenu() {
     };
   }, [menu]);
 
+  // Clamp menu position to viewport
   useEffect(() => {
     if (!menu || !menuRef.current) return;
     const rect = menuRef.current.getBoundingClientRect();
@@ -90,12 +113,17 @@ export function FilePathContextMenu() {
 
   if (!menu) return null;
 
-  const copyAbsolutePath = () => {
+  const insertDraft = (text: string) => {
+    window.dispatchEvent(new CustomEvent('phoenix:insert-draft', { detail: { text } }));
+    setMenu(null);
+  };
+
+  const copyAbsolute = () => {
     void copyToClipboard(menu.absolutePath);
     setMenu(null);
   };
 
-  const copyRelativePath = () => {
+  const copyRelative = () => {
     void copyToClipboard(menu.relativePath);
     setMenu(null);
   };
@@ -103,15 +131,22 @@ export function FilePathContextMenu() {
   return (
     <div
       ref={menuRef}
-      className="msg-context-menu file-path-context-menu"
+      className="msg-context-menu file-tree-context-menu"
       style={{ left: menu.x, top: menu.y }}
       onMouseDown={(e) => e.stopPropagation()}
     >
-      <button className="msg-context-item" onClick={copyAbsolutePath}>
+      <button className="msg-context-item" onClick={copyRelative}>
+        Copy relative path
+      </button>
+      <button className="msg-context-item" onClick={copyAbsolute}>
         Copy absolute path
       </button>
-      <button className="msg-context-item" onClick={copyRelativePath}>
-        Copy relative path
+      <div className="msg-context-divider" />
+      <button className="msg-context-item" onClick={() => insertDraft(`@${menu.relativePath} `)}>
+        Insert @file reference
+      </button>
+      <button className="msg-context-item" onClick={() => insertDraft(`./${menu.relativePath} `)}>
+        Insert ./path reference
       </button>
     </div>
   );

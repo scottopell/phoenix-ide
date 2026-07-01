@@ -182,3 +182,34 @@ THE SYSTEM SHALL open the prose reader (full-screen overlay)
 AND close the file browser overlay
 
 **Rationale:** Mobile uses modal overlay for focused file browsing. The same FileTree component renders in both desktop panel and mobile overlay contexts.
+
+---
+
+### REQ-FE-011: File Tree Context Menu, Drag-and-Drop, and Keyboard Navigation
+
+WHEN user right-clicks a file or directory in the file tree
+THE SYSTEM SHALL display a context menu with actions:
+  - Copy relative path (relative to the conversation's working directory)
+  - Copy absolute path
+  - Insert `@file` reference (include file contents at send time, per REQ-IR-001)
+  - Insert `./path` reference (point the AI at the file without expansion, per REQ-IR-008)
+AND shift-right-click SHALL defer to the native browser menu (escape hatch)
+
+WHEN user drags a file or directory from the file tree to the message composer
+THE SYSTEM SHALL insert an `@file` reference into the composer draft
+AND activate the composer's drop highlight during the drag
+AND NOT interfere with the existing OS file drag-and-drop (for attaching files from the desktop)
+
+WHEN a file tree item has keyboard focus
+THE SYSTEM SHALL support the following keyboard navigation:
+  - Arrow Down/Up: move focus between visible tree items
+  - Enter/Space: open file or toggle directory expansion
+  - Arrow Left: collapse an expanded directory, or move focus to parent
+  - Arrow Right: expand a collapsed directory, or move focus to first child
+  - Home/End: jump to first/last visible item
+  - Escape: blur the tree
+AND the file tree SHALL register as a focus scope (per `specs/keyboard-interaction/` REQ-KB-001) while it has keyboard focus, so navigation keys do not leak to the sidebar or other scopes
+
+**Rationale:** A file browser without context menu, drag-and-drop, or keyboard navigation forces users to type `@path` references manually. These affordances reduce friction when referencing files in messages and make the tree usable without a mouse. The focus scope integration prevents key leak per the keyboard interaction model.
+
+**Dependencies:** `specs/keyboard-interaction/` REQ-KB-001 through REQ-KB-008, `specs/inline-references/` REQ-IR-001, REQ-IR-008
