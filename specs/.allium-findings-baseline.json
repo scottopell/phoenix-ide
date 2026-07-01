@@ -4,6 +4,20 @@
   "description": "Accepted allium analyse findings — cross-spec triggers (emitted by bedrock, invisible to per-spec analyser), intentionally implicit system signals (established repo convention, see viewer_slot.allium), and pre-creation mode-selection events. Keyed on (spec, trigger, sorted listening_rules) so new rules listening on an already-baselined trigger are still caught. Regenerate: allium analyse specs/*/*.allium 2>/dev/null | jq -s (see dev.py check_allium)",
   "findings": [
     {
+      "spec": "specs/inline-terminal/inline-terminal.allium",
+      "trigger": "Osc133CommandFinish",
+      "listening_rules": [
+        "InlineCommandCompleted"
+      ]
+    },
+    {
+      "spec": "specs/inline-terminal/inline-terminal.allium",
+      "trigger": "Osc133CommandStart",
+      "listening_rules": [
+        "InlineCommandStarting"
+      ]
+    },
+    {
       "spec": "specs/projects/projects.allium",
       "trigger": "ConversationBecameTerminal",
       "listening_rules": [
