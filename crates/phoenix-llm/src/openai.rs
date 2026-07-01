@@ -1536,14 +1536,15 @@ fn chat_message_to_response(
         .iter()
         .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
     let usage = usage.unwrap_or_default();
+    let cached = u64::from(usage.prompt_tokens_details.cached_tokens);
     Ok(LlmResponse {
         content,
         end_turn: !has_tool_calls,
         usage: Usage {
-            input_tokens: u64::from(usage.prompt_tokens),
+            input_tokens: u64::from(usage.prompt_tokens).saturating_sub(cached),
             output_tokens: u64::from(usage.completion_tokens),
             cache_creation_tokens: 0,
-            cache_read_tokens: 0,
+            cache_read_tokens: cached,
         },
     })
 }
@@ -1867,12 +1868,25 @@ struct ChatFunctionCallDelta {
     arguments: Option<String>,
 }
 
+/// `usage.prompt_tokens_details` on the Chat Completions wire. Baseten and
+/// OpenAI-compatible gateways may report prompt cache hits here; omitted details
+/// mean no cache-read accounting is available for this response.
+#[derive(Debug, Default, Deserialize)]
+struct ChatPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ChatUsage {
     #[serde(default)]
     prompt_tokens: u32,
     #[serde(default)]
     completion_tokens: u32,
+    /// Chat Completions `prompt_tokens` includes `cached_tokens`, so normalization
+    /// splits cached reads out before storing Phoenix's uncached input bucket.
+    #[serde(default)]
+    prompt_tokens_details: ChatPromptTokensDetails,
 }
 
 #[cfg(test)]
@@ -2752,13 +2766,40 @@ mod tests {
                 usage: Some(ChatUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    prompt_tokens_details: ChatPromptTokensDetails::default(),
                 }),
             };
             let result = normalize_chat_response(resp, "test-model").unwrap();
             assert!(result.end_turn);
             assert_eq!(result.usage.input_tokens, 10);
             assert_eq!(result.usage.output_tokens, 5);
+            assert_eq!(result.usage.cache_read_tokens, 0);
             assert!(matches!(&result.content[0], ContentBlock::Text { text } if text == "Hello!"));
+        }
+
+        #[test]
+        fn chat_normalize_threads_cached_prompt_tokens_without_double_counting() {
+            let resp = ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatResponseMessage {
+                        reasoning_content: None,
+                        content: Some("Hello!".to_string()),
+                        tool_calls: None,
+                    },
+                }],
+                usage: Some(ChatUsage {
+                    prompt_tokens: 1_000,
+                    completion_tokens: 50,
+                    prompt_tokens_details: ChatPromptTokensDetails { cached_tokens: 800 },
+                }),
+            };
+            let result = normalize_chat_response(resp, "baseten/deepseek-ai/DeepSeek-V4-Pro")
+                .expect("response should normalize");
+            assert_eq!(result.usage.input_tokens, 200);
+            assert_eq!(result.usage.output_tokens, 50);
+            assert_eq!(result.usage.cache_read_tokens, 800);
+            assert_eq!(result.usage.cache_creation_tokens, 0);
+            assert_eq!(result.usage.context_window_used(), 1_050);
         }
 
         #[test]
@@ -3055,15 +3096,21 @@ mod tests {
             .to_string();
             let usage_chunk = serde_json::json!({
                 "choices": [],
-                "usage": {"prompt_tokens": 100, "completion_tokens": 2}
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 2,
+                    "prompt_tokens_details": {"cached_tokens": 80}
+                }
             })
             .to_string();
             acc.process_event(&text_chunk, &tx).unwrap();
             acc.process_event(&usage_chunk, &tx).unwrap();
             acc.process_event("[DONE]", &tx).unwrap();
             let resp = acc.into_response().unwrap();
-            assert_eq!(resp.usage.input_tokens, 100);
+            assert_eq!(resp.usage.input_tokens, 20);
             assert_eq!(resp.usage.output_tokens, 2);
+            assert_eq!(resp.usage.cache_read_tokens, 80);
+            assert_eq!(resp.usage.context_window_used(), 102);
         }
     }
 }
