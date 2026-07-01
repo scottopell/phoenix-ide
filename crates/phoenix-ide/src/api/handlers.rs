@@ -413,15 +413,20 @@ pub fn create_router(state: AppState) -> Router {
         // exporter uses to set the operation name to "http.server.request" and
         // the resource to "METHOD /template". The `http.response.status_code`
         // field is declared as Empty in the span and recorded in on_response so
-        // it appears as meta.http.status_code.
+        // it appears as meta.http.status_code. For 5xx responses, the OTel span
+        // status is set to ERROR so Datadog counts them in error-rate metrics.
         //
         // The raw `path` field is intentionally omitted from the span to avoid
         // exporting sensitive URL segments (share tokens, file paths) to
         // Datadog. The `http.route` template is sufficient for endpoint
-        // grouping; the `method` field is retained for local log output.
+        // grouping; the `method` field is retained for local log output. For
+        // unmatched/fallback routes where MatchedPath is not available,
+        // `http.route` is set to "unmatched" to avoid leaking raw paths.
         //
         // Health check endpoint (/version) uses Span::none() to suppress it
-        // from both logging and OTel export entirely.
+        // from both logging and OTel export entirely. The on_response callback
+        // checks for Span::none() via id().is_none() before emitting the access
+        // log event.
         .route_layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::http::Request<_>| {
@@ -433,13 +438,14 @@ pub fn create_router(state: AppState) -> Router {
                     } else {
                         // MatchedPath is the route template (e.g.
                         // /api/conversations/:id/stream), available because
-                        // route_layer runs after routing. Fall back to the raw
-                        // path if MatchedPath is not in extensions (e.g.
-                        // fallback routes).
+                        // route_layer runs after routing. For unmatched/fallback
+                        // routes where MatchedPath is not available, use
+                        // "unmatched" to avoid leaking raw paths that may
+                        // contain tokens or file paths.
                         let route = request
                             .extensions()
                             .get::<MatchedPath>()
-                            .map_or_else(|| path.to_string(), |m| m.as_str().to_string());
+                            .map_or_else(|| "unmatched".to_string(), |m| m.as_str().to_string());
                         tracing::info_span!(
                             "http",
                             otel.kind = "server",
@@ -447,6 +453,7 @@ pub fn create_router(state: AppState) -> Router {
                             "http.request.method" = %request.method(),
                             "http.route" = %route,
                             "http.response.status_code" = tracing::field::Empty,
+                            "otel.status_code" = tracing::field::Empty,
                         )
                     }
                 })
@@ -454,14 +461,23 @@ pub fn create_router(state: AppState) -> Router {
                     |response: &axum::http::Response<_>,
                      latency: std::time::Duration,
                      span: &tracing::Span| {
-                        // Record status code as a span attribute (not just an
-                        // event) so the Datadog exporter maps it to
-                        // meta.http.status_code. The field was declared as
-                        // Empty in make_span_with, so record() updates it.
-                        span.record("http.response.status_code", response.status().as_u16());
+                        // Skip access-log event for suppressed spans (e.g.
+                        // /version health checks that use Span::none()).
+                        if span.id().is_none() {
+                            return;
+                        }
+                        let status = response.status().as_u16();
+                        // Record status code as a span attribute so the Datadog
+                        // exporter maps it to meta.http.status_code.
+                        span.record("http.response.status_code", status);
+                        // Mark 5xx responses as errors so Datadog counts them
+                        // in APM error-rate metrics.
+                        if status >= 500 {
+                            span.record("otel.status_code", "ERROR");
+                        }
                         tracing::info!(
                             parent: span,
-                            status = response.status().as_u16(),
+                            status = status,
                             latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
                         );
                     },

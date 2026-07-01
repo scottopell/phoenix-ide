@@ -92,17 +92,25 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
     // Only initialize the Datadog OTel layer when tracing is explicitly
     // opted in. This prevents dev/self-hosted installs without a Datadog
     // agent from creating an exporter that spams localhost:8126 with trace
-    // and telemetry traffic. Opt-in requires any of:
+    // and telemetry traffic.
+    //
+    // DD_TRACE_ENABLED=false is a hard disable that short-circuits before
+    // considering agent host/URL opt-ins, so deployments that inject agent
+    // env vars globally can still opt out per-service.
+    //
+    // Opt-in requires DD_TRACE_ENABLED != false AND any of:
     //   - DD_TRACE_ENABLED=true (explicit)
     //   - DD_TRACE_AGENT_URL is set
     //   - DD_AGENT_HOST is set
-    //   - DD_TRACE_AGENT_HOST is set
-    let dd_tracing_requested = std::env::var("DD_TRACE_ENABLED")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false)
-        || std::env::var("DD_TRACE_AGENT_URL").is_ok()
-        || std::env::var("DD_AGENT_HOST").is_ok()
-        || std::env::var("DD_TRACE_AGENT_HOST").is_ok();
+    let dd_trace_disabled = std::env::var("DD_TRACE_ENABLED")
+        .map(|v| v.eq_ignore_ascii_case("false") || v == "0")
+        .unwrap_or(false);
+    let dd_tracing_requested = !dd_trace_disabled
+        && (std::env::var("DD_TRACE_ENABLED")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false)
+            || std::env::var("DD_TRACE_AGENT_URL").is_ok()
+            || std::env::var("DD_AGENT_HOST").is_ok());
 
     let tracer_provider = if dd_tracing_requested {
         // Fall back to "phoenix-ide" as the service name when DD_SERVICE is
