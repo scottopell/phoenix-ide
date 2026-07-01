@@ -1,6 +1,38 @@
 # Fix `allium analyse` findings — unreachable triggers, broken imports, spec hygiene
 
+**Status: Phases 1-4 complete, Phase 5 partially complete.**
+
 `allium analyse` (v3.2.3) surfaces **23 unreachable-trigger findings** and **111 warnings** across the 37 `.allium` specs that `allium check` reports as zero findings. Work through them in priority-ROI order: mechanical fixes first (broken imports, missing version markers), then a measurement checkpoint, then investigation of remaining unreachable triggers, then optional hygiene cleanup.
+
+## Results
+
+| Metric | Baseline | Final | Delta |
+|---|---|---|---|
+| Findings | 23 | 17 | -6 |
+| Warnings | 111 | 100 | -11 |
+| Unresolved paths | 8 | 0 | -8 ✓ |
+| Missing markers | 4 | 0 | -4 ✓ |
+| Deferred hints | 0 | 30 added | +30 (syntax correct per ref; analyser v3.2.3 doesn't recognize `-- see:` yet) |
+
+### Remaining 17 findings (all `unreachable_trigger`)
+
+**Projects (9):** `ForkProposalPersisted`, `ConversationCreated`, `TaskApprovalStarted`, `ConversationHardDeleted`, `ConversationBecameTerminal`, `SubAgentSpawned`, `UserStartsContinuationConversation`, `WriteAttempted`, `ServerRestarted`
+
+**Terminal (8):** `DataFrameReceived`, `ShellIntegrationDetectionWindowElapsed`, `WorkScopeCleaned`, `FirstResizeFrameReceived`, `ConversationBecameTerminal`, `BytesReadFromMaster`, `ResizeFrameReceived`, `EioOnMasterRead`
+
+All 17 are either:
+- **Cross-spec triggers** (5): emitted by bedrock's `ensures:` clauses or `provides:` surfaces; the per-spec analyser cannot see cross-spec providers.
+- **Intentionally implicit system signals** (12): system events, PTY/WebSocket implementation events, and temporal triggers wired by the implementation, not declared as surface operations. This is an established repo convention (see `viewer_slot.allium` for the pattern).
+
+Both categories are documented with comments in the respective specs. Not fixable in-spec without cross-spec analysis support in the analyser.
+
+### Remaining 100 warnings
+
+- `allium.deferred.missingLocationHint`: 30 — `-- see:` hints added but analyser v3.2.3 doesn't recognize them (known limitation)
+- `allium.surface.unusedBinding`: 20 — `facing` bindings not referenced in surface body (established pattern, not a correctness issue)
+- `allium.definition.unused`: 34 — value types declared but not referenced (would need per-spec analysis to determine if dead or intentionally kept)
+- `allium.entity.unused`: 12 — entities declared but not referenced (same)
+- `allium.externalEntity.missingSourceHint`: 4 — external entities without governing import (would need import additions)
 
 ## Phase 1 — Fix the 8 unresolved import paths (highest ROI)
 
