@@ -484,9 +484,10 @@ describe('handleTotalListHeightChanged', () => {
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     // Simulate: user at bottom, height grows from 500 to 600
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 500 });
-    // First call seeds the baseline (prevHeight) and triggers first-non-empty snap
+    // First call seeds the baseline via the conversation-switch handler
+    // (lastSeenConvIdRef starts undefined) — no snap on initial mount
     act(() => virtuosoMock.totalListHeightChanged?.(500));
-    // Clear the first-non-empty snap so we only observe the re-snap
+    // Clear so we only observe the re-snap
     virtuosoMock.scrollToIndex.mockClear();
     // Second call: height grew, user was at bottom (oldFromBottom = 500 - 100 - 500 = -100 <= 100)
     setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 500 });
@@ -511,10 +512,10 @@ describe('handleTotalListHeightChanged', () => {
     );
 
     const scroller = container.querySelector<HTMLElement>('#messages')!;
-    // Seed baseline (first call triggers the first-non-empty snap)
+    // Seed baseline via the conversation-switch handler (no snap on mount)
     setupScroller(scroller, { scrollHeight: 1000, scrollTop: 0, clientHeight: 400 });
     act(() => virtuosoMock.totalListHeightChanged?.(1000));
-    // Clear the first-non-empty snap call so we only observe subsequent calls
+    // Clear so we only observe subsequent calls
     virtuosoMock.scrollToIndex.mockClear();
 
     // User scrolled up: scrollTop = 0, but content is tall (prevHeight = 1000)
@@ -583,11 +584,15 @@ describe('handleTotalListHeightChanged', () => {
       ),
     );
 
-    // Seed baseline for conversation A
+    // Seed baseline for conversation A.
+    // The first measurement goes through the conversation-switch handler
+    // (lastSeenConvIdRef starts undefined), which seeds the baseline
+    // WITHOUT scrolling — initialTopMostItemIndex already placed the
+    // viewport for a conversation that mounted with messages.
     const scroller = container.querySelector<HTMLElement>('#messages')!;
     setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
     act(() => virtuosoMock.totalListHeightChanged?.(500));
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
 
     // Clear mock to track new calls
     virtuosoMock.scrollToIndex.mockClear();
@@ -646,7 +651,7 @@ describe('handleTotalListHeightChanged', () => {
     act(() => virtuosoMock.totalListHeightChanged?.(800));
     // oldFromBottom = 800 - 100 - 700 = 0 (pinned)
 
-    // Clear the first-non-empty snap call so we only observe subsequent calls
+    // Clear so we only observe subsequent calls
     virtuosoMock.scrollToIndex.mockClear();
 
     // Viewport shrinks from 700 to 500 (200px shrink > 100px threshold)

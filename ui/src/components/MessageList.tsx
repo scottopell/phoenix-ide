@@ -437,7 +437,13 @@ function MessageListImpl({
   //     synchronous with virtuoso's measurement timing.
   const streamingRequestIdRef = useRef(streamingRequestId);
   const convStateRef = useRef(convState);
-  const lastSeenConvIdRef = useRef(conversationId);
+  // Initialized to `undefined` (not `conversationId`) so the conversation-
+  // switch handler in `handleTotalListHeightChanged` fires on the FIRST
+  // measurement too — including initial mount. This seeds the baseline
+  // (prevTotalHeightRef, prevClientHeightRef, hasSeenContentRef) without
+  // scrolling, so a conversation that mounted with messages doesn't get
+  // an extra forced snap on top of `initialTopMostItemIndex`.
+  const lastSeenConvIdRef = useRef<string | undefined>(undefined);
   streamingRequestIdRef.current = streamingRequestId;
   convStateRef.current = convState;
 
@@ -509,9 +515,10 @@ function MessageListImpl({
       // Seed from the scroller so a viewport shrink before the next height
       // delta (composer growth, panel expansion right after navigation)
       // has a valid previous clientHeight to compare against. Setting 0
-      // here would make the shrink handler's `clientHeight < 0` check
-      // always false, causing it to use the new (smaller) height and
-      // misclassify a pinned user as scrolled-up.
+      // here would make the shrink handler's `clientHeight < prevClientHeight`
+      // check always false (no real viewport is 0px tall), causing it to
+      // use the new (smaller) height and misclassify a pinned user as
+      // scrolled-up.
       const s = scrollerRef.current;
       prevClientHeightRef.current = s ? s.clientHeight : 0;
       // Seed from allUnitsLengthRef: if the new conversation already has
@@ -531,10 +538,10 @@ function MessageListImpl({
     // initialTopMostItemIndex only controls the MOUNT position. If Virtuoso
     // mounted with empty data (fresh conversation, or cached metadata before
     // messages arrive), the first real content needs an explicit bottom
-    // snap. Tracked via `hasSeenContentRef` rather than `prevHeight === 0`
-    // because the baseline can be reset to 0 by the conversation-switch
-    // useEffect after the callback already seeded it — using the ref would
-    // re-introduce a scroll-yank on the next async height delta.
+    // snap. Tracked via `hasSeenContentRef` (seeded by the conversation-
+    // switch handler) rather than `prevHeight === 0`, which conflates
+    // "first content" with "baseline was reset" and can re-introduce a
+    // scroll-yank on a delayed height delta.
     if (!hasSeenContentRef.current) {
       hasSeenContentRef.current = true;
       prevClientHeightRef.current = s.clientHeight;
