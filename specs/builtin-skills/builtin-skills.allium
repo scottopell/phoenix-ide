@@ -8,7 +8,7 @@
 --           Frontmatter parsing (already in skills.allium)
 --           Argument substitution (already in skills.allium)
 
-use "./skills.allium" as skills
+use "../skills/skills.allium" as skills
 
 ------------------------------------------------------------
 -- External Entities

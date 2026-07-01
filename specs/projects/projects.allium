@@ -28,7 +28,7 @@
 -- (2 descoped: REQ-PROJ-009, REQ-PROJ-015) plus REQ-PROJ-033..037 (task forks +
 -- Request Changes promotion)
 
-use "./bedrock.allium" as bedrock
+use "../bedrock/bedrock.allium" as bedrock
 
 ------------------------------------------------------------
 -- External Entities
@@ -258,6 +258,17 @@ config {
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
+
+-- System signals: several rules listen for triggers that are not declared
+-- in any local surface's `provides` clause. These are intentionally implicit:
+--   - ConversationCreated, ServerRestarted, SubAgentSpawned, WriteAttempted,
+--     TaskApprovalStarted — system-level events wired by the implementation,
+--     not user actions on a surface (same convention as bedrock's
+--     ServerRestarted; see viewer_slot.allium for the established pattern).
+--   - ConversationBecameTerminal, ConversationHardDeleted, ForkProposalPersisted,
+--     UserStartsContinuationConversation — cross-spec triggers emitted by
+--     bedrock rules (ensures:) or provided by bedrock's UserConversation surface.
+--     The per-spec analyser cannot see cross-spec providers.
 
 -- ===========================================================
 -- 1. PROJECT DETECTION & MODE (REQ-PROJ-001, 002, 016, 018)
@@ -1747,22 +1758,32 @@ surface ProjectManagement {
     facing: bedrock/User
 
     context conversation: bedrock/Conversation
-        where mode in { work, branch } and core_status in { idle, error }
+        where core_status in { idle, error }
 
     let worktree = Worktree{conversation: conversation}
 
     exposes:
-        worktree.branch_name
-        worktree.base_branch
         conversation.mode
-        worktree.is_clean
+        worktree.branch_name when exists worktree
+        worktree.base_branch when exists worktree
+        worktree.is_clean when exists worktree
         -- Plain-brief forks are Work-mode with no typed task_file (REQ-PROJ-034), so
         -- gate the status read on its presence — never deref an absent task_file.
         worktree.task_file.status when conversation.mode = work and exists worktree.task_file
 
     provides:
+        UserSelectsManaged(conversation)
+            when conversation.mode = direct
+        UserSelectsBranch(conversation, branch_name)
+            when conversation.mode = direct
+        UserSendsFirstMessage(conversation)
+            when conversation.mode = explore
+        UserApprovesTask(conversation, decision)
+            when conversation.parent_status = awaiting_task_approval
         UserMarksAsMerged(conversation)
+            when conversation.mode in { work, branch }
         UserConfirmsAbandon(conversation)
+            when conversation.mode in { work, branch }
 
     @guarantee NonFatalBookkeeping
         -- Task file status updates are best-effort. If they fail,

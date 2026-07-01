@@ -1,3 +1,4 @@
+-- allium: 3
 -- Inline References Specification
 --
 -- How @file, /skill, and ./path references are tokenized, resolved,
@@ -6,7 +7,7 @@
 --
 -- This spec covers the message input lifecycle from keystroke to LLM request.
 
-use "./specs/bedrock/bedrock.allium" as bedrock
+use "../bedrock/bedrock.allium" as bedrock
 
 ------------------------------------------------------------
 -- Value Types

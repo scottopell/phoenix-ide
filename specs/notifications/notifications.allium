@@ -1,9 +1,10 @@
+-- allium: 3
 -- Notifications Specification
 --
 -- Browser desktop notifications when conversations need user attention.
 -- Driven by SSE state_change events, configured via server-side settings.
 
-use "./specs/bedrock/bedrock.allium" as bedrock
+use "../bedrock/bedrock.allium" as bedrock
 
 ------------------------------------------------------------
 -- Enumerations

@@ -233,6 +233,18 @@ config {
 -- Rules
 ------------------------------------------------------------
 
+-- System signals: several rules listen for triggers that are not declared
+-- in any local surface's `provides` clause. These are intentionally implicit:
+--   - BytesReadFromMaster, EioOnMasterRead, DataFrameReceived, ResizeFrameReceived,
+--     FirstResizeFrameReceived — PTY and WebSocket implementation events wired
+--     by the terminal relay, not user actions on a surface.
+--   - ShellIntegrationDetectionWindowElapsed — temporal trigger fired by an
+--     implementation timer (tokio sleep / setTimeout), not a surface operation.
+--   - WorkScopeCleaned — local event wired to project-lifecycle cleanup hooks
+--     (see TerminalTornDownWithWorkScopeCleanup @guidance).
+--   - ConversationBecameTerminal — cross-spec trigger emitted by bedrock rules;
+--     the per-spec analyser cannot see cross-spec providers.
+
 -- REQ-TERM-001, REQ-TERM-002, REQ-TERM-WS-001: Terminal opened, PTY spawned
 rule TerminalOpened {
     -- A UserOpensTerminal is keyed by WorkScope. For Conversation and
@@ -963,7 +975,7 @@ surface ShellIntegrationProtocol {
         terminal.last_completed_command
         terminal.reported_cwd
 
-    expects:
+    provides:
         Osc133MarkerReceived(terminal, "A")
             -- FTCS_PROMPT_START — shell is about to render a new prompt.
             -- Clears last_completed_command.
@@ -1062,6 +1074,5 @@ deferred macOsKqueueSupport
 --     chained event) preferred over cross-spec state-watch on is_terminal.
 --     Rationale and design discussion: tasks/08658.
 --
--- Import path note: uses "../bedrock/bedrock.allium" (relative to terminal.allium).
--- projects.allium uses "./bedrock.allium" (same directory). Both are correct
--- relative paths; the terminal spec lives one level deeper than bedrock.
+-- Import path note: all specs import bedrock as "../bedrock/bedrock.allium"
+-- since each spec lives in its own subdirectory alongside specs/bedrock/.

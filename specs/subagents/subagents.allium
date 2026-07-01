@@ -30,8 +30,8 @@
 --  injection is not implemented in the spawn handler — tracked in
 --  requirements.md status.)
 
-use "./bedrock.allium" as bedrock
-use "./projects.allium" as projects
+use "../bedrock/bedrock.allium" as bedrock
+use "../projects/projects.allium" as projects
 
 ------------------------------------------------------------
 -- Value Types

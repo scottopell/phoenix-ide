@@ -1,9 +1,10 @@
+-- allium: 3
 -- Auth & Share Specification
 --
 -- Single-user password authentication and read-only share mode.
 -- Imports bedrock for the Conversation entity and UserConversation surface.
 
-use "./specs/bedrock/bedrock.allium" as bedrock
+use "../bedrock/bedrock.allium" as bedrock
 
 ------------------------------------------------------------
 -- Config

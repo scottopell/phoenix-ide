@@ -41,7 +41,7 @@
 --
 -- Requirement traceability: REQ-STEER-001 through REQ-STEER-005
 
-use "./bedrock.allium" as bedrock
+use "../bedrock/bedrock.allium" as bedrock
 
 ------------------------------------------------------------
 -- Value Types
