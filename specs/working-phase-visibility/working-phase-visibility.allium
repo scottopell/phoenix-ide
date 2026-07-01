@@ -1158,7 +1158,7 @@ surface ConversationActivityFeed {
 -- Deferred
 ------------------------------------------------------------
 
-deferred MultipleParallelToolsInOneAssistantMessage
+deferred MultipleParallelToolsInOneAssistantMessage    -- see: ui/src/components/StateBar.tsx
     -- The runtime currently dispatches tool calls sequentially within a
     -- turn. If parallel dispatch arrives, the per-tool InflightToolTimer
     -- entity already supports it (each tool has its own started_at);
@@ -1168,21 +1168,21 @@ deferred MultipleParallelToolsInOneAssistantMessage
     -- materialises.
     -- Location: ui/src/components/StateBar.tsx
 
-deferred AggregateActivityDashboard
+deferred AggregateActivityDashboard    -- see: ui/src/pages/
     -- A cross-conversation view ("which conversations have stuck agents,
     -- by reason") is potentially useful for operators but out of scope
     -- for v1. The per-conversation indicators in this spec are the
     -- precondition for any such aggregate view.
     -- Location: would live in ui/src/pages/
 
-deferred PerArtifactRetryBadge
+deferred PerArtifactRetryBadge    -- see: ui/src/components/MessageComponents.tsx
     -- Per REQ-LRV-007 the retry badge lives on the assistant message
     -- bubble. Equivalent inline badges on tool widgets ("this tool
     -- call's underlying LLM turn retried 2x") would require correlating
     -- retry events to specific tool blocks; defer.
     -- Location: ui/src/components/MessageComponents.tsx
 
-deferred Req008ReloadContinuity
+deferred Req008ReloadContinuity    -- see: specs/working-phase-visibility/requirements.md
     -- REQ-WPV-008 ("display continuity across reload, within 1s of
     -- continuous-connect") is an emergent property of:
     --   (a) REQ-WPV-001's server-authoritative state_updated_at being

@@ -1015,12 +1015,12 @@ surface ShellIntegrationProtocol {
 -- Deferred
 ------------------------------------------------------------
 
-deferred TmuxIntegration.named_sessions
+deferred TmuxIntegration.named_sessions    -- see: specs/tmux-integration/
     -- Persistent named sessions; reconnect to existing session on WS open.
     -- Future path for users who want scrollback or session persistence.
     -- KISS: named sessions only. See KT doc for context.
 
-deferred ShellIntegrationAbsentFallback
+deferred ShellIntegrationAbsentFallback    -- see: specs/terminal/
     -- If evidence shows users need read-screen capability when shell integration
     -- is absent, a minimal grid scraper (vt100/alacritty_terminal) could be
     -- added as a fallback. Explicitly out of scope for this version: the
@@ -1029,7 +1029,7 @@ deferred ShellIntegrationAbsentFallback
     -- Revisit if user feedback indicates the error is blocking enough workflows
     -- to justify the complexity of maintaining a grid scraper in parallel.
 
-deferred ShellIntegrationAutoInjection
+deferred ShellIntegrationAutoInjection    -- see: specs/terminal/
     -- Phoenix could inject OSC 133 precmd/preexec hooks into the user's shell
     -- by manipulating ZDOTDIR, --rcfile, or $BASH_ENV at spawn time. This
     -- would make shell integration work without any user action.
@@ -1045,7 +1045,7 @@ deferred ShellIntegrationAutoInjection
     -- Revisit auto-injection if evidence shows users want the zero-config
     -- experience enough to accept the risk.
 
-deferred macOsKqueueSupport
+deferred macOsKqueueSupport    -- see: specs/terminal/
     -- PTY master fds have historically had kqueue quirks on macOS.
     -- Linux is the v1 target platform. Test on macOS before enabling.
 

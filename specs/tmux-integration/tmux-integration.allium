@@ -813,7 +813,7 @@ surface UserTerminalTmuxBridging {
 -- Deferred
 ------------------------------------------------------------
 
-deferred TmuxMultiAttach
+deferred TmuxMultiAttach    -- see: specs/terminal/
     -- Tmux's native protocol supports multiple clients attached to the
     -- same session simultaneously (each client gets its own resize and
     -- input stream; output is broadcast). The original draft of this
@@ -828,7 +828,7 @@ deferred TmuxMultiAttach
     -- REQ-TERM-003 wording would need updating.
     -- Location: specs/terminal/
 
-deferred TmuxStaleRecoveryNotification
+deferred TmuxStaleRecoveryNotification    -- see: src/tools/tmux/
     -- v1 silently unlinks and recreates after a stale socket detection
     -- (system reboot recovery). The original draft proposed a
     -- `send-keys -l` breadcrumb in the recovered pane, but that approach
@@ -840,7 +840,7 @@ deferred TmuxStaleRecoveryNotification
     -- failure mode justifies the additional surface area.
     -- Location: src/tools/tmux/
 
-deferred TmuxResourceQuotas
+deferred TmuxResourceQuotas    -- see: src/tools/tmux/registry.rs
     -- Per-conversation tmux servers consume process slots and memory. A
     -- runaway agent could create dozens of long-lived tmux windows. v1
     -- relies on tmux's own per-server limits (high but not unbounded);
@@ -848,7 +848,7 @@ deferred TmuxResourceQuotas
     -- conversation) belong in v2 if abuse patterns emerge.
     -- Location: src/tools/tmux/registry.rs
 
-deferred TmuxSocketRelocation
+deferred TmuxSocketRelocation    -- see: src/tools/tmux/registry.rs
     -- Some operators may want sockets in a different directory (e.g., a
     -- per-user runtime dir like /run/user/<uid>/phoenix-ide/). v1 hard-
     -- codes ~/.phoenix-ide/tmux-sockets/ for predictability and co-

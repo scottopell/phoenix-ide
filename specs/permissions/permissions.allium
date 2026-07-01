@@ -261,7 +261,7 @@ surface AgentToolGate {
 -- Deferred
 ------------------------------------------------------------
 
-deferred IntentAgnosticRiskEncoder
+deferred IntentAgnosticRiskEncoder    -- see: crates/phoenix-ide/src/ (DenyGate::check)
     -- An on-device dangerous-action classifier stacks behind Layer 0 as a
     -- second DenyGate stage: it runs only on calls Layer 0 allowed, and may
     -- add a denial (SAFE passes; RISKY/BLOCKED deny) but never removes a
@@ -269,7 +269,7 @@ deferred IntentAgnosticRiskEncoder
     -- reuses this seam's clear/deny shape with no new context plumbing.
     -- Location: would extend DenyGate::check in crates/phoenix-ide/src/.
 
-deferred IntentAwareEnforcement
+deferred IntentAwareEnforcement    -- see: crates/phoenix-ide/src/ (DenyGate)
     -- Judging an action against what the user authorized (overeagerness /
     -- consent-scoping) requires the conversation transcript and a reasoning
     -- step. It is a distinct layer from this intent-agnostic seam and is where

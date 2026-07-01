@@ -938,7 +938,7 @@ invariant OneTokenPerServer {
 -- Deferred
 ------------------------------------------------------------
 
-deferred ToolCallCancellationSafety
+deferred ToolCallCancellationSafety    -- see: crates/phoenix-tools/src/mcp.rs
     -- REQ-MCP-017. Cancellation safety and tool-error surfacing are executor
     -- mechanics, not connection-lifecycle states: McpTool::run spawns the
     -- tools/call as a detached task and selects on the cancellation token, so
@@ -948,7 +948,7 @@ deferred ToolCallCancellationSafety
     -- the granularity of the ConnState machine modeled here.
     -- Location: crates/phoenix-tools/src/mcp.rs (McpTool::run)
 
-deferred ReAuthCallRetry
+deferred ReAuthCallRetry    -- see: crates/phoenix-tools/src/mcp.rs
     -- REQ-MCP-012. Replaying the request whose 401/403 triggered a re-auth is
     -- an executor continuation, not a connection-lifecycle state, and covers
     -- both re-auth paths symmetrically: a 403 insufficient_scope step-up

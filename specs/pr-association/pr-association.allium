@@ -758,7 +758,7 @@ surface AbandonCleanup {
 -- Action. It is named here so the traceability is explicit rather than
 -- silently absent.
 
-deferred PrFeedbackFreshnessAdvisory
+deferred PrFeedbackFreshnessAdvisory    -- see: ui/src/components/WorkActions.tsx
     -- REQ-PRA-001. WHEN a Work or Branch conversation has an open associated PR
     -- AND PR feedback changed since Phoenix last captured agent-facing PR
     -- remediation context, a compact advisory count marker (`{N} new` or
@@ -770,7 +770,7 @@ deferred PrFeedbackFreshnessAdvisory
     -- baseline captured by PrRemediationContextBaseline below.
     -- Location: ui/src/components/WorkActions.tsx (PrRemediationActions)
 
-deferred PrRemediationContextBaseline
+deferred PrRemediationContextBaseline    -- see: crates/phoenix-ide/src/api/pr_monitoring.rs
     -- REQ-PRA-002. WHEN Phoenix successfully captures PR remediation context for
     -- an associated PR, that successful capture is recorded as the baseline for
     -- agent-facing PR feedback freshness, keyed by WorkScope and PR number:
@@ -782,7 +782,7 @@ deferred PrRemediationContextBaseline
     -- actually handed the agent, not what GitHub contained at an unrelated time.
     -- Location: crates/phoenix-ide/src/api/pr_monitoring.rs (WorkScope-keyed PR baseline persistence)
 
-deferred BoundedPrFeedbackRefresh
+deferred BoundedPrFeedbackRefresh    -- see: crates/phoenix-ide/src/api/pr_monitoring.rs
     -- REQ-PRA-003. WHEN refreshing routine PR status, the poll stays lightweight
     -- and does NOT fetch all PR feedback surfaces unless gated by evidence that
     -- feedback may have changed — PR `github_updated_at` newer than the latest
@@ -795,7 +795,7 @@ deferred BoundedPrFeedbackRefresh
     -- modelled in the status rules above.
     -- Location: crates/phoenix-ide/src/api/pr_monitoring.rs (pr-status handler, gated full fetch)
 
-deferred PrFeedbackCoverageHealthAdvisory
+deferred PrFeedbackCoverageHealthAdvisory    -- see: crates/phoenix-ide/src/api/pr_monitoring.rs
     -- REQ-PRA-004. WHEN classifying PR feedback freshness AND at least one
     -- feedback surface cannot be read, a coverage-health signal distinct from
     -- the freshness advisory identifies the unreadable surfaces, distinguishing

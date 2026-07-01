@@ -552,7 +552,7 @@ surface RetryCountPersistedSurface {
 -- Deferred
 ------------------------------------------------------------
 
-deferred PerProviderRetryPolicies
+deferred PerProviderRetryPolicies    -- see: crates/phoenix-ide/src/state_machine/transition.rs
     -- All retryable LlmErrorKind variants share the global
     -- MAX_RETRY_ATTEMPTS = 3 ceiling (`state_machine/transition.rs:183`)
     -- and the exponential backoff 1s/2s/4s. Per-provider customisation
@@ -562,7 +562,7 @@ deferred PerProviderRetryPolicies
     -- change. Defer until a use case materialises.
     -- Location: crates/phoenix-ide/src/state_machine/transition.rs
 
-deferred LiveBackoffCountdown
+deferred LiveBackoffCountdown    -- see: ui/src/components/StateBar.tsx
     -- A live "backing off Ns" sub-display would compose
     -- (now() - llm_attempt.event_arrived_at) against
     -- llm_attempt.backing_off_ms to show the remaining backoff.
@@ -572,7 +572,7 @@ deferred LiveBackoffCountdown
     -- this; the static "(retry K/N <reason>)" suffix is sufficient.
     -- Location: ui/src/components/StateBar.tsx
 
-deferred CrossConversationRetryRollup
+deferred CrossConversationRetryRollup    -- see: ui/src/pages/
     -- A parent-view aggregation ("this parent's sub-agents are
     -- collectively retrying") is potentially useful for the
     -- aggregate-dashboard feature but out of scope for v1. The
@@ -580,7 +580,7 @@ deferred CrossConversationRetryRollup
     -- for any such rollup.
     -- Location: would live in ui/src/pages/
 
-deferred PerToolRetryBadge
+deferred PerToolRetryBadge    -- see: ui/src/components/MessageComponents.tsx
     -- An inline badge on a tool widget ("this tool call's underlying
     -- LLM turn retried 2x") would require correlating LlmAttempt
     -- events to specific tool blocks. The retry_count on the
@@ -590,7 +590,7 @@ deferred PerToolRetryBadge
     -- entry — the two are linked.
     -- Location: ui/src/components/MessageComponents.tsx
 
-deferred Req005CancellationDuringBackoff
+deferred Req005CancellationDuringBackoff    -- see: specs/conversation_atom/
     -- REQ-LRV-005 is satisfied by the existing state machine: a
     -- user-triggered cancel during backoff transitions the
     -- conversation to a Cancelling* variant (handled by
@@ -606,7 +606,7 @@ deferred Req005CancellationDuringBackoff
     -- explicit documentation of this behaviour.
     -- Location: specs/conversation_atom/ (state machine transitions)
 
-deferred ReplayRingMembershipStructural
+deferred ReplayRingMembershipStructural    -- see: specs/sse_wire/
     -- The LlmAttemptReplayEligible invariant above is asserted as
     -- prose because cross-spec entity membership is awkward to
     -- express structurally in Allium v3. A future extension could

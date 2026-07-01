@@ -1242,20 +1242,20 @@ surface AgentBashAccess {
 -- Deferred
 ------------------------------------------------------------
 
-deferred BashHandleStdinSupport
+deferred BashHandleStdinSupport    -- see: src/tools/bash/
     -- Some non-interactive workflows benefit from sending input bytes to a
     -- still-running process. The current model does not expose stdin; the
     -- agent should use the tmux tool when it needs to send input. Revisit
     -- if a non-interactive use case demonstrates need.
     -- Location: src/tools/bash/
 
-deferred BashHandleResourceMetrics
+deferred BashHandleResourceMetrics    -- see: src/tools/bash/handle.rs
     -- CPU time, max RSS, page faults could be returned alongside
     -- exit_code/duration_ms. Useful for the agent to reason about the
     -- cost of long-running commands. Out of scope for v1.
     -- Location: src/tools/bash/handle.rs
 
-deferred BashHandleOutputDiskSpill
+deferred BashHandleOutputDiskSpill    -- see: src/tools/bash/ring.rs
     -- For runs that legitimately produce > 4MB of output, spilling the
     -- ring overflow to disk and exposing the file path in responses
     -- (analogous to specs/terminal/'s truncated-output disk writes) would
@@ -1263,7 +1263,7 @@ deferred BashHandleOutputDiskSpill
     -- signalling for now.
     -- Location: src/tools/bash/ring.rs
 
-deferred BashHandleCrossRestartPersistence
+deferred BashHandleCrossRestartPersistence    -- see: src/tools/bash/
     -- v1 deliberately does NOT persist handles across Phoenix restart;
     -- agents see handle_not_found and re-run. The earlier draft proposed
     -- a SQLite shadow store with `lost_in_restart` tombstones; the panel
