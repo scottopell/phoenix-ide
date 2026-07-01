@@ -184,7 +184,7 @@ const FileTreeItem = memo(function FileTreeItem({
       isText: item.viewer.kind === 'text',
     }));
     e.dataTransfer.effectAllowed = 'copy';
-  }, [item.path, item.is_directory, rootPath, isDisabled]);
+  }, [item.path, item.is_directory, item.viewer.kind, rootPath, isDisabled]);
 
   return (
     <div>
