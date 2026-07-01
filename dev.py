@@ -3015,15 +3015,28 @@ def _categorize_changed_paths(paths) -> set:
     return cats
 
 
+# Single-slot memo for _changed_paths_vs_base: lane gating and rust
+# crate-scoping both consume the diff, and the git state cannot change
+# mid-check, so the ~8 git subprocesses behind it run once per invocation.
+_changed_paths_memo: list = []
+
+
 def _changed_paths_vs_base():
     """Return a set of repo-relative paths that differ from the integration
     base, or None if the base cannot be determined (caller runs everything).
+    Memoized for the lifetime of the invocation.
 
     "Differ from base" = tracked changes between merge-base(HEAD, base) and the
     working tree, unioned with untracked-but-not-ignored files. The base ref is
     PHOENIX_CHECK_BASE if set, else the remote default branch (origin/HEAD),
     else origin/main, else main.
     """
+    if not _changed_paths_memo:
+        _changed_paths_memo.append(_compute_changed_paths_vs_base())
+    return _changed_paths_memo[0]
+
+
+def _compute_changed_paths_vs_base():
     def _git(args):
         return subprocess.run(
             ["git", *args], cwd=ROOT, capture_output=True, text=True,
@@ -3178,19 +3191,35 @@ _RUST_NONCRATE_PREFIXES = (".cargo/", "rust-toolchain", "ui/src/generated/")
 _RUST_NONCRATE_FILES = ("Cargo.toml", "Cargo.lock")
 
 
+# Single-slot memo for `cargo metadata --no-deps`: rust crate-scoping and
+# ts-rs export-crate discovery both read it, and the workspace manifest set
+# cannot change mid-check.
+_workspace_metadata_memo: list = []
+
+
+def _workspace_metadata():
+    """Parsed `cargo metadata --format-version 1 --no-deps` for the workspace,
+    memoized for the lifetime of the invocation. Returns None on any failure
+    (callers fall back to full-workspace behaviour)."""
+    if not _workspace_metadata_memo:
+        try:
+            out = subprocess.run(
+                ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                cwd=ROOT, capture_output=True, text=True, timeout=60,
+            )
+            meta = json.loads(out.stdout) if out.returncode == 0 else None
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+            meta = None
+        _workspace_metadata_memo.append(meta)
+    return _workspace_metadata_memo[0]
+
+
 def _workspace_rdeps_map():
     """Map each workspace crate -> set of crates that (transitively) depend on
     it, INCLUDING the crate itself. Derived from `cargo metadata`. Returns None
     on any failure (caller falls back to full workspace)."""
-    try:
-        out = subprocess.run(
-            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-            cwd=ROOT, capture_output=True, text=True, timeout=60,
-        )
-        if out.returncode != 0:
-            return None
-        meta = json.loads(out.stdout)
-    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+    meta = _workspace_metadata()
+    if meta is None:
         return None
     ws = {p["name"] for p in meta["packages"]}
     # direct intra-workspace dependency edges: crate -> {deps in ws}
