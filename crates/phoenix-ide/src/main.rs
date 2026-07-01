@@ -907,7 +907,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let compression = CompressionLayer::new().gzip(true).br(true);
 
-    // HTTP access log: one line per request with method, path, status, latency.
+    // HTTP access log + Datadog tracing: one span per request with method,
+    // path, status, latency. The `otel.kind = "server"` field is read by the
+    // tracing-opentelemetry bridge to set SpanKind::Server, which the
+    // datadog-opentelemetry exporter maps to type=web. The `http.request.method`
+    // and `http.route` fields are mapped to OTel HTTP semantic conventions,
+    // which the exporter uses to set the operation name to "http.server.request"
+    // and the resource to "METHOD /path". The `http.response.status_code` is
+    // recorded on the span in on_response so it appears as meta.http.status_code.
+    //
     // Health check endpoint (/version) is suppressed from normal INFO logging.
     let trace_layer = TraceLayer::new_for_http()
         .make_span_with(|request: &axum::http::Request<_>| {
@@ -917,14 +925,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if path == "/version" {
                 tracing::debug_span!(
                     "http",
+                    otel.kind = "server",
                     method = %request.method(),
                     path = %path,
+                    "http.request.method" = %request.method(),
+                    "http.route" = %path,
                 )
             } else {
                 tracing::info_span!(
                     "http",
+                    otel.kind = "server",
                     method = %request.method(),
                     path = %path,
+                    "http.request.method" = %request.method(),
+                    "http.route" = %path,
                 )
             }
         })
@@ -932,6 +946,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             |response: &axum::http::Response<_>,
              latency: std::time::Duration,
              span: &tracing::Span| {
+                // Record status code as a span attribute (not just an event) so
+                // the Datadog exporter maps it to meta.http.status_code.
+                span.record("http.response.status_code", response.status().as_u16());
                 tracing::info!(
                     parent: span,
                     status = response.status().as_u16(),
