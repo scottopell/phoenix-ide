@@ -41,7 +41,7 @@ New `FileTreeContextMenu.tsx` following the existing `FilePathContextMenu` patte
 - `InputArea`'s drop handler detects the custom type *before* the existing OS `Files` check, so the two drop modes don't conflict
 - On drop, inserts an `@path` reference into the draft (include-contents is the most common intent; the context menu covers `./path` for the less common case)
 - Visual feedback: the composer's existing `isDragOver` highlight activates for custom-type drags too
-- Directories are also draggable — dropping a directory inserts `@dir/` (the server's `@` expansion handles directories)
+- Directories are also draggable — dropping a directory inserts `./path` (since `@` expansion is text-only and rejects directory paths)
 
 ### Feature 3: Keyboard Navigation in File Tree
 

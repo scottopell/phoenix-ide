@@ -352,7 +352,11 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   const handleTreeKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
     const root = treeRootRef.current;
     if (!root) return;
-    const allItems = Array.from(root.querySelectorAll<HTMLElement>('.ft-item'));
+    // Filter out disabled rows (opaque/non-viewable files) — they have
+    // tabIndex={-1} and click disabled, so they shouldn't receive keyboard
+    // focus via arrow navigation either.
+    const allItems = Array.from(root.querySelectorAll<HTMLElement>('.ft-item'))
+      .filter(el => !el.classList.contains('ft-item--disabled'));
     if (allItems.length === 0) return;
     const currentIndex = allItems.findIndex(el => el === document.activeElement);
 

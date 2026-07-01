@@ -187,29 +187,30 @@ AND close the file browser overlay
 
 ### REQ-FE-011: File Tree Context Menu, Drag-and-Drop, and Keyboard Navigation
 
-WHEN user right-clicks a file in the file tree
+WHEN user right-clicks a text file in the file tree
 THE SYSTEM SHALL display a context menu with actions:
   - Copy relative path (relative to the conversation's working directory)
   - Copy absolute path
   - Insert `@file` reference (include file contents at send time, per REQ-IR-001)
   - Insert `./path` reference (point the AI at the file without expansion, per REQ-IR-008)
 
-WHEN user right-clicks a directory in the file tree
+WHEN user right-clicks a non-text file (image, binary) or a directory in the file tree
 THE SYSTEM SHALL display a context menu with actions:
   - Copy relative path
   - Copy absolute path
-  - Insert `./path` reference (per REQ-IR-008 — `@` expansion rejects directory paths)
+  - Insert `./path` reference (per REQ-IR-008 — `@` expansion is text-only and rejects non-text files and directory paths)
 
 AND shift-right-click SHALL defer to the native browser menu (escape hatch)
 
-WHEN user drags a file from the file tree to the message composer
+WHEN user drags a text file from the file tree to the message composer
 THE SYSTEM SHALL insert an `@file` reference into the composer draft
 AND activate the composer's drop highlight during the drag
 AND NOT interfere with the existing OS file drag-and-drop (for attaching files from the desktop)
 
-WHEN user drags a directory from the file tree to the message composer
+WHEN user drags a non-text file or a directory from the file tree to the message composer
 THE SYSTEM SHALL insert a `./path` reference into the composer draft
-(since `@` expansion rejects tokens ending in `/`, directories use `./path` instead)
+(since `@` expansion is text-only, non-text files and directories use `./path` instead)
+AND NOT interfere with the existing OS file drag-and-drop (for attaching files from the desktop)
 
 WHEN a file tree item has keyboard focus
 THE SYSTEM SHALL support the following keyboard navigation:

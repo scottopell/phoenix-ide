@@ -173,6 +173,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const [isDragOver, setIsDragOver] = useState(false);
   const [isUploadingFiles, setIsUploadingFiles] = useState(false);
 
+  // External draft insertions (file-tree context menu, drag-and-drop) bypass
+  // handleChange/refValueChange, so expansionError is never cleared. Listen
+  // for the insert event and clear the error so Send isn't left disabled.
+  useEffect(() => {
+    const handler = () => setExpansionError(null);
+    window.addEventListener('phoenix:insert-draft', handler);
+    return () => window.removeEventListener('phoenix:insert-draft', handler);
+  }, [setExpansionError]);
+
   // =========================================================================
   // Auto-resize
   // =========================================================================

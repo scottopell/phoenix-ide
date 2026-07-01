@@ -136,6 +136,7 @@ export function FileTreeContextMenu() {
       ref={menuRef}
       className="msg-context-menu file-tree-context-menu"
       style={{ left: menu.x, top: menu.y }}
+      role="menu"
       onMouseDown={(e) => e.stopPropagation()}
     >
       <button className="msg-context-item" onClick={copyRelative}>
