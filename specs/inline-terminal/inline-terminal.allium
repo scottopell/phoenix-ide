@@ -468,13 +468,17 @@ deferred BedrockInlineTerminalBusyState
 
 deferred OriginDiscriminatorSchema
     -- REQ-IT-007's single `origin` marker (user | agent) is a new persisted
-    -- field on the tool round. `MessageContent` carries no `origin` today, so
-    -- while no new `MessageContent` variant is added (inline rounds reuse the
-    -- Agent + Tool messages), a schema change IS owed: the persisted tool round
-    -- gains an `origin` discriminator (default `agent` for existing rows — a
-    -- true-absence default, since pre-feature rounds were all agent-authored).
-    -- Tracked here so the schema addition is visible the way the core_status
-    -- coupling is, rather than implied by design.md.
+    -- field. A tool round is two message rows — an Agent message carrying the
+    -- `tool_use` and a Tool message carrying the `tool_result` — so "stored
+    -- once" means origin lives on exactly one: the Agent message (the authored
+    -- `tool_use`). The paired Tool message stores no copy; its attribution is
+    -- derived by pairing on `tool_use_id`, so origin cannot diverge across the
+    -- pair. `MessageContent` carries no `origin` today; no new variant is added
+    -- (inline rounds reuse Agent + Tool messages), but the Agent message gains
+    -- an `origin` column (default `agent` for existing rows — a true-absence
+    -- default, since pre-feature messages were all agent-authored). Tracked here
+    -- so the schema addition is visible the way the core_status coupling is,
+    -- rather than implied by design.md.
     -- Location: crates/phoenix-core/src/domain/db_schema.rs
 
 deferred TuiCursorAddressedOutput

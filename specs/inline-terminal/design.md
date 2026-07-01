@@ -161,10 +161,14 @@ follows the precedent of `MessageContent::Skill`, which is delivered to the LLM
 as a user-role message yet attributed in history as system-generated — one
 stored fact, two derived presentations.
 
-The origin marker is modeled as a discriminator on the persisted tool round, not
-as a parallel "is_user" boolean alongside an agent/user enum elsewhere. A single
-`origin` field whose value is `user` for inline rounds (and, by construction,
-`agent` for the existing agent path) keeps the two presentations from drifting.
+A tool round is two message rows — the `Agent` message carrying the `tool_use`
+and the `Tool` message carrying the `tool_result` — so "stored once" means origin
+lives on exactly one of them: the `Agent` message (the authored `tool_use`). The
+paired `Tool` message carries no copy; its attribution is derived by pairing on
+`tool_use_id`, so origin cannot diverge across the pair. The marker is a single
+`origin` field (value `user` for inline rounds, `agent` by construction for the
+existing agent path), not a parallel "is_user" boolean alongside an enum
+elsewhere — one stored fact, all presentations derived.
 
 ### Why output is not a bare string
 
@@ -184,11 +188,12 @@ without migrating persisted rounds.
 ## Persistence
 
 Inline rounds persist through the same message path as agent tool rounds — an
-`Agent` message and a `Tool` message — with the `origin` discriminator on the
-round. No new top-level `MessageContent` *variant* is required: the rounds are
-ordinary agent/tool messages distinguished only by origin, which keeps the LLM
-history builder and crash recovery on their existing paths. There is still a
-schema change owed — the persisted tool round gains the `origin` field, which
+`Agent` message and a `Tool` message — with the `origin` field on the `Agent`
+message (the `tool_use` carrier) and the `Tool` message deriving it by pairing on
+`tool_use_id`. No new top-level `MessageContent` *variant* is required: the rounds
+are ordinary agent/tool messages distinguished only by origin, which keeps the
+LLM history builder and crash recovery on their existing paths. There is still a
+schema change owed — the `Agent` message gains the `origin` field, which
 `MessageContent` does not carry today — tracked as the `OriginDiscriminatorSchema`
 deferred entry (default `agent` for pre-feature rows, a true-absence default
 since existing rounds were all agent-authored). The inline session itself (the
@@ -198,8 +203,9 @@ terminal; only the committed rounds are durable.
 ## Deny-gate and provenance
 
 The agent command deny-gate (`specs/permissions`) does not apply to inline
-commands: they run in the user's own interactive shell, which the deny-gate has
-never governed (the panel terminal is equally ungated). The honesty guarantee is
+commands: they run in the server-hosted interactive shell — the server's Unix
+user, as the panel terminal — which the deny-gate has never governed (the panel
+terminal is equally ungated). The honesty guarantee is
 provenance, not gating — because inline rounds enter history shaped like agent
 `bash` rounds, the `origin: user` marker (REQ-IT-007) is what stops an audit from
 attributing an un-gated user command to the agent (REQ-IT-008).

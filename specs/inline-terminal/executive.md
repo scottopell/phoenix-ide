@@ -56,7 +56,7 @@ conversation rather than an out-of-band side channel the agent never sees.
 | Session vs panel terminal | Separate, short-lived | Preserves `specs/terminal` "one panel terminal per WorkScope" |
 | Attribution | Single `origin` discriminator | LLM-history role and UI attribution are both derived; no parallel representations (mirrors `MessageContent::Skill`) |
 | Result content type | Typed `ToolResult` content, not bare `String` | Leaves room for cursor-addressing-program resolution (empty for alt-screen, vt100-resolved for in-place rewriting) without migration |
-| Deny-gate | Not applied | User's own shell, ungated like the panel terminal; honesty comes from `origin: user` provenance |
+| Deny-gate | Not applied | Server-hosted shell (server's Unix user), ungated like the panel terminal; honesty comes from `origin: user` provenance |
 
 ## The Central Invariant
 
