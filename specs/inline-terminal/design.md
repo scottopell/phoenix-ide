@@ -147,8 +147,12 @@ own tool rounds use, so the LLM history builder needs no special case:
   `bash` tool already formats it).
 
 The tool-use input is a `BashToolInput` with `op: BashOp::Run` and `cmd` set —
-the same typed input an agent `bash` call produces — so the round is
-indistinguishable in *shape* from an agent round and reads back cleanly on the
+the same typed input an agent `bash` call produces. The Allium encodes this by
+construction: the round's tool-use is a `BashRunToolUse` value carrying only a
+command, so the backgrounded ops (`wait`/`kill`/handle) are structurally
+unrepresentable (REQ-IT-004) rather than merely forbidden by convention. So the
+round is indistinguishable in *shape* from an agent round and reads back cleanly
+on the
 next turn (REQ-IT-003, REQ-IT-004).
 
 ### User origin as the single source of truth
@@ -217,7 +221,7 @@ attributing an un-gated user command to the agent (REQ-IT-008).
 | REQ-IT-001 | `!` composer trigger; PTY session reusing `specs/terminal` transport |
 | REQ-IT-002 | `UserOpensInlineTerminal` gate on `core_status = idle`; `inline_terminal` busy state; `AtMostOneLiveInlineSessionPerConversation` |
 | REQ-IT-003 | `InlineCommandBridge` `expects: Osc133CommandFinish` → `InlineCommandCompleted` → `Agent`+`Tool` round (Track B) |
-| REQ-IT-004 | `BashToolInput { op: run }`; no `wait`/`kill`/handle ops emitted |
+| REQ-IT-004 | `BashRunToolUse` value (command-only, `wait`/`kill`/handle structurally unrepresentable) → `BashToolInput { op: run }` |
 | REQ-IT-005 | `InlineCommandBridge` (`Osc133CommandStart`/`Finish`); `InlineCommandStarting` supersession-flush from session `open_command` + close-with-open-bracket; `ClosedSessionHasNoOpenBracket`; `CommitOrderingPinned` + `EveryStartedCommandResolvesOnce` guarantees |
 | REQ-IT-006 | `UserClosesInlineTerminal` → idle; `NoAgentTurn` guarantee |
 | REQ-IT-007 | single `origin` discriminator; `UserOriginated` guarantee |

@@ -53,21 +53,51 @@ enum Origin {
     | agent
 }
 
+-- Why an inline-terminal open was rejected. Carried on
+-- InlineTerminalOpenRejected so the UI can surface an actionable error, in the
+-- shape of bedrock's MessageRejected(reason). A live inline session makes the
+-- conversation busy, so an "already open" attempt is a `conversation_busy` case
+-- too — not a distinct reason.
+enum OpenRejectReason {
+    conversation_busy
+}
+
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
 
--- The unit committed to conversation history for one inline command. Shaped as
--- a `bash` tool-use (op run, cmd = command_text) plus its tool-result, so the
--- LLM history builder reads it on the same path as an agent `bash` round
--- (Track B shared history, REQ-IT-003). `result` is the existing typed tool
--- result, not a bare string, so a future TUI screen-snapshot variant fits
--- without migrating persisted rounds.
+-- The `bash` tool-use of an inline round, encoded so REQ-IT-004 holds by
+-- construction: this type carries only a command, so the backgrounded ops
+-- (wait / kill / handle / label / since) are structurally unrepresentable — an
+-- inline round cannot be anything but `bash` `run`. Maps to `BashToolInput { op:
+-- BashOp::Run, cmd }`.
+value BashRunToolUse {
+    cmd: String                    -- the user's typed command (OSC 133;C payload)
+}
+
+-- The tool-result half of an inline round. bedrock/ToolResult models only
+-- {tool_use_id, outcome} — the LLM-facing acknowledgement — not the captured
+-- output and exit code REQ-IT-003 commits, so the round carries this dedicated
+-- type instead. `output` is a String, not a richer structure, so
+-- cursor-addressing-output resolution (empty for alt-screen, vt100-resolved for
+-- in-place rewriting; Deferred: TuiCursorAddressedOutput) fits without a shape
+-- change. For an interrupted command `output` is best-effort and `exit_code` is
+-- None.
+value InlineToolResult {
+    tool_use_id: String            -- pairs the result to its tool-use; also the
+                                   -- key origin is derived by (OriginDiscriminatorSchema)
+    output:      String            -- captured command output (best-effort if interrupted)
+    exit_code:   Integer?          -- from OSC 133;D; None when omitted or interrupted
+}
+
+-- The unit committed to conversation history for one inline command: a `bash`
+-- `run` tool-use plus its tool-result, so the LLM history builder reads it on
+-- the same path as an agent `bash` round (Track B shared history, REQ-IT-003).
 value InlineCommandRound {
-    command_text: String           -- the user's typed command (OSC 133;C payload)
-    result:       bedrock/ToolResult
-    outcome:      CommandOutcome
-    origin:       Origin           -- always user on this path (REQ-IT-007)
+    tool_use: BashRunToolUse       -- structurally `bash` `run` (REQ-IT-004)
+    result:   InlineToolResult
+    outcome:  CommandOutcome
+    origin:   Origin               -- always user on this path (REQ-IT-007)
 }
 
 ------------------------------------------------------------
@@ -86,20 +116,21 @@ value InlineCommandRound {
 --       (undefined after terminal teardown). (REQ-IT-005)
 --
 --   completed_round(record: terminal/CommandRecord) -> InlineCommandRound
---       The round for a command that finished (OSC 133;D). command_text and the
---       `bash` tool-result come from the finalized `record` (captured output +
---       exit-code annotation, using the bash tool's existing result formatting;
---       a None exit_code renders as "no exit code", never fabricated as 0).
---       outcome = completed, origin = user (REQ-IT-007 — origin is fixed by this
---       path, not a caller choice).
+--       The round for a command that finished (OSC 133;D). tool_use =
+--       BashRunToolUse(cmd: record.command_text); the `bash` tool-result comes
+--       from the finalized `record` (captured output + exit-code annotation,
+--       using the bash tool's existing result formatting; a None exit_code
+--       renders as "no exit code", never fabricated as 0). outcome = completed,
+--       origin = user (REQ-IT-007 — origin is fixed by this path, not a caller
+--       choice).
 --
 --   interrupted_round(command_text: String) -> InlineCommandRound
 --       The round for a command whose bracket was superseded or closed without a
---       D. Carries the command text and a best-effort tool-result (output
---       fidelity for a cut-off command is the shared CommandTracker concern,
---       Deferred: TuiCursorAddressedOutput). outcome = interrupted, origin =
---       user. The inline layer keeps only the command text for an open bracket
---       (session.open_command), which is all this needs.
+--       D. tool_use = BashRunToolUse(cmd: command_text); a best-effort
+--       tool-result (output fidelity for a cut-off command is the shared
+--       CommandTracker concern, Deferred: TuiCursorAddressedOutput). outcome =
+--       interrupted, origin = user. The inline layer keeps only the command text
+--       for an open bracket (session.open_command), which is all this needs.
 
 ------------------------------------------------------------
 -- Entities
@@ -127,8 +158,10 @@ entity InlineTerminalSession {
 
     -- The session's own pseudoterminal (InlinePty), distinct from the panel
     -- `terminal/Terminal` and outside its OneTerminalPerWorkScope invariant. Its
-    -- OSC 133 tracking drives the InlineCommandBridge command events.
-    pty: InlinePty
+    -- OSC 133 tracking drives the InlineCommandBridge command events. Present
+    -- only while live — spawned on open, torn down on close — matching the
+    -- OS-handle-when-active pattern in specs/terminal (master_fd/child_pid).
+    pty: InlinePty when status = live
 
     -- Lifecycle state. `closed` is both the initial and terminal state: a `!`
     -- opens a fresh live session; closing returns to closed.
@@ -187,6 +220,13 @@ rule OpenInlineTerminal {
     ensures: session.status = live
     ensures: session.conversation = conversation
     ensures: session.pty = pty
+    -- Drive the conversation busy: this transition is what maintains
+    -- LiveInlineSessionImpliesConversationBusy. It is realized as the bedrock
+    -- `inline_terminal` core_status (non-idle, never followed by an LLM
+    -- request); the enum variant itself is the deferred bedrock coupling
+    -- (BedrockInlineTerminalBusyState), but the transition is emitted here so
+    -- opening does not leave the conversation idle while a live session exists.
+    ensures: EnterInlineTerminalBusy(conversation)
 
     @guidance
         -- `!` as the first character of the composer is the trigger. It does
@@ -195,8 +235,7 @@ rule OpenInlineTerminal {
         -- LLM). Opening the inline terminal submits no message and requests no
         -- LLM; it switches the composer to terminal mode and spawns a PTY via
         -- the `specs/terminal` spawn path, with the conversation's working
-        -- directory as cwd. The conversation enters its inline-terminal busy
-        -- state (see Deferred: BedrockInlineTerminalBusyState).
+        -- directory as cwd.
 }
 
 -- REQ-IT-002: opening is rejected while the conversation is busy.
@@ -205,7 +244,7 @@ rule RejectOpenInlineTerminalWhileBusy {
 
     requires: conversation.core_status != idle
 
-    ensures: OpenRejected(conversation)
+    ensures: InlineTerminalOpenRejected(conversation, conversation_busy)
 
     @guidance
         -- Disjoint with OpenInlineTerminal on core_status (idle vs not idle).
@@ -234,6 +273,10 @@ rule UserClosesInlineTerminal {
 
     ensures: session.open_command = None
     ensures: session.status = closed
+    -- Return the conversation to idle (no LLM request) — the counterpart to
+    -- OpenInlineTerminal's EnterInlineTerminalBusy, clearing the bedrock
+    -- `inline_terminal` busy state (BedrockInlineTerminalBusyState).
+    ensures: ExitInlineTerminalToIdle(session.conversation)
 
     @guidance
         -- Two trigger sources, both ending at session closed:
@@ -335,9 +378,12 @@ invariant AtMostOneLiveInlineSessionPerConversation {
 }
 
 -- REQ-IT-002: a live inline session keeps the conversation out of idle, so the
--- agent cannot run while the user drives the terminal. The non-idle busy
--- representation is the bedrock `inline_terminal` core_status (see Deferred:
--- BedrockInlineTerminalBusyState).
+-- agent cannot run while the user drives the terminal. Established by the
+-- transitions this spec emits — OpenInlineTerminal's EnterInlineTerminalBusy
+-- sets it, UserClosesInlineTerminal's ExitInlineTerminalToIdle clears it — and
+-- realized as the bedrock `inline_terminal` core_status (the enum variant is the
+-- deferred coupling, BedrockInlineTerminalBusyState). A cross-spec invariant:
+-- this spec drives the transition, bedrock holds the state.
 invariant LiveInlineSessionImpliesConversationBusy {
     for s in InlineTerminalSession:
         s.status = live implies
@@ -460,10 +506,13 @@ deferred BedrockInlineTerminalBusyState
     -- new bedrock `core_status` variant (`inline_terminal`): non-idle so the
     -- agent cannot run, but never followed by an LLM request, and exiting to
     -- `idle` on session close. It must join bedrock's `is_busy` predicate so
-    -- `RejectMessageWhileBusy` covers it. This spec reads the gate
-    -- (core_status = idle on open; non-idle while live) but does not redefine
-    -- bedrock's enum; the variant and its idle-return transition are added in
-    -- `specs/bedrock` (`Conversation.core_status`, `Conversation.is_busy`).
+    -- `RejectMessageWhileBusy` covers it. This spec drives the transitions —
+    -- OpenInlineTerminal emits EnterInlineTerminalBusy, UserClosesInlineTerminal
+    -- emits ExitInlineTerminalToIdle — and reads the gate (core_status = idle on
+    -- open; non-idle while live). What is deferred is only bedrock's side: the
+    -- enum variant and its idle-return transition, added in `specs/bedrock`
+    -- (`Conversation.core_status`, `Conversation.is_busy`), which consume these
+    -- two transitions.
     -- Location: specs/bedrock/
 
 deferred OriginDiscriminatorSchema
