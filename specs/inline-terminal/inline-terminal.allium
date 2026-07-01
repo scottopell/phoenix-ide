@@ -105,12 +105,15 @@ value InlineCommandRound {
 -- Entities
 ------------------------------------------------------------
 
--- The terminal's OSC 133 command tracking (`specs/terminal`) as observed by the
--- inline session. Realized by the terminal CommandTracker fed the session PTY's
--- byte stream; modeled here as the external source of the session's
--- command-boundary events (Osc133CommandStart / Osc133CommandFinish on the
--- InlineCommandBridge surface).
-external entity InlineCommandSource {
+-- The inline session's own pseudoterminal: a PTY spawned via the `specs/terminal`
+-- spawn path but NOT the panel `terminal/Terminal` entity, so it is deliberately
+-- outside that spec's OneTerminalPerWorkScope invariant — the inline session is a
+-- separate, short-lived terminal, not a second panel terminal for the scope. Its
+-- OSC 133 byte stream (fed through the terminal CommandTracker) is the source of
+-- the session's command-boundary events (Osc133CommandStart / Osc133CommandFinish
+-- on the InlineCommandBridge surface); finalized commands reuse
+-- terminal/CommandRecord.
+external entity InlinePty {
 }
 
 -- An inline PTY terminal hosted in the composer for one conversation, opened by
@@ -122,10 +125,10 @@ entity InlineTerminalSession {
     -- receives the committed rounds.
     conversation: bedrock/Conversation
 
-    -- The underlying PTY terminal that does the OSC 133 command tracking
-    -- (`specs/terminal`). A separate terminal from the conversation's panel
-    -- terminal.
-    terminal: terminal/Terminal
+    -- The session's own pseudoterminal (InlinePty), distinct from the panel
+    -- `terminal/Terminal` and outside its OneTerminalPerWorkScope invariant. Its
+    -- OSC 133 tracking drives the InlineCommandBridge command events.
+    pty: InlinePty
 
     -- Lifecycle state. `closed` is both the initial and terminal state: a `!`
     -- opens a fresh live session; closing returns to closed.
@@ -173,7 +176,7 @@ config {
 
 -- REQ-IT-001, REQ-IT-002: `!` opens an inline terminal, only when idle.
 rule OpenInlineTerminal {
-    when: UserOpensInlineTerminal(session, conversation, terminal)
+    when: UserOpensInlineTerminal(session, conversation, pty)
 
     requires: session.status = closed
     -- Idle-only: the conversation must not be busy. By
@@ -183,7 +186,7 @@ rule OpenInlineTerminal {
 
     ensures: session.status = live
     ensures: session.conversation = conversation
-    ensures: session.terminal = terminal
+    ensures: session.pty = pty
 
     @guidance
         -- `!` as the first character of the composer is the trigger. It does
@@ -198,7 +201,7 @@ rule OpenInlineTerminal {
 
 -- REQ-IT-002: opening is rejected while the conversation is busy.
 rule RejectOpenInlineTerminalWhileBusy {
-    when: UserOpensInlineTerminal(_session, conversation, _terminal)
+    when: UserOpensInlineTerminal(_session, conversation, _pty)
 
     requires: conversation.core_status != idle
 
@@ -366,13 +369,13 @@ surface UserInlineTerminalAccess {
 
     context session: InlineTerminalSession
     context conversation: bedrock/Conversation
-    context terminal: terminal/Terminal
+    context pty: InlinePty
 
     exposes:
         session.status
 
     provides:
-        UserOpensInlineTerminal(session, conversation, terminal)
+        UserOpensInlineTerminal(session, conversation, pty)
             when session.status = closed
 
         UserClosesInlineTerminal(session)
@@ -417,9 +420,9 @@ surface UserInlineTerminalAccess {
 -- some rule must emit — the same shape as terminal.allium's
 -- ShellIntegrationProtocol.
 surface InlineCommandBridge {
-    facing source: InlineCommandSource
-        -- The session terminal's OSC 133 command tracking. Phoenix derives the
-        -- two events below from terminal/CommandExecutionStarted (C) and
+    facing source: InlinePty
+        -- The session's own PTY and its OSC 133 command tracking. Phoenix derives
+        -- the two events below from terminal/CommandExecutionStarted (C) and
         -- terminal/CommandExecutionFinished (D), scoped to the inline session.
 
     context session: InlineTerminalSession

@@ -52,7 +52,7 @@ A tool is exposed to direct user invocation only when all three hold:
 1. **Authorship is meaningful** — the call represents an action a human would
    plausibly want to perform themselves, not LLM-internal cognition (`think`)
    or an inter-agent protocol message (`submit_result`, `submit_error`,
-   `ask_user_question`, commission review).
+   `ask_user_question`, `commission_review`).
 2. **Self-service** — the invocation produces a result and returns the
    conversation to idle without launching further agent activity (REQ-UTI-006).
    Tools that start agent work are user-as-director actions, deferred (see Out
@@ -120,7 +120,8 @@ These are settled per consumer or deferred to implementation, not fixed here:
   semantics.
 - The exact sigil and argument grammar (`$tool` vs `T.tool`; positional vs
   JSON vs shell-style arguments). Bash may keep a bare-string shorthand
-  (`$bash <text>` → `{command: text}`); other tools carry structured input.
+  (`$bash <text>` → `{op: run, cmd: text}`, matching `BashToolInput`); other
+  tools carry structured input.
 - Per-tool composer affordances (completion, argument hints).
 - The interactive-PTY specialization for `bash`, which is the inline terminal's
   own spec.

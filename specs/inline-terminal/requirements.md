@@ -37,7 +37,8 @@ here.
 When the composer input begins with `!`, the input area becomes an interactive
 PTY terminal for the conversation, reusing the terminal transport, emulator, and
 OSC 133 command tracking defined in `specs/terminal`. The terminal runs the
-user's `$SHELL` with the conversation's working directory as its cwd. It is a
+user's `$SHELL -i` (the same interactive-shell spawn contract as `specs/terminal`)
+with the conversation's working directory as its cwd. It is a
 full terminal — line editing, completion, colour, and interactive programs work
 as in any native terminal — not a single command string.
 

@@ -85,7 +85,9 @@ down on close.
 The inline session observes the underlying terminal's OSC 133 command boundaries
 (owned by `specs/terminal`: `CommandExecutionStarted` on `C`,
 `CommandExecutionFinished` on `D`) and maintains one piece of its own state: the
-**open bracket**, the `CommandRecord` of the command awaiting commit.
+**open bracket** — the command *text* of the command awaiting commit
+(`open_command: String?` in the Allium), enough to commit an interrupted round
+without retaining the terminal's full `CommandRecord`.
 
 - **Start (`C`).** A new command starts. If a bracket is already open (the
   previous command never produced a `D`), it is first committed as an interrupted
