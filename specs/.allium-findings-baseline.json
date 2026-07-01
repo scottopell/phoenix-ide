@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "allium_version": "3.2.3",
+  "description": "Accepted allium analyse findings — cross-spec triggers (emitted by bedrock, invisible to per-spec analyser) and intentionally implicit system signals (established repo convention, see viewer_slot.allium). Regenerate: allium analyse specs/*/*.allium 2>/dev/null | jq -s (see dev.py check_allium)",
+  "findings": [
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "ConversationBecameTerminal"
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "ConversationCreated"
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "ConversationHardDeleted"
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "ForkProposalPersisted"
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "ServerRestarted"
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "SubAgentSpawned"
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "TaskApprovalStarted"
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "UserStartsContinuationConversation"
+    },
+    {
+      "spec": "specs/projects/projects.allium",
+      "trigger": "WriteAttempted"
+    },
+    {
+      "spec": "specs/terminal/terminal.allium",
+      "trigger": "BytesReadFromMaster"
+    },
+    {
+      "spec": "specs/terminal/terminal.allium",
+      "trigger": "ConversationBecameTerminal"
+    },
+    {
+      "spec": "specs/terminal/terminal.allium",
+      "trigger": "DataFrameReceived"
+    },
+    {
+      "spec": "specs/terminal/terminal.allium",
+      "trigger": "EioOnMasterRead"
+    },
+    {
+      "spec": "specs/terminal/terminal.allium",
+      "trigger": "FirstResizeFrameReceived"
+    },
+    {
+      "spec": "specs/terminal/terminal.allium",
+      "trigger": "ResizeFrameReceived"
+    },
+    {
+      "spec": "specs/terminal/terminal.allium",
+      "trigger": "ShellIntegrationDetectionWindowElapsed"
+    },
+    {
+      "spec": "specs/terminal/terminal.allium",
+      "trigger": "WorkScopeCleaned"
+    }
+  ]
+}

@@ -3853,8 +3853,9 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
 
     def check_allium():
         """Validate every specs/<name>/<name>.allium parses under v3 grammar.
-        `allium check` always exits 1 (even on clean files), so we parse the
-        JSON-stream output and aggregate error-severity diagnostics."""
+        `allium analyse` always exits 1 (findings or warnings), so we parse the
+        JSON-stream output and fail on error-severity diagnostics and on
+        findings not in the accepted baseline (specs/.allium-findings-baseline.json)."""
         import shutil, json
         if not shutil.which("allium"):
             with results_lock:
@@ -3872,13 +3873,13 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         reporter.step_start("allium", "allium specs")
         try:
             proc = subprocess.run(
-                ["allium", "check", *[str(p) for p in spec_files]],
+                ["allium", "analyse", *[str(p) for p in spec_files]],
                 capture_output=True, text=True, timeout=60,
             )
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - t0
             with results_lock:
-                results.append(("allium specs", 1, elapsed, "allium check timed out after 60s"))
+                results.append(("allium specs", 1, elapsed, "allium analyse timed out after 60s"))
             reporter.step_done("allium", "allium specs", 1, elapsed)
             return
         # Parse the concatenated JSON-doc stream that allium-cli emits
@@ -3888,6 +3889,7 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         text = proc.stdout
         idx = 0
         failures = []
+        all_findings = []          # (spec_file, trigger) tuples
         docs_parsed = 0
         decode_error = None
         while idx < len(text):
@@ -3902,9 +3904,16 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
                 break
             idx = end
             docs_parsed += 1
+            spec_file = doc.get("spec_file", "?")
+            try:
+                spec_file = str(Path(spec_file).relative_to(ROOT))
+            except (ValueError, TypeError):
+                pass
             errs = [d for d in doc.get("diagnostics", []) if d.get("severity") == "error"]
             if errs:
                 failures.append((doc.get("diagnostics", [{}])[0].get("location", {}).get("file") or "?", errs))
+            for f in doc.get("findings", []):
+                all_findings.append((spec_file, f.get("trigger", "?")))
         elapsed = time.monotonic() - t0
 
         # Hard-fail on any structural problem with the gate itself, even if
@@ -3921,26 +3930,56 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
             gate_problems.append(f"JSON-stream decode error after {docs_parsed} doc(s): {decode_error}")
         if docs_parsed == 0:
             gate_problems.append(
-                f"allium check produced no parseable diagnostic docs "
+                f"allium analyse produced no parseable diagnostic docs "
                 f"(passed {len(spec_files)} files; stdout {len(text)} bytes)"
             )
         elif docs_parsed != len(spec_files):
             gate_problems.append(
-                f"allium check returned {docs_parsed} diagnostic doc(s) but "
+                f"allium analyse returned {docs_parsed} diagnostic doc(s) but "
                 f"{len(spec_files)} spec(s) were passed -- some specs were not validated"
             )
 
-        if gate_problems or failures:
+        # Compare findings against the accepted baseline.  The baseline is a
+        # golden-file snapshot of known-accepted findings (cross-spec triggers
+        # the per-spec analyser cannot resolve, and intentionally implicit
+        # system signals).  Fail only on findings NOT in the baseline so the
+        # gate catches regressions without blocking on the known set.
+        baseline_path = ROOT / "specs" / ".allium-findings-baseline.json"
+        new_findings = []
+        if all_findings:
+            if baseline_path.exists():
+                try:
+                    with open(baseline_path) as bf:
+                        baseline = json.load(bf)
+                    baseline_keys = {
+                        (f.get("spec"), f.get("trigger"))
+                        for f in baseline.get("findings", [])
+                    }
+                except (json.JSONDecodeError, KeyError):
+                    baseline_keys = set()
+                    gate_problems.append(
+                        f"could not parse baseline {baseline_path.name}; "
+                        f"all {len(all_findings)} finding(s) treated as new"
+                    )
+            else:
+                baseline_keys = set()
+                gate_problems.append(
+                    f"baseline file {baseline_path.name} not found; "
+                    f"all {len(all_findings)} finding(s) treated as new"
+                )
+            new_findings = [f for f in all_findings if f not in baseline_keys]
+
+        if gate_problems or failures or new_findings:
             lines = []
             if gate_problems:
-                lines.append("allium check gate failure:")
+                lines.append("allium analyse gate failure:")
                 for p in gate_problems:
                     lines.append(f"  {p}")
                 if proc.stderr.strip():
                     lines.append(f"stderr (first 500 chars):\n{proc.stderr[:500]}")
-                if text.strip() and not failures:
+                if text.strip() and not failures and not new_findings:
                     lines.append(f"stdout (first 500 chars):\n{text[:500]}")
-                if failures:
+                if failures or new_findings:
                     lines.append("")
             for path, errs in failures:
                 rel = path
@@ -3957,6 +3996,21 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
                     lines.append(f"  L{loc.get('line', '?')}: {msg}")
                 if len(errs) > 5:
                     lines.append(f"  … and {len(errs) - 5} more")
+            if new_findings:
+                lines.append(f"{len(new_findings)} new finding(s) not in baseline:")
+                for spec, trigger in new_findings[:10]:
+                    try:
+                        rel = str(Path(spec).relative_to(ROOT))
+                    except (ValueError, TypeError):
+                        rel = spec
+                    lines.append(f"  {rel}: trigger '{trigger}'")
+                if len(new_findings) > 10:
+                    lines.append(f"  … and {len(new_findings) - 10} more")
+                lines.append(
+                    f"  To accept these, regenerate the baseline: "
+                    f"allium analyse specs/*/*.allium 2>/dev/null | jq -s ... "
+                    f"(see dev.py check_allium)"
+                )
             out = "\n".join(lines)
             with results_lock:
                 results.append(("allium specs", 1, elapsed, out))
@@ -4920,7 +4974,7 @@ _GRAPH_LANE_STEPS = {
     "ui-lint": ["eslint", "stylelint"],
     "vitest": ["vitest run"],
     "ast-grep": ["structural rules over ui/src/ + crates/"],
-    "allium": ["allium check specs/*/*.allium"],
+    "allium": ["allium analyse specs/*/*.allium"],
     "spec-anchors": ["REQ-* anchor cross-validation"],
     "e2e": ["uv run tests/e2e/run.py (real binary)"],
     "fast": ["cargo fmt --check", "task validation"],
