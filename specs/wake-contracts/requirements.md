@@ -194,9 +194,10 @@ For `TmuxPane`, terminal states SHALL include the watched pane/window process
 exiting, the pane/window being explicitly killed, or the tmux server/session
 being forgotten by lifecycle teardown.
 
-For `SubAgent`, terminal states SHALL include successful `submit_result`,
-`submit_error`, wall-clock timeout, parent/child cancellation, turn-limit
-hard-stop fallback, and forgotten child handle.
+For `SubAgent`, terminal fired payloads SHALL include successful
+`submit_result`, `submit_error`, wall-clock timeout, parent/child cancellation,
+and turn-limit hard-stop fallback. A missing child handle is not a fired payload;
+it resolves the contract as `Forgotten` per REQ-WAKE-011 and REQ-WAKE-017.
 
 THE SYSTEM SHALL NOT support in v1:
 - arbitrary conversation-actor messages or request/reply continuation
@@ -233,9 +234,11 @@ identity, terminal status, exit information when available, and a final captured
 tail window equivalent to the information the LLM would gather by inspecting the
 pane after exit.
 
-For `HandleTerminal/SubAgent`, the tool result MUST carry the child agent id,
-child conversation id, task label/description when available, and the structured
-sub-agent terminal payload defined by REQ-WAKE-017.
+For `HandleTerminal/SubAgent`, the tool result MUST carry one sub-agent identity
+field — the child conversation / agent id — plus task label/description when
+available and the structured sub-agent terminal payload defined by REQ-WAKE-017.
+The payload MUST NOT persist separate agent-id and conversation-id fields for the
+same handle identity.
 
 THE delivered tool result SHALL be addressable back to the original
 tool call that registered the contract (via `tool_use_id`)
@@ -458,26 +461,31 @@ there is no bash handle named `t-3`.
 
 WHEN a `HandleTerminal/SubAgent` contract fires because the child called
 `submit_result`
-THE SYSTEM SHALL deliver `outcome: success` with the submitted result text and the
-child agent/conversation identity.
+THE SYSTEM SHALL deliver a tagged `success` outcome with the submitted result text
+and the child conversation / agent id.
 
 WHEN a `HandleTerminal/SubAgent` contract fires because the child called
 `submit_error`
-THE SYSTEM SHALL deliver `outcome: failure` with the submitted error text and
-`error_kind`.
+THE SYSTEM SHALL deliver a tagged `submitted_error` outcome with the submitted
+error text, `error_kind`, and the child conversation / agent id.
 
 WHEN the child reaches wall-clock timeout
-THE SYSTEM SHALL deliver `outcome: failure`, `error_kind: timed_out`, and a
-message stating that the child exceeded its configured timeout.
+THE SYSTEM SHALL deliver a tagged `timed_out` outcome with a message stating that
+the child exceeded its configured timeout and the child conversation / agent id.
 
 WHEN the child is cancelled by the parent, user, or lifecycle cascade
-THE SYSTEM SHALL deliver `outcome: failure`, `error_kind: cancelled`, and the
-cancellation reason when available.
+THE SYSTEM SHALL deliver a tagged `cancelled` outcome with the cancellation reason
+when available and the child conversation / agent id.
 
 WHEN the child exhausts its turn-limit grace path and the runtime performs the
 hard-stop fallback
-THE SYSTEM SHALL deliver `outcome: failure`, `error_kind: turn_limit_exhausted`,
-and include the extracted partial assistant text when available.
+THE SYSTEM SHALL deliver a tagged `turn_limit_exhausted` outcome with the
+extracted partial assistant text when available and the child conversation / agent
+id.
+
+The tagged outcome SHALL make invalid combinations unrepresentable: a success
+requires result text; submitted errors require error text and kind; and at most
+one terminal outcome variant is present.
 
 WHEN the child conversation/agent id cannot be found during router evaluation
 THE SYSTEM SHALL fire the contract with cause `Forgotten` and reason
@@ -507,12 +515,12 @@ router startup.
 A `SubAgent` wake handle SHALL be addressed by the child conversation / agent id
 created for the sub-agent. It is not WorkScope-keyed and SHALL NOT transfer across
 WorkScope inheritance. Because active sub-agent runtimes do not survive Phoenix
-restart, startup resync fires pending sub-agent waits as
-`Forgotten { reason: "phoenix_restart" }`. Parent cancellation and child
-cancellation produce a terminal cancelled payload; parent hard-delete deletes the
-child through normal conversation cascade and either cancels the pending wake
-before deletion or, if only the orphaned contract remains observable, fires
-forgotten.
+restart, startup resync SHALL first inspect the persisted child conversation:
+completed or failed children deliver their durable terminal payload; non-terminal
+children fire `Forgotten { reason: "phoenix_restart" }`. Parent cancellation and
+child cancellation produce a terminal cancelled payload. Parent hard-delete SHALL
+cancel pending wake contracts before deleting the child; hard-delete MUST NOT
+report lifecycle cancellation as a missing child handle.
 
 **Rationale:** The three v1 handle kinds deliberately use their existing stable
 identities. The wake plane does not invent a parallel handle namespace, and it
@@ -540,7 +548,7 @@ does not treat sub-agents as WorkScope resources.
 | REQ-WAKE-014 | Proposed | Tool description discipline |
 | REQ-WAKE-015 | Proposed | Cost observability metrics |
 | REQ-WAKE-016 | Proposed | Unified `wait_until` tool, not per-substrate |
-| REQ-WAKE-017 | Proposed | Sub-agent terminal payloads for success, error, timed_out, cancellation, turn-limit fallback, forgotten |
+| REQ-WAKE-017 | Proposed | Tagged success, submitted_error, timed_out, cancellation, turn-limit fallback; missing child is Forgotten |
 | REQ-WAKE-018 | Proposed | V1 handle identity/lifecycle for bash, tmux, and sub-agent handles |
 
 **Progress:** 0 of 18 implemented.

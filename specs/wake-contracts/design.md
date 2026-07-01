@@ -189,9 +189,10 @@ The watchable handle kinds fall into two keying classes:
   wake at the wrong conversation.
 
 `Forgotten` is the terminal cause when a watched handle is destroyed:
-a Phoenix restart that drops in-memory bash handles or active sub-agent runtimes
-(see REQ-WAKE-002), or a hard-delete that tears down a WorkScope with no
-inheritor.
+a Phoenix restart that drops in-memory bash handles or non-terminal active
+sub-agent runtimes (see REQ-WAKE-002), or a hard-delete that tears down a
+WorkScope with no inheritor. A sub-agent child that already persisted a terminal
+state before restart still delivers that durable terminal payload.
 
 ### User-interrupt semantics during a wait
 
@@ -205,12 +206,14 @@ lock around message-log appends. No special policy is needed.
 ### Sub-agent terminal delivery is not continuation
 
 A sub-agent wake delivers the same terminal information the blocking fan-in path
-needs: success result, submitted error, wall-clock timeout, cancellation,
-turn-limit hard-stop fallback with extracted partial text when available, or
-forgotten child handle. That payload wakes the parent so it can synthesize or
-recover. It never resumes the child, grants more turns, or forwards a child
-question to the parent. Those behaviours would require an actor/request-reply
-contract with different authorization, budget, and UI semantics.
+needs: success result, submitted error, wall-clock timeout, cancellation, or
+turn-limit hard-stop fallback with extracted partial text when available. A
+missing child handle is not a terminal payload; it resolves the wake as
+`Forgotten` so the parent can retry or escalate. A fired sub-agent payload wakes
+the parent so it can synthesize or recover. It never resumes the child, grants
+more turns, or forwards a child question to the parent. Those behaviours would
+require an actor/request-reply contract with different authorization, budget, and
+UI semantics.
 
 ### Tool surface — one tool
 

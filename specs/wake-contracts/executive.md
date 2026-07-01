@@ -22,8 +22,9 @@ V1 supports one condition kind over three concrete handle kinds:
 `HandleTerminal { handle_kind, handle_id }` — fires when a named bash, tmux
 pane/window, or sub-agent handle reaches a terminal state. For sub-agents, the
 terminal payload covers `submit_result`, `submit_error`, wall-clock timeout,
-cancellation, turn-limit hard-stop fallback, and forgotten child handle. V1 does
-not define parent-to-child continuation, `NeedMoreBudget`, arbitrary child
+cancellation, and turn-limit hard-stop fallback. Missing child handles resolve as
+`Forgotten`, not as fired child payloads. V1 does not define parent-to-child
+continuation, `NeedMoreBudget`, arbitrary child
 questions, automatic sub-agent budget extension, or a general conversation-actor
 framework.
 
@@ -70,8 +71,9 @@ consequence of continuation.
 Mandatory `expires_at` (default 600s, cap 1800s) prevents unbounded
 commitments. Restart resync re-registers non-fired contracts; any
 contract whose underlying handle did not survive the restart — bash handles and
-active sub-agent runtimes — immediately fires `Forgotten`, never silently
-abandoned.
+non-terminal active sub-agent runtimes — resolves on startup, never silently
+abandoned. Sub-agent children that already persisted a terminal state deliver that
+durable result instead of being forgotten.
 
 The LLM-facing surface is a single unified `wait_until { handle: {
 kind, id }, condition, max_wait_seconds }` tool with a `#[serde(tag
@@ -100,7 +102,7 @@ land separately.
 | REQ-WAKE-014 Tool Description | Proposed | Explicit cost model + when-to-use guidance |
 | REQ-WAKE-015 Cost Observability | Proposed | Metrics on registration / fire / forgotten breakdown |
 | REQ-WAKE-016 Unified Tool Surface | Proposed | Single `wait_until` tool, tagged-enum handle discriminator |
-| REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Success, error, timed_out, cancellation, turn-limit fallback, forgotten child |
+| REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Tagged success, submitted_error, timed_out, cancellation, turn-limit fallback; missing child is Forgotten |
 | REQ-WAKE-018 Handle Identity + Lifecycle | Proposed | Bash/tmux WorkScope-keyed; sub-agent keyed by child conversation / agent id |
 
 **Progress:** 0 of 18 implemented.

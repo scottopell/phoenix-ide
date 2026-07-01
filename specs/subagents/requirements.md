@@ -179,13 +179,15 @@ THE SYSTEM SHALL expose a stable terminal-wait handle identified by the child
 conversation / agent id
 
 WHEN that handle is watched by a wake contract
-THE SYSTEM SHALL report terminal outcomes for successful `submit_result`,
-`submit_error`, wall-clock timeout, cancellation, turn-limit hard-stop fallback,
-and forgotten child handle
+THE SYSTEM SHALL report fired terminal outcomes for successful `submit_result`,
+`submit_error`, wall-clock timeout, cancellation, and turn-limit hard-stop
+fallback, and SHALL resolve missing child handles through the wake contract's
+`Forgotten` cause
 
 WHEN Phoenix restarts while a sub-agent wake contract is pending
-THE SYSTEM SHALL treat the sub-agent handle as forgotten because active sub-agent
-runtimes do not survive restart
+THE SYSTEM SHALL deliver the child conversation's persisted terminal state when it
+is already completed or failed, otherwise treat the sub-agent handle as forgotten
+because active sub-agent runtimes do not survive restart
 
 THE sub-agent wake handle SHALL NOT be keyed by the parent's WorkScope and SHALL
 NOT imply parent-to-child continuation or automatic budget extension

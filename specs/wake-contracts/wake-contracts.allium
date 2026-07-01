@@ -70,28 +70,42 @@ value Condition {
 }
 
 -- The payload delivered to the conversation when the contract
--- fires. Shape mirrors the bash op=wait response shape; this is
--- REQ-WAKE-006 "synthetic tool result indistinguishable from
--- synchronous wait."
+-- resolves. For cause = fired, exactly one handle-kind payload is present.
+-- For cause = forgotten, no handle-kind terminal payload is present;
+-- forgotten_reason carries the retry/escalation signal.
 value FirePayload {
     cause: TerminalCause
-    observed_handle_status: bash/HandleStatus?       -- when kind = handle_terminal
-    observed_exit_code: Integer?                     -- when cause = fired
-    observed_duration_ms: Integer?                   -- when cause = fired
-    observed_tail: List<bash/RingLine>?              -- when cause = fired
-    sub_agent_payload: SubAgentTerminalPayload?             -- when handle kind = subagent
+    bash_payload: BashTerminalPayload?               -- when handle kind = bash and cause = fired
+    tmux_payload: TmuxTerminalPayload?               -- when handle kind = tmux_pane and cause = fired
+    sub_agent_payload: SubAgentTerminalPayload?      -- when handle kind = subagent and cause = fired
     forgotten_reason: String?                        -- when cause = forgotten
 }
 
+value BashTerminalPayload {
+    status: bash/HandleStatus
+    exit_code: Integer?
+    duration_ms: Integer?
+    tail: List<bash/RingLine>
+}
+
+value TmuxTerminalPayload {
+    pane_id: String
+    terminal_status: TmuxTerminalStatus
+    exit_code: Integer?
+    duration_ms: Integer?
+    tail: List<String>?
+}
+
 value SubAgentTerminalPayload {
-    child_agent_id: String
-    child_conversation_id: String
+    sub_agent_id: String              -- single identity; child conversation id == agent id
     task_label: String?
     outcome: SubAgentTerminalOutcome
-    result_text: String?           -- present for submit_result success
-    error_text: String?            -- present for submitted/fallback failures
-    error_kind: String?            -- submit_error kind, timed_out, cancelled, turn_limit_exhausted
-    partial_text: String?          -- present when turn-limit hard-stop extracts assistant text
+    success_result: String?           when outcome = success
+    submitted_error: String?          when outcome = submitted_error
+    submitted_error_kind: String?     when outcome = submitted_error
+    timed_out_message: String?        when outcome = timed_out
+    cancelled_reason: String?         when outcome = cancelled
+    turn_limit_partial_text: String?  when outcome = turn_limit_exhausted
 }
 
 ------------------------------------------------------------
@@ -120,9 +134,18 @@ enum TerminalCause {
                   -- no inheritor)
 }
 
+enum TmuxTerminalStatus {
+    pane_process_exited
+    | pane_killed
+    | session_forgotten
+}
+
 enum SubAgentTerminalOutcome {
     success
-    | failure
+    | submitted_error
+    | timed_out
+    | cancelled
+    | turn_limit_exhausted
 }
 
 enum ContractStatus {
@@ -204,11 +227,12 @@ config {
     -- Cadence at which the wake_router evaluates handle_terminal
     -- conditions. Other condition kinds may have different cadences.
 
-    forgotten_on_restart_for_kinds: Set<HandleKind> = {bash, subagent}
-    -- HandleKinds whose active handles do not survive Phoenix restart. On
-    -- restart, every pending contract referencing one of these kinds
-    -- fires forgotten with reason = "phoenix_restart". bash handles are
-    -- in-memory, and active sub-agent runtimes do not survive restart.
+    forgotten_on_restart_for_kinds: Set<HandleKind> = {bash}
+    -- HandleKinds whose handles never survive Phoenix restart. On restart,
+    -- every pending contract referencing one of these kinds fires forgotten
+    -- with reason = "phoenix_restart". Sub-agent restart handling is conditional:
+    -- persisted terminal children are delivered, while non-terminal child runtimes
+    -- are forgotten because active sub-agent runtimes do not survive restart.
     -- tmux_pane handles may survive and are re-registered when present.
 
     workscope_keyed_kinds: Set<HandleKind> = {bash, tmux_pane}
@@ -325,16 +349,38 @@ rule WakeRouterFiresOnConditionHold {
         -- AwaitingWake (it only made sense as a conv-state
         -- transition).
         --
-        -- For handle.kind = subagent, payload.sub_agent_payload is populated with
-        -- one of the REQ-WAKE-017 terminal outcomes: submit_result success,
-        -- submit_error failure, timed_out, cancellation, turn-limit hard-stop fallback,
-        -- or forgotten child handle. The wake payload never resumes the child or
-        -- grants more budget.
+        -- For handle.kind = subagent, payload.sub_agent_payload is populated only
+        -- for persisted child terminal states: submit_result success, submit_error,
+        -- timed_out, cancellation, or turn-limit hard-stop fallback. A missing child
+        -- handle is not a condition-held fire; it follows WakeRouterForgetsMissingHandle
+        -- and resolves with cause = forgotten.
         -- The synthetic tool result is appended to the conv message
         -- log via the same path as a normal tool result completion.
         -- The conv's next-LLM-turn trigger is the same path as
         -- "user just sent a message" or "previous tool just
         -- returned." No new dispatcher state needed.
+}
+
+-- REQ-WAKE-011 + REQ-WAKE-017: a missing sub-agent child is forgotten, not a
+-- condition-held fire. This preserves the retry/escalation signal that
+-- distinguishes missing handles from completed child failures.
+rule WakeRouterForgetsMissingSubAgentHandle {
+    when: WakeRouterTick(contract)
+
+    requires: contract.status = pending
+    requires: contract.condition.handle?.kind = subagent
+    requires: not subagent_child_exists(contract.condition.handle?.id)
+
+    let payload = FirePayload(cause: forgotten, forgotten_reason: "subagent_handle_missing")
+
+    ensures: ContractTransitionsToTerminal(contract, forgotten, payload)
+    ensures: SyntheticToolResultAppendedToConversation(
+        conversation:   contract.conversation,
+        tool_use_id:    contract.registering_tool_use_id,
+        payload:        payload
+    )
+    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
+    ensures: SseEmitted(WakeContractForgotten, contract.id)
 }
 
 -- REQ-WAKE-003 + REQ-WAKE-007: router fires when expires_at has
@@ -454,7 +500,8 @@ rule ContinuationBoundaryHandlesContracts {
 }
 
 -- REQ-WAKE-002 + REQ-WAKE-011: restart resync. Pending contracts on
--- non-durable handle kinds fire forgotten; pending contracts on
+-- always-non-durable handle kinds fire forgotten; pending sub-agent contracts
+-- inspect the persisted child state before deciding whether to deliver or forget;
 -- durable handle kinds re-register with the router.
 rule PhoenixStartupResyncsContracts {
     when: PhoenixStartupReachesWakeRouterInit()
@@ -462,6 +509,16 @@ rule PhoenixStartupResyncsContracts {
     ensures: ForEveryPendingContract(
         if_kind_in_set: config.forgotten_on_restart_for_kinds,
             then: ContractTransitionsToTerminal(
+                contract,
+                forgotten,
+                FirePayload(cause: forgotten, forgotten_reason: "phoenix_restart")
+            ),
+        else_if_subagent_and_child_terminal: ContractTransitionsToTerminal(
+                contract,
+                fired,
+                FirePayload(cause: fired, sub_agent_payload: payload_from_persisted_child_terminal(contract))
+            ),
+        else_if_subagent_and_child_not_terminal: ContractTransitionsToTerminal(
                 contract,
                 forgotten,
                 FirePayload(cause: forgotten, forgotten_reason: "phoenix_restart")
@@ -476,16 +533,10 @@ rule PhoenixStartupResyncsContracts {
         -- appended to the conversation history before any further
         -- LLM turn.
         --
-        -- Sequence:
-        --   1. Load conv rows.
-        --   2. Load Contract rows.
-        --   3. For each conv with contracts: queue terminal
-        --      deliveries for forgotten kinds; re-register pending
-        --      for durable kinds.
-        --   4. Open API server (which serves SSE).
-        -- Reversing 3 and 4 would let a UI client subscribe to SSE
-        -- before contracts are resync'd, missing the synthetic
-        -- forgotten event.
+        -- Startup resync reads the child conversation before forgetting a
+        -- sub-agent contract. If the child already persisted Completed/Failed,
+        -- the wake delivers that terminal payload. Only non-terminal children are
+        -- forgotten because their active runtimes died with the process.
 }
 
 -- REQ-WAKE-004: is_busy() consults the contract table.
