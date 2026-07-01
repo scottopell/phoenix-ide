@@ -989,7 +989,7 @@ struct OpenAIError {
     #[allow(dead_code)]
     r#type: Option<String>,
     #[allow(dead_code)]
-    code: Option<String>,
+    code: Option<serde_json::Value>,
 }
 
 // Responses API types (for codex models)
@@ -1609,13 +1609,28 @@ fn chat_stream_error_code_as_string(code: Option<&serde_json::Value>) -> String 
 fn openai_http_error(status_code: u16, status_display: &str, body: &str) -> LlmError {
     if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(body) {
         let message = error_resp.error.message;
-        let code = error_resp.error.code.as_deref().unwrap_or("");
-        return match status_code {
-            401 | 403 => LlmError::auth(format!("Authentication failed: {message}")),
-            429 => LlmError::rate_limit(format!("Rate limit exceeded: {message}")),
-            400..=499 => classify_responses_error(code, &message),
-            500..=599 => LlmError::server_error(format!("Server error: {message}")),
-            _ => LlmError::server_error(format!("Unexpected HTTP {status_display}: {message}")),
+        let code = chat_stream_error_code_as_string(error_resp.error.code.as_ref());
+        let classified = classify_responses_error(&code, &message);
+        return match classified.kind {
+            super::LlmErrorKind::UsageLimitReached
+            | super::LlmErrorKind::ServerOverloaded
+            | super::LlmErrorKind::ContextWindowExceeded
+            | super::LlmErrorKind::ContentFilter
+            | super::LlmErrorKind::Auth
+            | super::LlmErrorKind::RateLimit
+            | super::LlmErrorKind::InvalidRequest
+            | super::LlmErrorKind::InvalidResponse => classified,
+            super::LlmErrorKind::ServerError if (400..=499).contains(&status_code) => {
+                LlmError::invalid_request(format!("Bad request ({status_display}): {message}"))
+            }
+            super::LlmErrorKind::ServerError if (500..=599).contains(&status_code) => {
+                LlmError::server_error(format!("Server error: {message}"))
+            }
+            super::LlmErrorKind::Network
+            | super::LlmErrorKind::OutputLimitExceeded
+            | super::LlmErrorKind::ServerError => {
+                LlmError::server_error(format!("Unexpected HTTP {status_display}: {message}"))
+            }
         };
     }
     LlmError::from_http_status(status_code, body)
@@ -1692,7 +1707,9 @@ impl ChatStreamAccumulator {
                 }
             }
             for tool_delta in choice.delta.tool_calls.unwrap_or_default() {
-                let index = tool_delta.index.unwrap_or(self.tool_calls.len());
+                let index = tool_delta
+                    .index
+                    .unwrap_or_else(|| self.tool_calls.len().saturating_sub(1));
                 while self.tool_calls.len() <= index {
                     self.tool_calls.push(ChatToolCallBuilder::default());
                 }
@@ -3110,6 +3127,38 @@ mod tests {
         }
 
         #[test]
+        fn chat_stream_tool_call_missing_index_reuses_active_builder() {
+            let (tx, _rx) = tokio::sync::broadcast::channel(8);
+            let mut acc = ChatStreamAccumulator::new();
+            let chunk1 = serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "id": "call_abc",
+                    "function": {"name": "bash", "arguments": ""}
+                }]}}]
+            })
+            .to_string();
+            let chunk2 = serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "function": {"arguments": "{\"cmd\":\"ls\"}"}
+                }]}}]
+            })
+            .to_string();
+            acc.process_event(&chunk1, &tx).unwrap();
+            acc.process_event(&chunk2, &tx).unwrap();
+            acc.process_event("[DONE]", &tx).unwrap();
+
+            let resp = acc.into_response().unwrap();
+            assert_eq!(resp.content.len(), 1);
+            if let ContentBlock::ToolUse { id, name, input } = &resp.content[0] {
+                assert_eq!(id, "call_abc");
+                assert_eq!(name, "bash");
+                assert_eq!(input["cmd"], "ls");
+            } else {
+                panic!("expected ToolUse content block, got {:?}", resp.content[0]);
+            }
+        }
+
+        #[test]
         fn chat_stream_inline_error_chunk_classifies_context_exhaustion() {
             use crate::LlmErrorKind;
             let (tx, _rx) = tokio::sync::broadcast::channel(8);
@@ -3325,6 +3374,36 @@ mod tests {
             let err = openai_http_error(400, "400 Bad Request", body);
             assert_eq!(err.kind, LlmErrorKind::ContextWindowExceeded);
             assert!(err.message.contains("context_length_exceeded"));
+        }
+
+        #[test]
+        fn openai_http_error_classifies_numeric_context_length_message() {
+            use crate::LlmErrorKind;
+            let body = r#"{"error":{"message":"context length exceeded","code":400}}"#;
+            let err = openai_http_error(400, "400 Bad Request", body);
+            assert_eq!(err.kind, LlmErrorKind::ContextWindowExceeded);
+        }
+
+        #[test]
+        fn openai_http_error_keeps_unknown_4xx_non_retryable() {
+            use crate::LlmErrorKind;
+            let body =
+                r#"{"error":{"message":"unsupported parameter","code":"unsupported_parameter"}}"#;
+            let err = openai_http_error(400, "400 Bad Request", body);
+            assert_eq!(err.kind, LlmErrorKind::InvalidRequest);
+            assert!(err.message.contains("unsupported parameter"));
+        }
+
+        #[test]
+        fn openai_http_error_prefers_coded_terminal_errors_over_status() {
+            use crate::LlmErrorKind;
+            let quota = r#"{"error":{"message":"quota exhausted","code":"usage_limit_reached"}}"#;
+            let err = openai_http_error(429, "429 Too Many Requests", quota);
+            assert_eq!(err.kind, LlmErrorKind::UsageLimitReached);
+
+            let overload = r#"{"error":{"message":"busy","code":"server_is_overloaded"}}"#;
+            let err = openai_http_error(503, "503 Service Unavailable", overload);
+            assert_eq!(err.kind, LlmErrorKind::ServerOverloaded);
         }
 
         #[test]

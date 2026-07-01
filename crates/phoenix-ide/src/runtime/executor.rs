@@ -4344,6 +4344,9 @@ where
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
         let context_window = self.context.context_window;
+        let continuation_output_tokens =
+            continuation_output_tokens_for_model(self.context.max_output_tokens);
+        let continuation_max_tokens = u32::try_from(continuation_output_tokens).unwrap_or(u32::MAX);
 
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
@@ -4383,7 +4386,7 @@ where
             // history has filled the budget.
             let fixed_tokens = estimate_text_tokens(&continuation_prompt)
                 + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
-                + CONTINUATION_OUTPUT_RESERVE_TOKENS
+                + continuation_output_tokens
                 + CONTINUATION_SAFETY_MARGIN_TOKENS;
             let budget = plan_continuation_history(messages, context_window, fixed_tokens);
             let mut messages = budget.messages;
@@ -4417,9 +4420,9 @@ where
                 messages,
                 system: vec![SystemContent::new(CONTINUATION_SYSTEM_PROMPT)],
                 tools: vec![], // No tools for continuation
-                // Handoff quality favors completeness; cap high enough that a
-                // thorough summary is not truncated mid-thought.
-                max_tokens: Some(4096),
+                // Handoff quality favors completeness up to the active model's
+                // configured output cap.
+                max_tokens: Some(continuation_max_tokens),
                 // Same conversation as the main loop — different system
                 // prompt won't share a prefix in practice, but using the
                 // conv id keeps the cache cohort coherent.
@@ -4929,6 +4932,10 @@ const CONTINUATION_BLOCK_CHAR_CAP: usize = 2000;
 /// Reserve (tokens) for the continuation reply — kept in lockstep with the
 /// `max_tokens` on the continuation request.
 const CONTINUATION_OUTPUT_RESERVE_TOKENS: usize = 4096;
+
+fn continuation_output_tokens_for_model(max_output_tokens: u32) -> usize {
+    CONTINUATION_OUTPUT_RESERVE_TOKENS.min(usize::try_from(max_output_tokens).unwrap_or(usize::MAX))
+}
 
 /// Safety margin (tokens) against the chars/token estimate being optimistic.
 /// The prompt and system text are budgeted from their actual size separately,
@@ -6487,6 +6494,15 @@ mod continuation_prompt_tests {
     use super::*;
     use crate::state_machine::state::ToolInput;
     use crate::tools::BashToolInput;
+
+    #[test]
+    fn continuation_output_cap_respects_model_cap() {
+        assert_eq!(continuation_output_tokens_for_model(2_048), 2_048);
+        assert_eq!(
+            continuation_output_tokens_for_model(8_192),
+            CONTINUATION_OUTPUT_RESERVE_TOKENS
+        );
+    }
 
     #[test]
     fn rejected_tool_call_includes_arguments_without_tool_discriminant() {

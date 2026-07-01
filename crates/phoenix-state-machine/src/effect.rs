@@ -6,7 +6,7 @@ use crate::state::{
 use chrono::{DateTime, Utc};
 use phoenix_bash_display::display_command;
 use phoenix_core::domain::db_schema::{
-    FileAttachment, ImageData, MessageContent, ToolContent, ToolContentImage, ToolResult, UsageData,
+    FileAttachment, ImageData, MessageContent, ToolResult, UsageData,
 };
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::llm_types::ContentBlock;
@@ -335,30 +335,6 @@ impl Effect {
             content: MessageContent::agent(blocks),
             display_data,
             usage_data: usage,
-            message_id,
-            idempotent: false,
-        }
-    }
-
-    #[allow(dead_code)] // Retained for test utilities; normal tool rounds use PersistCheckpoint
-    pub fn persist_tool_message(
-        tool_use_id: impl Into<String>,
-        output: impl Into<String>,
-        is_error: bool,
-        display_data: Option<Value>,
-        images: Vec<ToolContentImage>,
-    ) -> Self {
-        let tool_use_id = tool_use_id.into();
-        let message_id = format!("{tool_use_id}-result");
-        Effect::PersistMessage {
-            content: MessageContent::Tool(ToolContent {
-                tool_use_id: tool_use_id.clone(),
-                content: output.into(),
-                is_error,
-                images,
-            }),
-            display_data,
-            usage_data: None,
             message_id,
             idempotent: false,
         }
