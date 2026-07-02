@@ -1,0 +1,5 @@
+buildRenderUnits rebuilds every HistoricalUnit with a fresh toolResultsByUseId Map identity whenever any of its inputs change — including convState, which ticks on every state transition (sending, streaming, tool_executing, ...). AgentMessage is memo()d but the Map prop identity defeats the memo, so every mounted agent row re-renders on every conversation state tick. Wasted render work scales with the mounted window (~1800px of rows) times state-tick frequency; on mobile during streaming this is jank/battery for zero visual change.
+
+Fix shape: historical units do not depend on convState at all — split the build so historical units derive from [messages, pendingMessages] only and tail units from [convState, streamingHandle]; optionally cache units per message_id keyed on message object identity so a MessageUpdated only rebuilds its own unit.
+
+Found while verifying the mobile scroll fixes (branch claude/mobile-conversation-scroll-fix-ui1hjd) via a per-row ResizeObserver trace; the re-render storm is confirmed at code level (MessageList.tsx buildRenderUnits -> AgentMessage memo + fresh Map identity), independent of the height-churn symptom that led to it.
