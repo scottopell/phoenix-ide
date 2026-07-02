@@ -487,6 +487,9 @@ describe('handleTotalListHeightChanged', () => {
     // First call seeds the baseline via the conversation-switch handler
     // (lastSeenConvIdRef starts undefined) — no snap on initial mount
     act(() => virtuosoMock.totalListHeightChanged?.(500));
+    // Engage (downward wheel) so the assertion exercises the pin branch,
+    // not the pre-engagement settle rescue.
+    fireEvent.wheel(scroller, { deltaY: 50 });
     // Clear so we only observe the re-snap
     virtuosoMock.scrollToIndex.mockClear();
     // Second call: height grew, user was at bottom (oldFromBottom = 500 - 100 - 500 = -100 <= 100)
@@ -636,7 +639,7 @@ describe('handleTotalListHeightChanged', () => {
     expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
   });
 
-  it('re-snaps to bottom on pre-engagement height deltas even when stranded far from bottom', () => {
+  it('re-snaps to bottom on pre-engagement height deltas even when stranded far from bottom', async () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(
       withConvContext(
@@ -657,14 +660,71 @@ describe('handleTotalListHeightChanged', () => {
     // left at the top. The user has not interacted yet.
     setupScroller(scroller, { scrollHeight: 48000, scrollTop: 0, clientHeight: 600 });
     act(() => virtuosoMock.totalListHeightChanged?.(48000));
-    virtuosoMock.scrollToIndex.mockClear();
 
-    setupScroller(scroller, { scrollHeight: 12000000, scrollTop: 0, clientHeight: 600 });
+    // The settle snap writes scrollTop directly (a DOM snap cannot be
+    // aborted by virtuoso's seek loop, unlike scrollToIndex). Record it.
+    const written: number[] = [];
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 12000000 });
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => 0,
+      set: (v: number) => written.push(v),
+    });
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 600 });
     act(() => virtuosoMock.totalListHeightChanged?.(12000000));
+    // The snap is deferred one frame so virtuoso's own compensation for
+    // the triggering delta has already been applied.
+    await act(() => new Promise((r) => requestAnimationFrame(() => r(undefined))));
 
     // Distance from bottom is enormous, but without user engagement the
     // list is still settling — it must recover to the bottom.
-    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    expect(written).toContain(12000000);
+  });
+
+  it('settle watch corrects a silent stranding (no further events) within its window', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={idleState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-silent-strand"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      // Silent stranding: after the first (seeding) measurement, virtuoso's
+      // placement leaves the viewport off the bottom WITHOUT emitting any
+      // further height delta or scroll event. Only the settle watch can see
+      // this.
+      const written: number[] = [];
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 12000000 });
+      Object.defineProperty(scroller, 'scrollTop', {
+        configurable: true,
+        get: () => 11951000, // ~48k off the bottom
+        set: (v: number) => written.push(v),
+      });
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 600 });
+      act(() => virtuosoMock.totalListHeightChanged?.(12000000));
+
+      act(() => vi.advanceTimersByTime(500));
+      expect(written).toContain(12000000);
+
+      // Engagement stops the watch: no more corrections after the user
+      // takes over.
+      fireEvent.touchStart(scroller, { touches: [{}] });
+      written.length = 0;
+      act(() => vi.advanceTimersByTime(1000));
+      expect(written).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('user engagement releases the pre-engagement settle rescue', () => {
@@ -879,6 +939,9 @@ describe('handleTotalListHeightChanged', () => {
     setupScroller(scroller, { scrollHeight: 800, scrollTop: 100, clientHeight: 700 });
     act(() => virtuosoMock.totalListHeightChanged?.(800));
     // oldFromBottom = 800 - 100 - 700 = 0 (pinned)
+    // Engage (downward wheel) so the assertion exercises the pin branch,
+    // not the pre-engagement settle rescue.
+    fireEvent.wheel(scroller, { deltaY: 50 });
 
     // Clear so we only observe subsequent calls
     virtuosoMock.scrollToIndex.mockClear();

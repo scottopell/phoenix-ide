@@ -84,6 +84,15 @@ const PIN_TO_BOTTOM_THRESHOLD = 100;
 // scroll events, not the whole momentum animation.
 const USER_SCROLL_SUPPRESS_MS = 400;
 
+// Settle watch: how long after a conversation's first measurement the list
+// keeps verifying it is pinned to the bottom, and how often. Mount-time
+// stranding can be silent — virtuoso's placement churn does not always end
+// with a height delta or scroll event to hook — so event-driven rescue
+// alone can leave the viewport stranded until an unrelated late
+// measurement. The watch is stopped early by any user engagement.
+const SETTLE_WATCH_MS = 3000;
+const SETTLE_WATCH_INTERVAL_MS = 150;
+
 function formatAttachmentBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -413,6 +422,73 @@ function MessageListImpl({
   // stranding as "user scrolled up" and never recover. The mount contract is
   // "open pinned to the newest message"; only a user action releases it.
   const hasUserEngagedRef = useRef(false);
+  // Pending settle-snap frame (see scheduleSettleSnap). One in flight at a
+  // time; coalesces the burst of height deltas virtuoso emits while
+  // measuring a freshly-mounted conversation.
+  const settleSnapRafRef = useRef(0);
+
+  // Pre-engagement settle snap. Deliberately NOT virtuoso's
+  // `scrollToIndex('LAST')`: that navigates to the *model's* offset for the
+  // last item via an internal seek loop that measurement churn can abort
+  // mid-flight, leaving the viewport stranded once height deltas stop. A
+  // direct DOM assignment cannot be aborted and needs no model: each snap
+  // lands at the current DOM bottom, the tail rows mount and measure, any
+  // correction fires another height delta, and the loop converges exactly
+  // when the list is measured and the viewport is at the bottom. Deferred
+  // one frame so virtuoso's compensatory scrollTop adjustment for the
+  // triggering delta has already been applied (writing before it would be
+  // immediately shifted off-bottom by the compensation).
+  const scheduleSettleSnap = useCallback(() => {
+    if (settleSnapRafRef.current !== 0) return;
+    settleSnapRafRef.current = requestAnimationFrame(() => {
+      settleSnapRafRef.current = 0;
+      if (hasUserEngagedRef.current) return;
+      const s = scrollerRef.current;
+      if (!s) return;
+      s.scrollTop = s.scrollHeight;
+    });
+  }, []);
+
+  // Bounded settle watch (see SETTLE_WATCH_MS). Restarting extends the
+  // deadline; the interval instance is shared.
+  const settleWatchTimerRef = useRef(0);
+  const settleWatchDeadlineRef = useRef(0);
+
+  const stopSettleWatch = useCallback(() => {
+    if (settleWatchTimerRef.current !== 0) {
+      clearInterval(settleWatchTimerRef.current);
+      settleWatchTimerRef.current = 0;
+    }
+  }, []);
+
+  const startSettleWatch = useCallback(() => {
+    settleWatchDeadlineRef.current = Date.now() + SETTLE_WATCH_MS;
+    scheduleSettleSnap();
+    if (settleWatchTimerRef.current !== 0) return;
+    settleWatchTimerRef.current = window.setInterval(() => {
+      if (
+        hasUserEngagedRef.current ||
+        Date.now() > settleWatchDeadlineRef.current
+      ) {
+        stopSettleWatch();
+        return;
+      }
+      const s = scrollerRef.current;
+      if (!s) return;
+      if (s.scrollHeight - s.scrollTop - s.clientHeight > 1) {
+        s.scrollTop = s.scrollHeight;
+      }
+    }, SETTLE_WATCH_INTERVAL_MS);
+  }, [scheduleSettleSnap, stopSettleWatch]);
+
+  useEffect(() => {
+    return () => {
+      if (settleSnapRafRef.current !== 0) {
+        cancelAnimationFrame(settleSnapRafRef.current);
+      }
+      stopSettleWatch();
+    };
+  }, [stopSettleWatch]);
 
   const handleScrollerRef = useCallback((ref: HTMLElement | Window | null) => {
     detachGestureListenersRef.current?.();
@@ -452,6 +528,16 @@ function MessageListImpl({
           lastUpwardScrollAtRef.current = Date.now();
         }
         lastScrollTopRef.current = top;
+        // Pre-engagement, any movement that leaves the viewport off the
+        // bottom is settling churn (virtuoso initial placement and its
+        // compensations move scrollTop without a height delta, so the
+        // height-callback rescue alone cannot see every stranding).
+        // Our own settle snap lands at the bottom and won't re-trigger.
+        if (!hasUserEngagedRef.current) {
+          if (ref.scrollHeight - top - ref.clientHeight > 1) {
+            scheduleSettleSnap();
+          }
+        }
       };
       ref.addEventListener('pointerdown', onPointerDown, { passive: true });
       ref.addEventListener('touchstart', onTouchStart, { passive: true });
@@ -469,7 +555,7 @@ function MessageListImpl({
         touchActiveRef.current = false;
       };
     }
-  }, []);
+  }, [scheduleSettleSnap]);
 
   // Read latest length without re-binding the callback per render.
   // `data.length === 0` is reachable when systemPrompt is present but no
@@ -608,6 +694,12 @@ function MessageListImpl({
       // transition (conversation was empty at switch time, content arrived
       // later) should trigger the forced snap.
       hasSeenContentRef.current = allUnitsLengthRef.current > 0;
+      // Settle from the first measurement onwards rather than waiting for
+      // a later stray height delta: when initialTopMostItemIndex strands
+      // the mount (see hasUserEngagedRef), the stranding can be silent and
+      // the next delta a second away — a visible flash of the wrong
+      // position, or a permanent stranding if no delta ever comes.
+      if (hasSeenContentRef.current) startSettleWatch();
       return;
     }
     const prevHeight = prevTotalHeightRef.current;
@@ -632,6 +724,9 @@ function MessageListImpl({
         align: 'end',
         behavior: 'auto',
       });
+      // Content arriving after an empty mount goes through the same
+      // measurement churn as a conversation switch — watch it settle.
+      startSettleWatch();
       return;
     }
     // virtuoso calls this synchronously when its internal height model
@@ -660,11 +755,7 @@ function MessageListImpl({
     // meaningless while virtuoso may have stranded the initial placement,
     // so keep re-snapping until the user takes over.
     if (!hasUserEngagedRef.current) {
-      virtuosoRef.current?.scrollToIndex({
-        index: 'LAST',
-        align: 'end',
-        behavior: 'auto',
-      });
+      scheduleSettleSnap();
       return;
     }
     if (oldFromBottom <= PIN_TO_BOTTOM_THRESHOLD) {
@@ -715,7 +806,7 @@ function MessageListImpl({
         });
       }
     }
-  }, [conversationId]);
+  }, [conversationId, scheduleSettleSnap, startSettleWatch]);
 
   const scrollToNewest = useCallback(() => {
     if (allUnitsLengthRef.current === 0) return;

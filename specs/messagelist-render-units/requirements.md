@@ -396,8 +396,13 @@ streaming where Virtuoso's built-in handler is not.
 
 WHILE the user has not yet interacted with the conversation's scroller
 (no touch, wheel, or pointer input, and no conversation-nav jump)
-THE SYSTEM SHALL re-snap to the bottom on every total-list-height
-change regardless of the measured distance from the bottom
+THE SYSTEM SHALL keep the viewport pinned to the bottom regardless of
+the measured distance from it — correcting on every total-list-height
+change, on every scroll movement that leaves the viewport off the
+bottom, and by periodic verification for a bounded settling window
+after the conversation's first measurement (stranding can be silent:
+the virtualizer's placement churn does not always end with a height
+delta or scroll event to react to)
 SO THAT a stranded initial placement self-heals: the virtualizer's
 initial bottom placement is computed against pre-measurement estimates,
 and a large estimate correction landing right after mount can leave the
@@ -405,7 +410,11 @@ viewport far from the bottom (even at the top of the conversation).
 Distance-based pinning cannot recover from stranding — it classifies
 the stranded viewport as a scrolled-up user. The mount contract is
 "open pinned to the newest message"; only a user interaction releases
-the viewport from it.
+the viewport from it. The pre-engagement correction is a direct DOM
+scroll assignment, not a virtualizer scroll-to-index: the index seek
+navigates to the model's estimated offset via a seek loop that
+measurement churn can abort, while a DOM assignment to the current
+bottom cannot be aborted and converges as the tail measures.
 
 WHEN the Virtuoso instance mounts with empty data and the first
 messages arrive later (fresh conversation, or cached metadata before
