@@ -69,8 +69,11 @@ pub fn skill_names() -> Vec<String> {
 }
 
 /// Extract every embedded built-in file to `target_dir/<skill>/<...>`.
-/// Overwrites existing files and prunes stale files from currently bundled skill
-/// directories when those files are no longer embedded in the binary.
+/// Overwrites embedded files and removes every non-embedded file found under a
+/// currently bundled skill directory. The target directory is Phoenix-owned;
+/// user customizations and overrides must live in filesystem skill directories
+/// such as `.claude/skills/` or `.agents/skills/`, not beside extracted
+/// built-ins.
 ///
 /// # Errors
 ///
