@@ -81,6 +81,7 @@ pub use phoenix_core::domain::llm_types::{self as types, *};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tracing::Instrument;
 
 /// Chunks emitted during streaming. Only text deltas are forwarded to the UI;
 /// tool input fragments are accumulated internally by the provider.
@@ -138,16 +139,61 @@ impl LoggingService {
     }
 }
 
+impl LoggingService {
+    /// Span wrapping one provider call. `otel.name` overrides the exported
+    /// span name so the Datadog resource is the model id (per-model latency
+    /// and error aggregation); the tracing-side name stays `llm.request` for
+    /// local log filtering. Usage/error fields are `Empty` until the call
+    /// resolves.
+    fn request_span(&self, streaming: bool) -> tracing::Span {
+        tracing::info_span!(
+            "llm.request",
+            otel.kind = "client",
+            otel.name = %self.model_id,
+            otel.status_code = tracing::field::Empty,
+            model = %self.model_id,
+            streaming,
+            input_tokens = tracing::field::Empty,
+            output_tokens = tracing::field::Empty,
+            cache_read_tokens = tracing::field::Empty,
+            cache_creation_tokens = tracing::field::Empty,
+            time_to_first_token_ms = tracing::field::Empty,
+            error.message = tracing::field::Empty,
+        )
+    }
+
+    fn record_outcome(span: &tracing::Span, result: &Result<LlmResponse, LlmError>) {
+        match result {
+            Ok(response) => {
+                span.record("input_tokens", response.usage.input_tokens);
+                span.record("output_tokens", response.usage.output_tokens);
+                span.record("cache_read_tokens", response.usage.cache_read_tokens);
+                span.record(
+                    "cache_creation_tokens",
+                    response.usage.cache_creation_tokens,
+                );
+            }
+            Err(e) => {
+                span.record("otel.status_code", "ERROR");
+                span.record("error.message", e.message.as_str());
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl LlmService for LoggingService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        let span = self.request_span(false);
         let start = std::time::Instant::now();
-        let result = self.inner.complete(request).await;
+        let result = self.inner.complete(request).instrument(span.clone()).await;
         let duration = start.elapsed();
+        Self::record_outcome(&span, &result);
 
         match &result {
             Ok(response) => {
                 tracing::info!(
+                    parent: &span,
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     input_tokens = response.usage.input_tokens,
@@ -157,6 +203,7 @@ impl LlmService for LoggingService {
             }
             Err(e) => {
                 tracing::error!(
+                    parent: &span,
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     error = %e.message,
@@ -175,13 +222,49 @@ impl LlmService for LoggingService {
         request: &LlmRequest,
         chunk_tx: &broadcast::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
+        let span = self.request_span(true);
         let start = std::time::Instant::now();
-        let result = self.inner.complete_streaming(request, chunk_tx).await;
+
+        // Best-effort time-to-first-token: watch the broadcast channel from a
+        // side task and record the elapsed time when the first text chunk
+        // lands. Subscribing is side-effect free (providers ignore send
+        // errors, so an extra receiver changes nothing). The task is aborted
+        // once the request resolves so its span clone cannot hold the span
+        // open past the request. On Lagged the first token is long gone —
+        // skip recording rather than fabricate a late value.
+        let ttft_watch = {
+            let span = span.clone();
+            let mut rx = chunk_tx.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(TokenChunk::Text(_)) => {
+                            span.record(
+                                "time_to_first_token_ms",
+                                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            );
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+
+        let result = self
+            .inner
+            .complete_streaming(request, chunk_tx)
+            .instrument(span.clone())
+            .await;
+        ttft_watch.abort();
         let duration = start.elapsed();
+        Self::record_outcome(&span, &result);
 
         match &result {
             Ok(response) => {
                 tracing::info!(
+                    parent: &span,
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     input_tokens = response.usage.input_tokens,
@@ -191,6 +274,7 @@ impl LlmService for LoggingService {
             }
             Err(e) => {
                 tracing::error!(
+                    parent: &span,
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     error = %e.message,

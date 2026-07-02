@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 /// Safety-net wall-clock timeout for sub-agents (REQ-SA-006).
 /// Primary enforcement is max turns (REQ-PROJ-008). This catches stuck tool execution.
@@ -281,13 +282,33 @@ where
     S: Storage + Clone + 'static,
     T: ToolExecutor + ?Sized,
 {
-    tracing::info!(conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
+    // `otel.name` overrides the exported span name so the Datadog resource is
+    // the tool name (per-tool latency/error aggregation); the tracing-side
+    // name stays `tool.execute` for local log filtering. A tool-level failure
+    // (`success = false`) is an application result, not a span error — only
+    // unknown-tool dispatch marks the span as an error.
+    let span = tracing::info_span!(
+        "tool.execute",
+        otel.name = %tool_name,
+        otel.status_code = tracing::field::Empty,
+        tool = %tool_name,
+        conv_id = %conv_id,
+        root_conv_id = %root_conv_id,
+        tool_use_id = %tool_use_id,
+        outcome = tracing::field::Empty,
+        success = tracing::field::Empty,
+    );
+    tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Executing tool");
     let tool_start = std::time::Instant::now();
 
-    let output = tool_executor.execute(checked, tool_ctx).await;
+    let output = tool_executor
+        .execute(checked, tool_ctx)
+        .instrument(span.clone())
+        .await;
 
     if cancel_token_check.is_cancelled() {
-        tracing::info!(conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Tool cancelled");
+        span.record("outcome", "aborted");
+        tracing::info!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Tool cancelled");
         ToolExecOutcome::Aborted {
             tool_use_id,
             reason: crate::state_machine::AbortReason::CancellationRequested,
@@ -302,7 +323,10 @@ where
                 });
         }
         let duration_ms = u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        span.record("outcome", "completed");
+        span.record("success", out.is_success());
         tracing::info!(
+            parent: &span,
             conv_id = %conv_id,
             tool = %tool_name,
             id = %tool_use_id,
@@ -317,7 +341,9 @@ where
             duration_ms: Some(duration_ms),
         })
     } else {
-        tracing::warn!(conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Tool not found");
+        span.record("outcome", "unknown_tool");
+        span.record("otel.status_code", "ERROR");
+        tracing::warn!(parent: &span, conv_id = %conv_id, tool = %tool_name, id = %tool_use_id, "Tool not found");
         ToolExecOutcome::Failed {
             tool_use_id,
             error: format!("Unknown tool: {tool_name}"),
@@ -1092,6 +1118,13 @@ where
     /// handlers can read live runtime state without holding the `runtimes` lock.
     /// `None` in tests that do not exercise the live-state authority path.
     state_watcher: Option<watch::Sender<ConvState>>,
+    /// Trace span covering the active agent turn: opened lazily at the first
+    /// LLM dispatch, closed when the conversation next settles out of the
+    /// "working" presentation mode (`settle_turn_span`). The spawned
+    /// LLM-request and tool-execution tasks run instrumented with it, so
+    /// their `llm.request` / `tool.execute` spans share one trace per turn
+    /// instead of each becoming a single-span trace.
+    turn_span: Option<tracing::Span>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -1148,6 +1181,7 @@ where
             tool_cancel_token: None,
             llm_task_handle: None,
             retry_timer_handle: None,
+            turn_span: None,
             retry_generation: 0,
             llm_request_generation: 0,
             llm_outcome_tx,
@@ -1923,6 +1957,10 @@ where
                     let _ = tx.send(self.state.clone());
                 }
             }
+            // The turn's trace ends when the conversation stops working —
+            // including the transient Idle of a steering drain, where the
+            // queued message legitimately starts a new turn (and span).
+            self.settle_turn_span();
         }
 
         // Retire any pending retry-backoff timer when the conversation leaves
@@ -3299,6 +3337,39 @@ where
     /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
     /// messages, build the streaming pipeline, and spawn the LLM task.
     #[allow(clippy::too_many_lines)]
+    /// Get-or-open the trace span for the current agent turn (see the
+    /// `turn_span` field). Lazy: the first LLM dispatch of a turn creates it;
+    /// every subsequent dispatch in the same turn reuses it.
+    fn current_turn_span(&mut self) -> tracing::Span {
+        if let Some(span) = &self.turn_span {
+            return span.clone();
+        }
+        let span = tracing::info_span!(
+            "conversation.turn",
+            conv_id = %self.context.conversation_id,
+            root_conv_id = %self.context.root_conversation_id,
+            model = %self.context.model_id,
+            is_sub_agent = self.context.is_sub_agent,
+            final_state = tracing::field::Empty,
+        );
+        self.turn_span = Some(span.clone());
+        span
+    }
+
+    /// Drop the executor's turn-span handle once the conversation settles out
+    /// of the "working" presentation mode, stamping the state it settled
+    /// into. The span closes (and exports) when the last in-flight task's
+    /// clone drops. No-op while still working or when no turn is open.
+    fn settle_turn_span(&mut self) {
+        if self.state.presentation_mode() == "working" {
+            return;
+        }
+        if let Some(span) = self.turn_span.take() {
+            span.record("final_state", self.state.variant_name());
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_llm_request(&mut self) -> Result<Option<Event>, String> {
         // Parent-conversation tool-use cycle cap (task 24680). Sub-agents
         // have their own lifetime cap below (REQ-PROJ-008); this branch
@@ -3375,6 +3446,11 @@ where
         // Typed oneshot channel: background task gets Sender<LlmOutcome>,
         // physically cannot send a ToolExecOutcome or other type.
         let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
+
+        // The spawned request task runs detached from any request scope;
+        // instrumenting it with the turn span is what parents the
+        // `llm.request` span (LoggingService) into this turn's trace.
+        let turn_span = self.current_turn_span();
 
         // Open a fresh generation for this dispatch. The forwarder stamps it
         // onto the outcome; the select loop discards an outcome whose
@@ -3641,7 +3717,7 @@ where
             }
 
             let _ = llm_tx.send(llm_outcome);
-        });
+        }.instrument(turn_span));
         self.llm_task_handle = Some(handle);
 
         // Forward the typed outcome, generation-tagged — a dropped sender
@@ -3832,22 +3908,28 @@ where
                 }
             };
 
-        let tool_task = tokio::spawn(async move {
-            let tool_outcome = execute_tool_to_outcome(
-                storage,
-                tool_executor,
-                checked,
-                tool_ctx,
-                &cancel_token_check,
-                conv_id,
-                root_conv_id,
-                tool_name,
-                tool_use_id,
-            )
-            .await;
-            // Send typed outcome through oneshot channel
-            let _ = tool_tx.send(tool_outcome);
-        });
+        // Instrumenting the detached task with the turn span parents the
+        // `tool.execute` span (execute_tool_to_outcome) into this turn's trace.
+        let turn_span = self.current_turn_span();
+        let tool_task = tokio::spawn(
+            async move {
+                let tool_outcome = execute_tool_to_outcome(
+                    storage,
+                    tool_executor,
+                    checked,
+                    tool_ctx,
+                    &cancel_token_check,
+                    conv_id,
+                    root_conv_id,
+                    tool_name,
+                    tool_use_id,
+                )
+                .await;
+                // Send typed outcome through oneshot channel
+                let _ = tool_tx.send(tool_outcome);
+            }
+            .instrument(turn_span),
+        );
         // Retain the handle so the cancellation backstop (REQ-BED-005a) can
         // abort an uncooperative tool task that never observes its token.
         // Replacing any prior handle is correct: only one tool executes at a
@@ -4629,6 +4711,9 @@ where
                 if let Some(tx) = &self.state_watcher {
                     let _ = tx.send(self.state.clone());
                 }
+                // Direct state write bypasses apply_transition_result, so
+                // close any turn span opened by the brief LlmRequesting here.
+                self.settle_turn_span();
 
                 // Broadcast an error so the UI knows, but don't propagate — the
                 // conversation stays in AwaitingTaskApproval for retry.
@@ -4698,6 +4783,9 @@ where
                 if let Some(tx) = &self.state_watcher {
                     let _ = tx.send(self.state.clone());
                 }
+                // Direct state write bypasses apply_transition_result, so
+                // close any turn span opened by the brief LlmRequesting here.
+                self.settle_turn_span();
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
                     error: crate::runtime::user_facing_error::UserFacingError::retryable(

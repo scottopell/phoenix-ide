@@ -129,12 +129,19 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
         None
     };
 
-    // The OTel layer is intentionally unfiltered: it must always process
-    // spans for export regardless of RUST_LOG/EnvFilter, so that quiet logging
-    // configurations (e.g. RUST_LOG=warn) do not silently disable tracing.
-    let otel_layer = tracer_provider
-        .as_ref()
-        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("phoenix-ide")));
+    // The OTel layer is intentionally NOT gated by RUST_LOG/EnvFilter: quiet
+    // logging configurations (e.g. RUST_LOG=warn) must not silently disable
+    // tracing. The only exclusion is "http.stream" spans — long-lived SSE/
+    // WebSocket connection spans (see the TraceLayer in api/handlers.rs) whose
+    // durations are connection lifetimes, not request latencies. They stay
+    // visible to the stdout/file access log but are never exported.
+    let otel_layer = tracer_provider.as_ref().map(|provider| {
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("phoenix-ide"))
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                !(meta.is_span() && meta.name() == "http.stream")
+            }))
+    });
 
     // EnvFilter is applied per-layer to the stdout/file sinks only, not to the
     // OTel layer. EnvFilter does not implement Clone, so we create a fresh

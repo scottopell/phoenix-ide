@@ -76,6 +76,21 @@ async fn trajectory_export_handler(
     }
 }
 
+/// Long-lived connection routes (SSE, WebSocket). Their `TraceLayer` span
+/// lives until the response *body* ends, so it measures connection lifetime,
+/// not request latency — exporting it would skew latency percentiles and hold
+/// the span unexported until disconnect. `make_span_with` names these spans
+/// "http.stream", which the `OTel` layer in `logging.rs` drops from export; the
+/// stdout/file access log keeps them.
+const STREAMING_ROUTES: &[&str] = &[
+    "/api/conversations/:id/stream",
+    "/api/chains/:rootId/stream",
+    "/api/share/:token/events",
+    "/api/conversations/:id/terminal",
+    "/api/terminal/global",
+    "/api/conversations/:id/browser-view",
+];
+
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
     // The SPA client routes (`/`, `/new`, `/c/:slug`, …) are registered below
@@ -446,15 +461,27 @@ pub fn create_router(state: AppState) -> Router {
                             .extensions()
                             .get::<MatchedPath>()
                             .map_or_else(|| "unmatched".to_string(), |m| m.as_str().to_string());
-                        tracing::info_span!(
-                            "http",
-                            otel.kind = "server",
-                            method = %request.method(),
-                            "http.request.method" = %request.method(),
-                            "http.route" = %route,
-                            "http.response.status_code" = tracing::field::Empty,
-                            "otel.status_code" = tracing::field::Empty,
-                        )
+                        if STREAMING_ROUTES.contains(&route.as_str()) {
+                            tracing::info_span!(
+                                "http.stream",
+                                otel.kind = "server",
+                                method = %request.method(),
+                                "http.request.method" = %request.method(),
+                                "http.route" = %route,
+                                "http.response.status_code" = tracing::field::Empty,
+                                "otel.status_code" = tracing::field::Empty,
+                            )
+                        } else {
+                            tracing::info_span!(
+                                "http",
+                                otel.kind = "server",
+                                method = %request.method(),
+                                "http.request.method" = %request.method(),
+                                "http.route" = %route,
+                                "http.response.status_code" = tracing::field::Empty,
+                                "otel.status_code" = tracing::field::Empty,
+                            )
+                        }
                     }
                 })
                 .on_response(
