@@ -64,6 +64,25 @@ export interface BuildInputs {
   streamingHandle: StreamingHandle | null;
 }
 
+export interface HistoricalBuildInputs {
+  messages: Message[];
+  pendingMessages: QueuedMessage[];
+}
+
+export interface HistoricalBuild {
+  historicalUnits: HistoricalUnit[];
+  /** True when the message walk ends inside an agent run (the last
+   *  run-affecting message was agent/tool). Feeds the streaming tail
+   *  unit's `isFirstInTurn`. Pending user messages do not affect it. */
+  endsInAgentRun: boolean;
+}
+
+export interface TailBuildInputs {
+  convState: ConversationState;
+  streamingHandle: StreamingHandle | null;
+  endsInAgentRun: boolean;
+}
+
 /** Singleton key for the sub-agent status tail unit. React reconciler
  *  uses this to preserve the inner component identity across
  *  re-derivations. */
@@ -116,8 +135,20 @@ function buildAgentTurn(
   };
 }
 
-export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
-  const { messages, pendingMessages, convState, streamingHandle } = inputs;
+// The transform is split at the memoization boundary MessageList needs:
+// historical units depend only on (messages, pendingMessages), tail units
+// only on (convState, streamingHandle) plus the walk's endsInAgentRun.
+// Building both from one function keyed on all four inputs rebuilt every
+// historical unit — fresh object and toolResultsByUseId Map identities —
+// on every conversation state tick, defeating AgentMessage's memo() and
+// re-rendering every mounted row for zero visual change.
+// `buildRenderUnits` composes the halves for callers that want the whole
+// transform in one step (tests, non-memoized call sites).
+
+export function buildHistoricalUnits(
+  inputs: HistoricalBuildInputs,
+): HistoricalBuild {
+  const { messages, pendingMessages } = inputs;
 
   const historicalUnits: HistoricalUnit[] = [];
   let i = 0;
@@ -187,6 +218,12 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
     historicalUnits.push({ kind: 'pending_user', key: q.localId, message: q });
   }
 
+  return { historicalUnits, endsInAgentRun: inAgentRun };
+}
+
+export function buildTailUnits(inputs: TailBuildInputs): TailUnit[] {
+  const { convState, streamingHandle, endsInAgentRun } = inputs;
+
   const tailUnits: TailUnit[] = [];
 
   if (convState.type === 'awaiting_sub_agents') {
@@ -201,14 +238,24 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
     // First in turn when no finalized agent message has appeared yet this run:
     // the live stream then renders the same `message-header` the finalized first
     // message will, so the header row doesn't pop in on finalize. A continuation
-    // stream (after a tool result, inAgentRun still set) gets no header, matching
-    // its finalized continuation message.
+    // stream (after a tool result, endsInAgentRun still set) gets no header,
+    // matching its finalized continuation message.
     tailUnits.push({
       kind: 'streaming_agent',
       key: streamingHandle.key,
-      isFirstInTurn: !inAgentRun,
+      isFirstInTurn: !endsInAgentRun,
     });
   }
 
+  return tailUnits;
+}
+
+export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
+  const { historicalUnits, endsInAgentRun } = buildHistoricalUnits(inputs);
+  const tailUnits = buildTailUnits({
+    convState: inputs.convState,
+    streamingHandle: inputs.streamingHandle,
+    endsInAgentRun,
+  });
   return { historicalUnits, tailUnits };
 }

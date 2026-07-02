@@ -16,7 +16,8 @@ import { MessageContextMenu } from './MessageContextMenu';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
-  buildRenderUnits,
+  buildHistoricalUnits,
+  buildTailUnits,
   type HistoricalUnit,
   type TailUnit,
   type RenderUnit,
@@ -364,14 +365,19 @@ function MessageListImpl({
     [streamingRequestId],
   );
 
-  const { historicalUnits, tailUnits } = useMemo(
-    () => buildRenderUnits({
-      messages,
-      pendingMessages,
-      convState,
-      streamingHandle,
-    }),
-    [messages, pendingMessages, convState, streamingHandle],
+  // Split memos at the transform's natural boundary: historical units must
+  // NOT rebuild on conversation state ticks. A rebuild gives every unit a
+  // fresh object and toolResultsByUseId Map identity, which defeats
+  // AgentMessage's memo() and re-renders every mounted row on every state
+  // transition (sending → streaming → tool_executing → …) for zero visual
+  // change.
+  const { historicalUnits, endsInAgentRun } = useMemo(
+    () => buildHistoricalUnits({ messages, pendingMessages }),
+    [messages, pendingMessages],
+  );
+  const tailUnits = useMemo(
+    () => buildTailUnits({ convState, streamingHandle, endsInAgentRun }),
+    [convState, streamingHandle, endsInAgentRun],
   );
 
   const allUnits = useMemo<RenderUnit[]>(

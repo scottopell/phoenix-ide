@@ -156,9 +156,14 @@ entity Builder {
 -- Actor Declarations
 ------------------------------------------------------------
 
--- The transform is invoked from a React useMemo at the MessageList
--- shell. The actor exists to anchor the Builder entity; rules do not
--- reference it by name.
+-- The transform is invoked from a pair of React useMemos at the
+-- MessageList shell, split at the walking/tail_assembly boundary:
+-- historical units derive from (messages, pendingMessages) only and
+-- tail units from (convState, streamingHandle, in_agent_run), so a
+-- conversation state tick cannot rebuild historical units — a rebuild
+-- hands every agent_turn a fresh tool-result map identity and defeats
+-- the row renderer's memoization. The actor exists to anchor the
+-- Builder entity; rules do not reference it by name.
 actor RenderUnitsTransform {
     identified_by: Builder
 }

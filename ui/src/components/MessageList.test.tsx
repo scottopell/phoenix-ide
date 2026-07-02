@@ -21,16 +21,22 @@ function withConvContext(ui: React.ReactElement): React.ReactElement {
   );
 }
 
-vi.mock('./MessageComponents', () => ({
+// Render counter for the AgentMessage mock. The mock is memo()d like the
+// real component, so this counts actual re-renders — the render-unit
+// identity regression test (task 58044) asserts state ticks don't bump it.
+const agentRenderCounter = vi.hoisted(() => ({ count: 0 }));
+
+vi.mock('./MessageComponents', async () => ({
   UserMessage: ({ message }: { message: { sequence_id: number } }) => (
     <div className="message user" data-sequence-id={message.sequence_id} data-payload-kind="user">user</div>
   ),
   QueuedUserMessage: () => (
     <div className="message queued" data-payload-kind="pending">pending</div>
   ),
-  AgentMessage: ({ message }: { message: { sequence_id: number } }) => (
-    <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>
-  ),
+  AgentMessage: (await import('react')).memo(({ message }: { message: { sequence_id: number } }) => {
+    agentRenderCounter.count++;
+    return <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>;
+  }),
   SubAgentStatus: () => null,
   SkillCommandText: ({ text }: { text: string }) => {
     const [token = '', ...rest] = text.split(/\s+/);
@@ -70,6 +76,7 @@ const virtuosoMock = {
 beforeEach(() => {
   virtuosoMock.scrollToIndex = vi.fn();
   virtuosoMock.totalListHeightChanged = null;
+  agentRenderCounter.count = 0;
 });
 
 vi.mock('react-virtuoso', () => ({
@@ -446,6 +453,72 @@ describe('MessageList', () => {
     expect(container.querySelector('.system-prompt-content')).toHaveTextContent(
       'SENTINEL SYSTEM PROMPT',
     );
+  });
+});
+
+describe('render-unit identity across state ticks', () => {
+  it('does not re-render mounted agent rows on a conversation state tick', () => {
+    // Same store and same prop identities across rerenders — only convState
+    // changes, exactly like a state tick arriving over SSE.
+    const store = new ConversationStore();
+    const wrap = (el: React.ReactElement) => (
+      <ConversationContext.Provider value={store}>{el}</ConversationContext.Provider>
+    );
+    const messages = [
+      makeMessage(1, 'user'),
+      makeMessage(2, 'agent'),
+      makeMessage(3, 'agent'),
+    ];
+    const pending: never[] = [];
+    const onRetry = vi.fn();
+
+    const { rerender } = render(
+      wrap(
+        <MessageList
+          messages={messages}
+          pendingMessages={pending}
+          convState={idleState}
+          onRetry={onRetry}
+          onOpenFile={undefined}
+          conversationId="conv-memo-identity"
+        />,
+      ),
+    );
+    const mountCount = agentRenderCounter.count;
+    expect(mountCount).toBeGreaterThan(0);
+
+    // State tick: idle -> awaiting_llm. No message changed, no active tool
+    // changed — a rebuild of historical units here would hand every
+    // AgentMessage a fresh toolResultsByUseId Map and defeat its memo.
+    rerender(
+      wrap(
+        <MessageList
+          messages={messages}
+          pendingMessages={pending}
+          convState={{ type: 'awaiting_llm' }}
+          onRetry={onRetry}
+          onOpenFile={undefined}
+          conversationId="conv-memo-identity"
+        />,
+      ),
+    );
+    expect(agentRenderCounter.count).toBe(mountCount);
+
+    // Sanity check that the counter is live: an actual message change does
+    // re-render agent rows.
+    rerender(
+      wrap(
+        <MessageList
+          messages={[...messages, makeMessage(4, 'agent')]}
+          pendingMessages={pending}
+          convState={{ type: 'awaiting_llm' }}
+          onRetry={onRetry}
+          onOpenFile={undefined}
+          conversationId="conv-memo-identity"
+        />,
+      ),
+    );
+    expect(agentRenderCounter.count).toBeGreaterThan(mountCount);
   });
 });
 
