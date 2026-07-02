@@ -17,6 +17,7 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [003](003_bash-process-cleanup-uses-subreaper-kill-tree.md) | Bash process cleanup uses subreaper plus shutdown kill-tree | Accepted | REQ-BASH-003, REQ-BASH-006, REQ-BASH-007 |
 | [004](004_inline-terminal-shared-history-per-command.md) | Inline terminal records user commands as per-command bash rounds in shared history | Accepted | REQ-IT-003, REQ-IT-004, REQ-IT-005, REQ-IT-007 |
 | [005](005_user-tool-invocation-self-service-scope.md) | User tool invocation is limited to self-service tools; director tools deferred | Accepted | REQ-UTI-003, REQ-UTI-006, REQ-IT-002 |
+| [006](006_wake-contracts-are-persisted-conversation-scoped-terminal-waits.md) | Wake contracts are persisted conversation-scoped terminal waits | Accepted | REQ-WAKE-001, REQ-WAKE-002, REQ-WAKE-003, REQ-WAKE-004, REQ-WAKE-005, REQ-WAKE-006, REQ-WAKE-009, REQ-WAKE-010, REQ-WAKE-012, REQ-WAKE-013, REQ-WAKE-016, REQ-WAKE-017, REQ-WAKE-018 |
 
 ## For agents: which decisions bind your task
 
@@ -26,12 +27,13 @@ Consult the relevant ADRs before starting work of each kind.
 | --- | --- |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
-| Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003 |
+| Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
 | Specifying bash command execution / wait-window semantics | 001 |
 | Specifying bash handle state observation or response shaping | 002 |
 | Specifying bash process cleanup, shutdown cleanup, or kill escalation policy | 003 |
 | Specifying inline-terminal history commit, per-command rounds, or user-origin attribution | 004 |
 | Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
+| Specifying wake contracts, async terminal waits, or sub-agent terminal wake delivery | 006 |
 
 ## Decision dependencies
 
@@ -41,8 +43,9 @@ ADR-000 (adopt spEARS v2 for new work)
       ├── ADR-001 (Bash handles are first-class process-local entities with wait windows)
       │  ├── ADR-002 (Bash handle state uses watch-backed exit notifications and snapshot shaping)
       │  └── ADR-003 (Bash process cleanup uses subreaper plus shutdown kill-tree)
-      └── ADR-005 (User tool invocation is limited to self-service tools)
-         └── ADR-004 (Inline terminal records per-command bash rounds in shared history — the bash specialization)
+      ├── ADR-005 (User tool invocation is limited to self-service tools)
+      │  └── ADR-004 (Inline terminal records per-command bash rounds in shared history — the bash specialization)
+      └── ADR-006 (Wake contracts are persisted conversation-scoped terminal waits)
 ```
 
 ## Conventions

@@ -23,9 +23,9 @@
 --   - Webhook-triggered wake
 --   - Compound semantics (wait_all, wait_any)
 --   - First-fire-wins / supersede semantics (deliberately rejected;
---     see design.md "Independent multi-contract semantics")
+--     see ADR-006 "Multiple contracts on one conversation resolve independently")
 --   - A first-class AwaitingWake conv state (deliberately rejected;
---     see design.md "Why No AwaitingWake State")
+--     see ADR-006 "A new AwaitingWake conversation state" rejected option)
 --
 -- Requirement traceability: REQ-WAKE-001 through REQ-WAKE-018
 -- Dependencies: specs/bedrock/bedrock.allium, specs/bash/bash.allium
@@ -161,7 +161,7 @@ enum ContractStatus {
 -- registration; updated to terminal on resolution. Never silently
 -- removed. The contract row is the SINGLE SOURCE OF TRUTH for "is
 -- this conversation waiting on something" - there is no conv-state
--- mirror (see design.md "Why No AwaitingWake State").
+-- mirror (see ADR-006's rejected AwaitingWake option).
 entity Contract {
     -- Stable id allocated at registration. Survives Phoenix restart.
     id: String

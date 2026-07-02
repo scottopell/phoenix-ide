@@ -61,8 +61,8 @@ Wake is "waiting on the runtime," which is a different category —
 it does not block the user from interacting with the conversation,
 and it is invisible to the user except as a status indicator. The
 contract row in the `wake_contracts` table is the single source of
-truth for "is this conv waiting on something." (See design.md
-§"Why no AwaitingWake state.")
+truth for "is this conv waiting on something." ADR-006 records the rejected
+`AwaitingWake` alternative.
 
 **Persistence boundary:** wake contracts are persisted to SQLite. They
 survive Phoenix restart. A contract registered against a handle that
@@ -105,8 +105,7 @@ nothing further to do until this fires." The tool call itself does
 not return a synchronous payload to the LLM. The conversation state
 is unchanged — the LLM's next invocation is when the contract fires
 (or expires / is cancelled / is forgotten). See REQ-WAKE-006 for
-delivery semantics; see design.md §"Why no AwaitingWake state" for
-the explicit non-state rationale.
+delivery semantics; ADR-006 records the explicit non-state rationale.
 
 ---
 
@@ -302,8 +301,7 @@ continuation
 
 **Rationale:** WorkScope governs *resource* sharing across continuation
 boundaries; wake governs *conversation* resumption. Conflating them
-was explicitly identified as the design error that motivated the
-WorkScope+wake split (see executive.md §"Why two axes").
+is the invalid-state class that ADR-006's WorkScope/wake split avoids.
 
 ---
 
