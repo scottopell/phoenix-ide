@@ -342,6 +342,16 @@ appended
 to the last item when the user's pre-growth distance from the bottom is
 within the pin threshold)
 
+THE SYSTEM SHALL compute the pre-growth distance from the bottom in DOM
+scroller units — the previously observed `scrollHeight` against the
+current `scrollTop` and viewport height — not against the virtualizer's
+reported total list height. The virtualizer's total is an
+estimate-corrected model value whose divergence from the DOM
+`scrollHeight` grows with the number of not-yet-measured rows; on long
+conversations that divergence exceeds the pin threshold, and a
+model-based check misclassifies a genuinely pinned user as scrolled-up,
+silently disabling auto-follow.
+
 WHEN a new render unit appears and the user is NOT pinned to the bottom
 (scrolled up)
 THE SYSTEM SHALL show the "jump-to-newest" button
@@ -383,6 +393,19 @@ the user back to the bottom. The manual `totalListHeightChanged`
 callback uses the pre-growth scroll position to distinguish "user was
 near the bottom" from "user scrolled up," which is correct during
 streaming where Virtuoso's built-in handler is not.
+
+WHILE the user has not yet interacted with the conversation's scroller
+(no touch, wheel, or pointer input, and no conversation-nav jump)
+THE SYSTEM SHALL re-snap to the bottom on every total-list-height
+change regardless of the measured distance from the bottom
+SO THAT a stranded initial placement self-heals: the virtualizer's
+initial bottom placement is computed against pre-measurement estimates,
+and a large estimate correction landing right after mount can leave the
+viewport far from the bottom (even at the top of the conversation).
+Distance-based pinning cannot recover from stranding — it classifies
+the stranded viewport as a scrolled-up user. The mount contract is
+"open pinned to the newest message"; only a user interaction releases
+the viewport from it.
 
 WHEN the Virtuoso instance mounts with empty data and the first
 messages arrive later (fresh conversation, or cached metadata before

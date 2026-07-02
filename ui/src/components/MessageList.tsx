@@ -316,9 +316,18 @@ function MessageListImpl({
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   // Most recent `totalListHeightChanged` value virtuoso has reported. Used
-  // to detect "user was pinned to the previous bottom" — see the
-  // handleTotalListHeightChanged comment.
+  // only to classify a height delta as growth vs shrink (model units
+  // compared against model units) — see handleTotalListHeightChanged.
   const prevTotalHeightRef = useRef(0);
+  // Previous DOM scrollHeight of the scroller. The pin-distance check must
+  // compare scrollTop (DOM units) against the pre-growth bottom in the SAME
+  // units: virtuoso's totalListHeight is an estimate-corrected model value
+  // that can disagree with the DOM scrollHeight by more than the pin
+  // threshold on long conversations (hundreds of not-yet-measured rows'
+  // estimate error), which misclassifies a genuinely pinned user as
+  // scrolled-up and silently kills auto-follow. Synced at every height
+  // callback, so at callback time it still holds the pre-growth DOM height.
+  const prevScrollHeightRef = useRef(0);
   // Previous viewport (scroller) clientHeight. Used to detect viewport
   // shrinks (resize, panel expansion, composer growth) so a pinned user
   // stays pinned — see the viewport-shrink handling in
@@ -395,6 +404,15 @@ function MessageListImpl({
   const lastUpwardScrollAtRef = useRef(0);
   const lastScrollTopRef = useRef(0);
   const detachGestureListenersRef = useRef<(() => void) | null>(null);
+  // False until the user first interacts with this conversation's scroller
+  // (touch, wheel, pointer) or triggers a nav jump. While false, the list is
+  // still settling from mount and every height delta re-snaps to the bottom
+  // regardless of measured distance: virtuoso's initial `LAST` placement can
+  // be stranded far from the bottom when a large estimate correction lands
+  // right after mount, and a distance-based pin check would classify that
+  // stranding as "user scrolled up" and never recover. The mount contract is
+  // "open pinned to the newest message"; only a user action releases it.
+  const hasUserEngagedRef = useRef(false);
 
   const handleScrollerRef = useCallback((ref: HTMLElement | Window | null) => {
     detachGestureListenersRef.current?.();
@@ -410,7 +428,12 @@ function MessageListImpl({
       touchActiveRef.current = false;
       lastUpwardScrollAtRef.current = 0;
       lastScrollTopRef.current = ref.scrollTop;
+      hasUserEngagedRef.current = false;
+      const onPointerDown = () => {
+        hasUserEngagedRef.current = true;
+      };
       const onTouchStart = () => {
+        hasUserEngagedRef.current = true;
         touchActiveRef.current = true;
       };
       const onTouchEnd = (e: TouchEvent) => {
@@ -420,6 +443,7 @@ function MessageListImpl({
       // registers even when the wheel event and the height delta land before
       // the resulting scroll event does.
       const onWheel = (e: WheelEvent) => {
+        hasUserEngagedRef.current = true;
         if (e.deltaY < 0) lastUpwardScrollAtRef.current = Date.now();
       };
       const onScroll = () => {
@@ -429,12 +453,14 @@ function MessageListImpl({
         }
         lastScrollTopRef.current = top;
       };
+      ref.addEventListener('pointerdown', onPointerDown, { passive: true });
       ref.addEventListener('touchstart', onTouchStart, { passive: true });
       ref.addEventListener('touchend', onTouchEnd, { passive: true });
       ref.addEventListener('touchcancel', onTouchEnd, { passive: true });
       ref.addEventListener('wheel', onWheel, { passive: true });
       ref.addEventListener('scroll', onScroll, { passive: true });
       detachGestureListenersRef.current = () => {
+        ref.removeEventListener('pointerdown', onPointerDown);
         ref.removeEventListener('touchstart', onTouchStart);
         ref.removeEventListener('touchend', onTouchEnd);
         ref.removeEventListener('touchcancel', onTouchEnd);
@@ -575,6 +601,7 @@ function MessageListImpl({
       // scrolled-up.
       const s = scrollerRef.current;
       prevClientHeightRef.current = s ? s.clientHeight : 0;
+      prevScrollHeightRef.current = s ? s.scrollHeight : 0;
       // Seed from allUnitsLengthRef: if the new conversation already has
       // messages, initialTopMostItemIndex handled placement and we must
       // NOT force a snap on the next height delta. Only an empty→non-empty
@@ -599,6 +626,7 @@ function MessageListImpl({
     if (!hasSeenContentRef.current) {
       hasSeenContentRef.current = true;
       prevClientHeightRef.current = s.clientHeight;
+      prevScrollHeightRef.current = s.scrollHeight;
       virtuosoRef.current?.scrollToIndex({
         index: 'LAST',
         align: 'end',
@@ -620,8 +648,25 @@ function MessageListImpl({
       s.clientHeight < prevClientHeightRef.current
         ? prevClientHeightRef.current
         : s.clientHeight;
-    const oldFromBottom = prevHeight - s.scrollTop - clientHeightForPinCheck;
+    // Pin distance in DOM units: previous scrollHeight vs current scrollTop.
+    // Not `prevHeight` (virtuoso's model total), whose estimate error on a
+    // long conversation can exceed PIN_TO_BOTTOM_THRESHOLD and misclassify
+    // a pinned user as scrolled-up — see prevScrollHeightRef.
+    const oldFromBottom =
+      prevScrollHeightRef.current - s.scrollTop - clientHeightForPinCheck;
     prevClientHeightRef.current = s.clientHeight;
+    prevScrollHeightRef.current = s.scrollHeight;
+    // Pre-engagement settling: see hasUserEngagedRef. Distance is
+    // meaningless while virtuoso may have stranded the initial placement,
+    // so keep re-snapping until the user takes over.
+    if (!hasUserEngagedRef.current) {
+      virtuosoRef.current?.scrollToIndex({
+        index: 'LAST',
+        align: 'end',
+        behavior: 'auto',
+      });
+      return;
+    }
     if (oldFromBottom <= PIN_TO_BOTTOM_THRESHOLD) {
       // An in-progress user gesture owns the viewport. Height deltas fire
       // continuously while rows mount and measure during the user's own
@@ -748,6 +793,10 @@ function MessageListImpl({
   const scrollToUnitIndex = useCallback((unitIndex: number) => {
     const unit = historicalUnits[unitIndex];
     if (!unit) return;
+    // A nav jump is user engagement even though it never touches the
+    // scroller: without this, a pre-engagement height delta would snap the
+    // viewport back to the bottom and clobber the jump.
+    hasUserEngagedRef.current = true;
     clearJumpRetryTimers();
     activeJumpKeyRef.current = unit.key;
     pendingPulseKeyRef.current = unit.key;
