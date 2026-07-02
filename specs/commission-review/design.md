@@ -37,19 +37,18 @@ directory. Worktree-backed and direct git conversations review committed changes
 on the current `HEAD` against the fetched origin default branch tip. Workspace
 changes are never included in the commissioned diff.
 
-The base comparator must resolve to the remote-tracking ref `origin/<base>`. The
-bare local `<base>` ref is only as current as the worktree last fast-forwarded
-it, so on a long-lived clone it can be far behind; diffing a feature branch
-against a stale local base pulls in every commit merged upstream since,
-inflating the review with already-landed code and, for large files, fabricating
-diffs large enough to exceed the size caps. `origin/<base>` is what the branch
-actually merges into, so it is the correct comparator and matches the diff the
-conversation diff endpoint shows the user. The comparator is resolved freshly at
-review execution time rather than cached on the approval scope, so it cannot go
-stale between a review being proposed and approved; the approval card therefore
-presents the base as a proposal that resolves to its tracked remote at review
-time, and the result records the concrete resolved comparator. If the remote ref
-is unavailable, the target collection stage fails before any review LLM call.
+The base comparator resolves through the remote-tracking symbolic ref
+`origin/HEAD`, which identifies the fetched origin default branch. A bare local
+default-branch ref is only as current as the worktree last fast-forwarded it, so
+on a long-lived clone it can be far behind; diffing a feature branch against a
+stale local base pulls in every commit merged upstream since, inflating the
+review with already-landed code and, for large files, fabricating diffs large
+enough to exceed the size caps. `origin/HEAD` points at what the branch actually
+merges into by default, so it is the correct comparator and matches the branch
+delta the user expects. The comparator is resolved freshly at review execution
+time rather than cached on the approval scope, so it cannot go stale between a
+review being proposed and approved. If `origin/HEAD` is unavailable, the target
+collection stage fails before any review LLM call.
 
 `git status --porcelain` determines cleanliness. Any uncommitted or untracked
 changes cause target collection to fail before diff collection or LLM review.

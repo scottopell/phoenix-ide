@@ -1398,16 +1398,21 @@ fn assert_approved_paths_match(
     Ok(())
 }
 
-async fn effective_base_ref(repo: &Path, base_branch: &str) -> Result<String, String> {
-    let remote = format!("origin/{base_branch}");
-    if git_capture(repo, &["rev-parse", "--verify", "--quiet", &remote])
-        .await
-        .is_ok()
-    {
-        Ok(remote)
+async fn origin_default_ref(repo: &Path) -> Result<String, String> {
+    let remote = git_capture(
+        repo,
+        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .await
+    .map_err(|_| {
+        "commission_review requires fetched origin default branch ref `origin/HEAD`. Fetch origin before requesting review.".to_string()
+    })?;
+    let remote = remote.trim();
+    if remote.starts_with("origin/") {
+        Ok(remote.to_string())
     } else {
         Err(format!(
-            "commission_review requires remote-tracking base `{remote}`. Fetch the origin default branch before requesting review."
+            "commission_review expected `origin/HEAD` to resolve to an origin remote-tracking branch, got `{remote}`."
         ))
     }
 }
@@ -1415,7 +1420,7 @@ async fn effective_base_ref(repo: &Path, base_branch: &str) -> Result<String, St
 async fn resolve_target(
     ctx: &ToolContext,
     _input: &CommissionReviewInput,
-    runtime_base_branch: Option<&str>,
+    _runtime_base_branch: Option<&str>,
 ) -> Result<ReviewTarget, String> {
     let repo_root = git_capture(&ctx.working_dir, &["rev-parse", "--show-toplevel"]).await?;
     let repo = PathBuf::from(repo_root.trim());
@@ -1428,7 +1433,7 @@ async fn resolve_target(
     if dirty {
         return Err("commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the origin default branch tip.".to_string());
     }
-    let base = effective_base_ref(&repo, runtime_base_branch.unwrap_or("main")).await?;
+    let base = origin_default_ref(&repo).await?;
     Ok(ReviewTarget {
         summary: ReviewTargetSummary {
             kind: if ctx.worktree_path.is_some() {
@@ -2060,10 +2065,10 @@ mod tests {
         );
     }
 
-    /// The review target requires `origin/<base>` so reviews compare committed
-    /// branch changes against the fetched origin default branch tip.
+    /// The review target resolves the fetched origin default branch through
+    /// `origin/HEAD` instead of assuming a branch name such as `main`.
     #[tokio::test]
-    async fn effective_base_ref_requires_remote_tracking_ref() {
+    async fn origin_default_ref_uses_origin_head() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         git_ok(repo, &["init", "-q"]).await;
@@ -2076,13 +2081,19 @@ mod tests {
             .await
             .expect("head");
 
-        assert!(effective_base_ref(repo, "main").await.is_err());
+        assert!(origin_default_ref(repo).await.is_err());
 
-        git_ok(repo, &["update-ref", "refs/remotes/origin/main", &head]).await;
-        assert_eq!(
-            effective_base_ref(repo, "main").await.unwrap(),
-            "origin/main"
-        );
+        git_ok(repo, &["update-ref", "refs/remotes/origin/master", &head]).await;
+        git_ok(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/master",
+            ],
+        )
+        .await;
+        assert_eq!(origin_default_ref(repo).await.unwrap(), "origin/master");
     }
 
     #[tokio::test]
@@ -2097,6 +2108,15 @@ mod tests {
             .await
             .expect("base");
         git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base]).await;
+        git_ok(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )
+        .await;
         std::fs::write(repo.join("dirty.rs"), "uncommitted\n").expect("write");
 
         let ctx = ToolContext::new(
@@ -2125,6 +2145,53 @@ mod tests {
         assert!(err.contains("only reviews committed changes"));
     }
 
+    #[tokio::test]
+    async fn resolve_target_uses_origin_default_even_when_runtime_base_is_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]).await;
+        let base = git_capture(repo, &["rev-parse", "HEAD"])
+            .await
+            .expect("base");
+        git_ok(repo, &["update-ref", "refs/remotes/origin/master", &base]).await;
+        git_ok(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/master",
+            ],
+        )
+        .await;
+
+        let ctx = ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            repo.to_path_buf(),
+            std::sync::Arc::new(crate::BrowserSessionManager::default()),
+            std::sync::Arc::new(crate::BashHandleRegistry::new()),
+            std::sync::Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            std::sync::Arc::new(crate::TmuxRegistry::new()),
+            Some(repo.to_path_buf()),
+        );
+        let target = resolve_target(
+            &ctx,
+            &CommissionReviewInput {
+                brief: "ready".to_string(),
+                focus: None,
+            },
+            Some("develop"),
+        )
+        .await
+        .expect("target resolves");
+
+        assert_eq!(target.summary.base, "origin/master");
+    }
+
     /// A diff whose only changed files all exceed the per-file cap reviews
     /// nothing, but must report the coverage gap (partial status + top-level
     /// unreviewed list), not look like an ordinary empty-diff skip.
@@ -2140,6 +2207,15 @@ mod tests {
             .await
             .expect("base");
         git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base]).await;
+        git_ok(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )
+        .await;
         // One changed file, far over MAX_FILE_BYTES, on a committed branch.
         let big = "let x = 0;\n".repeat(MAX_FILE_BYTES / 5);
         std::fs::write(repo.join("big.rs"), &big).expect("write");
