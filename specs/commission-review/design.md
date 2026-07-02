@@ -104,6 +104,11 @@ review output. If an LLM timeout or transport failure happens after Phoenix has
 parsed a finding or reviewer summary, the result is `partial` and preserves that
 output. Conversation cancellation is handled by the runtime abort path, which
 discards returned tool output after the shared cancellation token is set.
+The implementation models these cases as a small typed outcome enum before
+constructing the wire result. Failed and unavailable outcomes do not carry parsed
+findings or reviewer summaries; interrupted-after-output outcomes require either
+findings or a reviewer summary; collection failures identify the failed
+collection stage and skip later stages.
 
 `review_status`, `findings_status`, `findings_trust`, and `stage_status` are
 typed enums rather than free-form strings. `stage_status` records target

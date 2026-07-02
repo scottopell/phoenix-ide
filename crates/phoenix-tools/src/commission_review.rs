@@ -57,10 +57,10 @@ enum ReviewStatus {
 enum ReviewCompletionStatus {
     Completed,
     CompletedWithWarnings,
-    ModelTimeoutAfterFindings,
-    ModelTimeoutNoFindings,
-    ModelFailedAfterFindings,
-    ModelFailedNoFindings,
+    ModelTimeoutAfterOutput,
+    ModelTimeoutNoOutput,
+    ModelFailedAfterOutput,
+    ModelFailedNoOutput,
     Cancelled,
     Unavailable,
     #[allow(dead_code)]
@@ -371,8 +371,28 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         );
     }
 
-    let target = resolve_target(&ctx, &input, approved.runtime_base_branch.as_deref()).await?;
-    let collection = collect_diff(&target, &ctx).await?;
+    let target = match resolve_target(&ctx, &input, approved.runtime_base_branch.as_deref()).await {
+        Ok(target) => target,
+        Err(reason) => {
+            return Ok(ReviewRun::CollectionFailed {
+                target: fallback_target_summary(&ctx, &input),
+                stage: CollectionFailureStage::TargetCollection,
+                reason,
+            }
+            .into_output(started.elapsed().as_millis()));
+        }
+    };
+    let collection = match collect_diff(&target, &ctx).await {
+        Ok(collection) => collection,
+        Err(reason) => {
+            return Ok(ReviewRun::CollectionFailed {
+                target: target.summary,
+                stage: CollectionFailureStage::DiffCollection,
+                reason,
+            }
+            .into_output(started.elapsed().as_millis()));
+        }
+    };
 
     if ctx.cancel.is_cancelled() {
         return Err("commission_review cancelled before LLM review".to_string());
@@ -388,41 +408,12 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         } else {
             "No reviewable text diff was found".to_string()
         };
-        return Ok(finalize_review_output(ReviewOutputDraft {
-            status: if has_unreviewed {
-                ReviewStatus::Partial
-            } else {
-                ReviewStatus::Skipped
-            },
-            review_status: if has_unreviewed {
-                ReviewCompletionStatus::CompletedWithWarnings
-            } else {
-                ReviewCompletionStatus::Unavailable
-            },
-            findings_status: FindingsStatus::Unavailable,
-            findings_trust: FindingsTrust::Low,
-            stage_status: ReviewStageStatus {
-                target_collection: StageStatus::Ok,
-                diff_collection: diff_stage_status(&collection.warnings, has_unreviewed),
-                llm_review: StageStatus::Skipped,
-                json_parse: StageStatus::Skipped,
-                finding_extraction: StageStatus::Skipped,
-            },
-            retry_recommendation: RetryRecommendation::DoNotRetry,
-            summary: ReviewSummary {
-                target: target.summary,
-                files_changed: collection.files_changed,
-                files_reviewed: 0,
-                insertions: collection.insertions,
-                deletions: collection.deletions,
-                elapsed_ms: started.elapsed().as_millis(),
-                usage: phoenix_core::domain::llm_types::Usage::default(),
-                reviewer_summary: Some(reviewer_summary),
-            },
-            unreviewed: collection.unreviewed,
-            findings: Vec::new(),
-            warnings: collection.warnings,
-        }));
+        return Ok(ReviewRun::SkippedNoReviewableDiff {
+            target: target.summary,
+            coverage: ReviewCoverage::from_collection(collection),
+            reason: reviewer_summary,
+        }
+        .into_output(started.elapsed().as_millis()));
     }
 
     let service = ctx.llm_selector().default_service().ok_or_else(|| {
@@ -540,52 +531,19 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     }
 
     normalize_findings(&mut findings, &mut warnings);
-    warnings.extend(collection.warnings);
-    let unreviewed = collection.unreviewed;
-    let has_unreviewed = !unreviewed.is_empty();
-    let has_parsed_output = !findings.is_empty() || !reviewer_summaries.is_empty();
-    let has_diff_coverage_gap =
-        diff_stage_status(&warnings, has_unreviewed) == StageStatus::Partial;
-    let (status, findings_status, findings_trust, retry_recommendation) =
-        completed_result_contract(&warnings, has_parsed_output, has_diff_coverage_gap);
-    let review_status = completed_review_status(&status, warnings.is_empty() && !has_unreviewed);
-
-    Ok(finalize_review_output(ReviewOutputDraft {
-        status,
-        review_status,
-        findings_status,
-        findings_trust,
-        stage_status: ReviewStageStatus {
-            target_collection: StageStatus::Ok,
-            diff_collection: diff_stage_status(&warnings, has_unreviewed),
-            llm_review: StageStatus::Ok,
-            json_parse: json_parse_stage_status(&warnings),
-            finding_extraction: finding_extraction_stage_status(&warnings),
-        },
-        retry_recommendation,
-        summary: ReviewSummary {
-            target: target.summary,
-            files_changed: collection.files_changed,
-            files_reviewed: collection.files_reviewed,
-            insertions: collection.insertions,
-            deletions: collection.deletions,
-            elapsed_ms: started.elapsed().as_millis(),
-            usage: phoenix_core::domain::llm_types::Usage {
-                input_tokens,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
-            },
-            reviewer_summary: if reviewer_summaries.is_empty() {
-                None
-            } else {
-                Some(reviewer_summaries.join("\n\n"))
-            },
-        },
-        unreviewed,
-        findings,
+    Ok(ReviewRun::Completed {
+        target: target.summary,
+        coverage: ReviewCoverage::from_collection(collection),
+        parsed: ParsedReviewOutput::from_parts(findings, reviewer_summaries),
         warnings,
-    }))
+        usage: phoenix_core::domain::llm_types::Usage {
+            input_tokens,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        },
+    }
+    .into_output(started.elapsed().as_millis()))
 }
 
 #[derive(Debug)]
@@ -619,30 +577,314 @@ struct InterruptedReview {
     interruption: ReviewInterruption,
 }
 
-fn interrupted_review_output(
-    started: Instant,
+#[derive(Debug)]
+struct ReviewCoverage {
+    files_changed: usize,
+    files_reviewed: usize,
+    insertions: u64,
+    deletions: u64,
+    warnings: Vec<ReviewWarning>,
+    unreviewed: Vec<UnreviewedFile>,
+}
+
+impl ReviewCoverage {
+    fn from_collection(collection: DiffCollection) -> Self {
+        Self {
+            files_changed: collection.files_changed,
+            files_reviewed: collection.files_reviewed,
+            insertions: collection.insertions,
+            deletions: collection.deletions,
+            warnings: collection.warnings,
+            unreviewed: collection.unreviewed,
+        }
+    }
+
+    fn from_collection_ref(collection: &DiffCollection) -> Self {
+        Self {
+            files_changed: collection.files_changed,
+            files_reviewed: collection.files_reviewed,
+            insertions: collection.insertions,
+            deletions: collection.deletions,
+            warnings: collection.warnings.clone(),
+            unreviewed: collection.unreviewed.clone(),
+        }
+    }
+
+    fn has_unreviewed(&self) -> bool {
+        !self.unreviewed.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct ParsedReviewOutput {
+    findings: Vec<ReviewFinding>,
+    reviewer_summary: Option<String>,
+}
+
+impl ParsedReviewOutput {
+    fn from_parts(findings: Vec<ReviewFinding>, reviewer_summaries: Vec<String>) -> Self {
+        Self {
+            findings,
+            reviewer_summary: if reviewer_summaries.is_empty() {
+                None
+            } else {
+                Some(reviewer_summaries.join("\n\n"))
+            },
+        }
+    }
+
+    fn has_output(&self) -> bool {
+        !self.findings.is_empty()
+            || self
+                .reviewer_summary
+                .as_ref()
+                .is_some_and(|summary| !summary.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionFailureStage {
+    TargetCollection,
+    DiffCollection,
+}
+
+#[derive(Debug)]
+enum ReviewRun {
+    CollectionFailed {
+        target: ReviewTargetSummary,
+        stage: CollectionFailureStage,
+        reason: String,
+    },
+    SkippedNoReviewableDiff {
+        target: ReviewTargetSummary,
+        coverage: ReviewCoverage,
+        reason: String,
+    },
+    Completed {
+        target: ReviewTargetSummary,
+        coverage: ReviewCoverage,
+        parsed: ParsedReviewOutput,
+        warnings: Vec<ReviewWarning>,
+        usage: phoenix_core::domain::llm_types::Usage,
+    },
+    InterruptedAfterOutput {
+        target: ReviewTargetSummary,
+        coverage: ReviewCoverage,
+        parsed: ParsedReviewOutput,
+        warnings: Vec<ReviewWarning>,
+        usage: phoenix_core::domain::llm_types::Usage,
+        reason: String,
+        interruption: ReviewInterruption,
+    },
+    InterruptedNoOutput {
+        target: ReviewTargetSummary,
+        coverage: ReviewCoverage,
+        warnings: Vec<ReviewWarning>,
+        usage: phoenix_core::domain::llm_types::Usage,
+        reason: String,
+        interruption: ReviewInterruption,
+    },
+}
+
+impl ReviewRun {
+    fn into_output(self, elapsed_ms: u128) -> ReviewOutput {
+        match self {
+            ReviewRun::CollectionFailed {
+                target,
+                stage,
+                reason,
+            } => collection_failed_output(target, stage, reason, elapsed_ms),
+            ReviewRun::SkippedNoReviewableDiff {
+                target,
+                coverage,
+                reason,
+            } => skipped_no_reviewable_output(target, coverage, reason, elapsed_ms),
+            ReviewRun::Completed {
+                target,
+                coverage,
+                parsed,
+                warnings,
+                usage,
+            } => completed_review_output(target, coverage, parsed, warnings, usage, elapsed_ms),
+            ReviewRun::InterruptedAfterOutput {
+                target,
+                coverage,
+                parsed,
+                warnings,
+                usage,
+                reason,
+                interruption,
+            } => interrupted_after_output(
+                target,
+                coverage,
+                parsed,
+                warnings,
+                usage,
+                reason,
+                interruption,
+                elapsed_ms,
+            ),
+            ReviewRun::InterruptedNoOutput {
+                target,
+                coverage,
+                warnings,
+                usage,
+                reason,
+                interruption,
+            } => interrupted_no_output(
+                target,
+                coverage,
+                warnings,
+                usage,
+                reason,
+                interruption,
+                elapsed_ms,
+            ),
+        }
+    }
+}
+
+fn fallback_target_summary(
+    ctx: &ToolContext,
+    input: &CommissionReviewInput,
+) -> ReviewTargetSummary {
+    ReviewTargetSummary {
+        kind: if ctx.worktree_path.is_some() {
+            ReviewTargetKind::WorktreeDiff
+        } else {
+            ReviewTargetKind::WorkspaceDiff
+        },
+        repo_root: ctx.working_dir.display().to_string(),
+        base: "unknown".to_string(),
+        head: "unknown".to_string(),
+        dirty: false,
+        allow_dirty_working_tree: input.allow_dirty_working_tree,
+    }
+}
+
+fn collection_failed_output(
     target: ReviewTargetSummary,
-    collection: &DiffCollection,
-    mut interrupted: InterruptedReview,
+    stage: CollectionFailureStage,
+    reason: String,
+    elapsed_ms: u128,
 ) -> ReviewOutput {
-    normalize_findings(&mut interrupted.findings, &mut interrupted.warnings);
-    interrupted.warnings.extend(collection.warnings.clone());
-    let has_output = !interrupted.findings.is_empty()
-        || interrupted
-            .reviewer_summaries
-            .iter()
-            .any(|summary| !summary.trim().is_empty());
-    let warning_kind = match (interrupted.interruption, has_output) {
-        (ReviewInterruption::Timeout, true) => "review_timeout_partial",
-        (ReviewInterruption::Timeout, false) => "review_timeout_no_output",
-        (ReviewInterruption::Failed, _) => "review_failed",
-        (ReviewInterruption::Cancelled, _) => "review_cancelled",
+    let coverage = ReviewCoverage {
+        files_changed: 0,
+        files_reviewed: 0,
+        insertions: 0,
+        deletions: 0,
+        warnings: vec![warning("collection_failed", &reason, None)],
+        unreviewed: Vec::new(),
     };
-    interrupted
-        .warnings
-        .push(warning(warning_kind, &interrupted.reason, None));
-    let (status, review_status, findings_status, findings_trust, retry_recommendation) =
-        interrupted_contract(interrupted.interruption, has_output);
+    finalize_review_output(ReviewOutputDraft {
+        status: ReviewStatus::Failed,
+        review_status: ReviewCompletionStatus::Unavailable,
+        findings_status: FindingsStatus::Unavailable,
+        findings_trust: FindingsTrust::Low,
+        stage_status: ReviewStageStatus {
+            target_collection: if stage == CollectionFailureStage::TargetCollection {
+                StageStatus::Failed
+            } else {
+                StageStatus::Ok
+            },
+            diff_collection: if stage == CollectionFailureStage::DiffCollection {
+                StageStatus::Failed
+            } else {
+                StageStatus::Skipped
+            },
+            llm_review: StageStatus::Skipped,
+            json_parse: StageStatus::Skipped,
+            finding_extraction: StageStatus::Skipped,
+        },
+        retry_recommendation: RetryRecommendation::Retry,
+        summary: review_summary(
+            target,
+            &coverage,
+            elapsed_ms,
+            phoenix_core::domain::llm_types::Usage::default(),
+            None,
+        ),
+        unreviewed: coverage.unreviewed,
+        findings: Vec::new(),
+        warnings: coverage.warnings,
+    })
+}
+
+fn review_summary(
+    target: ReviewTargetSummary,
+    coverage: &ReviewCoverage,
+    elapsed_ms: u128,
+    usage: phoenix_core::domain::llm_types::Usage,
+    reviewer_summary: Option<String>,
+) -> ReviewSummary {
+    ReviewSummary {
+        target,
+        files_changed: coverage.files_changed,
+        files_reviewed: coverage.files_reviewed,
+        insertions: coverage.insertions,
+        deletions: coverage.deletions,
+        elapsed_ms,
+        usage,
+        reviewer_summary,
+    }
+}
+
+fn skipped_no_reviewable_output(
+    target: ReviewTargetSummary,
+    coverage: ReviewCoverage,
+    reason: String,
+    elapsed_ms: u128,
+) -> ReviewOutput {
+    let has_unreviewed = coverage.has_unreviewed();
+    finalize_review_output(ReviewOutputDraft {
+        status: if has_unreviewed {
+            ReviewStatus::Partial
+        } else {
+            ReviewStatus::Skipped
+        },
+        review_status: if has_unreviewed {
+            ReviewCompletionStatus::CompletedWithWarnings
+        } else {
+            ReviewCompletionStatus::Unavailable
+        },
+        findings_status: FindingsStatus::Unavailable,
+        findings_trust: FindingsTrust::Low,
+        stage_status: ReviewStageStatus {
+            target_collection: StageStatus::Ok,
+            diff_collection: diff_stage_status(&coverage.warnings, has_unreviewed),
+            llm_review: StageStatus::Skipped,
+            json_parse: StageStatus::Skipped,
+            finding_extraction: StageStatus::Skipped,
+        },
+        retry_recommendation: RetryRecommendation::DoNotRetry,
+        summary: review_summary(
+            target,
+            &coverage,
+            elapsed_ms,
+            phoenix_core::domain::llm_types::Usage::default(),
+            Some(reason),
+        ),
+        unreviewed: coverage.unreviewed,
+        findings: Vec::new(),
+        warnings: coverage.warnings,
+    })
+}
+
+fn completed_review_output(
+    target: ReviewTargetSummary,
+    coverage: ReviewCoverage,
+    parsed: ParsedReviewOutput,
+    mut warnings: Vec<ReviewWarning>,
+    usage: phoenix_core::domain::llm_types::Usage,
+    elapsed_ms: u128,
+) -> ReviewOutput {
+    warnings.extend(coverage.warnings.clone());
+    let has_unreviewed = coverage.has_unreviewed();
+    let has_diff_coverage_gap =
+        diff_stage_status(&warnings, has_unreviewed) == StageStatus::Partial;
+    let (status, findings_status, findings_trust, retry_recommendation) =
+        completed_result_contract(&warnings, parsed.has_output(), has_diff_coverage_gap);
+    let review_status = completed_review_status(&status, warnings.is_empty() && !has_unreviewed);
 
     finalize_review_output(ReviewOutputDraft {
         status,
@@ -651,40 +893,154 @@ fn interrupted_review_output(
         findings_trust,
         stage_status: ReviewStageStatus {
             target_collection: StageStatus::Ok,
-            diff_collection: diff_stage_status(
-                &interrupted.warnings,
-                !collection.unreviewed.is_empty(),
-            ),
-            llm_review: match interrupted.interruption {
-                ReviewInterruption::Timeout => StageStatus::Timeout,
-                ReviewInterruption::Failed => StageStatus::Failed,
-                ReviewInterruption::Cancelled => StageStatus::Cancelled,
-            },
-            json_parse: interrupted_json_parse_stage_status(&interrupted.warnings, has_output),
-            finding_extraction: interrupted_finding_extraction_stage_status(
-                &interrupted.warnings,
-                has_output,
-            ),
+            diff_collection: diff_stage_status(&warnings, has_unreviewed),
+            llm_review: StageStatus::Ok,
+            json_parse: json_parse_stage_status(&warnings),
+            finding_extraction: finding_extraction_stage_status(&warnings),
         },
         retry_recommendation,
-        summary: ReviewSummary {
+        summary: review_summary(
             target,
-            files_changed: collection.files_changed,
-            files_reviewed: collection.files_reviewed,
-            insertions: collection.insertions,
-            deletions: collection.deletions,
-            elapsed_ms: started.elapsed().as_millis(),
-            usage: interrupted.usage,
-            reviewer_summary: if interrupted.reviewer_summaries.is_empty() {
-                Some(interrupted.reason)
-            } else {
-                Some(interrupted.reviewer_summaries.join("\n\n"))
-            },
-        },
-        unreviewed: collection.unreviewed.clone(),
-        findings: interrupted.findings,
-        warnings: interrupted.warnings,
+            &coverage,
+            elapsed_ms,
+            usage,
+            parsed.reviewer_summary,
+        ),
+        unreviewed: coverage.unreviewed,
+        findings: parsed.findings,
+        warnings,
     })
+}
+
+fn interrupted_after_output(
+    target: ReviewTargetSummary,
+    coverage: ReviewCoverage,
+    parsed: ParsedReviewOutput,
+    mut warnings: Vec<ReviewWarning>,
+    usage: phoenix_core::domain::llm_types::Usage,
+    reason: String,
+    interruption: ReviewInterruption,
+    elapsed_ms: u128,
+) -> ReviewOutput {
+    warnings.extend(coverage.warnings.clone());
+    warnings.push(warning(
+        interrupted_warning_kind(interruption, true),
+        &reason,
+        None,
+    ));
+    let (status, review_status, findings_status, findings_trust, retry_recommendation) =
+        interrupted_contract(interruption, true);
+    finalize_review_output(ReviewOutputDraft {
+        status,
+        review_status,
+        findings_status,
+        findings_trust,
+        stage_status: ReviewStageStatus {
+            target_collection: StageStatus::Ok,
+            diff_collection: diff_stage_status(&warnings, coverage.has_unreviewed()),
+            llm_review: llm_interruption_stage(interruption),
+            json_parse: interrupted_json_parse_stage_status(&warnings, true),
+            finding_extraction: interrupted_finding_extraction_stage_status(&warnings, true),
+        },
+        retry_recommendation,
+        summary: review_summary(
+            target,
+            &coverage,
+            elapsed_ms,
+            usage,
+            parsed.reviewer_summary,
+        ),
+        unreviewed: coverage.unreviewed,
+        findings: parsed.findings,
+        warnings,
+    })
+}
+
+fn interrupted_no_output(
+    target: ReviewTargetSummary,
+    coverage: ReviewCoverage,
+    mut warnings: Vec<ReviewWarning>,
+    usage: phoenix_core::domain::llm_types::Usage,
+    reason: String,
+    interruption: ReviewInterruption,
+    elapsed_ms: u128,
+) -> ReviewOutput {
+    warnings.extend(coverage.warnings.clone());
+    warnings.push(warning(
+        interrupted_warning_kind(interruption, false),
+        &reason,
+        None,
+    ));
+    let (status, review_status, findings_status, findings_trust, retry_recommendation) =
+        interrupted_contract(interruption, false);
+    finalize_review_output(ReviewOutputDraft {
+        status,
+        review_status,
+        findings_status,
+        findings_trust,
+        stage_status: ReviewStageStatus {
+            target_collection: StageStatus::Ok,
+            diff_collection: diff_stage_status(&warnings, coverage.has_unreviewed()),
+            llm_review: llm_interruption_stage(interruption),
+            json_parse: interrupted_json_parse_stage_status(&warnings, false),
+            finding_extraction: interrupted_finding_extraction_stage_status(&warnings, false),
+        },
+        retry_recommendation,
+        summary: review_summary(target, &coverage, elapsed_ms, usage, None),
+        unreviewed: coverage.unreviewed,
+        findings: Vec::new(),
+        warnings,
+    })
+}
+
+fn interrupted_warning_kind(interruption: ReviewInterruption, has_output: bool) -> &'static str {
+    match (interruption, has_output) {
+        (ReviewInterruption::Timeout, true) => "review_timeout_partial",
+        (ReviewInterruption::Timeout, false) => "review_timeout_no_output",
+        (ReviewInterruption::Failed, _) => "review_failed",
+        (ReviewInterruption::Cancelled, _) => "review_cancelled",
+    }
+}
+
+fn llm_interruption_stage(interruption: ReviewInterruption) -> StageStatus {
+    match interruption {
+        ReviewInterruption::Timeout => StageStatus::Timeout,
+        ReviewInterruption::Failed => StageStatus::Failed,
+        ReviewInterruption::Cancelled => StageStatus::Cancelled,
+    }
+}
+
+fn interrupted_review_output(
+    started: Instant,
+    target: ReviewTargetSummary,
+    collection: &DiffCollection,
+    mut interrupted: InterruptedReview,
+) -> ReviewOutput {
+    normalize_findings(&mut interrupted.findings, &mut interrupted.warnings);
+    let parsed =
+        ParsedReviewOutput::from_parts(interrupted.findings, interrupted.reviewer_summaries);
+    let coverage = ReviewCoverage::from_collection_ref(collection);
+    let run = if interrupted.interruption == ReviewInterruption::Cancelled || !parsed.has_output() {
+        ReviewRun::InterruptedNoOutput {
+            target,
+            coverage,
+            warnings: interrupted.warnings,
+            usage: interrupted.usage,
+            reason: interrupted.reason,
+            interruption: interrupted.interruption,
+        }
+    } else {
+        ReviewRun::InterruptedAfterOutput {
+            target,
+            coverage,
+            parsed,
+            warnings: interrupted.warnings,
+            usage: interrupted.usage,
+            reason: interrupted.reason,
+            interruption: interrupted.interruption,
+        }
+    };
+    run.into_output(started.elapsed().as_millis())
 }
 
 fn completed_review_status(status: &ReviewStatus, clean_complete: bool) -> ReviewCompletionStatus {
@@ -760,28 +1116,28 @@ fn interrupted_contract(
     match (interruption, has_output) {
         (ReviewInterruption::Timeout, true) => (
             ReviewStatus::Partial,
-            ReviewCompletionStatus::ModelTimeoutAfterFindings,
+            ReviewCompletionStatus::ModelTimeoutAfterOutput,
             FindingsStatus::Partial,
             FindingsTrust::Partial,
             RetryRecommendation::ReviewFindingsFirst,
         ),
         (ReviewInterruption::Timeout, false) => (
             ReviewStatus::Failed,
-            ReviewCompletionStatus::ModelTimeoutNoFindings,
+            ReviewCompletionStatus::ModelTimeoutNoOutput,
             FindingsStatus::Unavailable,
             FindingsTrust::Low,
             RetryRecommendation::Retry,
         ),
         (ReviewInterruption::Failed, true) => (
             ReviewStatus::Partial,
-            ReviewCompletionStatus::ModelFailedAfterFindings,
+            ReviewCompletionStatus::ModelFailedAfterOutput,
             FindingsStatus::Partial,
             FindingsTrust::Partial,
             RetryRecommendation::ReviewFindingsFirst,
         ),
         (ReviewInterruption::Failed, false) => (
             ReviewStatus::Failed,
-            ReviewCompletionStatus::ModelFailedNoFindings,
+            ReviewCompletionStatus::ModelFailedNoOutput,
             FindingsStatus::Unavailable,
             FindingsTrust::Low,
             RetryRecommendation::Retry,
@@ -806,7 +1162,7 @@ fn interrupted_contract(
 fn finalize_review_output(draft: ReviewOutputDraft) -> ReviewOutput {
     let finding_summary = summarize_findings(&draft.findings);
     let warnings_summary = summarize_warnings(&draft.warnings);
-    ReviewOutput {
+    let output = ReviewOutput {
         status: draft.status,
         review_status: draft.review_status,
         findings_status: draft.findings_status,
@@ -819,7 +1175,53 @@ fn finalize_review_output(draft: ReviewOutputDraft) -> ReviewOutput {
         unreviewed: draft.unreviewed,
         findings: draft.findings,
         warnings: draft.warnings,
+    };
+    debug_assert!(
+        review_output_invariant_error(&output).is_none(),
+        "invalid commission review output: {:?}",
+        review_output_invariant_error(&output)
+    );
+    output
+}
+
+fn review_output_invariant_error(output: &ReviewOutput) -> Option<&'static str> {
+    if output.finding_summary.total != output.findings.len() {
+        return Some("finding_summary.total must equal findings.len()");
     }
+    if matches!(output.status, ReviewStatus::Failed) {
+        if !output.findings.is_empty() || output.finding_summary.total != 0 {
+            return Some("failed output must not carry findings");
+        }
+        if output.summary.reviewer_summary.is_some() {
+            return Some("failed output must not carry reviewer summary");
+        }
+    }
+    if matches!(output.findings_status, FindingsStatus::Unavailable)
+        && (!output.findings.is_empty() || output.finding_summary.total != 0)
+    {
+        return Some("unavailable findings must not carry findings");
+    }
+    match output.review_status {
+        ReviewCompletionStatus::ModelTimeoutAfterOutput
+        | ReviewCompletionStatus::ModelFailedAfterOutput => {
+            if !matches!(output.status, ReviewStatus::Partial) {
+                return Some("after-output review status requires partial top-level status");
+            }
+            if output.findings.is_empty() && output.summary.reviewer_summary.is_none() {
+                return Some("after-output review status requires parsed output");
+            }
+        }
+        ReviewCompletionStatus::ModelTimeoutNoOutput
+        | ReviewCompletionStatus::ModelFailedNoOutput => {
+            if !matches!(output.status, ReviewStatus::Failed)
+                || !matches!(output.findings_status, FindingsStatus::Unavailable)
+            {
+                return Some("no-output review status requires failed unavailable result");
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 fn classify_llm_error(error: &str) -> ReviewInterruption {
@@ -859,7 +1261,9 @@ fn summarize_warnings(warnings: &[ReviewWarning]) -> Vec<String> {
             "model_output_repaired" => "model output repaired".to_string(),
             "model_output_parse" => "model output could not be parsed as JSON".to_string(),
             "review_timeout_partial" => "review request timed out after partial output".to_string(),
-            "review_timeout_no_output" => "review request timed out before findings".to_string(),
+            "review_timeout_no_output" => {
+                "review request timed out before parsed output".to_string()
+            }
             "review_failed" => "review request failed".to_string(),
             "review_cancelled" => "review request was cancelled".to_string(),
             "review_truncated" => "review material was truncated".to_string(),
@@ -2063,6 +2467,14 @@ mod tests {
         }
     }
 
+    fn sample_coverage() -> ReviewCoverage {
+        ReviewCoverage::from_collection(sample_collection())
+    }
+
+    fn assert_review_output_invariants(output: &ReviewOutput) {
+        assert_eq!(review_output_invariant_error(output), None);
+    }
+
     fn sample_finding(severity: &str, file: &str, title: &str) -> ReviewFinding {
         ReviewFinding {
             severity: severity.to_string(),
@@ -2074,6 +2486,72 @@ mod tests {
             rationale: "bad".to_string(),
             suggested_fix: "fix".to_string(),
         }
+    }
+
+    #[test]
+    fn outcome_cancelled_with_buffered_findings_clears_actionable_output() {
+        let output = ReviewRun::InterruptedNoOutput {
+            target: sample_target(),
+            coverage: sample_coverage(),
+            warnings: Vec::new(),
+            usage: phoenix_core::domain::llm_types::Usage::default(),
+            reason: "cancelled".to_string(),
+            interruption: ReviewInterruption::Cancelled,
+        }
+        .into_output(0);
+
+        assert_review_output_invariants(&output);
+        assert_eq!(output.status, ReviewStatus::Failed);
+        assert_eq!(output.findings_status, FindingsStatus::Unavailable);
+        assert!(output.findings.is_empty());
+        assert_eq!(output.finding_summary.total, 0);
+        assert_eq!(output.summary.reviewer_summary, None);
+    }
+
+    #[test]
+    fn outcome_after_output_requires_summary_or_findings() {
+        let output = ReviewRun::InterruptedAfterOutput {
+            target: sample_target(),
+            coverage: sample_coverage(),
+            parsed: ParsedReviewOutput::from_parts(
+                Vec::new(),
+                vec!["Reviewed chunks before timeout".to_string()],
+            ),
+            warnings: Vec::new(),
+            usage: phoenix_core::domain::llm_types::Usage::default(),
+            reason: "timed out".to_string(),
+            interruption: ReviewInterruption::Timeout,
+        }
+        .into_output(0);
+
+        assert_review_output_invariants(&output);
+        assert_eq!(output.status, ReviewStatus::Partial);
+        assert_eq!(
+            output.review_status,
+            ReviewCompletionStatus::ModelTimeoutAfterOutput
+        );
+        assert_eq!(output.finding_summary.total, 0);
+        assert_eq!(
+            output.summary.reviewer_summary.as_deref(),
+            Some("Reviewed chunks before timeout")
+        );
+    }
+
+    #[test]
+    fn outcome_collection_failure_marks_exact_failed_stage() {
+        let output = ReviewRun::CollectionFailed {
+            target: sample_target(),
+            stage: CollectionFailureStage::DiffCollection,
+            reason: "git diff failed".to_string(),
+        }
+        .into_output(0);
+
+        assert_review_output_invariants(&output);
+        assert_eq!(output.status, ReviewStatus::Failed);
+        assert_eq!(output.review_status, ReviewCompletionStatus::Unavailable);
+        assert_eq!(output.stage_status.target_collection, StageStatus::Ok);
+        assert_eq!(output.stage_status.diff_collection, StageStatus::Failed);
+        assert_eq!(output.stage_status.llm_review, StageStatus::Skipped);
     }
 
     #[test]
@@ -2103,7 +2581,7 @@ mod tests {
         assert_eq!(output.findings_status, FindingsStatus::Unavailable);
         assert_eq!(
             output.review_status,
-            ReviewCompletionStatus::ModelTimeoutNoFindings
+            ReviewCompletionStatus::ModelTimeoutNoOutput
         );
         assert_eq!(output.stage_status.json_parse, StageStatus::Failed);
         assert_eq!(output.stage_status.finding_extraction, StageStatus::Failed);
@@ -2305,7 +2783,7 @@ mod tests {
         assert_eq!(output.status, ReviewStatus::Partial);
         assert_eq!(
             output.review_status,
-            ReviewCompletionStatus::ModelTimeoutAfterFindings
+            ReviewCompletionStatus::ModelTimeoutAfterOutput
         );
         assert_eq!(output.stage_status.llm_review, StageStatus::Timeout);
         assert_eq!(output.stage_status.json_parse, StageStatus::Ok);
@@ -2341,7 +2819,7 @@ mod tests {
         assert_eq!(output.status, ReviewStatus::Failed);
         assert_eq!(
             output.review_status,
-            ReviewCompletionStatus::ModelTimeoutNoFindings
+            ReviewCompletionStatus::ModelTimeoutNoOutput
         );
         assert_eq!(output.findings_status, FindingsStatus::Unavailable);
         assert_eq!(output.findings_trust, FindingsTrust::Low);
@@ -2351,11 +2829,11 @@ mod tests {
         assert!(output.findings.is_empty());
         assert!(output
             .warnings_summary
-            .contains(&"review request timed out before findings".to_string()));
+            .contains(&"review request timed out before parsed output".to_string()));
     }
 
     #[test]
-    fn timeout_after_findings_returns_partial_actionable_output() {
+    fn timeout_after_output_returns_partial_actionable_output() {
         let output = interrupted_review_output(
             Instant::now(),
             sample_target(),
@@ -2373,7 +2851,7 @@ mod tests {
         assert_eq!(output.status, ReviewStatus::Partial);
         assert_eq!(
             output.review_status,
-            ReviewCompletionStatus::ModelTimeoutAfterFindings
+            ReviewCompletionStatus::ModelTimeoutAfterOutput
         );
         assert_eq!(output.findings_status, FindingsStatus::Partial);
         assert_eq!(output.findings_trust, FindingsTrust::Partial);
