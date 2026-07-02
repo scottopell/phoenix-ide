@@ -33,29 +33,28 @@ available before any expensive work begins.
 ## REQ-CR-004, REQ-CR-005, REQ-CR-006: Target resolution and dirty state
 
 The harness resolves the repository root from the tool context working
-directory. Worktree-backed conversations review the active branch against the
-base branch used for the task or worktree. Direct conversations inside a git
-repository review workspace changes against `HEAD`.
+directory. Worktree-backed and direct git conversations review committed changes
+on the current `HEAD` against the fetched origin default branch tip. Workspace
+changes are never included in the commissioned diff.
 
-The base comparator is resolved to the remote-tracking ref `origin/<base>` when
-it exists, falling back to the bare local `<base>` ref otherwise. The local
-`<base>` ref is only as current as the worktree last fast-forwarded it, so on a
-long-lived clone it can be far behind; diffing a feature branch against a stale
-local base pulls in every commit merged upstream since, inflating the review
-with already-landed code and, for large files, fabricating diffs large enough to
-exceed the size caps. `origin/<base>` is what the branch actually merges into,
-so it is the correct comparator and matches the diff the conversation diff
-endpoint shows the user. The comparator is resolved freshly at review execution
-time rather than cached on the approval scope, so it cannot go stale between a
-review being proposed and approved; the approval card therefore presents the
-base as a proposal that resolves to its tracked remote at review time, and the
-result records the concrete resolved comparator.
+The base comparator must resolve to the remote-tracking ref `origin/<base>`. The
+bare local `<base>` ref is only as current as the worktree last fast-forwarded
+it, so on a long-lived clone it can be far behind; diffing a feature branch
+against a stale local base pulls in every commit merged upstream since,
+inflating the review with already-landed code and, for large files, fabricating
+diffs large enough to exceed the size caps. `origin/<base>` is what the branch
+actually merges into, so it is the correct comparator and matches the diff the
+conversation diff endpoint shows the user. The comparator is resolved freshly at
+review execution time rather than cached on the approval scope, so it cannot go
+stale between a review being proposed and approved; the approval card therefore
+presents the base as a proposal that resolves to its tracked remote at review
+time, and the result records the concrete resolved comparator. If the remote ref
+is unavailable, the target collection stage fails before any review LLM call.
 
-For worktree-backed reviews, `git status --porcelain` determines cleanliness. A
-dirty worktree is rejected unless `allow_dirty_working_tree` is true. When dirty
-review is allowed, the target summary records both `dirty: true` and
-`allow_dirty_working_tree: true`, and that summary is included in the approval
-and result payloads.
+`git status --porcelain` determines cleanliness. Any uncommitted or untracked
+changes cause target collection to fail before diff collection or LLM review.
+There is no dirty-worktree opt-in; commissioned review is limited to committed,
+reproducible branch diffs.
 
 ## REQ-CR-007: Availability boundary
 

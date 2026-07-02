@@ -72,40 +72,44 @@ AND SHALL NOT require the agent to supply refs, commits, or diff commands for th
 normal review path
 
 WHEN commission review is requested from a direct conversation inside a git
-repository with workspace changes
-THE SYSTEM SHALL review the current workspace changes
+repository
+THE SYSTEM SHALL review committed changes on the current HEAD against the fetched
+origin default branch tip
 
 **Rationale:** Agents should not need to rebuild Phoenix's knowledge of the
-active task. Inferring the target avoids reviewing the wrong branch or omitting
-workspace changes because of hand-written diff plumbing.
+active task. Inferring the target avoids reviewing the wrong branch or comparing
+against an ad hoc local ref because of hand-written diff plumbing.
 
 ---
 
-### REQ-CR-005: Prevent Accidental Dirty Worktree Reviews
+### REQ-CR-005: Refuse Dirty Working Trees
 
-WHILE the review target is a git-aware task or worktree with uncommitted changes
-THE SYSTEM SHALL require `allow_dirty_working_tree` to be explicitly true before
-reviewing those changes
-
-IF the worktree is dirty and `allow_dirty_working_tree` is false
+WHILE the review target has uncommitted or untracked changes
 THE SYSTEM SHALL reject the request with an actionable explanation
 AND SHALL NOT call the review LLM
 
-**Rationale:** Dirty reviews can mix intentional task work with scratch edits,
-local debug changes, or generated files. Explicit opt-in makes that ambiguity
-visible before Phoenix spends review budget.
+THE SYSTEM SHALL NOT provide a dirty-worktree opt-in or include uncommitted
+changes in the review diff
+
+**Rationale:** Commission review is intended for reproducible review of committed
+work. Dirty reviews can mix intentional task work with scratch edits, local debug
+changes, or generated files, making findings difficult to reproduce or trust.
 
 ---
 
-### REQ-CR-006: Show Dirty State in Review Scope
+### REQ-CR-006: Compare Against Origin Default Branch Tip
 
-WHEN dirty worktree review is allowed
-THE SYSTEM SHALL include the dirty state and explicit dirty-review opt-in in the
-approval details and structured result
+WHEN commission review collects a diff
+THE SYSTEM SHALL compare the current HEAD against the fetched origin default
+branch tip
 
-**Rationale:** Users need to know whether review includes uncommitted work. The
-same fact must remain visible after the review so findings can be interpreted
-against the correct workspace state.
+IF the origin default branch ref is unavailable
+THE SYSTEM SHALL reject the request with an actionable explanation
+AND SHALL NOT call the review LLM
+
+**Rationale:** Reviewing against the fetched remote default branch avoids stale
+local branch refs and keeps the review scope tied to the branch delta that would
+be proposed for merge.
 
 ---
 

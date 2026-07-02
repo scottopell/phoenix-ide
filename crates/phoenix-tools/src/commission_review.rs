@@ -26,8 +26,6 @@ struct CommissionReviewInput {
     brief: String,
     #[serde(default)]
     focus: Option<String>,
-    #[serde(default)]
-    allow_dirty_working_tree: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,7 +169,6 @@ struct ReviewTargetSummary {
     base: String,
     head: String,
     dirty: bool,
-    allow_dirty_working_tree: bool,
 }
 
 /// Why a changed file was excluded from the review entirely. Distinct from a
@@ -220,12 +217,7 @@ struct ReviewTarget {
 
 #[derive(Debug)]
 enum DiffSpec {
-    Range {
-        base: String,
-        head: String,
-        include_worktree: bool,
-    },
-    Workspace,
+    Range { base: String, head: String },
 }
 
 #[derive(Debug)]
@@ -269,7 +261,7 @@ impl Tool for CommissionReviewTool {
     }
 
     fn description(&self) -> String {
-        "Request an independent Phoenix-native code review of the active git work. This is a capital-spend request: provide a concise executive brief explaining why the work is ready and why review tokens are useful now. Phoenix infers the review target from the active conversation/worktree. Set allow_dirty_working_tree only when reviewing uncommitted changes is intentional.".to_string()
+        "Request an independent Phoenix-native code review of the active git work. This is a capital-spend request: provide a concise executive brief explaining why the work is ready and why review tokens are useful now. Phoenix reviews committed changes only, comparing HEAD against the origin default branch tip, and refuses dirty working trees.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -284,11 +276,6 @@ impl Tool for CommissionReviewTool {
                 "focus": {
                     "type": "string",
                     "description": "Optional review focus, e.g. security and correctness"
-                },
-                "allow_dirty_working_tree": {
-                    "type": "boolean",
-                    "description": "Default false. Required for git-aware task/worktree review when uncommitted changes are present",
-                    "default": false
                 }
             }
         })
@@ -375,7 +362,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
         Ok(target) => target,
         Err(reason) => {
             return Ok(ReviewRun::CollectionFailed {
-                target: fallback_target_summary(&ctx, &input),
+                target: fallback_target_summary(&ctx),
                 stage: CollectionFailureStage::TargetCollection,
                 reason,
             }
@@ -744,10 +731,7 @@ impl ReviewRun {
     }
 }
 
-fn fallback_target_summary(
-    ctx: &ToolContext,
-    input: &CommissionReviewInput,
-) -> ReviewTargetSummary {
+fn fallback_target_summary(ctx: &ToolContext) -> ReviewTargetSummary {
     ReviewTargetSummary {
         kind: if ctx.worktree_path.is_some() {
             ReviewTargetKind::WorktreeDiff
@@ -758,7 +742,6 @@ fn fallback_target_summary(
         base: "unknown".to_string(),
         head: "unknown".to_string(),
         dirty: false,
-        allow_dirty_working_tree: input.allow_dirty_working_tree,
     }
 }
 
@@ -1415,25 +1398,23 @@ fn assert_approved_paths_match(
     Ok(())
 }
 
-/// Prefer the remote-tracking ref `origin/<base>` over the bare local branch,
-/// falling back to the local ref when no remote-tracking ref exists. See
-/// `specs/commission-review/design.md` (REQ-CR-004..006) for why the remote ref
-/// is the correct comparator.
-async fn effective_base_ref(repo: &Path, base_branch: &str) -> String {
+async fn effective_base_ref(repo: &Path, base_branch: &str) -> Result<String, String> {
     let remote = format!("origin/{base_branch}");
     if git_capture(repo, &["rev-parse", "--verify", "--quiet", &remote])
         .await
         .is_ok()
     {
-        remote
+        Ok(remote)
     } else {
-        base_branch.to_string()
+        Err(format!(
+            "commission_review requires remote-tracking base `{remote}`. Fetch the origin default branch before requesting review."
+        ))
     }
 }
 
 async fn resolve_target(
     ctx: &ToolContext,
-    input: &CommissionReviewInput,
+    _input: &CommissionReviewInput,
     runtime_base_branch: Option<&str>,
 ) -> Result<ReviewTarget, String> {
     let repo_root = git_capture(&ctx.working_dir, &["rev-parse", "--show-toplevel"]).await?;
@@ -1444,39 +1425,27 @@ async fn resolve_target(
         .is_empty();
     let head = git_capture(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
 
-    if ctx.worktree_path.is_some() {
-        if dirty && !input.allow_dirty_working_tree {
-            return Err("commission_review refused dirty worktree review. Commit/stash changes, or set allow_dirty_working_tree=true to include uncommitted changes.".to_string());
-        }
-        let base = effective_base_ref(&repo, runtime_base_branch.unwrap_or("main")).await;
-        Ok(ReviewTarget {
-            summary: ReviewTargetSummary {
-                kind: ReviewTargetKind::WorktreeDiff,
-                repo_root: repo.display().to_string(),
-                base: base.clone(),
-                head: head.trim().to_string(),
-                dirty,
-                allow_dirty_working_tree: input.allow_dirty_working_tree,
-            },
-            diff_spec: DiffSpec::Range {
-                base,
-                head: "HEAD".to_string(),
-                include_worktree: dirty && input.allow_dirty_working_tree,
-            },
-        })
-    } else {
-        Ok(ReviewTarget {
-            summary: ReviewTargetSummary {
-                kind: ReviewTargetKind::WorkspaceDiff,
-                repo_root: repo.display().to_string(),
-                base: "workspace-base".to_string(),
-                head: "working-tree".to_string(),
-                dirty,
-                allow_dirty_working_tree: input.allow_dirty_working_tree,
-            },
-            diff_spec: DiffSpec::Workspace,
-        })
+    if dirty {
+        return Err("commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the origin default branch tip.".to_string());
     }
+    let base = effective_base_ref(&repo, runtime_base_branch.unwrap_or("main")).await?;
+    Ok(ReviewTarget {
+        summary: ReviewTargetSummary {
+            kind: if ctx.worktree_path.is_some() {
+                ReviewTargetKind::WorktreeDiff
+            } else {
+                ReviewTargetKind::WorkspaceDiff
+            },
+            repo_root: repo.display().to_string(),
+            base: base.clone(),
+            head: head.trim().to_string(),
+            dirty,
+        },
+        diff_spec: DiffSpec::Range {
+            base,
+            head: "HEAD".to_string(),
+        },
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1484,64 +1453,19 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
     let repo = Path::new(&target.summary.repo_root);
     let mut warnings = Vec::new();
     let mut unreviewed = Vec::new();
-    let effective_range_base = match &target.diff_spec {
-        DiffSpec::Range { base, head, .. } => {
-            Some(git_capture_cancel(repo, &["merge-base", base, head], &ctx.cancel).await?)
-        }
-        DiffSpec::Workspace => None,
-    };
-    let numstat = match &target.diff_spec {
-        DiffSpec::Range {
-            base,
-            head,
-            include_worktree,
-        } => {
-            if *include_worktree {
-                let merge_base = effective_range_base.as_deref().unwrap_or(base);
-                git_capture_cancel(
-                    repo,
-                    &[
-                        "diff",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        "--numstat",
-                        merge_base,
-                        "--",
-                    ],
-                    &ctx.cancel,
-                )
-                .await?
-            } else {
-                git_capture_cancel(
-                    repo,
-                    &[
-                        "diff",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        "--numstat",
-                        &format!("{base}...{head}"),
-                    ],
-                    &ctx.cancel,
-                )
-                .await?
-            }
-        }
-        DiffSpec::Workspace => {
-            git_capture_cancel(
-                repo,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--numstat",
-                    "HEAD",
-                    "--",
-                ],
-                &ctx.cancel,
-            )
-            .await?
-        }
-    };
+    let DiffSpec::Range { base, head } = &target.diff_spec;
+    let numstat = git_capture_cancel(
+        repo,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            &format!("{base}...{head}"),
+        ],
+        &ctx.cancel,
+    )
+    .await?;
     let mut insertions = 0;
     let mut deletions = 0;
     let mut files_changed = 0;
@@ -1592,94 +1516,40 @@ async fn collect_diff(target: &ReviewTarget, ctx: &ToolContext) -> Result<DiffCo
             ));
             continue;
         }
-        let diff = match &target.diff_spec {
-            DiffSpec::Range {
-                base,
-                head,
-                include_worktree,
-            } => {
-                let capture_result = if *include_worktree {
-                    let merge_base = effective_range_base.as_deref().unwrap_or(base);
-                    git_capture_limited_cancel(
-                        repo,
-                        &[
-                            "diff",
-                            "--no-ext-diff",
-                            "--no-textconv",
-                            merge_base,
-                            "--",
-                            file,
-                        ],
-                        MAX_FILE_BYTES + 1,
-                        &ctx.cancel,
-                    )
-                    .await
-                } else {
-                    let merge_base_range = format!("{base}...{head}");
-                    git_capture_limited_cancel(
-                        repo,
-                        &[
-                            "diff",
-                            "--no-ext-diff",
-                            "--no-textconv",
-                            &merge_base_range,
-                            "--",
-                            file,
-                        ],
-                        MAX_FILE_BYTES + 1,
-                        &ctx.cancel,
-                    )
-                    .await
-                };
-                let (diff_output, truncated) = match capture_result {
-                    Ok(result) => result,
-                    Err(e) => {
-                        warnings.push(warning(
-                            "diff_capture_failed",
-                            &format!("failed to capture file diff: {e}"),
-                            Some(file),
-                        ));
-                        continue;
-                    }
-                };
-                if truncated {
-                    unreviewed.push(UnreviewedFile {
-                        file: file.clone(),
-                        reason: OversizedReason::PerFileCap,
-                    });
-                    continue;
-                }
-                diff_output
-            }
-            DiffSpec::Workspace => {
-                let (diff_output, truncated) = match git_capture_limited_cancel(
-                    repo,
-                    &["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--", file],
-                    MAX_FILE_BYTES + 1,
-                    &ctx.cancel,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        warnings.push(warning(
-                            "diff_capture_failed",
-                            &format!("failed to capture file diff: {e}"),
-                            Some(file),
-                        ));
-                        continue;
-                    }
-                };
-                if truncated {
-                    unreviewed.push(UnreviewedFile {
-                        file: file.clone(),
-                        reason: OversizedReason::PerFileCap,
-                    });
-                    continue;
-                }
-                diff_output
+        let DiffSpec::Range { base, head } = &target.diff_spec;
+        let merge_base_range = format!("{base}...{head}");
+        let capture_result = git_capture_limited_cancel(
+            repo,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                &merge_base_range,
+                "--",
+                file,
+            ],
+            MAX_FILE_BYTES + 1,
+            &ctx.cancel,
+        )
+        .await;
+        let (diff, truncated) = match capture_result {
+            Ok(result) => result,
+            Err(e) => {
+                warnings.push(warning(
+                    "diff_capture_failed",
+                    &format!("failed to capture file diff: {e}"),
+                    Some(file),
+                ));
+                continue;
             }
         };
+        if truncated {
+            unreviewed.push(UnreviewedFile {
+                file: file.clone(),
+                reason: OversizedReason::PerFileCap,
+            });
+            continue;
+        }
         if diff.len() > MAX_FILE_BYTES {
             unreviewed.push(UnreviewedFile {
                 file: file.clone(),
@@ -1720,7 +1590,7 @@ fn review_prompt(
     chunk_count: usize,
 ) -> String {
     format!(
-        "Brief:\n{}\n\nFocus:\n{}\n\nTarget:\n{}\n\nStats: {} changed files, {} reviewed files, +{}/-{}. Dirty: {}, dirty opt-in: {}. Chunk {}/{}.\n\nDiff:\n{}",
+        "Brief:\n{}\n\nFocus:\n{}\n\nTarget:\n{}\n\nStats: {} changed files, {} reviewed files, +{}/-{}. Dirty: {}. Chunk {}/{}.\n\nDiff:\n{}",
         input.brief.trim(),
         input.focus.as_deref().unwrap_or("general correctness review"),
         serde_json::to_string_pretty(target).unwrap_or_default(),
@@ -1729,7 +1599,6 @@ fn review_prompt(
         collection.insertions,
         collection.deletions,
         target.dirty,
-        target.allow_dirty_working_tree,
         chunk_index,
         chunk_count,
         diff_chunk
@@ -2191,12 +2060,10 @@ mod tests {
         );
     }
 
-    /// The review comparator must prefer origin/<base> over the (often stale)
-    /// local base ref, and fall back to the local ref only when no
-    /// remote-tracking ref exists. Diffing against a stale local base is what
-    /// inflated a 3-commit PR into a 118-commit review in production.
+    /// The review target requires `origin/<base>` so reviews compare committed
+    /// branch changes against the fetched origin default branch tip.
     #[tokio::test]
-    async fn effective_base_ref_prefers_remote_tracking_ref() {
+    async fn effective_base_ref_requires_remote_tracking_ref() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         git_ok(repo, &["init", "-q"]).await;
@@ -2209,12 +2076,53 @@ mod tests {
             .await
             .expect("head");
 
-        // No remote-tracking ref yet: fall back to the bare local branch.
-        assert_eq!(effective_base_ref(repo, "main").await, "main");
+        assert!(effective_base_ref(repo, "main").await.is_err());
 
-        // Once origin/main exists, it must win.
         git_ok(repo, &["update-ref", "refs/remotes/origin/main", &head]).await;
-        assert_eq!(effective_base_ref(repo, "main").await, "origin/main");
+        assert_eq!(
+            effective_base_ref(repo, "main").await.unwrap(),
+            "origin/main"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_working_tree_is_always_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]).await;
+        git_ok(repo, &["config", "user.email", "t@t.t"]).await;
+        git_ok(repo, &["config", "user.name", "t"]).await;
+        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]).await;
+        let base = git_capture(repo, &["rev-parse", "HEAD"])
+            .await
+            .expect("base");
+        git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base]).await;
+        std::fs::write(repo.join("dirty.rs"), "uncommitted\n").expect("write");
+
+        let ctx = ToolContext::new(
+            CancellationToken::new(),
+            "test-conv".to_string(),
+            repo.to_path_buf(),
+            std::sync::Arc::new(crate::BrowserSessionManager::default()),
+            std::sync::Arc::new(crate::BashHandleRegistry::new()),
+            std::sync::Arc::new(crate::NoLlm),
+            phoenix_terminal::ActiveTerminals::new(),
+            std::sync::Arc::new(crate::TmuxRegistry::new()),
+            Some(repo.to_path_buf()),
+        );
+        let err = resolve_target(
+            &ctx,
+            &CommissionReviewInput {
+                brief: "ready".to_string(),
+                focus: None,
+            },
+            Some("main"),
+        )
+        .await
+        .expect_err("dirty working tree is refused");
+
+        assert!(err.contains("refused dirty working tree"));
+        assert!(err.contains("only reviews committed changes"));
     }
 
     /// A diff whose only changed files all exceed the per-file cap reviews
@@ -2254,7 +2162,6 @@ mod tests {
             &CommissionReviewInput {
                 brief: "ready".to_string(),
                 focus: None,
-                allow_dirty_working_tree: false,
             },
             Some("main"),
         )
@@ -2299,7 +2206,6 @@ mod tests {
                     base: "main".to_string(),
                     head: "HEAD".to_string(),
                     dirty: false,
-                    allow_dirty_working_tree: false,
                 },
                 files_changed: 2,
                 files_reviewed: 0,
@@ -2400,7 +2306,6 @@ mod tests {
             request: CommissionReviewInput {
                 brief: "Ready".to_string(),
                 focus: None,
-                allow_dirty_working_tree: false,
             },
             runtime_base_branch: Some("main".to_string()),
             approved_working_dir: "/repo/approved".to_string(),
@@ -2432,7 +2337,6 @@ mod tests {
             request: CommissionReviewInput {
                 brief: "Ready".to_string(),
                 focus: None,
-                allow_dirty_working_tree: false,
             },
             runtime_base_branch: Some("main".to_string()),
             approved_working_dir: "/repo/approved".to_string(),
@@ -2451,7 +2355,6 @@ mod tests {
             base: "main".to_string(),
             head: "task".to_string(),
             dirty: false,
-            allow_dirty_working_tree: false,
         }
     }
 
