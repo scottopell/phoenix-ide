@@ -534,12 +534,18 @@ function MessageListImpl({
           lastUpwardScrollAtRef.current = Date.now();
         }
         lastScrollTopRef.current = top;
-        // Pre-engagement, any movement that leaves the viewport off the
-        // bottom is settling churn (virtuoso initial placement and its
-        // compensations move scrollTop without a height delta, so the
-        // height-callback rescue alone cannot see every stranding).
-        // Our own settle snap lands at the bottom and won't re-trigger.
-        if (!hasUserEngagedRef.current) {
+        // Pre-engagement and within the settle window, any movement that
+        // leaves the viewport off the bottom is settling churn (virtuoso
+        // initial placement and its compensations move scrollTop without a
+        // height delta, so the height-callback rescue alone cannot see
+        // every stranding). Our own settle snap lands at the bottom and
+        // won't re-trigger. Window-bounded because scroll-only user inputs
+        // (keyboard, find-in-page) never mark engagement and must not be
+        // fought once the mount has settled.
+        if (
+          !hasUserEngagedRef.current &&
+          Date.now() <= settleWatchDeadlineRef.current
+        ) {
           if (ref.scrollHeight - top - ref.clientHeight > 1) {
             scheduleSettleSnap();
           }
@@ -759,11 +765,35 @@ function MessageListImpl({
     prevScrollHeightRef.current = s.scrollHeight;
     // Pre-engagement settling: see hasUserEngagedRef. Distance is
     // meaningless while virtuoso may have stranded the initial placement,
-    // so keep re-snapping until the user takes over.
-    if (!hasUserEngagedRef.current) {
+    // so keep re-snapping until the user takes over. Bounded by the settle
+    // window: stranding is a mount-churn phenomenon, and scroll-only user
+    // inputs (keyboard scrolling on a focused row, browser find-in-page)
+    // emit no touch/wheel/pointer event to mark engagement — enforcing
+    // beyond the window would fight them. After the window the normal pin
+    // logic below applies, whose upward-scroll suppression covers
+    // scroll-only inputs.
+    if (
+      !hasUserEngagedRef.current &&
+      Date.now() <= settleWatchDeadlineRef.current
+    ) {
       scheduleSettleSnap();
       return;
     }
+    // Genuine tail-activity signal for the unread paths below. Only
+    // height growth with server-driven activity at the tail counts;
+    // unrelated growth — header toggle, image load in an older message,
+    // late syntax-highlighter mount — must not raise "↓ New messages".
+    // Two coarse signals indicate genuine tail activity:
+    //   - active stream (token text growing inside the tail unit)
+    //   - awaiting_sub_agents phase (persist_sub_agent_results updates
+    //     the existing spawn_agents message via MessageUpdated;
+    //     same-length but the rendered tail grows)
+    // Length-grew append cases are covered by the separate
+    // useEffect on messages.length / pending.
+    const grewWithTailActivity =
+      newHeight > prevHeight &&
+      (streamingRequestIdRef.current !== null ||
+        convStateRef.current.type === 'awaiting_sub_agents');
     if (oldFromBottom <= PIN_TO_BOTTOM_THRESHOLD) {
       // An in-progress user gesture owns the viewport. Height deltas fire
       // continuously while rows mount and measure during the user's own
@@ -783,24 +813,18 @@ function MessageListImpl({
           align: 'end',
           behavior: 'auto',
         });
+      } else if (grewWithTailActivity) {
+        // The suppressed snap must not swallow the unread signal: the user
+        // is departing the bottom while the tail genuinely grows, and this
+        // delta may be the LAST growth event (stream ends as they leave).
+        // Without marking here, they'd end up scrolled up above unseen
+        // content with no "↓ New messages" affordance. Harmless while they
+        // remain at bottom — the button renders only when !isAtBottom, and
+        // returning to bottom clears the flag.
+        setHasUnreadTailContent(true);
       }
     } else if (newHeight > prevHeight) {
-      // Only treat height growth as "unread tail content" when there's
-      // genuine server-driven activity at the tail. Otherwise unrelated
-      // growth — header toggle, image load in older message, late
-      // syntax-highlighter mount on scrolled-past code block — would
-      // spuriously raise the "↓ New messages" button.
-      //
-      // Two coarse signals indicate genuine tail activity:
-      //   - active stream (token text growing inside the tail unit)
-      //   - awaiting_sub_agents phase (persist_sub_agent_results updates
-      //     the existing spawn_agents message via MessageUpdated;
-      //     same-length but the rendered tail grows)
-      // Length-grew append cases are covered by the separate
-      // useEffect on messages.length / pending.
-      const streamingActive = streamingRequestIdRef.current !== null;
-      const subAgentsActive = convStateRef.current.type === 'awaiting_sub_agents';
-      if (streamingActive || subAgentsActive) {
+      if (grewWithTailActivity) {
         setHasUnreadTailContent(true);
       } else if (import.meta.env.DEV) {
         // Height grew, user is past the pin threshold, but no genuine tail

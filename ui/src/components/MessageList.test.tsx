@@ -71,11 +71,13 @@ vi.mock('./MessageContextMenu', () => ({
 const virtuosoMock = {
   scrollToIndex: vi.fn(),
   totalListHeightChanged: null as ((height: number) => void) | null,
+  atBottomStateChange: null as ((atBottom: boolean) => void) | null,
 };
 
 beforeEach(() => {
   virtuosoMock.scrollToIndex = vi.fn();
   virtuosoMock.totalListHeightChanged = null;
+  virtuosoMock.atBottomStateChange = null;
   agentRenderCounter.count = 0;
 });
 
@@ -88,6 +90,7 @@ vi.mock('react-virtuoso', () => ({
     computeItemKey,
     scrollerRef,
     totalListHeightChanged,
+    atBottomStateChange,
   }: {
     data: T[];
     context?: C;
@@ -97,11 +100,15 @@ vi.mock('react-virtuoso', () => ({
     computeItemKey?: (index: number, data: T) => React.Key;
     scrollerRef?: (ref: HTMLElement | Window | null) => void;
     totalListHeightChanged?: (height: number) => void;
+    atBottomStateChange?: (atBottom: boolean) => void;
   }, ref: React.Ref<{ scrollToIndex: (options: unknown) => void }>) => {
     const Header = components?.Header;
     const containerRef = useRef<HTMLDivElement>(null);
     if (totalListHeightChanged) {
       virtuosoMock.totalListHeightChanged = totalListHeightChanged;
+    }
+    if (atBottomStateChange) {
+      virtuosoMock.atBottomStateChange = atBottomStateChange;
     }
     useImperativeHandle(ref, () => ({ scrollToIndex: virtuosoMock.scrollToIndex }), []);
     useLayoutEffect(() => {
@@ -798,6 +805,100 @@ describe('handleTotalListHeightChanged', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('does not fight scroll-only inputs (keyboard, find-in-page) after the settle window', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={idleState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-scroll-only"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      // Pinned mount; the seeding measurement starts the settle window.
+      setupScroller(scroller, { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(1000));
+
+      // Settle window (3s) elapses without any user engagement.
+      act(() => vi.advanceTimersByTime(3500));
+      virtuosoMock.scrollToIndex.mockClear();
+
+      // Scroll-only input: browser find-in-page (or PageUp on a focused
+      // row) jumps the viewport up. Emits ONLY a scroll event — no
+      // touch/wheel/pointer, so engagement is never marked.
+      const written: number[] = [];
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 });
+      Object.defineProperty(scroller, 'scrollTop', {
+        configurable: true,
+        get: () => 100,
+        set: (v: number) => written.push(v),
+      });
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 400 });
+      fireEvent.scroll(scroller);
+
+      // A later height delta (image load, highlighter) must go through the
+      // normal distance-based pin logic — the user is 500px up, so no snap
+      // and no settle write.
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1100 });
+      act(() => virtuosoMock.totalListHeightChanged?.(1100));
+      act(() => vi.advanceTimersByTime(500));
+
+      expect(written).toHaveLength(0);
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('marks unread tail content when a gesture suppresses the pinned snap during tail growth', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const subAgentsState: ConversationState = {
+      type: 'awaiting_sub_agents',
+      pending: [],
+      completed_results: [],
+    };
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={subAgentsState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-suppressed-unread"
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+    act(() => virtuosoMock.totalListHeightChanged?.(500));
+    virtuosoMock.scrollToIndex.mockClear();
+
+    // The user starts dragging up (still within the pin threshold) and
+    // virtuoso reports them off the bottom.
+    act(() => virtuosoMock.atBottomStateChange?.(false));
+    fireEvent.touchStart(scroller, { touches: [{}] });
+
+    // Genuine tail growth (sub-agents phase) lands while the gesture
+    // suppresses the snap. oldFromBottom = 500 - 100 - 400 = 0 (pinned).
+    setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
+    act(() => virtuosoMock.totalListHeightChanged?.(600));
+
+    // The snap was suppressed, but the unread signal must not be swallowed:
+    // this may be the last growth event before the phase ends.
+    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
   });
 
   it('user engagement releases the pre-engagement settle rescue', () => {

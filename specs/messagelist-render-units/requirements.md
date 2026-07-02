@@ -396,13 +396,21 @@ streaming where Virtuoso's built-in handler is not.
 
 WHILE the user has not yet interacted with the conversation's scroller
 (no touch, wheel, or pointer input, and no conversation-nav jump)
+AND the bounded settling window following the conversation's first
+measurement (or first content after an empty mount) has not elapsed
 THE SYSTEM SHALL keep the viewport pinned to the bottom regardless of
 the measured distance from it — correcting on every total-list-height
 change, on every scroll movement that leaves the viewport off the
-bottom, and by periodic verification for a bounded settling window
-after the conversation's first measurement (stranding can be silent:
-the virtualizer's placement churn does not always end with a height
-delta or scroll event to react to)
+bottom, and by periodic verification (stranding can be silent: the
+virtualizer's placement churn does not always end with a height delta
+or scroll event to react to).
+The enforcement is bounded by the settling window, not merely the
+periodic check: stranding is a mount-churn phenomenon, and scroll-only
+user inputs — keyboard scrolling on a focused row, browser
+find-in-page — emit no touch/wheel/pointer event to mark engagement,
+so enforcement past the window would fight them. After the window the
+distance-based pin logic applies, whose upward-scroll suppression
+covers scroll-only inputs.
 SO THAT a stranded initial placement self-heals: the virtualizer's
 initial bottom placement is computed against pre-measurement estimates,
 and a large estimate correction landing right after mount can leave the
