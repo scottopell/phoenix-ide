@@ -86,6 +86,22 @@ class SpearsV2ShapeTests(unittest.TestCase):
 
             self.assertTrue(any("missing index row/link for 000_test-decision.md" in e for e in result.errors))
 
+    def test_adr_chain_reports_stale_index_link(self):
+        with tempfile.TemporaryDirectory() as td:
+            specs = Path(td) / "specs"
+            self.write_valid_adrs(specs)
+            (specs / "adrs" / "README.md").write_text(
+                "# Architecture Decision Records\n\n"
+                "| ADR | Title | Status | Affects |\n"
+                "| --- | --- | --- | --- |\n"
+                "| [000](000_test-decision.md) | Test decision | Accepted | methodology-level |\n"
+                "| [001](001_missing-decision.md) | Missing decision | Accepted | methodology-level |\n"
+            )
+
+            result = dev._validate_spears_v2_shape(specs)
+
+            self.assertTrue(any("index links to missing ADR file 001_missing-decision.md" in e for e in result.errors))
+
     def test_adr_chain_requires_numbering_to_start_at_zero(self):
         with tempfile.TemporaryDirectory() as td:
             specs = Path(td) / "specs"

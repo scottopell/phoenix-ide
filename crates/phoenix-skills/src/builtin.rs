@@ -129,7 +129,17 @@ fn prune_removed_builtin_files(target_dir: &Path) -> io::Result<()> {
 
     for skill in skill_names() {
         let skill_dir = target_dir.join(&skill);
-        if !skill_dir.exists() {
+        let metadata = match std::fs::symlink_metadata(&skill_dir) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if metadata.file_type().is_symlink() {
+            std::fs::remove_file(&skill_dir)?;
+            continue;
+        }
+        if !metadata.is_dir() {
+            std::fs::remove_file(&skill_dir)?;
             continue;
         }
         prune_dir(&skill_dir, Path::new(&skill), &expected)?;
@@ -298,5 +308,31 @@ mod tests {
         assert!(std::fs::read_to_string(&dest)
             .unwrap()
             .contains("name: spears"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_replaces_top_level_skill_symlink_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside-skill");
+        let outside_file = outside.join("keep.md");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(&outside_file, "do not delete").unwrap();
+        symlink(&outside, tmp.path().join("spears")).unwrap();
+
+        extract_to(tmp.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "do not delete"
+        );
+        let skill_metadata = std::fs::symlink_metadata(tmp.path().join("spears")).unwrap();
+        assert!(
+            skill_metadata.is_dir(),
+            "top-level skill path should be a real directory"
+        );
+        assert!(tmp.path().join("spears/SKILL.md").is_file());
     }
 }

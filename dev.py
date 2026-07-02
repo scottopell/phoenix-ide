@@ -4675,6 +4675,12 @@ def _validate_spears_v2_shape(specs_root: Path) -> SpearsV2ShapeResult:
                 key = (f"{num:03d}", path.name)
                 if key not in indexed:
                     errors.append(f"specs/adrs/README.md: missing index row/link for {path.name}")
+            numbered_keys = {(f"{num:03d}", path.name) for num, path in numbered}
+            for num, filename in sorted(indexed - numbered_keys):
+                errors.append(
+                    "specs/adrs/README.md: index links to missing ADR file "
+                    f"{filename} ({num})"
+                )
 
     return SpearsV2ShapeResult(errors=errors, legacy_design_docs=legacy_design_docs)
 
