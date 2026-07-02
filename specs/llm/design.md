@@ -262,12 +262,13 @@ The executor maps `Result<LlmResponse, LlmError>` → `LlmOutcome` via a total f
 
 ## Backend Implementations
 
-Phoenix has two HTTP backend families plus the in-process mock:
+Phoenix has three HTTP backend families plus the in-process mock:
 
 | Backend | Request URL | Wire protocol |
 |---------|-------------|---------------|
 | `anthropic` | `ANTHROPIC_BASE_URL` as-is, or `https://api.anthropic.com/v1/messages` | Anthropic Messages |
-| `openai_responses` | `OPENAI_BASE_URL` as-is, or `https://api.openai.com/v1/responses` | OpenAI Responses |
+| `openai_responses` | `OPENAI_RESPONSES_BASE_URL` as-is, legacy `OPENAI_BASE_URL` when it is not a Chat Completions endpoint, or `https://api.openai.com/v1/responses` | OpenAI Responses |
+| `openai_chat_completions` | `OPENAI_CHAT_COMPLETIONS_BASE_URL` as-is, legacy `OPENAI_BASE_URL` when it is not a Responses endpoint, or `https://api.openai.com/v1/chat/completions` | OpenAI Chat Completions |
 
 Configured base URLs are exact endpoints. Phoenix never treats them as gateway roots and never appends hidden provider path suffixes.
 
@@ -275,6 +276,7 @@ Configured base URLs are exact endpoints. Phoenix never treats them as gateway r
 pub enum ModelBackend {
     Anthropic,
     OpenAIResponses,
+    OpenAIChatCompletions,
     Mock,
 }
 
@@ -284,6 +286,7 @@ pub struct ModelSpec {
     pub backend: ModelBackend,
     pub description: String,
     pub context_window: usize,
+    pub max_output_tokens: u32,
     pub recommended: bool,
     pub supports_tool_search: bool,
 }
@@ -291,7 +294,7 @@ pub struct ModelSpec {
 
 ## Model Registry (REQ-LLM-003, REQ-SA-007)
 
-The registry starts from built-in model specs and merges valid additive specs from `PHOENIX_LLM_MODELS`. External specs declare a backend and may omit `api_name`, in which case Phoenix sends `id` as the wire model name. Duplicate IDs keep the built-in or earlier configured definition.
+The registry starts from built-in model specs and merges valid additive specs from `PHOENIX_LLM_MODELS`. External specs declare a backend and may omit `api_name`, in which case Phoenix sends `id` as the wire model name. External specs may provide `max_output_tokens`; explicit values must be nonzero and lower than `context_window`, and omitted values are capped below small context windows. Duplicate IDs keep the built-in or earlier configured definition.
 
 ```rust
 pub struct ModelRegistry {
@@ -310,8 +313,9 @@ When a credential helper and compatible base URL are configured, Phoenix derives
 |----------|---------------|
 | `https://proxy.example/v1/messages` | `https://proxy.example/v1/models` |
 | `https://proxy.example/v1/responses` | `https://proxy.example/v1/models` |
+| `https://proxy.example/v1/chat/completions` | `https://proxy.example/v1/chat/models` (not used for Responses filtering) |
 
-Discovery is backend-scoped. Anthropic discovery results only validate `anthropic` models; OpenAI Responses discovery results only validate `openai_responses` models. If discovery returns no usable configured models, Phoenix falls back to the configured model list and logs a warning.
+Discovery is backend-scoped. Anthropic discovery results only validate `anthropic` models; OpenAI Responses discovery results only validate `openai_responses` models. Chat Completions models are additive configuration entries and do not share the Responses discovery bucket. If discovery returns no usable configured models, Phoenix falls back to the configured model list and logs a warning.
 
 ## Request Translation (REQ-LLM-004)
 

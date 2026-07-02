@@ -3435,6 +3435,16 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 resets_at: None,
             }
         }
+        LlmOutcome::ContentFiltered { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::ContentFilter,
+                attempt,
+                recovery_in_progress: false,
+                resets_at: None,
+            }
+        }
         LlmOutcome::Cancelled => {
             let attempt = current_attempt(state);
             Event::LlmError {
@@ -3511,6 +3521,12 @@ fn current_attempt(state: &ConvState) -> u32 {
 /// usable headroom on any supported context size.
 const CONTINUATION_SAFETY_MARGIN: usize = 2_000;
 
+fn continuation_safety_margin(context_window: usize, max_output_tokens: u32) -> usize {
+    let output = usize::try_from(max_output_tokens).unwrap_or(usize::MAX);
+    let remaining = context_window.saturating_sub(output);
+    CONTINUATION_SAFETY_MARGIN.min(remaining / 2)
+}
+
 /// Check if context usage has exceeded the continuation threshold (REQ-BED-019).
 ///
 /// The threshold is `context_window - max_output_tokens - CONTINUATION_SAFETY_MARGIN`,
@@ -3525,7 +3541,10 @@ fn should_trigger_continuation(
     let used = usage.context_window_used();
     let threshold = context_window
         .saturating_sub(max_output_tokens as usize)
-        .saturating_sub(CONTINUATION_SAFETY_MARGIN);
+        .saturating_sub(continuation_safety_margin(
+            context_window,
+            max_output_tokens,
+        ));
     used >= threshold as u64
 }
 
@@ -4345,6 +4364,21 @@ mod tests {
         assert!(
             !should_trigger_continuation(&usage, context_window, 8_192),
             "small cap: 89k tokens is below threshold of 89_808 and should not trigger"
+        );
+    }
+
+    #[test]
+    fn continuation_safety_margin_scales_down_for_small_remaining_windows() {
+        assert_eq!(continuation_safety_margin(8_192, 6_192), 1_000);
+        let usage = UsageData {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert!(
+            !should_trigger_continuation(&usage, 8_192, 6_192),
+            "zero usage must not trigger continuation for small configured windows"
         );
     }
 

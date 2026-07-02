@@ -6483,7 +6483,10 @@ fn llm_error_to_outcome(error: phoenix_llm::LlmError) -> LlmOutcome {
             message: error.message,
             recovery_in_progress: error.recovery_in_progress,
         },
-        LlmErrorKind::InvalidRequest | LlmErrorKind::ContentFilter => LlmOutcome::RequestRejected {
+        LlmErrorKind::InvalidRequest => LlmOutcome::RequestRejected {
+            message: error.message,
+        },
+        LlmErrorKind::ContentFilter => LlmOutcome::ContentFiltered {
             message: error.message,
         },
     }

@@ -76,6 +76,8 @@ pub enum LlmOutcome {
     },
     /// Request rejected (400, content filter, etc.) — non-retryable
     RequestRejected { message: String },
+    /// Provider content filter or safety policy blocked the request/response.
+    ContentFiltered { message: String },
     /// Request was cancelled (abort signal received).
     #[allow(dead_code)]
     Cancelled,

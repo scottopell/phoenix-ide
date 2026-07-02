@@ -211,7 +211,6 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
     } else if lower.contains("context_length")
         || lower.contains("context length")
         || lower.contains("token_limit")
-        || lower.contains("max_tokens")
     {
         LlmError::new(super::LlmErrorKind::ContextWindowExceeded, detail)
     } else if lower.contains("content_filter") || lower.contains("safety") {
@@ -1553,6 +1552,13 @@ fn chat_message_to_response(
             );
         }
     }
+    if content.is_empty() {
+        if let Some(refusal) = message.refusal {
+            if !refusal.is_empty() {
+                content.push(ContentBlock::Text { text: refusal });
+            }
+        }
+    }
     for call in message.tool_calls.unwrap_or_default() {
         let input = serde_json::from_str(&call.function.arguments).unwrap_or_else(|e| {
             tracing::warn!(
@@ -1755,6 +1761,7 @@ impl ChatStreamAccumulator {
             } else {
                 Some(self.content)
             },
+            refusal: None,
             tool_calls: if self.tool_calls.is_empty() {
                 None
             } else {
@@ -1895,6 +1902,8 @@ struct ChatResponseMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ChatToolCall>>,
 }
@@ -2896,6 +2905,7 @@ mod tests {
                     message: ChatResponseMessage {
                         reasoning_content: None,
                         content: Some("Hello!".to_string()),
+                        refusal: None,
                         tool_calls: None,
                     },
                     finish_reason: Some("stop".to_string()),
@@ -2916,12 +2926,34 @@ mod tests {
         }
 
         #[test]
+        fn chat_normalize_refusal_response_surfaces_as_text() {
+            let resp = ChatCompletionsResponse {
+                choices: vec![ChatChoice {
+                    message: ChatResponseMessage {
+                        reasoning_content: None,
+                        content: None,
+                        refusal: Some("I can't help with that.".to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: None,
+            };
+            let result = normalize_chat_response(resp, "test-model").unwrap();
+            assert!(result.end_turn);
+            assert!(
+                matches!(&result.content[0], ContentBlock::Text { text } if text == "I can't help with that.")
+            );
+        }
+
+        #[test]
         fn chat_normalize_threads_cached_prompt_tokens_without_double_counting() {
             let resp = ChatCompletionsResponse {
                 choices: vec![ChatChoice {
                     message: ChatResponseMessage {
                         reasoning_content: None,
                         content: Some("Hello!".to_string()),
+                        refusal: None,
                         tool_calls: None,
                     },
                     finish_reason: Some("stop".to_string()),
@@ -2950,6 +2982,7 @@ mod tests {
                     message: ChatResponseMessage {
                         reasoning_content: Some("internal reasoning".to_string()),
                         content: Some("<\n\n".to_string()),
+                        refusal: None,
                         tool_calls: None,
                     },
                     finish_reason: Some("stop".to_string()),
@@ -2967,6 +3000,7 @@ mod tests {
                     message: ChatResponseMessage {
                         reasoning_content: Some("internal reasoning".to_string()),
                         content: Some("Final answer".to_string()),
+                        refusal: None,
                         tool_calls: None,
                     },
                     finish_reason: Some("stop".to_string()),
@@ -2986,6 +3020,7 @@ mod tests {
                     message: ChatResponseMessage {
                         reasoning_content: None,
                         content: None,
+                        refusal: None,
                         tool_calls: Some(vec![ChatToolCall {
                             id: "call_1".to_string(),
                             r#type: "function".to_string(),
@@ -3014,6 +3049,7 @@ mod tests {
                     message: ChatResponseMessage {
                         reasoning_content: None,
                         content: None,
+                        refusal: None,
                         tool_calls: Some(vec![ChatToolCall {
                             id: "call_1".to_string(),
                             r#type: "function".to_string(),
@@ -3043,6 +3079,7 @@ mod tests {
                     message: ChatResponseMessage {
                         reasoning_content: None,
                         content: None,
+                        refusal: None,
                         tool_calls: None,
                     },
                     finish_reason: Some("stop".to_string()),
@@ -3274,6 +3311,7 @@ mod tests {
                     message: ChatResponseMessage {
                         reasoning_content: None,
                         content: Some("partial".to_string()),
+                        refusal: None,
                         tool_calls: None,
                     },
                     finish_reason: Some("length".to_string()),
@@ -3300,6 +3338,7 @@ mod tests {
                     message: ChatResponseMessage {
                         reasoning_content: None,
                         content: Some("partial".to_string()),
+                        refusal: None,
                         tool_calls: None,
                     },
                     finish_reason: Some("content_filter".to_string()),
@@ -3317,6 +3356,7 @@ mod tests {
                     message: ChatResponseMessage {
                         reasoning_content: None,
                         content: Some("Hello!".to_string()),
+                        refusal: None,
                         tool_calls: None,
                     },
                     finish_reason: Some("stop".to_string()),
@@ -3334,6 +3374,7 @@ mod tests {
                     message: ChatResponseMessage {
                         reasoning_content: None,
                         content: None,
+                        refusal: None,
                         tool_calls: Some(vec![ChatToolCall {
                             id: "call_1".to_string(),
                             r#type: "function".to_string(),
@@ -3398,6 +3439,15 @@ mod tests {
             let err = openai_http_error(400, "400 Bad Request", body);
             assert_eq!(err.kind, LlmErrorKind::InvalidRequest);
             assert!(err.message.contains("unsupported parameter"));
+        }
+
+        #[test]
+        fn openai_http_error_does_not_treat_unsupported_max_tokens_as_context_exhausted() {
+            use crate::LlmErrorKind;
+            let body = r#"{"error":{"message":"Unsupported parameter: 'max_tokens'. Use 'max_completion_tokens'.","code":"unsupported_parameter"}}"#;
+            let err = openai_http_error(400, "400 Bad Request", body);
+            assert_eq!(err.kind, LlmErrorKind::InvalidRequest);
+            assert!(err.message.contains("Unsupported parameter"));
         }
 
         #[test]
