@@ -84,6 +84,7 @@ pub fn skill_names() -> Vec<String> {
 /// corrupt binary (the embed macro guarantees the iterator and lookup
 /// share the same compile-time set).
 pub fn extract_to(target_dir: &Path) -> std::io::Result<()> {
+    ensure_real_directory_root(target_dir)?;
     prune_removed_builtin_files(target_dir)?;
     for path in BuiltinAssets::iter() {
         let asset = BuiltinAssets::get(&path).expect("iterated asset must exist");
@@ -99,6 +100,22 @@ pub fn extract_to(target_dir: &Path) -> std::io::Result<()> {
         if needs_write {
             std::fs::write(&dest, asset.data.as_ref())?;
         }
+    }
+    Ok(())
+}
+
+fn ensure_real_directory_root(root: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                std::fs::remove_file(root)?;
+                std::fs::create_dir_all(root)?;
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(root)?;
+        }
+        Err(e) => return Err(e),
     }
     Ok(())
 }
@@ -334,5 +351,32 @@ mod tests {
             "top-level skill path should be a real directory"
         );
         assert!(tmp.path().join("spears/SKILL.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_replaces_symlinked_extract_root_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside-root");
+        let outside_file = outside.join("spears/unrelated.md");
+        let extract_root = tmp.path().join("extract-root");
+        std::fs::create_dir_all(outside_file.parent().unwrap()).unwrap();
+        std::fs::write(&outside_file, "do not delete").unwrap();
+        symlink(&outside, &extract_root).unwrap();
+
+        extract_to(&extract_root).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "do not delete"
+        );
+        let root_metadata = std::fs::symlink_metadata(&extract_root).unwrap();
+        assert!(
+            root_metadata.is_dir(),
+            "extract root should be a real directory"
+        );
+        assert!(extract_root.join("spears/SKILL.md").is_file());
     }
 }

@@ -127,12 +127,16 @@ ADRs, and only forward-looking unknowns land here.
 | 🟡 | Functional with gaps |
 | N/A | Not applicable |
 
-## The timeless rule (everything except executive.md)
+## The timeless rule (requirements and Allium)
 
-Every spEARS artifact except `executive.md` describes a standing ideal — the
-system as if it had always been this way.
-They are guidebooks for understanding the design, not changelogs of how it got
-here. Write what *is*, never what changed.
+`requirements.md` and `.allium` describe a standing ideal — the system as if it
+had always been this way. They are guidebooks for understanding the current
+behavioral contract, not changelogs of how it got here. Write what *is*, never
+what changed.
+
+This rule does **not** apply to `executive.md` or `adrs/`. `executive.md` is the
+status/current-reality artifact; ADRs are deliberately dated, point-in-time
+decision records with context, options, and consequences.
 
 These phrases signal a violation.
 If you write one, rewrite it as a standing fact:
