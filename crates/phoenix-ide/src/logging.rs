@@ -120,6 +120,20 @@ pub fn init(config: &LogConfig) -> std::io::Result<TracingHandles> {
         if std::env::var("DD_SERVICE").is_err() {
             dd_config_builder.set_service("phoenix-ide".to_string());
         }
+        // Every launchd/systemd deploy is a real running service instance
+        // (even a developer's own dogfood box), so default env to "prod"
+        // rather than leaving the tag empty.
+        if std::env::var("DD_ENV").is_err() {
+            dd_config_builder.set_env("prod".to_string());
+        }
+        // dev.py already computes a build identifier (e.g. "dev-<sha>") and
+        // injects it as PHOENIX_VERSION; reuse it as the DD_VERSION fallback
+        // so traces carry a version tag without a separate env var to set.
+        if std::env::var("DD_VERSION").is_err() {
+            if let Ok(version) = std::env::var("PHOENIX_VERSION") {
+                dd_config_builder.set_version(version);
+            }
+        }
         Some(
             datadog_opentelemetry::tracing()
                 .with_config(dd_config_builder.build())
