@@ -630,6 +630,129 @@ describe('handleTotalListHeightChanged', () => {
     expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
   });
 
+  it('does NOT re-snap while a touch gesture is active, and resumes after it ends', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={idleState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-touch"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      // Seed baseline: user pinned at bottom
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(500));
+      virtuosoMock.scrollToIndex.mockClear();
+
+      // Finger goes down and starts dragging up — still within the pin
+      // threshold (oldFromBottom = 500 - 80 - 400 = 20) when a
+      // measurement-driven height delta lands.
+      fireEvent.touchStart(scroller, { touches: [{}] });
+      setupScroller(scroller, { scrollHeight: 600, scrollTop: 80, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(600));
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+
+      // Finger lifts; once the suppress window expires, a pinned user is
+      // followed again.
+      fireEvent.touchEnd(scroller, { touches: [] });
+      act(() => vi.advanceTimersByTime(500));
+      setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
+      // oldFromBottom = 600 - 200 - 400 = 0 (pinned)
+      act(() => virtuosoMock.totalListHeightChanged?.(700));
+      expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does NOT re-snap within the suppress window after an upward scroll (momentum/wheel)', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={idleState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-momentum"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      // Establish the scroll-direction baseline at scrollTop=100 (the
+      // detector compares against the last observed scrollTop).
+      fireEvent.scroll(scroller);
+      act(() => virtuosoMock.totalListHeightChanged?.(500));
+      virtuosoMock.scrollToIndex.mockClear();
+
+      // scrollTop decreases (upward) — momentum after finger lift, a wheel
+      // notch, or a scrollbar drag all look like this.
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 60, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+
+      // Height delta lands while still within the pin threshold
+      // (oldFromBottom = 500 - 60 - 400 = 40) and within the window — no snap.
+      setupScroller(scroller, { scrollHeight: 600, scrollTop: 60, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(600));
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+
+      // After the window expires with no further upward movement, a pinned
+      // user is followed again.
+      act(() => vi.advanceTimersByTime(500));
+      setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
+      // oldFromBottom = 600 - 200 - 400 = 0 (pinned)
+      act(() => virtuosoMock.totalListHeightChanged?.(700));
+      expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('downward scroll does not suppress the pinned re-snap', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-downward"
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 50, clientHeight: 400 });
+    act(() => virtuosoMock.totalListHeightChanged?.(500));
+    virtuosoMock.scrollToIndex.mockClear();
+
+    // scrollTop increases (downward) — e.g. our own snap or the user heading
+    // to the bottom. Must NOT suppress auto-follow.
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+    fireEvent.scroll(scroller);
+
+    setupScroller(scroller, { scrollHeight: 600, scrollTop: 100, clientHeight: 400 });
+    // oldFromBottom = 500 - 100 - 400 = 0 (pinned)
+    act(() => virtuosoMock.totalListHeightChanged?.(600));
+    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+  });
+
   it('re-snaps when viewport shrinks while pinned', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(

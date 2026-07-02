@@ -78,6 +78,12 @@ export interface MessageListHandle {
 
 const PIN_TO_BOTTOM_THRESHOLD = 100;
 
+// How long after the last upward user scroll the auto-follow re-snap stays
+// suppressed. Rolling: touch momentum keeps refreshing it on every upward
+// scroll event, so the window only has to outlive the gap between momentum
+// scroll events, not the whole momentum animation.
+const USER_SCROLL_SUPPRESS_MS = 400;
+
 function formatAttachmentBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -379,7 +385,20 @@ function MessageListImpl({
     if (atBottom) setHasUnreadTailContent(false);
   }, []);
 
+  // User-gesture tracking for handleTotalListHeightChanged: an active touch
+  // drag, or any upward scroll within USER_SCROLL_SUPPRESS_MS (wheel notch,
+  // scrollbar drag, touch momentum after finger lift), marks the viewport as
+  // user-owned so the auto-follow re-snap never fights the gesture. Downward
+  // movement never suppresses — our own programmatic snaps scroll down, and a
+  // user scrolling down is heading to the bottom anyway.
+  const touchActiveRef = useRef(false);
+  const lastUpwardScrollAtRef = useRef(0);
+  const lastScrollTopRef = useRef(0);
+  const detachGestureListenersRef = useRef<(() => void) | null>(null);
+
   const handleScrollerRef = useCallback((ref: HTMLElement | Window | null) => {
+    detachGestureListenersRef.current?.();
+    detachGestureListenersRef.current = null;
     scrollerRef.current = ref instanceof HTMLElement ? ref : null;
     // Preserve the `#messages` selector that <MessageContextMenu> binds
     // its `contextmenu` listener to. Before the virtuoso migration the
@@ -388,6 +407,41 @@ function MessageListImpl({
     // working without restructuring the menu component.
     if (ref instanceof HTMLElement) {
       ref.id = 'messages';
+      touchActiveRef.current = false;
+      lastUpwardScrollAtRef.current = 0;
+      lastScrollTopRef.current = ref.scrollTop;
+      const onTouchStart = () => {
+        touchActiveRef.current = true;
+      };
+      const onTouchEnd = (e: TouchEvent) => {
+        if (e.touches.length === 0) touchActiveRef.current = false;
+      };
+      // Wheel is tracked in addition to scroll direction so an upward intent
+      // registers even when the wheel event and the height delta land before
+      // the resulting scroll event does.
+      const onWheel = (e: WheelEvent) => {
+        if (e.deltaY < 0) lastUpwardScrollAtRef.current = Date.now();
+      };
+      const onScroll = () => {
+        const top = ref.scrollTop;
+        if (top < lastScrollTopRef.current) {
+          lastUpwardScrollAtRef.current = Date.now();
+        }
+        lastScrollTopRef.current = top;
+      };
+      ref.addEventListener('touchstart', onTouchStart, { passive: true });
+      ref.addEventListener('touchend', onTouchEnd, { passive: true });
+      ref.addEventListener('touchcancel', onTouchEnd, { passive: true });
+      ref.addEventListener('wheel', onWheel, { passive: true });
+      ref.addEventListener('scroll', onScroll, { passive: true });
+      detachGestureListenersRef.current = () => {
+        ref.removeEventListener('touchstart', onTouchStart);
+        ref.removeEventListener('touchend', onTouchEnd);
+        ref.removeEventListener('touchcancel', onTouchEnd);
+        ref.removeEventListener('wheel', onWheel);
+        ref.removeEventListener('scroll', onScroll);
+        touchActiveRef.current = false;
+      };
     }
   }, []);
 
@@ -569,11 +623,25 @@ function MessageListImpl({
     const oldFromBottom = prevHeight - s.scrollTop - clientHeightForPinCheck;
     prevClientHeightRef.current = s.clientHeight;
     if (oldFromBottom <= PIN_TO_BOTTOM_THRESHOLD) {
-      virtuosoRef.current?.scrollToIndex({
-        index: 'LAST',
-        align: 'end',
-        behavior: 'auto',
-      });
+      // An in-progress user gesture owns the viewport. Height deltas fire
+      // continuously while rows mount and measure during the user's own
+      // scroll-up (overscan rows above the viewport, late images, syntax
+      // highlighters); re-snapping on those clobbers the gesture — on touch
+      // devices it made the first ~100px of every scroll-up yank back to
+      // the bottom, trapping the user there. The suppression covers the
+      // finger-down drag (touchActiveRef) and the momentum/wheel phase
+      // (rolling upward-scroll window). A genuinely pinned user is
+      // unaffected: their scroll events are all downward or absent.
+      const userOwnsViewport =
+        touchActiveRef.current ||
+        Date.now() - lastUpwardScrollAtRef.current < USER_SCROLL_SUPPRESS_MS;
+      if (!userOwnsViewport) {
+        virtuosoRef.current?.scrollToIndex({
+          index: 'LAST',
+          align: 'end',
+          behavior: 'auto',
+        });
+      }
     } else if (newHeight > prevHeight) {
       // Only treat height growth as "unread tail content" when there's
       // genuine server-driven activity at the tail. Otherwise unrelated

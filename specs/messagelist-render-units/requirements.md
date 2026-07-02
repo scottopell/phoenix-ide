@@ -347,6 +347,22 @@ WHEN a new render unit appears and the user is NOT pinned to the bottom
 THE SYSTEM SHALL show the "jump-to-newest" button
 AND SHALL NOT auto-scroll the viewport
 
+WHEN the total list height changes while a user scroll gesture is in
+progress — an active touch drag (finger down), or an upward scroll
+(wheel, scrollbar, keyboard, or touch momentum) within a short rolling
+suppression window
+THE SYSTEM SHALL NOT auto-scroll the viewport, even if the pre-change
+scroll position is within the pin threshold
+SO THAT measurement-driven height deltas (rows mounting and being
+measured during the user's own scroll-up, late image loads, syntax
+highlighters) cannot clobber the gesture and trap the user at the
+bottom — a departing user's first pin-threshold's worth of travel is
+otherwise re-snapped on every height delta.
+The suppression window is refreshed by each upward scroll event, so it
+only needs to outlive the gap between momentum scroll events; downward
+scrolls never suppress (the auto-follow snap itself scrolls downward,
+and a user scrolling down is heading to the bottom).
+
 THE SYSTEM SHALL NOT force-scroll the viewport for any message type.
 No "force" override exists for system messages, approval prompts, or
 any other unit kind: a user who has scrolled up retains their scroll
