@@ -1620,6 +1620,12 @@ fn openai_http_error(status_code: u16, status_display: &str, body: &str) -> LlmE
             | super::LlmErrorKind::RateLimit
             | super::LlmErrorKind::InvalidRequest
             | super::LlmErrorKind::InvalidResponse => classified,
+            super::LlmErrorKind::ServerError if matches!(status_code, 401 | 403) => {
+                LlmError::auth(format!("Authentication failed: {message}"))
+            }
+            super::LlmErrorKind::ServerError if status_code == 429 => {
+                LlmError::rate_limit(format!("Rate limit exceeded: {message}"))
+            }
             super::LlmErrorKind::ServerError if (400..=499).contains(&status_code) => {
                 LlmError::invalid_request(format!("Bad request ({status_display}): {message}"))
             }
@@ -3392,6 +3398,18 @@ mod tests {
             let err = openai_http_error(400, "400 Bad Request", body);
             assert_eq!(err.kind, LlmErrorKind::InvalidRequest);
             assert!(err.message.contains("unsupported parameter"));
+        }
+
+        #[test]
+        fn openai_http_error_preserves_status_specific_fallbacks_for_unknown_codes() {
+            use crate::LlmErrorKind;
+            let rate = r#"{"error":{"message":"Too many requests","code":"provider_specific"}}"#;
+            let err = openai_http_error(429, "429 Too Many Requests", rate);
+            assert_eq!(err.kind, LlmErrorKind::RateLimit);
+
+            let auth = r#"{"error":{"message":"Forbidden","code":"provider_specific"}}"#;
+            let err = openai_http_error(403, "403 Forbidden", auth);
+            assert_eq!(err.kind, LlmErrorKind::Auth);
         }
 
         #[test]

@@ -1628,6 +1628,30 @@ fn handle_core_continuation(
             .with_effect(Effect::notify_state_change()))
         }
 
+        // Non-retryable or exhausted LlmError during continuation -> Error.
+        (
+            CoreState::AwaitingContinuation { attempt, .. },
+            CoreEvent::LlmError {
+                message,
+                error_kind,
+                resets_at,
+                ..
+            },
+        ) => {
+            let error_message = if error_kind.is_auto_retryable() {
+                format!("Failed after {attempt} attempts: {message}")
+            } else {
+                message
+            };
+            Ok(CoreTransitionResult::new(CoreState::Error {
+                message: error_message,
+                error_kind,
+                resets_at,
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change()))
+        }
+
         // RetryTimeout during continuation
         (
             CoreState::AwaitingContinuation {
@@ -5675,6 +5699,36 @@ mod tests {
             ConvState::AwaitingContinuation { attempt: 1, .. }
         ));
         assert!(result.effects.is_empty());
+    }
+
+    #[test]
+    fn awaiting_continuation_output_limit_error_falls_back_to_context_exhausted() {
+        let state = ConvState::AwaitingContinuation {
+            rejected_tool_calls: vec![],
+            attempt: 1,
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::LlmError {
+                message: "output cap hit".to_string(),
+                error_kind: ErrorKind::OutputLimitExceeded,
+                attempt: 1,
+                recovery_in_progress: false,
+                resets_at: None,
+            },
+        )
+        .expect("non-retryable continuation error must transition");
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::ContextExhausted { .. }
+        ));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyContextExhausted { .. })));
     }
 
     #[test]
