@@ -1125,6 +1125,11 @@ where
     /// their `llm.request` / `tool.execute` spans share one trace per turn
     /// instead of each becoming a single-span trace.
     turn_span: Option<tracing::Span>,
+    /// Slot holding the span that triggered the next turn (see
+    /// [`super::TurnTriggerSlot`]). Created here, shared with the
+    /// [`super::ConversationHandle`] via `turn_trigger_slot()`; consumed by
+    /// `current_turn_span`, which records the trigger as an `OTel` span link.
+    turn_trigger: super::TurnTriggerSlot,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -1182,6 +1187,7 @@ where
             llm_task_handle: None,
             retry_timer_handle: None,
             turn_span: None,
+            turn_trigger: super::TurnTriggerSlot::default(),
             retry_generation: 0,
             llm_request_generation: 0,
             llm_outcome_tx,
@@ -2921,6 +2927,20 @@ where
             });
         }
 
+        // Captured before borrowing spawn_tx (current_turn_span needs &mut
+        // self). Each sub-agent's turn links back to this span; the context
+        // is extracted here, while the turn span is open, because a closed
+        // span no longer resolves to an OTel context.
+        let parent_turn_link = {
+            use opentelemetry::trace::TraceContextExt;
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            self.current_turn_span()
+                .context()
+                .span()
+                .span_context()
+                .clone()
+        };
+
         // All specs validated; require a spawn channel before sending any.
         let Some(spawn_tx) = &self.spawn_tx else {
             tracing::warn!("No spawn channel configured, cannot spawn sub-agents");
@@ -2945,6 +2965,7 @@ where
                 spec,
                 parent_conversation_id: self.context.conversation_id.clone(),
                 parent_event_tx: self.event_tx.clone(),
+                parent_turn_link: parent_turn_link.clone(),
             };
             if let Err(e) = spawn_tx.send(request).await {
                 tracing::error!(error = %e, "Failed to send spawn request");
@@ -3337,9 +3358,20 @@ where
     /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
     /// messages, build the streaming pipeline, and spawn the LLM task.
     #[allow(clippy::too_many_lines)]
+    /// The executor's turn-trigger slot, for sharing with the
+    /// [`super::ConversationHandle`] (event senders) and for seeding a
+    /// sub-agent's first turn with its parent's turn span.
+    pub(crate) fn turn_trigger_slot(&self) -> super::TurnTriggerSlot {
+        self.turn_trigger.clone()
+    }
+
     /// Get-or-open the trace span for the current agent turn (see the
     /// `turn_span` field). Lazy: the first LLM dispatch of a turn creates it;
-    /// every subsequent dispatch in the same turn reuses it.
+    /// every subsequent dispatch in the same turn reuses it. A pending
+    /// trigger span (the HTTP request that delivered the starting event, or
+    /// the parent's turn for a sub-agent) is consumed here and recorded as an
+    /// `OTel` span link — a link, not a parent, because the trigger's trace
+    /// completes independently of this turn.
     fn current_turn_span(&mut self) -> tracing::Span {
         if let Some(span) = &self.turn_span {
             return span.clone();
@@ -3352,6 +3384,16 @@ where
             is_sub_agent = self.context.is_sub_agent,
             final_state = tracing::field::Empty,
         );
+        let trigger = self
+            .turn_trigger
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(trigger_ctx) = trigger {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            // Validity was checked at deposit time (see TurnTriggerSlot).
+            span.add_link(trigger_ctx);
+        }
         self.turn_span = Some(span.clone());
         span
     }

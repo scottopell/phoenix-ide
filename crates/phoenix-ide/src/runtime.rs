@@ -47,12 +47,54 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 
+/// Shared slot carrying the trace identity of whatever triggered a
+/// conversation's next turn: the HTTP request span that delivered the user
+/// event, or the parent's `conversation.turn` span for sub-agents. Written by
+/// [`RuntimeManager::send_event`] / [`RuntimeManager::enqueue_steer_message`]
+/// and at sub-agent spawn; consumed once by the executor when it opens a
+/// `conversation.turn` span, which records the trigger as an `OTel` span link
+/// (a link, not a parent — the trigger's trace completes independently of
+/// the turn).
+///
+/// The slot holds a [`SpanContext`] (immutable trace/span ids extracted while
+/// the trigger span is still open), never a live `tracing::Span` handle — a
+/// held handle would keep the trigger span from closing, delaying its export
+/// and inflating its recorded duration whenever the trigger is consumed late
+/// or never. Best-effort observability: a lost or stale trigger only affects
+/// trace navigation, never behavior.
+pub type TurnTriggerSlot = Arc<Mutex<Option<opentelemetry::trace::SpanContext>>>;
+
+/// Deposit the caller's ambient span context into a conversation's
+/// turn-trigger slot (the HTTP request span when called from a handler inside
+/// the `TraceLayer` span). Overwrites only when a real exportable span is
+/// current — internal callers with no ambient span (or with tracing export
+/// disabled) never clear a trigger already deposited for a queued event.
+fn deposit_turn_trigger(handle: &ConversationHandle) {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    let ctx = tracing::Span::current()
+        .context()
+        .span()
+        .span_context()
+        .clone();
+    if ctx.is_valid() {
+        if let Ok(mut slot) = handle.turn_trigger.lock() {
+            *slot = Some(ctx);
+        }
+    }
+}
+
 /// Request to spawn a sub-agent
 #[derive(Debug)]
 pub struct SubAgentSpawnRequest {
     pub spec: SubAgentSpec,
     pub parent_conversation_id: String,
     pub parent_event_tx: mpsc::Sender<Event>,
+    /// The parent's `conversation.turn` span context at spawn time
+    /// (invalid when tracing export is disabled). Seeded into the sub-agent's
+    /// [`TurnTriggerSlot`] so the sub-agent's turn trace links back to the
+    /// parent turn that spawned it.
+    pub parent_turn_link: opentelemetry::trace::SpanContext,
 }
 
 /// Request to cancel sub-agents
@@ -179,6 +221,10 @@ pub struct RuntimeManager {
 /// Handle to interact with a running conversation
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
+    /// Turn-trigger slot shared with this conversation's executor (see
+    /// [`TurnTriggerSlot`]). Event senders deposit the ambient span here so
+    /// the turn the event starts can link back to it.
+    pub turn_trigger: TurnTriggerSlot,
     /// SSE broadcaster. Owns the per-conversation monotonic `sequence_id` counter
     /// that every emitted [`SseEvent`] must consume (task 02675). Callers never
     /// hand-craft a `sequence_id` — they either go through [`SseBroadcaster::send_seq`]
@@ -1581,6 +1627,7 @@ impl RuntimeManager {
             spec,
             parent_conversation_id,
             parent_event_tx,
+            parent_turn_link,
         } = req;
 
         tracing::info!(
@@ -1794,12 +1841,24 @@ impl RuntimeManager {
         let (sub_state_tx, sub_state_rx) = watch::channel(ConvState::Idle);
         let runtime = runtime.with_state_watcher(sub_state_tx);
 
+        // Seed the sub-agent's trigger slot with the parent's turn context. A
+        // sub-agent's whole life is one turn (it never leaves "working"
+        // until terminal), so its single conversation.turn span links back
+        // to the parent turn that spawned it.
+        let turn_trigger = runtime.turn_trigger_slot();
+        if parent_turn_link.is_valid() {
+            if let Ok(mut slot) = turn_trigger.lock() {
+                *slot = Some(parent_turn_link);
+            }
+        }
+
         // 7. Store handle
         let sub_agent_identity = Arc::new(());
         self.runtimes.write().await.insert(
             conv.id.clone(),
             ConversationHandle {
                 event_tx: event_tx.clone(),
+                turn_trigger,
                 broadcast_tx: broadcaster.clone(),
                 identity: sub_agent_identity.clone(),
                 state_rx: sub_state_rx,
@@ -1915,6 +1974,7 @@ impl RuntimeManager {
             if let Some(handle) = runtimes.get(conversation_id) {
                 return Ok(ConversationHandle {
                     event_tx: handle.event_tx.clone(),
+                    turn_trigger: handle.turn_trigger.clone(),
                     broadcast_tx: handle.broadcast_tx.clone(),
                     identity: handle.identity.clone(),
                     state_rx: handle.state_rx.clone(),
@@ -2194,6 +2254,9 @@ impl RuntimeManager {
         // Start runtime in background
         let conv_id = conversation_id.to_string();
         let manager_for_cleanup = Arc::clone(self);
+        // Shared with the executor: event senders deposit their ambient span
+        // here so the turn it starts can link back to the triggering request.
+        let turn_trigger = runtime.turn_trigger_slot();
         // Unique token for this runtime instance. Cleanup guards against
         // removing a replacement entry created after eviction.
         let identity = Arc::new(());
@@ -2221,6 +2284,7 @@ impl RuntimeManager {
 
         let handle = ConversationHandle {
             event_tx: event_tx.clone(),
+            turn_trigger: turn_trigger.clone(),
             broadcast_tx: broadcaster.clone(),
             identity: identity.clone(),
             state_rx: state_rx.clone(),
@@ -2231,6 +2295,7 @@ impl RuntimeManager {
             conversation_id.to_string(),
             ConversationHandle {
                 event_tx,
+                turn_trigger,
                 broadcast_tx: broadcaster,
                 identity,
                 state_rx,
@@ -2258,6 +2323,7 @@ impl RuntimeManager {
             conv_id.to_string(),
             ConversationHandle {
                 event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
@@ -2317,6 +2383,7 @@ impl RuntimeManager {
         event: Event,
     ) -> Result<(), String> {
         let handle = self.get_or_create(conversation_id).await?;
+        deposit_turn_trigger(&handle);
         handle
             .event_tx
             .send(event)
@@ -2368,6 +2435,7 @@ impl RuntimeManager {
 
         // DB is durable; now update the executor's in-memory queue via channel.
         let handle = self.get_or_create(conversation_id).await?;
+        deposit_turn_trigger(&handle);
         handle
             .event_tx
             .send(event)
@@ -2396,6 +2464,7 @@ impl RuntimeManager {
         let runtimes = self.runtimes.read().await;
         runtimes.get(conversation_id).map(|h| ConversationHandle {
             event_tx: h.event_tx.clone(),
+            turn_trigger: h.turn_trigger.clone(),
             broadcast_tx: h.broadcast_tx.clone(),
             identity: h.identity.clone(),
             state_rx: h.state_rx.clone(),
@@ -3321,6 +3390,7 @@ mod scope_liveness_tests {
             conv_id.to_string(),
             ConversationHandle {
                 event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
                 broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
                 identity: Arc::new(()),
                 state_rx,
