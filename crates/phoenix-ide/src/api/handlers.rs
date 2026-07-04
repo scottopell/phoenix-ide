@@ -1248,6 +1248,13 @@ async fn write_attachment_file_private(
     file.write_all(bytes)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to write attachment: {e}")))?;
+    // Dropping a tokio File does NOT flush its internal buffer — buffered
+    // bytes can land after a subsequent read observes the file (empty reads
+    // on slow runners; a size mismatch in validate_attachments racing a
+    // fresh upload).
+    file.flush()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to flush attachment: {e}")))?;
     Ok(())
 }
 
