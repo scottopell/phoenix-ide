@@ -3355,9 +3355,6 @@ where
         }
     }
 
-    /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
-    /// messages, build the streaming pipeline, and spawn the LLM task.
-    #[allow(clippy::too_many_lines)]
     /// The executor's turn-trigger slot, for sharing with the
     /// [`super::ConversationHandle`] (event senders) and for seeding a
     /// sub-agent's first turn with its parent's turn span.
@@ -3368,10 +3365,11 @@ where
     /// Get-or-open the trace span for the current agent turn (see the
     /// `turn_span` field). Lazy: the first LLM dispatch of a turn creates it;
     /// every subsequent dispatch in the same turn reuses it. A pending
-    /// trigger span (the HTTP request that delivered the starting event, or
-    /// the parent's turn for a sub-agent) is consumed here and recorded as an
-    /// `OTel` span link — a link, not a parent, because the trigger's trace
-    /// completes independently of this turn.
+    /// trigger (the most recently deposited one — an HTTP request span that
+    /// delivered a user event, or the parent's turn for a sub-agent; see
+    /// [`super::TurnTriggerSlot`] for the latest-wins semantics) is consumed
+    /// here and recorded as an `OTel` span link — a link, not a parent,
+    /// because the trigger's trace completes independently of this turn.
     fn current_turn_span(&mut self) -> tracing::Span {
         if let Some(span) = &self.turn_span {
             return span.clone();
@@ -3411,6 +3409,8 @@ where
         }
     }
 
+    /// Dispatch an LLM request: enforce turn/cycle caps, inject grace-turn
+    /// messages, build the streaming pipeline, and spawn the LLM task.
     #[allow(clippy::too_many_lines)]
     async fn dispatch_llm_request(&mut self) -> Result<Option<Event>, String> {
         // Parent-conversation tool-use cycle cap (task 24680). Sub-agents

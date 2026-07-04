@@ -54,7 +54,10 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 /// and at sub-agent spawn; consumed once by the executor when it opens a
 /// `conversation.turn` span, which records the trigger as an `OTel` span link
 /// (a link, not a parent — the trigger's trace completes independently of
-/// the turn).
+/// the turn). Latest-wins: each deposit overwrites the previous one, so when
+/// several events land before a turn opens (e.g. a chat POST racing a
+/// cancel), the link reflects the most recent trigger, not necessarily the
+/// event that started the turn.
 ///
 /// The slot holds a [`SpanContext`] (immutable trace/span ids extracted while
 /// the trigger span is still open), never a live `tracing::Span` handle — a
