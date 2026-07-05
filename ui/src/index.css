@@ -9138,6 +9138,27 @@ html * {
   opacity: 1;
 }
 
+@media (width <= 640px) {
+  .task-approval-actions {
+    flex-wrap: wrap;
+    align-items: stretch;
+    justify-content: stretch;
+    gap: 10px;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  }
+
+  .task-approval-btn {
+    flex: 1 1 calc(50% - 5px);
+    justify-content: center;
+    min-width: 0;
+    min-height: 44px;
+    padding: 8px 10px;
+    text-align: center;
+    white-space: normal;
+    line-height: 1.25;
+  }
+}
+
 /* --- First Task Welcome modal --- */
 
 .first-task-welcome {
