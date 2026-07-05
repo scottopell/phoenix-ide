@@ -12,6 +12,14 @@ poll loop consumes repeated LLM turns even when the agent has nothing useful to
 say until the work reaches a terminal state. Sub-agent fan-in avoids polling only
 by baking a blocking wait into the parent state machine.
 
+The wake plane is an accountability layer, not a handle-durability layer. Bash
+handles are process-local; a Phoenix restart can make the underlying process
+answer unknowable. The requirement is still stronger than "best effort": once
+Phoenix accepts a wake registration, the parent conversation must eventually
+receive exactly one accountable result — a fired payload, expiry, cancellation, or
+forgotten reason. Persisting the wake contract preserves that obligation even
+when the watched substrate cannot survive.
+
 The design problem has three independent axes:
 
 - conversation state determines whether user input is expected;
@@ -27,24 +35,43 @@ keyed by the child conversation / agent id.
 
 ## Options considered
 
-1. **In-memory wake handles.** Keep pending waits only in a router task. This is
-   simple, but Phoenix restart would silently lose the commitment to wake the
-   parent conversation.
-2. **A new `AwaitingWake` conversation state.** Model runtime waits like task
+1. **Ephemeral router registrations.** Keep pending waits only in a router task.
+   This is the KISS option: no schema, no restart reconciliation, and no stored
+   deadlines. Its cost is loss accounting. After Phoenix restart, the system
+   cannot distinguish "no wait was registered" from "a wait was registered, but
+   the watched handle is no longer knowable." That erases the parent
+   conversation's recovery path.
+2. **Persisted registrations without mandatory deadlines.** Persist the wait
+   intent, but allow unbounded waits. This preserves restart recovery, but it
+   creates durable commitments with no upper bound on when Phoenix will spend the
+   next LLM turn. A missing evaluator, stuck handle, or forgotten cancellation can
+   become a zombie contract.
+3. **A new `AwaitingWake` conversation state.** Model runtime waits like task
    approval or continuation waits. This gives a visible state-machine node, but
    it makes a runtime wait look like a user wait and creates a parallel
    representation alongside the pending contract row.
-3. **Persisted conversation-scoped terminal contracts.** Persist wake contracts as
-   rows, keep the conversation otherwise `Idle`, and have a wake router deliver a
-   synthetic terminal tool result when the watched handle resolves.
+4. **Persisted conversation-scoped terminal contracts with mandatory delivery
+   deadlines.** Persist wake contracts as rows, keep the conversation otherwise
+   `Idle`, and have a wake router deliver exactly one synthetic terminal tool
+   result when the watched handle resolves, is cancelled, is forgotten, or reaches
+   its deadline.
 
 ## Decision
 
-Adopt option 3. A wake contract is a persisted Phoenix commitment to resume a
-specific conversation when a concrete handle reaches a terminal, expired,
-cancelled, or forgotten outcome. The conversation stays `Idle` while the contract
-is pending. Busy/cleanup decisions derive from the contract table rather than from
-a new conversation state.
+Adopt option 4. A wake contract is a persisted Phoenix commitment to resume a
+specific conversation with exactly one accountable outcome: fired, expired,
+cancelled, or forgotten. The contract makes the wait intent durable; it does not
+make every watched handle durable. When a handle cannot still produce a terminal
+answer, Phoenix delivers `Forgotten` rather than silently dropping the wait.
+
+Every contract carries an `expires_at` delivery deadline. The deadline is an upper
+bound on how long a running Phoenix instance may keep the parent conversation
+parked without an answer. If Phoenix is down when the deadline passes, startup
+resync resolves the contract before normal serving resumes. Expiry reports that
+the condition did not hold before the deadline; forgotten reports that the handle
+became unknowable before Phoenix could evaluate the condition. The conversation
+stays `Idle` while the contract is pending. Busy/cleanup decisions derive from the
+contract table rather than from a new conversation state.
 
 Wake contracts v1 supports terminal waits only for bash handles, tmux `window_id`
 handles, and sub-agent handles. Bash and tmux handles are WorkScope-keyed and can
@@ -63,9 +90,13 @@ contract can encode first-wins semantics if that behavior is needed.
   watched terminal condition resolves.
 - **Positive:** User messages remain valid while the parent conversation is idle
   with pending wake contracts.
-- **Positive:** Restart handling is explicit: the contract survives, and startup
-  either re-registers durable handles, delivers persisted child terminal state, or
-  emits a forgotten result for handles that cannot still resolve.
+- **Positive:** Restart handling is explicit: the wait obligation survives, and
+  startup either re-registers durable handles, delivers persisted child terminal
+  state, expires overdue contracts, or emits a forgotten result for handles that
+  cannot still resolve.
+- **Negative:** Every accepted contract creates a bounded future delivery of a
+  synthetic result and possible LLM turn, even when the final answer is only
+  `Expired` or `Forgotten`.
 - **Negative:** `is_busy()` and lifecycle cleanup need a contract-table read in
   addition to conversation state.
 - **Negative:** The wake router polls handle state; push-based notification from

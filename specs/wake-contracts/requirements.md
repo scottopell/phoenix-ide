@@ -64,13 +64,14 @@ contract row in the `wake_contracts` table is the single source of
 truth for "is this conv waiting on something." ADR-006 records the rejected
 `AwaitingWake` alternative.
 
-**Persistence boundary:** wake contracts are persisted to SQLite. They
-survive Phoenix restart. A contract registered against a handle that
-itself does not survive restart (e.g., bash handles per `specs/bash/`, or active
-sub-agent runtimes per `specs/subagents/`) MUST fire a terminal `forgotten` event
-on restart so the LLM is not left waiting on a signal that can no longer occur.
-The contract is a *Phoenix-side commitment to fire the conversation* — its
-durability does not depend on the underlying handle's durability.
+**Persistence boundary:** wake contracts are persisted to SQLite. They survive
+Phoenix restart. The contract makes the wait intent durable, not the watched
+handle. A contract registered against a handle that itself does not survive
+restart (e.g., bash handles per `specs/bash/`, or active sub-agent runtimes per
+`specs/subagents/`) MUST deliver a terminal `forgotten` event during startup
+reconciliation so the LLM is not left waiting on a signal that can no longer
+occur. The contract is a *Phoenix-side commitment to deliver exactly one terminal
+outcome* — its durability does not depend on the underlying handle's durability.
 
 **Scope:** wake contracts are conversation-scoped, not WorkScope-scoped.
 A contract belongs to the conversation that registered it; resolution
@@ -117,17 +118,17 @@ condition_json, expires_at, registered_at, fire_template_json,
 registering_tool_use_id)`
 
 WHEN Phoenix restarts
-THE SYSTEM SHALL on startup re-register every non-fired, non-expired
-contract with the wake-router, and immediately fire `forgotten` for
-every contract whose underlying handle did not survive restart (see
-REQ-WAKE-005 for handle-kind durability)
+THE SYSTEM SHALL reconcile every non-terminal contract before normal serving:
+overdue contracts whose handles can still be evaluated resolve through the expiry
+path; contracts whose handles cannot still be evaluated resolve as `forgotten`;
+and still-pending durable handles re-register with the wake-router
 
-**Rationale:** The contract is the durable thing AND the single source
-of truth for "is this conv waiting on something." The underlying
-handle may or may not be durable; the contract's persistence is the
-runtime's commitment to deliver a terminal answer in all cases.
-Silent loss on restart is the failure mode this whole spec exists to
-eliminate.
+**Rationale:** The contract is the durable thing AND the single source of truth
+for "is this conv waiting on something." The underlying handle may or may not be
+durable; the contract's persistence is the runtime's commitment to deliver a
+terminal answer in all cases. Silent loss on restart is the failure mode this
+spec exists to eliminate. A restart may make a bash result unknowable, but it must
+not erase the parent conversation's recovery path.
 
 ---
 
@@ -262,10 +263,13 @@ THE SYSTEM SHALL apply a default `max_wait_seconds` of
 `WAKE_DEFAULT_SECONDS` (v1: 600s = 10 minutes) when the caller omits
 it
 
-**Rationale:** A persisted commitment to fire the LLM is a persisted
-commitment to spend money. Unbounded waits are not expressible. The
-cap is enforced at registration so the contract row's `expires_at`
-is always a true upper bound on the conversation's wake latency.
+**Rationale:** A persisted commitment to fire the LLM is a persisted commitment
+to spend money. Unbounded waits are not expressible. The cap is enforced at
+registration so the contract row's `expires_at` is always the delivery deadline:
+while Phoenix is running, the router resolves the contract no later than the
+first tick at or after that timestamp; after downtime, startup reconciliation
+resolves overdue contracts before normal serving resumes. The deadline bounds the
+wait obligation, not the lifetime of the underlying process or child agent.
 
 ---
 
@@ -331,13 +335,16 @@ honest semantics.
 
 ### REQ-WAKE-011: Terminal-Cause Distinction
 
-THE wake event payload SHALL distinguish:
+Every accepted wake contract SHALL transition from pending to exactly one
+terminal outcome and SHALL deliver that outcome to the registering conversation.
+The wake event payload SHALL distinguish:
 - `Fired { observed_payload }` — condition held
-- `Expired` — timeout reached, condition never held
+- `Expired` — delivery deadline reached before the condition held
 - `Cancelled` — user cancelled, or lifecycle cascade
-- `Forgotten { reason }` — underlying handle was destroyed before the
+- `Forgotten { reason }` — underlying handle became unknowable before the
   condition could be evaluated: a hard-delete cascade with no inheriting
-  WorkScope, or a Phoenix restart that dropped an in-memory handle (bash)
+  WorkScope, a Phoenix restart that dropped an in-memory handle (bash), or a
+  missing sub-agent child
 
 **Rationale:** "The wait returned" is not a sufficient description.
 Forgotten is structurally different from expired — the contract was

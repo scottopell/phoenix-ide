@@ -12,11 +12,12 @@ re-feed, six tool-description re-feeds, and six assistant-message
 round-trips — all to deliver one bit of information (the task
 finished).
 
-Wake contracts replace the poll-loop with persistence + an
-asynchronous router: the LLM registers a contract, the conversation
-stays in `Idle`, and the runtime delivers a synthetic tool result
-into the conversation when the condition fires (or expires). The LLM
-consumes zero turns in between.
+Wake contracts replace the poll-loop with persistence + an asynchronous router:
+the LLM registers a contract, the conversation stays in `Idle`, and the runtime
+delivers exactly one synthetic terminal result into the conversation when the
+condition fires, expires, is cancelled, or becomes forgotten. The LLM consumes
+zero turns in between. Persistence makes the wait intent durable; it does not make
+every watched handle durable.
 
 V1 supports one condition kind over three concrete handle kinds:
 `HandleTerminal { handle_kind, handle_id }` — fires when a named bash, tmux
@@ -68,12 +69,13 @@ fires `Forgotten` only when its watched handle is genuinely destroyed (a Phoenix
 restart, or a hard-delete with no inheriting scope), not as a routine
 consequence of continuation.
 
-Mandatory `expires_at` (default 600s, cap 1800s) prevents unbounded
-commitments. Restart resync re-registers non-fired contracts; any
-contract whose underlying handle did not survive the restart — bash handles and
-non-terminal active sub-agent runtimes — resolves on startup, never silently
-abandoned. Sub-agent children that already persisted a terminal state deliver that
-durable result instead of being forgotten.
+Mandatory `expires_at` (default 600s, cap 1800s) is the delivery deadline for the
+wait obligation and prevents unbounded commitments. While Phoenix is running, the
+router resolves a pending contract no later than the first tick at or after that
+timestamp. After downtime, restart resync resolves overdue contracts before normal
+serving resumes; it re-registers still-pending durable handles, delivers persisted
+child terminal state, or emits `Forgotten` for handles that cannot still produce
+an answer.
 
 The LLM-facing surface is a single unified `wait_until { handle: {
 kind, id }, condition, max_wait_seconds }` tool with a `#[serde(tag

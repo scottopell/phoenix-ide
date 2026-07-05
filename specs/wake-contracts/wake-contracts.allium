@@ -221,7 +221,9 @@ config {
 
     max_max_wait_seconds: Integer = 1800
     -- Upper bound. max_wait_seconds > this is rejected at
-    -- registration time (REQ-WAKE-007).
+    -- registration time (REQ-WAKE-007). expires_at is the delivery
+    -- deadline for the wait obligation, not a lifetime guarantee for
+    -- the watched handle.
 
     router_tick_handle_terminal_ms: Integer = 1000
     -- Cadence at which the wake_router evaluates handle_terminal
@@ -406,9 +408,9 @@ rule WakeRouterFiresOnExpiry {
         -- Expiry is evaluated BEFORE condition-hold on each tick,
         -- so a contract whose expires_at coincides with
         -- condition-hold fires as expired, not fired. Rationale:
-        -- the cap is the hard contract guarantee; "condition held
-        -- at the last possible instant" is not distinguishable from
-        -- clock-skew effects, and expired is the safer report.
+        -- the cap is the hard delivery deadline for the wait obligation;
+        -- "condition held at the last possible instant" is not distinguishable
+        -- from clock-skew effects, and expired is the safer report.
 }
 
 -- REQ-WAKE-008: explicit user cancel (UI button click).
@@ -499,10 +501,11 @@ rule ContinuationBoundaryHandlesContracts {
         -- bash handle).
 }
 
--- REQ-WAKE-002 + REQ-WAKE-011: restart resync. Pending contracts on
--- always-non-durable handle kinds fire forgotten; pending sub-agent contracts
--- inspect the persisted child state before deciding whether to deliver or forget;
--- durable handle kinds re-register with the router.
+-- REQ-WAKE-002 + REQ-WAKE-011: restart resync. Startup reconciles persisted
+-- wait obligations before normal serving: overdue durable contracts expire,
+-- always-non-durable handle kinds fire forgotten, pending sub-agent contracts
+-- inspect persisted child state before deciding whether to deliver or forget,
+-- and still-pending durable handle kinds re-register with the router.
 rule PhoenixStartupResyncsContracts {
     when: PhoenixStartupReachesWakeRouterInit()
 
@@ -523,6 +526,11 @@ rule PhoenixStartupResyncsContracts {
                 forgotten,
                 FirePayload(cause: forgotten, forgotten_reason: "phoenix_restart")
             ),
+        else_if_overdue_and_handle_evaluable: ContractTransitionsToTerminal(
+                contract,
+                expired,
+                FirePayload(cause: expired)
+            ),
         else: ContractReRegisteredWithRouter(contract)
     )
 
@@ -533,10 +541,13 @@ rule PhoenixStartupResyncsContracts {
         -- appended to the conversation history before any further
         -- LLM turn.
         --
-        -- Startup resync reads the child conversation before forgetting a
-        -- sub-agent contract. If the child already persisted Completed/Failed,
-        -- the wake delivers that terminal payload. Only non-terminal children are
-        -- forgotten because their active runtimes died with the process.
+        -- Startup resync exists because the contract is durable wait intent, not
+        -- durable handle state. The router must deliver exactly one accountable
+        -- outcome for every accepted contract. It reads the child conversation
+        -- before forgetting a sub-agent contract. If the child already persisted
+        -- Completed/Failed, the wake delivers that terminal payload. Only
+        -- non-terminal children are forgotten because their active runtimes died
+        -- with the process.
 }
 
 -- REQ-WAKE-004: is_busy() consults the contract table.
