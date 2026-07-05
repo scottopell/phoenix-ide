@@ -1,0 +1,353 @@
+-- allium: 3
+-- scroll_policy.allium
+--
+-- MessageList Scroll Policy: Behavioural Specification
+--
+-- Scope: The deterministic policy that decides how the conversation
+--        message-list viewport reacts to scroll facts, user gestures,
+--        content-height changes, and conversation changes.
+--
+-- Includes: Pinned-to-bottom preservation; non-pinned no-yank behaviour;
+--           gesture suppression; bounded pre-engagement settling; first
+--           content after empty mount; unread signalling; conversation
+--           identity reset.
+--
+-- Excludes: React component structure, react-virtuoso internals, DOM API
+--           calls, timer implementation mechanics, and message render-unit
+--           construction (see render_units.allium).
+
+------------------------------------------------------------
+-- Configuration
+------------------------------------------------------------
+
+config {
+    pin_threshold_px: Integer = 100
+    gesture_suppression_ms: Integer = 400
+    settle_window_ms: Integer = 3000
+}
+
+------------------------------------------------------------
+-- Value Types and Enumerations
+------------------------------------------------------------
+
+enum EffectKind {
+    snap_to_last_index
+    schedule_dom_bottom_write
+    write_dom_bottom
+    start_settle_watch
+    stop_settle_watch
+    show_unread
+    clear_unread
+    debug_ignored_growth
+}
+
+enum ScrollPolicyPhase { unmeasured settling engaged }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity ScrollPolicy {
+    conversation_id: String?
+    phase: ScrollPolicyPhase
+    prev_total_height: Integer
+    prev_scroll_height: Integer
+    prev_client_height: Integer
+    has_seen_content: Boolean
+    touch_active: Boolean
+    last_upward_scroll_at: Integer
+    last_scroll_top: Integer
+    settle_deadline: Integer
+
+    transitions phase {
+        unmeasured -> settling
+        settling -> engaged
+        engaged -> settling
+    }
+}
+
+entity ScrollEffect {
+    policy: ScrollPolicy
+    kind: EffectKind
+}
+
+------------------------------------------------------------
+-- Boundary Surface
+------------------------------------------------------------
+
+surface ScrollPolicyAdapter {
+    facing policy: ScrollPolicy
+
+    exposes:
+        policy.conversation_id
+        policy.phase
+        policy.has_seen_content
+        policy.touch_active
+
+    provides:
+        ScrollerAttached(policy, snapshot)
+        AtBottomChanged(policy, at_bottom)
+        PointerDown(policy)
+        NavigationJump(policy)
+        TouchStart(policy)
+        TouchEnd(policy, remaining_touches)
+        Wheel(policy, delta_y, now_ms)
+        ScrollMoved(policy, snapshot, now_ms)
+        TotalHeightChanged(policy, conversation_id, total_height, unit_count, snapshot, tail_activity, now_ms)
+        SettleTick(policy, snapshot, now_ms)
+        JumpToNewestClicked(policy, unit_count)
+}
+
+surface ScrollPolicyEffectSink {
+    facing effect: ScrollEffect
+
+    exposes:
+        effect.policy
+        effect.kind
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule ScrollerAttachmentResetsGestureTracking {
+    when: ScrollerAttached(policy, snapshot)
+    ensures: policy.touch_active = false
+    ensures: policy.last_upward_scroll_at = 0
+    ensures: policy.last_scroll_top = snapshot.scroll_top
+    ensures:
+        if policy.has_seen_content:
+            policy.phase = settling
+        else:
+            policy.phase = unmeasured
+}
+
+rule AtBottomClearsUnread {
+    when: AtBottomChanged(policy, at_bottom)
+    requires: at_bottom = true
+    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
+}
+
+rule PointerEngagesViewport {
+    when: PointerDown(policy)
+    ensures: policy.phase = engaged
+}
+
+rule NavigationJumpEngagesViewport {
+    when: NavigationJump(policy)
+    ensures: policy.phase = engaged
+}
+
+rule TouchStartEngagesAndSuppresses {
+    when: TouchStart(policy)
+    ensures: policy.phase = engaged
+    ensures: policy.touch_active = true
+}
+
+rule TouchEndReleasesWhenNoTouchesRemain {
+    when: TouchEnd(policy, remaining_touches)
+    requires: remaining_touches = 0
+    ensures: policy.touch_active = false
+}
+
+rule UpwardWheelEngagesAndSuppresses {
+    when: Wheel(policy, delta_y, now_ms)
+    requires: delta_y < 0
+    ensures: policy.phase = engaged
+    ensures: policy.last_upward_scroll_at = now_ms
+}
+
+rule DownwardWheelEngagesWithoutSuppressing {
+    when: Wheel(policy, delta_y, _)
+    requires: delta_y >= 0
+    ensures: policy.phase = engaged
+}
+
+rule UpwardScrollRefreshesSuppression {
+    when: ScrollMoved(policy, snapshot, now_ms)
+    requires: snapshot.scroll_top < policy.last_scroll_top
+    ensures: policy.last_scroll_top = snapshot.scroll_top
+    ensures: policy.last_upward_scroll_at = now_ms
+}
+
+rule NonUpwardScrollOnlyUpdatesPosition {
+    when: ScrollMoved(policy, snapshot, _)
+    requires: snapshot.scroll_top >= policy.last_scroll_top
+    ensures: policy.last_scroll_top = snapshot.scroll_top
+}
+
+rule SettlingScrollSchedulesBottomCorrection {
+    when: ScrollMoved(policy, snapshot, now_ms)
+    requires: policy.phase = settling
+    requires: now_ms <= policy.settle_deadline
+    requires: snapshot.scroll_height - snapshot.scroll_top - snapshot.client_height > 1
+    ensures: ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
+}
+
+rule FirstMeasurementSeedsConversationBaseline {
+    when: TotalHeightChanged(policy, conversation_id, total_height, unit_count, snapshot, _, now_ms)
+    requires: policy.phase = unmeasured
+    ensures: policy.conversation_id = conversation_id
+    ensures: policy.prev_total_height = total_height
+    ensures: policy.prev_scroll_height = snapshot.scroll_height
+    ensures: policy.prev_client_height = snapshot.client_height
+    ensures: policy.last_scroll_top = snapshot.scroll_top
+    ensures: policy.has_seen_content = unit_count > 0
+    ensures:
+        if unit_count > 0:
+            policy.phase = settling
+            policy.settle_deadline = now_ms + config.settle_window_ms
+            ScrollEffect.created(policy: policy, kind: start_settle_watch)
+            ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
+}
+
+rule ConversationChangeSeedsFreshBaseline {
+    when: TotalHeightChanged(policy, conversation_id, total_height, unit_count, snapshot, _, now_ms)
+    requires: policy.phase != unmeasured
+    requires: policy.conversation_id != conversation_id
+    ensures: policy.conversation_id = conversation_id
+    ensures: policy.prev_total_height = total_height
+    ensures: policy.prev_scroll_height = snapshot.scroll_height
+    ensures: policy.prev_client_height = snapshot.client_height
+    ensures: policy.last_scroll_top = snapshot.scroll_top
+    ensures: policy.touch_active = false
+    ensures: policy.last_upward_scroll_at = 0
+    ensures: policy.has_seen_content = unit_count > 0
+    ensures:
+        if unit_count > 0:
+            policy.phase = settling
+            policy.settle_deadline = now_ms + config.settle_window_ms
+            ScrollEffect.created(policy: policy, kind: start_settle_watch)
+            ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
+        else:
+            policy.phase = unmeasured
+}
+
+rule FirstContentAfterEmptyMountSnapsToNewest {
+    when: TotalHeightChanged(policy, _, total_height, unit_count, snapshot, _, now_ms)
+    requires: policy.phase != unmeasured
+    requires: policy.has_seen_content = false
+    requires: unit_count > 0
+    ensures: policy.prev_total_height = total_height
+    ensures: policy.prev_scroll_height = snapshot.scroll_height
+    ensures: policy.prev_client_height = snapshot.client_height
+    ensures: policy.has_seen_content = true
+    ensures: policy.phase = settling
+    ensures: policy.settle_deadline = now_ms + config.settle_window_ms
+    ensures: ScrollEffect.created(policy: policy, kind: snap_to_last_index)
+    ensures: ScrollEffect.created(policy: policy, kind: start_settle_watch)
+    ensures: ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
+}
+
+rule SettlingHeightChangeSchedulesBottomCorrection {
+    when: TotalHeightChanged(policy, _, total_height, unit_count, snapshot, _, now_ms)
+    requires: policy.phase = settling
+    requires: policy.has_seen_content = true
+    requires: unit_count > 0
+    requires: now_ms <= policy.settle_deadline
+    ensures: policy.prev_total_height = total_height
+    ensures: policy.prev_scroll_height = snapshot.scroll_height
+    ensures: policy.prev_client_height = snapshot.client_height
+    ensures: ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
+}
+
+rule PinnedHeightChangeSnapsToNewest {
+    when: TotalHeightChanged(policy, _, total_height, unit_count, snapshot, _, now_ms)
+    requires: policy.phase = engaged
+    requires: unit_count > 0
+    let client_height_for_pin = policy.prev_client_height
+    let old_from_bottom = policy.prev_scroll_height - snapshot.scroll_top - client_height_for_pin
+    requires: old_from_bottom <= config.pin_threshold_px
+    requires: policy.touch_active = false
+    requires: now_ms - policy.last_upward_scroll_at >= config.gesture_suppression_ms
+    ensures: policy.prev_total_height = total_height
+    ensures: policy.prev_scroll_height = snapshot.scroll_height
+    ensures: policy.prev_client_height = snapshot.client_height
+    ensures: ScrollEffect.created(policy: policy, kind: snap_to_last_index)
+}
+
+rule GestureSuppressedTailGrowthShowsUnread {
+    when: TotalHeightChanged(policy, _, total_height, unit_count, snapshot, tail_activity, now_ms)
+    requires: policy.phase = engaged
+    requires: unit_count > 0
+    requires: tail_activity = active
+    requires: total_height > policy.prev_total_height
+    let client_height_for_pin = policy.prev_client_height
+    let old_from_bottom = policy.prev_scroll_height - snapshot.scroll_top - client_height_for_pin
+    requires: old_from_bottom <= config.pin_threshold_px
+    requires: policy.touch_active = true or now_ms - policy.last_upward_scroll_at < config.gesture_suppression_ms
+    ensures: policy.prev_total_height = total_height
+    ensures: policy.prev_scroll_height = snapshot.scroll_height
+    ensures: policy.prev_client_height = snapshot.client_height
+    ensures: ScrollEffect.created(policy: policy, kind: show_unread)
+}
+
+rule NonPinnedTailGrowthShowsUnreadWithoutSnapping {
+    when: TotalHeightChanged(policy, _, total_height, unit_count, snapshot, tail_activity, _)
+    requires: policy.phase = engaged
+    requires: unit_count > 0
+    requires: tail_activity = active
+    requires: total_height > policy.prev_total_height
+    let client_height_for_pin = policy.prev_client_height
+    let old_from_bottom = policy.prev_scroll_height - snapshot.scroll_top - client_height_for_pin
+    requires: old_from_bottom > config.pin_threshold_px
+    ensures: policy.prev_total_height = total_height
+    ensures: policy.prev_scroll_height = snapshot.scroll_height
+    ensures: policy.prev_client_height = snapshot.client_height
+    ensures: ScrollEffect.created(policy: policy, kind: show_unread)
+}
+
+rule NonPinnedUnrelatedGrowthDoesNotSnap {
+    when: TotalHeightChanged(policy, _, total_height, unit_count, snapshot, tail_activity, _)
+    requires: policy.phase = engaged
+    requires: unit_count > 0
+    requires: tail_activity = none
+    requires: total_height > policy.prev_total_height
+    let client_height_for_pin = policy.prev_client_height
+    let old_from_bottom = policy.prev_scroll_height - snapshot.scroll_top - client_height_for_pin
+    requires: old_from_bottom > config.pin_threshold_px
+    ensures: policy.prev_total_height = total_height
+    ensures: policy.prev_scroll_height = snapshot.scroll_height
+    ensures: policy.prev_client_height = snapshot.client_height
+    ensures: ScrollEffect.created(policy: policy, kind: debug_ignored_growth)
+}
+
+rule SettleTickWritesBottomWhenStranded {
+    when: SettleTick(policy, snapshot, now_ms)
+    requires: policy.phase = settling
+    requires: now_ms <= policy.settle_deadline
+    requires: snapshot.scroll_height - snapshot.scroll_top - snapshot.client_height > 1
+    ensures: ScrollEffect.created(policy: policy, kind: write_dom_bottom)
+}
+
+rule SettleTickStopsAfterEngagementOrDeadline {
+    when: SettleTick(policy, _, now_ms)
+    requires: policy.phase = engaged or now_ms > policy.settle_deadline
+    ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
+}
+
+rule JumpToNewestClearsUnreadAndSnaps {
+    when: JumpToNewestClicked(policy, unit_count)
+    requires: unit_count > 0
+    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
+    ensures: ScrollEffect.created(policy: policy, kind: snap_to_last_index)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UnmeasuredHasNoSeenContent {
+    for policy in ScrollPolicy:
+        policy.phase = unmeasured implies policy.has_seen_content = false
+}
+
+invariant SettlingHasDeadline {
+    for policy in ScrollPolicy:
+        policy.phase = settling implies policy.settle_deadline > 0
+}
+
+invariant EffectsBelongToPolicy {
+    for effect in ScrollEffect:
+        effect.policy != null
+}
