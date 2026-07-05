@@ -1,0 +1,291 @@
+/* ----- Chain blocks (REQ-CHN-002) -------------------------------------- */
+
+/* A chain block is a collapsible group rendered between standalone
+ * conversation rows in the sidebar. The header (caret + name) is the
+ * primary affordance; members are rendered nested below, indented to
+ * convey membership without inflating the row count. */
+
+.conv-chain-block {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 4px;
+  border-left: 2px solid var(--border-color);
+  border-radius: 0 6px 6px 0;
+  padding-left: 0;
+}
+
+.conv-chain-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px 4px 4px;
+  border-radius: 0 6px 6px 0;
+}
+
+.conv-chain-header:hover {
+  background: var(--bg-tertiary);
+}
+
+.conv-chain-caret {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+}
+
+.conv-chain-caret:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.conv-chain-caret-icon {
+  transition: transform 200ms ease;
+}
+
+.conv-chain-caret-icon.collapsed {
+  transform: rotate(-90deg);
+}
+
+.conv-chain-name {
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  padding: 2px 4px;
+  border-radius: 3px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  min-width: 0;
+}
+
+.conv-chain-name:hover {
+  background: var(--bg-secondary);
+}
+
+.conv-chain-name-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.conv-chain-count {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--bg-tertiary);
+  padding: 1px 6px;
+  border-radius: 8px;
+  letter-spacing: 0.3px;
+}
+
+.conv-chain-menu-container {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.conv-chain-menu-btn {
+  background: transparent;
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 3px;
+  color: var(--text-muted);
+  line-height: 1;
+  transition: background 0.15s, color 0.15s;
+}
+
+.conv-chain-menu-btn:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.conv-chain-actions {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 10;
+  min-width: 180px;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 18%);
+  padding: 6px;
+}
+
+.conv-chain-actions .action-btn {
+  flex: none;
+  text-align: left;
+}
+
+.conv-chain-members {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 2px 12px;
+
+  /* Subtle entrance animation when expanding (purposeful 200ms,
+   * AGENTS.md). Collapsed state is unmounted so this only runs on
+   * expand. */
+  animation: chain-expand 200ms ease-out;
+}
+
+@keyframes chain-expand {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.sidebar-mode .conv-item-chain-member {
+  /* Members already sit inside the indented `.conv-chain-members` UL;
+   * just trim the row's own outer margins so they pack nicely. */
+  margin-bottom: 1px;
+}
+
+/* Bold latest member in both sidebar and full-page mode */
+.conv-item-chain-latest .conv-item-slug {
+  font-weight: 600;
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active) {
+  padding: 2px 4px;
+  margin-bottom: 0;
+  background: transparent;
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active) .conv-item-main {
+  padding: 2px 28px 2px 6px;
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active) .conv-item-slug {
+  margin-bottom: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-secondary);
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active) .conv-mode-badge,
+.sidebar-mode .conv-item-chain-completed:not(.active) .conv-item-meta {
+  display: none;
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active) .conv-item-menu-btn {
+  top: 2px;
+  right: 4px;
+}
+
+.sidebar-mode .conv-item-chain-completed:not(.active):hover,
+.sidebar-mode .conv-item-chain-completed:not(.active).keyboard-selected,
+.sidebar-mode .conv-item-chain-completed:not(.active).expanded {
+  background: var(--bg-tertiary);
+}
+
+
+.conv-chain-latest-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% - 12px);
+  min-height: 48px;
+  margin: 0 6px 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.conv-chain-latest-summary:hover,
+.conv-chain-latest-summary.keyboard-selected {
+  background: var(--bg-tertiary);
+}
+
+.conv-chain-latest-summary.keyboard-selected {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+.conv-chain-summary-main,
+.conv-chain-summary-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.conv-chain-summary-main {
+  flex: 1 1 auto;
+}
+
+.conv-chain-summary-title {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.conv-chain-summary-meta {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+}
+
+
+/* Full-page (non-sidebar) chain block sizing — match surrounding list density. */
+#conversation-list:not(.sidebar-mode) .conv-chain-name {
+  font-size: 15px;
+}
+
+#conversation-list:not(.sidebar-mode) .conv-chain-header {
+  padding: 8px 10px 8px 6px;
+}
+
+#conversation-list:not(.sidebar-mode) .conv-chain-members {
+  padding-left: 20px;
+}
+
+#conversation-list:not(.sidebar-mode) .conv-chain-count {
+  font-size: 12px;
+  padding: 2px 8px;
+}
+
+/* Position label (#1, #2, #3) shown instead of raw slug inside chain blocks */
+.conv-item-slug-pos {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.conv-chain-latest-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent-blue, #3b82f6);
+  background: color-mix(in srgb, var(--accent-blue, #3b82f6) 14%, transparent);
+  border-radius: 8px;
+  vertical-align: middle;
+}

@@ -1,0 +1,22 @@
+.chain-delete-confirm {
+  max-width: 480px;
+}
+
+.chain-delete-confirm .confirm-message p {
+  margin: 0 0 8px;
+}
+
+.chain-delete-bullets {
+  margin: 0 0 12px 18px;
+  padding: 0;
+  list-style: disc;
+}
+
+.chain-delete-bullets li {
+  margin: 4px 0;
+}
+
+.chain-delete-final {
+  font-weight: 500;
+  color: var(--text-primary);
+}

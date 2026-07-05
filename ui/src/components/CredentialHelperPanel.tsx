@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import './CredentialHelperPanel.css';
 
 const URL_RE = /https?:\/\/[^\s)>\]]+/g;
 

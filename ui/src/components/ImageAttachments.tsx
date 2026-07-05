@@ -1,4 +1,5 @@
 import type { ImageData } from '../api';
+import './ImageAttachments.css';
 
 interface ImageAttachmentsProps {
   images: ImageData[];

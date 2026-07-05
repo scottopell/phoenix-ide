@@ -11,6 +11,7 @@ import {
 } from '../utils/chains';
 
 import { useKeyboardNav } from '../hooks';
+import './ConversationList.css';
 
 
 interface ConversationListProps {

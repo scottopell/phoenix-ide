@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import type { ChainView } from '../api';
+import './ChainDeleteConfirm.css';
 
 interface ChainDeleteConfirmProps {
   visible: boolean;
