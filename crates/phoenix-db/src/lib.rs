@@ -1654,6 +1654,28 @@ impl Database {
         Ok(rows.into_iter().flatten().collect())
     }
 
+    /// Distinct Phoenix-created worktree paths known to the database.
+    ///
+    /// This is a disk-accounting inventory, not a liveness/ownership query: terminal
+    /// and archived rows are included because an existing directory at a persisted
+    /// managed path is still Phoenix-created disk usage, even when normal lifecycle
+    /// cleanup should already have removed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn managed_worktree_paths(&self) -> DbResult<Vec<String>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT cm_worktree_path FROM conversations
+              WHERE cm_worktree_path IS NOT NULL
+                AND cm_worktree_path != ''
+              ORDER BY cm_worktree_path",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
     /// List archived conversations
     ///
     /// # Errors

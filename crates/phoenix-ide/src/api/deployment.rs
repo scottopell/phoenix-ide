@@ -18,6 +18,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use ts_rs::TS;
@@ -212,8 +213,10 @@ pub async fn deployment_info(
     disk.push(measure_location(&active_codex_credentials_location(
         &state.runtime_env,
     )));
-    // PR auto-fix context bundles live per-worktree, not under a startup-known
-    // root, so this aggregate is resolved per request by enumerating worktrees.
+    // Managed worktrees and their PR auto-fix bundles live under each project's
+    // `.phoenix/worktrees/` root, not under a startup-known deployment root, so
+    // these aggregates are resolved per request from persisted worktree paths.
+    disk.push(managed_worktrees_aggregate(&state.db).await);
     disk.push(pr_context_aggregate(&state.db).await);
 
     Json(DeploymentInfo {
@@ -227,7 +230,79 @@ pub async fn deployment_info(
     })
 }
 
-/// Aggregate the PR auto-fix context bundles across every Work/Branch
+async fn managed_worktrees_aggregate(db: &crate::db::Database) -> DiskEntry {
+    const LABEL: &str = "Phoenix-managed worktrees";
+    const PATTERN: &str = ".phoenix/worktrees/*";
+
+    let paths = match db.managed_worktree_paths().await {
+        Ok(paths) => paths,
+        Err(e) => {
+            tracing::debug!(error = %e, "managed worktree aggregate: failed to enumerate worktrees");
+            return DiskEntry {
+                label: LABEL.to_string(),
+                path: PATTERN.to_string(),
+                size: DiskSize::NotMeasured,
+            };
+        }
+    };
+
+    managed_worktrees_entry_from_paths(LABEL, PATTERN, paths.iter().map(String::as_str))
+}
+
+fn managed_worktrees_entry_from_paths<'a>(
+    label: &str,
+    pattern: &str,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> DiskEntry {
+    let mut seen = BTreeSet::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut total: u64 = 0;
+    let mut any = false;
+
+    for path in paths {
+        if !seen.insert(path.to_string()) {
+            continue;
+        }
+        let wt = Path::new(path);
+        if let Some(root) = crate::git_ops::repo_root_from_phoenix_worktree(wt) {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        if !wt.is_dir() {
+            continue;
+        }
+        any = true;
+        total = total.saturating_add(dir_size(wt));
+    }
+
+    let path = aggregate_pattern_path(&roots, pattern);
+    let size = if any {
+        DiskSize::Measured { bytes: total }
+    } else {
+        DiskSize::Absent
+    };
+
+    DiskEntry {
+        label: label.to_string(),
+        path,
+        size,
+    }
+}
+
+fn aggregate_pattern_path(roots: &[PathBuf], pattern: &str) -> String {
+    match roots {
+        [root] => root.join(pattern).display().to_string(),
+        [first, rest @ ..] => format!(
+            "{} (+{} more roots)",
+            first.join(pattern).display(),
+            rest.len()
+        ),
+        [] => pattern.to_string(),
+    }
+}
+
+/// Aggregate the PR auto-fix context bundles across every DB-known managed
 /// worktree into a single `DiskEntry`. These bundles are written under
 /// `{worktree}/.phoenix/pr-context/`; worktrees are scattered under each
 /// project's `{repo_root}/.phoenix/worktrees/`, so there is no single
@@ -241,8 +316,8 @@ async fn pr_context_aggregate(db: &crate::db::Database) -> DiskEntry {
     const LABEL: &str = "PR auto-fix context";
     const PATTERN: &str = ".phoenix/worktrees/*/.phoenix/pr-context";
 
-    let convs = match db.get_work_conversations().await {
-        Ok(convs) => convs,
+    let paths = match db.managed_worktree_paths().await {
+        Ok(paths) => paths,
         Err(e) => {
             tracing::debug!(error = %e, "PR context aggregate: failed to enumerate worktrees");
             return DiskEntry {
@@ -253,46 +328,45 @@ async fn pr_context_aggregate(db: &crate::db::Database) -> DiskEntry {
         }
     };
 
+    pr_context_entry_from_paths(LABEL, PATTERN, paths.iter().map(String::as_str))
+}
+
+fn pr_context_entry_from_paths<'a>(
+    label: &str,
+    pattern: &str,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> DiskEntry {
     let mut total: u64 = 0;
     let mut any = false;
     let mut roots: Vec<PathBuf> = Vec::new();
-    for conv in &convs {
-        let Some(wt) = conv.conv_mode.worktree_path().filter(|p| !p.is_empty()) else {
-            continue;
-        };
-        let wt = Path::new(wt);
-        let ctx_dir = wt.join(".phoenix").join("pr-context");
-        if !ctx_dir.is_dir() {
+    let mut seen = BTreeSet::new();
+
+    for path in paths {
+        if !seen.insert(path.to_string()) {
             continue;
         }
-        any = true;
-        total = total.saturating_add(dir_size(&ctx_dir));
+        let wt = Path::new(path);
+        let ctx_dir = wt.join(".phoenix").join("pr-context");
         if let Some(root) = crate::git_ops::repo_root_from_phoenix_worktree(wt) {
             if !roots.contains(&root) {
                 roots.push(root);
             }
         }
+        if !ctx_dir.is_dir() {
+            continue;
+        }
+        any = true;
+        total = total.saturating_add(dir_size(&ctx_dir));
     }
 
-    // Show a glob anchored at the project root when bundles all live under one;
-    // fall back to a relative pattern when zero or many roots are in play (a
-    // single `path` string cannot honestly point at several roots at once).
-    let path = match roots.as_slice() {
-        [root] => root.join(PATTERN).display().to_string(),
-        [first, rest @ ..] => format!(
-            "{} (+{} more roots)",
-            first.join(PATTERN).display(),
-            rest.len()
-        ),
-        [] => PATTERN.to_string(),
-    };
+    let path = aggregate_pattern_path(&roots, pattern);
     let size = if any {
         DiskSize::Measured { bytes: total }
     } else {
         DiskSize::Absent
     };
     DiskEntry {
-        label: LABEL.to_string(),
+        label: label.to_string(),
         path,
         size,
     }
@@ -537,6 +611,99 @@ mod tests {
         ));
         assert_eq!(entry.size, DiskSize::InlineDb);
         assert_eq!(entry.path, "/does/not/exist/phoenix.db");
+    }
+
+    #[test]
+    fn managed_worktrees_aggregate_dedupes_and_sums_existing_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let wt = repo.join(".phoenix").join("worktrees").join("conv-1");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("a.bin"), b"12345").unwrap();
+        fs::create_dir_all(wt.join("nested")).unwrap();
+        fs::write(wt.join("nested").join("b.bin"), b"123").unwrap();
+
+        let wt_str = wt.to_string_lossy().to_string();
+        let entry = managed_worktrees_entry_from_paths(
+            "Managed worktrees",
+            ".phoenix/worktrees/*",
+            [wt_str.as_str(), wt_str.as_str()],
+        );
+
+        assert_eq!(entry.size, DiskSize::Measured { bytes: 8 });
+        assert_eq!(
+            entry.path,
+            repo.join(".phoenix/worktrees/*").display().to_string()
+        );
+    }
+
+    #[test]
+    fn managed_worktrees_aggregate_reports_absent_when_no_known_path_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let wt = repo.join(".phoenix").join("worktrees").join("missing");
+        let wt_str = wt.to_string_lossy().to_string();
+
+        let entry = managed_worktrees_entry_from_paths(
+            "Managed worktrees",
+            ".phoenix/worktrees/*",
+            [wt_str.as_str()],
+        );
+
+        assert_eq!(entry.size, DiskSize::Absent);
+        assert_eq!(
+            entry.path,
+            repo.join(".phoenix/worktrees/*").display().to_string()
+        );
+    }
+
+    #[test]
+    fn managed_worktrees_aggregate_mentions_multiple_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_a = dir.path().join("repo-a");
+        let repo_b = dir.path().join("repo-b");
+        let wt_a = repo_a.join(".phoenix").join("worktrees").join("a");
+        let wt_b = repo_b.join(".phoenix").join("worktrees").join("b");
+        fs::create_dir_all(&wt_a).unwrap();
+        fs::create_dir_all(&wt_b).unwrap();
+        fs::write(wt_a.join("a.bin"), b"1").unwrap();
+        fs::write(wt_b.join("b.bin"), b"22").unwrap();
+        let wt_a = wt_a.to_string_lossy().to_string();
+        let wt_b = wt_b.to_string_lossy().to_string();
+
+        let entry = managed_worktrees_entry_from_paths(
+            "Managed worktrees",
+            ".phoenix/worktrees/*",
+            [wt_a.as_str(), wt_b.as_str()],
+        );
+
+        assert_eq!(entry.size, DiskSize::Measured { bytes: 3 });
+        assert!(entry.path.ends_with(".phoenix/worktrees/* (+1 more roots)"));
+    }
+
+    #[test]
+    fn pr_context_aggregate_dedupes_worktree_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let wt = repo.join(".phoenix").join("worktrees").join("conv-1");
+        let ctx = wt.join(".phoenix").join("pr-context");
+        fs::create_dir_all(&ctx).unwrap();
+        fs::write(ctx.join("context.json"), b"1234").unwrap();
+        let wt_str = wt.to_string_lossy().to_string();
+
+        let entry = pr_context_entry_from_paths(
+            "PR auto-fix context",
+            ".phoenix/worktrees/*/.phoenix/pr-context",
+            [wt_str.as_str(), wt_str.as_str()],
+        );
+
+        assert_eq!(entry.size, DiskSize::Measured { bytes: 4 });
+        assert_eq!(
+            entry.path,
+            repo.join(".phoenix/worktrees/*/.phoenix/pr-context")
+                .display()
+                .to_string()
+        );
     }
 
     #[test]

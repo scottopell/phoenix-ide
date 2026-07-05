@@ -4142,6 +4142,41 @@ pre:hover .copy-btn {
   word-break: break-all;
 }
 
+.deploy-disk-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.deploy-disk-summary__item {
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--bg-secondary);
+}
+
+.deploy-disk-summary__item span {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.deploy-disk-summary__item strong {
+  display: block;
+  color: var(--text-primary);
+  font-size: 14px;
+  margin-top: 2px;
+}
+
+.deploy-disk-summary__item--warn {
+  border-color: var(--warning-color, #c58a00);
+}
+
+.settings-section__hint--warning {
+  color: var(--warning-color, #c58a00);
+}
+
 .deploy-table {
   width: 100%;
   border-collapse: collapse;
@@ -4152,6 +4187,10 @@ pre:hover .copy-btn {
   padding: 4px 8px 4px 0;
   vertical-align: top;
   border-bottom: 1px solid var(--border-color);
+}
+
+.deploy-table__row--largest td {
+  background: color-mix(in srgb, var(--accent-color) 8%, transparent);
 }
 
 .deploy-table__label {

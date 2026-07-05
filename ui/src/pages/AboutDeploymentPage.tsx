@@ -4,6 +4,8 @@ import { api } from '../api';
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
 import type { DiskSize } from '../generated/DiskSize';
 
+const MANAGED_WORKTREES_LABEL = 'Phoenix-managed worktrees';
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const units = ['KiB', 'MiB', 'GiB', 'TiB'];
@@ -50,6 +52,46 @@ function diskSizeLabel(size: DiskSize): string {
 
 function resourceText(value: number | null, format: (n: number) => string): string {
   return value === null ? 'unavailable' : format(value);
+}
+
+type MeasuredDiskEntry = DeploymentInfo['disk'][number] & { size: { kind: 'measured'; bytes: number } };
+
+type DiskSummary = {
+  totalMeasuredBytes: number;
+  measuredCount: number;
+  notMeasuredCount: number;
+  absentCount: number;
+  largestMeasured: MeasuredDiskEntry | null;
+};
+
+function diskSummary(entries: DeploymentInfo['disk']): DiskSummary {
+  let totalMeasuredBytes = 0;
+  let measuredCount = 0;
+  let notMeasuredCount = 0;
+  let absentCount = 0;
+  let largestMeasured: MeasuredDiskEntry | null = null;
+
+  for (const entry of entries) {
+    switch (entry.size.kind) {
+      case 'measured':
+        totalMeasuredBytes += entry.size.bytes;
+        measuredCount += 1;
+        if (!largestMeasured || entry.size.bytes > largestMeasured.size.bytes) {
+          largestMeasured = entry as MeasuredDiskEntry;
+        }
+        break;
+      case 'not_measured':
+        notMeasuredCount += 1;
+        break;
+      case 'absent':
+        absentCount += 1;
+        break;
+      case 'inline_db':
+        break;
+    }
+  }
+
+  return { totalMeasuredBytes, measuredCount, notMeasuredCount, absentCount, largestMeasured };
 }
 
 /** A path is revealable when it names a concrete location on disk: absolute,
@@ -127,7 +169,9 @@ export function AboutDeploymentPage() {
           {error && <div className="settings-section__error">{error}</div>}
           {!info && loading && <div className="settings-section__hint">Loading…</div>}
 
-          {info && (
+          {info && (() => {
+            const summary = diskSummary(info.disk);
+            return (
             <>
               <section className="settings-section">
                 <h3 className="settings-section__title">Build</h3>
@@ -183,27 +227,63 @@ export function AboutDeploymentPage() {
 
               <section className="settings-section">
                 <h3 className="settings-section__title">On disk</h3>
+                <div className="deploy-disk-summary" aria-label="Disk usage health">
+                  <div className="deploy-disk-summary__item">
+                    <span>Total measured</span>
+                    <strong>{formatBytes(summary.totalMeasuredBytes)}</strong>
+                  </div>
+                  <div className="deploy-disk-summary__item">
+                    <span>Measured rows</span>
+                    <strong>{summary.measuredCount}</strong>
+                  </div>
+                  <div className={summary.notMeasuredCount > 0 ? 'deploy-disk-summary__item deploy-disk-summary__item--warn' : 'deploy-disk-summary__item'}>
+                    <span>Not measured</span>
+                    <strong>{summary.notMeasuredCount}</strong>
+                  </div>
+                  <div className="deploy-disk-summary__item">
+                    <span>Absent</span>
+                    <strong>{summary.absentCount}</strong>
+                  </div>
+                </div>
+                {summary.largestMeasured && (
+                  <div className="settings-section__hint">
+                    {summary.largestMeasured.label === MANAGED_WORKTREES_LABEL
+                      ? 'Phoenix-managed worktrees are the largest measured disk category.'
+                      : `Largest measured disk category: ${summary.largestMeasured.label} (${formatBytes(summary.largestMeasured.size.bytes)}).`}
+                  </div>
+                )}
+                {summary.notMeasuredCount > 0 && (
+                  <div className="settings-section__hint settings-section__hint--warning">
+                    {summary.notMeasuredCount} disk {summary.notMeasuredCount === 1 ? 'row is' : 'rows are'} path-only, so total measured bytes is a lower bound.
+                  </div>
+                )}
                 <table className="deploy-table">
                   <tbody>
-                    {info.disk.map((entry) => (
-                      <tr key={entry.label}>
-                        <td className="deploy-table__label">{entry.label}</td>
-                        <td className="deploy-table__path"><code>{entry.path}</code></td>
-                        <td className="deploy-table__size">{diskSizeLabel(entry.size)}</td>
-                        <td className="deploy-table__action">
-                          {info.local_access && isRevealable(entry.path, entry.size) && (
-                            <button
-                              type="button"
-                              className="deploy-reveal-btn"
-                              title="Open the containing folder in the file manager"
-                              onClick={() => handleReveal(entry.path)}
-                            >
-                              Reveal
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
+                    {info.disk.map((entry) => {
+                      const isLargest = summary.largestMeasured?.label === entry.label;
+                      return (
+                        <tr
+                          key={entry.label}
+                          className={isLargest ? 'deploy-table__row--largest' : undefined}
+                        >
+                          <td className="deploy-table__label">{entry.label}</td>
+                          <td className="deploy-table__path"><code>{entry.path}</code></td>
+                          <td className="deploy-table__size">{diskSizeLabel(entry.size)}</td>
+                          <td className="deploy-table__action">
+                            {info.local_access && isRevealable(entry.path, entry.size) && (
+                              <button
+                                type="button"
+                                className="deploy-reveal-btn"
+                                title="Open the containing folder in the file manager"
+                                onClick={() => handleReveal(entry.path)}
+                              >
+                                Reveal
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
                 {revealError && <div className="settings-section__error">{revealError}</div>}
@@ -233,7 +313,8 @@ export function AboutDeploymentPage() {
                 Sampled at {formatDateTime(info.sampled_at)}
               </div>
             </>
-          )}
+            );
+          })()}
         </section>
       </main>
     </div>

@@ -124,8 +124,10 @@ field. It holds the static facts:
   (`RecurseSmall`) or the explicit certificate and key files in manual mode
   (`File` each); the built-in skills directory (`RecurseSmall`); the attachment
   store (`InlineDb` while attachments live in the database); the browser binary
-  cache (`NoMeasure`); and the per-scope browser profile glob (`Pattern`). The
-  active codex credential file is *not* a static row — it is resolved per request
+  cache (`NoMeasure`); and the per-scope browser profile glob (`Pattern`).
+  Phoenix-managed git worktrees are not a static row — they are resolved per
+  request from persisted conversation worktree paths because every project has
+  its own `.phoenix/worktrees/` root. The active codex credential file is *not* a static row — it is resolved per request
   in the handler because the credential source can change at runtime (see below).
   Every path is absolute, resolved from the same logic the rest of the process
   uses, so the page reports the locations the process actually uses.
@@ -170,24 +172,25 @@ Sampling steps:
    `MeasureMode` (see Config capture). `File`/`RecurseSmall` produce
    `DiskSize::measured`; `NoMeasure`/`Pattern` produce `DiskSize::not_measured`;
    a missing real path yields `DiskSize::absent`; the attachment store yields
-   `inline_db`. The handler then appends two rows resolved per request rather
+   `inline_db`. The handler then appends three rows resolved per request rather
    than at startup. The active codex credential row is resolved via
    `resolve_active_auth_path` (Phoenix's own `~/.phoenix-ide/codex-auth.json`, or
    Codex CLI's `~/.codex/auth.json` under `OPENAI_USE_CODEX_AUTH` piggyback mode,
    falling back to the canonical Phoenix path reported absent); resolving per
    request keeps the row correct after the in-app login flow switches the active
-   credential source at runtime. The PR auto-fix context row aggregates the
-   per-worktree `{worktree}/.phoenix/pr-context/` bundle directories: their parent
-   worktrees live under each project's `{repo_root}/.phoenix/worktrees/`, so there
-   is no single startup-known path to size. The handler enumerates Work/Branch
-   worktrees from the database and sums each bundle directory's bytes into one
-   `measured` row (`absent` when no worktree holds a bundle directory). The `path`
-   is the `…/.phoenix/worktrees/*/.phoenix/pr-context` glob anchored at the lone
-   project root when all bundles share one, and a root-relative glob otherwise,
-   since a single `path` string cannot honestly point at several roots. Resolving
-   per request reflects worktrees created and torn down after startup. Each bundle
-   directory is capacity-bounded by the capture-site retention, so the aggregate
-   walk stays cheap.
+   credential source at runtime. The managed-worktrees row aggregates distinct
+   DB-known `cm_worktree_path` values into one measured row. It includes any
+   still-present directory at those persisted Phoenix-created paths, regardless of
+   conversation state, because terminal or archived rows are not live owners but
+   leftover directories still consume disk. The PR auto-fix context row aggregates
+   the per-worktree `{worktree}/.phoenix/pr-context/` bundle directories from the
+   same DB-known worktree path set. Both aggregate rows use a `path` glob anchored
+   at the lone project root when all entries share one root, or the first root
+   with a `(+N more roots)` suffix when several project roots are represented;
+   the relative glob is used when no root is known. Resolving per request reflects
+   worktrees created and torn down after startup. Each PR-context bundle directory
+   is capacity-bounded by the capture-site retention, so that aggregate walk stays
+   cheap.
 4. **`sampled_at`:** `Utc::now()` at the moment the snapshot is assembled.
 
 The `dir_size` helper is bounded: it recurses only the directories the spec
@@ -211,7 +214,10 @@ large-cache paths, so a single request cannot trigger a multi-gigabyte walk
   point-in-time.
 - **Rendering rules:** `DiskSize` is matched exhaustively — `measured` shows a
   human-readable size, `not_measured` shows "not measured," `absent` shows
-  "absent," `inline_db` shows "stored in database." `null` resource values show
+  "absent," `inline_db` shows "stored in database." The disk section also
+  derives a point-in-time health summary from the typed sizes: total measured
+  bytes, measured/not-measured/absent row counts, a lower-bound warning when any
+  rows are path-only, and a highlight for the largest measured category. `null` resource values show
   "unavailable." TLS-disabled renders "Serving plain HTTP." The log section
   renders one row per sink: stdout on/off, and the file path (or "none").
 - **API:** `api.deploymentInfo()` is a plain `GET /api/deployment` returning the

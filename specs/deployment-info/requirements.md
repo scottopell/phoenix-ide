@@ -158,6 +158,7 @@ absolute path and, where determinable, its current size:
 - The attachment store: the directory holding file-based attachments when that
   storage mode is active, or an explicit indication that attachments are stored
   inline in the database
+- Phoenix-managed git worktrees created under project `.phoenix/worktrees/`
 - Temporary and cache directories used for ephemeral work (e.g. browser caches
   and per-scope browser profiles)
 
@@ -180,11 +181,15 @@ cheap and useful; recursively walking a multi-gigabyte browser cache on every
 page load is neither, so those are shown as paths with an explicit "not
 measured" marker. Distinguishing absent from zero-size matters: an absent TLS
 directory means TLS was never configured, which is different from a configured
-directory that happens to be empty. The attachment store is listed even while
-attachments live inline in the database, so the row is a stable home for the
-file-based attachment directory once that storage mode is active — the reader
-always finds attachment storage in the same place, whether it currently resolves
-to a directory or to "inline in the database."
+directory that happens to be empty. Managed worktrees are listed because they are
+Phoenix-created project checkouts and can dominate disk usage; terminal or
+archived conversations do not imply live worktree ownership, but any DB-known
+managed worktree path that still exists on disk is still Phoenix-created disk
+usage. The attachment store is listed even while attachments live inline in the
+database, so the row is a stable home for the file-based attachment directory
+once that storage mode is active — the reader always finds attachment storage in
+the same place, whether it currently resolves to a directory or to "inline in the
+database."
 
 ---
 
