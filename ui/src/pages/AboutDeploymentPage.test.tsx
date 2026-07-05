@@ -74,7 +74,7 @@ describe('AboutDeploymentPage disk usage health', () => {
     vi.clearAllMocks();
   });
 
-  it('summarizes measured, not-measured, and absent disk rows', async () => {
+  it('summarizes measured, not-measured, and absent disk rows without summing overlaps', async () => {
     renderPage(deployment({
       disk: [
         { label: 'Database', path: '/tmp/phoenix.db', size: { kind: 'measured', bytes: 1024 } },
@@ -86,12 +86,13 @@ describe('AboutDeploymentPage disk usage health', () => {
     }));
 
     const summary = await screen.findByLabelText('Disk usage health');
-    expect(within(summary).getByText('Total measured')).toBeInTheDocument();
-    expect(within(summary).getByText('3.0 KiB')).toBeInTheDocument();
+    expect(within(summary).getByText('Largest measured')).toBeInTheDocument();
+    expect(within(summary).getByText('2.0 KiB')).toBeInTheDocument();
+    expect(within(summary).queryByText('3.0 KiB')).not.toBeInTheDocument();
     expect(within(summary).getByText('Measured rows').nextElementSibling).toHaveTextContent('2');
     expect(within(summary).getByText('Not measured').nextElementSibling).toHaveTextContent('1');
     expect(within(summary).getByText('Absent').nextElementSibling).toHaveTextContent('1');
-    expect(screen.getByText('1 disk row is path-only, so total measured bytes is a lower bound.')).toBeInTheDocument();
+    expect(screen.getByText('1 disk row is path-only; measured rows may also overlap, so this section highlights categories rather than summing them.')).toBeInTheDocument();
   });
 
   it('highlights managed worktrees when they are the largest measured category', async () => {

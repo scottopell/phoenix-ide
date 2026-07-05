@@ -215,9 +215,10 @@ large-cache paths, so a single request cannot trigger a multi-gigabyte walk
 - **Rendering rules:** `DiskSize` is matched exhaustively — `measured` shows a
   human-readable size, `not_measured` shows "not measured," `absent` shows
   "absent," `inline_db` shows "stored in database." The disk section also
-  derives a point-in-time health summary from the typed sizes: total measured
-  bytes, measured/not-measured/absent row counts, a lower-bound warning when any
-  rows are path-only, and a highlight for the largest measured category. `null` resource values show
+  derives a point-in-time health summary from the typed sizes:
+  measured/not-measured/absent row counts, a warning when rows are path-only or
+  potentially overlapping, and a highlight for the largest measured category.
+  `null` resource values show
   "unavailable." TLS-disabled renders "Serving plain HTTP." The log section
   renders one row per sink: stdout on/off, and the file path (or "none").
 - **API:** `api.deploymentInfo()` is a plain `GET /api/deployment` returning the

@@ -57,7 +57,6 @@ function resourceText(value: number | null, format: (n: number) => string): stri
 type MeasuredDiskEntry = DeploymentInfo['disk'][number] & { size: { kind: 'measured'; bytes: number } };
 
 type DiskSummary = {
-  totalMeasuredBytes: number;
   measuredCount: number;
   notMeasuredCount: number;
   absentCount: number;
@@ -65,7 +64,6 @@ type DiskSummary = {
 };
 
 function diskSummary(entries: DeploymentInfo['disk']): DiskSummary {
-  let totalMeasuredBytes = 0;
   let measuredCount = 0;
   let notMeasuredCount = 0;
   let absentCount = 0;
@@ -74,7 +72,6 @@ function diskSummary(entries: DeploymentInfo['disk']): DiskSummary {
   for (const entry of entries) {
     switch (entry.size.kind) {
       case 'measured':
-        totalMeasuredBytes += entry.size.bytes;
         measuredCount += 1;
         if (!largestMeasured || entry.size.bytes > largestMeasured.size.bytes) {
           largestMeasured = entry as MeasuredDiskEntry;
@@ -91,7 +88,7 @@ function diskSummary(entries: DeploymentInfo['disk']): DiskSummary {
     }
   }
 
-  return { totalMeasuredBytes, measuredCount, notMeasuredCount, absentCount, largestMeasured };
+  return { measuredCount, notMeasuredCount, absentCount, largestMeasured };
 }
 
 /** A path is revealable when it names a concrete location on disk: absolute,
@@ -229,8 +226,8 @@ export function AboutDeploymentPage() {
                 <h3 className="settings-section__title">On disk</h3>
                 <div className="deploy-disk-summary" aria-label="Disk usage health">
                   <div className="deploy-disk-summary__item">
-                    <span>Total measured</span>
-                    <strong>{formatBytes(summary.totalMeasuredBytes)}</strong>
+                    <span>Largest measured</span>
+                    <strong>{summary.largestMeasured ? formatBytes(summary.largestMeasured.size.bytes) : 'none'}</strong>
                   </div>
                   <div className="deploy-disk-summary__item">
                     <span>Measured rows</span>
@@ -254,7 +251,7 @@ export function AboutDeploymentPage() {
                 )}
                 {summary.notMeasuredCount > 0 && (
                   <div className="settings-section__hint settings-section__hint--warning">
-                    {summary.notMeasuredCount} disk {summary.notMeasuredCount === 1 ? 'row is' : 'rows are'} path-only, so total measured bytes is a lower bound.
+                    {summary.notMeasuredCount} disk {summary.notMeasuredCount === 1 ? 'row is' : 'rows are'} path-only; measured rows may also overlap, so this section highlights categories rather than summing them.
                   </div>
                 )}
                 <table className="deploy-table">

@@ -246,7 +246,21 @@ async fn managed_worktrees_aggregate(db: &crate::db::Database) -> DiskEntry {
         }
     };
 
-    managed_worktrees_entry_from_paths(LABEL, PATTERN, paths.iter().map(String::as_str))
+    match tokio::task::spawn_blocking(move || {
+        managed_worktrees_entry_from_paths(LABEL, PATTERN, paths.iter().map(String::as_str))
+    })
+    .await
+    {
+        Ok(entry) => entry,
+        Err(e) => {
+            tracing::debug!(error = %e, "managed worktree aggregate: sizing task failed");
+            DiskEntry {
+                label: LABEL.to_string(),
+                path: PATTERN.to_string(),
+                size: DiskSize::NotMeasured,
+            }
+        }
+    }
 }
 
 fn managed_worktrees_entry_from_paths<'a>(
