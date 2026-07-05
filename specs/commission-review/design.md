@@ -34,21 +34,21 @@ available before any expensive work begins.
 
 The harness resolves the repository root from the tool context working
 directory. Worktree-backed and direct git conversations review committed changes
-on the current `HEAD` against the fetched origin default branch tip. Workspace
-changes are never included in the commissioned diff.
+on the current `HEAD` against a fetched origin ref. Workspace changes are never
+included in the commissioned diff.
 
-The base comparator resolves through the remote-tracking symbolic ref
-`origin/HEAD`, which identifies the fetched origin default branch. A bare local
-default-branch ref is only as current as the worktree last fast-forwarded it, so
-on a long-lived clone it can be far behind; diffing a feature branch against a
-stale local base pulls in every commit merged upstream since, inflating the
-review with already-landed code and, for large files, fabricating diffs large
-enough to exceed the size caps. `origin/HEAD` points at what the branch actually
-merges into by default, so it is the correct comparator and matches the branch
-delta the user expects. The comparator is resolved freshly at review execution
-time rather than cached on the approval scope, so it cannot go stale between a
-review being proposed and approved. If `origin/HEAD` is unavailable, the target
-collection stage fails before any review LLM call.
+When the approved context carries a base branch, the comparator resolves to
+`origin/<approved-base>`. When no base branch is approved, the comparator
+resolves through the remote-tracking symbolic ref `origin/HEAD`, which identifies
+the fetched origin default branch. A bare local base ref is only as current as
+the worktree last fast-forwarded it, so on a long-lived clone it can be far
+behind; diffing a feature branch against a stale local base pulls in every commit
+merged upstream since, inflating the review with already-landed code and, for
+large files, fabricating diffs large enough to exceed the size caps. The
+comparator is resolved freshly at review execution time rather than cached on
+the approval scope, so it cannot go stale between a review being proposed and
+approved. If the required origin ref is unavailable, the target collection stage
+fails before any review LLM call.
 
 `git status --porcelain` determines cleanliness. Any uncommitted or untracked
 changes cause target collection to fail before diff collection or LLM review.

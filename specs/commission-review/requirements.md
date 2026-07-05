@@ -74,7 +74,8 @@ normal review path
 WHEN commission review is requested from a direct conversation inside a git
 repository
 THE SYSTEM SHALL review committed changes on the current HEAD against the fetched
-origin default branch tip
+origin ref for the approved base branch, or against the fetched origin default
+branch tip when no base branch was approved
 
 **Rationale:** Agents should not need to rebuild Phoenix's knowledge of the
 active task. Inferring the target avoids reviewing the wrong branch or comparing
@@ -97,19 +98,23 @@ changes, or generated files, making findings difficult to reproduce or trust.
 
 ---
 
-### REQ-CR-006: Compare Against Origin Default Branch Tip
+### REQ-CR-006: Compare Against the Approved Origin Base
 
-WHEN commission review collects a diff
+WHEN commission review collects a diff for an approved base branch
+THE SYSTEM SHALL compare the current HEAD against the fetched origin ref for that
+approved base branch
+
+WHEN no base branch was approved
 THE SYSTEM SHALL compare the current HEAD against the fetched origin default
 branch tip
 
-IF the origin default branch ref is unavailable
+IF the required origin ref is unavailable
 THE SYSTEM SHALL reject the request with an actionable explanation
 AND SHALL NOT call the review LLM
 
-**Rationale:** Reviewing against the fetched remote default branch avoids stale
-local branch refs and keeps the review scope tied to the branch delta that would
-be proposed for merge.
+**Rationale:** Reviewing against the fetched remote base avoids stale local
+branch refs while keeping the executed review scope identical to the scope the
+user approved.
 
 ---
 

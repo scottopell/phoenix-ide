@@ -158,8 +158,7 @@ struct ReviewSummary {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReviewTargetKind {
-    WorktreeDiff,
-    WorkspaceDiff,
+    CommittedBranchDiff,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,7 +260,7 @@ impl Tool for CommissionReviewTool {
     }
 
     fn description(&self) -> String {
-        "Request an independent Phoenix-native code review of the active git work. This is a capital-spend request: provide a concise executive brief explaining why the work is ready and why review tokens are useful now. Phoenix reviews committed changes only, comparing HEAD against the origin default branch tip, and refuses dirty working trees.".to_string()
+        "Request an independent Phoenix-native code review of the active git work. This is a capital-spend request: provide a concise executive brief explaining why the work is ready and why review tokens are useful now. Phoenix reviews committed changes only, comparing HEAD against the approved origin base branch (or origin default branch when no base is approved), and refuses dirty working trees.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -733,11 +732,7 @@ impl ReviewRun {
 
 fn fallback_target_summary(ctx: &ToolContext) -> ReviewTargetSummary {
     ReviewTargetSummary {
-        kind: if ctx.worktree_path.is_some() {
-            ReviewTargetKind::WorktreeDiff
-        } else {
-            ReviewTargetKind::WorkspaceDiff
-        },
+        kind: ReviewTargetKind::CommittedBranchDiff,
         repo_root: ctx.working_dir.display().to_string(),
         base: "unknown".to_string(),
         head: "unknown".to_string(),
@@ -1417,10 +1412,31 @@ async fn origin_default_ref(repo: &Path) -> Result<String, String> {
     }
 }
 
+async fn remote_base_ref(
+    repo: &Path,
+    approved_base_branch: Option<&str>,
+) -> Result<String, String> {
+    if let Some(base_branch) = approved_base_branch.filter(|branch| !branch.trim().is_empty()) {
+        let remote = format!("origin/{}", base_branch.trim());
+        if git_capture(repo, &["rev-parse", "--verify", "--quiet", &remote])
+            .await
+            .is_ok()
+        {
+            Ok(remote)
+        } else {
+            Err(format!(
+                "commission_review requires fetched approved base ref `{remote}`. Fetch origin before requesting review."
+            ))
+        }
+    } else {
+        origin_default_ref(repo).await
+    }
+}
+
 async fn resolve_target(
     ctx: &ToolContext,
     _input: &CommissionReviewInput,
-    _runtime_base_branch: Option<&str>,
+    runtime_base_branch: Option<&str>,
 ) -> Result<ReviewTarget, String> {
     let repo_root = git_capture(&ctx.working_dir, &["rev-parse", "--show-toplevel"]).await?;
     let repo = PathBuf::from(repo_root.trim());
@@ -1431,16 +1447,12 @@ async fn resolve_target(
     let head = git_capture(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
 
     if dirty {
-        return Err("commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the origin default branch tip.".to_string());
+        return Err("commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the approved origin base branch.".to_string());
     }
-    let base = origin_default_ref(&repo).await?;
+    let base = remote_base_ref(&repo, runtime_base_branch).await?;
     Ok(ReviewTarget {
         summary: ReviewTargetSummary {
-            kind: if ctx.worktree_path.is_some() {
-                ReviewTargetKind::WorktreeDiff
-            } else {
-                ReviewTargetKind::WorkspaceDiff
-            },
+            kind: ReviewTargetKind::CommittedBranchDiff,
             repo_root: repo.display().to_string(),
             base: base.clone(),
             head: head.trim().to_string(),
@@ -2146,7 +2158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_target_uses_origin_default_even_when_runtime_base_is_present() {
+    async fn resolve_target_uses_approved_remote_base_when_present() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path();
         git_ok(repo, &["init", "-q"]).await;
@@ -2157,6 +2169,7 @@ mod tests {
             .await
             .expect("base");
         git_ok(repo, &["update-ref", "refs/remotes/origin/master", &base]).await;
+        git_ok(repo, &["update-ref", "refs/remotes/origin/develop", &base]).await;
         git_ok(
             repo,
             &[
@@ -2189,7 +2202,7 @@ mod tests {
         .await
         .expect("target resolves");
 
-        assert_eq!(target.summary.base, "origin/master");
+        assert_eq!(target.summary.base, "origin/develop");
     }
 
     /// A diff whose only changed files all exceed the per-file cap reviews
@@ -2277,7 +2290,7 @@ mod tests {
             retry_recommendation: RetryRecommendation::DoNotRetry,
             summary: ReviewSummary {
                 target: ReviewTargetSummary {
-                    kind: ReviewTargetKind::WorktreeDiff,
+                    kind: ReviewTargetKind::CommittedBranchDiff,
                     repo_root: "/r".to_string(),
                     base: "main".to_string(),
                     head: "HEAD".to_string(),
@@ -2426,7 +2439,7 @@ mod tests {
 
     fn sample_target() -> ReviewTargetSummary {
         ReviewTargetSummary {
-            kind: ReviewTargetKind::WorktreeDiff,
+            kind: ReviewTargetKind::CommittedBranchDiff,
             repo_root: "/repo".to_string(),
             base: "main".to_string(),
             head: "task".to_string(),
