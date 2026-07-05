@@ -115,7 +115,7 @@
   color: var(--text-primary);
 }
 
-.conv-chain-actions {
+.conv-item-actions.conv-chain-actions {
   position: absolute;
   top: 100%;
   right: 0;
@@ -129,7 +129,7 @@
   padding: 6px;
 }
 
-.conv-chain-actions .action-btn {
+.conv-item-actions.conv-chain-actions .action-btn {
   flex: none;
   text-align: left;
 }

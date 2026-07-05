@@ -1,16 +1,4 @@
-/* Phoenix Mobile-First UI
- *
- * CSS ownership map for agents:
- * - Keep global/base here: font faces, theme tokens, resets, root/app layout.
- * - Keep shared primitives here: buttons, modals, markdown/message primitives,
- *   broad conversation row/list primitives used across unrelated surfaces.
- * - Keep app shell/layout here when it spans multiple routes or pane owners.
- * - Put page-specific styles beside the page TSX as `PageName.css`.
- * - Put component-specific styles beside the component TSX as `ComponentName.css`
- *   and import that CSS from the owner.
- * - Legacy/unclear sections may remain here until their owner is obvious; when
- *   touching one, prefer clarifying ownership or extracting a small bounded block.
- */
+/* Phoenix Mobile-First UI */
 
 /* SauceCodePro Nerd Font Mono — bundled under SIL Open Font License */
 @font-face {

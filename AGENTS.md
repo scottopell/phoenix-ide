@@ -474,6 +474,12 @@ When you touch a spec, leave it more timeless than you found it, even for drift 
 
 **Before pushing a spec change**, run the pre-flight checklist in [`specs/AUTHORING.md`](specs/AUTHORING.md). The checklist captures the recurring spec-authoring failure modes — wire-shape mismatches, Allium grammar bugs, undeclared helpers, cross-file drift, stale citations, cross-spec whitelist gaps — so future spec authors don't repay them.
 
+### CSS Ownership
+
+Default to colocating page- or component-specific CSS beside the owning TSX file and importing it from that owner. Keep `ui/src/index.css` for global/base styling, shared primitives, and app shell/layout rules that span multiple unrelated owners.
+
+When extracting from `index.css`, choose bounded sections with an obvious owner and preserve source-order behavior by making overrides order-independent where necessary. Leave legacy or unclear sections in `index.css` until ownership is obvious.
+
 ### UI Design Philosophy
 
 #### Information Density, Not Minimalism
