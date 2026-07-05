@@ -544,6 +544,11 @@ pub struct TasksResponse {
     pub tasks: Vec<TaskEntry>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct TaskAvailabilityResponse {
+    pub available: bool,
+}
+
 /// Query parameters for listing project task files before a conversation exists.
 #[derive(Debug, Deserialize)]
 pub struct ProjectTasksQuery {

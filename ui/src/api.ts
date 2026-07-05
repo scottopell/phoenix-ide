@@ -583,6 +583,10 @@ export interface TaskCountResponse {
   current: boolean;
 }
 
+export interface TaskAvailabilityResponse {
+  available: boolean;
+}
+
 /** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */
 export interface ExpansionErrorDetail {
   error: string;
@@ -1450,6 +1454,16 @@ export const api = {
       signal ? { signal } : {},
     );
     if (!resp.ok) throw new Error('Failed to list skills');
+    return resp.json();
+  },
+
+  /** Lightweight project task availability for the new-conversation workflow. */
+  async getProjectTaskAvailability(cwd: string, signal?: AbortSignal): Promise<TaskAvailabilityResponse> {
+    const resp = await fetch(
+      `/api/tasks/availability?cwd=${encodeURIComponent(cwd)}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to check task availability');
     return resp.json();
   },
 

@@ -27,8 +27,8 @@ use super::types::{
     FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
     NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
     ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
-    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
-    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    SuggestResponse, SystemPromptResponse, TaskAvailabilityResponse, TaskCountQuery,
+    TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -308,6 +308,10 @@ pub fn create_router(state: AppState) -> Router {
             post(create_pr_auto_fix_context),
         )
         // Project task files available before a conversation exists
+        .route(
+            "/api/tasks/availability",
+            get(get_project_task_availability),
+        )
         .route("/api/tasks", get(list_project_tasks))
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
@@ -4806,6 +4810,42 @@ async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<Ta
         .collect()
 }
 
+fn project_tasks_available(cwd: &std::path::Path) -> bool {
+    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd);
+    cwd.join(tasks_dir_name).is_dir()
+}
+
+fn refresh_default_branch_for_project_tasks(cwd: &std::path::Path) {
+    let _ = run_git(cwd, &["fetch", "origin"])
+        .inspect_err(|e| tracing::debug!(error = %e, "project task refresh fetch failed"));
+    let Some(default_branch) = run_git(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .ok()
+        .and_then(|s| {
+            s.trim()
+                .strip_prefix("refs/remotes/origin/")
+                .map(String::from)
+        })
+    else {
+        return;
+    };
+    if let Err(e) = materialize_branch(cwd, &default_branch) {
+        tracing::debug!(branch = %default_branch, error = %e, "project task refresh could not materialize default branch");
+    }
+}
+
+async fn get_project_task_availability(
+    Query(query): Query<ProjectTasksQuery>,
+) -> Result<Json<TaskAvailabilityResponse>, AppError> {
+    let cwd = std::path::PathBuf::from(&query.cwd);
+    if !cwd.exists() || !cwd.is_dir() {
+        return Err(AppError::BadRequest("Directory does not exist".to_string()));
+    }
+    let available = tokio::task::spawn_blocking(move || project_tasks_available(&cwd))
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+    Ok(Json(TaskAvailabilityResponse { available }))
+}
+
 /// List task files from a project's tasks/ directory before a conversation exists.
 async fn list_project_tasks(
     State(state): State<AppState>,
@@ -4815,6 +4855,10 @@ async fn list_project_tasks(
     if !cwd.exists() || !cwd.is_dir() {
         return Err(AppError::BadRequest("Directory does not exist".to_string()));
     }
+    let refresh_cwd = cwd.clone();
+    tokio::task::spawn_blocking(move || refresh_default_branch_for_project_tasks(&refresh_cwd))
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
     Ok(Json(TasksResponse {
         tasks: task_entries_for_cwd(&state, &cwd).await,
     }))

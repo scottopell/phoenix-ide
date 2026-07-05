@@ -27,6 +27,11 @@ interface ConversationSettingsProps {
   workflow?: NewConversationWorkflow;
   setWorkflow?: (workflow: NewConversationWorkflow) => void;
   tasks?: TaskEntry[];
+  taskAvailabilityLoading?: boolean;
+  taskAvailable?: boolean | null;
+  tasksLoading?: boolean;
+  tasksLoaded?: boolean;
+  loadProjectTasks?: () => void;
   /** Available git branches for the current directory */
   branches?: GitBranchEntry[];
   /** Currently checked-out branch */
@@ -70,6 +75,11 @@ export function ConversationSettings({
   workflow = { kind: 'direct' },
   setWorkflow,
   tasks = [],
+  taskAvailabilityLoading = false,
+  taskAvailable = null,
+  tasksLoading = false,
+  tasksLoaded = false,
+  loadProjectTasks,
   branches,
   currentBranch,
   gitMetadataLoading,
@@ -83,6 +93,7 @@ export function ConversationSettings({
   const [taskDetail, setTaskDetail] = useState<{ path: string; content: string } | null>(null);
   const [taskDetailLoading, setTaskDetailLoading] = useState(false);
   const [taskPage, setTaskPage] = useState(0);
+  const [taskSearch, setTaskSearch] = useState('');
   const comboRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -107,12 +118,6 @@ export function ConversationSettings({
         : '';
   const selectedTask = workflow.kind === 'planFromTask' ? workflow.task : null;
 
-  const selectPlanBranch = useCallback((name: string) => {
-    setWorkflow?.({ kind: 'planFromBranch', baseBranch: name });
-    setBranchSearch?.('');
-    setComboOpen(false);
-  }, [setBranchSearch, setWorkflow]);
-
   const selectContinueBranch = useCallback((name: string) => {
     setWorkflow?.({ kind: 'continueBranch', branch: name });
     setBranchSearch?.('');
@@ -120,10 +125,10 @@ export function ConversationSettings({
   }, [setBranchSearch, setWorkflow]);
 
   const selectTask = useCallback((task: TaskEntry) => {
-    setWorkflow?.({ kind: 'planFromTask', task, baseBranch: workflow.kind === 'planFromTask' ? workflow.baseBranch : null });
+    setWorkflow?.({ kind: 'planFromTask', task, baseBranch: null });
     setBranchSearch?.('');
     setComboOpen(false);
-  }, [setBranchSearch, setWorkflow, workflow]);
+  }, [setBranchSearch, setWorkflow]);
 
   const chooseWorkflow = useCallback((next: NewConversationWorkflow) => {
     setWorkflow?.(next);
@@ -157,8 +162,9 @@ export function ConversationSettings({
     return () => { cancelled = true; };
   }, [selectedTask, cwd]);
   const activeTasks = tasks.filter(t => !['done', 'wont-do'].includes(t.status));
-  const hasActiveTasks = activeTasks.length > 0;
-  const gitAlternatesClass = hasActiveTasks
+  const taskWorkflowVisible = taskAvailable !== false || workflow.kind === 'planFromTask';
+  const taskWorkflowEnabled = taskAvailable === true && !taskAvailabilityLoading;
+  const gitAlternatesClass = taskWorkflowVisible
     ? 'new-conv-workflow-alternates new-conv-workflow-alternates--three'
     : 'new-conv-workflow-alternates new-conv-workflow-alternates--two';
   const sortedActiveTasks = activeTasks.toSorted((a, b) => {
@@ -168,16 +174,20 @@ export function ConversationSettings({
     };
     return priorityRank(a.priority) - priorityRank(b.priority) || a.id.localeCompare(b.id);
   });
+  const normalizedTaskSearch = taskSearch.trim().toLowerCase();
+  const filteredTasks = normalizedTaskSearch
+    ? sortedActiveTasks.filter(t => `${t.id} ${t.slug} ${t.priority} ${t.status}`.toLowerCase().includes(normalizedTaskSearch))
+    : sortedActiveTasks;
   const taskPageSize = 8;
-  const taskPageCount = Math.max(1, Math.ceil(sortedActiveTasks.length / taskPageSize));
+  const taskPageCount = Math.max(1, Math.ceil(filteredTasks.length / taskPageSize));
   const clampedTaskPage = Math.min(taskPage, taskPageCount - 1);
-  const pagedTasks = sortedActiveTasks.slice(
+  const pagedTasks = filteredTasks.slice(
     clampedTaskPage * taskPageSize,
     clampedTaskPage * taskPageSize + taskPageSize,
   );
   useEffect(() => {
     setTaskPage(0);
-  }, [tasks]);
+  }, [tasks, taskSearch]);
 
   // Build display list: current branch first, then the rest in order received
   // (already sorted by recency from backend for local, or relevance for search).
@@ -252,21 +262,36 @@ export function ConversationSettings({
             </label>
           </div>
           <div className={gitAlternatesClass}>
-            {hasActiveTasks && (
+            {taskWorkflowVisible && (
               <label
-                className={`workflow-card ${workflow.kind === 'planFromTask' ? 'workflow-card--active' : ''}`}
-                onClick={() => chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: workflow.kind === 'planFromTask' ? workflow.baseBranch : null })}
+                className={`workflow-card ${!taskWorkflowEnabled ? 'workflow-card--disabled' : ''} ${workflow.kind === 'planFromTask' ? 'workflow-card--active' : ''}`}
+                onClick={() => {
+                  if (!taskWorkflowEnabled) return;
+                  chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: null });
+                  loadProjectTasks?.();
+                }}
               >
                 <input
                   className="workflow-card-radio"
                   type="radio"
                   name={radioGroupName}
                   checked={workflow.kind === 'planFromTask'}
-                  onChange={() => chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: workflow.kind === 'planFromTask' ? workflow.baseBranch : null })}
+                  disabled={!taskWorkflowEnabled}
+                  onChange={() => {
+                    if (!taskWorkflowEnabled) return;
+                    chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: null });
+                    loadProjectTasks?.();
+                  }}
                 />
                 <span className="workflow-card-content">
                   <strong>Start from a task</strong>
-                  <span>Pick a task file and approve the plan before Work mode.</span>
+                  <span>
+                    {taskAvailabilityLoading || taskAvailable === null
+                      ? 'Loading tasks...'
+                      : taskAvailable === true
+                        ? 'Pick a task file and approve the plan before Work mode.'
+                        : 'No repo tasks detected.'}
+                  </span>
                 </span>
               </label>
             )}
@@ -315,67 +340,38 @@ export function ConversationSettings({
                 </div>
 
                 {workflow.kind === 'planFromTask' && (
-                  <div className="branch-combobox">
-                    <span className="settings-field-label">Base branch for planning</span>
-                    <input
-                      ref={inputRef}
-                      type="text"
-                      className="settings-input branch-combobox-input"
-                      placeholder={comboOpen ? 'Type to filter branches...' : undefined}
-                      value={comboOpen ? branchSearch : selectedName}
-                      readOnly={!comboOpen}
-                      onFocus={() => setComboOpen(true)}
-                      onChange={(e) => setBranchSearch?.(e.target.value)}
-                    />
-                    {branchSearchLoading && <span className="branch-combobox-loading">...</span>}
-                    {comboOpen && (
-                      <div className="branch-combobox-dropdown">
-                        {displayBranches.map(b => {
-                          const tag = branchTag(b);
-                          return (
-                            <div
-                              key={`base:${b.name}`}
-                              className={`branch-combobox-item ${selectedName === b.name ? 'branch-combobox-item--selected' : ''}`}
-                              onClick={() => {
-                                if (workflow.kind === 'planFromTask') {
-                                  setWorkflow?.({ ...workflow, baseBranch: b.name });
-                                  setBranchSearch?.('');
-                                  setComboOpen(false);
-                                } else {
-                                  selectPlanBranch(b.name);
-                                }
-                              }}
-                            >
-                              <span className="branch-combobox-item-name">{branchLabel(b, currentBranch)}</span>
-                              {tag && <span className={tag.className}>{tag.text}</span>}
-                            </div>
-                          );
-                        })}
-                        {displayBranches.length === 0 && !branchSearchLoading && (
-                          <div className="branch-combobox-empty">No branches found</div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {workflow.kind === 'planFromTask' && (
                   <>
                     <button
                       type="button"
                       className={`git-workflow-option ${taskPickerOpen || selectedTask ? 'git-workflow-option--active' : ''}`}
                       onClick={() => {
+                        loadProjectTasks?.();
                         setTaskPickerOpen(open => !open);
                       }}
                     >
                       <span className="git-workflow-title">Task file</span>
                       <span className="git-workflow-desc">
-                        {selectedTask ? `${selectedTask.priority} ${selectedTask.id}: ${selectedTask.slug}` : taskPickerOpen ? 'Select a task below' : `${activeTasks.length} active tasks`}
+                        {selectedTask
+                          ? `${selectedTask.priority} ${selectedTask.id}: ${selectedTask.slug}`
+                          : tasksLoading || !tasksLoaded
+                            ? 'Loading tasks...'
+                            : taskPickerOpen
+                              ? 'Select a task below'
+                              : `${activeTasks.length} active tasks`}
                       </span>
                     </button>
                     {(taskPickerOpen || !selectedTask) && (
                       <div className="task-start-list">
-                        {activeTasks.length === 0 && <div className="task-start-empty">No active tasks found.</div>}
+                        <input
+                          type="search"
+                          className="settings-input task-start-search"
+                          placeholder="Search tasks by number or name..."
+                          value={taskSearch}
+                          onChange={(e) => setTaskSearch(e.target.value)}
+                        />
+                        {tasksLoading && <div className="task-start-empty">Loading tasks...</div>}
+                        {!tasksLoading && tasksLoaded && activeTasks.length === 0 && <div className="task-start-empty">No active tasks found.</div>}
+                        {!tasksLoading && tasksLoaded && activeTasks.length > 0 && filteredTasks.length === 0 && <div className="task-start-empty">No tasks match “{taskSearch}”.</div>}
                         {pagedTasks.map(t => (
                           <button
                             key={t.path}
@@ -393,7 +389,7 @@ export function ConversationSettings({
                         {taskPageCount > 1 && (
                           <div className="task-start-pagination">
                             <span>
-                              Showing {clampedTaskPage * taskPageSize + 1}-{Math.min((clampedTaskPage + 1) * taskPageSize, sortedActiveTasks.length)} of {sortedActiveTasks.length}
+                              Showing {clampedTaskPage * taskPageSize + 1}-{Math.min((clampedTaskPage + 1) * taskPageSize, filteredTasks.length)} of {filteredTasks.length}
                             </span>
                             <span className="task-start-pagination-controls">
                               <button
