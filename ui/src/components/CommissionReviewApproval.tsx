@@ -3,7 +3,6 @@ import { useState } from 'react';
 export interface CommissionReviewApprovalProps {
   brief: string;
   focus: string | null | undefined;
-  allowDirtyWorkingTree: boolean;
   scope: {
     kind: string;
     repo_root: string;
@@ -21,7 +20,6 @@ export interface CommissionReviewApprovalProps {
 export function CommissionReviewApproval({
   brief,
   focus,
-  allowDirtyWorkingTree,
   scope,
   onApprove,
   onReject,
@@ -69,8 +67,7 @@ export function CommissionReviewApproval({
 
           <section className="task-approval-section">
             <h3>Scope</h3>
-            <p>Phoenix will infer the review target from this conversation/worktree and use the configured default LLM.</p>
-            <p>Dirty worktree review: {allowDirtyWorkingTree ? 'explicitly allowed' : 'not allowed'}</p>
+            <p>Phoenix reviews committed changes only and refuses dirty working trees before spending review tokens.</p>
             {scope && (
               <ul>
                 <li>Target: {scope.kind}</li>
@@ -78,7 +75,7 @@ export function CommissionReviewApproval({
                 <li>
                   Proposed base → head: {scope.base} → {scope.head}{' '}
                   <span style={{ color: 'var(--text-muted)' }}>
-                    (base resolves to its tracked remote at review time)
+                    (approved base resolves to its origin ref at review time)
                   </span>
                 </li>
                 <li>Stats: {scope.changed_files} files, +{scope.insertions}/-{scope.deletions}</li>

@@ -75,8 +75,6 @@ pub struct CommissionReviewInput {
     pub brief: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus: Option<String>,
-    #[serde(default)]
-    pub allow_dirty_working_tree: bool,
 }
 
 /// Runtime-owned execution payload for an approved `commission_review` request.

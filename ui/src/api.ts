@@ -363,7 +363,6 @@ export type ConversationState =
       type: 'awaiting_commission_review_approval';
       brief: string;
       focus?: string | null;
-      allow_dirty_working_tree: boolean;
       scope: CommissionReviewApprovalScope | undefined;
     }
   | { type: 'awaiting_user_response'; questions: UserQuestion[] }

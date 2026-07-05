@@ -141,7 +141,7 @@ describe('canCancelConversationState', () => {
     [{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }, false],
     [{ type: 'cancelling_sub_agents', pending: [] }, false],
     [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, true],
-    [{ type: 'awaiting_commission_review_approval', brief: 'b', focus: null, allow_dirty_working_tree: false, scope: undefined }, true],
+    [{ type: 'awaiting_commission_review_approval', brief: 'b', focus: null, scope: undefined }, true],
     [{ type: 'awaiting_user_response', questions: [] }, false],
     [{ type: 'context_exhausted', summary: 's' }, false],
     [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }, true],
@@ -162,14 +162,13 @@ describe('parseConversationState commission review approval', () => {
       request: {
         brief: 'Ready for review',
         focus: 'security',
-        allow_dirty_working_tree: true,
       },
       scope: {
-        kind: 'worktree_diff',
+        kind: 'committed_branch_diff',
         repo_root: '/repo',
-        base: 'main',
+        base: 'origin/main',
         head: 'task',
-        dirty: true,
+        dirty: false,
         changed_files: 0,
         insertions: 0,
         deletions: 0,
@@ -178,13 +177,12 @@ describe('parseConversationState commission review approval', () => {
       type: 'awaiting_commission_review_approval',
       brief: 'Ready for review',
       focus: 'security',
-      allow_dirty_working_tree: true,
       scope: {
-        kind: 'worktree_diff',
+        kind: 'committed_branch_diff',
         repo_root: '/repo',
-        base: 'main',
+        base: 'origin/main',
         head: 'task',
-        dirty: true,
+        dirty: false,
         changed_files: 0,
         insertions: 0,
         deletions: 0,
@@ -194,9 +192,8 @@ describe('parseConversationState commission review approval', () => {
 
   it('rejects invalid commission review payloads', () => {
     for (const raw of [
-      { type: 'awaiting_commission_review_approval', request: { allow_dirty_working_tree: false } },
-      { type: 'awaiting_commission_review_approval', request: { brief: 'Ready', allow_dirty_working_tree: 'false' } },
-      { type: 'awaiting_commission_review_approval', request: { brief: 'Ready', focus: 42, allow_dirty_working_tree: false } },
+      { type: 'awaiting_commission_review_approval', request: {} },
+      { type: 'awaiting_commission_review_approval', request: { brief: 'Ready', focus: 42 } },
     ]) {
       expect(parseConversationState(raw).type).toBe('error');
     }
@@ -219,7 +216,7 @@ describe('canChangeModelInState (task 02713)', () => {
     [{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }, false],
     [{ type: 'cancelling_sub_agents', pending: [] }, false],
     [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, false],
-    [{ type: 'awaiting_commission_review_approval', brief: 'b', focus: null, allow_dirty_working_tree: false, scope: undefined }, false],
+    [{ type: 'awaiting_commission_review_approval', brief: 'b', focus: null, scope: undefined }, false],
     [{ type: 'awaiting_user_response', questions: [] }, false],
     [{ type: 'context_exhausted', summary: 's' }, false],
     [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }, false],

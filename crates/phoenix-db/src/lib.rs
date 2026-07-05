@@ -6493,14 +6493,13 @@ mod tests {
             request: CommissionReviewInput {
                 brief: "Ready for review".to_string(),
                 focus: Some("correctness".to_string()),
-                allow_dirty_working_tree: true,
             },
             scope: CommissionReviewApprovalScope {
-                kind: "worktree_diff".to_string(),
+                kind: "committed_branch_diff".to_string(),
                 repo_root: "/tmp".to_string(),
-                base: "main".to_string(),
+                base: "origin/main".to_string(),
                 head: "task".to_string(),
-                dirty: true,
+                dirty: false,
                 changed_files: 0,
                 insertions: 0,
                 deletions: 0,

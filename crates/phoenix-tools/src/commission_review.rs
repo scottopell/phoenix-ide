@@ -746,27 +746,48 @@ fn collection_failed_output(
     reason: String,
     elapsed_ms: u128,
 ) -> ReviewOutput {
+    let cancelled = reason.to_ascii_lowercase().contains("cancelled");
     let coverage = ReviewCoverage {
         files_changed: 0,
         files_reviewed: 0,
         insertions: 0,
         deletions: 0,
-        warnings: vec![warning("collection_failed", &reason, None)],
+        warnings: vec![warning(
+            if cancelled {
+                "review_cancelled"
+            } else {
+                "collection_failed"
+            },
+            &reason,
+            None,
+        )],
         unreviewed: Vec::new(),
     };
     finalize_review_output(ReviewOutputDraft {
         status: ReviewStatus::Failed,
-        review_status: ReviewCompletionStatus::Unavailable,
+        review_status: if cancelled {
+            ReviewCompletionStatus::Cancelled
+        } else {
+            ReviewCompletionStatus::Unavailable
+        },
         findings_status: FindingsStatus::Unavailable,
         findings_trust: FindingsTrust::Low,
         stage_status: ReviewStageStatus {
             target_collection: if stage == CollectionFailureStage::TargetCollection {
-                StageStatus::Failed
+                if cancelled {
+                    StageStatus::Cancelled
+                } else {
+                    StageStatus::Failed
+                }
             } else {
                 StageStatus::Ok
             },
             diff_collection: if stage == CollectionFailureStage::DiffCollection {
-                StageStatus::Failed
+                if cancelled {
+                    StageStatus::Cancelled
+                } else {
+                    StageStatus::Failed
+                }
             } else {
                 StageStatus::Skipped
             },
@@ -774,7 +795,11 @@ fn collection_failed_output(
             json_parse: StageStatus::Skipped,
             finding_extraction: StageStatus::Skipped,
         },
-        retry_recommendation: RetryRecommendation::Retry,
+        retry_recommendation: if cancelled {
+            RetryRecommendation::DoNotRetry
+        } else {
+            RetryRecommendation::Retry
+        },
         summary: review_summary(
             target,
             &coverage,
@@ -1248,6 +1273,7 @@ fn summarize_warnings(warnings: &[ReviewWarning]) -> Vec<String> {
             "file_too_large" => "some file diffs exceeded review limits".to_string(),
             "unsupported_file" => "some changed files were not reviewable".to_string(),
             "diff_capture_failed" => "some file diffs could not be captured".to_string(),
+            "collection_failed" => "review target or diff collection failed".to_string(),
             "untracked_file" => "some untracked files were not reviewed".to_string(),
             "dropped_findings" => warning.message.clone(),
             "invalid_severity" => "some finding severities were normalized".to_string(),
@@ -2544,6 +2570,25 @@ mod tests {
         assert_eq!(output.stage_status.target_collection, StageStatus::Ok);
         assert_eq!(output.stage_status.diff_collection, StageStatus::Failed);
         assert_eq!(output.stage_status.llm_review, StageStatus::Skipped);
+    }
+
+    #[test]
+    fn outcome_collection_cancellation_marks_stage_cancelled() {
+        let output = ReviewRun::CollectionFailed {
+            target: sample_target(),
+            stage: CollectionFailureStage::DiffCollection,
+            reason: "commission_review cancelled while collecting diffs".to_string(),
+        }
+        .into_output(0);
+
+        assert_review_output_invariants(&output);
+        assert_eq!(output.status, ReviewStatus::Failed);
+        assert_eq!(output.review_status, ReviewCompletionStatus::Cancelled);
+        assert_eq!(output.stage_status.diff_collection, StageStatus::Cancelled);
+        assert_eq!(output.retry_recommendation, RetryRecommendation::DoNotRetry);
+        assert!(output
+            .warnings_summary
+            .contains(&"review request was cancelled".to_string()));
     }
 
     #[test]

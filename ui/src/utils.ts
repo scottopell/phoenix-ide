@@ -281,21 +281,16 @@ export function parseConversationState(raw: unknown): ConversationState {
       const requestObj = request as Record<string, unknown>;
       const brief = requestObj['brief'];
       const focus = requestObj['focus'];
-      const allowDirty = requestObj['allow_dirty_working_tree'];
       if (typeof brief !== 'string' || brief.trim() === '') {
         return invalidRequestError('Invalid commission review approval state: missing brief');
       }
       if (focus !== undefined && focus !== null && typeof focus !== 'string') {
         return invalidRequestError('Invalid commission review approval state: invalid focus');
       }
-      if (typeof allowDirty !== 'boolean') {
-        return invalidRequestError('Invalid commission review approval state: invalid dirty-worktree flag');
-      }
       return {
         type: 'awaiting_commission_review_approval',
         brief,
         focus: focus ?? null,
-        allow_dirty_working_tree: allowDirty,
         scope: parseCommissionReviewScope(obj['scope']),
       };
     }

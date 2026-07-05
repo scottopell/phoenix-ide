@@ -306,7 +306,7 @@ enum CommissionReviewCall<'a> {
 
 fn commission_review_scope_from_context(
     context: &ConvContext,
-    input: &super::state::CommissionReviewInput,
+    _input: &super::state::CommissionReviewInput,
 ) -> CommissionReviewApprovalScope {
     let (kind, base, head) = match context.mode_context.as_ref() {
         Some(
@@ -321,19 +321,19 @@ fn commission_review_scope_from_context(
                 ..
             },
         ) => (
-            "worktree_diff".to_string(),
-            base_branch.clone(),
+            "committed_branch_diff".to_string(),
+            format!("origin/{base_branch}"),
             branch_name.clone(),
         ),
         _ => (
-            "workspace_diff".to_string(),
+            "committed_branch_diff".to_string(),
+            "origin/HEAD".to_string(),
             "HEAD".to_string(),
-            "working-tree".to_string(),
         ),
     };
 
     let repo_root = context.working_dir.display().to_string();
-    let dirty = input.allow_dirty_working_tree;
+    let dirty = false;
     let (changed_files, insertions, deletions) = (0, 0, 0);
 
     CommissionReviewApprovalScope {
@@ -1874,7 +1874,6 @@ pub fn transition_parent(
                     "summary": {
                         "brief": request.brief,
                         "focus": request.focus,
-                        "allow_dirty_working_tree": request.allow_dirty_working_tree,
                         "reviewer_summary": "Commission review rejected before LLM execution"
                     },
                     "findings": [],
@@ -6032,7 +6031,6 @@ mod tests {
                 ToolInput::CommissionReview(CommissionReviewInput {
                     brief: "Ready for independent review".to_string(),
                     focus: Some("correctness".to_string()),
-                    allow_dirty_working_tree: false,
                 }),
             );
             Event::LlmResponse {
@@ -6042,7 +6040,6 @@ mod tests {
                     input: serde_json::json!({
                         "brief": "Ready for independent review",
                         "focus": "correctness",
-                        "allow_dirty_working_tree": false,
                     }),
                 }],
                 tool_calls: vec![tool],
@@ -6058,14 +6055,13 @@ mod tests {
                 request: CommissionReviewInput {
                     brief: "Ready for independent review".to_string(),
                     focus: None,
-                    allow_dirty_working_tree: true,
                 },
                 scope: CommissionReviewApprovalScope {
-                    kind: "worktree_diff".to_string(),
+                    kind: "committed_branch_diff".to_string(),
                     repo_root: "/tmp".to_string(),
-                    base: "main".to_string(),
+                    base: "origin/main".to_string(),
                     head: "task".to_string(),
-                    dirty: true,
+                    dirty: false,
                     changed_files: 0,
                     insertions: 0,
                     deletions: 0,
@@ -6142,7 +6138,6 @@ mod tests {
                 ToolInput::CommissionReview(CommissionReviewInput {
                     brief: "   ".to_string(),
                     focus: None,
-                    allow_dirty_working_tree: false,
                 }),
             );
             let event = Event::LlmResponse {
@@ -6222,14 +6217,13 @@ mod tests {
                 request: CommissionReviewInput {
                     brief: "Ready for independent review".to_string(),
                     focus: None,
-                    allow_dirty_working_tree: true,
                 },
                 scope: CommissionReviewApprovalScope {
-                    kind: "worktree_diff".to_string(),
+                    kind: "committed_branch_diff".to_string(),
                     repo_root: "/tmp".to_string(),
-                    base: "main".to_string(),
+                    base: "origin/main".to_string(),
                     head: "task".to_string(),
-                    dirty: true,
+                    dirty: false,
                     changed_files: 0,
                     insertions: 0,
                     deletions: 0,
