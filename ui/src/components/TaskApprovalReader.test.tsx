@@ -69,7 +69,10 @@ describe('TaskApprovalReader feedback action emphasis', () => {
   });
 
   it('keeps action order stable and recommends sending feedback when notes exist', () => {
-    renderTaskApprovalReader();
+    renderTaskApprovalReader('# Plan\n\nAdd the thing.', vi.fn(), {
+      contextWindowUsed: 176_000,
+      modelContextWindow: 200_000,
+    });
 
     fireEvent.click(screen.getByRole('button', { name: /add note to line 1/i }));
     fireEvent.change(screen.getByPlaceholderText('Add your note...'), {
@@ -91,6 +94,8 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     expect(buttons[1]).toHaveClass('task-approval-btn--subdued');
     expect(buttons[2]).toHaveClass('task-approval-btn--approve');
     expect(buttons[2]).toHaveClass('task-approval-btn--subdued');
+    expect(buttons[1]).not.toHaveClass('task-approval-btn--recommended-decision');
+    expect(buttons[2]).not.toHaveClass('task-approval-btn--recommended-decision');
     expect(screen.getByRole('status')).toHaveTextContent(
       'You have 1 note of unsent feedback'
     );

@@ -9055,8 +9055,8 @@ html * {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
+  width: 44px;
+  height: 44px;
   border: 1px solid transparent;
   border-radius: 8px;
   background: transparent;
@@ -9224,7 +9224,9 @@ html * {
     min-height: 44px;
     padding: 8px 10px;
     text-align: center;
-    white-space: nowrap;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+    white-space: normal;
   }
 
   .task-approval-btn-label-full {
@@ -9244,6 +9246,8 @@ html * {
   }
 
   .task-approval-context-cue__recommendation {
+    flex-shrink: 1;
+    min-width: 0;
     margin-left: auto;
     overflow: hidden;
     text-overflow: ellipsis;

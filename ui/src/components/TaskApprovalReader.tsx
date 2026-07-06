@@ -532,7 +532,7 @@ export function TaskApprovalReader({
             'task-approval-btn',
             'task-approval-btn--approve',
             hasUnsentNotes && 'task-approval-btn--subdued',
-            contextRecommendation?.kind === 'start-here' && 'task-approval-btn--recommended-decision',
+            !hasUnsentNotes && contextRecommendation?.kind === 'start-here' && 'task-approval-btn--recommended-decision',
           ]
             .filter(Boolean)
             .join(' ')}
@@ -558,7 +558,7 @@ export function TaskApprovalReader({
             'task-approval-btn',
             'task-approval-btn--approve',
             hasUnsentNotes && 'task-approval-btn--subdued',
-            contextRecommendation?.kind === 'new-chat' && 'task-approval-btn--recommended-decision',
+            !hasUnsentNotes && contextRecommendation?.kind === 'new-chat' && 'task-approval-btn--recommended-decision',
           ]
             .filter(Boolean)
             .join(' ')}

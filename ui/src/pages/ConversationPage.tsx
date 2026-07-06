@@ -290,6 +290,7 @@ function ConversationPageContent() {
 
   // Task approval overlay
   const [showTaskApproval, setShowTaskApproval] = useState(false);
+  const [approvalContextWindowUsed, setApprovalContextWindowUsed] = useState<number | null>(null);
   const [showFirstTaskWelcome, setShowFirstTaskWelcome] = useState(false);
   // Context-full banner: summary expanded by default; user can collapse to
   // read the conversation above.
@@ -328,6 +329,7 @@ function ConversationPageContent() {
     setImages([]);
     setFiles([]);
     setShowTaskApproval(false);
+    setApprovalContextWindowUsed(null);
     setShowFirstTaskWelcome(false);
     setContextExhaustedExpanded(true);
     setFocusToken(0);
@@ -583,8 +585,29 @@ function ConversationPageContent() {
       setShowTaskApproval(true);
     } else {
       setShowTaskApproval(false);
+      setApprovalContextWindowUsed(null);
     }
   }, [atom.phase.type, isArchived]);
+
+  useEffect(() => {
+    if (!showTaskApproval || atom.phase.type !== 'awaiting_task_approval' || !conversationId) {
+      setApprovalContextWindowUsed(null);
+      return;
+    }
+
+    let cancelled = false;
+    api.getConversation(conversationId)
+      .then((result) => {
+        if (!cancelled) setApprovalContextWindowUsed(result.context_window_size);
+      })
+      .catch(() => {
+        if (!cancelled) setApprovalContextWindowUsed(atom.contextWindow.used);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [showTaskApproval, atom.phase.type, conversationId, atom.contextWindow.used]);
 
   // Ctrl+` toggles the terminal collapse state. Only blocked when focus is
   // inside the xterm itself — in every other input (chat textarea, etc.)
@@ -1629,7 +1652,7 @@ function ConversationPageContent() {
             title={atom.phase.title}
             priority={atom.phase.priority}
             plan={atom.phase.plan}
-            contextWindowUsed={atom.contextWindow.used}
+            contextWindowUsed={approvalContextWindowUsed ?? atom.contextWindow.used}
             modelContextWindow={modelContextWindow}
             onApprove={handleApproveTask}
             onReject={handleRejectTask}
