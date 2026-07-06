@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
+import { useState, useCallback, useContext, useEffect, useMemo, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getConvDisplayState } from '../api';
 import type { ChainView, Conversation, Project } from '../api';
@@ -11,6 +11,7 @@ import { LocalServicesPanel } from './LocalServicesPanel';
 import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
+import { ConversationContext } from '../conversation/ConversationContext';
 
 const PROJECT_FILTER_KEY = 'phoenix:sidebar-project-filter';
 
@@ -53,6 +54,7 @@ export function Sidebar({
 }: SidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
+  const conversationStore = useContext(ConversationContext);
   const { theme, toggleTheme } = useTheme();
   const [codexPreflight, setCodexPreflight] = useState<CodexLoginPreflight | null>(null);
   const refetchCodexPreflight = useCallback(() => {
@@ -245,30 +247,33 @@ export function Sidebar({
     }
   }, [deleteChainTarget, onConversationCreated]);
 
-  const updateRouteAfterRename = useCallback((oldSlug: string | null | undefined, newSlug: string | null | undefined) => {
-    if (oldSlug && newSlug && oldSlug === activeSlug) {
-      navigate(`/c/${newSlug}`, { replace: true });
+  const applyRenameSnapshot = useCallback((oldSlug: string | null | undefined, conversation: Conversation) => {
+    if (oldSlug) {
+      conversationStore?.replaceSlugSnapshot(oldSlug, conversation);
     }
-  }, [activeSlug, navigate]);
+    if (oldSlug && conversation.slug && oldSlug === activeSlug) {
+      navigate(`/c/${conversation.slug}`, { replace: true });
+    }
+  }, [activeSlug, conversationStore, navigate]);
 
   const handleRename = useCallback(async (newName: string) => {
     if (!renameTarget) return;
     try {
       const res = await api.renameConversation(renameTarget.id, newName);
-      updateRouteAfterRename(renameTarget.slug, res.conversation.slug);
+      applyRenameSnapshot(renameTarget.slug, res.conversation);
       setRenameTarget(null);
       setRenameError(undefined);
       onConversationCreated();
     } catch (err) {
       setRenameError(err instanceof Error ? err.message : 'Failed to rename');
     }
-  }, [renameTarget, onConversationCreated, updateRouteAfterRename]);
+  }, [renameTarget, onConversationCreated, applyRenameSnapshot]);
 
   const handleGenerateRename = useCallback(async () => {
     if (!renameTarget) return;
     try {
       const res = await api.regenerateConversationName(renameTarget.id);
-      updateRouteAfterRename(renameTarget.slug, res.conversation.slug);
+      applyRenameSnapshot(renameTarget.slug, res.conversation);
       setRenameTarget(null);
       setRenameError(undefined);
       onConversationCreated();
@@ -276,7 +281,7 @@ export function Sidebar({
       setRenameError(err instanceof Error ? err.message : 'Failed to generate name');
       throw err;
     }
-  }, [renameTarget, onConversationCreated, updateRouteAfterRename]);
+  }, [renameTarget, onConversationCreated, applyRenameSnapshot]);
 
   const handleSetDeleteTarget = useCallback((conv: Conversation) => {
     setDeleteTarget(conv);

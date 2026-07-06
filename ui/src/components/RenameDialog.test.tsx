@@ -18,6 +18,28 @@ describe('RenameDialog', () => {
     expect(screen.queryByRole('button', { name: /generate with ai/i })).not.toBeInTheDocument();
   });
 
+  it('prevents dismissing while generation is in flight', async () => {
+    const onCancel = vi.fn();
+    render(
+      <RenameDialog
+        visible
+        currentName="current-slug"
+        onRename={vi.fn()}
+        onGenerate={() => new Promise<void>(() => {})}
+        onCancel={onCancel}
+        error={undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /generate with ai/i }));
+    fireEvent.keyDown(document, { key: 'Escape' });
+    fireEvent.click(screen.getByText('Rename Conversation').closest('.modal-overlay')!);
+    fireEvent.click(screen.getByRole('button', { name: /cancel/i }));
+
+    expect(screen.getByRole('button', { name: /cancel/i })).toBeDisabled();
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
   it('renders the AI generation button and shows in-flight state', async () => {
     let resolveGenerate!: () => void;
     const onGenerate = vi.fn(

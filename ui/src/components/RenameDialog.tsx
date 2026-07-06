@@ -32,16 +32,21 @@ export function RenameDialog({
   useEffect(() => {
     if (visible) {
       const handleEscape = (e: KeyboardEvent) => {
-        if (e.key === 'Escape') onCancel();
+        if (e.key === 'Escape' && !generating) onCancel();
       };
       document.addEventListener('keydown', handleEscape);
       return () => document.removeEventListener('keydown', handleEscape);
     }
     return undefined;
-  }, [visible, onCancel]);
+  }, [visible, generating, onCancel]);
+
+  const handleCancel = () => {
+    if (!generating) onCancel();
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (generating) return;
     const trimmed = name.trim();
     if (trimmed && trimmed !== currentName) {
       onRename(trimmed);
@@ -65,7 +70,7 @@ export function RenameDialog({
   if (!visible) return null;
 
   return (
-    <div className="modal-overlay" onClick={onCancel}>
+    <div className="modal-overlay" onClick={handleCancel}>
       <div
         className="modal rename-dialog"
         role="dialog"
@@ -100,7 +105,7 @@ export function RenameDialog({
             </button>
           )}
           <div className="modal-actions">
-            <button type="button" className="btn-secondary" onClick={onCancel}>
+            <button type="button" className="btn-secondary" onClick={handleCancel} disabled={generating}>
               Cancel
             </button>
             <button

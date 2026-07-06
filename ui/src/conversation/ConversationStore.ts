@@ -114,6 +114,19 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     return changed;
   }
 
+  replaceSlugSnapshot(oldSlug: string, conversation: Conversation): boolean {
+    const newSlug = conversation.slug;
+    if (oldSlug === newSlug) {
+      return this.upsertSnapshot(newSlug, conversation);
+    }
+
+    const oldAtom = this.atomByKey(oldSlug);
+    if (oldAtom?.conversation?.id === conversation.id) {
+      this.removeAtom(oldSlug);
+    }
+    return this.upsertSnapshot(newSlug, conversation);
+  }
+
   /**
    * Read all currently-held conversation snapshots. Returns a fresh
    * array — callers that need reference stability across calls should

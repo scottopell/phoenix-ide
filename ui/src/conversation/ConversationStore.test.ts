@@ -183,6 +183,40 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.slugForId('unknown')).toBeUndefined();
   });
 
+  it('replaceSlugSnapshot moves a renamed conversation to its new slug', () => {
+    const store = new ConversationStore();
+    const original = makeConv('alpha', {
+      id: 'conv-1',
+      updated_at: '2024-06-01T00:00:00Z',
+    });
+    const renamed = makeConv('beta', {
+      id: 'conv-1',
+      updated_at: '2024-06-02T00:00:00Z',
+    });
+    store.upsertSnapshot('alpha', original);
+
+    expect(store.replaceSlugSnapshot('alpha', renamed)).toBe(true);
+
+    expect(store.getSnapshot('alpha').conversation).toBeNull();
+    expect(store.getSnapshot('beta').conversation?.id).toBe('conv-1');
+    expect(store.slugForId('conv-1')).toBe('beta');
+    expect(store.listSnapshots().map((c) => c.slug)).toEqual(['beta']);
+  });
+
+  it('replaceSlugSnapshot does not remove an old slug that belongs to a different conversation', () => {
+    const store = new ConversationStore();
+    store.upsertSnapshot('alpha', makeConv('alpha', { id: 'conv-alpha' }));
+    const renamed = makeConv('beta', {
+      id: 'conv-beta',
+      updated_at: '2024-06-02T00:00:00Z',
+    });
+
+    store.replaceSlugSnapshot('alpha', renamed);
+
+    expect(store.getSnapshot('alpha').conversation?.id).toBe('conv-alpha');
+    expect(store.getSnapshot('beta').conversation?.id).toBe('conv-beta');
+  });
+
   it('remove drops the atom and clears the slugForId index', () => {
     const store = new ConversationStore();
     const a = makeConv('alpha');
