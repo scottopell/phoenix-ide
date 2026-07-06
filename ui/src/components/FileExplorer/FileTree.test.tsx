@@ -212,6 +212,35 @@ describe('FileTree — reveal active file', () => {
     expect(screen.getByText('Other.tsx')).toBeInTheDocument();
   });
 
+  it('uses depth-only row indentation with stable file/folder slots', async () => {
+    const onFileSelect = vi.fn();
+    render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={onFileSelect}
+        activeFile={null}
+        conversationId="conv-test-layout"
+      />,
+    );
+
+    const folderRow = (await screen.findByText('ui')).closest('.ft-item') as HTMLElement;
+    const fileRow = screen.getByText('README.md').closest('.ft-item') as HTMLElement;
+
+    expect(folderRow.style.paddingLeft).toBe('12px');
+    expect(fileRow.style.paddingLeft).toBe('12px');
+    expect(fileRow.querySelector('.ft-disclosure-slot')).not.toBeNull();
+    expect(fileRow.querySelector('.ft-icon-slot')).not.toBeNull();
+    expect(fileRow.querySelector('.ft-dot')).not.toBeNull();
+    expect(folderRow.querySelector('.ft-disclosure-slot svg')).not.toBeNull();
+    expect(folderRow.querySelector('.ft-icon-slot')?.textContent).toBe('');
+
+    fireEvent.click(folderRow);
+    const childRow = (await screen.findByText('src')).closest('.ft-item') as HTMLElement;
+
+    expect(childRow.style.paddingLeft).toBe('28px');
+    expect(parseInt(childRow.style.paddingLeft, 10) - parseInt(folderRow.style.paddingLeft, 10)).toBe(16);
+  });
+
   it('opens image files and disables only non-viewable (opaque) files', async () => {
     const onFileSelect = vi.fn();
     render(
