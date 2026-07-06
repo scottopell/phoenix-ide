@@ -808,22 +808,24 @@ body {
   opacity: 0.7;
 }
 
+.message-mobile-copy-row {
+  display: none;
+  justify-content: flex-end;
+  margin-bottom: 4px;
+}
+
+.message-mobile-copy-row:empty {
+  display: none;
+}
+
 .message-mobile-copy.copy-btn {
   display: none;
-  width: 34px;
-  height: 34px;
+  width: 44px;
+  height: 44px;
   margin-left: auto;
   border: 1px solid var(--border-color);
   background: var(--bg-secondary);
 }
-
-.message-mobile-copy-floating.copy-btn {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  z-index: 1;
-}
-
 
 .message-content {
   overflow-wrap: break-word;
@@ -1655,6 +1657,14 @@ pre:hover .copy-btn {
 }
 
 @media (hover: none), (width <= 768px) {
+  .message-mobile-copy-row {
+    display: flex;
+  }
+
+  .message-mobile-copy-row:empty {
+    display: none;
+  }
+
   .message-mobile-copy.copy-btn {
     display: inline-flex;
   }

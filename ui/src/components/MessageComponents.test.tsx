@@ -434,6 +434,56 @@ describe('message copy affordances', () => {
     });
   });
 
+  it('does not render a message copy button when extracted markdown is empty', () => {
+    render(
+      <MemoryRouter>
+        <UserMessage
+          message={{
+            message_id: 'user-attachment-only',
+            sequence_id: 1,
+            conversation_id: 'agent-1',
+            message_type: 'user',
+            content: {
+              text: '',
+              files: [{ original_name: 'notes.txt', size_bytes: 12, stored_path: '/tmp/notes.txt', media_type: 'text/plain' }],
+            },
+            display_data: null,
+            created_at: '2026-01-01T00:00:00Z',
+          }}
+        />
+        <AgentMessage
+          message={agentMessage('agent-tool-only', [
+            { type: 'tool_use', id: 'tool-1', name: 'bash', input: { cmd: 'pwd' } },
+          ])}
+          toolResults={new Map()}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByRole('button', { name: 'Copy your message' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy Phoenix message' })).not.toBeInTheDocument();
+  });
+
+  it('renders continuation message copy controls in a non-overlapping row', () => {
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-continuation-copy', [
+            { type: 'text', text: 'Continuation text starts immediately.' },
+          ])}
+          toolResults={new Map()}
+          onOpenFile={vi.fn()}
+          isFirstInTurn={false}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('button', { name: 'Copy Phoenix message' })).toBeInTheDocument();
+    expect(container.querySelector('.message-mobile-copy-row')).toBeInTheDocument();
+    expect(container.querySelector('.message-mobile-copy-floating')).not.toBeInTheDocument();
+  });
+
   it('keeps message context-menu markdown copy aligned with the mobile copy value', async () => {
     const message = agentMessage('agent-context-copy', [
       { type: 'text', text: 'Context **markdown**.' },

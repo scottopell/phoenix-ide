@@ -576,11 +576,14 @@ function formatBrowserInput(name: string, input: Record<string, unknown>): strin
 // User Message Components
 // ============================================================================
 
-function MessageCopyButton({ message, title, className = '' }: { message: Message; title: string; className?: string }) {
+function MessageCopyButton({ message, title }: { message: Message; title: string }) {
+  const markdown = getMessageMarkdown(message);
+  if (markdown.trim() === '') return null;
+
   return (
     <CopyButton
-      text={getMessageMarkdown(message)}
-      className={`message-mobile-copy ${className}`}
+      text={markdown}
+      className="message-mobile-copy"
       title={title}
     />
   );
@@ -1004,11 +1007,9 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   return (
     <div className="message agent" data-sequence-id={message.sequence_id}>
       {!isFirstInTurn && (
-        <MessageCopyButton
-          message={message}
-          title="Copy Phoenix message"
-          className="message-mobile-copy-floating"
-        />
+        <div className="message-mobile-copy-row">
+          <MessageCopyButton message={message} title="Copy Phoenix message" />
+        </div>
       )}
       {isFirstInTurn && (
         <div className="message-header">
