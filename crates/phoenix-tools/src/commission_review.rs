@@ -520,7 +520,7 @@ async fn run_review(input: Value, ctx: ToolContext) -> Result<ReviewOutput, Stri
     Ok(ReviewRun::Completed {
         target: target.summary,
         coverage: ReviewCoverage::from_collection(collection),
-        parsed: ParsedReviewOutput::from_parts(findings, reviewer_summaries),
+        parsed: ParsedReviewOutput::from_parts(findings, &reviewer_summaries),
         warnings,
         usage: phoenix_core::domain::llm_types::Usage {
             input_tokens,
@@ -608,7 +608,7 @@ struct ParsedReviewOutput {
 }
 
 impl ParsedReviewOutput {
-    fn from_parts(findings: Vec<ReviewFinding>, reviewer_summaries: Vec<String>) -> Self {
+    fn from_parts(findings: Vec<ReviewFinding>, reviewer_summaries: &[String]) -> Self {
         Self {
             findings,
             reviewer_summary: if reviewer_summaries.is_empty() {
@@ -679,7 +679,7 @@ impl ReviewRun {
                 target,
                 stage,
                 reason,
-            } => collection_failed_output(target, stage, reason, elapsed_ms),
+            } => collection_failed_output(target, stage, &reason, elapsed_ms),
             ReviewRun::SkippedNoReviewableDiff {
                 target,
                 coverage,
@@ -706,8 +706,10 @@ impl ReviewRun {
                 parsed,
                 warnings,
                 usage,
-                reason,
-                interruption,
+                ReviewInterruptionContext {
+                    reason: &reason,
+                    interruption,
+                },
                 elapsed_ms,
             ),
             ReviewRun::InterruptedNoOutput {
@@ -722,7 +724,7 @@ impl ReviewRun {
                 coverage,
                 warnings,
                 usage,
-                reason,
+                &reason,
                 interruption,
                 elapsed_ms,
             ),
@@ -743,7 +745,7 @@ fn fallback_target_summary(ctx: &ToolContext) -> ReviewTargetSummary {
 fn collection_failed_output(
     target: ReviewTargetSummary,
     stage: CollectionFailureStage,
-    reason: String,
+    reason: &str,
     elapsed_ms: u128,
 ) -> ReviewOutput {
     let cancelled = reason.to_ascii_lowercase().contains("cancelled");
@@ -758,7 +760,7 @@ fn collection_failed_output(
             } else {
                 "collection_failed"
             },
-            &reason,
+            reason,
             None,
         )],
         unreviewed: Vec::new(),
@@ -915,20 +917,29 @@ fn completed_review_output(
     })
 }
 
+#[derive(Clone, Copy)]
+struct ReviewInterruptionContext<'a> {
+    reason: &'a str,
+    interruption: ReviewInterruption,
+}
+
 fn interrupted_after_output(
     target: ReviewTargetSummary,
     coverage: ReviewCoverage,
     parsed: ParsedReviewOutput,
     mut warnings: Vec<ReviewWarning>,
     usage: phoenix_core::domain::llm_types::Usage,
-    reason: String,
-    interruption: ReviewInterruption,
+    context: ReviewInterruptionContext<'_>,
     elapsed_ms: u128,
 ) -> ReviewOutput {
+    let ReviewInterruptionContext {
+        reason,
+        interruption,
+    } = context;
     warnings.extend(coverage.warnings.clone());
     warnings.push(warning(
         interrupted_warning_kind(interruption, true),
-        &reason,
+        reason,
         None,
     ));
     let (status, review_status, findings_status, findings_trust, retry_recommendation) =
@@ -964,14 +975,14 @@ fn interrupted_no_output(
     coverage: ReviewCoverage,
     mut warnings: Vec<ReviewWarning>,
     usage: phoenix_core::domain::llm_types::Usage,
-    reason: String,
+    reason: &str,
     interruption: ReviewInterruption,
     elapsed_ms: u128,
 ) -> ReviewOutput {
     warnings.extend(coverage.warnings.clone());
     warnings.push(warning(
         interrupted_warning_kind(interruption, false),
-        &reason,
+        reason,
         None,
     ));
     let (status, review_status, findings_status, findings_trust, retry_recommendation) =
@@ -1021,7 +1032,7 @@ fn interrupted_review_output(
 ) -> ReviewOutput {
     normalize_findings(&mut interrupted.findings, &mut interrupted.warnings);
     let parsed =
-        ParsedReviewOutput::from_parts(interrupted.findings, interrupted.reviewer_summaries);
+        ParsedReviewOutput::from_parts(interrupted.findings, &interrupted.reviewer_summaries);
     let coverage = ReviewCoverage::from_collection_ref(collection);
     let run = if interrupted.interruption == ReviewInterruption::Cancelled || !parsed.has_output() {
         ReviewRun::InterruptedNoOutput {
@@ -1145,14 +1156,7 @@ fn interrupted_contract(
             FindingsTrust::Low,
             RetryRecommendation::Retry,
         ),
-        (ReviewInterruption::Cancelled, true) => (
-            ReviewStatus::Failed,
-            ReviewCompletionStatus::Cancelled,
-            FindingsStatus::Unavailable,
-            FindingsTrust::Low,
-            RetryRecommendation::DoNotRetry,
-        ),
-        (ReviewInterruption::Cancelled, false) => (
+        (ReviewInterruption::Cancelled, true | false) => (
             ReviewStatus::Failed,
             ReviewCompletionStatus::Cancelled,
             FindingsStatus::Unavailable,
@@ -1222,7 +1226,11 @@ fn review_output_invariant_error(output: &ReviewOutput) -> Option<&'static str> 
                 return Some("no-output review status requires failed unavailable result");
             }
         }
-        _ => {}
+        ReviewCompletionStatus::Completed
+        | ReviewCompletionStatus::CompletedWithWarnings
+        | ReviewCompletionStatus::Cancelled
+        | ReviewCompletionStatus::Unavailable
+        | ReviewCompletionStatus::Rejected => {}
     }
     None
 }
@@ -2536,13 +2544,11 @@ mod tests {
 
     #[test]
     fn outcome_after_output_requires_summary_or_findings() {
+        let summaries = vec!["Reviewed chunks before timeout".to_string()];
         let output = ReviewRun::InterruptedAfterOutput {
             target: sample_target(),
             coverage: sample_coverage(),
-            parsed: ParsedReviewOutput::from_parts(
-                Vec::new(),
-                vec!["Reviewed chunks before timeout".to_string()],
-            ),
+            parsed: ParsedReviewOutput::from_parts(Vec::new(), &summaries),
             warnings: Vec::new(),
             usage: phoenix_core::domain::llm_types::Usage::default(),
             reason: "timed out".to_string(),

@@ -2513,29 +2513,26 @@ pub fn transition_parent(
                     });
                 }
 
-                let scope = match commission_review_scope_from_context(context, input) {
-                    Some(scope) => scope,
-                    None => {
-                        let err_msg = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff.".to_string();
-                        let display_data = make_display_data(&content);
-                        let assistant_message = AssistantMessage::new(
-                            request_id.clone(),
-                            content,
-                            Some(usage_data),
-                            display_data,
-                        );
-                        let tool_result = ToolResult::error(tool.id.clone(), err_msg);
-                        let checkpoint =
-                            CheckpointData::tool_round(assistant_message, vec![tool_result])
-                                .expect("commission_review produces exactly one result");
-                        return Ok(ParentTransitionResult::new(ParentState::Core(
-                            CoreState::LlmRequesting { attempt: 1 },
-                        ))
-                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                        .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change())
-                        .with_effect(Effect::RequestLlm));
-                    }
+                let Some(scope) = commission_review_scope_from_context(context, input) else {
+                    let err_msg = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff.".to_string();
+                    let display_data = make_display_data(&content);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
+                    let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                    let checkpoint =
+                        CheckpointData::tool_round(assistant_message, vec![tool_result])
+                            .expect("commission_review produces exactly one result");
+                    return Ok(ParentTransitionResult::new(ParentState::Core(
+                        CoreState::LlmRequesting { attempt: 1 },
+                    ))
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm));
                 };
 
                 // Park for approval without writing a tool_result placeholder.
@@ -3650,7 +3647,7 @@ mod tests {
             .current_dir(repo)
             .status()
             .expect("git runs");
-        assert!(status.success(), "git {:?} failed", args);
+        assert!(status.success(), "git {args:?} failed");
     }
 
     #[test]
