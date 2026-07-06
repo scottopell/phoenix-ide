@@ -333,8 +333,10 @@ AND SHALL display an approval toolbar alongside the standard annotation interfac
 WHEN the prose reader is opened by the system for task approval
 THE SYSTEM SHALL clearly indicate that this is a pending task plan awaiting review
 AND prevent the user from closing the prose reader without choosing an action
-  (Approve, Discard, or Send Feedback)
+  (Approve, Discard/Reject, or Send Feedback/Request Changes)
 AND suppress back/Escape-to-close — the user MUST choose an explicit action
+AND a close/dismiss icon counts as the Discard/Reject action only when it opens
+  the discard confirmation flow rather than passively closing the reader
 
 WHEN the conversation leaves AwaitingTaskApproval state (for any reason)
 THE SYSTEM SHALL automatically close the task approval prose reader
@@ -352,22 +354,24 @@ than accidentally dismissing the review.
 ### REQ-PF-016: Approve, Discard, and Feedback Actions for Task Approval
 
 WHEN prose reader is in task approval mode
-THE SYSTEM SHALL display three primary actions: Approve, Discard, and Send Feedback
+THE SYSTEM SHALL display action affordances for approval, discard/reject, and feedback/request changes
+AND the discard/reject affordance MAY be either an explicit labeled action or a close/dismiss icon
+AND an icon-only discard/reject affordance SHALL expose an accessible name that identifies the discard/reject action
 
-WHEN user taps Approve
+WHEN user taps an approval action
 THE SYSTEM SHALL resolve the approval with an approved outcome
 AND close the task approval prose reader
 AND the system SHALL perform all git operations (write task file, commit, branch,
   checkout) as defined in REQ-PROJ-004
 
-WHEN user taps Discard
+WHEN user taps the discard/reject affordance
 THE SYSTEM SHALL display a confirmation: "Discard this plan? The conversation will
 return to Explore mode."
 AND on confirmation, resolve the approval with a rejected outcome
 AND close the task approval prose reader
 AND NOT perform any git operations (no file was written, nothing to clean up)
 
-WHEN user annotates lines and taps Send Feedback
+WHEN user annotates lines and taps a feedback/request-changes action
 THE SYSTEM SHALL format the annotations as a structured message (per REQ-PF-009 format)
 AND deliver the formatted feedback to the agent as a user message (NOT a tool result —
   the propose_task tool result was already persisted when entering AwaitingTaskApproval)
@@ -380,8 +384,9 @@ AwaitingTaskApproval and opens a fresh prose reader with the updated plan conten
 No content reload or keep-open behavior is needed — each feedback cycle is a clean
 mount/unmount of the prose reader.
 
-**Rationale:** Three explicit actions make the user's choices unambiguous. Approve and
-Discard are terminal decisions; Send Feedback is iterative but each round is a clean
+**Rationale:** The user's choices remain explicit even when the destructive terminal
+decision is framed as a close/dismiss affordance. Approval and discard/reject are
+terminal decisions; feedback/request changes is iterative but each round is a clean
 cycle (close, agent revises, reopen). The discard confirmation prevents accidental loss
 of task proposals that the agent may have worked to produce.
 
