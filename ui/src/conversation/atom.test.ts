@@ -865,6 +865,26 @@ describe('conversationReducer', () => {
       expect(next.phase.type).toBe('awaiting_llm');
     });
 
+    it('applies live awaiting_continuation state changes', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        phase: { type: 'idle' },
+        lastSequenceId: 12,
+      };
+
+      const next = dispatch(atom, {
+        type: 'sse_state_change',
+        sequenceId: 13,
+        phase: { type: 'awaiting_continuation', attempt: 1 },
+        stateUpdatedAt: 1_700_000_000_000,
+      });
+
+      expect(next.phase).toEqual({ type: 'awaiting_continuation', attempt: 1 });
+      expect(next.phaseStateUpdatedAt).toBe(1_700_000_000_000);
+      expect(next.lastSequenceId).toBe(13);
+    });
+
     it('is a no-op for sequenceId already seen', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 10 };
 
@@ -1487,6 +1507,24 @@ describe('conversationReducer', () => {
 
       expect(next.phase.type).toBe('awaiting_llm');
       expect(next.lastSequenceId).toBe(42);
+    });
+
+    it('supports optimistic awaiting_continuation after manual trigger acceptance', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        lastSequenceId: 42,
+      };
+
+      const next = dispatch(atom, {
+        type: 'local_phase_change',
+        phase: { type: 'awaiting_continuation', attempt: 1 },
+        expectedConversationId: 'conv-1',
+      });
+
+      expect(next.phase).toEqual({ type: 'awaiting_continuation', attempt: 1 });
+      expect(next.lastSequenceId).toBe(42);
+      expect(next.phaseStateUpdatedAt).toBeNull();
     });
 
     it('drops when expectedConversationId does not match (post-navigation resolve)', () => {

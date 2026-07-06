@@ -817,10 +817,15 @@ function ConversationPageContent() {
 
     try {
       await api.triggerContinuation(conversationId);
+      dispatch({
+        type: 'local_phase_change',
+        phase: { type: 'awaiting_continuation', attempt: 1 },
+        expectedConversationId: conversationId,
+      });
     } catch (err) {
       console.error('Failed to trigger continuation:', err);
     }
-  }, [conversationId, isArchived]);
+  }, [conversationId, isArchived, dispatch]);
 
   const handleUpgradeModel = useCallback(async (newModelId: string) => {
     if (!conversationId || isArchived || !canChangeModelInState(atom.phase)) return;

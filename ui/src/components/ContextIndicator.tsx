@@ -10,7 +10,7 @@ interface ContextIndicatorProps {
   used: number;
   max: number;
   conversationId: string;
-  /** When provided, the trigger menu includes an "End & summarize now" action. */
+  /** When provided, the trigger menu includes a "Summarize & continue" action. */
   onTriggerContinuation?: (() => void) | undefined;
 }
 
@@ -91,7 +91,7 @@ export function ContextIndicator({ used, max, conversationId, onTriggerContinuat
 
   const usageText = `Context window usage: ${formatTokens(used)} / ${formatTokens(max)} tokens (${percent.toFixed(1)}%).`;
   const tooltipText = canTrigger
-    ? `${usageText} You can end and summarize this conversation to continue in a new one.`
+    ? `${usageText} Phoenix can prepare a handoff summary for a continuation conversation.`
     : usageText;
 
   const handleTrigger = () => {
@@ -140,12 +140,12 @@ export function ContextIndicator({ used, max, conversationId, onTriggerContinuat
               <button
                 className="context-menu-item"
                 onClick={handleTrigger}
-                title="End this conversation and summarize it for continuation"
+                title="Prepare a handoff summary for a continuation conversation"
               >
-                End &amp; summarize now
+                Summarize &amp; continue
               </button>
               <div className="context-menu-hint">
-                Creates a summary so you can continue in a new conversation
+                Prepares a summary so you can continue in a new conversation
               </div>
             </>
           )}

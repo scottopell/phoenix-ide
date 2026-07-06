@@ -333,7 +333,7 @@ describe('StateBar manual continuation action', () => {
 
     fireEvent.click(screen.getByText('100k'));
 
-    const action = await screen.findByRole('button', { name: /end & summarize now/i });
+    const action = await screen.findByRole('button', { name: /summarize & continue/i });
     expect(screen.getByText(/continue in a new conversation/i)).toBeInTheDocument();
 
     fireEvent.click(action);
@@ -351,7 +351,7 @@ describe('StateBar manual continuation action', () => {
 
     fireEvent.click(screen.getByText('100k'));
 
-    expect(screen.queryByRole('button', { name: /end & summarize now/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /summarize & continue/i })).not.toBeInTheDocument();
   });
 });
 

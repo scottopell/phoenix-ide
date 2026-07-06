@@ -3104,12 +3104,35 @@ where
             }
 
             Effect::NotifyStateChange => {
-                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                    sequence_id: seq,
-                    state: self.state.clone(),
-                    presentation_mode: self.state.presentation_mode().to_string(),
-                    state_updated_at: self.state_updated_at,
+                let state = self.state.clone();
+                let state_name = state.variant_name();
+                let presentation_mode = state.presentation_mode().to_string();
+                let state_updated_at = self.state_updated_at;
+                let receiver_count_before = self.broadcast_tx.receiver_count();
+                let conv_id = self.context.conversation_id.clone();
+                let send_result = self.broadcast_tx.send_seq(|seq| {
+                    tracing::debug!(
+                        conv_id = %conv_id,
+                        sequence_id = seq,
+                        state = state_name,
+                        receiver_count = receiver_count_before,
+                        "broadcasting conversation state_change"
+                    );
+                    SseEvent::StateChange {
+                        sequence_id: seq,
+                        state,
+                        presentation_mode,
+                        state_updated_at,
+                    }
                 });
+                if let Ok(receiver_count) = send_result {
+                    tracing::debug!(
+                        conv_id = %self.context.conversation_id,
+                        state = state_name,
+                        receiver_count,
+                        "broadcasted conversation state_change"
+                    );
+                }
                 Ok(None)
             }
 
@@ -7465,6 +7488,48 @@ mod steer_drain_detector_tests {
             "drain must still broadcast the authoritative LlmRequesting StateChange"
         );
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    #[tokio::test]
+    async fn manual_continuation_from_idle_persists_broadcasts_and_requests_summary() {
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-manual-continuation", ConvState::Idle, vec![]);
+        let mut rx = rt.broadcast_tx.subscribe();
+
+        rt.process_event(Event::UserTriggerContinuation)
+            .await
+            .expect("manual continuation trigger must be accepted from idle");
+
+        let persisted = storage
+            .get_state("conv-manual-continuation")
+            .await
+            .expect("state must persist");
+        assert!(
+            matches!(
+                persisted,
+                ConvState::AwaitingContinuation { attempt: 1, .. }
+            ),
+            "manual continuation must persist AwaitingContinuation, got {persisted:?}"
+        );
+        assert!(
+            matches!(rt.state, ConvState::AwaitingContinuation { attempt: 1, .. }),
+            "manual continuation must enter AwaitingContinuation, got {:?}",
+            rt.state
+        );
+
+        let mut saw_awaiting_continuation = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let SseEvent::StateChange { state, .. } = ev {
+                if matches!(state, ConvState::AwaitingContinuation { attempt: 1, .. }) {
+                    saw_awaiting_continuation = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_awaiting_continuation,
+            "manual continuation must broadcast AwaitingContinuation state_change"
+        );
     }
 
     /// Mid-turn drain from `ToolExecuting` → `LlmRequesting`: persists run
