@@ -305,10 +305,30 @@ enum CommissionReviewCall<'a> {
     Malformed(&'a str),
 }
 
+fn git_status_clean(repo: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout.is_empty())
+}
+
+fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", git_ref])
+        .current_dir(repo)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn commission_review_scope_from_context(
     context: &ConvContext,
     _input: &super::state::CommissionReviewInput,
 ) -> Option<CommissionReviewApprovalScope> {
+    if !git_status_clean(&context.working_dir) {
+        return None;
+    }
+
     let (kind, base, head) = match context.mode_context.as_ref() {
         Some(
             ModeContext::Work {
@@ -321,11 +341,17 @@ fn commission_review_scope_from_context(
                 branch_name,
                 ..
             },
-        ) => (
-            "committed_branch_diff".to_string(),
-            format!("refs/remotes/origin/{base_branch}"),
-            branch_name.clone(),
-        ),
+        ) => {
+            let base_ref = format!("refs/remotes/origin/{base_branch}");
+            if !git_ref_exists(&context.working_dir, &base_ref) {
+                return None;
+            }
+            (
+                "committed_branch_diff".to_string(),
+                base_ref,
+                branch_name.clone(),
+            )
+        }
         _ => (
             "committed_branch_diff".to_string(),
             format!(
@@ -3667,6 +3693,41 @@ mod tests {
         assert!(!scope.dirty);
     }
 
+    #[test]
+    fn commission_review_scope_rejects_dirty_work_context_and_missing_base_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]);
+        git_ok(repo, &["config", "user.email", "t@t.t"]);
+        git_ok(repo, &["config", "user.name", "t"]);
+        git_ok(repo, &["config", "commit.gpgsign", "false"]);
+        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]);
+
+        let mut ctx = context_with_dir(repo);
+        ctx.mode_context = Some(ModeContext::Work {
+            branch_name: "task".to_string(),
+            base_branch: "develop".to_string(),
+            worktree_path: repo.display().to_string(),
+        });
+        let input = CommissionReviewInput {
+            brief: "Ready".to_string(),
+            focus: None,
+        };
+        assert!(commission_review_scope_from_context(&ctx, &input).is_none());
+
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .expect("git rev-parse");
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        git_ok(repo, &["update-ref", "refs/remotes/origin/develop", &head]);
+        assert!(commission_review_scope_from_context(&ctx, &input).is_some());
+
+        std::fs::write(repo.join("dirty.rs"), "uncommitted\n").expect("write dirty file");
+        assert!(commission_review_scope_from_context(&ctx, &input).is_none());
+    }
+
     fn test_tool_call(id: &str) -> ToolCall {
         ToolCall::new(
             id,
@@ -6109,12 +6170,27 @@ mod tests {
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
         fn work_context() -> ConvContext {
-            let mut context = test_context();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let repo = dir.path().to_path_buf();
+            git_ok(&repo, &["init", "-q"]);
+            git_ok(&repo, &["config", "user.email", "t@t.t"]);
+            git_ok(&repo, &["config", "user.name", "t"]);
+            git_ok(&repo, &["config", "commit.gpgsign", "false"]);
+            git_ok(&repo, &["commit", "-qm", "base", "--allow-empty"]);
+            let head = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .expect("git rev-parse");
+            let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+            git_ok(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+            let mut context = context_with_dir(&repo);
             context.mode_context = Some(ModeContext::Work {
                 branch_name: "task".to_string(),
                 base_branch: "main".to_string(),
-                worktree_path: "/tmp/wt".to_string(),
+                worktree_path: repo.display().to_string(),
             });
+            std::mem::forget(dir);
             context
         }
 
