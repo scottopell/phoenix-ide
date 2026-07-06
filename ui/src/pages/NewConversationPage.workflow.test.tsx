@@ -72,6 +72,12 @@ function renderPage() {
   );
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => { resolve = r; });
+  return { promise, resolve };
+}
+
 async function settleValidation() {
   await act(async () => {
     await new Promise(resolve => setTimeout(resolve, 350));
@@ -514,6 +520,39 @@ describe('/new workflow modes', () => {
     await screen.findAllByText('No active tasks found.');
     fireEvent.change(screen.getAllByPlaceholderText('Optional notes for this task…')[0]!, { target: { value: 'notes only' } });
     expect(screen.getAllByRole('button', { name: 'Send' })[0]).toBeDisabled();
+  });
+
+  it('ignores a stale lazy task response after cwd changes', async () => {
+    const repoOneTasks = deferred<{ tasks: typeof task[] }>();
+    const repoTwoTask = {
+      ...task,
+      id: '07004',
+      slug: 'repo-two-task',
+      path: '/repo-two/tasks/07004-p1-ready--repo-two-task.md',
+    };
+    vi.mocked(api.listProjectTasks).mockImplementation((cwd: string) => {
+      if (cwd === '/repo') return repoOneTasks.promise;
+      return Promise.resolve({ tasks: [repoTwoTask] });
+    });
+    renderPage();
+
+    await settleValidation();
+    fireEvent.click(screen.getAllByText('Start from a task')[0]!);
+    await waitFor(() => expect(api.listProjectTasks).toHaveBeenCalledWith('/repo'));
+
+    fireEvent.change(screen.getAllByDisplayValue('/repo')[0]!, { target: { value: '/repo-two' } });
+    await settleValidation();
+    await waitFor(() => expect(api.getProjectTaskAvailability).toHaveBeenCalledWith('/repo-two'));
+
+    await act(async () => {
+      repoOneTasks.resolve({ tasks: [task] });
+      await Promise.resolve();
+    });
+    expect(screen.queryByText('27108 · refine-new-workflows')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByText('Start from a task')[0]!);
+    await waitFor(() => expect(api.listProjectTasks).toHaveBeenCalledWith('/repo-two'));
+    expect((await screen.findAllByText('07004 · repo-two-task')).length).toBeGreaterThan(0);
   });
 
   it('submits task workflow with propose-task prompt and managed mode', async () => {

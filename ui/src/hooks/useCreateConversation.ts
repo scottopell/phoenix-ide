@@ -231,6 +231,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => {
     setBranches([]);
     setTasks([]);
+    taskAvailabilityRequestSeqRef.current += 1;
+    taskListRequestSeqRef.current += 1;
     setTaskAvailabilityLoading(false);
     setTaskAvailable(null);
     setTasksLoading(false);
@@ -247,6 +249,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
     if (!isGitDir) {
       setBranches([]);
       setTasks([]);
+      taskAvailabilityRequestSeqRef.current += 1;
+      taskListRequestSeqRef.current += 1;
       setTaskAvailabilityLoading(false);
       setTaskAvailable(null);
       setTasksLoading(false);
