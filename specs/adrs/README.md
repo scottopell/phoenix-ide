@@ -15,6 +15,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [001](001_bash-first-class-handles.md) | Bash handles are first-class process-local entities with wait windows | Accepted | REQ-BASH-001, REQ-BASH-002, REQ-BASH-003, REQ-BASH-005, REQ-BASH-009, REQ-BASH-014, REQ-BASH-WS-001, REQ-BASH-WS-002 |
 | [002](002_bash-watch-backed-handle-state.md) | Bash handle state uses watch-backed exit notifications and snapshot shaping | Accepted | REQ-BASH-001, REQ-BASH-003, REQ-BASH-004, REQ-BASH-005, REQ-BASH-006, REQ-BASH-014, REQ-BASH-WS-002 |
 | [003](003_bash-process-cleanup-uses-subreaper-kill-tree.md) | Bash process cleanup uses subreaper plus shutdown kill-tree | Accepted | REQ-BASH-003, REQ-BASH-006, REQ-BASH-007 |
+| [004](004_inline-terminal-shared-history-per-command.md) | Inline terminal records user commands as per-command bash rounds in shared history | Accepted | REQ-IT-003, REQ-IT-004, REQ-IT-005, REQ-IT-007 |
+| [005](005_user-tool-invocation-self-service-scope.md) | User tool invocation is limited to self-service tools; director tools deferred | Accepted | REQ-UTI-003, REQ-UTI-006, REQ-IT-002 |
 
 ## For agents: which decisions bind your task
 
@@ -28,15 +30,19 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying bash command execution / wait-window semantics | 001 |
 | Specifying bash handle state observation or response shaping | 002 |
 | Specifying bash process cleanup, shutdown cleanup, or kill escalation policy | 003 |
+| Specifying inline-terminal history commit, per-command rounds, or user-origin attribution | 004 |
+| Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
 
 ## Decision dependencies
 
 ```text
 ADR-000 (adopt spEARS v2 for new work)
    └── establishes the shared ADR chain and incremental legacy-spec migration path
-      └── ADR-001 (Bash handles are first-class process-local entities with wait windows)
-         ├── ADR-002 (Bash handle state uses watch-backed exit notifications and snapshot shaping)
-         └── ADR-003 (Bash process cleanup uses subreaper plus shutdown kill-tree)
+      ├── ADR-001 (Bash handles are first-class process-local entities with wait windows)
+      │  ├── ADR-002 (Bash handle state uses watch-backed exit notifications and snapshot shaping)
+      │  └── ADR-003 (Bash process cleanup uses subreaper plus shutdown kill-tree)
+      └── ADR-005 (User tool invocation is limited to self-service tools)
+         └── ADR-004 (Inline terminal records per-command bash rounds in shared history — the bash specialization)
 ```
 
 ## Conventions

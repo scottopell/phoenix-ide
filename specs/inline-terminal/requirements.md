@@ -42,6 +42,13 @@ with the conversation's working directory as its cwd. It is a
 full terminal — line editing, completion, colour, and interactive programs work
 as in any native terminal — not a single command string.
 
+Shell integration (OSC 133 markers) is a prerequisite for the per-command
+history commit (REQ-IT-003) and for the empty-line detection the
+return-to-composer gesture relies on (REQ-IT-006). A shell without integration
+still yields a working interactive terminal, but commits no rounds and leaves
+shell exit (`Ctrl-D`) as the only close path; the implementation surfaces this
+degradation to the user rather than the spec modeling it.
+
 ### REQ-IT-002 — Opening is gated to an idle conversation
 
 An inline terminal session may be opened only when the conversation is idle.

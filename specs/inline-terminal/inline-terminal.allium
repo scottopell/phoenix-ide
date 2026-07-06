@@ -290,8 +290,8 @@ rule UserClosesInlineTerminal {
         --      line empties is consumed by the terminal, not read as the exit
         --      gesture. Detecting an empty input line depends on OSC 133 prompt
         --      markers / cursor position; a shell without integration falls back
-        --      to shell exit (Ctrl-D) as the only close path (see the
-        --      ShellIntegrationPrerequisite note in design.md).
+        --      to shell exit (Ctrl-D) as the only close path (see the shell
+        --      integration prerequisite in requirements.md, REQ-IT-001).
         -- The interrupted flush reads session.open_command and commits BEFORE
         -- the PTY teardown, so it does not race the terminal dropping its
         -- current_command. The conversation returns to idle WITHOUT an LLM
@@ -527,7 +527,7 @@ deferred OriginDiscriminatorSchema
     -- an `origin` column (default `agent` for existing rows — a true-absence
     -- default, since pre-feature messages were all agent-authored). Tracked here
     -- so the schema addition is visible the way the core_status coupling is,
-    -- rather than implied by design.md.
+    -- rather than left implicit. Rationale: ADR-004.
     -- Location: crates/phoenix-core/src/domain/db_schema.rs
 
 deferred TuiCursorAddressedOutput

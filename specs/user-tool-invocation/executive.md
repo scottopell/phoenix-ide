@@ -62,16 +62,19 @@ discriminator, the Track B commit path) is the common core both surfaces use;
 this spec is where that core is defined, and the inline terminal is the proof
 that the model carries a real consumer.
 
-## Key Design Decisions
+## Design decisions
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| History model | Shared (Track B) | A user-run tool reads back to the agent exactly like an agent tool round; manual and agent work compose into one record |
-| Attribution | Single `origin` discriminator | LLM-history role and UI attribution both derived; no parallel representations |
-| Tool scope | Eligibility criterion, not a list: meaningful + self-service + not dominated | Survivors are `bash` and shell-less integrations (MCP/custom); dominated tools defer to the terminal, director tools are deferred |
-| Validation | Parse-time, against the registry | A typo is a synchronous rejection, never a malformed tool that executes |
-| Conversation state | Idle-gated, no agent turn | The user advances the conversation without invoking the model |
-| `bash` surface | The inline terminal | An interactive PTY is a richer fit for `bash` than a one-shot string; same round shape |
+The rationale lives in the project ADR chain:
+
+- **ADR-005** — the eligibility scope (meaningful + self-service + not-dominated;
+  director tools deferred) and why the worker-vs-control taxonomy was rejected.
+- **ADR-004** — the inline terminal, the `bash` specialization of this model
+  (Track B shared history, per-command rounds, user-origin attribution).
+
+At a glance: eligibility is a criterion, not a list (survivors are `bash` and
+shell-less integrations); each invocation is a user-originated tool round in
+shared history (Track B), attributed by a single `origin` marker; invocations are
+validated at parse time and idle-gated with no agent turn.
 
 ## Status Summary
 

@@ -43,20 +43,23 @@ conversation rather than an out-of-band side channel the agent never sees.
 - Sharing one session with the per-WorkScope panel terminal
 - The general `$tool` / `T.tool` user-invocation syntax for other eligible tools (`specs/user-tool-invocation`)
 
-## Key Design Decisions
+## Design decisions
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| Open trigger | `!` as first composer char | Distinct from `@`/`/` prose expansion; switches the composer to terminal mode rather than submitting a message |
-| History model | Shared (Track B) | Inline rounds shaped exactly like agent `bash` rounds so a later agent turn reads them with no special case |
-| Round shape | `bash` tool-use + tool-result, `op: run` | Reuses the agent tool-round message path; no new `MessageContent` variant |
-| Command granularity | Per OSC 133 command | The `CommandTracker` already decomposes a session into discrete `CommandRecord`s — the natural commit unit |
-| Started-but-uncompleted command | Interrupted round on supersession | Every `C` resolves to exactly one round; user activity never silently disappears |
-| Conversation state while live | Busy (`inline_terminal`), never requests LLM | Mutual exclusion with agent tool rounds prevents two writers interleaving into history |
-| Session vs panel terminal | Separate, short-lived | Preserves `specs/terminal` "one panel terminal per WorkScope" |
-| Attribution | Single `origin` discriminator | LLM-history role and UI attribution are both derived; no parallel representations (mirrors `MessageContent::Skill`) |
-| Result content type | Typed `ToolResult` content, not bare `String` | Leaves room for cursor-addressing-program resolution (empty for alt-screen, vt100-resolved for in-place rewriting) without migration |
-| Deny-gate | Not applied | Server-hosted shell (server's Unix user), ungated like the panel terminal; honesty comes from `origin: user` provenance |
+The rationale — the alternatives weighed and their tradeoffs — lives in the
+project ADR chain:
+
+- **ADR-004** — Track B shared history, per-command commit, the dedicated
+  `InlinePty`, and user-origin attribution: why user commands become
+  agent-visible `bash` rounds rather than a private track.
+- **ADR-005** — user tool invocation scope (self-service; director tools
+  deferred), of which the inline terminal is the `bash` specialization.
+
+At a glance: `!` opens the terminal (distinct from `@`/`/` prose expansion); each
+OSC-133 command commits as a `bash`-`run` round; a started-but-uncompleted
+command commits interrupted (every `C` resolves to exactly one round); the
+conversation is busy while live and returns to idle on close with no agent turn;
+the deny-gate does not apply (server-hosted shell), with honesty from
+`origin: user` provenance.
 
 ## The Central Invariant
 
