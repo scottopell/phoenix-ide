@@ -570,6 +570,10 @@ export interface TaskEntry {
   slug: string;
   /** Absolute path to the task file on disk. */
   path: string;
+  /** Git ref the task was listed from, when different from the current checkout. */
+  source_ref?: string;
+  /** Task body loaded from source_ref for preview. */
+  content?: string;
   /** Slug of the conversation working on this task, if any. */
   conversation_slug?: string;
 }

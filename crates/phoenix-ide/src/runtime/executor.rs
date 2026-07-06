@@ -5720,7 +5720,9 @@ fn resolve_approval_base_branch(
         }
         b
     };
-    crate::git_ops::materialize_branch(cwd, &base_branch).map_err(|e| e.to_string())?;
+    if run_git(cwd, &["rev-parse", "--verify", &base_branch]).is_err() {
+        crate::git_ops::materialize_branch(cwd, &base_branch).map_err(|e| e.to_string())?;
+    }
     Ok(base_branch)
 }
 

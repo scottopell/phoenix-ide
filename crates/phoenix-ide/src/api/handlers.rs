@@ -2019,12 +2019,14 @@ fn create_managed_explore_worktree_blocking(
 ) -> Result<String, ManagedWorktreeError> {
     let cwd = std::path::Path::new(repo_root);
 
-    materialize_branch(cwd, base_branch).map_err(|e| match e {
-        GitOpError::BranchNotFound(b) => ManagedWorktreeError::BadRequest(format!(
-            "Branch '{b}' not found locally or at origin",
-        )),
-        other => ManagedWorktreeError::Git(other.to_string()),
-    })?;
+    if run_git(cwd, &["rev-parse", "--verify", base_branch]).is_err() {
+        materialize_branch(cwd, base_branch).map_err(|e| match e {
+            GitOpError::BranchNotFound(b) => ManagedWorktreeError::BadRequest(format!(
+                "Branch '{b}' not found locally or at origin",
+            )),
+            other => ManagedWorktreeError::Git(other.to_string()),
+        })?;
+    }
 
     let id_prefix: String = conv_id.chars().take(8).collect();
     let temp_branch = format!("task-pending-{id_prefix}");
@@ -4811,6 +4813,8 @@ async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<Ta
                     status: t.status.to_string(),
                     slug: t.slug,
                     path: t.path.to_string_lossy().into_owned(),
+                    source_ref: None,
+                    content: None,
                 },
                 conversation_slug,
             )
@@ -4824,6 +4828,8 @@ struct TaskEntryParts {
     status: String,
     slug: String,
     path: String,
+    source_ref: Option<String>,
+    content: Option<String>,
 }
 
 fn task_entry_with_conversation(
@@ -4836,6 +4842,8 @@ fn task_entry_with_conversation(
         status: parts.status,
         slug: parts.slug,
         path: parts.path,
+        source_ref: parts.source_ref,
+        content: parts.content,
         conversation_slug,
     }
 }
@@ -4849,6 +4857,8 @@ fn local_task_entry_parts(cwd: &std::path::Path, tasks_dir_name: &str) -> Vec<Ta
             status: t.status.to_string(),
             slug: t.slug,
             path: t.path.to_string_lossy().into_owned(),
+            source_ref: None,
+            content: None,
         })
         .collect()
 }
@@ -4856,6 +4866,9 @@ fn local_task_entry_parts(cwd: &std::path::Path, tasks_dir_name: &str) -> Vec<Ta
 fn fetch_origin_for_project_tasks(cwd: &std::path::Path) {
     let _ = run_git(cwd, &["fetch", "origin"])
         .inspect_err(|e| tracing::debug!(error = %e, "project task refresh fetch failed"));
+    let _ = run_git(cwd, &["remote", "set-head", "origin", "--auto"]).inspect_err(
+        |e| tracing::debug!(error = %e, "project task refresh origin HEAD update failed"),
+    );
 }
 
 fn refreshed_default_task_ref(cwd: &std::path::Path) -> Option<String> {
@@ -4882,6 +4895,15 @@ fn task_entries_from_git_ref(
     ref_name: &str,
     tasks_dir_name: &str,
 ) -> Vec<TaskEntryParts> {
+    task_entries_from_git_ref_with_limit(cwd, ref_name, tasks_dir_name, None)
+}
+
+fn task_entries_from_git_ref_with_limit(
+    cwd: &std::path::Path,
+    ref_name: &str,
+    tasks_dir_name: &str,
+    limit: Option<usize>,
+) -> Vec<TaskEntryParts> {
     let tasks_prefix = format!("{}/", tasks_dir_name.trim_end_matches('/'));
     let output = run_git(
         cwd,
@@ -4902,14 +4924,18 @@ fn task_entries_from_git_ref(
                 .file_name()
                 .and_then(|name| name.to_str())?;
             let parsed = taskmd_core::filename::parse_filename(filename)?;
+            let content = run_git(cwd, &["show", &format!("{ref_name}:{repo_relative_path}")]).ok();
             Some(TaskEntryParts {
                 id: parsed.id,
                 priority: parsed.priority.to_string(),
                 status: parsed.status.to_string(),
                 slug: parsed.slug,
                 path: cwd.join(repo_relative_path).to_string_lossy().into_owned(),
+                source_ref: Some(ref_name.to_string()),
+                content,
             })
         })
+        .take(limit.unwrap_or(usize::MAX))
         .collect()
 }
 
@@ -4940,7 +4966,19 @@ async fn project_task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -
 }
 
 fn project_tasks_available(cwd: &std::path::Path) -> bool {
-    !project_task_entries_from_default_ref(cwd).is_empty()
+    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
+        .to_string_lossy()
+        .into_owned();
+    let Some(task_ref) = refreshed_default_task_ref(cwd) else {
+        return local_task_entry_parts(cwd, &tasks_dir_name)
+            .into_iter()
+            .next()
+            .is_some();
+    };
+    task_entries_from_git_ref_with_limit(cwd, &task_ref, &tasks_dir_name, Some(1))
+        .into_iter()
+        .next()
+        .is_some()
 }
 
 async fn get_project_task_availability(
@@ -8859,9 +8897,31 @@ mod project_task_ref_tests {
         assert_eq!(entries[0].id, "07004");
         assert_eq!(entries[0].slug, "merged-target-task");
         assert_eq!(entries[0].status, "ready");
+        assert_eq!(entries[0].source_ref.as_deref(), Some("origin/main"));
+        assert_eq!(entries[0].content.as_deref(), Some("# merged task"));
         assert!(entries[0]
             .path
             .ends_with("tasks/07004-p1-ready--merged-target-task.md"));
+    }
+
+    #[test]
+    fn managed_worktree_can_start_from_listed_remote_ref() {
+        let repo = repo_with_remote_only_task();
+
+        let worktree = match create_managed_explore_worktree_blocking(
+            repo.path().to_str().unwrap(),
+            "12345678-1234-1234-1234-123456789abc",
+            "origin/main",
+        ) {
+            Ok(path) => path,
+            Err(ManagedWorktreeError::BadRequest(e) | ManagedWorktreeError::Git(e)) => {
+                panic!("{e}")
+            }
+        };
+
+        assert!(std::path::Path::new(&worktree)
+            .join("tasks/07004-p1-ready--merged-target-task.md")
+            .exists());
     }
 }
 

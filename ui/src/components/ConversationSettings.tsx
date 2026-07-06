@@ -125,7 +125,7 @@ export function ConversationSettings({
   }, [setBranchSearch, setWorkflow]);
 
   const selectTask = useCallback((task: TaskEntry) => {
-    setWorkflow?.({ kind: 'planFromTask', task, baseBranch: null });
+    setWorkflow?.({ kind: 'planFromTask', task, baseBranch: task.source_ref ?? null });
     setBranchSearch?.('');
     setComboOpen(false);
   }, [setBranchSearch, setWorkflow]);
@@ -145,6 +145,11 @@ export function ConversationSettings({
     }
     let cancelled = false;
     setTaskDetailLoading(true);
+    if (selectedTask.content !== undefined) {
+      setTaskDetail({ path: selectedTask.path, content: selectedTask.content });
+      setTaskDetailLoading(false);
+      return () => { cancelled = true; };
+    }
     fetch(`/api/files/read?path=${encodeURIComponent(selectedTask.path)}&cwd=${encodeURIComponent(cwd)}`)
       .then(async resp => {
         if (!resp.ok) throw new Error('Failed to read task');
@@ -267,7 +272,8 @@ export function ConversationSettings({
                 className={`workflow-card ${!taskWorkflowEnabled ? 'workflow-card--disabled' : ''} ${workflow.kind === 'planFromTask' ? 'workflow-card--active' : ''}`}
                 onClick={() => {
                   if (!taskWorkflowEnabled) return;
-                  chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: null });
+                  const task = workflow.kind === 'planFromTask' ? workflow.task : null;
+                  chooseWorkflow({ kind: 'planFromTask', task, baseBranch: task?.source_ref ?? null });
                   loadProjectTasks?.();
                 }}
               >
@@ -279,7 +285,8 @@ export function ConversationSettings({
                   disabled={!taskWorkflowEnabled}
                   onChange={() => {
                     if (!taskWorkflowEnabled) return;
-                    chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: null });
+                    const task = workflow.kind === 'planFromTask' ? workflow.task : null;
+                  chooseWorkflow({ kind: 'planFromTask', task, baseBranch: task?.source_ref ?? null });
                     loadProjectTasks?.();
                   }}
                 />

@@ -556,6 +556,9 @@ describe('/new workflow modes', () => {
   });
 
   it('submits task workflow with propose-task prompt and managed mode', async () => {
+    vi.mocked(api.listProjectTasks).mockResolvedValue({
+      tasks: [{ ...task, source_ref: 'origin/main', content: '# Remote task body\n' }],
+    });
     renderPage();
 
     await settleValidation();
@@ -563,13 +566,14 @@ describe('/new workflow modes', () => {
     fireEvent.click(screen.getAllByText('Start from a task')[0]!);
     await waitFor(() => expect(api.listProjectTasks).toHaveBeenCalledWith('/repo'));
     fireEvent.click(screen.getAllByText('27108 · refine-new-workflows')[0]!);
+    expect((await screen.findAllByText('Remote task body')).length).toBeGreaterThan(0);
     fireEvent.change(screen.getAllByPlaceholderText('Optional notes for this task…')[0]!, { target: { value: 'extra notes' } });
     fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
 
     await waitFor(() => expect(api.createConversation).toHaveBeenCalled());
     const [, text,,,, mode, baseBranch] = vi.mocked(api.createConversation).mock.calls[0]!;
     expect(mode).toBe('managed');
-    expect(baseBranch).toBe('main');
+    expect(baseBranch).toBe('origin/main');
     expect(text).toContain('Call the propose_task tool');
     expect(text).toContain('tasks/27108-p1-ready--refine-new-workflows.md');
     expect(text).toContain('extra notes');

@@ -349,6 +349,9 @@ pub(crate) fn materialize_branch(cwd: &Path, branch_name: &str) -> Result<(), Gi
 /// Routing all diff-comparison call sites through this helper makes them
 /// prefer the remote-tracking ref when one exists.
 pub(crate) fn effective_base_ref(cwd: &Path, base_branch: &str) -> String {
+    if base_branch.starts_with("origin/") || base_branch.starts_with("refs/") {
+        return base_branch.to_string();
+    }
     let remote = format!("origin/{base_branch}");
     if run_git(cwd, &["rev-parse", "--verify", &remote]).is_ok() {
         remote
