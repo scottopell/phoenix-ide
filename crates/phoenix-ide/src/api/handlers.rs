@@ -37,8 +37,10 @@ use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
     GitOpError, PhoenixIgnoreStrategy,
 };
+use crate::git_start::{GitStartError, GitStartPoint};
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
+use crate::task_listing::TaskEntryParts;
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -1683,13 +1685,18 @@ async fn create_conversation_with_id(
                 )
             })?;
         validate_user_ref(base_branch)?;
-        let checkout_ref = req.checkout_ref.as_deref().unwrap_or(base_branch);
-        validate_user_ref(checkout_ref)?;
-        managed_base_branch = Some(base_branch.to_string());
+        if let Some(checkout_ref) = req.checkout_ref.as_deref() {
+            validate_user_ref(checkout_ref)?;
+        }
+        let repo_path = std::path::Path::new(&repo_root);
+        let start =
+            GitStartPoint::for_create_request(repo_path, base_branch, req.checkout_ref.as_deref())
+                .map_err(git_start_error_to_app_error)?;
+        managed_base_branch = Some(start.logical_base().to_string());
 
         let conv_id = id.clone();
-        let branch = base_branch.to_string();
-        let checkout = checkout_ref.to_string();
+        let branch = start.logical_base().to_string();
+        let checkout = start.checkout_ref().to_string();
         let repo = repo_root.clone();
 
         let result = tokio::task::spawn_blocking(move || {
@@ -1700,7 +1707,6 @@ async fn create_conversation_with_id(
 
         let worktree_path = match result {
             Ok(p) => p,
-            Err(ManagedWorktreeError::BadRequest(msg)) => return Err(AppError::BadRequest(msg)),
             Err(ManagedWorktreeError::Git(msg)) => return Err(AppError::Internal(msg)),
         };
 
@@ -1921,6 +1927,15 @@ fn validate_user_ref(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn git_start_error_to_app_error(error: GitStartError) -> AppError {
+    match error {
+        GitStartError::BranchNotFound(_) | GitStartError::DetachedHead => {
+            AppError::BadRequest(error.to_string())
+        }
+        GitStartError::Git(message) => AppError::Internal(message),
+    }
+}
+
 /// Create a git worktree for an existing branch. Runs on a blocking thread.
 ///
 /// Delegates to `git_ops::{materialize_branch, check_branch_conflict, create_worktree}`.
@@ -2009,8 +2024,6 @@ fn create_branch_worktree_blocking(
 /// base branch. At approval time, `execute_approve_task_blocking` detects
 /// the existing worktree and renames the branch.
 enum ManagedWorktreeError {
-    /// User-input failure (e.g. branch doesn't exist locally or at origin).
-    BadRequest(String),
     /// Infrastructure failure (worktree creation, generic git errors).
     Git(String),
 }
@@ -2022,20 +2035,6 @@ fn create_managed_explore_worktree_blocking(
     checkout_ref: &str,
 ) -> Result<String, ManagedWorktreeError> {
     let cwd = std::path::Path::new(repo_root);
-
-    let checkout_is_explicit_ref =
-        checkout_ref.starts_with("origin/") || checkout_ref.starts_with("refs/");
-    if checkout_is_explicit_ref {
-        run_git(cwd, &["rev-parse", "--verify", checkout_ref])
-            .map_err(ManagedWorktreeError::Git)?;
-    } else {
-        materialize_branch(cwd, checkout_ref).map_err(|e| match e {
-            GitOpError::BranchNotFound(b) => ManagedWorktreeError::BadRequest(format!(
-                "Branch '{b}' not found locally or at origin",
-            )),
-            other => ManagedWorktreeError::Git(other.to_string()),
-        })?;
-    }
 
     let id_prefix: String = conv_id.chars().take(8).collect();
     let temp_branch = format!("task-pending-{id_prefix}");
@@ -4832,16 +4831,6 @@ async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<Ta
         .collect()
 }
 
-struct TaskEntryParts {
-    id: String,
-    priority: String,
-    status: String,
-    slug: String,
-    path: String,
-    source_ref: Option<String>,
-    content: Option<String>,
-}
-
 fn task_entry_with_conversation(
     parts: TaskEntryParts,
     conversation_slug: Option<String>,
@@ -4859,135 +4848,20 @@ fn task_entry_with_conversation(
 }
 
 fn local_task_entry_parts(cwd: &std::path::Path, tasks_dir_name: &str) -> Vec<TaskEntryParts> {
-    taskmd_core::tasks::list_tasks(&cwd.join(tasks_dir_name))
-        .into_iter()
-        .map(|t| TaskEntryParts {
-            id: t.id,
-            priority: t.priority.to_string(),
-            status: t.status.to_string(),
-            slug: t.slug,
-            path: t.path.to_string_lossy().into_owned(),
-            source_ref: None,
-            content: None,
-        })
-        .collect()
-}
-
-fn fetch_origin_for_project_tasks(cwd: &std::path::Path) {
-    let _ = run_git(cwd, &["fetch", "origin"])
-        .inspect_err(|e| tracing::debug!(error = %e, "project task refresh fetch failed"));
-    let _ = run_git(cwd, &["remote", "set-head", "origin", "--auto"]).inspect_err(
-        |e| tracing::debug!(error = %e, "project task refresh origin HEAD update failed"),
-    );
-}
-
-fn refreshed_default_task_ref(cwd: &std::path::Path) -> Option<String> {
-    fetch_origin_for_project_tasks(cwd);
-    let default_branch = run_git(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"])
-        .ok()
-        .and_then(|s| {
-            s.trim()
-                .strip_prefix("refs/remotes/origin/")
-                .map(String::from)
-        })?;
-    let remote_ref = format!("origin/{default_branch}");
-    if run_git(cwd, &["rev-parse", "--verify", &remote_ref]).is_ok() {
-        Some(remote_ref)
-    } else if run_git(cwd, &["rev-parse", "--verify", &default_branch]).is_ok() {
-        Some(default_branch)
-    } else {
-        None
-    }
-}
-
-fn discover_task_dir_from_git_ref(cwd: &std::path::Path, ref_name: &str) -> String {
-    let output = run_git(cwd, &["ls-tree", "-r", "--name-only", ref_name]).unwrap_or_default();
-    let mut candidates: Vec<String> = output
-        .lines()
-        .filter_map(|path| {
-            let mut parts = path.split('/');
-            let dir = parts.next()?;
-            let file = parts.next()?;
-            if parts.next().is_none() && file == taskmd_core::constants::TEMPLATE_FILENAME {
-                Some(dir.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-    candidates.sort();
-    if candidates
-        .iter()
-        .any(|name| name == taskmd_core::constants::DEFAULT_TASKS_DIR_NAME)
-    {
-        taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string()
-    } else {
-        candidates.into_iter().next().unwrap_or_else(|| {
-            taskmd_core::discover::discover_or_default(cwd)
-                .to_string_lossy()
-                .into_owned()
-        })
-    }
-}
-
-fn task_entries_from_git_ref(
-    cwd: &std::path::Path,
-    ref_name: &str,
-    tasks_dir_name: &str,
-) -> Vec<TaskEntryParts> {
-    task_entries_from_git_ref_with_limit(cwd, ref_name, tasks_dir_name, None)
-}
-
-fn task_entries_from_git_ref_with_limit(
-    cwd: &std::path::Path,
-    ref_name: &str,
-    tasks_dir_name: &str,
-    limit: Option<usize>,
-) -> Vec<TaskEntryParts> {
-    let tasks_prefix = format!("{}/", tasks_dir_name.trim_end_matches('/'));
-    let output = run_git(
-        cwd,
-        &[
-            "ls-tree",
-            "-r",
-            "--name-only",
-            ref_name,
-            "--",
-            &tasks_prefix,
-        ],
-    )
-    .unwrap_or_default();
-    output
-        .lines()
-        .filter_map(|repo_relative_path| {
-            let filename = std::path::Path::new(repo_relative_path)
-                .file_name()
-                .and_then(|name| name.to_str())?;
-            let parsed = taskmd_core::filename::parse_filename(filename)?;
-            let content = run_git(cwd, &["show", &format!("{ref_name}:{repo_relative_path}")]).ok();
-            Some(TaskEntryParts {
-                id: parsed.id,
-                priority: parsed.priority.to_string(),
-                status: parsed.status.to_string(),
-                slug: parsed.slug,
-                path: cwd.join(repo_relative_path).to_string_lossy().into_owned(),
-                source_ref: Some(ref_name.to_string()),
-                content,
-            })
-        })
-        .take(limit.unwrap_or(usize::MAX))
-        .collect()
+    let root = crate::resolution_root::ResolutionRoot::working_dir(cwd);
+    crate::task_listing::list_task_entries(&root, cwd, tasks_dir_name, None)
 }
 
 fn project_task_entries_from_default_ref(cwd: &std::path::Path) -> Vec<TaskEntryParts> {
-    let Some(task_ref) = refreshed_default_task_ref(cwd) else {
+    let Some(start) = GitStartPoint::for_default_task_start(cwd) else {
         let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
             .to_string_lossy()
             .into_owned();
         return local_task_entry_parts(cwd, &tasks_dir_name);
     };
-    let tasks_dir_name = discover_task_dir_from_git_ref(cwd, &task_ref);
-    task_entries_from_git_ref(cwd, &task_ref, &tasks_dir_name)
+    let root = crate::resolution_root::ResolutionRoot::from_start_point(cwd, &start);
+    let tasks_dir_name = crate::task_listing::discover_task_dir(&root, cwd);
+    crate::task_listing::list_task_entries(&root, cwd, &tasks_dir_name, None)
 }
 
 async fn project_task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<TaskEntry> {
@@ -5007,7 +4881,7 @@ async fn project_task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -
 }
 
 fn project_tasks_available(cwd: &std::path::Path) -> bool {
-    let Some(task_ref) = refreshed_default_task_ref(cwd) else {
+    let Some(start) = GitStartPoint::for_default_task_start(cwd) else {
         let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
             .to_string_lossy()
             .into_owned();
@@ -5016,8 +4890,9 @@ fn project_tasks_available(cwd: &std::path::Path) -> bool {
             .next()
             .is_some();
     };
-    let tasks_dir_name = discover_task_dir_from_git_ref(cwd, &task_ref);
-    task_entries_from_git_ref_with_limit(cwd, &task_ref, &tasks_dir_name, Some(1))
+    let root = crate::resolution_root::ResolutionRoot::from_start_point(cwd, &start);
+    let tasks_dir_name = crate::task_listing::discover_task_dir(&root, cwd);
+    crate::task_listing::list_task_entries(&root, cwd, &tasks_dir_name, Some(1))
         .into_iter()
         .next()
         .is_some()
@@ -8974,9 +8849,7 @@ mod project_task_ref_tests {
             "origin/main",
         ) {
             Ok(path) => path,
-            Err(ManagedWorktreeError::BadRequest(e) | ManagedWorktreeError::Git(e)) => {
-                panic!("{e}")
-            }
+            Err(ManagedWorktreeError::Git(e)) => panic!("{e}"),
         };
 
         assert!(std::path::Path::new(&worktree)

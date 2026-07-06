@@ -10,6 +10,7 @@ mod chain_runtime;
 mod conversation_cwd;
 mod discovery;
 pub(crate) mod git_ops;
+pub(crate) mod git_start;
 mod mcp_oauth_store;
 mod message_expander;
 mod phx_cli;
@@ -18,6 +19,7 @@ mod resolution_root;
 mod runtime;
 mod suggest;
 mod system_prompt;
+mod task_listing;
 mod title_generator;
 mod tls;
 

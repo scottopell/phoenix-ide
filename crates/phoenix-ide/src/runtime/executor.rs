@@ -5704,29 +5704,9 @@ fn resolve_approval_base_branch(
     repo_root: &std::path::Path,
     desired_base_branch: Option<&str>,
 ) -> Result<String, String> {
-    let base_branch = if let Some(b) = desired_base_branch {
-        b.to_string()
-    } else {
-        let b = run_git(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
-            .trim()
-            .to_string();
-        if b.is_empty() || b == "HEAD" {
-            return Err(
-                "Cannot determine the base branch for this approval (the conversation didn't \
-                 record one and the repository is on a detached HEAD). Re-create the \
-                 conversation with an explicit base branch."
-                    .to_string(),
-            );
-        }
-        b
-    };
-    let explicit_ref = base_branch.starts_with("origin/") || base_branch.starts_with("refs/");
-    if explicit_ref {
-        run_git(cwd, &["rev-parse", "--verify", &base_branch])?;
-    } else {
-        crate::git_ops::materialize_branch(cwd, &base_branch).map_err(|e| e.to_string())?;
-    }
-    Ok(base_branch)
+    crate::git_start::GitStartPoint::for_approval(cwd, repo_root, desired_base_branch)
+        .map(|start| start.logical_base().to_string())
+        .map_err(|e| e.to_string())
 }
 
 /// Locate the early Explore worktree at `{repo_root}/.phoenix/worktrees/{conv_id}`

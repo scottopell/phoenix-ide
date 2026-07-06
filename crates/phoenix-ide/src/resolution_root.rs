@@ -8,9 +8,8 @@
 //! the first message expands:
 //!
 //! - **Pre-create discovery** has no worktree yet, so it reads the chosen
-//!   branch's committed tree through a `GitTree` built by
-//!   [`ResolutionRoot::for_create`] (resolving to the commit creation will
-//!   check out — see [`resolve_tree_ref`]). This is what lets the `/new`
+//!   branch's committed tree through a `GitTree` built from
+//!   [`crate::git_start::GitStartPoint`]. This is what lets the `/new`
 //!   composer offer accurate suggestions before any worktree exists.
 //! - **Create-time expansion** runs against the conversation's freshly-created
 //!   worktree (`WorkingDir`), a clean checkout of that same committed tree —
@@ -61,29 +60,27 @@ impl ResolutionRoot {
         Self::WorkingDir(dir.into())
     }
 
-    /// Construct the root a new conversation will resolve against, from the
-    /// same creation parameters the create handler uses.
-    ///
-    /// `mode` is the resolved creation mode (`"direct"`, `"managed"`,
-    /// `"branch"`). Branch/managed resolve against `base_branch`'s committed
-    /// tree; everything else resolves against `cwd`. If a git mode is missing
-    /// either the repo root or the branch, it degrades to `cwd` — there is no
-    /// ref to resolve against yet, so the working directory is the best
-    /// available (and what the user is looking at).
+    pub fn git_tree(repo_root: impl Into<PathBuf>, reference: impl Into<String>) -> Self {
+        Self::GitTree {
+            repo_root: repo_root.into(),
+            reference: reference.into(),
+        }
+    }
+
+    pub fn from_start_point(
+        repo_root: impl Into<PathBuf>,
+        start: &crate::git_start::GitStartPoint,
+    ) -> Self {
+        Self::git_tree(repo_root, start.tree_ref())
+    }
+
     pub fn for_create(cwd: &str, mode: &str, base_branch: Option<&str>) -> Self {
         let cwd_path = PathBuf::from(cwd);
-        if matches!(mode, "branch" | "managed") {
-            if let (Some(branch), Some(repo_root)) = (
-                base_branch.filter(|b| !b.is_empty()),
-                phoenix_core::git::detect_git_repo_root(&cwd_path),
-            ) {
-                let repo_root = PathBuf::from(repo_root);
-                if let Some(reference) = resolve_tree_ref(&repo_root, branch) {
-                    return Self::GitTree {
-                        repo_root,
-                        reference,
-                    };
-                }
+        if let Some(start) =
+            crate::git_start::GitStartPoint::for_inline_discovery(&cwd_path, mode, base_branch)
+        {
+            if let Some(repo_root) = phoenix_core::git::detect_git_repo_root(&cwd_path) {
+                return Self::from_start_point(repo_root, &start);
             }
         }
         Self::WorkingDir(cwd_path)
@@ -97,6 +94,30 @@ impl ResolutionRoot {
                 repo_root,
                 reference,
             } => list_files_in_tree(repo_root, reference, query, limit),
+        }
+    }
+
+    pub fn all_paths(&self) -> Vec<String> {
+        match self {
+            Self::WorkingDir(dir) => all_files_in_root(dir),
+            Self::GitTree {
+                repo_root,
+                reference,
+            } => tree_paths(repo_root, reference).iter().cloned().collect(),
+        }
+    }
+
+    pub fn read_text(&self, rel: &str) -> Option<String> {
+        match self.read_file(rel) {
+            FileResolution::Text(text) => Some(text),
+            FileResolution::Binary | FileResolution::NotFound => None,
+        }
+    }
+
+    pub fn source_ref(&self) -> Option<&str> {
+        match self {
+            Self::WorkingDir(_) => None,
+            Self::GitTree { reference, .. } => Some(reference),
         }
     }
 
@@ -171,66 +192,6 @@ pub struct SkillsView {
     _temp: Option<TempDir>,
 }
 
-/// Resolve a branch name the composer selected to the commit-ish that
-/// conversation creation will actually check out — so discovery offers
-/// candidates from the same tree the first message expands against.
-///
-/// This mirrors `git_ops::materialize_branch`'s ref decision: creation fetches
-/// `origin/<branch>` and fast-forwards the local branch to the remote tip only
-/// when the local ref is an ancestor of it (local is behind) *and* the branch
-/// is not checked out in a worktree (a checked-out branch cannot be moved, so
-/// creation keeps its stale local tip — relevant to managed mode, which builds
-/// a temp branch from the base ref while the base may be checked out in the
-/// main worktree). So:
-/// - both refs exist, local behind, not checked out → the remote tip (creation FFs);
-/// - both exist but diverged / local ahead / checked out → the local ref;
-/// - remote only → `origin/<branch>` (creation makes a local branch there);
-/// - local only → the local ref;
-/// - neither → `None`, leaving the caller to degrade to the working directory.
-///
-/// Discovery does not fetch (too costly per keystroke), so it sees `origin`
-/// as of the last fetch; the freshness gap that remains is inherent, but a
-/// locally-stale tracking branch no longer offers candidates from a commit
-/// creation would discard.
-fn resolve_tree_ref(repo_root: &Path, branch: &str) -> Option<String> {
-    let remote = format!("origin/{branch}");
-    let has_local = verify_commit(repo_root, branch);
-    let has_remote = verify_commit(repo_root, &remote);
-    match (has_local, has_remote) {
-        (true, true) => {
-            let local_is_ancestor =
-                run_git(repo_root, &["merge-base", "--is-ancestor", branch, &remote]).is_ok();
-            // Creation can only fast-forward the local branch to the remote tip
-            // when the branch isn't pinned by a worktree; otherwise the worktree
-            // is built from the stale local ref, so discovery must match it.
-            if local_is_ancestor
-                && crate::git_ops::find_branch_in_worktree_list(repo_root, branch).is_none()
-            {
-                Some(remote)
-            } else {
-                Some(branch.to_string())
-            }
-        }
-        (false, true) => Some(remote),
-        (true, false) => Some(branch.to_string()),
-        (false, false) => None,
-    }
-}
-
-/// Whether `rev` resolves to a commit object in `repo_root`.
-fn verify_commit(repo_root: &Path, rev: &str) -> bool {
-    run_git(
-        repo_root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{rev}^{{commit}}"),
-        ],
-    )
-    .is_ok()
-}
-
 fn bytes_to_resolution(bytes: Vec<u8>) -> FileResolution {
     if bytes.contains(&0) {
         return FileResolution::Binary;
@@ -285,6 +246,28 @@ fn tree_paths(repo_root: &Path, reference: &str) -> Arc<[String]> {
     }
     cache.insert(sha, Arc::clone(&paths));
     paths
+}
+
+fn all_files_in_root(root: &Path) -> Vec<String> {
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build();
+    walker
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+        .filter_map(|entry| {
+            entry
+                .path()
+                .strip_prefix(root)
+                .ok()
+                .map(|path| path.to_string_lossy().to_string())
+        })
+        .collect()
 }
 
 /// List files in a branch's committed tree, fuzzy-scored against `query` with
@@ -555,12 +538,13 @@ mod tests {
 
         // `feature` exists only as refs/remotes/origin/feature in the clone.
         assert_eq!(
-            resolve_tree_ref(clone.path(), "feature").as_deref(),
+            crate::git_start::resolve_tree_ref_without_fetch(clone.path(), "feature").as_deref(),
             Some("origin/feature"),
             "remote-only branch should resolve via origin/"
         );
         assert!(
-            resolve_tree_ref(clone.path(), "does-not-exist").is_none(),
+            crate::git_start::resolve_tree_ref_without_fetch(clone.path(), "does-not-exist")
+                .is_none(),
             "an unresolvable branch yields None"
         );
     }
@@ -593,7 +577,7 @@ mod tests {
         git(clone.path(), &["fetch", "-q", "origin"]);
 
         assert_eq!(
-            resolve_tree_ref(clone.path(), "feature").as_deref(),
+            crate::git_start::resolve_tree_ref_without_fetch(clone.path(), "feature").as_deref(),
             Some("origin/feature"),
             "unpinned branch behind origin → creation FFs to the remote tip"
         );
@@ -625,7 +609,7 @@ mod tests {
         git(clone.path(), &["fetch", "-q", "origin"]);
 
         assert_eq!(
-            resolve_tree_ref(clone.path(), "main").as_deref(),
+            crate::git_start::resolve_tree_ref_without_fetch(clone.path(), "main").as_deref(),
             Some("main"),
             "a checked-out branch can't be fast-forwarded, so creation keeps the local tip"
         );
