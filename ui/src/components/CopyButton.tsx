@@ -11,9 +11,8 @@ interface CopyButtonProps {
 function CopyIcon() {
   return (
     <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-      <rect x="5" y="3" width="8" height="10" rx="1.5" />
-      <path d="M3 6.5V4.5A1.5 1.5 0 0 1 4.5 3H7" />
-      <path d="M3 6.5v5A1.5 1.5 0 0 0 4.5 13H7" />
+      <rect x="6" y="3" width="7" height="9" rx="1.3" />
+      <rect x="3" y="6" width="7" height="7" rx="1.3" />
     </svg>
   );
 }

@@ -383,6 +383,86 @@ describe('inline tool timers', () => {
   });
 });
 
+describe('message copy affordances', () => {
+  beforeEach(() => {
+    vi.mocked(copyToClipboard).mockClear();
+  });
+
+  it('copies finalized user messages from the mobile copy button', async () => {
+    render(
+      <UserMessage
+        message={{
+          message_id: 'user-copy',
+          sequence_id: 1,
+          conversation_id: 'agent-1',
+          message_type: 'user',
+          content: { text: 'Please summarize `src/main.rs`.' },
+          display_data: null,
+          created_at: '2026-01-01T00:00:00Z',
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy your message' }));
+
+    await waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith('Please summarize `src/main.rs`.');
+    });
+  });
+
+  it('copies finalized agent text blocks as markdown from the mobile copy button', async () => {
+    const message = agentMessage('agent-copy', [
+      { type: 'text', text: 'First **markdown** block.' },
+      { type: 'tool_use', id: 'tool-1', name: 'bash', input: { cmd: 'pwd' } },
+      { type: 'text', text: 'Second block.' },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={message}
+          toolResults={new Map()}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy Phoenix message' }));
+
+    await waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith('First **markdown** block.\n\nSecond block.');
+    });
+  });
+
+  it('keeps message context-menu markdown copy aligned with the mobile copy value', async () => {
+    const message = agentMessage('agent-context-copy', [
+      { type: 'text', text: 'Context **markdown**.' },
+      { type: 'tool_use', id: 'tool-1', name: 'bash', input: { cmd: 'pwd' } },
+      { type: 'text', text: 'More markdown.' },
+    ], 14);
+
+    render(
+      <MemoryRouter>
+        <div id="messages">
+          <AgentMessage
+            message={message}
+            toolResults={new Map()}
+            onOpenFile={vi.fn()}
+          />
+        </div>
+        <MessageContextMenu messages={[message]} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.contextMenu(screen.getByText(/Context/), { clientX: 20, clientY: 30 });
+    fireEvent.click(screen.getByRole('button', { name: 'Copy as Markdown' }));
+
+    await waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith('Context **markdown**.\n\nMore markdown.');
+    });
+  });
+});
+
 describe('skill command rendering', () => {
   it('renders slash-command user messages as a flat command chip with normal args', () => {
     render(
@@ -815,7 +895,7 @@ describe('finalized code fence highlighting', () => {
 
     expect(container.querySelector('.agent-text-collapsed')).toBeInTheDocument();
     expect(container.querySelector('.agent-text-block')).not.toBeInTheDocument();
-    expect(screen.getByRole('button')).toHaveTextContent(`${'A'.repeat(139)}…`);
+    expect(container.querySelector('.agent-text-collapsed')).toHaveTextContent(`${'A'.repeat(139)}…`);
   });
 
   it('collapses short multi-line assistant prose when later lines are omitted', () => {
@@ -835,7 +915,7 @@ describe('finalized code fence highlighting', () => {
 
     expect(container.querySelector('.agent-text-collapsed')).toBeInTheDocument();
     expect(container.querySelector('.agent-text-block')).not.toBeInTheDocument();
-    expect(screen.getByRole('button')).toHaveTextContent('First line summary.');
+    expect(container.querySelector('.agent-text-collapsed')).toHaveTextContent('First line summary.');
   });
 
   it('renders short mermaid fences in compact mode instead of collapsing them', async () => {

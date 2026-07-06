@@ -31,6 +31,7 @@ import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 
 import { linkifyText } from '../utils/linkify';
+import { getMessageMarkdown } from '../utils/messageCopy';
 import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
@@ -575,6 +576,16 @@ function formatBrowserInput(name: string, input: Record<string, unknown>): strin
 // User Message Components
 // ============================================================================
 
+function MessageCopyButton({ message, title, className = '' }: { message: Message; title: string; className?: string }) {
+  return (
+    <CopyButton
+      text={getMessageMarkdown(message)}
+      className={`message-mobile-copy ${className}`}
+      title={title}
+    />
+  );
+}
+
 function formatAttachmentBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -614,6 +625,7 @@ function UserMessageImpl({ message }: { message: Message }) {
           </span>
         )}
         {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
+        <MessageCopyButton message={message} title="Copy your message" />
       </div>
       <div className="message-content">
         <SkillCommandText text={text} />
@@ -991,6 +1003,13 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
 
   return (
     <div className="message agent" data-sequence-id={message.sequence_id}>
+      {!isFirstInTurn && (
+        <MessageCopyButton
+          message={message}
+          title="Copy Phoenix message"
+          className="message-mobile-copy-floating"
+        />
+      )}
       {isFirstInTurn && (
         <div className="message-header">
           <span className="message-sender">Phoenix</span>
@@ -1021,6 +1040,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
             }
             return null;
           })()}
+          <MessageCopyButton message={message} title="Copy Phoenix message" />
         </div>
       )}
       <div className="message-content">

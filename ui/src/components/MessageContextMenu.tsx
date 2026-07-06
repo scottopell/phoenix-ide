@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { Message, ContentBlock } from '../api';
+import type { Message } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
+import { getMessageMarkdown } from '../utils/messageCopy';
 import {
   FILE_PATH_CONTEXT_MENU_OPEN_EVENT,
   MESSAGE_CONTEXT_MENU_OPEN_EVENT,
@@ -22,26 +23,6 @@ interface MenuState {
 
 interface MessageContextMenuProps {
   messages: Message[];
-}
-
-/** Extract raw markdown text from a message's content */
-function getRawMarkdown(message: Message): string {
-  const type = message.message_type || (message as unknown as Record<string, unknown>)['type'];
-
-  if (type === 'user') {
-    const content = message.content as { text?: string };
-    return content.text || (typeof message.content === 'string' ? message.content as string : '');
-  }
-
-  if (type === 'agent') {
-    const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
-    return blocks
-      .filter((b) => b.type === 'text' && b.text)
-      .map((b) => b.text!)
-      .join('\n\n');
-  }
-
-  return '';
 }
 
 /** Extract plain text (strip markdown) by reading innerText from the DOM */
@@ -178,7 +159,7 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
   const hasSelection = (window.getSelection()?.toString().length ?? 0) > 0;
 
   const copyMarkdown = () => {
-    const md = getRawMarkdown(menu.message);
+    const md = getMessageMarkdown(menu.message);
     void copyToClipboard(md);
     setMenu(null);
   };
@@ -187,7 +168,7 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
     const el = document.querySelector(
       `.message[data-sequence-id="${menu.message.sequence_id}"]`
     ) as HTMLElement | null;
-    const text = el ? getPlainText(el) : getRawMarkdown(menu.message);
+    const text = el ? getPlainText(el) : getMessageMarkdown(menu.message);
     void copyToClipboard(text);
     setMenu(null);
   };
