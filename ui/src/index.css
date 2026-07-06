@@ -9108,6 +9108,20 @@ html * {
   font-weight: 700;
 }
 
+.task-approval-context-cue__recommendation {
+  flex-shrink: 0;
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.task-approval-context-cue--start-here .task-approval-context-cue__recommendation {
+  color: var(--accent-green);
+}
+
+.task-approval-context-cue--new-chat .task-approval-context-cue__recommendation {
+  color: var(--accent-yellow);
+}
+
 .task-approval-context-cue__hint {
   min-width: 0;
   overflow: hidden;
@@ -9180,6 +9194,11 @@ html * {
   font-weight: 700;
 }
 
+.task-approval-btn--recommended-decision {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-green) 35%, transparent);
+  font-weight: 700;
+}
+
 .task-approval-btn--approve.task-approval-btn--subdued {
   background: transparent;
   color: var(--text-secondary);
@@ -9222,6 +9241,13 @@ html * {
 
   .task-approval-context-cue__hint {
     display: none;
+  }
+
+  .task-approval-context-cue__recommendation {
+    margin-left: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 }
 

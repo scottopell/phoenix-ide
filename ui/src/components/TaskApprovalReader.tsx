@@ -47,6 +47,18 @@ const formatTaskApprovalContextPercent = (used: number, max: number): string => 
   return `${Math.round(percent)}%`;
 };
 
+type TaskApprovalContextRecommendation = 'start-here' | 'new-chat' | 'either';
+
+function getTaskApprovalContextRecommendation(percent: number): {
+  kind: TaskApprovalContextRecommendation;
+  label: string;
+} {
+  if (percent < 60) return { kind: 'start-here', label: 'Start here recommended' };
+  if (percent < 82) return { kind: 'either', label: 'Either path is fine' };
+  if (percent < 94) return { kind: 'new-chat', label: 'New chat recommended' };
+  return { kind: 'new-chat', label: 'New chat strongly recommended' };
+}
+
 export interface TaskApprovalReaderProps {
   title: string;
   priority: string;
@@ -213,10 +225,16 @@ export function TaskApprovalReader({
   const hasUnsentNotes = notes.length > 0;
   const noteCountLabel = `${notes.length} note${notes.length !== 1 ? 's' : ''}`;
 
-  const contextUsagePercent =
-    contextWindowUsed !== undefined && modelContextWindow !== undefined
-      ? formatTaskApprovalContextPercent(contextWindowUsed, modelContextWindow)
+  const contextUsage =
+    contextWindowUsed !== undefined && modelContextWindow !== undefined && modelContextWindow > 0
+      ? Math.min(Math.max((contextWindowUsed / modelContextWindow) * 100, 0), 100)
       : null;
+  const contextUsagePercent = contextUsage !== null
+    ? formatTaskApprovalContextPercent(contextWindowUsed ?? 0, modelContextWindow ?? 0)
+    : null;
+  const contextRecommendation = contextUsage !== null
+    ? getTaskApprovalContextRecommendation(contextUsage)
+    : null;
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
@@ -473,12 +491,15 @@ export function TaskApprovalReader({
         </div>
       )}
 
-      {contextUsagePercent && (
-        <div className="task-approval-context-cue">
-          <span className="task-approval-context-cue__label">Context used</span>
-          <span className="task-approval-context-cue__value">{contextUsagePercent}</span>
+      {contextUsagePercent && contextRecommendation && (
+        <div className={`task-approval-context-cue task-approval-context-cue--${contextRecommendation.kind}`}>
+          <span className="task-approval-context-cue__label">Context</span>
+          <span className="task-approval-context-cue__value">{contextUsagePercent} used</span>
+          <span className="task-approval-context-cue__recommendation">
+            {contextRecommendation.label}
+          </span>
           <span className="task-approval-context-cue__hint">
-            Start here keeps this Explore context in play; New chat starts a continuation.
+            Start here keeps this discussion; New chat starts a summarized continuation.
           </span>
         </div>
       )}
@@ -511,6 +532,7 @@ export function TaskApprovalReader({
             'task-approval-btn',
             'task-approval-btn--approve',
             hasUnsentNotes && 'task-approval-btn--subdued',
+            contextRecommendation?.kind === 'start-here' && 'task-approval-btn--recommended-decision',
           ]
             .filter(Boolean)
             .join(' ')}
@@ -536,6 +558,7 @@ export function TaskApprovalReader({
             'task-approval-btn',
             'task-approval-btn--approve',
             hasUnsentNotes && 'task-approval-btn--subdued',
+            contextRecommendation?.kind === 'new-chat' && 'task-approval-btn--recommended-decision',
           ]
             .filter(Boolean)
             .join(' ')}

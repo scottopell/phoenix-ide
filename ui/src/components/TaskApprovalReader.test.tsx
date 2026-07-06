@@ -96,14 +96,29 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     );
   });
 
-  it('shows context usage for the start-here decision', () => {
+  it('shows context usage and recommends the lower-pressure start path', () => {
     renderTaskApprovalReader('# Plan', vi.fn(), {
-      contextWindowUsed: 136_000,
+      contextWindowUsed: 96_000,
       modelContextWindow: 200_000,
     });
 
-    expect(screen.getByText('Context used')).toBeInTheDocument();
-    expect(screen.getByText('68%')).toBeInTheDocument();
+    expect(screen.getByText('Context')).toBeInTheDocument();
+    expect(screen.getByText('48% used')).toBeInTheDocument();
+    expect(screen.getByText('Start here recommended')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approve and start here' }))
+      .toHaveClass('task-approval-btn--recommended-decision');
+  });
+
+  it('recommends a new chat when context pressure is high', () => {
+    renderTaskApprovalReader('# Plan', vi.fn(), {
+      contextWindowUsed: 176_000,
+      modelContextWindow: 200_000,
+    });
+
+    expect(screen.getByText('88% used')).toBeInTheDocument();
+    expect(screen.getByText('New chat recommended')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' }))
+      .toHaveClass('task-approval-btn--recommended-decision');
   });
 
   it('calls onApprove with the selected handoff', () => {
