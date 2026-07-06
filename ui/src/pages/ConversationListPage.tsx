@@ -308,6 +308,19 @@ export function ConversationListPage() {
     }
   };
 
+  const handleGenerateRename = async () => {
+    if (!renameTarget) return;
+    try {
+      await api.regenerateConversationName(renameTarget.id);
+      setRenameTarget(null);
+      setRenameError(undefined);
+      await refresh();
+    } catch (err) {
+      setRenameError(err instanceof Error ? err.message : 'Failed to generate name');
+      throw err;
+    }
+  };
+
   // Pull-to-refresh handlers
   const handleTouchStart = useCallback((e: React.TouchEvent) => {
     const touch = e.touches[0];
@@ -479,6 +492,7 @@ export function ConversationListPage() {
         currentName={renameTarget?.slug ?? ''}
         error={renameError ?? undefined}
         onRename={handleRename}
+        onGenerate={handleGenerateRename}
         onCancel={() => {
           setRenameTarget(null);
           setRenameError(undefined);

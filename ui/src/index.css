@@ -4522,6 +4522,10 @@ html * {
   border-color: var(--accent-blue);
 }
 
+.rename-generate-btn {
+  align-self: flex-start;
+}
+
 .error-text {
   color: var(--accent-red);
   font-size: 13px;

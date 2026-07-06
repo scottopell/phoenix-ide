@@ -201,6 +201,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route("/api/conversations/:id/delete", post(delete_conversation))
         .route("/api/conversations/:id/rename", post(rename_conversation))
+        .route(
+            "/api/conversations/:id/regenerate-name",
+            post(regenerate_conversation_name),
+        )
         // Token usage (Phase 4)
         .route(
             "/api/conversations/:id/usage",
@@ -3647,22 +3651,71 @@ async fn rename_conversation(
     Path(id): Path<String>,
     Json(req): Json<RenameRequest>,
 ) -> Result<Json<ConversationResponse>, AppError> {
+    rename_conversation_slug(&state, &id, &req.name).await?;
+    conversation_response(&state, &id).await
+}
+
+async fn regenerate_conversation_name(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    let opening = state
+        .runtime
+        .db()
+        .first_opening_message_text(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| {
+            tracing::debug!(
+                conv_id = %id,
+                "conversation regenerate-name: no opening message; leaving slug unchanged"
+            );
+            AppError::Internal(
+                "cannot regenerate conversation name: no opening message to summarize".to_string(),
+            )
+        })?;
+
+    let cheap_model = state.llm_registry.get_cheap_model().ok_or_else(|| {
+        AppError::Internal("no cheap LLM model is available for name regeneration".to_string())
+    })?;
+
+    let generated = crate::title_generator::generate_title(&opening, cheap_model)
+        .await
+        .filter(|slug| !slug.is_empty())
+        .ok_or_else(|| {
+            AppError::Internal(
+                "conversation name regeneration failed — the existing name is unchanged"
+                    .to_string(),
+            )
+        })?;
+
+    rename_conversation_slug(&state, &id, &generated).await?;
+    conversation_response(&state, &id).await
+}
+
+async fn rename_conversation_slug(state: &AppState, id: &str, slug: &str) -> Result<(), AppError> {
     state
         .runtime
         .db()
-        .rename_conversation(&id, &req.name)
+        .rename_conversation(id, slug)
         .await
         .map_err(|e| match e {
             crate::db::DbError::SlugExists(_) => {
                 AppError::BadRequest("Slug already exists".to_string())
             }
-            _ => AppError::NotFound(e.to_string()),
-        })?;
+            crate::db::DbError::ConversationNotFound(_) => AppError::NotFound(e.to_string()),
+            _ => AppError::Internal(e.to_string()),
+        })
+}
 
+async fn conversation_response(
+    state: &AppState,
+    id: &str,
+) -> Result<Json<ConversationResponse>, AppError> {
     let conversation = state
         .runtime
         .db()
-        .get_conversation(&id)
+        .get_conversation(id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -8112,6 +8165,216 @@ pub(crate) mod hard_delete_cascade_tests {
             !orphan_wt.exists(),
             "pending proposal's deterministic orphan must be cleaned by the fork step"
         );
+    }
+}
+
+#[cfg(test)]
+mod regenerate_conversation_name_tests {
+    use super::*;
+    use crate::chain_qa::ChainQa;
+    use crate::db::Database;
+    use crate::platform::PlatformCapability;
+    use crate::runtime::RuntimeManager;
+    use crate::tools::mcp::McpClientManager;
+    use async_trait::async_trait;
+    use phoenix_core::domain::db_schema::{MessageContent, UserContent};
+    use phoenix_llm::{
+        ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
+    };
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    #[derive(Debug)]
+    enum StubLlm {
+        Ok(&'static str),
+        Err,
+    }
+
+    #[async_trait]
+    impl LlmService for StubLlm {
+        async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            match self {
+                StubLlm::Ok(text) => Ok(LlmResponse {
+                    content: vec![ContentBlock::text(*text)],
+                    end_turn: true,
+                    usage: Usage::default(),
+                }),
+                StubLlm::Err => Err(LlmError::server_error("temporary outage")),
+            }
+        }
+
+        async fn complete_streaming(
+            &self,
+            r: &LlmRequest,
+            _: &broadcast::Sender<phoenix_llm::TokenChunk>,
+        ) -> Result<LlmResponse, LlmError> {
+            self.complete(r).await
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "claude-sonnet-4-6"
+        }
+    }
+
+    async fn make_test_state(llm_registry: Arc<ModelRegistry>) -> AppState {
+        let db = Database::open_in_memory().await.expect("open db");
+        let platform = PlatformCapability::None {
+            details: "test".into(),
+        };
+        let mcp_manager = Arc::new(McpClientManager::new());
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            llm_registry.clone(),
+            platform.clone(),
+            mcp_manager.clone(),
+            None,
+        ));
+        let terminals = runtime.terminals.clone();
+        let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
+        let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
+        AppState {
+            runtime,
+            llm_registry,
+            db,
+            platform,
+            mcp_manager,
+            credential_helper: None,
+            password: None,
+            sessions,
+            login_throttle: super::super::auth::LoginThrottle::new(),
+            terminals,
+            chain_qa,
+            message_retriever,
+            codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
+            discovery: crate::discovery::start(crate::discovery::DiscoveryConfig {
+                enabled: false,
+                ..crate::discovery::DiscoveryConfig::from_env()
+            }),
+        }
+    }
+
+    async fn seed_conversation(state: &AppState, id: &str, slug: &str) {
+        state
+            .db
+            .create_conversation(id, slug, "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+    }
+
+    async fn seed_opening(state: &AppState, conv_id: &str, text: &str) {
+        state
+            .db
+            .add_message(
+                &format!("msg-{conv_id}"),
+                conv_id,
+                &MessageContent::User(UserContent::new(text)),
+                None,
+                None,
+            )
+            .await
+            .expect("add opening message");
+    }
+
+    async fn regenerate(
+        state: &AppState,
+        id: &str,
+    ) -> Result<Json<ConversationResponse>, AppError> {
+        regenerate_conversation_name(State(state.clone()), Path(id.to_string())).await
+    }
+
+    #[tokio::test]
+    async fn successful_generation_renames_with_existing_slug_rules() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("Useful Auth Fix"),
+        ))))
+        .await;
+        seed_conversation(&state, "conv-ok", "deterministic-conv-ok").await;
+        seed_opening(
+            &state,
+            "conv-ok",
+            "fix authentication retry after quota errors",
+        )
+        .await;
+
+        let Json(response) = regenerate(&state, "conv-ok").await.expect("regenerate");
+        assert_eq!(response.conversation["slug"], "useful-auth-fix");
+        let reloaded = state.db.get_conversation("conv-ok").await.expect("reload");
+        assert_eq!(reloaded.slug.as_deref(), Some("useful-auth-fix"));
+    }
+
+    #[tokio::test]
+    async fn missing_opening_leaves_slug_unchanged() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("Useful Name"),
+        ))))
+        .await;
+        seed_conversation(&state, "conv-empty", "deterministic-conv-empty").await;
+
+        assert!(regenerate(&state, "conv-empty").await.is_err());
+        let reloaded = state
+            .db
+            .get_conversation("conv-empty")
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-empty"));
+    }
+
+    #[tokio::test]
+    async fn llm_failure_leaves_slug_unchanged() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Err,
+        ))))
+        .await;
+        seed_conversation(&state, "conv-fail", "deterministic-conv-fail").await;
+        seed_opening(&state, "conv-fail", "rename this later").await;
+
+        assert!(regenerate(&state, "conv-fail").await.is_err());
+        let reloaded = state
+            .db
+            .get_conversation("conv-fail")
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-fail"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_generated_slug_returns_error_and_leaves_slug_unchanged() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("Taken Slug"),
+        ))))
+        .await;
+        seed_conversation(&state, "conv-taken", "taken-slug").await;
+        seed_conversation(&state, "conv-rename", "deterministic-conv-rename").await;
+        seed_opening(&state, "conv-rename", "rename this later").await;
+
+        assert!(regenerate(&state, "conv-rename").await.is_err());
+        let reloaded = state
+            .db
+            .get_conversation("conv-rename")
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-rename"));
+    }
+
+    #[tokio::test]
+    async fn missing_cheap_model_leaves_slug_unchanged() {
+        let state = make_test_state(Arc::new(ModelRegistry::new_empty())).await;
+        seed_conversation(&state, "conv-nomodel", "deterministic-conv-nomodel").await;
+        seed_opening(&state, "conv-nomodel", "rename this later").await;
+
+        assert!(regenerate(&state, "conv-nomodel").await.is_err());
+        let reloaded = state
+            .db
+            .get_conversation("conv-nomodel")
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-nomodel"));
     }
 }
 

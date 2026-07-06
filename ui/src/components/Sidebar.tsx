@@ -245,17 +245,38 @@ export function Sidebar({
     }
   }, [deleteChainTarget, onConversationCreated]);
 
+  const updateRouteAfterRename = useCallback((oldSlug: string | null | undefined, newSlug: string | null | undefined) => {
+    if (oldSlug && newSlug && oldSlug === activeSlug) {
+      navigate(`/c/${newSlug}`, { replace: true });
+    }
+  }, [activeSlug, navigate]);
+
   const handleRename = useCallback(async (newName: string) => {
     if (!renameTarget) return;
     try {
-      await api.renameConversation(renameTarget.id, newName);
+      const res = await api.renameConversation(renameTarget.id, newName);
+      updateRouteAfterRename(renameTarget.slug, res.conversation.slug);
       setRenameTarget(null);
       setRenameError(undefined);
       onConversationCreated();
     } catch (err) {
       setRenameError(err instanceof Error ? err.message : 'Failed to rename');
     }
-  }, [renameTarget, onConversationCreated]);
+  }, [renameTarget, onConversationCreated, updateRouteAfterRename]);
+
+  const handleGenerateRename = useCallback(async () => {
+    if (!renameTarget) return;
+    try {
+      const res = await api.regenerateConversationName(renameTarget.id);
+      updateRouteAfterRename(renameTarget.slug, res.conversation.slug);
+      setRenameTarget(null);
+      setRenameError(undefined);
+      onConversationCreated();
+    } catch (err) {
+      setRenameError(err instanceof Error ? err.message : 'Failed to generate name');
+      throw err;
+    }
+  }, [renameTarget, onConversationCreated, updateRouteAfterRename]);
 
   const handleSetDeleteTarget = useCallback((conv: Conversation) => {
     setDeleteTarget(conv);
@@ -419,6 +440,7 @@ export function Sidebar({
         currentName={renameTarget?.slug ?? ''}
         error={renameError ?? undefined}
         onRename={handleRename}
+        onGenerate={handleGenerateRename}
         onCancel={() => { setRenameTarget(null); setRenameError(undefined); }}
       />
     </aside>

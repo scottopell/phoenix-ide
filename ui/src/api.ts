@@ -1395,7 +1395,7 @@ export const api = {
     return resp.json();
   },
 
-  async renameConversation(convId: string, name: string): Promise<{ ok: boolean }> {
+  async renameConversation(convId: string, name: string): Promise<{ conversation: Conversation }> {
     const resp = await fetch(`/api/conversations/${convId}/rename`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1404,6 +1404,17 @@ export const api = {
     if (!resp.ok) {
       const err = await resp.json();
       throw new Error(err.error || 'Failed to rename');
+    }
+    return resp.json();
+  },
+
+  async regenerateConversationName(convId: string): Promise<{ conversation: Conversation }> {
+    const resp = await fetch(`/api/conversations/${convId}/regenerate-name`, {
+      method: 'POST',
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to generate name');
     }
     return resp.json();
   },

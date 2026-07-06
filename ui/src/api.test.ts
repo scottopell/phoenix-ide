@@ -87,6 +87,47 @@ describe('api.continueConversation', () => {
   });
 });
 
+describe('api.regenerateConversationName', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('POSTs /api/conversations/:id/regenerate-name and returns the refreshed conversation', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        conversation: { id: 'conv-id', slug: 'generated-slug' },
+      }),
+    } as unknown as Response);
+
+    const res = await api.regenerateConversationName('conv-id');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/conversations/conv-id/regenerate-name',
+      { method: 'POST' },
+    );
+    expect(res.conversation.slug).toBe('generated-slug');
+  });
+
+  it('surfaces backend errors', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => ({ error: 'name regeneration failed' }),
+    } as unknown as Response);
+
+    await expect(api.regenerateConversationName('conv-id')).rejects.toThrow(
+      /name regeneration failed/,
+    );
+  });
+});
+
 describe('canCancelConversationState', () => {
   const cases: ReadonlyArray<readonly [ConversationState, boolean]> = [
     [{ type: 'idle' }, false],
