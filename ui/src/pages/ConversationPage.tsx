@@ -596,12 +596,13 @@ function ConversationPageContent() {
     }
 
     let cancelled = false;
+    setApprovalContextWindowUsed(null);
     api.getConversation(conversationId)
       .then((result) => {
         if (!cancelled) setApprovalContextWindowUsed(result.context_window_size);
       })
       .catch(() => {
-        if (!cancelled) setApprovalContextWindowUsed(atom.contextWindow.used);
+        if (!cancelled) setApprovalContextWindowUsed(null);
       });
 
     return () => {
@@ -1214,11 +1215,11 @@ function ConversationPageContent() {
     convStateForChildren.type !== 'context_exhausted';
 
   // Derived: model context window is a pure function of the current model's
-  // spec. Falls back to 200_000 when availableModels hasn't loaded yet or the
-  // model isn't in the registry (matches prior denormalized default).
-  const modelContextWindow =
-    availableModels?.find((m) => m.id === atom.conversation?.model)?.context_window
-    ?? 200_000;
+  // spec. Falls back to 200_000 for legacy surfaces when availableModels hasn't
+  // loaded yet or the model isn't in the registry.
+  const actualModelContextWindow =
+    availableModels?.find((m) => m.id === atom.conversation?.model)?.context_window ?? null;
+  const modelContextWindow = actualModelContextWindow ?? 200_000;
 
   // REQ-SEED-003: seed parent breadcrumb. Rendered above the message list
   // when this conversation was spawned from another via a seed action.
@@ -1652,8 +1653,8 @@ function ConversationPageContent() {
             title={atom.phase.title}
             priority={atom.phase.priority}
             plan={atom.phase.plan}
-            contextWindowUsed={approvalContextWindowUsed ?? atom.contextWindow.used}
-            modelContextWindow={modelContextWindow}
+            contextWindowUsed={approvalContextWindowUsed ?? undefined}
+            modelContextWindow={actualModelContextWindow ?? undefined}
             onApprove={handleApproveTask}
             onReject={handleRejectTask}
             onSendFeedback={handleTaskFeedback}

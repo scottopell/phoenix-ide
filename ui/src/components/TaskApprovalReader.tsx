@@ -63,8 +63,8 @@ export interface TaskApprovalReaderProps {
   title: string;
   priority: string;
   plan: string;
-  contextWindowUsed?: number;
-  modelContextWindow?: number;
+  contextWindowUsed?: number | undefined;
+  modelContextWindow?: number | undefined;
   onApprove: (handoff: TaskApprovalHandoff) => void;
   onReject: () => void;
   onSendFeedback: (annotations: string) => void;
