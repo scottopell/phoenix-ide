@@ -41,10 +41,18 @@ interface ReviewNote {
   timestamp: number;
 }
 
+const formatTaskApprovalContextPercent = (used: number, max: number): string => {
+  if (max <= 0) return '0%';
+  const percent = Math.min(Math.max((used / max) * 100, 0), 100);
+  return `${Math.round(percent)}%`;
+};
+
 export interface TaskApprovalReaderProps {
   title: string;
   priority: string;
   plan: string;
+  contextWindowUsed?: number;
+  modelContextWindow?: number;
   onApprove: (handoff: TaskApprovalHandoff) => void;
   onReject: () => void;
   onSendFeedback: (annotations: string) => void;
@@ -184,6 +192,8 @@ export function TaskApprovalReader({
   title,
   priority,
   plan,
+  contextWindowUsed,
+  modelContextWindow,
   onApprove,
   onReject,
   onSendFeedback,
@@ -202,6 +212,11 @@ export function TaskApprovalReader({
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const hasUnsentNotes = notes.length > 0;
   const noteCountLabel = `${notes.length} note${notes.length !== 1 ? 's' : ''}`;
+
+  const contextUsagePercent =
+    contextWindowUsed !== undefined && modelContextWindow !== undefined
+      ? formatTaskApprovalContextPercent(contextWindowUsed, modelContextWindow)
+      : null;
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
@@ -458,6 +473,16 @@ export function TaskApprovalReader({
         </div>
       )}
 
+      {contextUsagePercent && (
+        <div className="task-approval-context-cue">
+          <span className="task-approval-context-cue__label">Context used</span>
+          <span className="task-approval-context-cue__value">{contextUsagePercent}</span>
+          <span className="task-approval-context-cue__hint">
+            Start here keeps this Explore context in play; New chat starts a continuation.
+          </span>
+        </div>
+      )}
+
       {/* Action toolbar */}
       <div className="task-approval-actions">
         <button
@@ -470,7 +495,7 @@ export function TaskApprovalReader({
             .join(' ')}
           onClick={handleSendFeedback}
           disabled={!hasUnsentNotes}
-          aria-label={`Send Feedback (${notes.length})`}
+          aria-label={`Request changes (${notes.length})`}
           title={
             !hasUnsentNotes
               ? 'Add annotations to the plan before sending feedback'
@@ -478,8 +503,8 @@ export function TaskApprovalReader({
           }
         >
           <Send size={18} />
-          <span className="task-approval-btn-label-full">Send Feedback ({notes.length})</span>
-          <span className="task-approval-btn-label-compact">Feedback</span>
+          <span className="task-approval-btn-label-full">Request changes ({notes.length})</span>
+          <span className="task-approval-btn-label-compact">Revise</span>
         </button>
         <button
           className={[
@@ -491,7 +516,7 @@ export function TaskApprovalReader({
             .join(' ')}
           disabled={approvingHandoff !== null}
           onClick={() => handleApprove('continue_in_current_conversation')}
-          aria-label="Continue here"
+          aria-label="Approve and start here"
         >
           {approvingHandoff === 'continue_in_current_conversation' ? (
             <>
@@ -501,8 +526,8 @@ export function TaskApprovalReader({
           ) : (
             <>
               <Check size={18} />
-              <span className="task-approval-btn-label-full">Continue here</span>
-              <span className="task-approval-btn-label-compact">Continue</span>
+              <span className="task-approval-btn-label-full">Start here</span>
+              <span className="task-approval-btn-label-compact">Start here</span>
             </>
           )}
         </button>
@@ -516,7 +541,7 @@ export function TaskApprovalReader({
             .join(' ')}
           disabled={approvingHandoff !== null}
           onClick={() => handleApprove('start_fresh_work_conversation')}
-          aria-label="Start fresh conversation"
+          aria-label="Approve and start a new continuation conversation"
         >
           {approvingHandoff === 'start_fresh_work_conversation' ? (
             <>
@@ -526,8 +551,8 @@ export function TaskApprovalReader({
           ) : (
             <>
               <Check size={18} />
-              <span className="task-approval-btn-label-full">Start fresh conversation</span>
-              <span className="task-approval-btn-label-compact">Fresh</span>
+              <span className="task-approval-btn-label-full">New chat</span>
+              <span className="task-approval-btn-label-compact">New chat</span>
             </>
           )}
         </button>

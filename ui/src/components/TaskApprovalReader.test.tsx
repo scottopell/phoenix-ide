@@ -1,8 +1,13 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { TaskApprovalReader } from './TaskApprovalReader';
+import type { TaskApprovalReaderProps } from './TaskApprovalReader';
 
-function renderTaskApprovalReader(plan = '# Plan\n\nAdd the thing.', onApprove = vi.fn()) {
+function renderTaskApprovalReader(
+  plan = '# Plan\n\nAdd the thing.',
+  onApprove = vi.fn(),
+  overrides: Partial<TaskApprovalReaderProps> = {}
+) {
   return render(
     <TaskApprovalReader
       title="Review task"
@@ -11,6 +16,7 @@ function renderTaskApprovalReader(plan = '# Plan\n\nAdd the thing.', onApprove =
       onApprove={onApprove}
       onReject={vi.fn()}
       onSendFeedback={vi.fn()}
+      {...overrides}
     />
   );
 }
@@ -43,9 +49,9 @@ describe('TaskApprovalReader feedback action emphasis', () => {
 
     const buttons = toolbarButtons();
     expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
-      'Send Feedback (0)',
-      'Continue here',
-      'Start fresh conversation',
+      'Request changes (0)',
+      'Approve and start here',
+      'Approve and start a new continuation conversation',
     ]);
     expect(screen.getByRole('button', { name: 'Discard task' })).toHaveClass('task-approval-header-discard');
 
@@ -73,9 +79,9 @@ describe('TaskApprovalReader feedback action emphasis', () => {
 
     const buttons = toolbarButtons();
     expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
-      'Send Feedback (1)',
-      'Continue here',
-      'Start fresh conversation',
+      'Request changes (1)',
+      'Approve and start here',
+      'Approve and start a new continuation conversation',
     ]);
 
     expect(buttons[0]).toBeEnabled();
@@ -90,13 +96,23 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     );
   });
 
+  it('shows context usage for the start-here decision', () => {
+    renderTaskApprovalReader('# Plan', vi.fn(), {
+      contextWindowUsed: 136_000,
+      modelContextWindow: 200_000,
+    });
+
+    expect(screen.getByText('Context used')).toBeInTheDocument();
+    expect(screen.getByText('68%')).toBeInTheDocument();
+  });
+
   it('calls onApprove with the selected handoff', () => {
     const onApprove = vi.fn();
     renderTaskApprovalReader(undefined, onApprove);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Continue here' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Approve and start here' }));
     expect(onApprove).toHaveBeenCalledWith('continue_in_current_conversation');
 
-    expect(screen.getByRole('button', { name: 'Start fresh conversation' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' })).toBeInTheDocument();
   });
 });

@@ -1629,6 +1629,8 @@ function ConversationPageContent() {
             title={atom.phase.title}
             priority={atom.phase.priority}
             plan={atom.phase.plan}
+            contextWindowUsed={atom.contextWindow.used}
+            modelContextWindow={modelContextWindow}
             onApprove={handleApproveTask}
             onReject={handleRejectTask}
             onSendFeedback={handleTaskFeedback}

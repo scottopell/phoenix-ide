@@ -26,6 +26,8 @@ export function TaskApprovalFixture({ scenario }: Props) {
       title="Augment QC fixture set with canonical archive cases"
       priority="p3"
       plan={taskApprovalFixturePlan}
+      contextWindowUsed={136_000}
+      modelContextWindow={200_000}
       onApprove={() => {}}
       onReject={() => {}}
       onSendFeedback={() => {}}

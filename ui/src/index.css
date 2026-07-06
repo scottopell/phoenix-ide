@@ -9086,6 +9086,35 @@ html * {
   font-size: 13px;
 }
 
+.task-approval-context-cue {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.task-approval-context-cue__label {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.task-approval-context-cue__value {
+  flex-shrink: 0;
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.task-approval-context-cue__hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .task-approval-actions {
   display: flex;
   align-items: center;
@@ -9185,6 +9214,14 @@ html * {
 
   .task-approval-btn-label-compact {
     display: inline;
+  }
+
+  .task-approval-context-cue {
+    padding: 8px 12px;
+  }
+
+  .task-approval-context-cue__hint {
+    display: none;
   }
 }
 
