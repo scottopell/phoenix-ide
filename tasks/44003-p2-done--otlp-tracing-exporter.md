@@ -58,18 +58,18 @@ Before implementing the exporter, compare `opentelemetry-otlp` feature choices a
 
 Constraints/preferences:
 
-- Phoenix has mostly avoided gRPC/tonic dependencies. `Cargo.lock` currently contains `prost` transitively, but not `tonic`.
-- Prefer OTLP HTTP/protobuf on Jaeger's `4318` endpoint if it avoids pulling in `tonic` and a large gRPC stack.
+- Phoenix has mostly avoided gRPC/tonic dependencies. `Cargo.lock` previously contained `prost` transitively, but not `tonic`.
+- Prefer OTLP HTTP/protobuf on Jaeger's `4318` endpoint if it avoids the gRPC transport/channel stack.
 - Only choose OTLP gRPC on `4317` if the HTTP/protobuf path is materially worse, unsupported by compatible crate versions, or operationally unreliable.
 - Capture the decision in local code comments only where they describe the chosen dependency feature; avoid broad design commentary in source. A short note in this task is sufficient for workflow context.
 
-Likely dependency direction if HTTP/protobuf is viable:
+Dependency decision reached during implementation:
 
 ```toml
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "hyper-client"] }
 ```
 
-Adjust exact feature names to the published `opentelemetry-otlp` 0.31 API. If the SDK requires a runtime feature, add the minimal `opentelemetry_sdk` feature needed for batch export.
+This avoids a second `reqwest` major version and avoids OTLP gRPC transport. The upstream `opentelemetry-proto` generated message feature still pulls `tonic`/`tonic-prost` codegen types for protobuf message definitions; avoiding those would require a different exporter implementation rather than the supported `opentelemetry-otlp` HTTP/protobuf path.
 
 ## Implementation plan
 
