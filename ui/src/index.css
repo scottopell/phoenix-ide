@@ -9051,6 +9051,26 @@ html * {
   flex-shrink: 0;
 }
 
+.task-approval-header-discard {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.task-approval-header-discard:hover {
+  color: var(--accent-red);
+  border-color: color-mix(in srgb, var(--accent-red) 35%, transparent);
+  background: color-mix(in srgb, var(--accent-red) 10%, transparent);
+}
+
 .task-approval-content {
   flex: 1;
   overflow-y: auto;
@@ -9087,6 +9107,10 @@ html * {
   font-weight: 500;
   cursor: pointer;
   transition: opacity 0.15s, background 0.15s;
+}
+
+.task-approval-btn-label-compact {
+  display: none;
 }
 
 .task-approval-btn:disabled {
@@ -9140,22 +9164,27 @@ html * {
 
 @media (width <= 640px) {
   .task-approval-actions {
-    flex-wrap: wrap;
-    align-items: stretch;
     justify-content: stretch;
-    gap: 10px;
+    gap: 8px;
     padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
   }
 
   .task-approval-btn {
-    flex: 1 1 calc(50% - 5px);
+    flex: 1 1 0;
     justify-content: center;
     min-width: 0;
     min-height: 44px;
     padding: 8px 10px;
     text-align: center;
-    white-space: normal;
-    line-height: 1.25;
+    white-space: nowrap;
+  }
+
+  .task-approval-btn-label-full {
+    display: none;
+  }
+
+  .task-approval-btn-label-compact {
+    display: inline;
   }
 }
 

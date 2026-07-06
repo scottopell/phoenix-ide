@@ -16,9 +16,9 @@ function renderTaskApprovalReader(plan = '# Plan\n\nAdd the thing.', onApprove =
 }
 
 function toolbarButtons() {
-  const toolbar = screen.getByRole('button', { name: /discard/i }).parentElement;
+  const toolbar = document.querySelector('.task-approval-actions');
   if (!toolbar) throw new Error('toolbar not found');
-  return within(toolbar).getAllByRole('button');
+  return within(toolbar as HTMLElement).getAllByRole('button');
 }
 
 describe('TaskApprovalReader markdown rendering', () => {
@@ -42,23 +42,23 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     renderTaskApprovalReader();
 
     const buttons = toolbarButtons();
-    expect(buttons.map((button) => button.textContent)).toEqual([
-      'Discard',
+    expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
       'Send Feedback (0)',
       'Continue here',
       'Start fresh conversation',
     ]);
+    expect(screen.getByRole('button', { name: 'Discard task' })).toHaveClass('task-approval-header-discard');
 
-    expect(buttons[1]).toBeDisabled();
-    expect(buttons[1]).toHaveAttribute(
+    expect(buttons[0]).toBeDisabled();
+    expect(buttons[0]).toHaveAttribute(
       'title',
       'Add annotations to the plan before sending feedback'
     );
-    expect(buttons[1]).not.toHaveClass('task-approval-btn--recommended');
+    expect(buttons[0]).not.toHaveClass('task-approval-btn--recommended');
+    expect(buttons[1]).toHaveClass('task-approval-btn--approve');
+    expect(buttons[1]).not.toHaveClass('task-approval-btn--subdued');
     expect(buttons[2]).toHaveClass('task-approval-btn--approve');
     expect(buttons[2]).not.toHaveClass('task-approval-btn--subdued');
-    expect(buttons[3]).toHaveClass('task-approval-btn--approve');
-    expect(buttons[3]).not.toHaveClass('task-approval-btn--subdued');
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
@@ -72,20 +72,19 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
 
     const buttons = toolbarButtons();
-    expect(buttons.map((button) => button.textContent)).toEqual([
-      'Discard',
+    expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
       'Send Feedback (1)',
       'Continue here',
       'Start fresh conversation',
     ]);
 
-    expect(buttons[1]).toBeEnabled();
-    expect(buttons[1]).toHaveClass('task-approval-btn--recommended');
-    expect(buttons[1]).toHaveAttribute('title', 'Send 1 note as feedback');
+    expect(buttons[0]).toBeEnabled();
+    expect(buttons[0]).toHaveClass('task-approval-btn--recommended');
+    expect(buttons[0]).toHaveAttribute('title', 'Send 1 note as feedback');
+    expect(buttons[1]).toHaveClass('task-approval-btn--approve');
+    expect(buttons[1]).toHaveClass('task-approval-btn--subdued');
     expect(buttons[2]).toHaveClass('task-approval-btn--approve');
     expect(buttons[2]).toHaveClass('task-approval-btn--subdued');
-    expect(buttons[3]).toHaveClass('task-approval-btn--approve');
-    expect(buttons[3]).toHaveClass('task-approval-btn--subdued');
     expect(screen.getByRole('status')).toHaveTextContent(
       'You have 1 note of unsent feedback'
     );

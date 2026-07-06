@@ -29,7 +29,6 @@ import {
   Send,
   ChevronDown,
   Check,
-  XCircle,
   Loader2,
 } from 'lucide-react';
 
@@ -436,6 +435,14 @@ export function TaskApprovalReader({
               </button>
             </>
           )}
+          <button
+            className="task-approval-header-discard"
+            onClick={handleDiscard}
+            aria-label="Discard task"
+            title="Discard task"
+          >
+            <X size={18} />
+          </button>
         </div>
       </div>
 
@@ -454,13 +461,6 @@ export function TaskApprovalReader({
       {/* Action toolbar */}
       <div className="task-approval-actions">
         <button
-          className="task-approval-btn task-approval-btn--discard"
-          onClick={handleDiscard}
-        >
-          <XCircle size={18} />
-          Discard
-        </button>
-        <button
           className={[
             'task-approval-btn',
             'task-approval-btn--feedback',
@@ -470,6 +470,7 @@ export function TaskApprovalReader({
             .join(' ')}
           onClick={handleSendFeedback}
           disabled={!hasUnsentNotes}
+          aria-label={`Send Feedback (${notes.length})`}
           title={
             !hasUnsentNotes
               ? 'Add annotations to the plan before sending feedback'
@@ -477,7 +478,8 @@ export function TaskApprovalReader({
           }
         >
           <Send size={18} />
-          Send Feedback ({notes.length})
+          <span className="task-approval-btn-label-full">Send Feedback ({notes.length})</span>
+          <span className="task-approval-btn-label-compact">Feedback</span>
         </button>
         <button
           className={[
@@ -489,6 +491,7 @@ export function TaskApprovalReader({
             .join(' ')}
           disabled={approvingHandoff !== null}
           onClick={() => handleApprove('continue_in_current_conversation')}
+          aria-label="Continue here"
         >
           {approvingHandoff === 'continue_in_current_conversation' ? (
             <>
@@ -498,7 +501,8 @@ export function TaskApprovalReader({
           ) : (
             <>
               <Check size={18} />
-              Continue here
+              <span className="task-approval-btn-label-full">Continue here</span>
+              <span className="task-approval-btn-label-compact">Continue</span>
             </>
           )}
         </button>
@@ -512,6 +516,7 @@ export function TaskApprovalReader({
             .join(' ')}
           disabled={approvingHandoff !== null}
           onClick={() => handleApprove('start_fresh_work_conversation')}
+          aria-label="Start fresh conversation"
         >
           {approvingHandoff === 'start_fresh_work_conversation' ? (
             <>
@@ -521,7 +526,8 @@ export function TaskApprovalReader({
           ) : (
             <>
               <Check size={18} />
-              Start fresh conversation
+              <span className="task-approval-btn-label-full">Start fresh conversation</span>
+              <span className="task-approval-btn-label-compact">Fresh</span>
             </>
           )}
         </button>
