@@ -1688,25 +1688,27 @@ async fn create_conversation_with_id(
         if let Some(checkout_ref) = req.checkout_ref.as_deref() {
             validate_user_ref(checkout_ref)?;
         }
-        let repo_path = std::path::Path::new(&repo_root);
-        let start =
-            GitStartPoint::for_create_request(repo_path, base_branch, req.checkout_ref.as_deref())
-                .map_err(git_start_error_to_app_error)?;
-        managed_base_branch = Some(start.logical_base().to_string());
+        let logical_base = base_branch.to_string();
+        managed_base_branch = Some(logical_base.clone());
 
         let conv_id = id.clone();
-        let branch = start.logical_base().to_string();
-        let checkout = start.checkout_ref().to_string();
+        let checkout = req.checkout_ref.clone();
         let repo = repo_root.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            create_managed_explore_worktree_blocking(&repo, &conv_id, &branch, &checkout)
+            create_managed_explore_worktree_blocking(
+                &repo,
+                &conv_id,
+                &logical_base,
+                checkout.as_deref(),
+            )
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
 
         let worktree_path = match result {
             Ok(p) => p,
+            Err(ManagedWorktreeError::BadRequest(msg)) => return Err(AppError::BadRequest(msg)),
             Err(ManagedWorktreeError::Git(msg)) => return Err(AppError::Internal(msg)),
         };
 
@@ -1927,15 +1929,6 @@ fn validate_user_ref(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn git_start_error_to_app_error(error: GitStartError) -> AppError {
-    match error {
-        GitStartError::BranchNotFound(_) | GitStartError::DetachedHead => {
-            AppError::BadRequest(error.to_string())
-        }
-        GitStartError::Git(message) => AppError::Internal(message),
-    }
-}
-
 /// Create a git worktree for an existing branch. Runs on a blocking thread.
 ///
 /// Delegates to `git_ops::{materialize_branch, check_branch_conflict, create_worktree}`.
@@ -2024,17 +2017,31 @@ fn create_branch_worktree_blocking(
 /// base branch. At approval time, `execute_approve_task_blocking` detects
 /// the existing worktree and renames the branch.
 enum ManagedWorktreeError {
+    /// User-input failure (e.g. branch doesn't exist locally or at origin).
+    BadRequest(String),
     /// Infrastructure failure (worktree creation, generic git errors).
     Git(String),
+}
+
+fn managed_worktree_error_from_git_start(error: GitStartError) -> ManagedWorktreeError {
+    match error {
+        GitStartError::BranchNotFound(_) | GitStartError::DetachedHead => {
+            ManagedWorktreeError::BadRequest(error.to_string())
+        }
+        GitStartError::Git(message) => ManagedWorktreeError::Git(message),
+    }
 }
 
 fn create_managed_explore_worktree_blocking(
     repo_root: &str,
     conv_id: &str,
     base_branch: &str,
-    checkout_ref: &str,
+    checkout_ref: Option<&str>,
 ) -> Result<String, ManagedWorktreeError> {
     let cwd = std::path::Path::new(repo_root);
+    let start = GitStartPoint::for_create_request(cwd, base_branch, checkout_ref)
+        .map_err(managed_worktree_error_from_git_start)?;
+    let checkout_ref = start.checkout_ref();
 
     let id_prefix: String = conv_id.chars().take(8).collect();
     let temp_branch = format!("task-pending-{id_prefix}");
@@ -4847,9 +4854,24 @@ fn task_entry_with_conversation(
     }
 }
 
-fn local_task_entry_parts(cwd: &std::path::Path, tasks_dir_name: &str) -> Vec<TaskEntryParts> {
-    let root = crate::resolution_root::ResolutionRoot::working_dir(cwd);
-    crate::task_listing::list_task_entries(&root, cwd, tasks_dir_name, None)
+fn local_task_entry_parts(
+    cwd: &std::path::Path,
+    tasks_dir_name: &str,
+    limit: Option<usize>,
+) -> Vec<TaskEntryParts> {
+    taskmd_core::tasks::list_tasks(&cwd.join(tasks_dir_name))
+        .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|t| TaskEntryParts {
+            id: t.id,
+            priority: t.priority.to_string(),
+            status: t.status.to_string(),
+            slug: t.slug,
+            path: t.path.to_string_lossy().into_owned(),
+            source_ref: None,
+            content: None,
+        })
+        .collect()
 }
 
 fn project_task_entries_from_default_ref(cwd: &std::path::Path) -> Vec<TaskEntryParts> {
@@ -4857,7 +4879,7 @@ fn project_task_entries_from_default_ref(cwd: &std::path::Path) -> Vec<TaskEntry
         let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
             .to_string_lossy()
             .into_owned();
-        return local_task_entry_parts(cwd, &tasks_dir_name);
+        return local_task_entry_parts(cwd, &tasks_dir_name, None);
     };
     let root = crate::resolution_root::ResolutionRoot::from_start_point(cwd, &start);
     let tasks_dir_name = crate::task_listing::discover_task_dir(&root, cwd);
@@ -4885,7 +4907,7 @@ fn project_tasks_available(cwd: &std::path::Path) -> bool {
         let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
             .to_string_lossy()
             .into_owned();
-        return local_task_entry_parts(cwd, &tasks_dir_name)
+        return local_task_entry_parts(cwd, &tasks_dir_name, Some(1))
             .into_iter()
             .next()
             .is_some();
@@ -8846,10 +8868,12 @@ mod project_task_ref_tests {
             repo.path().to_str().unwrap(),
             "12345678-1234-1234-1234-123456789abc",
             "main",
-            "origin/main",
+            Some("origin/main"),
         ) {
             Ok(path) => path,
-            Err(ManagedWorktreeError::Git(e)) => panic!("{e}"),
+            Err(ManagedWorktreeError::BadRequest(e) | ManagedWorktreeError::Git(e)) => {
+                panic!("{e}")
+            }
         };
 
         assert!(std::path::Path::new(&worktree)

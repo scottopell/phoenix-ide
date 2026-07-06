@@ -265,6 +265,7 @@ mod tests {
         git(clone.path(), &["add", "."]);
         git(clone.path(), &["commit", "-qm", "initial"]);
         git(clone.path(), &["push", "-u", "origin", "main"]);
+        git(origin.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
         git(clone.path(), &["remote", "set-head", "origin", "-a"]);
         (origin, clone)
     }
