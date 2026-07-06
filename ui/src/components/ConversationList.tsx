@@ -113,6 +113,34 @@ function compactContextLabel(conv: Conversation): string | null {
   return leaf || null;
 }
 
+function isLowValueIdentifier(value: string | null | undefined): boolean {
+  const normalized = value?.trim();
+  if (!normalized) return true;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)
+    || /^[0-9a-f]{24,}$/i.test(normalized);
+}
+
+function displayTitleFromConversation(conv: Conversation, fallback = 'Untitled conversation'): string {
+  const candidates = [
+    conv.slug,
+    conv.task_title,
+    conv.branch_name,
+    compactContextLabel(conv),
+  ];
+  return candidates.find((candidate) => !isLowValueIdentifier(candidate))?.trim() || fallback;
+}
+
+function displayTitleFromChain(item: Extract<SidebarItem, { kind: 'chain' }>): string {
+  const root = item.members[0];
+  const candidates = [
+    item.displayName,
+    root?.task_title,
+    root?.branch_name,
+    root ? compactContextLabel(root) : null,
+  ];
+  return candidates.find((candidate) => !isLowValueIdentifier(candidate))?.trim() || 'Untitled chain';
+}
+
 function stateLabel(conv: Conversation, displayState: ReturnType<typeof getConvDisplayState>): string {
   if (conv.state?.type === 'context_exhausted' && conv.presentation_mode === 'needs_action') return 'Context full';
   if (conv.state?.type === 'awaiting_user_response') return 'Needs reply';
@@ -172,6 +200,7 @@ export const ConversationRow = memo(function ConversationRow({
     if (conv.state?.type === 'context_exhausted') {
       return conv.presentation_mode === 'needs_action' ? 'Context full' : 'Continued';
     }
+    if (conv.state?.type === 'awaiting_user_response') return 'Needs reply';
     switch (displayState) {
       case 'idle': return 'Ready';
       case 'working': return 'Working';
@@ -182,7 +211,7 @@ export const ConversationRow = memo(function ConversationRow({
   })();
 
   const contextLabel = compactContextLabel(conv);
-  const visibleStateLabel = stateLabel(conv, displayState);
+  const displayTitle = displayTitleFromConversation(conv);
   const shouldShowMobileChainTitle = isMobileList
     && isChainMember
     && (isCompactCompletedChainMember || isChainLatest || isActive || isActionableDisplayState(displayState));
@@ -192,7 +221,7 @@ export const ConversationRow = memo(function ConversationRow({
       <div
         className="conv-item-main"
         onClick={() => onClick(conv)}
-        title={conv.slug ? `Open conversation "${conv.slug}"` : 'Open conversation'}
+        title={`Open conversation "${displayTitle}"`}
       >
         <div className="conv-item-slug">
           <span className="conv-item-slug-main">
@@ -200,31 +229,28 @@ export const ConversationRow = memo(function ConversationRow({
               className={`conv-state-dot ${displayState}`}
               title={stateTitle}
             />
-            {isMobileList && (displayState === 'working' || displayState === 'error' || displayState === 'awaiting-approval') && (
-              <span className={`conv-state-chip ${displayState}`}>{visibleStateLabel}</span>
-            )}
             {chainIndex !== undefined ? (
               shouldShowMobileChainTitle ? (
                 <>
-                  <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
+                  <span className="conv-item-slug-pos" title={displayTitle ?? undefined}>
                     #{chainIndex + 1}
                   </span>
-                  <span className="conv-item-title">{conv.slug}</span>
+                  <span className="conv-item-title">{displayTitle}</span>
                 </>
               ) : (
-                <span className="conv-item-slug-pos" title={conv.slug ?? undefined}>
+                <span className="conv-item-slug-pos" title={displayTitle ?? undefined}>
                   #{chainIndex + 1}
                 </span>
               )
             ) : (
-              <span className="conv-item-title">{conv.slug}</span>
+              <span className="conv-item-title">{displayTitle}</span>
             )}
             {isChainLatest && (
               <span className="conv-chain-latest-badge" title="Latest in chain — click to continue">
                 latest
               </span>
             )}
-            {conv.conv_mode_label && (
+            {!isMobileList && conv.conv_mode_label && (
               <span
                 className="conv-mode-badge"
                 title={
@@ -242,16 +268,8 @@ export const ConversationRow = memo(function ConversationRow({
                 {conv.conv_mode_label}
               </span>
             )}
-            {cachedPrForBadge && <PrBadge pr={cachedPrForBadge} interactive={!isMobileList} />}
+            {!isMobileList && cachedPrForBadge && <PrBadge pr={cachedPrForBadge} />}
           </span>
-          {isMobileList && (
-            <span
-              className="conv-item-time conv-item-time-mobile"
-              title={`Created: ${formatShortDateTime(conv.created_at)}\nLast activity: ${formatRelativeTime(conv.updated_at)}`}
-            >
-              {formatRelativeTime(conv.updated_at)}
-            </span>
-          )}
         </div>
         <div className="conv-item-meta">
           <span
@@ -265,7 +283,19 @@ export const ConversationRow = memo(function ConversationRow({
           </span>
         </div>
         <div className="conv-item-meta secondary">
-          {contextLabel && (
+          {isMobileList && conv.conv_mode_label && (
+            <span className="conv-mode-badge">{conv.conv_mode_label}</span>
+          )}
+          {isMobileList && cachedPrForBadge && <PrBadge pr={cachedPrForBadge} interactive={false} />}
+          {isMobileList && (
+            <span
+              className="conv-item-time conv-item-time-inline"
+              title={`Created: ${formatShortDateTime(conv.created_at)}\nLast activity: ${formatRelativeTime(conv.updated_at)}`}
+            >
+              {formatRelativeTime(conv.updated_at)}
+            </span>
+          )}
+          {contextLabel && (!isMobileList || !conv.project_name) && (
             <span className="conv-project-label">{contextLabel}</span>
           )}
           <span className="conv-item-model">{conv.model}</span>
@@ -292,7 +322,7 @@ export const ConversationRow = memo(function ConversationRow({
                 onCloseMenu();
                 onRename(conv);
               }}
-              title={conv.slug ? `Rename conversation "${conv.slug}"` : 'Rename conversation'}
+              title={`Rename conversation "${displayTitle}"`}
             >
               Rename
             </button>
@@ -304,7 +334,7 @@ export const ConversationRow = memo(function ConversationRow({
                   onCloseMenu();
                   onArchive(conv);
                 }}
-                title={conv.slug ? `Archive conversation "${conv.slug}"` : 'Archive conversation'}
+                title={`Archive conversation "${displayTitle}"`}
               >
                 Archive
               </button>
@@ -317,7 +347,7 @@ export const ConversationRow = memo(function ConversationRow({
                   onCloseMenu();
                   onDelete(conv);
                 }}
-                title={conv.slug ? `Delete conversation "${conv.slug}" (can't be undone)` : "Delete conversation (can't be undone)"}
+                title={`Delete conversation "${displayTitle}" (can't be undone)`}
               >
                 Delete
               </button>
@@ -386,6 +416,8 @@ export const ChainBlock = memo(function ChainBlock({
   const latestIndex = Math.max(0, item.members.findIndex((m) => m.id === latestMember?.id));
   const latestDisplayState = latestMember ? getConvDisplayState(latestMember) : 'idle';
   const latestContext = latestMember ? compactContextLabel(latestMember) : null;
+  const chainDisplayTitle = displayTitleFromChain(item);
+  const latestDisplayTitle = latestMember ? displayTitleFromConversation(latestMember) : 'Latest conversation';
   return (
     <li
       className={`conv-chain-block ${collapsed ? 'collapsed' : 'expanded'}`}
@@ -420,9 +452,9 @@ export const ChainBlock = memo(function ChainBlock({
         <button
           className="conv-chain-name"
           onClick={() => navigate(`/chains/${item.rootId}`)}
-          title={`Open chain "${item.displayName}"`}
+          title={`Open chain "${chainDisplayTitle}"`}
         >
-          <span className="conv-chain-name-label">{item.displayName}</span>
+          <span className="conv-chain-name-label">{chainDisplayTitle}</span>
           {listDensity !== 'mobile' && (
             <span className="conv-chain-count">{item.members.length} parts</span>
           )}
@@ -449,7 +481,7 @@ export const ChainBlock = memo(function ChainBlock({
                   // page (a no-op when already on the chain page).
                   navigate(`/chains/${item.rootId}?rename=1`);
                 }}
-              title={`Open chain "${item.displayName}" to rename it`}
+              title={`Open chain "${chainDisplayTitle}" to rename it`}
               >
                 Rename chain…
               </button>
@@ -461,7 +493,7 @@ export const ChainBlock = memo(function ChainBlock({
                     onCloseChainMenu();
                     onArchiveChain?.(item.rootId);
                   }}
-                  title={`Archive chain "${item.displayName}"`}
+                  title={`Archive chain "${chainDisplayTitle}"`}
                 >
                   Archive chain
                 </button>
@@ -473,7 +505,7 @@ export const ChainBlock = memo(function ChainBlock({
                   onCloseChainMenu();
                   onDeleteChain?.(item.rootId);
                 }}
-                title={`Delete chain "${item.displayName}" (can't be undone)`}
+                title={`Delete chain "${chainDisplayTitle}" (can't be undone)`}
               >
                 Delete chain
               </button>
@@ -486,19 +518,16 @@ export const ChainBlock = memo(function ChainBlock({
           className={`conv-chain-latest-summary ${keyboardSelectedId === latestMember.id ? 'keyboard-selected' : ''}`}
           data-id={latestMember.id}
           onClick={() => onRowClick(latestMember)}
-          title={latestMember.slug ? `Open latest conversation "${latestMember.slug}"` : 'Open latest conversation'}
+          title={`Open latest conversation "${latestDisplayTitle}"`}
         >
           <span className={`conv-state-dot ${latestDisplayState}`} title={stateLabel(latestMember, latestDisplayState)} />
-          {isActionableDisplayState(latestDisplayState) && (
-            <span className={`conv-state-chip ${latestDisplayState}`}>{stateLabel(latestMember, latestDisplayState)}</span>
-          )}
           <span className="conv-chain-summary-main">
-            <span className="conv-chain-summary-title">Latest #{latestIndex + 1}</span>
+            <span className="conv-chain-summary-title">Latest #{latestIndex + 1}: {latestDisplayTitle}</span>
             {latestMember.conv_mode_label && <span className="conv-mode-badge">{latestMember.conv_mode_label}</span>}
             <span className="conv-item-time">{formatRelativeTime(latestMember.updated_at)}</span>
           </span>
           <span className="conv-chain-summary-meta">
-            {latestContext && <span className="conv-project-label">{latestContext}</span>}
+            {latestContext && !latestMember.project_name && <span className="conv-project-label">{latestContext}</span>}
             {latestMember.cached_pr && <PrBadge pr={latestMember.cached_pr} interactive={false} />}
           </span>
         </button>

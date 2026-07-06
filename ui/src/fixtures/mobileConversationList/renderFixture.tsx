@@ -3,7 +3,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { ConversationList } from '../../components/ConversationList';
 import { SettingsDropdown } from '../../components/SettingsDropdown';
 import '../../index.css';
-import { mobileConversationListFixtureData } from './scenarios';
+import { getMobileConversationListFixtureData } from './scenarios';
 import type { MobileConversationListScenario } from './types';
 
 interface Props {
@@ -12,6 +12,7 @@ interface Props {
 
 export function MobileConversationListFixtureBody({ scenario }: Props) {
   const [showArchived, setShowArchived] = useState(scenario.kind === 'archived');
+  const fixtureData = getMobileConversationListFixtureData(scenario);
 
   useEffect(() => {
     delete document.documentElement.dataset['mobileConversationListFixtureReady'];
@@ -30,8 +31,8 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
     <div id="app" className="list-page mobile-conversation-list-fixture">
       <main id="main-area">
         <ConversationList
-          conversations={mobileConversationListFixtureData.conversations}
-          archivedConversations={mobileConversationListFixtureData.archivedConversations}
+          conversations={fixtureData.conversations}
+          archivedConversations={fixtureData.archivedConversations}
           showArchived={showArchived}
           onToggleArchived={() => setShowArchived((value) => !value)}
           onNewConversation={() => {}}

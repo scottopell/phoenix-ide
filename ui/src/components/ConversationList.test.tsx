@@ -838,7 +838,7 @@ describe('Mobile conversation list redesign', () => {
     expect(desktop.querySelector('[data-id="with-pr"] a.sidebar-pr-badge')).not.toBeNull();
   });
 
-  it('keeps the mobile timestamp in a separate trailing slot from slug and badges', () => {
+  it('keeps the mobile title in the primary row and moves metadata below it', () => {
     const conv = makeConv('with-long-mobile-row', 'very-long-mobile-conversation-title-that-must-truncate', {
       cached_pr: pr(),
       conv_mode_label: 'WORK',
@@ -853,16 +853,16 @@ describe('Mobile conversation list redesign', () => {
     );
 
     const row = container.querySelector('[data-id="with-long-mobile-row"]')!;
-    const slugLine = row.querySelector<HTMLElement>('.conv-item-slug')!;
     const slugMain = row.querySelector<HTMLElement>('.conv-item-slug-main')!;
-    const time = row.querySelector<HTMLElement>('.conv-item-time-mobile')!;
+    const secondary = row.querySelector<HTMLElement>('.conv-item-meta.secondary')!;
+    const time = row.querySelector<HTMLElement>('.conv-item-time-inline')!;
 
-    expect(Array.from(slugLine.children)).toEqual(expect.arrayContaining([slugMain, time]));
     expect(slugMain).toContainElement(row.querySelector('.conv-item-title'));
-    expect(slugMain).toContainElement(row.querySelector('.conv-state-chip'));
-    expect(slugMain).toContainElement(row.querySelector('.conv-mode-badge'));
-    expect(slugMain).toContainElement(row.querySelector('.sidebar-pr-badge'));
-    expect(slugMain).not.toContainElement(time);
+    expect(slugMain).not.toContainElement(row.querySelector('.conv-mode-badge'));
+    expect(slugMain).not.toContainElement(row.querySelector('.sidebar-pr-badge'));
+    expect(secondary).toContainElement(row.querySelector('.conv-mode-badge'));
+    expect(secondary).toContainElement(row.querySelector('.sidebar-pr-badge'));
+    expect(secondary).toContainElement(time);
   });
 
   it('defaults mobile chains to a compact summary with separate chain and latest-conversation targets', () => {
@@ -993,10 +993,10 @@ describe('Mobile conversation list redesign', () => {
 
     expect(container.querySelector('.conv-chain-block')).toHaveClass('expanded');
     expect(container.querySelector('.conv-chain-latest-summary')).toBeNull();
-    expect(container.querySelector('[data-id="needs-leaf"] .conv-state-chip')?.textContent).toBe('Needs approval');
+    expect(container.querySelector('[data-id="needs-leaf"] .conv-state-dot')).toHaveClass('awaiting-approval');
   });
 
-  it('labels context-full mobile rows distinctly from task approvals', () => {
+  it('marks context-full mobile rows as actionable without an extra status badge', () => {
     const conv = makeConv('context-full', 'context-full', {
       presentation_mode: 'needs_action',
       state: { type: 'context_exhausted', summary: 'Context is full' },
@@ -1008,10 +1008,12 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('[data-id="context-full"] .conv-state-chip')?.textContent).toBe('Context full');
+    expect(container.querySelector('[data-id="context-full"] .conv-state-dot')).toHaveClass('awaiting-approval');
+    expect(container.querySelector('[data-id="context-full"] .conv-state-dot')).toHaveAttribute('title', 'Context full');
+    expect(container.querySelector('[data-id="context-full"] .conv-state-chip')).toBeNull();
   });
 
-  it('labels mobile question-blocked rows as needing a reply', () => {
+  it('marks mobile question-blocked rows as actionable without an extra status badge', () => {
     const conv = makeConv('needs-reply', 'needs-reply', {
       presentation_mode: 'needs_action',
       state: { type: 'awaiting_user_response', questions: [] },
@@ -1023,17 +1025,51 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('[data-id="needs-reply"] .conv-state-chip')?.textContent).toBe('Needs reply');
+    expect(container.querySelector('[data-id="needs-reply"] .conv-state-dot')).toHaveClass('awaiting-approval');
+    expect(container.querySelector('[data-id="needs-reply"] .conv-state-dot')).toHaveAttribute('title', 'Needs reply');
+    expect(container.querySelector('[data-id="needs-reply"] .conv-state-chip')).toBeNull();
   });
 
-  it('auto-expands mobile chains with actionable historical members', () => {
-    const root = makeConv('historical-needs-action', 'historical-needs-action', {
-      continued_in_conv_id: 'quiet-leaf',
-      presentation_mode: 'needs_action',
-      state: { type: 'awaiting_user_response', questions: [] },
+  it('uses semantic title fallbacks instead of GUID-like primary labels on mobile rows', () => {
+    const withTaskTitle = makeConv('task-title', 'f872dd1a-f701-49f3-ad25-2605c6b6f3dc', {
+      task_title: 'Iterate mobile conversation list fixtures',
+      branch_name: 'task-26004-iterate-mobile-conversation-list-fixtures',
+    });
+    const withBranch = makeConv('branch-title', '9d1b4cc93b7845228e4fdbe566761f44', {
+      task_title: null,
+      branch_name: 'scott/mobile-row-overflow-audit',
+    });
+    const withContext = makeConv('context-title', '123e4567-e89b-12d3-a456-426614174000', {
+      task_title: null,
+      branch_name: null,
+      project_name: null,
+      cwd: '/tmp/readable-context-leaf',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[withTaskTitle, withBranch, withContext]} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-id="task-title"] .conv-item-title')?.textContent).toBe('Iterate mobile conversation list fixtures');
+    expect(container.querySelector('[data-id="branch-title"] .conv-item-title')?.textContent).toBe('scott/mobile-row-overflow-audit');
+    expect(container.querySelector('[data-id="context-title"] .conv-item-title')?.textContent).toBe('readable-context-leaf');
+  });
+
+  it('uses semantic chain and latest-title fallbacks in collapsed mobile chain summaries', () => {
+    const root = makeConv('guid-root', 'f872dd1a-f701-49f3-ad25-2605c6b6f3dc', {
+      continued_in_conv_id: 'guid-leaf',
+      chain_name: null,
+      task_title: 'Readable root task title',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
       updated_at: '2024-01-01T00:00:00Z',
     });
-    const leaf = makeConv('quiet-leaf', 'quiet-leaf', { updated_at: '2024-02-01T00:00:00Z' });
+    const leaf = makeConv('guid-leaf', '9d1b4cc93b7845228e4fdbe566761f44', {
+      task_title: 'Readable latest task title',
+      updated_at: '2024-02-01T00:00:00Z',
+    });
 
     const { container } = render(
       <MemoryRouter>
@@ -1041,9 +1077,44 @@ describe('Mobile conversation list redesign', () => {
       </MemoryRouter>,
     );
 
-    expect(container.querySelector('.conv-chain-block')).toHaveClass('expanded');
-    expect(container.querySelector('[data-id="historical-needs-action"] .conv-item-title')?.textContent).toBe('historical-needs-action');
-    expect(container.querySelector('[data-id="historical-needs-action"] .conv-state-chip')?.textContent).toBe('Needs reply');
+    expect(container.querySelector('.conv-chain-name-label')?.textContent).toBe('Readable root task title');
+    expect(container.querySelector('.conv-chain-summary-title')?.textContent).toBe('Latest #2: Readable latest task title');
+    expect(container.querySelector('.conv-chain-name-label')?.textContent).not.toContain('f872dd1a');
+    expect(container.querySelector('.conv-chain-summary-title')?.textContent).not.toContain('9d1b4cc');
+  });
+
+  it('keeps cleaned-up terminal mobile chains collapsed by default', () => {
+    const root = makeConv('cleanup-root', 'explore-options', {
+      continued_in_conv_id: 'cleanup-middle',
+      chain_name: 'explore to cleanup',
+      conv_mode_label: 'EXPLORE',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const middle = makeConv('cleanup-middle', 'implement-work', {
+      continued_in_conv_id: 'cleanup-leaf',
+      conv_mode_label: 'WORK',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-02-01T00:00:00Z',
+    });
+    const leaf = makeConv('cleanup-leaf', 'cleanup-after-merge', {
+      conv_mode_label: 'WORK',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-03-01T00:00:00Z',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[leaf, middle, root]} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.conv-chain-block')).toHaveClass('collapsed');
+    expect(container.querySelectorAll('.conv-item-chain-member')).toHaveLength(0);
+    expect(container.querySelector('.conv-chain-summary-title')?.textContent).toBe('Latest #3: cleanup-after-merge');
   });
 
   it('mobile keyboard navigation targets collapsed chain summaries, not hidden history rows', () => {
