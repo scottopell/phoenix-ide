@@ -2537,6 +2537,16 @@ def cmd_qa_mobile_conversation_list() -> None:
     )
 
 
+def cmd_qa_message_list() -> None:
+    """Capture message list Ladle screenshots into ignored local artifacts."""
+    subprocess.run(
+        ["pnpm", "qa:message-list"],
+        cwd=ROOT / "ui",
+        check=True,
+        env=node_env(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # TLS
 # ---------------------------------------------------------------------------
@@ -7370,6 +7380,7 @@ def main():
     qa_sub.add_parser("meta-viewer", help="Capture MetaViewer edge-state Ladle screenshots")
     qa_sub.add_parser("conversation-panel", help="Capture conversation side panel Ladle screenshots")
     qa_sub.add_parser("mobile-conversation-list", help="Capture mobile conversation list Ladle screenshots")
+    qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
 
     # tls
     tls_parser = sub.add_parser("tls", help="Manage Phoenix HTTPS certificates")
@@ -7465,6 +7476,8 @@ def main():
             cmd_qa_conversation_panel()
         elif args.qa_command == "mobile-conversation-list":
             cmd_qa_mobile_conversation_list()
+        elif args.qa_command == "message-list":
+            cmd_qa_message_list()
     elif args.command == "tls":
         if args.tls_command == "ca":
             cmd_tls_ca(args.dir)

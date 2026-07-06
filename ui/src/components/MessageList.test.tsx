@@ -25,30 +25,35 @@ function withConvContext(ui: React.ReactElement): React.ReactElement {
 // real component, so this counts actual re-renders — the render-unit
 // identity regression test (task 58044) asserts state ticks don't bump it.
 const agentRenderCounter = vi.hoisted(() => ({ count: 0 }));
+const agentMessageProps = vi.hoisted(() => [] as Array<{ message: Message; forceExpandedText: boolean | undefined }>);
 
-vi.mock('./MessageComponents', async () => ({
-  UserMessage: ({ message }: { message: { sequence_id: number } }) => (
-    <div className="message user" data-sequence-id={message.sequence_id} data-payload-kind="user">user</div>
-  ),
-  QueuedUserMessage: () => (
-    <div className="message queued" data-payload-kind="pending">pending</div>
-  ),
-  AgentMessage: (await import('react')).memo(({ message }: { message: { sequence_id: number } }) => {
-    agentRenderCounter.count++;
-    return <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>;
-  }),
-  SubAgentStatus: () => null,
-  SkillCommandText: ({ text }: { text: string }) => {
-    const [token = '', ...rest] = text.split(/\s+/);
-    return (
-      <span className="skill-command-inline">
-        <span className="skill-command-chip"><span className="skill-command-slash">/</span><span className="skill-command-name">{token.replace(/^\//, '')}</span></span>
-        {rest.length > 0 && <span className="skill-command-args"> {rest.join(' ')}</span>}
-      </span>
-    );
-  },
-  formatMessageTime: () => '12:00',
-}));
+vi.mock('./MessageComponents', async () => {
+  const React = await import('react');
+  return {
+    UserMessage: ({ message }: { message: { sequence_id: number } }) => (
+      <div className="message user" data-sequence-id={message.sequence_id} data-payload-kind="user">user</div>
+    ),
+    QueuedUserMessage: () => (
+      <div className="message queued" data-payload-kind="pending">pending</div>
+    ),
+    AgentMessage: React.memo(({ message, forceExpandedText }: { message: Message; forceExpandedText?: boolean }) => {
+      agentRenderCounter.count++;
+      agentMessageProps.push({ message, forceExpandedText });
+      return <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>;
+    }),
+    SubAgentStatus: () => null,
+    SkillCommandText: ({ text }: { text: string }) => {
+      const [token = '', ...rest] = text.split(/\s+/);
+      return (
+        <span className="skill-command-inline">
+          <span className="skill-command-chip"><span className="skill-command-slash">/</span><span className="skill-command-name">{token.replace(/^\//, '')}</span></span>
+          {rest.length > 0 && <span className="skill-command-args"> {rest.join(' ')}</span>}
+        </span>
+      );
+    },
+    formatMessageTime: () => '12:00',
+  };
+});
 
 vi.mock('./StreamingMessage', () => ({
   StreamingMessage: () => null,
@@ -79,6 +84,7 @@ beforeEach(() => {
   virtuosoMock.totalListHeightChanged = null;
   virtuosoMock.atBottomStateChange = null;
   agentRenderCounter.count = 0;
+  agentMessageProps.length = 0;
 });
 
 vi.mock('react-virtuoso', () => ({
@@ -148,6 +154,35 @@ function makeMessage(sequence_id: number, message_type: Message['message_type'] 
 const appCss = readFileSync(`${process.cwd()}/src/index.css`, 'utf8');
 
 const idleState: ConversationState = { type: 'idle' };
+
+describe('latest assistant expansion in compact mode', () => {
+  it('shows the latest finalized assistant text fully in compact mode', () => {
+    const messages: Message[] = [
+      { ...makeMessage(1, 'user'), message_id: 'user-1', content: { text: 'Please summarize the plan.' } },
+      { ...makeMessage(2, 'agent'), message_id: 'agent-1', content: [{ type: 'text', text: 'Older assistant summary that should collapse in compact mode.\n\nSecond line.' }] },
+      { ...makeMessage(3, 'user'), message_id: 'user-2', content: { text: 'Anything else?' } },
+      { ...makeMessage(4, 'agent'), message_id: 'agent-2', content: [{ type: 'text', text: 'Latest assistant summary should stay expanded in compact mode.\n\nSecond line.' }] },
+    ];
+
+    render(
+      withConvContext(
+        <MessageList
+          messages={messages}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-latest-expanded"
+          slug="conv-latest-expanded"
+        />,
+      ),
+    );
+
+    expect(agentMessageProps).toHaveLength(2);
+    expect(agentMessageProps[0]?.forceExpandedText).toBe(false);
+    expect(agentMessageProps[1]?.forceExpandedText).toBe(true);
+  });
+});
 
 describe('MessageList', () => {
   it('renders skill invocations as inline slash-command user messages with attachments', () => {

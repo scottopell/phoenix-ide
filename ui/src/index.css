@@ -13070,6 +13070,26 @@ button.keyword-search-filepath:hover {
   align-items: stretch;
 }
 
+.fixture-message-list-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 12px;
+  display: flex;
+  background: var(--bg-primary);
+}
+
+.message-list-fixture-shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: var(--bg-primary);
+}
+
+
 
 
 /* stylelint-disable no-descending-specificity -- mobile conversation list overrides refine base/sidebar/full-page conversation selectors */

@@ -129,6 +129,7 @@ function renderHistoricalUnit(
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
   activeToolUseId: string | undefined,
+  isLatestAgentMessage: boolean,
 ): JSX.Element | null {
   switch (unit.kind) {
     case 'user':
@@ -171,6 +172,7 @@ function renderHistoricalUnit(
           workScopeKey={workScopeKey}
           activeToolUseId={activeToolUseId}
           isFirstInTurn={unit.isFirstInTurn}
+          forceExpandedText={isLatestAgentMessage}
         />
       );
     case 'system': {
@@ -215,6 +217,7 @@ function renderUnit(
   onCancelSteering: ((localId: string) => void) | undefined,
   workScopeKey: string | undefined,
   activeToolUseId: string | undefined,
+  isLatestAgentMessage: boolean,
 ): JSX.Element | null {
   if (
     unit.kind === 'sub_agent_status' ||
@@ -222,7 +225,7 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug);
   }
-  return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId);
+  return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, isLatestAgentMessage);
 }
 
 interface SystemPromptHeaderProps {
@@ -957,13 +960,21 @@ function MessageListImpl({
     [systemPrompt, systemPromptExpanded, toggleSystemPrompt],
   );
 
+  const latestAgentKey = useMemo(() => {
+    for (let i = historicalUnits.length - 1; i >= 0; i -= 1) {
+      const unit = historicalUnits[i];
+      if (unit?.kind === 'agent_turn') return unit.key;
+    }
+    return null;
+  }, [historicalUnits]);
+
   const itemContent = useCallback(
     (_index: number, unit: RenderUnit) => (
       <div className="virtuoso-row" data-render-unit-key={unit.key}>
-        {renderUnit(unit, slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId)}
+        {renderUnit(unit, slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, unit.kind === 'agent_turn' && unit.key === latestAgentKey)}
       </div>
     ),
-    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId],
+    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey],
   );
 
   const computeItemKey = useCallback(

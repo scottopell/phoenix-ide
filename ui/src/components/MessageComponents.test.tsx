@@ -838,6 +838,26 @@ describe('finalized code fence highlighting', () => {
     expect(screen.getByRole('button')).toHaveTextContent('First line summary.');
   });
 
+  it('renders compact text fully when forceExpandedText is set', () => {
+    mockDensity = 'compact';
+
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-force-expanded', [{
+            type: 'text',
+            text: 'First line summary.\n\nSecond line with more detail.',
+          }])}
+          toolResults={new Map()}
+          forceExpandedText
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('.agent-text-block')).toBeInTheDocument();
+    expect(container.querySelector('.agent-text-collapsed')).not.toBeInTheDocument();
+  });
+
   it('renders short mermaid fences in compact mode instead of collapsing them', async () => {
     mockDensity = 'compact';
 

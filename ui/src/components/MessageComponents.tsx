@@ -860,11 +860,16 @@ interface AgentMessageProps {
    * the original behavior.
    */
   isFirstInTurn?: boolean;
+  /**
+   * When true, the compact-density prose preview is bypassed so the message
+   * renders in its full non-collapsed form.
+   */
+  forceExpandedText?: boolean;
 }
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
   const { theme } = useTheme();
@@ -1041,7 +1046,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
               const remarkPlugins = usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
               // Compact: only previews that hide content fold to an expandable one-liner.
               // Substantial prose (>= threshold) always renders full.
-              if (compact && shouldCollapseCompactText(block.text)) {
+              if (compact && !forceExpandedText && shouldCollapseCompactText(block.text)) {
                 return (
                   <CollapsibleText
                     key={i}
