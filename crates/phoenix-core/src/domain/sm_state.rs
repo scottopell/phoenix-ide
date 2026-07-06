@@ -102,6 +102,12 @@ pub struct CommissionReviewApprovalScope {
     pub deletions: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommissionReviewApprovalAvailability {
+    Available(CommissionReviewApprovalScope),
+    Unavailable { reason: String },
+}
+
 /// User decision for a pending `commission_review` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommissionReviewApprovalOutcome {
@@ -2038,6 +2044,7 @@ pub struct ConvContext {
     pub context_exhaustion_behavior: ContextExhaustionBehavior,
     /// Conversation mode context for system prompt (stable per mode, updated on Explore->Work)
     pub mode_context: Option<crate::domain::mode_context::ModeContext>,
+    pub commission_review_approval: Option<CommissionReviewApprovalAvailability>,
     /// Explore-mode bash authority surfaced to the system prompt. This is a
     /// typed capability (not inferred from tool names) so sandboxed and
     /// unavailable bash cannot be conflated.
@@ -2093,6 +2100,7 @@ impl ConvContext {
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: ExploreBashCapability::Unavailable,
             max_turns: 0,
             desired_base_branch: None,
@@ -2121,6 +2129,7 @@ impl ConvContext {
             context_window,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: ExploreBashCapability::Unavailable,
             max_turns: 0,
             desired_base_branch: None,

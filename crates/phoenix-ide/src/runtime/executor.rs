@@ -22,7 +22,8 @@ use super::{
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
 use crate::state_machine::state::{
-    SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
+    CommissionReviewApprovalAvailability, CommissionReviewApprovalScope, SubAgentMode,
+    SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
 };
 use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
@@ -34,11 +35,215 @@ use chrono::{DateTime, Utc};
 use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+
+const COMMISSION_REVIEW_DIRTY_WORKTREE: &str = "commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the approved origin base branch.";
+const COMMISSION_REVIEW_MISSING_ORIGIN_HEAD: &str = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.";
+const COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE: &str = "commission_review is unavailable: git status could not inspect the review target working tree.";
+
+fn refresh_commission_review_approval_for_outcome(
+    context: &mut ConvContext,
+    outcome: &EffectOutcome,
+) {
+    let EffectOutcome::Llm(LlmOutcome::Response { tool_calls, .. }) = outcome else {
+        return;
+    };
+    if !tool_calls.iter().any(|tool| match &tool.input {
+        ToolInput::CommissionReview(_) => true,
+        ToolInput::Malformed { name, .. } => name == "commission_review",
+        _ => false,
+    }) {
+        return;
+    }
+
+    context.commission_review_approval = Some(resolve_commission_review_approval(context));
+}
+
+fn resolve_commission_review_approval(
+    context: &ConvContext,
+) -> CommissionReviewApprovalAvailability {
+    if let Err(reason) = git_worktree_clean(&context.working_dir) {
+        return CommissionReviewApprovalAvailability::Unavailable { reason };
+    }
+
+    let (base, head) = if let Some(
+        ModeContext::Work {
+            base_branch,
+            branch_name,
+            ..
+        }
+        | ModeContext::Branch {
+            base_branch,
+            branch_name,
+            ..
+        },
+    ) = context.mode_context.as_ref()
+    {
+        let base_ref = format!("refs/remotes/origin/{base_branch}");
+        if !git_ref_exists(&context.working_dir, &base_ref) {
+            return CommissionReviewApprovalAvailability::Unavailable {
+                reason: format!(
+                    "commission_review is unavailable: this conversation does not have fetched approved base ref `{base_ref}` for a committed branch diff. Fetch origin before requesting review."
+                ),
+            };
+        }
+        (base_ref, branch_name.clone())
+    } else {
+        let Some(default_branch) =
+            phoenix_core::git::resolve_remote_default_branch(&context.working_dir)
+        else {
+            return CommissionReviewApprovalAvailability::Unavailable {
+                reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string(),
+            };
+        };
+        let base_ref = format!("refs/remotes/origin/{default_branch}");
+        if !git_ref_exists(&context.working_dir, &base_ref) {
+            return CommissionReviewApprovalAvailability::Unavailable {
+                reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string(),
+            };
+        }
+        (base_ref, "HEAD".to_string())
+    };
+
+    CommissionReviewApprovalAvailability::Available(CommissionReviewApprovalScope {
+        kind: "committed_branch_diff".to_string(),
+        repo_root: context.working_dir.display().to_string(),
+        base,
+        head,
+        dirty: false,
+        changed_files: 0,
+        insertions: 0,
+        deletions: 0,
+    })
+}
+
+fn git_worktree_clean(repo: &Path) -> Result<(), String> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo)
+        .output()
+        .map_err(|_| COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE.to_string())?;
+
+    if !output.status.success() {
+        return Err(COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE.to_string());
+    }
+    if !output.stdout.is_empty() {
+        return Err(COMMISSION_REVIEW_DIRTY_WORKTREE.to_string());
+    }
+    Ok(())
+}
+
+fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", git_ref])
+        .current_dir(repo)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(test)]
+mod commission_review_approval_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn git_ok(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn git_output(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn repo_context(repo: &Path) -> ConvContext {
+        ConvContext::new("test-conv", PathBuf::from(repo), "test-model", 200_000)
+    }
+
+    fn init_repo(repo: &Path) {
+        git_ok(repo, &["init", "-q"]);
+        git_ok(repo, &["config", "user.email", "t@t.t"]);
+        git_ok(repo, &["config", "user.name", "t"]);
+        git_ok(repo, &["config", "commit.gpgsign", "false"]);
+        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]);
+    }
+
+    #[test]
+    fn commission_review_approval_rejects_dirty_worktree_before_approval() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let head = git_output(dir.path(), &["rev-parse", "HEAD"]);
+        git_ok(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", &head],
+        );
+        std::fs::write(dir.path().join("dirty.rs"), "uncommitted\n").expect("write dirty file");
+
+        let availability = resolve_commission_review_approval(&repo_context(dir.path()));
+        assert_eq!(
+            availability,
+            CommissionReviewApprovalAvailability::Unavailable {
+                reason: COMMISSION_REVIEW_DIRTY_WORKTREE.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn commission_review_approval_requires_work_mode_origin_base_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let mut context = repo_context(dir.path());
+        context.mode_context = Some(ModeContext::Work {
+            branch_name: "task".to_string(),
+            base_branch: "develop".to_string(),
+            worktree_path: dir.path().display().to_string(),
+        });
+
+        let availability = resolve_commission_review_approval(&context);
+        assert_eq!(
+            availability,
+            CommissionReviewApprovalAvailability::Unavailable {
+                reason: "commission_review is unavailable: this conversation does not have fetched approved base ref `refs/remotes/origin/develop` for a committed branch diff. Fetch origin before requesting review.".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn commission_review_approval_rejects_dangling_origin_head() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        git_ok(
+            dir.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+
+        let availability = resolve_commission_review_approval(&repo_context(dir.path()));
+        assert_eq!(
+            availability,
+            CommissionReviewApprovalAvailability::Unavailable {
+                reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string()
+            }
+        );
+    }
+}
 
 /// Safety-net wall-clock timeout for sub-agents (REQ-SA-006).
 /// Primary enforcement is max turns (REQ-PROJ-008). This catches stuck tool execution.
@@ -1702,6 +1907,8 @@ where
         if matches!(outcome, EffectOutcome::RetryTimeout { .. }) {
             self.retry_timer_handle = None;
         }
+
+        refresh_commission_review_approval_for_outcome(&mut self.context, &outcome);
 
         let result = match handle_outcome(&self.state, &self.context, outcome) {
             Ok(r) => r,

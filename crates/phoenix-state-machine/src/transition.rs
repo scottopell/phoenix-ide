@@ -17,7 +17,7 @@ use super::event::{
 };
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
-    AssistantMessage, CommissionReviewApprovalOutcome, CommissionReviewApprovalScope,
+    AssistantMessage, CommissionReviewApprovalAvailability, CommissionReviewApprovalOutcome,
     ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind, ParentState,
     RecoveryKind, RecoveryResumeTarget, SubAgentOutcome, SubAgentResult, SubAgentState,
     TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
@@ -26,7 +26,6 @@ use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::mode_context::ModeContext;
-use phoenix_core::git::resolve_remote_default_branch;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -305,96 +304,16 @@ enum CommissionReviewCall<'a> {
     Malformed(&'a str),
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-enum CommissionReviewScopeError {
-    #[error("commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the approved origin base branch.")]
-    DirtyWorktree,
-    #[error("commission_review is unavailable: this conversation does not have fetched approved base ref `{base_ref}` for a committed branch diff. Fetch origin before requesting review.")]
-    MissingOriginBaseRef { base_ref: String },
-    #[error("commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.")]
-    MissingOriginHead,
-    #[error("commission_review is unavailable: git status could not inspect the review target working tree.")]
-    GitStatusUnavailable,
-}
-
-fn git_worktree_clean(repo: &Path) -> Result<(), CommissionReviewScopeError> {
-    let output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(repo)
-        .output()
-        .map_err(|_| CommissionReviewScopeError::GitStatusUnavailable)?;
-
-    if !output.status.success() {
-        return Err(CommissionReviewScopeError::GitStatusUnavailable);
-    }
-    if !output.stdout.is_empty() {
-        return Err(CommissionReviewScopeError::DirtyWorktree);
-    }
-    Ok(())
-}
-
-fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", git_ref])
-        .current_dir(repo)
-        .status()
-        .is_ok_and(|status| status.success())
-}
+const COMMISSION_REVIEW_SCOPE_UNAVAILABLE: &str = "commission_review is unavailable: this conversation does not have a current committed branch diff scope.";
 
 fn commission_review_scope_from_context(
     context: &ConvContext,
-    _input: &super::state::CommissionReviewInput,
-) -> Result<CommissionReviewApprovalScope, CommissionReviewScopeError> {
-    git_worktree_clean(&context.working_dir)?;
-
-    let (kind, base, head) = match context.mode_context.as_ref() {
-        Some(
-            ModeContext::Work {
-                base_branch,
-                branch_name,
-                ..
-            }
-            | ModeContext::Branch {
-                base_branch,
-                branch_name,
-                ..
-            },
-        ) => {
-            let base_ref = format!("refs/remotes/origin/{base_branch}");
-            if !git_ref_exists(&context.working_dir, &base_ref) {
-                return Err(CommissionReviewScopeError::MissingOriginBaseRef { base_ref });
-            }
-            (
-                "committed_branch_diff".to_string(),
-                base_ref,
-                branch_name.clone(),
-            )
-        }
-        _ => (
-            "committed_branch_diff".to_string(),
-            format!(
-                "refs/remotes/origin/{}",
-                resolve_remote_default_branch(&context.working_dir)
-                    .ok_or(CommissionReviewScopeError::MissingOriginHead)?
-            ),
-            "HEAD".to_string(),
-        ),
-    };
-
-    let repo_root = context.working_dir.display().to_string();
-    let dirty = false;
-    let (changed_files, insertions, deletions) = (0, 0, 0);
-
-    Ok(CommissionReviewApprovalScope {
-        kind,
-        repo_root,
-        base,
-        head,
-        dirty,
-        changed_files,
-        insertions,
-        deletions,
-    })
+) -> Result<super::state::CommissionReviewApprovalScope, String> {
+    match context.commission_review_approval.as_ref() {
+        Some(CommissionReviewApprovalAvailability::Available(scope)) => Ok(scope.clone()),
+        Some(CommissionReviewApprovalAvailability::Unavailable { reason }) => Err(reason.clone()),
+        None => Err(COMMISSION_REVIEW_SCOPE_UNAVAILABLE.to_string()),
+    }
 }
 
 /// Result of a state transition
@@ -2532,10 +2451,10 @@ pub fn transition_parent(
                     });
                 }
 
-                let scope = match commission_review_scope_from_context(context, input) {
+                let scope = match commission_review_scope_from_context(context) {
                     Ok(scope) => scope,
                     Err(err) => {
-                        let err_msg = err.to_string();
+                        let err_msg = err;
                         let display_data = make_display_data(&content);
                         let assistant_message = AssistantMessage::new(
                             request_id.clone(),
@@ -3652,8 +3571,8 @@ pub fn llm_error_to_db_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::CommissionReviewInput;
-    use std::path::PathBuf;
+    use crate::state::CommissionReviewApprovalScope;
+    use std::path::{Path, PathBuf};
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
@@ -3673,87 +3592,35 @@ mod tests {
     }
 
     #[test]
-    fn commission_review_scope_requires_origin_head_for_direct_context() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let repo = dir.path();
-        git_ok(repo, &["init", "-q"]);
-        git_ok(repo, &["config", "user.email", "t@t.t"]);
-        git_ok(repo, &["config", "user.name", "t"]);
-        git_ok(repo, &["config", "commit.gpgsign", "false"]);
-        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]);
+    fn commission_review_scope_uses_precomputed_availability() {
+        let mut ctx = test_context();
+        ctx.commission_review_approval = Some(CommissionReviewApprovalAvailability::Available(
+            CommissionReviewApprovalScope {
+                kind: "committed_branch_diff".to_string(),
+                repo_root: "/repo".to_string(),
+                base: "refs/remotes/origin/main".to_string(),
+                head: "HEAD".to_string(),
+                dirty: false,
+                changed_files: 0,
+                insertions: 0,
+                deletions: 0,
+            },
+        ));
 
-        let ctx = context_with_dir(repo);
-        let input = CommissionReviewInput {
-            brief: "Ready".to_string(),
-            focus: None,
-        };
-        let err =
-            commission_review_scope_from_context(&ctx, &input).expect_err("origin/HEAD missing");
-        assert_eq!(err, CommissionReviewScopeError::MissingOriginHead);
-
-        let head = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(repo)
-            .output()
-            .expect("git rev-parse");
-        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        git_ok(repo, &["update-ref", "refs/remotes/origin/main", &head]);
-        git_ok(
-            repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-        );
-
-        let scope = commission_review_scope_from_context(&ctx, &input).expect("scope available");
-        assert_eq!(scope.kind, "committed_branch_diff");
+        let scope = commission_review_scope_from_context(&ctx).expect("scope available");
         assert_eq!(scope.base, "refs/remotes/origin/main");
         assert_eq!(scope.head, "HEAD");
-        assert!(!scope.dirty);
     }
 
     #[test]
-    fn commission_review_scope_rejects_dirty_work_context_and_missing_base_ref() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let repo = dir.path();
-        git_ok(repo, &["init", "-q"]);
-        git_ok(repo, &["config", "user.email", "t@t.t"]);
-        git_ok(repo, &["config", "user.name", "t"]);
-        git_ok(repo, &["config", "commit.gpgsign", "false"]);
-        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]);
-
-        let mut ctx = context_with_dir(repo);
-        ctx.mode_context = Some(ModeContext::Work {
-            branch_name: "task".to_string(),
-            base_branch: "develop".to_string(),
-            worktree_path: repo.display().to_string(),
+    fn commission_review_scope_preserves_precomputed_unavailable_reason() {
+        let mut ctx = test_context();
+        ctx.commission_review_approval = Some(CommissionReviewApprovalAvailability::Unavailable {
+            reason: "commission_review refused dirty working tree".to_string(),
         });
-        let input = CommissionReviewInput {
-            brief: "Ready".to_string(),
-            focus: None,
-        };
-        let err = commission_review_scope_from_context(&ctx, &input).expect_err("base ref missing");
-        assert_eq!(
-            err,
-            CommissionReviewScopeError::MissingOriginBaseRef {
-                base_ref: "refs/remotes/origin/develop".to_string()
-            }
-        );
 
-        let head = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(repo)
-            .output()
-            .expect("git rev-parse");
-        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
-        git_ok(repo, &["update-ref", "refs/remotes/origin/develop", &head]);
-        assert!(commission_review_scope_from_context(&ctx, &input).is_ok());
-
-        std::fs::write(repo.join("dirty.rs"), "uncommitted\n").expect("write dirty file");
-        let err = commission_review_scope_from_context(&ctx, &input).expect_err("dirty worktree");
-        assert_eq!(err, CommissionReviewScopeError::DirtyWorktree);
+        let err = commission_review_scope_from_context(&ctx).expect_err("scope unavailable");
+        assert_eq!(err, "commission_review refused dirty working tree");
     }
 
     fn test_tool_call(id: &str) -> ToolCall {
@@ -4406,6 +4273,7 @@ mod tests {
         // Create a sub-agent context
         let subagent_ctx = ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -4474,6 +4342,7 @@ mod tests {
         use crate::state::ContextExhaustionBehavior;
         ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-cancel".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -4798,6 +4667,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -4906,6 +4776,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -4960,6 +4831,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -5021,6 +4893,7 @@ mod tests {
 
         let subagent_ctx = ConvContext {
             mode_context: None,
+            commission_review_approval: None,
             explore_bash: phoenix_core::domain::sm_state::ExploreBashCapability::Unavailable,
             conversation_id: "subagent-1".to_string(),
             root_conversation_id: "test-root".to_string(),
@@ -6218,6 +6091,18 @@ mod tests {
                 base_branch: "main".to_string(),
                 worktree_path: repo.display().to_string(),
             });
+            context.commission_review_approval = Some(
+                CommissionReviewApprovalAvailability::Available(CommissionReviewApprovalScope {
+                    kind: "committed_branch_diff".to_string(),
+                    repo_root: repo.display().to_string(),
+                    base: "refs/remotes/origin/main".to_string(),
+                    head: "task".to_string(),
+                    dirty: false,
+                    changed_files: 0,
+                    insertions: 0,
+                    deletions: 0,
+                }),
+            );
             std::mem::forget(dir);
             context
         }
