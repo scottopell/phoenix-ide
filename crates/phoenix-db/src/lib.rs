@@ -6497,7 +6497,7 @@ mod tests {
             scope: CommissionReviewApprovalScope {
                 kind: "committed_branch_diff".to_string(),
                 repo_root: "/tmp".to_string(),
-                base: "origin/main".to_string(),
+                base: "refs/remotes/origin/main".to_string(),
                 head: "task".to_string(),
                 dirty: false,
                 changed_files: 0,

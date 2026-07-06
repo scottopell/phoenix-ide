@@ -166,7 +166,7 @@ describe('parseConversationState commission review approval', () => {
       scope: {
         kind: 'committed_branch_diff',
         repo_root: '/repo',
-        base: 'origin/main',
+        base: 'refs/remotes/origin/main',
         head: 'task',
         dirty: false,
         changed_files: 0,
@@ -180,7 +180,7 @@ describe('parseConversationState commission review approval', () => {
       scope: {
         kind: 'committed_branch_diff',
         repo_root: '/repo',
-        base: 'origin/main',
+        base: 'refs/remotes/origin/main',
         head: 'task',
         dirty: false,
         changed_files: 0,

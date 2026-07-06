@@ -26,6 +26,7 @@ use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::mode_context::ModeContext;
+use phoenix_core::git::resolve_remote_default_branch;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -307,7 +308,7 @@ enum CommissionReviewCall<'a> {
 fn commission_review_scope_from_context(
     context: &ConvContext,
     _input: &super::state::CommissionReviewInput,
-) -> CommissionReviewApprovalScope {
+) -> Option<CommissionReviewApprovalScope> {
     let (kind, base, head) = match context.mode_context.as_ref() {
         Some(
             ModeContext::Work {
@@ -322,12 +323,15 @@ fn commission_review_scope_from_context(
             },
         ) => (
             "committed_branch_diff".to_string(),
-            format!("origin/{base_branch}"),
+            format!("refs/remotes/origin/{base_branch}"),
             branch_name.clone(),
         ),
         _ => (
             "committed_branch_diff".to_string(),
-            "origin/HEAD".to_string(),
+            format!(
+                "refs/remotes/origin/{}",
+                resolve_remote_default_branch(&context.working_dir)?
+            ),
             "HEAD".to_string(),
         ),
     };
@@ -336,7 +340,7 @@ fn commission_review_scope_from_context(
     let dirty = false;
     let (changed_files, insertions, deletions) = (0, 0, 0);
 
-    CommissionReviewApprovalScope {
+    Some(CommissionReviewApprovalScope {
         kind,
         repo_root,
         base,
@@ -345,7 +349,7 @@ fn commission_review_scope_from_context(
         changed_files,
         insertions,
         deletions,
-    }
+    })
 }
 
 /// Result of a state transition
@@ -2483,6 +2487,31 @@ pub fn transition_parent(
                     });
                 }
 
+                let scope = match commission_review_scope_from_context(context, input) {
+                    Some(scope) => scope,
+                    None => {
+                        let err_msg = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff.".to_string();
+                        let display_data = make_display_data(&content);
+                        let assistant_message = AssistantMessage::new(
+                            request_id.clone(),
+                            content,
+                            Some(usage_data),
+                            display_data,
+                        );
+                        let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                        let checkpoint =
+                            CheckpointData::tool_round(assistant_message, vec![tool_result])
+                                .expect("commission_review produces exactly one result");
+                        return Ok(ParentTransitionResult::new(ParentState::Core(
+                            CoreState::LlmRequesting { attempt: 1 },
+                        ))
+                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_state_change())
+                        .with_effect(Effect::RequestLlm));
+                    }
+                };
+
                 // Park for approval without writing a tool_result placeholder.
                 // The original assistant message is carried in state and paired
                 // with the real review result after approval; writing an ack for
@@ -2500,7 +2529,7 @@ pub fn transition_parent(
                     ParentState::AwaitingCommissionReviewApproval {
                         tool_use_id: tool.id.clone(),
                         request: input.clone(),
-                        scope: commission_review_scope_from_context(context, input),
+                        scope,
                         assistant_message,
                     },
                 )
@@ -3578,10 +3607,64 @@ pub fn llm_error_to_db_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::CommissionReviewInput;
     use std::path::PathBuf;
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+    }
+
+    fn context_with_dir(dir: &Path) -> ConvContext {
+        ConvContext::new("test-conv", dir.to_path_buf(), "test-model", 200_000)
+    }
+
+    fn git_ok(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    #[test]
+    fn commission_review_scope_requires_origin_head_for_direct_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        git_ok(repo, &["init", "-q"]);
+        git_ok(repo, &["config", "user.email", "t@t.t"]);
+        git_ok(repo, &["config", "user.name", "t"]);
+        git_ok(repo, &["config", "commit.gpgsign", "false"]);
+        git_ok(repo, &["commit", "-qm", "base", "--allow-empty"]);
+
+        let ctx = context_with_dir(repo);
+        let input = CommissionReviewInput {
+            brief: "Ready".to_string(),
+            focus: None,
+        };
+        assert!(commission_review_scope_from_context(&ctx, &input).is_none());
+
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .expect("git rev-parse");
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        git_ok(repo, &["update-ref", "refs/remotes/origin/main", &head]);
+        git_ok(
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+
+        let scope = commission_review_scope_from_context(&ctx, &input).expect("scope available");
+        assert_eq!(scope.kind, "committed_branch_diff");
+        assert_eq!(scope.base, "refs/remotes/origin/main");
+        assert_eq!(scope.head, "HEAD");
+        assert!(!scope.dirty);
     }
 
     fn test_tool_call(id: &str) -> ToolCall {
@@ -6025,6 +6108,16 @@ mod tests {
         use crate::state::{CommissionReviewInput, ToolInput};
         use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
+        fn work_context() -> ConvContext {
+            let mut context = test_context();
+            context.mode_context = Some(ModeContext::Work {
+                branch_name: "task".to_string(),
+                base_branch: "main".to_string(),
+                worktree_path: "/tmp/wt".to_string(),
+            });
+            context
+        }
+
         fn commission_review_event() -> Event {
             let tool = ToolCall::new(
                 "tool-review-1",
@@ -6059,7 +6152,7 @@ mod tests {
                 scope: CommissionReviewApprovalScope {
                     kind: "committed_branch_diff".to_string(),
                     repo_root: "/tmp".to_string(),
-                    base: "origin/main".to_string(),
+                    base: "refs/remotes/origin/main".to_string(),
                     head: "task".to_string(),
                     dirty: false,
                     changed_files: 0,
@@ -6196,7 +6289,7 @@ mod tests {
         fn commission_review_parks_for_approval() {
             let result = transition(
                 &ConvState::LlmRequesting { attempt: 1 },
-                &test_context(),
+                &work_context(),
                 commission_review_event(),
             )
             .expect("commission_review should enter approval state");
@@ -6221,7 +6314,7 @@ mod tests {
                 scope: CommissionReviewApprovalScope {
                     kind: "committed_branch_diff".to_string(),
                     repo_root: "/tmp".to_string(),
-                    base: "origin/main".to_string(),
+                    base: "refs/remotes/origin/main".to_string(),
                     head: "task".to_string(),
                     dirty: false,
                     changed_files: 0,

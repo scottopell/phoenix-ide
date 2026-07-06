@@ -38,8 +38,9 @@ on the current `HEAD` against a fetched origin ref. Workspace changes are never
 included in the commissioned diff.
 
 When the approved context carries a base branch, the comparator resolves to
-`origin/<approved-base>`. When no base branch is approved, the comparator
-resolves through the remote-tracking symbolic ref `origin/HEAD`, which identifies
+`refs/remotes/origin/<approved-base>`. When no base branch is approved, the
+comparator resolves through the remote-tracking symbolic ref
+`refs/remotes/origin/HEAD`, which identifies
 the fetched origin default branch. A bare local base ref is only as current as
 the worktree last fast-forwarded it, so on a long-lived clone it can be far
 behind; diffing a feature branch against a stale local base pulls in every commit

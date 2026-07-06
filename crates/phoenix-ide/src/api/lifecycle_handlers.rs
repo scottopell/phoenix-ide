@@ -810,7 +810,7 @@ mod tests {
             scope: crate::state_machine::state::CommissionReviewApprovalScope {
                 kind: "committed_branch_diff".to_string(),
                 repo_root: "/tmp".to_string(),
-                base: "origin/HEAD".to_string(),
+                base: "refs/remotes/origin/HEAD".to_string(),
                 head: "HEAD".to_string(),
                 dirty: false,
                 changed_files: 0,

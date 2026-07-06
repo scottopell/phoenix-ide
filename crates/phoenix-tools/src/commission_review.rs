@@ -1422,14 +1422,14 @@ fn assert_approved_paths_match(
 async fn origin_default_ref(repo: &Path) -> Result<String, String> {
     let remote = git_capture(
         repo,
-        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
     )
     .await
     .map_err(|_| {
         "commission_review requires fetched origin default branch ref `origin/HEAD`. Fetch origin before requesting review.".to_string()
     })?;
     let remote = remote.trim();
-    if remote.starts_with("origin/") {
+    if remote.starts_with("refs/remotes/origin/") {
         Ok(remote.to_string())
     } else {
         Err(format!(
@@ -1443,7 +1443,12 @@ async fn remote_base_ref(
     approved_base_branch: Option<&str>,
 ) -> Result<String, String> {
     if let Some(base_branch) = approved_base_branch.filter(|branch| !branch.trim().is_empty()) {
-        let remote = format!("origin/{}", base_branch.trim());
+        let branch = base_branch
+            .trim()
+            .strip_prefix("refs/remotes/origin/")
+            .or_else(|| base_branch.trim().strip_prefix("origin/"))
+            .unwrap_or_else(|| base_branch.trim());
+        let remote = format!("refs/remotes/origin/{branch}");
         if git_capture(repo, &["rev-parse", "--verify", "--quiet", &remote])
             .await
             .is_ok()
@@ -2131,7 +2136,10 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(origin_default_ref(repo).await.unwrap(), "origin/master");
+        assert_eq!(
+            origin_default_ref(repo).await.unwrap(),
+            "refs/remotes/origin/master"
+        );
     }
 
     #[tokio::test]
@@ -2228,7 +2236,7 @@ mod tests {
         .await
         .expect("target resolves");
 
-        assert_eq!(target.summary.base, "origin/develop");
+        assert_eq!(target.summary.base, "refs/remotes/origin/develop");
     }
 
     /// A diff whose only changed files all exceed the per-file cap reviews
