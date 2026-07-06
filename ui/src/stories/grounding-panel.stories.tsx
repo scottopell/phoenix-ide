@@ -41,6 +41,9 @@ WorkLight.storyName = 'work-light';
 export const NarrowDark = storyFor('narrow-dark');
 NarrowDark.storyName = 'narrow-dark';
 
+export const FileTreeDark = storyFor('file-tree-dark');
+FileTreeDark.storyName = 'file-tree-dark';
+
 export const SkillDetailDark = storyFor('skill-detail-dark');
 SkillDetailDark.storyName = 'skill-detail-dark';
 

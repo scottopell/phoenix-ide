@@ -1,7 +1,7 @@
 import type { McpServerStatus, SkillEntry, TaskEntry, WorkScopeInventory } from '../../api';
 import type { FileItem } from '../../components/FileExplorer/FileTree';
 
-export type GroundingPanelScenarioKind = 'full' | 'empty' | 'errors' | 'collapsed' | 'skill-detail' | 'task-detail' | 'work' | 'narrow';
+export type GroundingPanelScenarioKind = 'full' | 'empty' | 'errors' | 'collapsed' | 'skill-detail' | 'task-detail' | 'work' | 'narrow' | 'file-tree';
 
 export type GroundingPanelTheme = 'dark' | 'light';
 
@@ -17,6 +17,7 @@ export const groundingPanelScenarioDefinitions = [
   { id: 'work-dark', title: 'Work resources / dark', kind: 'work', theme: 'dark', width: 360, collapsed: false },
   { id: 'work-light', title: 'Work resources / light', kind: 'work', theme: 'light', width: 360, collapsed: false },
   { id: 'narrow-dark', title: 'Narrow panel', kind: 'narrow', theme: 'dark', width: 248, collapsed: false },
+  { id: 'file-tree-dark', title: 'File tree nesting', kind: 'file-tree', theme: 'dark', width: 360, collapsed: false },
   { id: 'skill-detail-dark', title: 'Selected skill detail', kind: 'skill-detail', theme: 'dark', width: 360, collapsed: false },
   { id: 'task-detail-dark', title: 'Selected task detail', kind: 'task-detail', theme: 'dark', width: 360, collapsed: false },
 ] as const satisfies readonly {

@@ -3,6 +3,7 @@ import { FileExplorerPanel, FileExplorerProvider } from '../../components/FileEx
 import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
 import '../../index.css';
 import { fixtureWorkScope, installGroundingPanelFixtureFetch } from './mockApi';
+import { GROUNDING_PANEL_ROOT } from './scenarios';
 import type { GroundingPanelScenario } from './types';
 
 interface Props {
@@ -18,6 +19,15 @@ export function GroundingPanelFixture({ scenario, showToolbar = true }: Props) {
     delete document.documentElement.dataset['groundingFixtureReady'];
     document.documentElement.dataset['theme'] = scenario.theme;
     const restore = installGroundingPanelFixtureFetch(scenario);
+    if (scenario.kind === 'file-tree') {
+      localStorage.setItem(
+        `phoenix:file-tree-expansion:${scenario.conversationId}`,
+        JSON.stringify([
+          `${GROUNDING_PANEL_ROOT}/examples`,
+          `${GROUNDING_PANEL_ROOT}/examples/nested`,
+        ]),
+      );
+    }
     setReady(true);
     return restore;
   }, [scenario]);
@@ -67,6 +77,8 @@ export function GroundingPanelFixture({ scenario, showToolbar = true }: Props) {
           return document.querySelector('.grounding-section-body') != null;
         case 'work':
           return document.querySelector('.ws-section') != null;
+        case 'file-tree':
+          return document.querySelector('[data-path$="/examples/nested/child-file.ts"]') != null;
         default:
           return document.querySelector('.grounding-section') != null;
       }
