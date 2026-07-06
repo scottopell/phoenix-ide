@@ -56,6 +56,13 @@ function branchTag(b: GitBranchEntry): { text: string; className: string } | nul
   return null;
 }
 
+function logicalBranchFromTaskRef(sourceRef?: string): string | null {
+  if (!sourceRef) return null;
+  if (sourceRef.startsWith('origin/')) return sourceRef.slice('origin/'.length) || null;
+  if (sourceRef.startsWith('refs/heads/')) return sourceRef.slice('refs/heads/'.length) || null;
+  return null;
+}
+
 const REMARK_PLUGINS = [remarkGfm];
 
 export function ConversationSettings({
@@ -125,7 +132,7 @@ export function ConversationSettings({
   }, [setBranchSearch, setWorkflow]);
 
   const selectTask = useCallback((task: TaskEntry) => {
-    setWorkflow?.({ kind: 'planFromTask', task, baseBranch: task.source_ref ?? null });
+    setWorkflow?.({ kind: 'planFromTask', task, baseBranch: logicalBranchFromTaskRef(task.source_ref) });
     setBranchSearch?.('');
     setComboOpen(false);
   }, [setBranchSearch, setWorkflow]);
@@ -273,7 +280,7 @@ export function ConversationSettings({
                 onClick={() => {
                   if (!taskWorkflowEnabled) return;
                   const task = workflow.kind === 'planFromTask' ? workflow.task : null;
-                  chooseWorkflow({ kind: 'planFromTask', task, baseBranch: task?.source_ref ?? null });
+                  chooseWorkflow({ kind: 'planFromTask', task, baseBranch: logicalBranchFromTaskRef(task?.source_ref) });
                   loadProjectTasks?.();
                 }}
               >
@@ -286,7 +293,7 @@ export function ConversationSettings({
                   onChange={() => {
                     if (!taskWorkflowEnabled) return;
                     const task = workflow.kind === 'planFromTask' ? workflow.task : null;
-                  chooseWorkflow({ kind: 'planFromTask', task, baseBranch: task?.source_ref ?? null });
+                  chooseWorkflow({ kind: 'planFromTask', task, baseBranch: logicalBranchFromTaskRef(task?.source_ref) });
                     loadProjectTasks?.();
                   }}
                 />

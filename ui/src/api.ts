@@ -1146,10 +1146,14 @@ export const api = {
     seedParentId?: string | null,
     seedLabel?: string | null,
     files: File[] = [],
+    checkoutRef?: string | null,
   ): Promise<Conversation> {
     const body: Record<string, unknown> = { cwd, model, text, message_id: messageId, images, mode };
     if (baseBranch) {
       body['base_branch'] = baseBranch;
+    }
+    if (checkoutRef) {
+      body['checkout_ref'] = checkoutRef;
     }
     if (seedParentId) {
       body['seed_parent_id'] = seedParentId;

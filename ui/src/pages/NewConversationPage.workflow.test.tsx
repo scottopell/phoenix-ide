@@ -571,9 +571,10 @@ describe('/new workflow modes', () => {
     fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
 
     await waitFor(() => expect(api.createConversation).toHaveBeenCalled());
-    const [, text,,,, mode, baseBranch] = vi.mocked(api.createConversation).mock.calls[0]!;
+    const [, text,,,, mode, baseBranch,,,, checkoutRef] = vi.mocked(api.createConversation).mock.calls[0]!;
     expect(mode).toBe('managed');
-    expect(baseBranch).toBe('origin/main');
+    expect(baseBranch).toBe('main');
+    expect(checkoutRef).toBe('origin/main');
     expect(text).toContain('Call the propose_task tool');
     expect(text).toContain('tasks/27108-p1-ready--refine-new-workflows.md');
     expect(text).toContain('extra notes');

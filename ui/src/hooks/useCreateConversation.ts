@@ -121,15 +121,16 @@ export function effectiveWorkflow(
   }
 }
 
-function deriveSubmission(workflow: NewConversationWorkflow): { mode: 'direct' | 'managed' | 'branch'; baseBranch: string | null } {
+function deriveSubmission(workflow: NewConversationWorkflow): { mode: 'direct' | 'managed' | 'branch'; baseBranch: string | null; checkoutRef: string | null } {
   switch (workflow.kind) {
     case 'direct':
-      return { mode: 'direct', baseBranch: null };
+      return { mode: 'direct', baseBranch: null, checkoutRef: null };
     case 'planFromBranch':
+      return { mode: 'managed', baseBranch: workflow.baseBranch, checkoutRef: null };
     case 'planFromTask':
-      return { mode: 'managed', baseBranch: workflowBranch(workflow) };
+      return { mode: 'managed', baseBranch: workflow.baseBranch, checkoutRef: workflow.task?.source_ref ?? null };
     case 'continueBranch':
-      return { mode: 'branch', baseBranch: workflow.branch };
+      return { mode: 'branch', baseBranch: workflow.branch, checkoutRef: null };
   }
 }
 
@@ -509,27 +510,55 @@ export function useCreateConversation(navigate: (path: string) => void) {
         ? buildTaskStartPrompt(trimmedCwd, selectedTask, trimmed)
         : trimmed;
       const conv = files.length > 0
-        ? await createConversationWithStore(
-            trimmedCwd,
-            submitText,
-            messageId,
-            selectedModel || undefined,
-            images,
-            submission.mode,
-            submission.baseBranch,
-            undefined,
-            undefined,
-            files,
-          )
-        : await createConversationWithStore(
-            trimmedCwd,
-            submitText,
-            messageId,
-            selectedModel || undefined,
-            images,
-            submission.mode,
-            submission.baseBranch,
-          );
+        ? submission.checkoutRef
+          ? await createConversationWithStore(
+              trimmedCwd,
+              submitText,
+              messageId,
+              selectedModel || undefined,
+              images,
+              submission.mode,
+              submission.baseBranch,
+              undefined,
+              undefined,
+              files,
+              submission.checkoutRef,
+            )
+          : await createConversationWithStore(
+              trimmedCwd,
+              submitText,
+              messageId,
+              selectedModel || undefined,
+              images,
+              submission.mode,
+              submission.baseBranch,
+              undefined,
+              undefined,
+              files,
+            )
+        : submission.checkoutRef
+          ? await createConversationWithStore(
+              trimmedCwd,
+              submitText,
+              messageId,
+              selectedModel || undefined,
+              images,
+              submission.mode,
+              submission.baseBranch,
+              undefined,
+              undefined,
+              [],
+              submission.checkoutRef,
+            )
+          : await createConversationWithStore(
+              trimmedCwd,
+              submitText,
+              messageId,
+              selectedModel || undefined,
+              images,
+              submission.mode,
+              submission.baseBranch,
+            );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
       setDraft('');

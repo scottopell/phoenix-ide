@@ -1683,14 +1683,17 @@ async fn create_conversation_with_id(
                 )
             })?;
         validate_user_ref(base_branch)?;
+        let checkout_ref = req.checkout_ref.as_deref().unwrap_or(base_branch);
+        validate_user_ref(checkout_ref)?;
         managed_base_branch = Some(base_branch.to_string());
 
         let conv_id = id.clone();
         let branch = base_branch.to_string();
+        let checkout = checkout_ref.to_string();
         let repo = repo_root.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            create_managed_explore_worktree_blocking(&repo, &conv_id, &branch)
+            create_managed_explore_worktree_blocking(&repo, &conv_id, &branch, &checkout)
         })
         .await
         .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
@@ -2016,11 +2019,17 @@ fn create_managed_explore_worktree_blocking(
     repo_root: &str,
     conv_id: &str,
     base_branch: &str,
+    checkout_ref: &str,
 ) -> Result<String, ManagedWorktreeError> {
     let cwd = std::path::Path::new(repo_root);
 
-    if run_git(cwd, &["rev-parse", "--verify", base_branch]).is_err() {
-        materialize_branch(cwd, base_branch).map_err(|e| match e {
+    let checkout_is_explicit_ref =
+        checkout_ref.starts_with("origin/") || checkout_ref.starts_with("refs/");
+    if checkout_is_explicit_ref {
+        run_git(cwd, &["rev-parse", "--verify", checkout_ref])
+            .map_err(ManagedWorktreeError::Git)?;
+    } else {
+        materialize_branch(cwd, checkout_ref).map_err(|e| match e {
             GitOpError::BranchNotFound(b) => ManagedWorktreeError::BadRequest(format!(
                 "Branch '{b}' not found locally or at origin",
             )),
@@ -2035,18 +2044,19 @@ fn create_managed_explore_worktree_blocking(
         cwd,
         conv_id,
         &temp_branch,
-        Some(base_branch),
+        Some(checkout_ref),
         PhoenixIgnoreStrategy::StageGitignore,
     )
     .map_err(|e| {
         ManagedWorktreeError::Git(format!(
-            "Failed to create early worktree from '{base_branch}': {e}",
+            "Failed to create early worktree from '{checkout_ref}': {e}",
         ))
     })?;
 
     tracing::info!(
         conv_id = %conv_id,
         base_branch = %base_branch,
+        checkout_ref = %checkout_ref,
         temp_branch = %temp_branch,
         worktree = %worktree_path_str,
         "Created early Managed-mode worktree (REQ-PROJ-028)"
@@ -4890,6 +4900,36 @@ fn refreshed_default_task_ref(cwd: &std::path::Path) -> Option<String> {
     }
 }
 
+fn discover_task_dir_from_git_ref(cwd: &std::path::Path, ref_name: &str) -> String {
+    let output = run_git(cwd, &["ls-tree", "-r", "--name-only", ref_name]).unwrap_or_default();
+    let mut candidates: Vec<String> = output
+        .lines()
+        .filter_map(|path| {
+            let mut parts = path.split('/');
+            let dir = parts.next()?;
+            let file = parts.next()?;
+            if parts.next().is_none() && file == taskmd_core::constants::TEMPLATE_FILENAME {
+                Some(dir.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    candidates.sort();
+    if candidates
+        .iter()
+        .any(|name| name == taskmd_core::constants::DEFAULT_TASKS_DIR_NAME)
+    {
+        taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string()
+    } else {
+        candidates.into_iter().next().unwrap_or_else(|| {
+            taskmd_core::discover::discover_or_default(cwd)
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+}
+
 fn task_entries_from_git_ref(
     cwd: &std::path::Path,
     ref_name: &str,
@@ -4940,12 +4980,13 @@ fn task_entries_from_git_ref_with_limit(
 }
 
 fn project_task_entries_from_default_ref(cwd: &std::path::Path) -> Vec<TaskEntryParts> {
-    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
-        .to_string_lossy()
-        .into_owned();
     let Some(task_ref) = refreshed_default_task_ref(cwd) else {
+        let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
+            .to_string_lossy()
+            .into_owned();
         return local_task_entry_parts(cwd, &tasks_dir_name);
     };
+    let tasks_dir_name = discover_task_dir_from_git_ref(cwd, &task_ref);
     task_entries_from_git_ref(cwd, &task_ref, &tasks_dir_name)
 }
 
@@ -4966,15 +5007,16 @@ async fn project_task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -
 }
 
 fn project_tasks_available(cwd: &std::path::Path) -> bool {
-    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
-        .to_string_lossy()
-        .into_owned();
     let Some(task_ref) = refreshed_default_task_ref(cwd) else {
+        let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
+            .to_string_lossy()
+            .into_owned();
         return local_task_entry_parts(cwd, &tasks_dir_name)
             .into_iter()
             .next()
             .is_some();
     };
+    let tasks_dir_name = discover_task_dir_from_git_ref(cwd, &task_ref);
     task_entries_from_git_ref_with_limit(cwd, &task_ref, &tasks_dir_name, Some(1))
         .into_iter()
         .next()
@@ -5744,6 +5786,7 @@ mod conversation_cwd_validation_tests {
             files: Vec::new(),
             mode: Some("direct".to_string()),
             base_branch: None,
+            checkout_ref: None,
             seed_parent_id: None,
             seed_label: None,
         }
@@ -8841,6 +8884,10 @@ mod project_task_ref_tests {
     }
 
     fn repo_with_remote_only_task() -> tempfile::TempDir {
+        repo_with_remote_only_task_in("tasks")
+    }
+
+    fn repo_with_remote_only_task_in(tasks_dir: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path();
         git(repo, &["init", "--initial-branch=main"]);
@@ -8851,16 +8898,16 @@ mod project_task_ref_tests {
         git(repo, &["commit", "-m", "base"]);
         let base = git(repo, &["rev-parse", "HEAD"]);
 
-        std::fs::create_dir_all(repo.join("tasks")).expect("tasks dir");
+        let queue_path = repo.join(tasks_dir);
+        std::fs::create_dir_all(&queue_path).expect("tasks dir");
         std::fs::write(
-            repo.join("tasks/07004-p1-ready--merged-target-task.md"),
-            "# merged task\n",
+            queue_path.join(taskmd_core::constants::TEMPLATE_FILENAME),
+            "# Template\n",
         )
-        .expect("write task");
-        git(
-            repo,
-            &["add", "tasks/07004-p1-ready--merged-target-task.md"],
-        );
+        .expect("write template");
+        let task_rel = format!("{tasks_dir}/07004-p1-ready--merged-target-task.md");
+        std::fs::write(repo.join(&task_rel), "# merged task\n").expect("write task");
+        git(repo, &["add", tasks_dir]);
         git(repo, &["commit", "-m", "add task"]);
         let remote_default = git(repo, &["rev-parse", "HEAD"]);
         git(
@@ -8876,7 +8923,7 @@ mod project_task_ref_tests {
             ],
         );
         git(repo, &["checkout", "-b", "feature", &base]);
-        assert!(!repo.join("tasks").exists());
+        assert!(!repo.join(tasks_dir).exists());
         tmp
     }
 
@@ -8885,6 +8932,18 @@ mod project_task_ref_tests {
         let repo = repo_with_remote_only_task();
 
         assert!(project_tasks_available(repo.path()));
+    }
+
+    #[test]
+    fn project_task_discovery_reads_task_dir_from_ref() {
+        let repo = repo_with_remote_only_task_in("work-items");
+
+        assert!(project_tasks_available(repo.path()));
+        let entries = project_task_entries_from_default_ref(repo.path());
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]
+            .path
+            .ends_with("work-items/07004-p1-ready--merged-target-task.md"));
     }
 
     #[test]
@@ -8911,6 +8970,7 @@ mod project_task_ref_tests {
         let worktree = match create_managed_explore_worktree_blocking(
             repo.path().to_str().unwrap(),
             "12345678-1234-1234-1234-123456789abc",
+            "main",
             "origin/main",
         ) {
             Ok(path) => path,
