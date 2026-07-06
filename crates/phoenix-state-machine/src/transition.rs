@@ -305,12 +305,32 @@ enum CommissionReviewCall<'a> {
     Malformed(&'a str),
 }
 
-fn git_status_clean(repo: &Path) -> bool {
-    std::process::Command::new("git")
+#[derive(Debug, Error, PartialEq, Eq)]
+enum CommissionReviewScopeError {
+    #[error("commission_review refused dirty working tree. Commit or stash changes before requesting review; commission_review only reviews committed changes against the approved origin base branch.")]
+    DirtyWorktree,
+    #[error("commission_review is unavailable: this conversation does not have fetched approved base ref `{base_ref}` for a committed branch diff. Fetch origin before requesting review.")]
+    MissingOriginBaseRef { base_ref: String },
+    #[error("commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff. Fetch origin before requesting review.")]
+    MissingOriginHead,
+    #[error("commission_review is unavailable: git status could not inspect the review target working tree.")]
+    GitStatusUnavailable,
+}
+
+fn git_worktree_clean(repo: &Path) -> Result<(), CommissionReviewScopeError> {
+    let output = std::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(repo)
         .output()
-        .is_ok_and(|output| output.status.success() && output.stdout.is_empty())
+        .map_err(|_| CommissionReviewScopeError::GitStatusUnavailable)?;
+
+    if !output.status.success() {
+        return Err(CommissionReviewScopeError::GitStatusUnavailable);
+    }
+    if !output.stdout.is_empty() {
+        return Err(CommissionReviewScopeError::DirtyWorktree);
+    }
+    Ok(())
 }
 
 fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
@@ -324,10 +344,8 @@ fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
 fn commission_review_scope_from_context(
     context: &ConvContext,
     _input: &super::state::CommissionReviewInput,
-) -> Option<CommissionReviewApprovalScope> {
-    if !git_status_clean(&context.working_dir) {
-        return None;
-    }
+) -> Result<CommissionReviewApprovalScope, CommissionReviewScopeError> {
+    git_worktree_clean(&context.working_dir)?;
 
     let (kind, base, head) = match context.mode_context.as_ref() {
         Some(
@@ -344,7 +362,7 @@ fn commission_review_scope_from_context(
         ) => {
             let base_ref = format!("refs/remotes/origin/{base_branch}");
             if !git_ref_exists(&context.working_dir, &base_ref) {
-                return None;
+                return Err(CommissionReviewScopeError::MissingOriginBaseRef { base_ref });
             }
             (
                 "committed_branch_diff".to_string(),
@@ -356,7 +374,8 @@ fn commission_review_scope_from_context(
             "committed_branch_diff".to_string(),
             format!(
                 "refs/remotes/origin/{}",
-                resolve_remote_default_branch(&context.working_dir)?
+                resolve_remote_default_branch(&context.working_dir)
+                    .ok_or(CommissionReviewScopeError::MissingOriginHead)?
             ),
             "HEAD".to_string(),
         ),
@@ -366,7 +385,7 @@ fn commission_review_scope_from_context(
     let dirty = false;
     let (changed_files, insertions, deletions) = (0, 0, 0);
 
-    Some(CommissionReviewApprovalScope {
+    Ok(CommissionReviewApprovalScope {
         kind,
         repo_root,
         base,
@@ -2513,26 +2532,29 @@ pub fn transition_parent(
                     });
                 }
 
-                let Some(scope) = commission_review_scope_from_context(context, input) else {
-                    let err_msg = "commission_review is unavailable: this conversation does not have a fetched origin default branch ref (`origin/HEAD`) for a committed branch diff.".to_string();
-                    let display_data = make_display_data(&content);
-                    let assistant_message = AssistantMessage::new(
-                        request_id.clone(),
-                        content,
-                        Some(usage_data),
-                        display_data,
-                    );
-                    let tool_result = ToolResult::error(tool.id.clone(), err_msg);
-                    let checkpoint =
-                        CheckpointData::tool_round(assistant_message, vec![tool_result])
-                            .expect("commission_review produces exactly one result");
-                    return Ok(ParentTransitionResult::new(ParentState::Core(
-                        CoreState::LlmRequesting { attempt: 1 },
-                    ))
-                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                    .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change())
-                    .with_effect(Effect::RequestLlm));
+                let scope = match commission_review_scope_from_context(context, input) {
+                    Ok(scope) => scope,
+                    Err(err) => {
+                        let err_msg = err.to_string();
+                        let display_data = make_display_data(&content);
+                        let assistant_message = AssistantMessage::new(
+                            request_id.clone(),
+                            content,
+                            Some(usage_data),
+                            display_data,
+                        );
+                        let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                        let checkpoint =
+                            CheckpointData::tool_round(assistant_message, vec![tool_result])
+                                .expect("commission_review produces exactly one result");
+                        return Ok(ParentTransitionResult::new(ParentState::Core(
+                            CoreState::LlmRequesting { attempt: 1 },
+                        ))
+                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_state_change())
+                        .with_effect(Effect::RequestLlm));
+                    }
                 };
 
                 // Park for approval without writing a tool_result placeholder.
@@ -3665,7 +3687,9 @@ mod tests {
             brief: "Ready".to_string(),
             focus: None,
         };
-        assert!(commission_review_scope_from_context(&ctx, &input).is_none());
+        let err =
+            commission_review_scope_from_context(&ctx, &input).expect_err("origin/HEAD missing");
+        assert_eq!(err, CommissionReviewScopeError::MissingOriginHead);
 
         let head = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -3710,7 +3734,13 @@ mod tests {
             brief: "Ready".to_string(),
             focus: None,
         };
-        assert!(commission_review_scope_from_context(&ctx, &input).is_none());
+        let err = commission_review_scope_from_context(&ctx, &input).expect_err("base ref missing");
+        assert_eq!(
+            err,
+            CommissionReviewScopeError::MissingOriginBaseRef {
+                base_ref: "refs/remotes/origin/develop".to_string()
+            }
+        );
 
         let head = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -3719,10 +3749,11 @@ mod tests {
             .expect("git rev-parse");
         let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
         git_ok(repo, &["update-ref", "refs/remotes/origin/develop", &head]);
-        assert!(commission_review_scope_from_context(&ctx, &input).is_some());
+        assert!(commission_review_scope_from_context(&ctx, &input).is_ok());
 
         std::fs::write(repo.join("dirty.rs"), "uncommitted\n").expect("write dirty file");
-        assert!(commission_review_scope_from_context(&ctx, &input).is_none());
+        let err = commission_review_scope_from_context(&ctx, &input).expect_err("dirty worktree");
+        assert_eq!(err, CommissionReviewScopeError::DirtyWorktree);
     }
 
     fn test_tool_call(id: &str) -> ToolCall {
