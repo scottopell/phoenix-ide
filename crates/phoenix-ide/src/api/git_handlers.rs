@@ -641,14 +641,6 @@ async fn attach_pr_feedback_freshness(
         return Ok(response);
     };
 
-    let Some(baseline) = db
-        .work_scope_pr_feedback_baseline(work_scope, pr_number)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    else {
-        return Ok(response);
-    };
-
     let previous_feedback_status = db
         .primary_work_scope_pr_association(work_scope)
         .await
@@ -656,7 +648,14 @@ async fn attach_pr_feedback_freshness(
         .filter(|pr| pr.pr_number == pr_number)
         .map(|pr| pr.feedback_status);
 
-    if crate::api::pr_monitoring::pr_updated_after_baseline(&baseline, updated_at) {
+    let baseline = db
+        .work_scope_pr_feedback_baseline(work_scope, pr_number)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if baseline.as_ref().is_some_and(|baseline| {
+        crate::api::pr_monitoring::pr_updated_after_baseline(baseline, updated_at)
+    }) {
         let cwd_for_feedback = cwd.to_path_buf();
         let feedback = tokio::task::spawn_blocking(move || {
             crate::api::pr_monitoring::fetch_pr_feedback_for_pr(&cwd_for_feedback, pr_number)
@@ -684,7 +683,9 @@ async fn attach_pr_feedback_freshness(
                 }
                 response.feedback_freshness =
                     crate::api::pr_monitoring::actionable_feedback_freshness_from_baseline(
-                        &baseline,
+                        baseline
+                            .as_ref()
+                            .expect("baseline exists in full feedback branch"),
                         Some(&feedback),
                     );
                 response.feedback_coverage = coverage_health;
