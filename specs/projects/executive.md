@@ -8,7 +8,7 @@ access, no worktrees, no ceremony. Managed mode is opt-in for git repositories a
 provides a two-phase lifecycle: conversations start in Explore (read-only worktree
 created on first message), then upgrade to Work when the user approves a task proposed
 via `propose_task`. The plan is presented for human review; users can annotate, request
-revisions, or approve. On approval, the temporary branch is renamed to the final task
+revisions, or approve. On approval, the temporary branch is renamed to the chosen execution
 branch, a task file is committed on that branch, and write tools are enabled. Branch
 mode lets users work directly on an existing branch with no Explore phase and no task
 file. A branch picker with local listing (sorted by recency, with staleness counts) and
@@ -29,8 +29,9 @@ branch; in Branch mode, abandon deletes only the worktree, keeping the user's br
 worktree is created on first message using a temporary branch (`task-pending-{id}`),
 with a best-effort single-branch fetch of the base branch. The agent drafts a task file
 under the project's tasks directory with `patch`; on `propose_task` + approval the temp
-branch is renamed to `task-{NNNN}-{slug}`, the task file's status is promoted to
-`in-progress` and it is committed on that branch (never main), and the mode upgrades to
+branch is renamed to `task-{NNNN}-{slug}` unless that name already exists locally or at
+`origin`, in which case Phoenix uses a suffixed execution branch. The task file's status is
+promoted to `in-progress`, committed on that branch (never main), and the mode upgrades to
 Work.
 Branch mode creates a worktree on the user's chosen branch immediately, with no Explore
 phase and no task file. Worktree paths are derived from conversation IDs -- collision is
@@ -60,9 +61,9 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-001:** Open a Git Repository as a Project | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-002:** Start Every Conversation in Explore Mode | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete | Task 08602 (M2). propose_task tool; task 13009 — `task_file` may be any `.md` file, taskmd naming is one accepted form (`crate::task_source::TaskSource`) |
-| **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ✅ Complete | Approval is a permission upgrade in the existing worktree (REQ-PROJ-028): rename temp branch, promote+commit the agent's task file on it |
+| **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ✅ Complete | Approval is a permission upgrade in the existing worktree (REQ-PROJ-028): rename temp branch to the chosen execution branch, promote+commit the agent's task file on it |
 | **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Task 08603 (M3). Derived from conversation UUID |
-| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | taskmd 1.0 (filename is metadata, no frontmatter) is the default; agent drafts the file via `patch` in Explore; committed on the task branch, not main (work-lifecycle REQ-WL-002). A plain `.md` file (no taskmd metadata, no on-approve status rename, branch `task-{stem}-{conv-id8}`) works too, behind the `TaskSource` seam |
+| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | taskmd 1.0 (filename is metadata, no frontmatter) is the default; agent drafts the file via `patch` in Explore; committed on the execution branch, not main (work-lifecycle REQ-WL-002). A plain `.md` file (no taskmd metadata, no on-approve status rename, desired branch `task-{stem}-{conv-id8}`) works too, behind the `TaskSource` seam |
 | **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete | Task 08603 (M3). upgrade_to_work_mode() |
 | **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | ✅ Complete | Mode parameter, model override, max_turns, one-writer constraint, MCP access, cwd-scoping guard all implemented; spec normative in `specs/subagents/subagents.allium`. Explore-search-restricted MCP subset stays deferred (see subagents executive.md). |
 | **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted. Superseded by REQ-PROJ-027 (push branch, user merges via PR) |

@@ -170,20 +170,25 @@ AND the agent MAY revise the plan and call `propose_task` again
 WHEN user approves the task AND the file's name parses as a taskmd filename
 THE SYSTEM SHALL parse the task ID, priority, status, and slug from the on-disk task
   file's name (it allocates no ID; see REQ-PROJ-006)
-AND rename the worktree's temp branch in place to `task-{ID}-{slug}` (REQ-PROJ-028)
+AND choose `task-{ID}-{slug}` as the desired execution branch (REQ-PROJ-028)
+AND if that branch name already exists locally or at `origin`, choose a suffixed execution
+  branch name and leave the existing ref untouched
+AND rename the worktree's temp branch in place to the chosen execution branch
 AND rename the task file to `...-in-progress--{slug}.md` if it isn't already
-AND commit the task file on that task branch in the existing worktree
+AND commit the task file on that execution branch in the existing worktree
 AND transition the conversation from Explore to Work mode within the same worktree
-  (storing worktree_path, branch_name, base_branch, task_id, task_title)
-AND resume agent execution with "Task approved. You are on branch task-{ID}-{slug}."
+  (storing worktree_path, the chosen branch_name, base_branch, task_id, task_title)
+AND resume agent execution with the chosen branch name
 
 WHEN user approves the task AND the file is a plain-markdown brief (not a taskmd filename)
-THE SYSTEM SHALL rename the worktree's temp branch in place to
-  `task-{sanitized-file-stem}-{conversation-id-prefix}` (the conversation-id prefix is the
-  uniquifier — two conversations proposing files with the same stem must not collide on the
-  branch name; the approval mutex only serializes, it does not uniquify)
+THE SYSTEM SHALL choose `task-{sanitized-file-stem}-{conversation-id-prefix}` as the desired
+  execution branch (the conversation-id prefix prevents two conversations proposing files
+  with the same stem from sharing a default branch name)
+AND if that branch name already exists locally or at `origin`, choose a suffixed execution
+  branch name and leave the existing ref untouched
+AND rename the worktree's temp branch in place to the chosen execution branch
 AND NOT rename the file (a plain brief has no status segment) and NOT call `format_filename`
-AND commit the file at its own path on the task branch
+AND commit the file at its own path on the execution branch
 AND transition the conversation to Work mode (the `task_id` recorded is the sanitized stem,
   kept non-empty for the conversation record; there is no `task_title` parse so the display
   title — the body's `# H1`, falling back to the stem — is used)
@@ -197,8 +202,10 @@ left it under the tasks directory — nothing to commit, nothing to clean up)
 **Rationale:** The Explore -> Work transition is a permission upgrade within an
 existing worktree (REQ-PROJ-028). The task file already exists on disk (the agent
 wrote it with `patch` in Explore mode); approval renames the temp branch, promotes the
-file's status to `in-progress` if needed, and commits it on the task branch (never
-main -- work-lifecycle REQ-WL-002). Discarding is cheap: the worktree and temp branch already
+file's status to `in-progress` if needed, and commits it on the execution branch (never
+main -- work-lifecycle REQ-WL-002). A deterministic desired branch can already be occupied
+by another local or remote ref, so approval uses a suffixed execution branch rather than
+moving or overwriting the existing ref. Discarding is cheap: the worktree and temp branch already
 exist, and an uncommitted task file on the temp branch is harmless. The prose reader
 renders the file's body — surfaced via the display copy in the state, re-read from disk
 on approval.
