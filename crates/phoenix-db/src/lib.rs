@@ -1676,6 +1676,31 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    /// Conversations with persisted Phoenix-created worktree paths, including
+    /// archived and terminal rows for disk disposition.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn managed_worktree_conversations(&self) -> DbResult<Vec<Conversation>> {
+        sqlx::query(
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.desired_base_branch,
+                    c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+             FROM conversations c
+             WHERE c.cm_worktree_path IS NOT NULL
+               AND c.cm_worktree_path != ''
+             ORDER BY c.cm_worktree_path, c.updated_at DESC",
+        )
+        .try_map(parse_conversation_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
     /// List archived conversations
     ///
     /// # Errors

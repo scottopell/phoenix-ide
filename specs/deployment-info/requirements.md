@@ -7,10 +7,12 @@ the conversation list. It answers one operator question: *what exactly is this
 running instance, where does it keep its data, and how much of the machine is it
 using right now?*
 
-The page is diagnostic, not interactive. It changes no server state. Every value
-it shows is a fact the running process already knows or can cheaply measure:
-build identity, runtime configuration (network binding, TLS), live resource
-usage, on-disk locations with their sizes, and the path to the log file.
+The page is primarily diagnostic. It changes no server state while reading build,
+network, resource, disk, or log facts. The disk section may expose narrowly scoped
+cleanup actions for backend-confirmed leftover Phoenix-managed worktrees. Every
+value it shows is a fact the running process already knows or can measure: build
+identity, runtime configuration (network binding, TLS), live resource usage,
+on-disk locations with their sizes, and the path to the log file.
 
 Logs are surfaced as a **path only** — the page never renders log contents.
 
@@ -56,14 +58,16 @@ WHEN the user opens that entry
 THE SYSTEM SHALL render a dedicated read-only page (its own route) showing the
 deployment facts described by REQ-DEPLOY-002 through REQ-DEPLOY-006
 
-THE SYSTEM SHALL NOT expose any control on this page that mutates server state —
-it is observational only
+THE SYSTEM SHALL NOT expose controls on this page that mutate server state except
+for the backend-revalidated leftover worktree cleanup action described by
+REQ-DEPLOY-008
 
 **Rationale:** The existing settings menu is a floating dropdown sized for a few
 toggles. "About this deployment" is a dense read-only report, not a control, so
-it gets its own page rather than crowding the dropdown. Keeping it strictly
-read-only means it is always safe to open — there is no footgun in inspecting a
-deployment.
+it gets its own page rather than crowding the dropdown. Keeping ordinary
+inspection separate from the explicitly scoped cleanup action means the page is
+safe to open while still giving leftover Phoenix-created disk usage an in-product
+resolution path.
 
 ---
 
@@ -147,8 +151,12 @@ from a bug.
 
 ### REQ-DEPLOY-005: Report on-disk locations and their sizes
 
+THE SYSTEM SHALL load on-disk locations through a disk-specific API surface so the
+page can render build, network, resource, and log facts without waiting for
+recursive disk sizing.
+
 THE SYSTEM SHALL display the on-disk locations the deployment uses, each with its
-absolute path and, where determinable, its current size:
+semantic category, absolute path, and, where determinable, its current size:
 
 - The SQLite database file
 - The data directory root (the parent that holds the database and other state)
@@ -173,6 +181,23 @@ rather than reporting it as zero.
 WHEN a listed path does not exist on disk
 THE SYSTEM SHALL show it as absent rather than omitting the row or reporting a
 size of zero
+
+THE SYSTEM SHALL give disk sizing its own loading, error, refresh, and sampled-at
+state independent of the general deployment facts.
+
+THE SYSTEM SHALL make the Phoenix-managed worktree aggregate expandable into
+per-worktree rows sorted by measured size descending, with unmeasured or absent
+rows ordered predictably after measured rows.
+
+THE SYSTEM SHALL render managed-worktree row semantics from typed backend
+disposition, not by interpreting labels or path strings.
+
+FOR a live/non-terminal managed worktree, THE SYSTEM SHALL show an action to open
+the owning conversation and SHALL NOT offer direct deletion from the deployment
+page.
+
+FOR a leftover managed worktree, THE SYSTEM SHALL show cleanup only when the
+backend disposition says cleanup is allowed.
 
 **Rationale:** "Where are my bytes?" is the disk-pressure question. The data
 directory is what an operator backs up, copies, or deletes; the caches are what
@@ -228,9 +253,42 @@ samples taken when the page data was requested
 WHEN the user requests a refresh
 THE SYSTEM SHALL re-sample the live values rather than serving a cached snapshot
 
+WHEN the user requests a disk-only refresh
+THE SYSTEM SHALL re-sample disk values without requiring the general deployment
+facts to reload
+
 **Rationale:** Memory, CPU, and disk sizes drift continuously. A value with no
 notion of when it was taken invites the reader to trust a stale number. Making
 the sample explicitly point-in-time, with a way to re-sample, keeps the page
 honest about what it is: a snapshot, not a live stream. (A live-streaming gauge
 is deliberately out of scope — the operator question is "what is it now," not
 "chart it over time.")
+
+---
+
+### REQ-DEPLOY-008: Safely clean up leftover managed worktrees
+
+THE SYSTEM SHALL expose a mutation endpoint for cleaning up a Phoenix-managed
+worktree only after backend revalidation.
+
+WHEN cleanup is requested
+THE SYSTEM SHALL re-check that:
+
+- the path is one of the database-known managed worktree paths
+- the path matches the strict Phoenix worktree shape `{repo}/.phoenix/worktrees/{id}`
+- no live, non-terminal, non-archived conversation owns that worktree
+- the operation matches persisted mode semantics: Work-mode cleanup may remove the
+  Phoenix-created branch after removing the worktree; Branch-mode cleanup removes
+  only the worktree and preserves the user branch
+
+WHEN the directory is already absent
+THE SYSTEM SHALL treat cleanup as a successful idempotent no-op.
+
+THE SYSTEM SHALL reject cleanup for unknown paths, malformed/non-Phoenix paths,
+and worktrees still owned by a live conversation.
+
+**Rationale:** A leftover managed worktree is Phoenix-created disk usage, but the
+filesystem is still a user-owned environment. Cleanup therefore belongs behind a
+server-side proof obligation, not a UI convention. The backend already has the
+conversation state, archived flag, and persisted mode semantics needed to avoid
+deleting live work or user branches.

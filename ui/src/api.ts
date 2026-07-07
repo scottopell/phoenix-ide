@@ -1,6 +1,8 @@
 import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
+import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
+import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktreeCleanupResponse';
 import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
@@ -968,6 +970,31 @@ export const api = {
   async deploymentInfo(): Promise<DeploymentInfo> {
     const resp = await fetch('/api/deployment');
     if (!resp.ok) throw new Error('Failed to load deployment info');
+    return resp.json();
+  },
+
+  async deploymentDiskInfo(): Promise<DeploymentDiskInfo> {
+    const resp = await fetch('/api/deployment/disk');
+    if (!resp.ok) throw new Error('Failed to load deployment disk info');
+    return resp.json();
+  },
+
+  async cleanupManagedWorktree(path: string): Promise<ManagedWorktreeCleanupResponse> {
+    const resp = await fetch('/api/deployment/disk/managed-worktrees/cleanup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    if (!resp.ok) {
+      let detail = 'Failed to clean up worktree';
+      try {
+        const body = (await resp.json()) as { error?: string };
+        if (body.error) detail = body.error;
+      } catch {
+        // keep fallback
+      }
+      throw new Error(detail);
+    }
     return resp.json();
   },
 

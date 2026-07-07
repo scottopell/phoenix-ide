@@ -348,8 +348,16 @@ pub fn create_router(state: AppState) -> Router {
         // Version
         .route("/version", get(get_version))
         .route("/api/version", get(get_version_json))
-        // About this deployment (read-only diagnostics)
+        // About this deployment diagnostics
         .route("/api/deployment", get(super::deployment::deployment_info))
+        .route(
+            "/api/deployment/disk",
+            get(super::deployment::deployment_disk),
+        )
+        .route(
+            "/api/deployment/disk/managed-worktrees/cleanup",
+            post(super::deployment::cleanup_managed_worktree),
+        )
         // Usage analytics (read-only)
         .route("/api/usage", get(super::usage::usage_overview))
         .route(

@@ -4176,6 +4176,13 @@ pre:hover .copy-btn {
   word-break: break-all;
 }
 
+.settings-section__title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .deploy-disk-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -4227,6 +4234,10 @@ pre:hover .copy-btn {
   background: color-mix(in srgb, var(--accent-color) 8%, transparent);
 }
 
+.deploy-table__detail-row td {
+  background: color-mix(in srgb, var(--bg-secondary) 70%, transparent);
+}
+
 .deploy-table__label {
   color: var(--text-secondary);
   white-space: nowrap;
@@ -4268,6 +4279,15 @@ pre:hover .copy-btn {
 .deploy-reveal-btn:hover {
   color: var(--text-primary);
   border-color: var(--text-secondary);
+}
+
+.deploy-reveal-btn + .deploy-reveal-btn {
+  margin-left: 6px;
+}
+
+.deploy-reveal-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 /* LLM language prompt preview page */

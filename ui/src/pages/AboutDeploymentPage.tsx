@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import type { DeploymentInfo } from '../generated/DeploymentInfo';
+import type { DeploymentDiskInfo } from '../generated/DeploymentDiskInfo';
 import type { DiskSize } from '../generated/DiskSize';
-
-const MANAGED_WORKTREES_LABEL = 'Phoenix-managed worktrees';
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -54,7 +53,7 @@ function resourceText(value: number | null, format: (n: number) => string): stri
   return value === null ? 'unavailable' : format(value);
 }
 
-type MeasuredDiskEntry = DeploymentInfo['disk'][number] & { size: { kind: 'measured'; bytes: number } };
+type MeasuredDiskEntry = DeploymentDiskInfo['disk'][number] & { size: { kind: 'measured'; bytes: number } };
 
 type DiskSummary = {
   measuredCount: number;
@@ -63,7 +62,7 @@ type DiskSummary = {
   largestMeasured: MeasuredDiskEntry | null;
 };
 
-function diskSummary(entries: DeploymentInfo['disk']): DiskSummary {
+function diskSummary(entries: DeploymentDiskInfo['disk']): DiskSummary {
   let measuredCount = 0;
   let notMeasuredCount = 0;
   let absentCount = 0;
@@ -114,6 +113,12 @@ export function AboutDeploymentPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [revealError, setRevealError] = useState<string | null>(null);
+  const [diskInfo, setDiskInfo] = useState<DeploymentDiskInfo | null>(null);
+  const [diskError, setDiskError] = useState<string | null>(null);
+  const [diskLoading, setDiskLoading] = useState(true);
+  const [expandedWorktrees, setExpandedWorktrees] = useState(false);
+  const [cleanupError, setCleanupError] = useState<string | null>(null);
+  const [cleanupPath, setCleanupPath] = useState<string | null>(null);
 
   const handleReveal = useCallback((path: string) => {
     setRevealError(null);
@@ -122,15 +127,37 @@ export function AboutDeploymentPage() {
     });
   }, []);
 
+  const loadDisk = useCallback(() => {
+    setDiskLoading(true);
+    setDiskError(null);
+    return api
+      .deploymentDiskInfo()
+      .then((data) => setDiskInfo(data))
+      .catch((e) => setDiskError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setDiskLoading(false));
+  }, []);
+
+  const handleCleanup = useCallback((path: string) => {
+    setCleanupPath(path);
+    setCleanupError(null);
+    api.cleanupManagedWorktree(path)
+      .then(() => loadDisk())
+      .catch((e) => setCleanupError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setCleanupPath(null));
+  }, [loadDisk]);
+
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
-    return api
-      .deploymentInfo()
-      .then((data) => setInfo(data))
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setLoading(false));
-  }, []);
+    return Promise.all([
+      api
+        .deploymentInfo()
+        .then((data) => setInfo(data))
+        .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+        .finally(() => setLoading(false)),
+      loadDisk(),
+    ]);
+  }, [loadDisk]);
 
   useEffect(() => {
     let cancelled = false;
@@ -139,6 +166,11 @@ export function AboutDeploymentPage() {
       .then((data) => { if (!cancelled) setInfo(data); })
       .catch((e) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)); })
       .finally(() => { if (!cancelled) setLoading(false); });
+    api
+      .deploymentDiskInfo()
+      .then((data) => { if (!cancelled) setDiskInfo(data); })
+      .catch((e) => { if (!cancelled) setDiskError(e instanceof Error ? e.message : String(e)); })
+      .finally(() => { if (!cancelled) setDiskLoading(false); });
     return () => { cancelled = true; };
   }, []);
 
@@ -166,9 +198,7 @@ export function AboutDeploymentPage() {
           {error && <div className="settings-section__error">{error}</div>}
           {!info && loading && <div className="settings-section__hint">Loading…</div>}
 
-          {info && (() => {
-            const summary = diskSummary(info.disk);
-            return (
+          {info && (
             <>
               <section className="settings-section">
                 <h3 className="settings-section__title">Build</h3>
@@ -223,72 +253,138 @@ export function AboutDeploymentPage() {
               </section>
 
               <section className="settings-section">
-                <h3 className="settings-section__title">On disk</h3>
-                <div className="deploy-disk-summary" aria-label="Disk usage health">
-                  <div className="deploy-disk-summary__item">
-                    <span>Largest measured</span>
-                    <strong>{summary.largestMeasured ? formatBytes(summary.largestMeasured.size.bytes) : 'none'}</strong>
-                  </div>
-                  <div className="deploy-disk-summary__item">
-                    <span>Measured rows</span>
-                    <strong>{summary.measuredCount}</strong>
-                  </div>
-                  <div className={summary.notMeasuredCount > 0 ? 'deploy-disk-summary__item deploy-disk-summary__item--warn' : 'deploy-disk-summary__item'}>
-                    <span>Not measured</span>
-                    <strong>{summary.notMeasuredCount}</strong>
-                  </div>
-                  <div className="deploy-disk-summary__item">
-                    <span>Absent</span>
-                    <strong>{summary.absentCount}</strong>
-                  </div>
+                <div className="settings-section__title-row">
+                  <h3 className="settings-section__title">On disk</h3>
+                  <button
+                    type="button"
+                    className="settings-inline-btn"
+                    onClick={() => { void loadDisk(); }}
+                    disabled={diskLoading}
+                  >
+                    {diskLoading ? 'Refreshing disk…' : 'Refresh disk'}
+                  </button>
                 </div>
-                {summary.largestMeasured && (
-                  <div className="settings-section__hint">
-                    {summary.largestMeasured.label === MANAGED_WORKTREES_LABEL
-                      ? 'Phoenix-managed worktrees are the largest measured disk category.'
-                      : `Largest measured disk category: ${summary.largestMeasured.label} (${formatBytes(summary.largestMeasured.size.bytes)}).`}
-                  </div>
-                )}
-                {summary.notMeasuredCount > 0 && (
-                  <div className="settings-section__hint settings-section__hint--warning">
-                    {summary.notMeasuredCount} disk {summary.notMeasuredCount === 1 ? 'row is' : 'rows are'} path-only; measured rows may also overlap, so this section highlights categories rather than summing them.
-                  </div>
-                )}
-                <table className="deploy-table">
-                  <tbody>
-                    {info.disk.map((entry) => {
-                      const isLargest = summary.largestMeasured?.label === entry.label;
-                      return (
-                        <tr
-                          key={entry.label}
-                          className={isLargest ? 'deploy-table__row--largest' : undefined}
-                        >
-                          <td className="deploy-table__label">{entry.label}</td>
-                          <td className="deploy-table__path"><code>{entry.path}</code></td>
-                          <td className="deploy-table__size">{diskSizeLabel(entry.size)}</td>
-                          <td className="deploy-table__action">
-                            {info.local_access && isRevealable(entry.path, entry.size) && (
-                              <button
-                                type="button"
-                                className="deploy-reveal-btn"
-                                title="Open the containing folder in the file manager"
-                                onClick={() => handleReveal(entry.path)}
-                              >
-                                Reveal
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-                {revealError && <div className="settings-section__error">{revealError}</div>}
-                {!info.local_access && (
-                  <div className="settings-section__hint">
-                    Reveal-in-file-manager is available only when viewing from the server host.
-                  </div>
-                )}
+                {diskError && <div className="settings-section__error">{diskError}</div>}
+                {!diskInfo && diskLoading && <div className="settings-section__hint">Loading disk usage…</div>}
+                {diskInfo && (() => {
+                  const summary = diskSummary(diskInfo.disk);
+                  return (
+                    <>
+                      <div className="deploy-disk-summary" aria-label="Disk usage health">
+                        <div className="deploy-disk-summary__item">
+                          <span>Largest measured</span>
+                          <strong>{summary.largestMeasured ? formatBytes(summary.largestMeasured.size.bytes) : 'none'}</strong>
+                        </div>
+                        <div className="deploy-disk-summary__item">
+                          <span>Measured rows</span>
+                          <strong>{summary.measuredCount}</strong>
+                        </div>
+                        <div className={summary.notMeasuredCount > 0 ? 'deploy-disk-summary__item deploy-disk-summary__item--warn' : 'deploy-disk-summary__item'}>
+                          <span>Not measured</span>
+                          <strong>{summary.notMeasuredCount}</strong>
+                        </div>
+                        <div className="deploy-disk-summary__item">
+                          <span>Absent</span>
+                          <strong>{summary.absentCount}</strong>
+                        </div>
+                      </div>
+                      {summary.largestMeasured && (
+                        <div className="settings-section__hint">
+                          {summary.largestMeasured.category === 'managed_worktrees'
+                            ? 'Phoenix-managed worktrees are the largest measured disk category.'
+                            : `Largest measured disk category: ${summary.largestMeasured.label} (${formatBytes(summary.largestMeasured.size.bytes)}).`}
+                        </div>
+                      )}
+                      {summary.notMeasuredCount > 0 && (
+                        <div className="settings-section__hint settings-section__hint--warning">
+                          {summary.notMeasuredCount} disk {summary.notMeasuredCount === 1 ? 'row is' : 'rows are'} path-only; measured rows may also overlap, so this section highlights categories rather than summing them.
+                        </div>
+                      )}
+                      <table className="deploy-table">
+                        <tbody>
+                          {diskInfo.disk.map((entry) => {
+                            const isLargest = summary.largestMeasured?.category === entry.category && summary.largestMeasured?.label === entry.label;
+                            const isManaged = entry.category === 'managed_worktrees';
+                            return (
+                              <Fragment key={entry.label}>
+                                <tr
+                                  className={isLargest ? 'deploy-table__row--largest' : undefined}
+                                >
+                                  <td className="deploy-table__label">{entry.label}</td>
+                                  <td className="deploy-table__path"><code>{entry.path}</code></td>
+                                  <td className="deploy-table__size">{diskSizeLabel(entry.size)}</td>
+                                  <td className="deploy-table__action">
+                                    {isManaged && diskInfo.managed_worktrees.length > 0 && (
+                                      <button
+                                        type="button"
+                                        className="deploy-reveal-btn"
+                                        onClick={() => setExpandedWorktrees((v) => !v)}
+                                      >
+                                        {expandedWorktrees ? 'Hide worktrees' : 'Show worktrees'}
+                                      </button>
+                                    )}
+                                    {info.local_access && isRevealable(entry.path, entry.size) && (
+                                      <button
+                                        type="button"
+                                        className="deploy-reveal-btn"
+                                        title="Open the containing folder in the file manager"
+                                        onClick={() => handleReveal(entry.path)}
+                                      >
+                                        Reveal
+                                      </button>
+                                    )}
+                                  </td>
+                                </tr>
+                                {isManaged && expandedWorktrees && diskInfo.managed_worktrees.map((wt) => {
+                                  const disposition = wt.disposition;
+                                  return (
+                                    <tr key={wt.path} className="deploy-table__detail-row">
+                                      <td className="deploy-table__label">↳ {diskSizeLabel(wt.size)}</td>
+                                      <td className="deploy-table__path">
+                                        <code>{wt.path}</code>
+                                        {wt.repository && <div className="settings-section__hint">repo: {wt.repository}</div>}
+                                        {wt.branch_name && <div className="settings-section__hint">branch: {wt.branch_name}</div>}
+                                      </td>
+                                      <td className="deploy-table__size">
+                                        {disposition.kind === 'live'
+                                          ? `Live: ${disposition.title ?? disposition.conversation_id} (${disposition.state})`
+                                          : `Leftover: ${disposition.source_conversation_id} (${disposition.source_state})`}
+                                      </td>
+                                      <td className="deploy-table__action">
+                                        {disposition.kind === 'live' ? (
+                                          <button type="button" className="deploy-reveal-btn" onClick={() => navigate(`/c/${disposition.conversation_id}`)}>
+                                            Open conversation
+                                          </button>
+                                        ) : disposition.cleanup_allowed ? (
+                                          <button
+                                            type="button"
+                                            className="deploy-reveal-btn"
+                                            onClick={() => handleCleanup(wt.path)}
+                                            disabled={cleanupPath === wt.path}
+                                          >
+                                            {cleanupPath === wt.path ? 'Cleaning…' : 'Clean up leftover'}
+                                          </button>
+                                        ) : null}
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </Fragment>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                      {revealError && <div className="settings-section__error">{revealError}</div>}
+                      {cleanupError && <div className="settings-section__error">{cleanupError}</div>}
+                      {!info.local_access && (
+                        <div className="settings-section__hint">
+                          Reveal-in-file-manager is available only when viewing from the server host.
+                        </div>
+                      )}
+                      <div className="settings-section__hint">Disk sampled at {formatDateTime(diskInfo.sampled_at)}</div>
+                    </>
+                  );
+                })()}
               </section>
 
               <section className="settings-section">
@@ -310,8 +406,7 @@ export function AboutDeploymentPage() {
                 Sampled at {formatDateTime(info.sampled_at)}
               </div>
             </>
-            );
-          })()}
+          )}
         </section>
       </main>
     </div>

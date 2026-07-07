@@ -12,13 +12,14 @@
 use super::AppState;
 use axum::{
     extract::{ConnectInfo, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
 use chrono::{DateTime, Utc};
-use serde::Serialize;
-use std::collections::BTreeSet;
+use phoenix_core::domain::db_schema::{ConvMode, Conversation};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use ts_rs::TS;
@@ -46,6 +47,7 @@ pub enum MeasureMode {
 /// A configured on-disk location to report.
 #[derive(Clone, Debug)]
 pub struct DiskLocation {
+    pub category: DiskCategory,
     pub label: String,
     pub path: PathBuf,
     pub mode: MeasureMode,
@@ -72,13 +74,20 @@ pub struct DeploymentInfo {
     pub build: BuildInfo,
     pub network: NetworkInfo,
     pub resources: ResourceUsage,
-    pub disk: Vec<DiskEntry>,
     pub log: LogInfo,
     /// Whether the requesting browser is on the server host, and so may use
     /// host-local actions like revealing a path in the OS file manager. False
     /// for any remote browser — the file-manager window opens on the server's
     /// desktop, which a remote user cannot see.
     pub local_access: bool,
+    pub sampled_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct DeploymentDiskInfo {
+    pub disk: Vec<DiskEntry>,
+    pub managed_worktrees: Vec<ManagedWorktreeDiskEntry>,
     pub sampled_at: DateTime<Utc>,
 }
 
@@ -145,15 +154,73 @@ pub struct ResourceUsage {
 #[derive(Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct DiskEntry {
+    pub category: DiskCategory,
     pub label: String,
     pub path: String,
     pub size: DiskSize,
 }
 
+#[derive(Serialize, TS, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum DiskCategory {
+    Database,
+    DataDirectory,
+    ManagedWorktrees,
+    PrContext,
+    BrowserCache,
+    BrowserProfiles,
+    Tls,
+    Skills,
+    Credentials,
+    Attachments,
+}
+
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ManagedWorktreeDiskEntry {
+    pub path: String,
+    pub size: DiskSize,
+    pub repository: Option<String>,
+    pub branch_name: Option<String>,
+    pub disposition: ManagedWorktreeDisposition,
+}
+
+#[derive(Serialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum ManagedWorktreeDisposition {
+    Live {
+        conversation_id: String,
+        title: Option<String>,
+        state: String,
+        archived: bool,
+    },
+    Leftover {
+        source_conversation_id: String,
+        source_state: String,
+        archived: bool,
+        cleanup_allowed: bool,
+    },
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ManagedWorktreeCleanupRequest {
+    pub path: String,
+}
+
+#[derive(Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ManagedWorktreeCleanupResponse {
+    pub path: String,
+    pub removed: bool,
+}
+
 /// The four semantically-distinct outcomes of sizing a location. A bare
 /// nullable number cannot tell these apart, so they are modelled as a tagged
 /// union (correct-by-construction).
-#[derive(Serialize, TS, Debug, PartialEq, Eq)]
+#[derive(Serialize, TS, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum DiskSize {
@@ -205,32 +272,123 @@ pub async fn deployment_info(
     };
 
     let resources = sample_resources().await;
-    let mut disk: Vec<DiskEntry> = cfg.locations.iter().map(measure_location).collect();
-    // The codex credential file is resolved per request, not captured at
-    // startup: the in-app login flow can switch the active source at runtime
-    // (Phoenix's own file vs Codex CLI's in piggyback mode), so a static row
-    // would go stale after a credential switch.
-    disk.push(measure_location(&active_codex_credentials_location(
-        &state.runtime_env,
-    )));
-    // Managed worktrees and their PR auto-fix bundles live under each project's
-    // `.phoenix/worktrees/` root, not under a startup-known deployment root, so
-    // these aggregates are resolved per request from persisted worktree paths.
-    disk.push(managed_worktrees_aggregate(&state.db).await);
-    disk.push(pr_context_aggregate(&state.db).await);
 
     Json(DeploymentInfo {
         build,
         network,
         resources,
-        disk,
         log: cfg.log.clone(),
         local_access: super::local_reveal::client_is_local(peer.ip(), &headers),
         sampled_at: Utc::now(),
     })
 }
 
-async fn managed_worktrees_aggregate(db: &crate::db::Database) -> DiskEntry {
+pub async fn deployment_disk(State(state): State<AppState>) -> impl IntoResponse {
+    Json(build_disk_info(&state).await)
+}
+
+pub async fn cleanup_managed_worktree(
+    State(state): State<AppState>,
+    Json(request): Json<ManagedWorktreeCleanupRequest>,
+) -> impl IntoResponse {
+    match cleanup_managed_worktree_inner(&state, &request.path).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err((status, message)) => {
+            (status, Json(serde_json::json!({ "error": message }))).into_response()
+        }
+    }
+}
+
+async fn cleanup_managed_worktree_inner(
+    state: &AppState,
+    path: &str,
+) -> Result<ManagedWorktreeCleanupResponse, (StatusCode, String)> {
+    let conversations = state
+        .db
+        .managed_worktree_conversations()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let owners: Vec<_> = conversations
+        .iter()
+        .filter(|conv| conv.conv_mode.worktree_path() == Some(path))
+        .collect();
+    if owners.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "worktree path is not known to Phoenix".to_string(),
+        ));
+    }
+    let worktree = Path::new(path);
+    let repo_root = crate::git_ops::repo_root_from_phoenix_worktree(worktree).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "worktree path is not a Phoenix-managed worktree path".to_string(),
+        )
+    })?;
+    if owners
+        .iter()
+        .any(|conv| !conv.archived && !conv.state.is_terminal())
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "worktree is still owned by a live conversation".to_string(),
+        ));
+    }
+    if !worktree.exists() {
+        return Ok(ManagedWorktreeCleanupResponse {
+            path: path.to_string(),
+            removed: false,
+        });
+    }
+
+    let mode = &owners[0].conv_mode;
+    let branch_to_delete = match mode {
+        ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
+        ConvMode::Explore { .. } | ConvMode::Branch { .. } | ConvMode::Direct => None,
+    };
+    let worktree_str = worktree.to_string_lossy().to_string();
+    crate::git_ops::run_git(&repo_root, &["worktree", "remove", &worktree_str, "--force"])
+        .or_else(|git_err| {
+            tracing::debug!(error = %git_err, path = %worktree.display(), "leftover worktree cleanup: git remove failed; trying filesystem removal");
+            std::fs::remove_dir_all(worktree).map_err(|e| e.to_string())?;
+            let _ = crate::git_ops::run_git(&repo_root, &["worktree", "prune"]);
+            Ok(String::new())
+        })
+        .map_err(|e: String| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    if let Some(branch) = branch_to_delete {
+        if crate::git_ops::find_branch_in_worktree_list(&repo_root, &branch).is_none() {
+            crate::git_ops::run_git(&repo_root, &["branch", "-D", &branch])
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        }
+    }
+
+    Ok(ManagedWorktreeCleanupResponse {
+        path: path.to_string(),
+        removed: true,
+    })
+}
+
+async fn build_disk_info(state: &AppState) -> DeploymentDiskInfo {
+    let cfg = &state.deployment;
+    let mut disk: Vec<DiskEntry> = cfg.locations.iter().map(measure_location).collect();
+    disk.push(measure_location(&active_codex_credentials_location(
+        &state.runtime_env,
+    )));
+    let (managed_entry, managed_worktrees) = managed_worktrees_disk(&state.db).await;
+    disk.push(managed_entry);
+    disk.push(pr_context_aggregate(&state.db).await);
+
+    DeploymentDiskInfo {
+        disk,
+        managed_worktrees,
+        sampled_at: Utc::now(),
+    }
+}
+
+async fn managed_worktrees_disk(
+    db: &crate::db::Database,
+) -> (DiskEntry, Vec<ManagedWorktreeDiskEntry>) {
     const LABEL: &str = "Phoenix-managed worktrees";
     const PATTERN: &str = ".phoenix/worktrees/*";
 
@@ -238,57 +396,87 @@ async fn managed_worktrees_aggregate(db: &crate::db::Database) -> DiskEntry {
         Ok(paths) => paths,
         Err(e) => {
             tracing::debug!(error = %e, "managed worktree aggregate: failed to enumerate worktrees");
-            return DiskEntry {
-                label: LABEL.to_string(),
-                path: PATTERN.to_string(),
-                size: DiskSize::NotMeasured,
-            };
+            return not_measured_managed_worktrees(LABEL, PATTERN);
+        }
+    };
+    let conversations = match db.managed_worktree_conversations().await {
+        Ok(conversations) => conversations,
+        Err(e) => {
+            tracing::debug!(error = %e, "managed worktree aggregate: failed to load worktree conversations");
+            Vec::new()
         }
     };
 
     match tokio::task::spawn_blocking(move || {
-        managed_worktrees_entry_from_paths(LABEL, PATTERN, paths.iter().map(String::as_str))
+        managed_worktrees_from_conversations(LABEL, PATTERN, &conversations, &paths)
     })
     .await
     {
-        Ok(entry) => entry,
+        Ok(value) => value,
         Err(e) => {
             tracing::debug!(error = %e, "managed worktree aggregate: sizing task failed");
-            DiskEntry {
-                label: LABEL.to_string(),
-                path: PATTERN.to_string(),
-                size: DiskSize::NotMeasured,
-            }
+            not_measured_managed_worktrees(LABEL, PATTERN)
         }
     }
 }
 
-fn managed_worktrees_entry_from_paths<'a>(
+fn not_measured_managed_worktrees(
     label: &str,
     pattern: &str,
-    paths: impl IntoIterator<Item = &'a str>,
-) -> DiskEntry {
+) -> (DiskEntry, Vec<ManagedWorktreeDiskEntry>) {
+    (
+        DiskEntry {
+            category: DiskCategory::ManagedWorktrees,
+            label: label.to_string(),
+            path: pattern.to_string(),
+            size: DiskSize::NotMeasured,
+        },
+        Vec::new(),
+    )
+}
+
+fn managed_worktrees_from_conversations(
+    label: &str,
+    pattern: &str,
+    conversations: &[Conversation],
+    paths: &[String],
+) -> (DiskEntry, Vec<ManagedWorktreeDiskEntry>) {
     let mut seen = BTreeSet::new();
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut total: u64 = 0;
     let mut any = false;
+    let by_path = worktree_conversation_index(conversations);
+    let mut details = Vec::new();
 
     for path in paths {
-        if !seen.insert(path.to_string()) {
+        if !seen.insert(path.clone()) {
             continue;
         }
         let wt = Path::new(path);
-        if let Some(root) = crate::git_ops::repo_root_from_phoenix_worktree(wt) {
+        let repository = crate::git_ops::repo_root_from_phoenix_worktree(wt).map(|root| {
             if !roots.contains(&root) {
-                roots.push(root);
+                roots.push(root.clone());
             }
+            root.display().to_string()
+        });
+        let size = if wt.is_dir() {
+            any = true;
+            let bytes = dir_size(wt);
+            total = total.saturating_add(bytes);
+            DiskSize::Measured { bytes }
+        } else {
+            DiskSize::Absent
+        };
+        if let Some(convs) = by_path.get(path) {
+            details.push(managed_worktree_detail(path, size, repository, convs));
         }
-        if !wt.is_dir() {
-            continue;
-        }
-        any = true;
-        total = total.saturating_add(dir_size(wt));
     }
+
+    details.sort_by(|a, b| {
+        disk_size_rank(&b.size)
+            .cmp(&disk_size_rank(&a.size))
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     let path = aggregate_pattern_path(&roots, pattern);
     let size = if any {
@@ -297,10 +485,103 @@ fn managed_worktrees_entry_from_paths<'a>(
         DiskSize::Absent
     };
 
-    DiskEntry {
-        label: label.to_string(),
-        path,
+    (
+        DiskEntry {
+            category: DiskCategory::ManagedWorktrees,
+            label: label.to_string(),
+            path,
+            size,
+        },
+        details,
+    )
+}
+
+fn worktree_conversation_index(
+    conversations: &[Conversation],
+) -> BTreeMap<String, Vec<&Conversation>> {
+    let mut by_path: BTreeMap<String, Vec<&Conversation>> = BTreeMap::new();
+    for conv in conversations {
+        if let Some(path) = conv.conv_mode.worktree_path() {
+            by_path.entry(path.to_string()).or_default().push(conv);
+        }
+    }
+    by_path
+}
+
+fn managed_worktree_detail(
+    path: &str,
+    size: DiskSize,
+    repository: Option<String>,
+    conversations: &[&Conversation],
+) -> ManagedWorktreeDiskEntry {
+    let source = conversations[0];
+    let live = conversations
+        .iter()
+        .copied()
+        .find(|conv| !conv.archived && !conv.state.is_terminal());
+    let owner = live.unwrap_or(source);
+    ManagedWorktreeDiskEntry {
+        path: path.to_string(),
         size,
+        repository,
+        branch_name: owner.conv_mode.branch_name().map(str::to_string),
+        disposition: match live {
+            Some(conv) => ManagedWorktreeDisposition::Live {
+                conversation_id: conv.id.clone(),
+                title: conv.title.clone(),
+                state: conv_state_name(&conv.state).to_string(),
+                archived: conv.archived,
+            },
+            None => ManagedWorktreeDisposition::Leftover {
+                source_conversation_id: source.id.clone(),
+                source_state: conv_state_name(&source.state).to_string(),
+                archived: source.archived,
+                cleanup_allowed: true,
+            },
+        },
+    }
+}
+
+fn conv_state_name(state: &phoenix_core::domain::sm_state::ConvState) -> &'static str {
+    match state {
+        phoenix_core::domain::sm_state::ConvState::Idle => "Idle",
+        phoenix_core::domain::sm_state::ConvState::LlmRequesting { .. } => "LlmRequesting",
+        phoenix_core::domain::sm_state::ConvState::SeededLlmRequesting { .. } => {
+            "SeededLlmRequesting"
+        }
+        phoenix_core::domain::sm_state::ConvState::ToolExecuting { .. } => "ToolExecuting",
+        phoenix_core::domain::sm_state::ConvState::CancellingTool { .. } => "CancellingTool",
+        phoenix_core::domain::sm_state::ConvState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
+        phoenix_core::domain::sm_state::ConvState::CancellingSubAgents { .. } => {
+            "CancellingSubAgents"
+        }
+        phoenix_core::domain::sm_state::ConvState::Completed { .. } => "Completed",
+        phoenix_core::domain::sm_state::ConvState::Failed { .. } => "Failed",
+        phoenix_core::domain::sm_state::ConvState::Error { .. } => "Error",
+        phoenix_core::domain::sm_state::ConvState::AwaitingRecovery { .. } => "AwaitingRecovery",
+        phoenix_core::domain::sm_state::ConvState::AwaitingContinuation { .. } => {
+            "AwaitingContinuation"
+        }
+        phoenix_core::domain::sm_state::ConvState::AwaitingTaskApproval { .. } => {
+            "AwaitingTaskApproval"
+        }
+        phoenix_core::domain::sm_state::ConvState::AwaitingUserResponse { .. } => {
+            "AwaitingUserResponse"
+        }
+        phoenix_core::domain::sm_state::ConvState::AwaitingCommissionReviewApproval { .. } => {
+            "AwaitingCommissionReviewApproval"
+        }
+        phoenix_core::domain::sm_state::ConvState::ContextExhausted { .. } => "ContextExhausted",
+        phoenix_core::domain::sm_state::ConvState::HandedOff { .. } => "HandedOff",
+        phoenix_core::domain::sm_state::ConvState::Terminal => "Terminal",
+    }
+}
+
+fn disk_size_rank(size: &DiskSize) -> (u8, u64) {
+    match size {
+        DiskSize::Measured { bytes } => (2, *bytes),
+        DiskSize::NotMeasured | DiskSize::InlineDb => (1, 0),
+        DiskSize::Absent => (0, 0),
     }
 }
 
@@ -335,6 +616,7 @@ async fn pr_context_aggregate(db: &crate::db::Database) -> DiskEntry {
         Err(e) => {
             tracing::debug!(error = %e, "PR context aggregate: failed to enumerate worktrees");
             return DiskEntry {
+                category: DiskCategory::PrContext,
                 label: LABEL.to_string(),
                 path: PATTERN.to_string(),
                 size: DiskSize::NotMeasured,
@@ -380,6 +662,7 @@ fn pr_context_entry_from_paths<'a>(
         DiskSize::Absent
     };
     DiskEntry {
+        category: DiskCategory::PrContext,
         label: label.to_string(),
         path,
         size,
@@ -398,6 +681,7 @@ fn active_codex_credentials_location(
             .unwrap_or_else(|| runtime_env.codex_auth_path()),
     );
     DiskLocation {
+        category: DiskCategory::Credentials,
         label: "Codex credentials".to_string(),
         path,
         mode: MeasureMode::File,
@@ -470,6 +754,7 @@ fn measure_location(loc: &DiskLocation) -> DiskEntry {
         MeasureMode::NoMeasure => DiskSize::NotMeasured,
     };
     DiskEntry {
+        category: loc.category,
         label: loc.label.clone(),
         path: loc.path.display().to_string(),
         size,
@@ -534,6 +819,7 @@ mod tests {
 
     fn loc(path: PathBuf, mode: MeasureMode) -> DiskLocation {
         DiskLocation {
+            category: DiskCategory::DataDirectory,
             label: "x".to_string(),
             path,
             mode,
@@ -638,13 +924,15 @@ mod tests {
         fs::write(wt.join("nested").join("b.bin"), b"123").unwrap();
 
         let wt_str = wt.to_string_lossy().to_string();
-        let entry = managed_worktrees_entry_from_paths(
+        let (entry, details) = managed_worktrees_from_conversations(
             "Managed worktrees",
             ".phoenix/worktrees/*",
-            [wt_str.as_str(), wt_str.as_str()],
+            &[],
+            &[wt_str.clone(), wt_str.clone()],
         );
 
         assert_eq!(entry.size, DiskSize::Measured { bytes: 8 });
+        assert!(details.is_empty());
         assert_eq!(
             entry.path,
             repo.join(".phoenix/worktrees/*").display().to_string()
@@ -658,10 +946,11 @@ mod tests {
         let wt = repo.join(".phoenix").join("worktrees").join("missing");
         let wt_str = wt.to_string_lossy().to_string();
 
-        let entry = managed_worktrees_entry_from_paths(
+        let (entry, _) = managed_worktrees_from_conversations(
             "Managed worktrees",
             ".phoenix/worktrees/*",
-            [wt_str.as_str()],
+            &[],
+            &[wt_str],
         );
 
         assert_eq!(entry.size, DiskSize::Absent);
@@ -685,10 +974,11 @@ mod tests {
         let wt_a = wt_a.to_string_lossy().to_string();
         let wt_b = wt_b.to_string_lossy().to_string();
 
-        let entry = managed_worktrees_entry_from_paths(
+        let (entry, _) = managed_worktrees_from_conversations(
             "Managed worktrees",
             ".phoenix/worktrees/*",
-            [wt_a.as_str(), wt_b.as_str()],
+            &[],
+            &[wt_a, wt_b],
         );
 
         assert_eq!(entry.size, DiskSize::Measured { bytes: 3 });

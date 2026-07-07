@@ -308,7 +308,7 @@ fn build_disk_locations(
     tls_source: Option<&tls::ConfigSource>,
     loaded_tls: Option<&tls::LoadedConfig>,
 ) -> Vec<api::DiskLocation> {
-    use api::{DiskLocation, MeasureMode};
+    use api::{DiskCategory, DiskLocation, MeasureMode};
 
     let db_pb = api::absolutize(&runtime_env.db_path());
     let data_dir = db_pb
@@ -333,11 +333,13 @@ fn build_disk_locations(
 
     let mut locations = vec![
         DiskLocation {
+            category: DiskCategory::Database,
             label: "Database".to_string(),
             path: db_pb.clone(),
             mode: MeasureMode::File,
         },
         DiskLocation {
+            category: DiskCategory::DataDirectory,
             label: "Data directory".to_string(),
             path: data_dir,
             mode: data_dir_mode,
@@ -349,6 +351,7 @@ fn build_disk_locations(
     match (tls_source, loaded_tls) {
         (Some(tls::ConfigSource::Auto { dir, .. }), _) => {
             locations.push(DiskLocation {
+                category: DiskCategory::Tls,
                 label: "TLS directory".to_string(),
                 path: dir.clone(),
                 mode: MeasureMode::RecurseSmall,
@@ -356,11 +359,13 @@ fn build_disk_locations(
         }
         (Some(tls::ConfigSource::Manual(_)), Some(loaded)) => {
             locations.push(DiskLocation {
+                category: DiskCategory::Tls,
                 label: "TLS certificate".to_string(),
                 path: loaded.cert_path.clone(),
                 mode: MeasureMode::File,
             });
             locations.push(DiskLocation {
+                category: DiskCategory::Tls,
                 label: "TLS key".to_string(),
                 path: loaded.key_path.clone(),
                 mode: MeasureMode::File,
@@ -370,6 +375,7 @@ fn build_disk_locations(
     }
 
     locations.push(DiskLocation {
+        category: DiskCategory::Skills,
         label: "Built-in skills".to_string(),
         path: runtime_env.builtin_skills_dir(),
         mode: MeasureMode::RecurseSmall,
@@ -382,12 +388,14 @@ fn build_disk_locations(
     // Attachments are stored inline in the database. This row is the stable home
     // for the file-based attachment directory once that storage mode is active.
     locations.push(DiskLocation {
+        category: DiskCategory::Attachments,
         label: "Attachments".to_string(),
         path: db_pb,
         mode: MeasureMode::InlineDb,
     });
 
     locations.push(DiskLocation {
+        category: DiskCategory::BrowserCache,
         label: "Browser binary cache".to_string(),
         path: runtime_env.chromium_cache_dir(),
         mode: MeasureMode::NoMeasure,
@@ -397,6 +405,7 @@ fn build_disk_locations(
     // active. A glob, not a single dir, and potentially large — reported as an
     // unsized pattern row.
     locations.push(DiskLocation {
+        category: DiskCategory::BrowserProfiles,
         label: "Browser profiles".to_string(),
         path: PathBuf::from(tools::browser::session::user_data_dir_glob()),
         mode: MeasureMode::Pattern,

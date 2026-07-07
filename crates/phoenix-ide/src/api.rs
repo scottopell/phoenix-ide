@@ -24,7 +24,9 @@ mod types;
 pub(crate) mod usage;
 pub(crate) mod wire;
 
-pub use deployment::{absolutize, DeploymentConfig, DiskLocation, LogInfo, MeasureMode, TlsInfo};
+pub use deployment::{
+    absolutize, DeploymentConfig, DiskCategory, DiskLocation, LogInfo, MeasureMode, TlsInfo,
+};
 pub use handlers::create_router;
 #[allow(unused_imports)] // Public API re-exports
 pub use types::*;
