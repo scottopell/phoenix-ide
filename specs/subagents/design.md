@@ -163,33 +163,6 @@ JSON shape; conceptually:
 }
 ```
 
-## Wake-plane terminal handle
-
-Each spawned sub-agent has a stable terminal-wait handle: the child conversation /
-agent id already allocated for parent fan-in and inline status. Wake contracts use
-that identity directly while the child runtime is active. A sub-agent handle is
-not WorkScope-keyed: WorkScope inheritance may move bash/tmux resources to a
-continuation, but it does not move an already-spawned child conversation to a
-different parent transcript. Because active sub-agent runtimes do not survive
-Phoenix restart, wake router startup resync delivers an already-persisted child
-terminal state when present and fires forgotten only for non-terminal children.
-
-A wake on a sub-agent handle delivers only terminal outcomes:
-
-- explicit `submit_result` success;
-- explicit `submit_error` failure with `error_kind`;
-- wall-clock timeout;
-- independently observed child cancellation;
-- turn-limit hard-stop fallback with extracted partial text when available;
-- implicit text completion, if bedrock admits it as a child terminal state;
-- non-retryable runtime failure;
-- context exhaustion.
-
-A missing child handle resolves the wake as `Forgotten` rather than as a fired
-sub-agent terminal payload. The wake payload is not a continuation channel. It
-does not resume the child, request more budget, or carry arbitrary child questions
-to the parent.
-
 ## Example Use Cases
 
 ### Multi-Perspective Code Review

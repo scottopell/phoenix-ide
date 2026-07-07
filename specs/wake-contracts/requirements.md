@@ -40,11 +40,10 @@ Today three tools spawn potentially-long work:
 - **`tmux_run`** — readiness modes are `return_immediately` and
   `wait_for_text`. No `wait_for_exit`. For finite long-running commands
   the LLM polls `tmux capture-pane`, same round-trip cost as bash.
-- **`subagent`** — spawns a sub-conversation; the parent currently blocks on
-  completion inside the state machine. This is the *only* current
-  spawn-and-wait surface that does not require LLM polling, and it
-  achieves that by hardcoding the wait into the state machine rather
-  than exposing a reusable terminal-handle primitive.
+- **`subagent`** — spawns a sub-conversation; the parent can wait on
+  completion through state-machine fan-in. That path avoids LLM polling by
+  hardcoding the wait into the state machine rather than exposing a reusable
+  terminal-handle primitive.
 
 The subagent path proves the runtime *can* resume a conversation on an
 external signal. Wake contracts generalize only that terminal-wait capability in
@@ -258,10 +257,11 @@ window after exit. The captured tail MUST be represented as a list; no output is
 an empty list, not an absent field.
 
 For `HandleTerminal/SubAgent`, the tool result MUST carry one sub-agent identity
-field — the child conversation / agent id — plus task label/description when
-available and the structured sub-agent terminal payload defined by REQ-WAKE-017.
-The payload MUST NOT persist separate agent-id and conversation-id fields for the
-same handle identity.
+field — the child conversation / agent id — plus the spawned task text, an
+optional label, and the structured sub-agent terminal payload defined by
+REQ-WAKE-017. The
+payload MUST NOT persist separate agent-id and conversation-id fields for the same
+handle identity.
 
 THE delivered tool result SHALL be addressable back to the original
 tool call that registered the contract (via `tool_use_id`)
@@ -326,8 +326,7 @@ the wait is non-blocking from the user's standpoint.
 
 ### REQ-WAKE-009: Conversation-Scoped, Not WorkScope-Scoped
 
-A wake contract SHALL be owned by the conversation id currently stored on the
-contract row
+A wake contract SHALL be owned by the conversation id stored on the contract row
 
 THE wake-router SHALL fire only the contract's current conversation id, even when
 the underlying handle is WorkScope-keyed and shared across continuation. When
@@ -589,32 +588,6 @@ report lifecycle cancellation as a missing child handle.
 identities. The wake plane does not invent a parallel handle namespace, and it
 does not treat sub-agents as WorkScope resources.
 
----
-
-## Status
-
-| Requirement | Status | Notes |
-|-------------|--------|-------|
-| REQ-WAKE-001 | Proposed | Registration tool surface; no conv state mutation |
-| REQ-WAKE-002 | Proposed | SQLite persistence + restart resync |
-| REQ-WAKE-003 | Proposed | wake_router background service |
-| REQ-WAKE-004 | Proposed | `is_busy()` consults contract table |
-| REQ-WAKE-005 | Proposed | HandleTerminal only in v1 |
-| REQ-WAKE-006 | Proposed | Synthetic tool result delivery |
-| REQ-WAKE-007 | Proposed | Mandatory expires_at cap |
-| REQ-WAKE-008 | Proposed | UI status indicator + cancel |
-| REQ-WAKE-009 | Proposed | Conv-scoped (not WorkScope) |
-| REQ-WAKE-010 | Proposed | Independent contracts, no auto-cancel-on-fire |
-| REQ-WAKE-011 | Proposed | Terminal cause discriminator |
-| REQ-WAKE-012 | Proposed | Continuation: WorkScope-keyed (bash, tmux) transfer; subagent is agent-id-keyed |
-| REQ-WAKE-013 | Proposed | User messages just work (conv stays Idle) |
-| REQ-WAKE-014 | Proposed | Tool description discipline |
-| REQ-WAKE-015 | Proposed | Cost observability metrics |
-| REQ-WAKE-016 | Proposed | Unified `wait_until` tool, not per-substrate |
-| REQ-WAKE-017 | Proposed | Tagged exhaustive sub-agent terminal causes; missing child is Forgotten |
-| REQ-WAKE-018 | Proposed | V1 handle identity/lifecycle for bash, tmux, and sub-agent handles |
-
-**Progress:** 0 of 18 implemented.
 
 ## Dependencies
 

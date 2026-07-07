@@ -106,6 +106,7 @@ value TmuxTerminalPayload {
 
 value SubAgentTerminalPayload {
     sub_agent_id: String              -- single identity; child conversation id == agent id
+    task_text: String                 -- spawned task string supplied to the child
     task_label: String?
     outcome: SubAgentTerminalOutcome
     success_result: String            when outcome = success
