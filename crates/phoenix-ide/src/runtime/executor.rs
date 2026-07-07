@@ -5765,6 +5765,14 @@ fn open_early_worktree_and_rename_branch(
         .trim()
         .to_string();
     tracing::info!(temp_branch = %temp_branch, task_branch, "REQ-PROJ-028: renaming temp branch");
+    if temp_branch == task_branch || temp_branch.starts_with(&format!("{task_branch}-")) {
+        tracing::info!(
+            current_branch = %temp_branch,
+            task_branch = %task_branch,
+            "Task approval retry found worktree already on approval branch; skipping rename"
+        );
+        return Ok((worktree_path, temp_branch));
+    }
     let target_branch = unique_task_approval_branch(repo_root, task_branch, &temp_branch);
     run_git(
         &worktree_path,
@@ -6922,6 +6930,28 @@ mod approve_task_branch_collision_tests {
             result.branch_name
         );
         assert!(branch_exists(&repo_root, &result.branch_name));
+    }
+
+    #[test]
+    fn approval_retry_skips_rename_when_worktree_already_on_task_branch() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "retry-conv-1234";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let target_branch = "task-12345-fix-the-login-bug";
+        run_git(
+            &explore_wt,
+            &["branch", "-m", "task-pending-retry-co", target_branch],
+        )
+        .unwrap();
+
+        let (worktree_path, branch_name) =
+            open_early_worktree_and_rename_branch(&repo_root, conv_id, target_branch)
+                .expect("retry should continue on the already-renamed branch");
+
+        assert_eq!(worktree_path, explore_wt);
+        assert_eq!(branch_name, target_branch);
+        assert!(branch_exists(&repo_root, target_branch));
     }
 }
 

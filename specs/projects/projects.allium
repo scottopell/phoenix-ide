@@ -606,9 +606,12 @@ rule TaskApprovalExecuted {
     -- ForkProposalApproved: taskmd parses id/slug and branches task-{id}-{slug}; a plain
     -- brief uses the sanitized stem and branches task-{stem}-{conv-id-prefix}.
     let task_id = approval_task_id(conversation.proposal.task_file)
-    let branch_name = approval_branch_name(conversation.proposal.task_file, conversation)
+    let desired_branch_name = approval_branch_name(conversation.proposal.task_file, conversation)
+    let branch_name = approval_execution_branch_name(desired_branch_name)
 
-    -- Rename the temporary branch to the final task branch name (in place).
+    -- Rename the temporary branch to the execution branch name (in place). The execution name
+    -- is the deterministic approval branch unless that name already exists locally or at origin,
+    -- in which case Phoenix records a suffixed fallback and leaves the existing ref untouched.
     ensures: worktree.branch_name = branch_name
 
     -- The committed brief splits by shape — TaskFile is the taskmd-only entity, never
@@ -634,24 +637,29 @@ rule TaskApprovalExecuted {
         -- Sequence (taskmd filename):
         --   1. Parse id/priority/status/slug from the on-disk filename.
         --   2. Single-branch fetch of base_branch, best-effort (REQ-PROJ-022).
-        --   3. Rename branch in place: `git branch -m <temp-name> <task-branch>`.
-        --   4. Rename the task file to ...-in-progress--<slug>.md if needed
+        --   3. Choose the execution branch: normally `task-<id>-<slug>`; if that
+        --      name exists locally or at origin, append a random suffix and leave
+        --      the existing ref untouched. If retrying after the branch was already
+        --      renamed in this conversation's worktree, skip the rename and continue.
+        --   4. Rename branch in place: `git branch -m <temp-name> <execution-branch>`.
+        --   5. Rename the task file to ...-in-progress--<slug>.md if needed
         --      (staging the old name's deletion too, so the commit is a rename).
-        --   5. `git add` + `git commit` on the task branch (skipped if nothing
+        --   6. `git add` + `git commit` on the execution branch (skipped if nothing
         --      is staged — e.g. reusing an existing already-in-progress file
         --      that wasn't modified).
-        --   6. Transition Explore -> Work (permission upgrade).
+        --   7. Transition Explore -> Work (permission upgrade).
         --
         -- Sequence (plain-markdown brief — `crate::task_source::TaskSource`
         -- routes here when the filename doesn't parse as taskmd):
-        --   1. Sanitize the file stem; branch = `task-<stem>-<conv-id[..8]>`.
+        --   1. Sanitize the file stem; desired branch = `task-<stem>-<conv-id[..8]>`.
         --   2. Single-branch fetch of base_branch, best-effort.
-        --   3. Rename branch in place to that branch name.
-        --   4. (no status rename — a plain brief has no status segment)
-        --   5. `git add <task_file>` + `git commit` at the file's own path
+        --   3. Choose the execution branch with the same collision fallback as taskmd.
+        --   4. Rename branch in place to that execution branch name.
+        --   5. (no status rename — a plain brief has no status segment)
+        --   6. `git add <task_file>` + `git commit` at the file's own path
         --      (skipped if nothing is staged — e.g. the file was already on
         --      the branch, inherited from base, and not modified).
-        --   6. Transition Explore -> Work. Recorded task_id = the stem.
+        --   7. Transition Explore -> Work. Recorded task_id = the stem.
         --
         -- Both paths handle only the early-worktree case: the worktree (and
         -- base_branch) were set by ManagedWorktreeOnFirstMessage, so by the
@@ -673,7 +681,8 @@ rule TaskApprovalFreshHandoffExecuted {
 
     let worktree = Worktree{conversation: conversation}
     let task_id = approval_task_id(conversation.proposal.task_file)
-    let branch_name = approval_branch_name(conversation.proposal.task_file, conversation)
+    let desired_branch_name = approval_branch_name(conversation.proposal.task_file, conversation)
+    let branch_name = approval_execution_branch_name(desired_branch_name)
     let successor = conversation.continued_in_conv_id
 
     ensures: worktree.branch_name = branch_name
