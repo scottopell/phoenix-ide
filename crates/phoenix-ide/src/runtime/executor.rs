@@ -4355,23 +4355,24 @@ where
                 + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
                 + CONTINUATION_OUTPUT_RESERVE_TOKENS
                 + CONTINUATION_SAFETY_MARGIN_TOKENS;
-            let input_budget = context_window.saturating_sub(fixed_tokens);
-            let (messages, dropped) = cap_messages_to_token_budget(messages, input_budget);
-            // The budget cap drops oldest-first, which can drop the original
-            // leading user task and expose an assistant message at the front.
-            // The Anthropic Messages API rejects a request whose first message
-            // is not user-role, so trim leading non-user messages — re-creating
-            // the exact ContextWindowExceeded→fallback loop this guard prevents
-            // otherwise. Flattened history carries no tool_use/tool_result
-            // pairing, so dropping leading assistant narration is safe.
-            let (mut messages, trimmed) = drop_leading_non_user(messages);
-            if dropped > 0 || trimmed > 0 {
+            let budget = plan_continuation_history(messages, context_window, fixed_tokens);
+            let mut messages = budget.messages;
+            if budget.dropped_by_budget > 0
+                || budget.trimmed_for_user_first > 0
+                || budget.dropped_for_headroom > 0
+                || !budget.minimum_headroom_satisfied
+            {
                 tracing::debug!(
-                    dropped,
-                    trimmed_for_user_first = trimmed,
+                    dropped_by_budget = budget.dropped_by_budget,
+                    trimmed_for_user_first = budget.trimmed_for_user_first,
+                    dropped_for_headroom = budget.dropped_for_headroom,
                     context_window,
-                    input_budget,
-                    "continuation: trimmed history to fit budget and start user-first"
+                    input_budget = budget.input_budget,
+                    estimated_history_tokens = budget.estimated_history_tokens,
+                    headroom_tokens = budget.headroom_tokens,
+                    minimum_headroom_tokens = CONTINUATION_MIN_HEADROOM_TOKENS,
+                    minimum_headroom_satisfied = budget.minimum_headroom_satisfied,
+                    "continuation: trimmed history to fit budget, start user-first, and preserve headroom"
                 );
             }
 
@@ -4904,6 +4905,10 @@ const CONTINUATION_OUTPUT_RESERVE_TOKENS: usize = 4096;
 /// so this only covers estimate error, not their bulk.
 const CONTINUATION_SAFETY_MARGIN_TOKENS: usize = 512;
 
+/// Estimated tokens left unused inside the provider context window after the
+/// continuation history, system prompt, continuation prompt, and output reserve.
+const CONTINUATION_MIN_HEADROOM_TOKENS: usize = 8192;
+
 /// Most-recent image blocks replayed into a continuation/summarization request.
 /// Older screenshots are dropped to their text so an image-heavy session cannot
 /// fill the request with stale screenshots and evict the older textual context a
@@ -5042,6 +5047,56 @@ fn estimate_message_tokens(msg: &LlmMessage) -> usize {
     content + MESSAGE_OVERHEAD_TOKENS
 }
 
+#[derive(Debug)]
+struct ContinuationBudgetResult {
+    messages: Vec<LlmMessage>,
+    input_budget: usize,
+    dropped_by_budget: usize,
+    trimmed_for_user_first: usize,
+    dropped_for_headroom: usize,
+    estimated_history_tokens: usize,
+    headroom_tokens: usize,
+    minimum_headroom_satisfied: bool,
+}
+
+fn plan_continuation_history(
+    messages: Vec<LlmMessage>,
+    context_window: usize,
+    fixed_tokens: usize,
+) -> ContinuationBudgetResult {
+    let input_budget = context_window.saturating_sub(fixed_tokens);
+    let (messages, dropped_by_budget) = cap_messages_to_token_budget(messages, input_budget);
+    let (mut messages, trimmed_for_user_first) = drop_leading_non_user(messages);
+
+    let target_history_budget = input_budget.saturating_sub(CONTINUATION_MIN_HEADROOM_TOKENS);
+    let mut estimated_history_tokens = estimate_messages_tokens(&messages);
+    let mut dropped_for_headroom = 0usize;
+    while estimated_history_tokens > target_history_budget && !messages.is_empty() {
+        messages.remove(0);
+        dropped_for_headroom += 1;
+        let (user_first, trimmed) = drop_leading_non_user(messages);
+        messages = user_first;
+        dropped_for_headroom += trimmed;
+        estimated_history_tokens = estimate_messages_tokens(&messages);
+    }
+
+    let headroom_tokens = context_window.saturating_sub(fixed_tokens + estimated_history_tokens);
+    ContinuationBudgetResult {
+        messages,
+        input_budget,
+        dropped_by_budget,
+        trimmed_for_user_first,
+        dropped_for_headroom,
+        estimated_history_tokens,
+        headroom_tokens,
+        minimum_headroom_satisfied: headroom_tokens >= CONTINUATION_MIN_HEADROOM_TOKENS,
+    }
+}
+
+fn estimate_messages_tokens(messages: &[LlmMessage]) -> usize {
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContinuationPipelineStage {
@@ -5063,6 +5118,9 @@ struct ContinuationPipelineSummary {
     input_budget: usize,
     dropped_by_budget: usize,
     trimmed_for_user_first: usize,
+    dropped_for_headroom: usize,
+    headroom_tokens: usize,
+    minimum_headroom_satisfied: bool,
     stages: Vec<ContinuationPipelineStage>,
 }
 
@@ -5130,7 +5188,7 @@ fn summarize_continuation_pipeline(
     ));
 
     let (budget_capped, dropped_by_budget) =
-        cap_messages_to_token_budget(images_capped, input_budget);
+        cap_messages_to_token_budget(images_capped.clone(), input_budget);
     stages.push(summarize_continuation_stage(
         "budget_capped",
         &budget_capped,
@@ -5139,12 +5197,18 @@ fn summarize_continuation_pipeline(
     let (user_first, trimmed_for_user_first) = drop_leading_non_user(budget_capped);
     stages.push(summarize_continuation_stage("user_first", &user_first));
 
+    let budget = plan_continuation_history(images_capped, context_window, fixed_tokens);
+    stages.push(summarize_continuation_stage("headroom", &budget.messages));
+
     ContinuationPipelineSummary {
         context_window,
         fixed_tokens,
-        input_budget,
+        input_budget: budget.input_budget,
         dropped_by_budget,
         trimmed_for_user_first,
+        dropped_for_headroom: budget.dropped_for_headroom,
+        headroom_tokens: budget.headroom_tokens,
+        minimum_headroom_satisfied: budget.minimum_headroom_satisfied,
         stages,
     }
 }
@@ -5670,6 +5734,82 @@ mod strip_tool_blocks_tests {
         assert_eq!(
             user_first.user_messages + user_first.assistant_messages,
             user_first.messages
+        );
+    }
+
+    #[test]
+    fn continuation_planner_preserves_minimum_headroom_for_tool_heavy_history() {
+        let mut msgs = Vec::new();
+        msgs.push(user_text(&"initial task context ".repeat(1_000)));
+        for i in 0..90 {
+            msgs.push(assistant(vec![ContentBlock::ToolUse {
+                id: format!("tool-{i}"),
+                name: "bash".to_string(),
+                input: serde_json::json!({ "cmd": format!("rg continuation {i}") }),
+            }]));
+            msgs.push(user(vec![ContentBlock::ToolResult {
+                tool_use_id: format!("tool-{i}"),
+                content: "tool output with quoted JSON, file paths, and escaped text \\\\ "
+                    .repeat(120),
+                images: vec![],
+                is_error: false,
+            }]));
+            msgs.push(assistant(vec![ContentBlock::text(format!(
+                "observed result {i}: {}",
+                "summary detail ".repeat(20)
+            ))]));
+        }
+
+        let summary = summarize_continuation_pipeline(msgs, &[], 40_000);
+        let headroom = summary
+            .stages
+            .iter()
+            .find(|stage| stage.name == "headroom")
+            .expect("headroom stage");
+
+        assert!(
+            summary.dropped_for_headroom > 0,
+            "planner should drop oldest retained history until the headroom floor is satisfied"
+        );
+        assert!(
+            summary.minimum_headroom_satisfied,
+            "headroom floor should be satisfiable for this window"
+        );
+        assert!(
+            summary.headroom_tokens >= CONTINUATION_MIN_HEADROOM_TOKENS,
+            "final estimated headroom should leave meaningful provider slack"
+        );
+        assert!(
+            headroom.estimated_tokens
+                <= summary
+                    .input_budget
+                    .saturating_sub(CONTINUATION_MIN_HEADROOM_TOKENS),
+            "retained history should fit the stricter post-trim headroom budget"
+        );
+        assert!(
+            headroom.messages == 0 || headroom.user_messages > 0,
+            "non-empty planned history must still start with a user-role message"
+        );
+    }
+
+    #[test]
+    fn continuation_planner_reports_unsatisfied_headroom_when_fixed_tokens_leave_no_room() {
+        let fixed_tokens = 1_000;
+        let context_window = fixed_tokens + CONTINUATION_MIN_HEADROOM_TOKENS - 1;
+        let budget = plan_continuation_history(
+            vec![user_text(
+                "history that must be dropped because no headroom remains",
+            )],
+            context_window,
+            fixed_tokens,
+        );
+
+        assert!(budget.messages.is_empty());
+        assert_eq!(budget.dropped_for_headroom, 1);
+        assert_eq!(budget.headroom_tokens, CONTINUATION_MIN_HEADROOM_TOKENS - 1);
+        assert!(
+            !budget.minimum_headroom_satisfied,
+            "fixed prompt/system/output reserve can make the floor impossible even after history is empty"
         );
     }
 
