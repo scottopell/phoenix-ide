@@ -1689,8 +1689,8 @@ pre:hover .copy-btn {
 }
 
 @media (hover: none), (width <= 768px) {
-  .message-header:has(.message-header-actions:not(:empty)) {
-    padding-right: 40px;
+  .message:has(.message-header-actions:not(:empty)) {
+    padding-right: 48px;
   }
 
   .message-header-actions:not(:empty) {
