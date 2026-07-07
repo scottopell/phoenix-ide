@@ -1358,6 +1358,10 @@ fn finding_extraction_stage_status(warnings: &[ReviewWarning]) -> StageStatus {
         StageStatus::Partial
     } else if has_warning(warnings, "model_output_parse") {
         StageStatus::Failed
+    } else if has_warning(warnings, "invalid_severity")
+        || has_warning(warnings, "invalid_confidence")
+    {
+        StageStatus::Repaired
     } else {
         StageStatus::Ok
     }
@@ -1384,6 +1388,10 @@ fn interrupted_finding_extraction_stage_status(
         StageStatus::Failed
     } else if has_warning(warnings, "dropped_findings") {
         StageStatus::Partial
+    } else if has_warning(warnings, "invalid_severity")
+        || has_warning(warnings, "invalid_confidence")
+    {
+        StageStatus::Repaired
     } else {
         StageStatus::Ok
     }
@@ -3001,6 +3009,10 @@ mod tests {
         assert_eq!(
             findings_trust_for_completed(&warnings),
             FindingsTrust::Repaired
+        );
+        assert_eq!(
+            finding_extraction_stage_status(&warnings),
+            StageStatus::Repaired
         );
         let summaries = summarize_warnings(&warnings);
         assert!(summaries.contains(&"some finding severities were normalized".to_string()));

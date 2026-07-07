@@ -96,6 +96,10 @@ pub struct CommissionReviewApprovalScope {
     pub repo_root: String,
     pub base: String,
     pub head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_base: Option<String>,
     pub dirty: bool,
     pub changed_files: usize,
     pub insertions: u64,

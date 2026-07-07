@@ -812,6 +812,8 @@ mod tests {
                 repo_root: "/tmp".to_string(),
                 base: "refs/remotes/origin/HEAD".to_string(),
                 head: "HEAD".to_string(),
+                approved_head: None,
+                approved_base: None,
                 dirty: false,
                 changed_files: 0,
                 insertions: 0,

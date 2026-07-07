@@ -171,6 +171,14 @@ fn resolve_commission_review_approval_from_parts(
         (base_ref, "HEAD".to_string(), "HEAD".to_string())
     };
 
+    let approved_head = match git_capture(&repo_root, &["rev-parse", "HEAD^{commit}"]) {
+        Ok(head) => head,
+        Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
+    };
+    let approved_base = match git_merge_base(&repo_root, &base, &diff_head) {
+        Ok(base) => Some(base),
+        Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
+    };
     let (changed_files, insertions, deletions) = match diff_numstat(&repo_root, &base, &diff_head) {
         Ok(stats) => stats,
         Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
@@ -181,6 +189,8 @@ fn resolve_commission_review_approval_from_parts(
         repo_root: repo_root.display().to_string(),
         base,
         head,
+        approved_head: Some(approved_head),
+        approved_base,
         dirty: false,
         changed_files,
         insertions,
@@ -224,6 +234,16 @@ fn diff_numstat(repo: &Path, base: &str, head: &str) -> Result<(usize, u64, u64)
         }
     }
     Ok((changed_files, insertions, deletions))
+}
+
+fn git_merge_base(repo: &Path, base: &str, head: &str) -> Result<String, String> {
+    git_capture(repo, &["merge-base", base, head]).map_err(|reason| {
+        if reason == COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE {
+            format!("commission_review is unavailable: no merge base between `{base}` and `{head}`")
+        } else {
+            reason
+        }
+    })
 }
 
 fn git_worktree_clean(repo: &Path) -> Result<(), String> {
@@ -478,6 +498,11 @@ mod commission_review_approval_tests {
             panic!("expected available review scope, got {availability:?}");
         };
         assert_eq!(scope.changed_files, 1);
+        assert_eq!(
+            scope.approved_head.as_deref(),
+            Some(git_output(dir.path(), &["rev-parse", "HEAD^{commit}"]).as_str())
+        );
+        assert_eq!(scope.approved_base.as_deref(), Some(base.as_str()));
         assert_eq!(scope.insertions, 2);
         assert_eq!(scope.deletions, 0);
     }
@@ -4190,8 +4215,9 @@ where
             );
 
             // Build request — normalize messages against current tool set
-            let tool_names: std::collections::HashSet<&str> =
+            let mut tool_names: std::collections::HashSet<&str> =
                 tools.iter().map(|t| t.name.as_str()).collect();
+            tool_names.insert("commission_review");
             let messages = strip_unavailable_tool_blocks(messages, &tool_names);
 
             let request = LlmRequest {

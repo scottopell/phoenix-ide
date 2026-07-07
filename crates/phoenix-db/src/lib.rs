@@ -6499,6 +6499,8 @@ mod tests {
                 repo_root: "/tmp".to_string(),
                 base: "refs/remotes/origin/main".to_string(),
                 head: "task".to_string(),
+                approved_head: None,
+                approved_base: None,
                 dirty: false,
                 changed_files: 0,
                 insertions: 0,

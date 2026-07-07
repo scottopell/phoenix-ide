@@ -1782,7 +1782,7 @@ pub fn transition_parent(
                 tool_use_id,
                 request,
                 assistant_message,
-                ..
+                scope,
             },
             ParentEvent::Parent(ParentOnlyEvent::CommissionReviewApprovalDecided {
                 outcome: CommissionReviewApprovalOutcome::Approved,
@@ -1793,20 +1793,14 @@ pub fn transition_parent(
                 ToolInput::ApprovedCommissionReview(
                     phoenix_core::domain::sm_state::ApprovedCommissionReviewInput {
                         request: request.clone(),
-                        runtime_base_branch: match context.mode_context.as_ref() {
-                            Some(
-                                ModeContext::Work { base_branch, .. }
-                                | ModeContext::Branch { base_branch, .. },
-                            ) => Some(base_branch.clone()),
-                            Some(ModeContext::Explore { .. } | ModeContext::Direct) | None => None,
-                        },
+                        runtime_base_branch: Some(scope.base.clone()),
                         approved_working_dir: context.working_dir.display().to_string(),
                         approved_worktree_path: context
                             .work_scope_worktree
                             .as_ref()
                             .map(|path| path.display().to_string()),
-                        approved_head: None,
-                        approved_base: None,
+                        approved_head: scope.approved_head.clone(),
+                        approved_base: scope.approved_base.clone(),
                     },
                 ),
             );
@@ -3600,6 +3594,8 @@ mod tests {
                 repo_root: "/repo".to_string(),
                 base: "refs/remotes/origin/main".to_string(),
                 head: "HEAD".to_string(),
+                approved_head: None,
+                approved_base: None,
                 dirty: false,
                 changed_files: 0,
                 insertions: 0,
@@ -6097,6 +6093,8 @@ mod tests {
                     repo_root: repo.display().to_string(),
                     base: "refs/remotes/origin/main".to_string(),
                     head: "task".to_string(),
+                    approved_head: None,
+                    approved_base: None,
                     dirty: false,
                     changed_files: 0,
                     insertions: 0,
@@ -6143,6 +6141,8 @@ mod tests {
                     repo_root: "/tmp".to_string(),
                     base: "refs/remotes/origin/main".to_string(),
                     head: "task".to_string(),
+                    approved_head: None,
+                    approved_base: None,
                     dirty: false,
                     changed_files: 0,
                     insertions: 0,
@@ -6303,8 +6303,10 @@ mod tests {
                 scope: CommissionReviewApprovalScope {
                     kind: "committed_branch_diff".to_string(),
                     repo_root: "/tmp".to_string(),
-                    base: "refs/remotes/origin/main".to_string(),
+                    base: "refs/remotes/origin/develop".to_string(),
                     head: "task".to_string(),
+                    approved_head: Some("head-sha".to_string()),
+                    approved_base: Some("base-sha".to_string()),
                     dirty: false,
                     changed_files: 0,
                     insertions: 0,
@@ -6357,11 +6359,16 @@ mod tests {
             match &tool_call.input {
                 ToolInput::ApprovedCommissionReview(input) => {
                     assert_eq!(input.request.brief, "Ready for independent review");
-                    assert_eq!(input.runtime_base_branch.as_deref(), Some("develop"));
+                    assert_eq!(
+                        input.runtime_base_branch.as_deref(),
+                        Some("refs/remotes/origin/develop")
+                    );
                     assert_eq!(
                         input.approved_working_dir,
                         context.working_dir.display().to_string()
                     );
+                    assert_eq!(input.approved_head.as_deref(), Some("head-sha"));
+                    assert_eq!(input.approved_base.as_deref(), Some("base-sha"));
                 }
                 other @ (ToolInput::Bash(_)
                 | ToolInput::Think(_)
