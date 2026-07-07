@@ -5789,6 +5789,11 @@ fn branch_ref_exists(repo_root: &std::path::Path, git_ref: &str) -> bool {
 fn task_approval_branch_name_exists(repo_root: &std::path::Path, branch_name: &str) -> bool {
     branch_ref_exists(repo_root, &format!("refs/heads/{branch_name}"))
         || branch_ref_exists(repo_root, &format!("refs/remotes/origin/{branch_name}"))
+        || run_git(
+            repo_root,
+            &["ls-remote", "--exit-code", "--heads", "origin", branch_name],
+        )
+        .is_ok()
 }
 
 fn unique_task_approval_branch(
@@ -6889,7 +6894,7 @@ mod approve_task_branch_collision_tests {
     }
 
     #[test]
-    fn approve_task_uses_suffixed_fallback_when_target_branch_exists_at_origin() {
+    fn approve_task_uses_suffixed_fallback_when_target_branch_exists_as_fetched_origin_ref() {
         let (_tmp, repo_root) = init_repo();
         let conv_id = "remote-collision";
         let base_branch = "main";
@@ -6920,6 +6925,55 @@ mod approve_task_branch_collision_tests {
             Some(base_branch),
         )
         .expect("approval should avoid a poisoned remote branch name");
+
+        assert_ne!(result.branch_name, target_branch);
+        assert!(
+            result
+                .branch_name
+                .starts_with("task-12345-fix-the-login-bug-"),
+            "unexpected fallback branch: {}",
+            result.branch_name
+        );
+        assert!(branch_exists(&repo_root, &result.branch_name));
+    }
+
+    #[test]
+    fn approve_task_uses_suffixed_fallback_when_target_branch_exists_only_on_remote() {
+        let (_tmp, repo_root) = init_repo();
+        let origin = tempfile::TempDir::new().unwrap();
+        run_git(origin.path(), &["init", "--bare", "-q"]).unwrap();
+        run_git(
+            &repo_root,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        )
+        .unwrap();
+        run_git(&repo_root, &["push", "-u", "origin", "main"]).unwrap();
+
+        let target_branch = "task-12345-fix-the-login-bug";
+        let head = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
+        run_git(
+            origin.path(),
+            &["update-ref", &format!("refs/heads/{target_branch}"), &head],
+        )
+        .unwrap();
+
+        let conv_id = "unfetched-remote";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let task_filename = "12345-p2-ready--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(task_filename), "# Fix\n").unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            &format!("tasks/{task_filename}"),
+            "Fix the login bug",
+            Some("main"),
+        )
+        .expect("approval should query origin and avoid an unfetched remote branch name");
 
         assert_ne!(result.branch_name, target_branch);
         assert!(
