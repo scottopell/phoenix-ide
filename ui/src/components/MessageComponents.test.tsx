@@ -1069,6 +1069,39 @@ describe('finalized code fence highlighting', () => {
   });
 });
 
+describe('compact tool summaries', () => {
+  it('renders contextual compact cards and expands to full tool details', () => {
+    mockDensity = 'compact';
+    const message = agentMessage('agent-compact-tools', [
+      { type: 'tool_use', id: 'tool-search', name: 'search', input: { pattern: 'compact|Tool|tool', path: 'ui/src', include: '*.tsx' } },
+      { type: 'tool_use', id: 'tool-read', name: 'read_file', input: { path: 'ui/src/components/MessageComponents.tsx', offset: 711, limit: 40 } },
+      { type: 'tool_use', id: 'tool-bash', name: 'bash', input: { op: 'run', cmd: './dev.py check' } },
+    ]);
+    const results = new Map<string, Message>([
+      ['tool-search', toolMessage('tool-search', 'a.ts:1: one\nb.ts:2: two')],
+      ['tool-read', toolMessage('tool-read', 'line one\nline two')],
+      ['tool-bash', toolMessage('tool-bash', JSON.stringify({ status: 'exited', exit_code: 0, lines: [] }))],
+    ]);
+
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage message={message} toolResults={results} onOpenFile={undefined} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelectorAll('.compact-tool-card')).toHaveLength(3);
+    expect(screen.getByText('2 matches in 2 files')).toBeInTheDocument();
+    expect(screen.getByText('2 lines')).toBeInTheDocument();
+    expect(screen.getByText('exited 0')).toBeInTheDocument();
+    expect(container.querySelectorAll('.tool-block')).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole('button', { name: /read_file: 2 lines .*expand tool detail/i }));
+
+    expect(container.querySelectorAll('.tool-block')).toHaveLength(3);
+    expect(screen.getByText('ui/src/components/MessageComponents.tsx:711-750')).toBeInTheDocument();
+  });
+});
+
 describe('bash tool inspector affordance', () => {
   const bashToolUse = { type: 'tool_use', id: 'tool-bash', name: 'bash', input: { op: 'run', cmd: 'sleep 60' } };
 

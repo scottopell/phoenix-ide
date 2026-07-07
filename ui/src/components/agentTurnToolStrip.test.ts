@@ -11,13 +11,13 @@ function agentMessage(content: unknown): Message {
   } as unknown as Message;
 }
 
-function toolResult(toolUseId: string, opts: { isError?: boolean } = {}): Message {
+function toolResult(toolUseId: string, opts: { isError?: boolean; content?: string } = {}): Message {
   return {
     message_id: `r-${toolUseId}`,
     message_type: 'tool',
     content: {
       tool_use_id: toolUseId,
-      content: 'ok',
+      content: opts.content ?? 'ok',
       is_error: opts.isError ?? false,
     },
   } as unknown as Message;
@@ -66,6 +66,53 @@ describe('deriveToolStripItems', () => {
     expect(items[0]).toMatchObject({ hasResult: true, isError: false });
     expect(items[1]).toMatchObject({ hasResult: true, isError: true });
     expect(items[2]).toMatchObject({ hasResult: false, isError: false });
+  });
+
+  it('adds input summaries that distinguish repeated search and read_file tools', () => {
+    const msg = agentMessage([
+      { type: 'tool_use', id: 's1', name: 'search', input: { pattern: 'compact|Tool|tool', path: 'ui/src', include: '*.tsx' } },
+      { type: 'tool_use', id: 'r1', name: 'read_file', input: { path: 'ui/src/components/MessageComponents.tsx', offset: 711, limit: 40 } },
+      { type: 'tool_use', id: 'r2', name: 'read_file', input: { path: 'ui/src/components/agentTurnToolStrip.ts' } },
+    ]);
+
+    const items = deriveToolStripItems(msg, new Map());
+
+    expect(items.map((item) => item.inputSummary)).toEqual([
+      'compact|Tool|tool in ui/src (*.tsx)',
+      'ui/src/components/MessageComponents.tsx:711-750',
+      'ui/src/components/agentTurnToolStrip.ts',
+    ]);
+  });
+
+  it('adds cheap result summaries for search, read_file, and bash', () => {
+    const msg = agentMessage([
+      { type: 'tool_use', id: 's1', name: 'search', input: { pattern: 'x' } },
+      { type: 'tool_use', id: 'r1', name: 'read_file', input: { path: 'README.md' } },
+      { type: 'tool_use', id: 'b1', name: 'bash', input: { op: 'run', cmd: './dev.py check' } },
+    ]);
+    const results = new Map<string, Message>([
+      ['s1', toolResult('s1', { content: 'a.ts:1: one\na.ts:2: two\nb.ts:3: three' })],
+      ['r1', toolResult('r1', { content: 'line one\nline two' })],
+      ['b1', toolResult('b1', { content: JSON.stringify({ status: 'exited', exit_code: 0, lines: [] }) })],
+    ]);
+
+    const items = deriveToolStripItems(msg, results);
+
+    expect(items.map((item) => item.resultSummary)).toEqual([
+      '3 matches in 2 files',
+      '2 lines',
+      'exited 0',
+    ]);
+  });
+
+  it('uses a scalar fallback for unknown tools instead of name-only rendering', () => {
+    const msg = agentMessage([
+      { type: 'tool_use', id: 'u1', name: 'future_tool', input: { target: 'alpha', nested: { ignored: true } } },
+    ]);
+
+    const items = deriveToolStripItems(msg, new Map());
+
+    expect(items[0]).toMatchObject({ name: 'future_tool', inputSummary: 'target: alpha' });
   });
 
   it('returns empty for a turn with no tool blocks', () => {

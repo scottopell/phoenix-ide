@@ -317,57 +317,89 @@ body {
   flex-shrink: 0;
 }
 
-/* Compact density — per-turn inline tool pill strip. */
+/* Compact density — per-turn tool summary cards. */
 .compact-tool-strip {
-  margin: 4px 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  gap: 6px;
+  margin: 6px 0;
 }
 
-.compact-tool-strip > nav {
-  display: block;
-}
-
-.compact-tool-strip > nav > div {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px;
-}
-
-.compact-tool-pill {
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 8px;
-  font-size: 12px;
-  color: var(--accent-purple);
+.compact-tool-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: 7px 9px;
+  color: var(--text-primary);
+  text-align: left;
   background: var(--bg-secondary);
-  border-radius: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
   cursor: pointer;
-  flex-shrink: 0;
-  position: relative;
 }
 
-.compact-tool-pill:hover {
+.compact-tool-card:hover {
   background: var(--border-color);
 }
 
-.compact-tool-arrow {
+.compact-tool-card:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+.compact-tool-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.compact-tool-card-name {
+  overflow: hidden;
+  color: var(--accent-purple);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compact-tool-card-status {
+  flex: 0 0 auto;
   color: var(--text-muted);
   font-size: 10px;
-  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
-.compact-tool-pill.subagents {
+.compact-tool-card-summary {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compact-tool-card.subagents .compact-tool-card-name {
   color: var(--accent-yellow);
-  background: rgb(210 153 34 / 15%);
 }
 
-.compact-tool-pill.error {
+.compact-tool-card.error {
+  border-color: rgb(248 81 73 / 35%);
+  background: rgb(248 81 73 / 10%);
+}
+
+.compact-tool-card.error .compact-tool-card-name,
+.compact-tool-card.error .compact-tool-card-status {
   color: var(--accent-red, #f85149);
-  background: rgb(248 81 73 / 12%);
 }
 
-.compact-tool-pill.pending {
-  opacity: 0.6;
+.compact-tool-card.pending {
+  opacity: 0.75;
 }
 
 /* Compact density — short assistant prose folded to a faded one-liner.

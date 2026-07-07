@@ -35,7 +35,6 @@ import { getMessageMarkdown } from '../utils/messageCopy';
 import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
-import { PillStrip, type PillItem } from './PillStrip';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, CONVERSATION_MARKDOWN_COMPONENTS } from './conversationMarkdown';
@@ -828,31 +827,33 @@ function CompactToolStripImpl({
   items: ToolStripItem[];
   onExpand: (toolId: string) => void;
 }) {
-  const pills: PillItem[] = useMemo(
-    () =>
-      items.map((item, i) => {
-        const variant = item.isSubAgent ? 'subagents' : 'tool';
-        const classNames = [variant, item.isError ? 'error' : '', !item.hasResult ? 'pending' : '']
-          .filter(Boolean)
-          .join(' ');
-        return {
-          key: item.toolId || `${item.name}-${i}`,
-          label: item.name,
-          className: classNames,
-          ariaLabel: `${item.name}${item.isError ? ' (error)' : ''} — expand tool detail`,
-          onClick: () => onExpand(item.toolId),
-        };
-      }),
-    [items, onExpand],
-  );
-
   return (
-    <div className="compact-tool-strip">
-      <PillStrip
-        items={pills}
-        pillClassName="compact-tool-pill"
-        arrowClassName="compact-tool-arrow"
-      />
+    <div className="compact-tool-strip" role="list" aria-label="Tool calls">
+      {items.map((item, i) => {
+        const classNames = [
+          'compact-tool-card',
+          item.isSubAgent ? 'subagents' : '',
+          item.isError ? 'error' : '',
+          !item.hasResult ? 'pending' : '',
+        ].filter(Boolean).join(' ');
+        const summary = item.resultSummary ?? item.inputSummary;
+        const statusLabel = item.isError ? 'failed' : item.hasResult ? 'done' : 'running';
+        return (
+          <button
+            key={item.toolId || `${item.name}-${i}`}
+            type="button"
+            className={classNames}
+            onClick={() => onExpand(item.toolId)}
+            aria-label={`${item.name}: ${summary} (${statusLabel}) — expand tool detail`}
+          >
+            <span className="compact-tool-card-header">
+              <span className="compact-tool-card-name">{item.name}</span>
+              <span className="compact-tool-card-status">{statusLabel}</span>
+            </span>
+            <span className="compact-tool-card-summary" title={summary}>{summary}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }
