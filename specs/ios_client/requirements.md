@@ -183,12 +183,41 @@ on existing conversations.
 ### REQ-IOS-010: Message Rendering
 
 WHEN rendering authoritative history
-THE SYSTEM SHALL render user text, agent text blocks, collapsed tool-use
-cards (name + input summary, expandable), and tool results (status +
-expandable output, error-tinted on failure)
+THE SYSTEM SHALL render user text, agent text blocks, tool-use cards, and
+tool result cards
 AND stream in-flight agent text from token events
 AND fall back to a compact JSON rendering for unrecognized content shapes
 rather than omitting them
 
+WHEN rendering a tool invocation or result
+THE SYSTEM SHALL dispatch on the tool name to a native renderer when one
+exists
+AND join a tool result to its invoking tool_use block by `tool_use_id` to
+determine the tool name
+AND fall back to a generic card (name + input summary for invocations;
+status line + expandable output for results) for tools without a native
+renderer or when the join fails
+
+WHEN rendering a `bash` invocation
+THE SYSTEM SHALL show the command (preferring the server-cleaned `display`
+string) in monospace, and render non-run ops as `op handle`
+
+WHEN rendering a `bash` result
+THE SYSTEM SHALL parse the typed response envelope (success shapes tagged
+by `status`, error shapes tagged by `error` — see `specs/bash/`)
+AND show a one-glance outcome header (status, exit code or signal,
+duration, handle for in-flight ops) colored by outcome
+AND show the output tail collapsed, with the full output expandable and a
+truncation notice when the server truncated
+AND degrade to the generic result card when the payload is not a parseable
+envelope
+
+WHEN rendering a `think` invocation
+THE SYSTEM SHALL render the recorded thoughts as a quiet quote block
+AND suppress the paired tool result unless it is an error (the success
+payload is fixed boilerplate addressed to the LLM, not the user)
+
 **Rationale:** Readable transcripts with progressive disclosure; unknown
-shapes must degrade visibly, not vanish (omission is data loss).
+shapes must degrade visibly, not vanish (omission is data loss). Native
+renderers are per-tool and additive; the generic cards are the structural
+floor that makes every tool legible before it earns a dedicated view.

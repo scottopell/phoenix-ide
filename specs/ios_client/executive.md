@@ -25,7 +25,7 @@ next verification steps.
 | REQ-IOS-007 connectivity transparency | `OfflineBanner`, `ConnectionStateBar`, composer send tint |
 | REQ-IOS-008 auth/TLS | `PhoenixAPI` (Bearer), `ServerTrustDelegate`, `Keychain` |
 | REQ-IOS-009 creation flow | `NewConversationView` |
-| REQ-IOS-010 rendering | `MessageViews.swift` |
+| REQ-IOS-010 rendering | `MessageViews.swift` (generic fallback), `ToolViews.swift` (dispatch + native bash/think renderers), `ConversationSession.toolUseIndex` (result join) |
 
 ## Known Gaps / Future Work
 
@@ -35,5 +35,7 @@ next verification steps.
 - Steering-queue entries are not reorderable/deletable server-side from the app.
 - No archived-conversations view, rename, or delete.
 - Markdown rendering is inline-only (no fenced code blocks or tables).
+- Native tool renderers cover `bash` and `think` only; all other tools
+  (patch, browser, keyword_search, tmux, …) hit the generic JSON cards.
 - The `recoverable_inconsistency` trigger is time-based rather than
   causally proven (deviation recorded in REQ-IOS-002).
