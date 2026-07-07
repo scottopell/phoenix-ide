@@ -5042,6 +5042,113 @@ fn estimate_message_tokens(msg: &LlmMessage) -> usize {
     content + MESSAGE_OVERHEAD_TOKENS
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContinuationPipelineStage {
+    name: &'static str,
+    messages: usize,
+    user_messages: usize,
+    assistant_messages: usize,
+    text_blocks: usize,
+    image_blocks: usize,
+    text_chars: usize,
+    estimated_tokens: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContinuationPipelineSummary {
+    context_window: usize,
+    fixed_tokens: usize,
+    input_budget: usize,
+    dropped_by_budget: usize,
+    trimmed_for_user_first: usize,
+    stages: Vec<ContinuationPipelineStage>,
+}
+
+#[cfg(test)]
+fn summarize_continuation_stage(
+    name: &'static str,
+    messages: &[LlmMessage],
+) -> ContinuationPipelineStage {
+    let mut user_messages = 0usize;
+    let mut assistant_messages = 0usize;
+    let mut text_blocks = 0usize;
+    let mut image_blocks = 0usize;
+    let mut text_chars = 0usize;
+
+    for msg in messages {
+        match msg.role {
+            MessageRole::User => user_messages += 1,
+            MessageRole::Assistant => assistant_messages += 1,
+        }
+        for block in &msg.content {
+            if matches!(block, ContentBlock::Image { .. }) {
+                image_blocks += 1;
+            } else {
+                text_blocks += 1;
+                text_chars += block.render_text().chars().count();
+            }
+        }
+    }
+
+    ContinuationPipelineStage {
+        name,
+        messages: messages.len(),
+        user_messages,
+        assistant_messages,
+        text_blocks,
+        image_blocks,
+        text_chars,
+        estimated_tokens: messages.iter().map(estimate_message_tokens).sum(),
+    }
+}
+
+#[cfg(test)]
+fn summarize_continuation_pipeline(
+    messages: Vec<LlmMessage>,
+    rejected_tool_calls: &[ToolCall],
+    context_window: usize,
+) -> ContinuationPipelineSummary {
+    let continuation_prompt = build_continuation_prompt(rejected_tool_calls);
+    let fixed_tokens = estimate_text_tokens(&continuation_prompt)
+        + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
+        + CONTINUATION_OUTPUT_RESERVE_TOKENS
+        + CONTINUATION_SAFETY_MARGIN_TOKENS;
+    let input_budget = context_window.saturating_sub(fixed_tokens);
+
+    let mut stages = Vec::new();
+    stages.push(summarize_continuation_stage("rendered", &messages));
+
+    let flattened = flatten_tool_blocks(messages);
+    stages.push(summarize_continuation_stage("flattened", &flattened));
+
+    let images_capped = cap_replayed_images(flattened, CONTINUATION_MAX_REPLAYED_IMAGES);
+    stages.push(summarize_continuation_stage(
+        "images_capped",
+        &images_capped,
+    ));
+
+    let (budget_capped, dropped_by_budget) =
+        cap_messages_to_token_budget(images_capped, input_budget);
+    stages.push(summarize_continuation_stage(
+        "budget_capped",
+        &budget_capped,
+    ));
+
+    let (user_first, trimmed_for_user_first) = drop_leading_non_user(budget_capped);
+    stages.push(summarize_continuation_stage("user_first", &user_first));
+
+    ContinuationPipelineSummary {
+        context_window,
+        fixed_tokens,
+        input_budget,
+        dropped_by_budget,
+        trimmed_for_user_first,
+        stages,
+    }
+}
+
 /// Keep the most-recent messages whose combined estimated token cost fits
 /// `budget_tokens`, dropping the oldest first to preserve a contiguous recent
 /// window. The single most-recent message is always kept even if it alone
@@ -5496,6 +5603,74 @@ mod strip_tool_blocks_tests {
         let (kept, dropped) = cap_messages_to_token_budget(msgs, 1);
         assert_eq!(kept.len(), 1, "the sole newest message is always kept");
         assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn continuation_pipeline_summary_exposes_tool_flattening_and_budget_trim() {
+        let mut msgs = Vec::new();
+        msgs.push(user_text(&"old leading task context ".repeat(4_000)));
+        msgs.push(assistant(vec![ContentBlock::text("orphaned prefix")]));
+        for i in 0..40 {
+            msgs.push(user_text(&format!("turn {i}: {}", "u".repeat(80))));
+            msgs.push(assistant(vec![ContentBlock::ToolUse {
+                id: format!("tool-{i}"),
+                name: "bash".to_string(),
+                input: serde_json::json!({ "cmd": format!("echo {i}") }),
+            }]));
+            msgs.push(user(vec![ContentBlock::ToolResult {
+                tool_use_id: format!("tool-{i}"),
+                content: format!(
+                    "{{\"status\":\"exited\",\"cmd\":\"{}\",\"output\":\"{}\"}}",
+                    "rg commission-review crates/phoenix-ide/src/runtime/executor.rs",
+                    "json-ish tool output with paths and escapes \\\\".repeat(80)
+                ),
+                images: vec![],
+                is_error: false,
+            }]));
+        }
+
+        let summary = summarize_continuation_pipeline(msgs, &[], 20_000);
+        let rendered = summary
+            .stages
+            .iter()
+            .find(|stage| stage.name == "rendered")
+            .expect("rendered stage");
+        let flattened = summary
+            .stages
+            .iter()
+            .find(|stage| stage.name == "flattened")
+            .expect("flattened stage");
+        let budget_capped = summary
+            .stages
+            .iter()
+            .find(|stage| stage.name == "budget_capped")
+            .expect("budget-capped stage");
+        let user_first = summary
+            .stages
+            .iter()
+            .find(|stage| stage.name == "user_first")
+            .expect("user-first stage");
+
+        assert!(
+            rendered.estimated_tokens > flattened.estimated_tokens,
+            "flattening applies per-block caps and must be observable in diagnostics"
+        );
+        assert!(
+            summary.dropped_by_budget > 0,
+            "small diagnostic window should force oldest-message budget trimming"
+        );
+        assert!(
+            budget_capped.estimated_tokens <= summary.input_budget + IMAGE_TOKEN_ESTIMATE,
+            "budget-capped estimate should stay near the configured input budget"
+        );
+        assert!(
+            summary.trimmed_for_user_first <= budget_capped.messages,
+            "user-first trimming is reported separately from budget drops"
+        );
+        assert_eq!(
+            user_first.user_messages + user_first.assistant_messages,
+            user_first.messages
+        );
     }
 
     #[test]
