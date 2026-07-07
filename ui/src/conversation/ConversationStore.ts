@@ -64,11 +64,13 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     const indexedSlug = this.slugByConvId.get(conversation.id);
     if (!indexedSlug) {
       this.slugByConvId.set(conversation.id, slug);
+      this.notifyChanged(slug);
       return;
     }
     const indexedConversation = this.atomByKey(indexedSlug)?.conversation;
-    if (!indexedConversation || conversation.updated_at >= indexedConversation.updated_at) {
+    if (indexedSlug !== slug && (!indexedConversation || conversation.updated_at >= indexedConversation.updated_at)) {
       this.slugByConvId.set(conversation.id, slug);
+      this.notifyChanged(slug);
     }
   }
 
@@ -202,7 +204,8 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
   }
 
   private isSnapshotOnly(atom: ConversationAtom): boolean {
-    return atom.messages.length === 0
+    return atom.conversationId === null
+      && atom.messages.length === 0
       && atom.connectionEpoch === null
       && atom.streamingBuffer === null
       && atom.systemPrompt === null;

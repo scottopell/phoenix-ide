@@ -271,7 +271,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.listSnapshots().map((c) => c.slug)).toEqual(['current-slug']);
   });
 
-  it('discovers unindexed same-id atoms created by direct page hydration', () => {
+  it('reconciles same-id atoms created by direct page hydration', () => {
     const store = new ConversationStore();
     store.dispatch('old-slug', {
       type: 'set_initial_data',
@@ -291,7 +291,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
       updated_at: '2024-06-02T00:00:00Z',
     }))).toBe(true);
 
-    expect(store.getSnapshot('old-slug').conversation).toBeNull();
+    expect(store.getSnapshot('old-slug').conversation?.slug).toBe('old-slug');
     expect(store.getSnapshot('new-slug').conversation?.id).toBe('conv-shared');
     expect(store.listSnapshots().map((c) => c.slug)).toEqual(['new-slug']);
   });
@@ -328,20 +328,73 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.listSnapshots().map((c) => c.slug)).toEqual(['new-slug']);
   });
 
+  it('does not drop an empty hydrated old-slug route atom during alias cleanup', () => {
+    const store = new ConversationStore();
+    store.dispatch('old-slug', {
+      type: 'set_initial_data',
+      conversationId: 'conv-shared',
+      conversation: makeConv('old-slug', {
+        id: 'conv-shared',
+        updated_at: '2024-06-01T00:00:00Z',
+      }),
+      messages: [],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+    });
+
+    expect(store.upsertSnapshot('new-slug', makeConv('new-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-02T00:00:00Z',
+    }))).toBe(true);
+
+    expect(store.getSnapshot('old-slug').conversationId).toBe('conv-shared');
+    expect(store.getSnapshot('old-slug').conversation?.slug).toBe('old-slug');
+    expect(store.slugForId('conv-shared')).toBe('new-slug');
+    expect(store.listSnapshots().map((c) => c.slug)).toEqual(['new-slug']);
+  });
+
+  it('notifies list subscribers when direct hydration changes the alias index', () => {
+    const store = new ConversationStore();
+    const snapshots: string[][] = [];
+    const unsubscribe = store.subscribeAny(() => {
+      snapshots.push(store.listSnapshots().map((c) => c.slug));
+    });
+
+    store.dispatch('old-slug', {
+      type: 'set_initial_data',
+      conversationId: 'conv-shared',
+      conversation: makeConv('old-slug', {
+        id: 'conv-shared',
+        updated_at: '2024-06-01T00:00:00Z',
+      }),
+      messages: [],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+    });
+    store.dispatch('new-slug', {
+      type: 'set_initial_data',
+      conversationId: 'conv-shared',
+      conversation: makeConv('new-slug', {
+        id: 'conv-shared',
+        updated_at: '2024-06-01T00:00:00Z',
+      }),
+      messages: [],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+    });
+
+    unsubscribe();
+    expect(snapshots).toContainEqual(['new-slug']);
+    expect(snapshots.at(-1)).toEqual(['new-slug']);
+  });
+
   it('removes all inactive aliases for a conversation id before inserting the canonical row', () => {
     const store = new ConversationStore();
     for (const slug of ['alias-a', 'alias-b', 'alias-c']) {
-      store.dispatch(slug, {
-        type: 'set_initial_data',
-        conversationId: 'conv-shared',
-        conversation: makeConv(slug, {
-          id: 'conv-shared',
-          updated_at: '2024-06-01T00:00:00Z',
-        }),
-        messages: [],
-        phase: { type: 'idle' },
-        contextWindow: { used: 0 },
-      });
+      store.upsertSnapshot(slug, makeConv(slug, {
+        id: 'conv-shared',
+        updated_at: '2024-06-01T00:00:00Z',
+      }));
     }
 
     expect(store.upsertSnapshot('canonical', makeConv('canonical', {
