@@ -14,194 +14,244 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    # The check is split across parallel runners by lane (dev.py check
-    # --lanes); wall clock is the slowest leg instead of the sum. Gating
-    # mode is explicit per event — dev.py refuses to auto-derive a gating
-    # base under CI (a derived base on a main push diffs HEAD against
-    # itself and silently skips every lane):
-    #   - push to main:  PHOENIX_CHECK_ALL=1 — always the full suite.
-    #   - pull_request:  PHOENIX_CHECK_BASE=origin/main — lanes untouched
-    #     by the PR are skipped; main re-runs the full suite post-merge and
-    #     the notify-main-failure job below files an issue if that breaks.
-    name: check (${{ matrix.lane-group }})
+  plan_check:
+    name: plan check lanes
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # rust: codegen + cargo test (+ fmt/task validation riding along).
-          # Chrome so the browser tests run instead of auto-skipping.
-          - lane-group: rust
-            lanes: rust,fast
-            needs-ui: false
-            needs-chrome: true
-          - lane-group: clippy
-            lanes: clippy
-            needs-ui: false
-            needs-chrome: false
-          # e2e drives a real phoenix-ide binary over HTTP/SSE; no browser,
-          # no UI toolchain (the embedded-assets read tolerates empty ui/dist).
-          - lane-group: e2e
-            lanes: e2e
-            needs-ui: false
-            needs-chrome: false
-          # Everything that reads the committed UI tree + the spec lanes.
-          - lane-group: ui
-            lanes: tsc,ui-lint,vitest,ast-grep,allium,spec-anchors,pkglock
-            needs-ui: true
-            needs-chrome: false
-
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.plan.outputs.rust }}
+      clippy: ${{ steps.plan.outputs.clippy }}
+      e2e: ${{ steps.plan.outputs.e2e }}
+      ui: ${{ steps.plan.outputs.ui }}
+      fast: ${{ steps.plan.outputs.fast }}
+      active_lanes: ${{ steps.plan.outputs.active_lanes }}
     env:
-      CARGO_TERM_COLOR: always
-      # sccache wraps rustc and content-addresses every compilation, so a PR
-      # reuses object files for any crate whose source is unchanged vs the
-      # cached build — including across Cargo.lock changes that defeat the
-      # rust-cache target/ snapshot. Backs up the Cache Cargo step below.
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
-      # Explicit gating mode — see the job comment above.
       PHOENIX_CHECK_ALL: ${{ github.event_name == 'push' && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
-
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history so PR gating can compute merge-base(HEAD, origin/main).
           fetch-depth: 0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Compute check plan
+        id: plan
+        run: |
+          ./dev.py check-plan --format github-env | tee check-plan.env
+          cat check-plan.env >> "$GITHUB_OUTPUT"
 
-      # --- Toolchains -----------------------------------------------------
-
-      # Reads rust-toolchain.toml: pins 1.94.1, pulls rustfmt + clippy and
-      # the x86_64-unknown-linux-musl target declared there. Every leg gets
-      # Rust: rust/clippy/e2e compile; ui needs cargo for the allium binary
-      # install fallback.
+  check-rust:
+    name: check (rust)
+    needs: plan_check
+    if: ${{ needs.plan_check.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      PHOENIX_CHECK_ALL: ${{ github.event_name == 'push' && '1' || '' }}
+      PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          cache: false # Swatinem below gives finer control + bin caching
-
+          cache: false
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
-          # Keep ~/.cargo/bin (cargo-nextest, allium) across runs.
           cache-bin: true
-          # One bucket per lane group (their target/ contents differ),
-          # shared by main + every PR (no per-branch key). A PR whose
-          # Cargo.lock differs from main misses the exact key but hits
-          # rust-cache's restore-key prefix and warm-starts from main's
-          # dependency artifacts, recompiling only what actually changed.
-          shared-key: check-${{ matrix.lane-group }}
-          # Only main writes the bucket; PRs restore it read-only, so one
-          # continuously-warm cache survives instead of PR branches evicting
-          # main's under the 10 GB limit.
+          shared-key: check-rust
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          # Bump to force a cold rebuild after a [profile] edit (the only
-          # change that silently invalidates a restored target/).
           prefix-key: v1-rust
-
-      # Installs the sccache binary and wires up the GitHub Actions cache
-      # backend it writes to. RUSTC_WRAPPER / SCCACHE_GHA_ENABLED are set at
-      # the job level so every cargo invocation (including dev.py's) routes
-      # rustc through sccache.
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Set up Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          install-dependencies: true
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@phoenix-ide.invalid"
+          git config --global user.name "Phoenix CI"
+      - name: ./dev.py check (rust,cargo-fmt)
+        run: ./dev.py check --lanes rust,cargo-fmt
 
+  check-clippy:
+    name: check (clippy)
+    needs: plan_check
+    if: ${{ needs.plan_check.outputs.clippy == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      PHOENIX_CHECK_ALL: ${{ github.event_name == 'push' && '1' || '' }}
+      PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: true
+          shared-key: check-clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          prefix-key: v1-rust
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@phoenix-ide.invalid"
+          git config --global user.name "Phoenix CI"
+      - name: ./dev.py check (clippy)
+        run: ./dev.py check --lanes clippy
+
+  check-e2e:
+    name: check (e2e)
+    needs: plan_check
+    if: ${{ needs.plan_check.outputs.e2e == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      PHOENIX_CHECK_ALL: ${{ github.event_name == 'push' && '1' || '' }}
+      PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: true
+          shared-key: check-e2e
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          prefix-key: v1-rust
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@phoenix-ide.invalid"
+          git config --global user.name "Phoenix CI"
+      - name: ./dev.py check (e2e)
+        run: ./dev.py check --lanes e2e
+
+  check-ui:
+    name: check (ui/specs)
+    needs: plan_check
+    if: ${{ needs.plan_check.outputs.ui == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      PHOENIX_CHECK_ALL: ${{ github.event_name == 'push' && '1' || '' }}
+      PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: true
+          shared-key: check-ui
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          prefix-key: v1-rust
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Set up pnpm
-        if: matrix.needs-ui
         uses: pnpm/action-setup@v4
-        # Reads packageManager from ui/package.json — single source of truth.
         with:
           package_json_file: ui/package.json
-
       - name: Set up Node
-        if: matrix.needs-ui
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
-
-      # dev.py's ensure_corepack_pnpm() enforces a corepack floor (pnpm 11.x
-      # signing keys). The corepack bundled with older Node LTS is too old;
-      # install the latest so dev.py's preflight passes.
       - name: Upgrade corepack
-        if: matrix.needs-ui
         run: |
           npm i -g corepack@latest
           corepack enable
-
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
-        # dev.py runs via `uv run` (PEP 723 inline deps incl. taskmd).
-
-      # --- Optional check dependencies (so nothing is skipped) ------------
-
-      - name: Install cargo-nextest
-        if: matrix.lane-group == 'rust' || matrix.lane-group == 'e2e'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-
       - name: Install ast-grep
-        if: matrix.needs-ui
         run: npm i -g @ast-grep/cli
-
-      # allium-cli has no prebuilt binstall artifact; compile it. Cached in
-      # ~/.cargo/bin by the rust-cache step above (cache-bin: true). Pinned so
-      # every runner validates specs against one grammar version; the version
-      # check forces a reinstall when this pin is bumped even if a stale binary
-      # sits in the restored cache.
       - name: Install allium-cli
-        if: matrix.needs-ui
         env:
           ALLIUM_VERSION: 3.5.0
         run: |
           if ! allium --version 2>/dev/null | grep -q "$ALLIUM_VERSION"; then
             cargo install allium-cli --version "$ALLIUM_VERSION" --locked
           fi
-
-      # Chrome on PATH → dev.py's _classify_browser_env() sets
-      # PHOENIX_CHROME_EXECUTABLE and the browser tests run instead of
-      # auto-skipping.
-      - name: Set up Chrome
-        if: matrix.needs-chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          install-dependencies: true
-
-      # --- Repo prep ------------------------------------------------------
-
-      # Some Rust tests run `git commit`; give git an identity. dev.py
-      # already disables gpgsign for child processes if signing probes fail.
       - name: Configure git identity
         run: |
           git config --global user.email "ci@phoenix-ide.invalid"
           git config --global user.name "Phoenix CI"
-
-      # Install UI deps up front with the frozen lockfile so dev.py's own
-      # ensure_ui_deps() finds node_modules and skips a non-frozen install
-      # (which could otherwise drift the lockfile and trip pkglock-clean).
       - name: Install UI dependencies
-        if: matrix.needs-ui
         run: pnpm install --frozen-lockfile
         working-directory: ui
+      - name: ./dev.py check (ui/specs)
+        run: ./dev.py check --lanes tsc,ui-lint,vitest,ast-grep,allium,spec-shape,spec-anchors,pkglock
 
-      # --- The gate -------------------------------------------------------
+  check-fast:
+    name: check (task validation)
+    needs: plan_check
+    if: ${{ needs.plan_check.outputs.fast == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PHOENIX_CHECK_ALL: ${{ github.event_name == 'push' && '1' || '' }}
+      PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+      - name: ./dev.py check (task)
+        run: ./dev.py check --lanes task
 
-      - name: ./dev.py check (${{ matrix.lanes }})
-        run: ./dev.py check --lanes "${{ matrix.lanes }}"
-
-  # A failed `check` on main would otherwise be silent. Track it as a single
-  # deduplicated issue: open (or comment on) it on failure, close it on the
-  # next green push. PR failures are visible on the PR itself, so these only
-  # fire for pushes to main.
   notify-main-failure:
     name: Open issue on main CI failure
-    needs: check
-    if: ${{ failure() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, check-fast]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(join(needs.*.result, ','), 'failure') }}
     runs-on: ubuntu-latest
     permissions:
       issues: write
@@ -226,8 +276,8 @@ jobs:
 
   close-main-failure:
     name: Close CI-failure issue on green
-    needs: check
-    if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: [plan_check, check-rust, check-clippy, check-e2e, check-ui, check-fast]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(join(needs.*.result, ','), 'failure') && !contains(join(needs.*.result, ','), 'cancelled') && !contains(join(needs.*.result, ','), 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       issues: write

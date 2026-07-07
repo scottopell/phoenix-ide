@@ -2983,6 +2983,7 @@ def _classify_network_env() -> None:
 _LANE_DEFS = [
     # (name, inputs, desc)
     ("rust", {"RUST"}, "codegen + cargo test (+ musl smoke on macOS)"),
+    ("cargo-fmt", {"RUST"}, "cargo fmt --check"),
     ("clippy", {"RUST"}, "cargo clippy --all-targets (own target dir)"),
     ("tsc", {"UI"}, "tsc -b --noEmit project typecheck"),
     ("ui-lint", {"UI"}, "eslint + stylelint"),
@@ -2994,12 +2995,26 @@ _LANE_DEFS = [
     # change to either side can orphan or satisfy an anchor.
     ("spec-anchors", {"SPECS", "RUST", "UI"}, "REQ-* anchor cross-validation"),
     ("e2e", {"RUST", "E2E"}, "API-boundary tests via a real binary"),
-    ("fast", None, "cargo fmt + task validation"),
-    ("pkglock", None, "pnpm-lock drift tripwire"),
+    ("task", None, "task filename validation"),
+    ("pkglock", {"UI"}, "pnpm-lock drift tripwire"),
 ]
 _LANE_INPUTS = {name: inputs for name, inputs, _ in _LANE_DEFS if inputs is not None}
 _ALWAYS_ON_LANES = {name for name, inputs, _ in _LANE_DEFS if inputs is None}
 _LANE_DESCS = {name: desc for name, _, desc in _LANE_DEFS}
+
+
+_CI_LANE_GROUPS = {
+    "rust": {"rust", "cargo-fmt"},
+    "clippy": {"clippy"},
+    "e2e": {"e2e"},
+    "ui": {"tsc", "ui-lint", "vitest", "ast-grep", "allium", "spec-shape", "spec-anchors", "pkglock"},
+    "fast": {"task"},
+}
+_LANE_TO_CI_GROUP = {
+    lane: group
+    for group, lanes in _CI_LANE_GROUPS.items()
+    for lane in lanes
+}
 
 
 def _categorize_changed_paths(paths) -> set:
@@ -3011,6 +3026,8 @@ def _categorize_changed_paths(paths) -> set:
     cats: set[str] = set()
     for p in paths:
         if p == "dev.py":
+            cats.add("SELF")
+        if p.startswith(".github/workflows/"):
             cats.add("SELF")
         if (
             p.startswith("crates/")
@@ -3193,6 +3210,91 @@ def _gate_lanes():
             need = "/".join(sorted(inputs))
             skipped[lane] = f"no {need} changes"
     return active, skipped
+
+
+def _all_lanes() -> set[str]:
+    return {name for name, _, _ in _LANE_DEFS}
+
+
+def _resolve_check_lanes(gate: bool = True, lanes: str | None = None):
+    """Return the active/skipped lane sets for a check invocation.
+
+    This is the side-effect-free planner used by both `check` and the CI
+    planning command. `lanes` has the same comma-separated filter semantics as
+    `./dev.py check --lanes`.
+    """
+    if gate:
+        active, skipped = _gate_lanes()
+    else:
+        active, skipped = _all_lanes(), {}
+
+    if lanes is not None:
+        requested = {l.strip() for l in lanes.split(",") if l.strip()}
+        known = _all_lanes()
+        unknown = requested - known
+        if unknown:
+            print(f"✗ unknown lane(s): {', '.join(sorted(unknown))}\n"
+                  f"  valid lanes: {', '.join(sorted(known))}", file=sys.stderr)
+            sys.exit(1)
+        active &= requested
+        skipped = {k: v for k, v in skipped.items() if k in requested}
+    return active, skipped
+
+
+def _ci_groups_for_active_lanes(active: set[str]) -> dict[str, bool]:
+    return {
+        group: bool(active & lanes)
+        for group, lanes in sorted(_CI_LANE_GROUPS.items())
+    }
+
+
+def _ci_lane_inventory_errors() -> list[str]:
+    lane_names = _all_lanes()
+    assigned = set(_LANE_TO_CI_GROUP)
+    errors = []
+    missing = lane_names - assigned
+    extra = assigned - lane_names
+    if missing:
+        errors.append(f"lane(s) missing from _CI_LANE_GROUPS: {', '.join(sorted(missing))}")
+    if extra:
+        errors.append(f"unknown lane(s) assigned in _CI_LANE_GROUPS: {', '.join(sorted(extra))}")
+    for lane in sorted(lane_names):
+        groups = [g for g, lanes in _CI_LANE_GROUPS.items() if lane in lanes]
+        if len(groups) > 1:
+            errors.append(f"lane {lane!r} assigned to multiple CI groups: {', '.join(groups)}")
+    return errors
+
+
+def cmd_check_plan(gate: bool = True, lanes: str | None = None, fmt: str = "json") -> None:
+    """Print the lane/group plan without running any check lanes."""
+    errors = _ci_lane_inventory_errors()
+    if errors:
+        print("✗ invalid CI lane inventory:\n  - " + "\n  - ".join(errors), file=sys.stderr)
+        sys.exit(1)
+
+    active, skipped = _resolve_check_lanes(gate=gate, lanes=lanes)
+    paths = None if (not gate or os.environ.get("PHOENIX_CHECK_ALL") == "1") else _changed_paths_vs_base()
+    categories = None if paths is None else sorted(_categorize_changed_paths(paths))
+    groups = _ci_groups_for_active_lanes(active)
+    group_lanes = {
+        group: sorted(active & lanes_in_group)
+        for group, lanes_in_group in sorted(_CI_LANE_GROUPS.items())
+    }
+    payload = {
+        "schema": "phoenix-check-plan/1",
+        "active_lanes": sorted(active),
+        "skipped_lanes": {k: skipped[k] for k in sorted(skipped)},
+        "ci_groups": groups,
+        "ci_group_lanes": group_lanes,
+        "changed_paths": None if paths is None else sorted(paths),
+        "categories": categories,
+    }
+    if fmt == "github-env":
+        for group, enabled in groups.items():
+            print(f"{group}={'true' if enabled else 'false'}")
+        print("active_lanes=" + ",".join(payload["active_lanes"]))
+    else:
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
 # Crate-level scoping for the rust lane (Stage 3 / per-crate gating).
@@ -3564,27 +3666,9 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
     # a markdown/spec/task-only change must not require Corepack/pnpm or a
     # working cargo toolchain to be present. --all / PHOENIX_CHECK_ALL=1
     # (handled in _gate_lanes) forces every lane.
-    if gate:
-        active, skipped = _gate_lanes()
-    else:
-        active, skipped = set(_LANE_INPUTS) | _ALWAYS_ON_LANES, {}
-
-    # --lanes: restrict this invocation to an explicit lane subset. Gating
-    # still applies within the subset (a gated-out lane stays skipped);
-    # lanes outside the subset are someone else's job (another CI runner)
-    # and get neither a result entry nor a skip line.
-    if lanes is not None:
-        requested = {l.strip() for l in lanes.split(",") if l.strip()}
-        known = {name for name, _, _ in _LANE_DEFS}
-        unknown = requested - known
-        if unknown:
-            print(f"✗ unknown lane(s): {', '.join(sorted(unknown))}\n"
-                  f"  valid lanes: {', '.join(sorted(known))}", file=sys.stderr)
-            sys.exit(1)
-        active &= requested
-        skipped = {k: v for k, v in skipped.items() if k in requested}
-        if not active:
-            print("  i  no requested lane is active for this change set")
+    active, skipped = _resolve_check_lanes(gate=gate, lanes=lanes)
+    if lanes is not None and not active:
+        print("  i  no requested lane is active for this change set")
 
     reporter = _make_reporter(pretty, active, skipped)
     if lanes is not None:
@@ -3832,20 +3916,17 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         run_step("eslint", ["pnpm", "run", "lint"], UI_DIR)
         run_step("stylelint", ["pnpm", "run", "lint:css"], UI_DIR)
 
-    def lane_fast():
-        """Fast lane: cargo fmt then task validation."""
+    def lane_cargo_fmt():
         run_step("cargo fmt", ["cargo", "fmt", "--check"])
-        # Task validation runs in-process (taskmd is a Python dep, not a
-        # subprocess) so it can't go through run_step. detail carries the
-        # error list into the results tuple so a failure is readable in
-        # the end-of-run summary.
+
+    def lane_task():
         t0 = time.monotonic()
-        reporter.step_start("fast", "task validation")
+        reporter.step_start("task", "task validation")
         ok, detail = cmd_tasks_validate(quiet=True)
         elapsed = time.monotonic() - t0
         with results_lock:
             results.append(("task validation", 0 if ok else 1, elapsed, detail))
-        reporter.step_done("fast", "task validation", 0 if ok else 1, elapsed)
+        reporter.step_done("task", "task validation", 0 if ok else 1, elapsed)
 
     def lane_e2e():
         """E2E API-boundary tests driven through a real running binary.
@@ -4178,7 +4259,7 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
             with results_lock:
                 results.append(("spec shape", 0, elapsed, detail))
             reporter.step_done("spec-shape", "spec shape", 0, elapsed)
-            run_step("spec shape unit tests", [sys.executable, "-m", "unittest", "tests/devpy/test_spears_shape.py"])
+            run_step("dev.py unit tests", [sys.executable, "-m", "unittest", "discover", "tests/devpy"])
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
@@ -4403,7 +4484,8 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         ("tsc", lambda: run_step("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR)),
         ("ui-lint", lane_ui_lint),
         ("vitest", lambda: run_step("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
-        ("fast", lane_fast),
+        ("cargo-fmt", lane_cargo_fmt),
+        ("task", lane_task),
         ("ast-grep", check_ast_grep),
         ("allium", check_allium),
         ("spec-shape", check_spec_shape),
@@ -5193,20 +5275,23 @@ _GRAPH_LANE_STEPS = {
     "vitest": ["vitest run"],
     "ast-grep": ["structural rules over ui/src/ + crates/"],
     "allium": ["allium analyse specs/*/*.allium"],
-    "spec-shape": ["spEARS v2 artifact-shape validation", "python unittest tests/devpy/test_spears_shape.py"],
+    "spec-shape": ["spEARS v2 artifact-shape validation", "python unittest discover tests/devpy"],
     "spec-anchors": ["REQ-* anchor cross-validation"],
     "e2e": ["uv run tests/e2e/run.py (real binary)"],
-    "fast": ["cargo fmt --check", "task validation"],
+    "cargo-fmt": ["cargo fmt --check"],
+    "task": ["task validation"],
     "pkglock": ["pnpm-lock drift tripwire"],
 }
 _GRAPH_CATEGORY_LABELS = {
     "RUST": "RUST · crates/ Cargo.*",
     "UI": "UI · ui/",
+    "TASKS": "TASKS · tasks/",
     "SPECS": "SPECS · specs/",
     "ASTGREP": "ASTGREP · ast-grep-rules/",
     "E2E": "E2E · tests/e2e/",
-    "SELF": "SELF · dev.py",
+    "SELF": "SELF · dev.py/.github workflows",
 }
+
 
 
 def _check_graph_model():
@@ -7333,6 +7418,23 @@ def main():
         help="Render lanes as a live table instead of line-per-step output",
     )
 
+    check_plan_parser = sub.add_parser(
+        "check-plan",
+        help="Print the incremental check lane/group plan without running lanes",
+    )
+    check_plan_parser.add_argument(
+        "--all", dest="check_all", action="store_true", default=False,
+        help="Plan every lane, disabling incremental path-gating (also: PHOENIX_CHECK_ALL=1)",
+    )
+    check_plan_parser.add_argument(
+        "--lanes", default=None, metavar="A,B,...",
+        help="Restrict the plan to this comma-separated lane subset",
+    )
+    check_plan_parser.add_argument(
+        "--format", choices=("json", "github-env"), default="json",
+        help="Output format (default: json)",
+    )
+
     # audit-specs (manual / verbose run; the orphan-anchor half also
     # runs as a `spec anchors` lane inside `./dev.py check`)
     audit_parser = sub.add_parser(
@@ -7467,6 +7569,8 @@ def main():
         cmd_status()
     elif args.command == "check":
         cmd_check(gate=not args.check_all, lanes=args.lanes, pretty=pretty)
+    elif args.command == "check-plan":
+        cmd_check_plan(gate=not args.check_all, lanes=args.lanes, fmt=args.format)
     elif args.command == "codegen":
         if not cmd_codegen():
             sys.exit(1)
