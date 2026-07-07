@@ -81,11 +81,21 @@ trait GhClient {
         repo: &GhRepoView,
         number: u64,
     ) -> Result<Vec<GhIssueComment>, GhFailure>;
+    fn issue_comment_reactions(
+        &self,
+        repo: &GhRepoView,
+        comment_id: u64,
+    ) -> Result<Vec<GhReaction>, GhFailure>;
     fn review_comments(
         &self,
         repo: &GhRepoView,
         number: u64,
     ) -> Result<Vec<GhReviewComment>, GhFailure>;
+    fn review_comment_reactions(
+        &self,
+        repo: &GhRepoView,
+        comment_id: u64,
+    ) -> Result<Vec<GhReaction>, GhFailure>;
     fn review_summaries(
         &self,
         repo: &GhRepoView,
@@ -145,6 +155,8 @@ impl<'a> ShellGhClient<'a> {
                     "api",
                     path,
                     "--paginate",
+                    "-H",
+                    "Accept: application/vnd.github+json",
                     "-f",
                     "per_page=100",
                     "-f",
@@ -243,6 +255,20 @@ impl GhClient for ShellGhClient<'_> {
         )
     }
 
+    fn issue_comment_reactions(
+        &self,
+        repo: &GhRepoView,
+        comment_id: u64,
+    ) -> Result<Vec<GhReaction>, GhFailure> {
+        self.rest_paginated_json(
+            &format!(
+                "repos/{}/{}/issues/comments/{comment_id}/reactions",
+                repo.owner.login, repo.name
+            ),
+            "issue comment reactions",
+        )
+    }
+
     fn review_comments(
         &self,
         repo: &GhRepoView,
@@ -254,6 +280,20 @@ impl GhClient for ShellGhClient<'_> {
                 repo.owner.login, repo.name
             ),
             "review comments",
+        )
+    }
+
+    fn review_comment_reactions(
+        &self,
+        repo: &GhRepoView,
+        comment_id: u64,
+    ) -> Result<Vec<GhReaction>, GhFailure> {
+        self.rest_paginated_json(
+            &format!(
+                "repos/{}/{}/pulls/comments/{comment_id}/reactions",
+                repo.owner.login, repo.name
+            ),
+            "review comment reactions",
         )
     }
 
@@ -1270,6 +1310,36 @@ fn classify_check(check: &GhPrCheck) -> CheckBucket {
     }
 }
 
+fn hydrate_issue_comment_reactions(
+    client: &dyn GhClient,
+    repo: &GhRepoView,
+    comments: &mut [GhIssueComment],
+) -> Result<(), GhFailure> {
+    for comment in comments {
+        let Some(id) = comment.id else {
+            continue;
+        };
+        let reactions = client.issue_comment_reactions(repo, id)?;
+        comment.reactions = Some(reactions_to_summary(&reactions));
+    }
+    Ok(())
+}
+
+fn hydrate_review_comment_reactions(
+    client: &dyn GhClient,
+    repo: &GhRepoView,
+    comments: &mut [GhReviewComment],
+) -> Result<(), GhFailure> {
+    for comment in comments {
+        let Some(id) = comment.id else {
+            continue;
+        };
+        let reactions = client.review_comment_reactions(repo, id)?;
+        comment.reactions = Some(reactions_to_summary(&reactions));
+    }
+    Ok(())
+}
+
 fn fetch_pr_feedback(client: &dyn GhClient, number: u64) -> PrFeedbackSummary {
     let mut items = Vec::new();
     let mut coverage = Vec::new();
@@ -1299,7 +1369,10 @@ fn fetch_pr_feedback(client: &dyn GhClient, number: u64) -> PrFeedbackSummary {
         PrFeedbackCoverageSurface::IssueComments,
         client
             .issue_comments(&repo, number)
-            .map(|v| v.into_iter().map(PrFeedbackItem::from).collect()),
+            .and_then(|mut comments| {
+                hydrate_issue_comment_reactions(client, &repo, &mut comments)?;
+                Ok(comments.into_iter().map(PrFeedbackItem::from).collect())
+            }),
     );
     extend_feedback(
         &mut items,
@@ -1307,7 +1380,10 @@ fn fetch_pr_feedback(client: &dyn GhClient, number: u64) -> PrFeedbackSummary {
         PrFeedbackCoverageSurface::ReviewComments,
         client
             .review_comments(&repo, number)
-            .map(|v| v.into_iter().map(PrFeedbackItem::from).collect()),
+            .and_then(|mut comments| {
+                hydrate_review_comment_reactions(client, &repo, &mut comments)?;
+                Ok(comments.into_iter().map(PrFeedbackItem::from).collect())
+            }),
     );
     extend_feedback(
         &mut items,
@@ -1820,6 +1896,23 @@ struct GhUser {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct GhReaction {
+    content: String,
+}
+
+fn reactions_to_summary(reactions: &[GhReaction]) -> GhReactionSummary {
+    let mut summary = GhReactionSummary::default();
+    for reaction in reactions {
+        match reaction.content.as_str() {
+            "+1" => summary.plus_one = summary.plus_one.saturating_add(1),
+            "eyes" => summary.eyes = summary.eyes.saturating_add(1),
+            _ => {}
+        }
+    }
+    summary
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 struct GhReactionSummary {
     #[serde(default, rename = "+1")]
     plus_one: u32,
@@ -2052,7 +2145,9 @@ mod tests {
         checks: Result<Vec<GhPrCheck>, GhFailure>,
         repo: Result<GhRepoView, GhFailure>,
         issue_comments: Result<Vec<GhIssueComment>, GhFailure>,
+        issue_comment_reactions: Result<Vec<GhReaction>, GhFailure>,
         review_comments: Result<Vec<GhReviewComment>, GhFailure>,
+        review_comment_reactions: Result<Vec<GhReaction>, GhFailure>,
         review_summaries: Result<Vec<GhReviewSummary>, GhFailure>,
         review_threads: Result<Vec<GhReviewThread>, GhFailure>,
     }
@@ -2064,7 +2159,9 @@ mod tests {
                 checks: Ok(Vec::new()),
                 repo: Err(GhFailure::default()),
                 issue_comments: Ok(Vec::new()),
+                issue_comment_reactions: Ok(Vec::new()),
                 review_comments: Ok(Vec::new()),
+                review_comment_reactions: Ok(Vec::new()),
                 review_summaries: Ok(Vec::new()),
                 review_threads: Ok(Vec::new()),
             }
@@ -2094,12 +2191,26 @@ mod tests {
         fn issue_comments(&self, _: &GhRepoView, _: u64) -> Result<Vec<GhIssueComment>, GhFailure> {
             self.issue_comments.clone()
         }
+        fn issue_comment_reactions(
+            &self,
+            _: &GhRepoView,
+            _: u64,
+        ) -> Result<Vec<GhReaction>, GhFailure> {
+            self.issue_comment_reactions.clone()
+        }
         fn review_comments(
             &self,
             _: &GhRepoView,
             _: u64,
         ) -> Result<Vec<GhReviewComment>, GhFailure> {
             self.review_comments.clone()
+        }
+        fn review_comment_reactions(
+            &self,
+            _: &GhRepoView,
+            _: u64,
+        ) -> Result<Vec<GhReaction>, GhFailure> {
+            self.review_comment_reactions.clone()
         }
         fn review_summaries(
             &self,
@@ -2431,10 +2542,10 @@ mod tests {
                 body: Some("looking".to_string()),
                 html_url: Some("https://c/1".to_string()),
                 created_at: Some("t".to_string()),
-                reactions: Some(GhReactionSummary {
-                    plus_one: 0,
-                    eyes: 1,
-                }),
+                reactions: None,
+            }]),
+            issue_comment_reactions: Ok(vec![GhReaction {
+                content: "eyes".to_string(),
             }]),
             review_comments: Ok(vec![GhReviewComment {
                 id: Some(2),
@@ -2445,10 +2556,10 @@ mod tests {
                 path: Some("src/lib.rs".to_string()),
                 html_url: Some("https://c/2".to_string()),
                 created_at: Some("t".to_string()),
-                reactions: Some(GhReactionSummary {
-                    plus_one: 1,
-                    eyes: 0,
-                }),
+                reactions: None,
+            }]),
+            review_comment_reactions: Ok(vec![GhReaction {
+                content: "+1".to_string(),
             }]),
             review_summaries: Ok(vec![]),
             review_threads: Ok(vec![]),
@@ -2782,6 +2893,7 @@ mod tests {
                     }],
                 },
             }]),
+            ..FakeGh::default()
         };
         let response = capture_pr_auto_fix_context_for_branch_with_client(
             temp.path(),
