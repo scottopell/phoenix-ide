@@ -1,0 +1,218 @@
+import SwiftUI
+
+/// One conversation: cached history + live SSE updates + outbox chips +
+/// composer. Fully readable offline; sends queue while disconnected.
+struct ConversationView: View {
+    @Environment(AppModel.self) private var model
+    let session: ConversationSession
+
+    @State private var draft = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            OfflineBanner()
+            ConnectionStateBar(session: session)
+            messageList
+            ComposerView(session: session, draft: $draft)
+        }
+        .navigationTitle(session.conversation?.displayTitle ?? "Conversation")
+        .navigationBarTitleDisplayMode(.inline)
+        .alert(
+            "Server error",
+            isPresented: Binding(
+                get: { session.lastErrorToast != nil },
+                set: { if !$0 { session.clearErrorToast() } })
+        ) {
+            Button("OK") { session.clearErrorToast() }
+        } message: {
+            Text(session.lastErrorToast ?? "")
+        }
+        .onAppear { session.start() }
+        .onDisappear {
+            // Keep the session alive (AppModel owns it) so the outbox keeps
+            // draining, but flush a snapshot at navigation boundaries.
+            session.persistOnNavigate()
+        }
+    }
+
+    private var messageList: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(session.messages) { message in
+                        MessageView(message: message)
+                            .id(message.message_id)
+                    }
+                    if !session.streamingText.isEmpty {
+                        StreamingBubble(text: session.streamingText)
+                            .id("streaming")
+                    }
+                    OutboxSection(session: session)
+                    if session.agentWorking && session.streamingText.isEmpty {
+                        WorkingIndicator(stateType: currentStateType)
+                            .id("working")
+                    }
+                    Color.clear.frame(height: 1).id("bottom")
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+            .defaultScrollAnchor(.bottom)
+            .onChange(of: session.messages.count) {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo("bottom", anchor: .bottom)
+                }
+            }
+            .onChange(of: session.streamingText) {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+        }
+    }
+
+    private var currentStateType: String? {
+        session.convState?.stringValue ?? session.convState?["type"]?.stringValue
+    }
+}
+
+/// Inline connection state, shown only when not live — quiet when healthy.
+struct ConnectionStateBar: View {
+    let session: ConversationSession
+
+    var body: some View {
+        switch session.connection {
+        case .live, .idle:
+            EmptyView()
+        case .connecting:
+            bar { Text("Connecting…") }
+        case .offline:
+            EmptyView()  // OfflineBanner already covers this
+        case .waitingToRetry:
+            bar { Text("Connection lost — reconnecting…") }
+        }
+    }
+
+    private func bar(@ViewBuilder _ content: () -> Text) -> some View {
+        content()
+            .font(.caption2)
+            .foregroundStyle(.orange)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 3)
+            .background(.thinMaterial)
+    }
+}
+
+/// The state-machine phase indicator while the agent works.
+struct WorkingIndicator: View {
+    let stateType: String?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var label: String {
+        switch stateType {
+        case "llm_requesting": return "Thinking…"
+        case "tool_executing": return "Running tools…"
+        case "awaiting_sub_agents": return "Waiting on sub-agents…"
+        default: return "Working…"
+        }
+    }
+}
+
+/// In-flight LLM text from token events.
+struct StreamingBubble: View {
+    let text: String
+
+    var body: some View {
+        HStack {
+            Text(text)
+                .font(.body)
+                .padding(10)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Spacer(minLength: 40)
+        }
+        .opacity(0.85)
+    }
+}
+
+/// Queued/failed local messages rendered after authoritative history, per
+/// the union-without-duplicates rule: entries disappear the moment the
+/// server's copy of the same message_id lands.
+struct OutboxSection: View {
+    let session: ConversationSession
+
+    var body: some View {
+        ForEach(session.outbox.visibleEntries) { entry in
+            OutboxEntryView(entry: entry, session: session)
+        }
+    }
+}
+
+struct OutboxEntryView: View {
+    let entry: OutboxEntry
+    let session: ConversationSession
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 3) {
+            HStack {
+                Spacer(minLength: 40)
+                Text(entry.text)
+                    .font(.body)
+                    .padding(10)
+                    .background(bubbleColor)
+                    .foregroundStyle(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+            statusLine
+        }
+    }
+
+    private var bubbleColor: Color {
+        switch entry.status {
+        case .failed, .recoverableInconsistency: return .red.opacity(0.75)
+        default: return .accentColor.opacity(0.65)
+        }
+    }
+
+    @ViewBuilder
+    private var statusLine: some View {
+        switch entry.status {
+        case .pending:
+            Label(
+                entry.acceptedByServer ? "Sent — awaiting confirmation" : "Queued — will send",
+                systemImage: entry.acceptedByServer ? "checkmark.circle" : "clock")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        case .steeringQueued:
+            Label("Queued for after current turn", systemImage: "text.append")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        case .failed, .recoverableInconsistency:
+            HStack(spacing: 12) {
+                if let err = entry.lastError {
+                    Text(err)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                }
+                Button("Retry") { session.retryEntry(entry.localId) }
+                    .font(.caption.bold())
+                Button("Discard", role: .destructive) {
+                    session.dismissEntry(entry.localId)
+                }
+                .font(.caption)
+            }
+        case .reconciled, .dismissed:
+            EmptyView()
+        }
+    }
+}
