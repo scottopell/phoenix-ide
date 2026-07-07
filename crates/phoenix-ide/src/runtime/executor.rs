@@ -53,21 +53,61 @@ fn refresh_commission_review_approval_for_outcome(
     let EffectOutcome::Llm(LlmOutcome::Response { tool_calls, .. }) = outcome else {
         return;
     };
-    if !tool_calls.iter().any(|tool| match &tool.input {
-        ToolInput::CommissionReview(_) => true,
-        ToolInput::Malformed { name, .. } => name == "commission_review",
-        _ => false,
-    }) {
+    if !tool_calls
+        .iter()
+        .any(|tool| valid_commission_review_tool_input(&tool.input))
+    {
         return;
     }
 
     context.commission_review_approval = Some(resolve_commission_review_approval(context));
 }
 
+fn valid_commission_review_tool_input(input: &ToolInput) -> bool {
+    matches!(
+        input,
+        ToolInput::CommissionReview(request) if !request.brief.trim().is_empty()
+    )
+}
+
+fn maybe_precompute_commission_review_tools(
+    working_dir: &Path,
+    mode_context: Option<&ModeContext>,
+    tools: &mut Vec<phoenix_llm::ToolDefinition>,
+) -> Option<CommissionReviewApprovalAvailability> {
+    if !tools.iter().any(|tool| tool.name == "commission_review") {
+        return None;
+    }
+
+    let availability = resolve_commission_review_approval_from_parts(working_dir, mode_context);
+    if matches!(
+        availability,
+        CommissionReviewApprovalAvailability::Unavailable { .. }
+    ) {
+        tools.retain(|tool| tool.name != "commission_review");
+    }
+    Some(availability)
+}
+
 fn resolve_commission_review_approval(
     context: &ConvContext,
 ) -> CommissionReviewApprovalAvailability {
-    if let Err(reason) = git_worktree_clean(&context.working_dir) {
+    resolve_commission_review_approval_from_parts(
+        &context.working_dir,
+        context.mode_context.as_ref(),
+    )
+}
+
+fn resolve_commission_review_approval_from_parts(
+    working_dir: &Path,
+    mode_context: Option<&ModeContext>,
+) -> CommissionReviewApprovalAvailability {
+    let repo_root = match git_capture(working_dir, &["rev-parse", "--show-toplevel"]) {
+        Ok(root) => std::path::PathBuf::from(root.trim()),
+        Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
+    };
+
+    if let Err(reason) = git_worktree_clean(&repo_root) {
         return CommissionReviewApprovalAvailability::Unavailable { reason };
     }
 
@@ -82,10 +122,22 @@ fn resolve_commission_review_approval(
             branch_name,
             ..
         },
-    ) = context.mode_context.as_ref()
+    ) = mode_context
     {
-        let base_ref = format!("refs/remotes/origin/{base_branch}");
-        if !git_ref_exists(&context.working_dir, &base_ref) {
+        let current_branch = match git_capture(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+            Ok(branch) => branch.trim().to_string(),
+            Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
+        };
+        if current_branch != *branch_name {
+            return CommissionReviewApprovalAvailability::Unavailable {
+                reason: format!(
+                    "commission_review target changed before approval: expected work branch `{branch_name}` but current branch is `{current_branch}`. Switch back to `{branch_name}` before requesting review."
+                ),
+            };
+        }
+
+        let base_ref = normalize_commission_review_origin_base(base_branch);
+        if !git_ref_exists(&repo_root, &base_ref) {
             return CommissionReviewApprovalAvailability::Unavailable {
                 reason: format!(
                     "commission_review is unavailable: this conversation does not have fetched approved base ref `{base_ref}` for a committed branch diff. Fetch origin before requesting review."
@@ -94,15 +146,24 @@ fn resolve_commission_review_approval(
         }
         (base_ref, branch_name.clone())
     } else {
-        let Some(default_branch) =
-            phoenix_core::git::resolve_remote_default_branch(&context.working_dir)
-        else {
+        let remote = match git_capture(
+            &repo_root,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        ) {
+            Ok(remote) => remote.trim().to_string(),
+            Err(_) => {
+                return CommissionReviewApprovalAvailability::Unavailable {
+                    reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string(),
+                };
+            }
+        };
+        let Some(default_branch) = remote.strip_prefix("refs/remotes/origin/") else {
             return CommissionReviewApprovalAvailability::Unavailable {
                 reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string(),
             };
         };
         let base_ref = format!("refs/remotes/origin/{default_branch}");
-        if !git_ref_exists(&context.working_dir, &base_ref) {
+        if !git_ref_exists(&repo_root, &base_ref) {
             return CommissionReviewApprovalAvailability::Unavailable {
                 reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string(),
             };
@@ -110,21 +171,84 @@ fn resolve_commission_review_approval(
         (base_ref, "HEAD".to_string())
     };
 
+    let (changed_files, insertions, deletions) =
+        diff_numstat(&repo_root, &base, &head).unwrap_or((0, 0, 0));
+
     CommissionReviewApprovalAvailability::Available(CommissionReviewApprovalScope {
         kind: "committed_branch_diff".to_string(),
-        repo_root: context.working_dir.display().to_string(),
+        repo_root: repo_root.display().to_string(),
         base,
         head,
         dirty: false,
-        changed_files: 0,
-        insertions: 0,
-        deletions: 0,
+        changed_files,
+        insertions,
+        deletions,
     })
 }
 
+fn normalize_commission_review_origin_base(base_branch: &str) -> String {
+    let branch = base_branch
+        .trim()
+        .strip_prefix("refs/remotes/origin/")
+        .or_else(|| base_branch.trim().strip_prefix("origin/"))
+        .unwrap_or_else(|| base_branch.trim());
+    format!("refs/remotes/origin/{branch}")
+}
+
+fn diff_numstat(repo: &Path, base: &str, head: &str) -> Result<(usize, u64, u64), String> {
+    let numstat = git_capture(
+        repo,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            &format!("{base}...{head}"),
+        ],
+    )?;
+    let mut changed_files = 0;
+    let mut insertions = 0;
+    let mut deletions = 0;
+    for line in numstat.lines() {
+        let parts: Vec<_> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            changed_files += 1;
+            if parts[0] != "-" {
+                insertions += parts[0].parse::<u64>().unwrap_or(0);
+            }
+            if parts[1] != "-" {
+                deletions += parts[1].parse::<u64>().unwrap_or(0);
+            }
+        }
+    }
+    Ok((changed_files, insertions, deletions))
+}
+
 fn git_worktree_clean(repo: &Path) -> Result<(), String> {
+    let output = git_capture(repo, &["status", "--porcelain"])?;
+    if !output.is_empty() {
+        return Err(COMMISSION_REVIEW_DIRTY_WORKTREE.to_string());
+    }
+    Ok(())
+}
+
+fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
+    git_capture(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{git_ref}^{{commit}}"),
+        ],
+    )
+    .is_ok()
+}
+
+fn git_capture(repo: &Path, args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
+        .arg("--no-optional-locks")
+        .args(args)
         .current_dir(repo)
         .output()
         .map_err(|_| COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE.to_string())?;
@@ -132,18 +256,7 @@ fn git_worktree_clean(repo: &Path) -> Result<(), String> {
     if !output.status.success() {
         return Err(COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE.to_string());
     }
-    if !output.stdout.is_empty() {
-        return Err(COMMISSION_REVIEW_DIRTY_WORKTREE.to_string());
-    }
-    Ok(())
-}
-
-fn git_ref_exists(repo: &Path, git_ref: &str) -> bool {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", git_ref])
-        .current_dir(repo)
-        .status()
-        .is_ok_and(|status| status.success())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[cfg(test)]
@@ -207,6 +320,7 @@ mod commission_review_approval_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         init_repo(dir.path());
         let mut context = repo_context(dir.path());
+        git_ok(dir.path(), &["checkout", "-qb", "task"]);
         context.mode_context = Some(ModeContext::Work {
             branch_name: "task".to_string(),
             base_branch: "develop".to_string(),
@@ -242,6 +356,158 @@ mod commission_review_approval_tests {
                 reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string()
             }
         );
+    }
+
+    #[test]
+    fn commission_review_approval_uses_repo_root_from_subdirectory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let head = git_output(dir.path(), &["rev-parse", "HEAD"]);
+        git_ok(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", &head],
+        );
+        git_ok(
+            dir.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        let subdir = dir.path().join("nested");
+        std::fs::create_dir(&subdir).expect("create subdir");
+
+        let availability = resolve_commission_review_approval(&repo_context(&subdir));
+        let CommissionReviewApprovalAvailability::Available(scope) = availability else {
+            panic!("expected available review scope");
+        };
+        assert_eq!(
+            std::fs::canonicalize(&scope.repo_root).expect("canonical scope root"),
+            std::fs::canonicalize(dir.path()).expect("canonical temp root")
+        );
+    }
+
+    #[test]
+    fn commission_review_approval_normalizes_explicit_origin_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        git_ok(dir.path(), &["checkout", "-qb", "task"]);
+        let head = git_output(dir.path(), &["rev-parse", "HEAD"]);
+        git_ok(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/release", &head],
+        );
+        let mut context = repo_context(dir.path());
+        context.mode_context = Some(ModeContext::Work {
+            branch_name: "task".to_string(),
+            base_branch: "origin/release".to_string(),
+            worktree_path: dir.path().display().to_string(),
+        });
+
+        let availability = resolve_commission_review_approval(&context);
+        let CommissionReviewApprovalAvailability::Available(scope) = availability else {
+            panic!("expected available review scope");
+        };
+        assert_eq!(scope.base, "refs/remotes/origin/release");
+    }
+
+    #[test]
+    fn commission_review_approval_rejects_stale_recorded_work_branch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let head = git_output(dir.path(), &["rev-parse", "HEAD"]);
+        git_ok(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", &head],
+        );
+        let current_branch = git_output(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let mut context = repo_context(dir.path());
+        context.mode_context = Some(ModeContext::Work {
+            branch_name: "task".to_string(),
+            base_branch: "main".to_string(),
+            worktree_path: dir.path().display().to_string(),
+        });
+
+        let availability = resolve_commission_review_approval(&context);
+        assert_eq!(
+            availability,
+            CommissionReviewApprovalAvailability::Unavailable {
+                reason: format!(
+                    "commission_review target changed before approval: expected work branch `task` but current branch is `{current_branch}`. Switch back to `task` before requesting review."
+                )
+            }
+        );
+    }
+
+    #[test]
+    fn commission_review_approval_computes_diff_stats() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let base = git_output(dir.path(), &["rev-parse", "HEAD"]);
+        git_ok(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", &base],
+        );
+        git_ok(dir.path(), &["checkout", "-qb", "task"]);
+        std::fs::write(dir.path().join("src.txt"), "one\ntwo\n").expect("write file");
+        git_ok(dir.path(), &["add", "src.txt"]);
+        git_ok(dir.path(), &["commit", "-qm", "change"]);
+        let mut context = repo_context(dir.path());
+        context.mode_context = Some(ModeContext::Work {
+            branch_name: "task".to_string(),
+            base_branch: "main".to_string(),
+            worktree_path: dir.path().display().to_string(),
+        });
+
+        let availability = resolve_commission_review_approval(&context);
+        let CommissionReviewApprovalAvailability::Available(scope) = availability else {
+            panic!("expected available review scope");
+        };
+        assert_eq!(scope.changed_files, 1);
+        assert_eq!(scope.insertions, 2);
+        assert_eq!(scope.deletions, 0);
+    }
+
+    #[test]
+    fn commission_review_tool_is_removed_when_scope_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("dirty.rs"), "uncommitted\n").expect("write dirty file");
+        let mut tools = vec![phoenix_llm::ToolDefinition {
+            name: "commission_review".to_string(),
+            description: "review".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+            defer_loading: false,
+        }];
+
+        let availability = maybe_precompute_commission_review_tools(dir.path(), None, &mut tools);
+        assert!(matches!(
+            availability,
+            Some(CommissionReviewApprovalAvailability::Unavailable { .. })
+        ));
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn invalid_commission_review_output_does_not_resolve_git_scope() {
+        let mut context = repo_context(Path::new("/definitely/not/a/repo"));
+        let outcome = EffectOutcome::Llm(LlmOutcome::Response {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall::new(
+                "tool-review-1",
+                ToolInput::CommissionReview(crate::state_machine::state::CommissionReviewInput {
+                    brief: "   ".to_string(),
+                    focus: None,
+                }),
+            )],
+            end_turn: false,
+            usage: phoenix_llm::Usage::default(),
+            request_id: "req".to_string(),
+        });
+
+        refresh_commission_review_approval_for_outcome(&mut context, &outcome);
+        assert_eq!(context.commission_review_approval, None);
     }
 }
 
@@ -3858,7 +4124,12 @@ where
 
             // Build tool definitions before the mode prompt so Explore prose can
             // describe the same tool surface the model receives.
-            let tools = tool_executor.definitions_for_language(llm_language).await;
+            let mut tools = tool_executor.definitions_for_language(llm_language).await;
+            let _commission_review_approval = maybe_precompute_commission_review_tools(
+                &working_dir,
+                mode_context.as_ref(),
+                &mut tools,
+            );
             let explore_bash_capability =
                 if matches!(mode_context.as_ref(), Some(ModeContext::Explore { .. })) {
                     explore_bash
