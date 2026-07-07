@@ -356,7 +356,7 @@ describe('canChangeModelInState (task 02713)', () => {
     [{ type: 'context_exhausted', summary: 's' }, false],
     [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }, false],
     [{ type: 'provisioning', prompt: 'hello' }, false],
-    [{ type: 'creation_failed', message: 'boom', prompt: 'hello' }, true],
+    [{ type: 'creation_failed', message: 'boom', prompt: 'hello' }, false],
     [{ type: 'terminal' }, false],
   ];
 

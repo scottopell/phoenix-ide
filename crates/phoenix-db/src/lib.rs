@@ -3789,7 +3789,7 @@ impl Database {
         //   - terminal: task lifecycle ended (complete/abandon) — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')",
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'creation_failed', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')",
         )
         .bind(&idle_state)
         .bind(now.to_rfc3339())

@@ -485,21 +485,19 @@ def scenario_continuation(base_url: str) -> None:
 def scenario_mid_stream_cancel(base_url: str) -> None:
     """Cancel during streaming; verify state reaches idle cleanly."""
     conv = _new_conv(base_url, "[[scenario:long]] start streaming")
-    # Creation returns an instant provisioning shell; wait until the first turn
-    # has actually left idle/provisioning before cancelling.
-    url = f"{base_url}/api/conversations/{conv['id']}/stream"
-    with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)) as client:
-        with connect_sse(client, "GET", url) as src:
-            deadline = time.monotonic() + 10.0
-            for event in src.iter_sse():
-                if time.monotonic() > deadline:
-                    raise AssertionError("conversation did not start before cancel deadline")
-                if event.event != "state_change":
-                    continue
-                data = json.loads(event.data) if event.data else {}
-                state = _state_str(data.get("state"))
-                if state not in ("idle", "provisioning"):
-                    break
+    # Creation returns an instant provisioning shell; poll until the worker has
+    # submitted the first turn before cancelling. Waiting on the SSE iterator can
+    # block past the deadline when no event arrives during async provisioning.
+    deadline = time.monotonic() + 10.0
+    last_state = None
+    while time.monotonic() < deadline:
+        snap = _get_conv(base_url, conv["id"])
+        last_state = _state_str(snap["conversation"]["state"])
+        if last_state not in ("idle", "provisioning"):
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError(f"conversation did not start before cancel deadline (last: {last_state})")
     resp = _cancel(base_url, conv["id"])
     assert not resp.get("no_op", False), "cancel was a no-op — conversation already idle before we cancelled"
     # State should converge to idle within a few seconds.

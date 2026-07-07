@@ -113,6 +113,8 @@ export interface Conversation {
   /** Slug of the seed parent, resolved server-side for the breadcrumb link.
    *  `null` if the parent has been deleted; UI renders unlinked text. */
   seed_parent_slug?: string | null;
+  creation_prompt?: string | null;
+  creation_error?: string | null;
   /** Continuation pointer (REQ-BED-030). If this conversation has been
    *  continued into a new conversation (context-exhausted handoff), this is
    *  the continuation's id. The UI uses this to (a) swap the Continue
@@ -390,7 +392,7 @@ export type ConversationState =
 
 /** Mirror of the backend `ConvState::allows_model_change`. */
 export function canChangeModelInState(state: ConversationState): boolean {
-  return state.type === 'idle' || state.type === 'error' || state.type === 'creation_failed';
+  return state.type === 'idle' || state.type === 'error';
 }
 
 /** A conversation in a terminal state can no longer act on its pending fork

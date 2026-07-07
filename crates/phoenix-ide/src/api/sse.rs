@@ -384,6 +384,8 @@ mod tests {
             shell: Some("/bin/zsh".to_string()),
             home_dir: Some("/home/alice".to_string()),
             seed_parent_slug: None,
+            creation_prompt: None,
+            creation_error: None,
             parent_conversation_slug: None,
             browser_session_active: false,
             terminal_uses_tmux: false,

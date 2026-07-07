@@ -1289,6 +1289,31 @@ function ConversationPageContent() {
   }, [parentConvSlugForCallback, navigate]);
 
   const convStateForChildren = atom.phase;
+  const localCreateIntent = readCreateIntent(conversationId);
+  const provisioningPrompt = convStateForChildren.type === 'provisioning'
+    ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
+    : null;
+  const creationFailedPrompt = convStateForChildren.type === 'creation_failed'
+    ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
+    : null;
+  const handleStartOverFromFailedCreation = useCallback(() => {
+    const prompt = creationFailedPrompt;
+    if (prompt) {
+      try {
+        localStorage.setItem('phoenix-new-conversation-draft', prompt);
+      } catch {
+        // ignore — non-fatal
+      }
+    }
+    navigate('/new');
+  }, [creationFailedPrompt, navigate]);
+
+  useEffect(() => {
+    if (convStateForChildren.type === 'provisioning') return;
+    if (convStateForChildren.type !== 'creation_failed') {
+      clearCreateIntent(conversationId);
+    }
+  }, [convStateForChildren.type, conversationId]);
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
   const fileRootPath = isArchived || !conversation ? null : (conversation.worktree_path ?? conversation.cwd);
   const handleOpenFiles = useCallback(() => {
@@ -1446,6 +1471,7 @@ function ConversationPageContent() {
     !isArchived &&
     convStateForChildren.type !== 'terminal' &&
     convStateForChildren.type !== 'handed_off' &&
+    convStateForChildren.type !== 'provisioning' &&
     convStateForChildren.type !== 'context_exhausted';
 
   // Derived: model context window is a pure function of the current model's

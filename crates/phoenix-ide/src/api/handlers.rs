@@ -2648,7 +2648,7 @@ async fn stream_conversation(
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
-        conversation: Box::new(enrich_conversation_with_seed(&state, &conversation, true).await?),
+        conversation: Box::new(init_conversation),
         transcript_generation: conversation.transcript_generation,
         messages,
         agent_working: conversation.is_agent_working(),

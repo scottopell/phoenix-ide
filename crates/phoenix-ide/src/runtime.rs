@@ -870,6 +870,10 @@ pub struct EnrichedConversation {
     /// case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed_parent_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creation_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creation_error: Option<String>,
     /// Slug of the sub-agent's parent conversation, resolved for the UI
     /// breadcrumb. `None` if `inner.parent_conversation_id` is `None` (the
     /// conversation is not a sub-agent) or the parent has been deleted — the
@@ -2728,7 +2732,9 @@ impl RuntimeManager {
         let row_state_updated_at = conv.state_updated_at;
 
         match &conv.state {
-            ConvState::AwaitingTaskApproval { .. }
+            ConvState::Provisioning { .. }
+            | ConvState::CreationFailed { .. }
+            | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. }
