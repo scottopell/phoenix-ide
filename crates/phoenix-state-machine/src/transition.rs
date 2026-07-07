@@ -1788,6 +1788,25 @@ pub fn transition_parent(
                 outcome: CommissionReviewApprovalOutcome::Approved,
             }),
         ) => {
+            let (Some(approved_head), Some(approved_base)) =
+                (scope.approved_head.clone(), scope.approved_base.clone())
+            else {
+                let tool_result = ToolResult::error(
+                    tool_use_id.clone(),
+                    "commission_review approval expired: the approved diff range was not frozen. Request review again to approve a fresh committed diff scope.".to_string(),
+                );
+                let checkpoint =
+                    CheckpointData::tool_round(assistant_message.clone(), vec![tool_result])
+                        .expect("commission_review approval expiry pairs exactly one tool_use");
+                return Ok(ParentTransitionResult::new(ParentState::Core(
+                    CoreState::LlmRequesting { attempt: 1 },
+                ))
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm));
+            };
+
             let approved_tool = ToolCall::new(
                 tool_use_id.clone(),
                 ToolInput::ApprovedCommissionReview(
@@ -1799,8 +1818,8 @@ pub fn transition_parent(
                             .work_scope_worktree
                             .as_ref()
                             .map(|path| path.display().to_string()),
-                        approved_head: scope.approved_head.clone(),
-                        approved_base: scope.approved_base.clone(),
+                        approved_head: Some(approved_head),
+                        approved_base: Some(approved_base),
                     },
                 ),
             );
@@ -6180,6 +6199,25 @@ mod tests {
 
             assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
             assert!(!has_execute_tool(&result.effects));
+        }
+
+        #[test]
+        fn approval_without_frozen_range_does_not_execute_review() {
+            let result = transition(
+                &approval_state(),
+                &test_context(),
+                Event::CommissionReviewApprovalDecided {
+                    outcome: CommissionReviewApprovalOutcome::Approved,
+                },
+            )
+            .expect("expired approval should settle as a tool error");
+
+            assert!(matches!(result.new_state, ConvState::LlmRequesting { .. }));
+            assert!(!has_execute_tool(&result.effects));
+            assert!(result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistCheckpoint { .. })));
         }
 
         #[test]
