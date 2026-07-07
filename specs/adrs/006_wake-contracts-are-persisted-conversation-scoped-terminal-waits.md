@@ -91,9 +91,9 @@ contract can encode first-wins semantics if that behavior is needed.
 - **Positive:** User messages remain valid while the parent conversation is idle
   with pending wake contracts.
 - **Positive:** Restart handling is explicit: the wait obligation survives, and
-  startup either re-registers durable handles, delivers persisted child terminal
-  state, expires overdue contracts, or emits a forgotten result for handles that
-  cannot still resolve.
+  startup either re-registers durable handles, delivers persisted in-deadline
+  terminal evidence, expires overdue contracts with no such evidence, or emits a
+  forgotten result for handles that cannot still resolve.
 - **Negative:** Every accepted contract creates a bounded future delivery of a
   synthetic result and possible LLM turn, even when the final answer is only
   `Expired` or `Forgotten`.

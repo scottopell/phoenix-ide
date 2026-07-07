@@ -119,7 +119,8 @@ registering_tool_use_id)`
 
 WHEN Phoenix restarts
 THE SYSTEM SHALL reconcile every non-terminal contract before normal serving:
-overdue contracts whose handles can still be evaluated resolve through the expiry
+durable terminal evidence recorded before `expires_at` delivers a fired payload;
+overdue contracts with no in-deadline terminal evidence resolve through the expiry
 path; contracts whose handles cannot still be evaluated resolve as `forgotten`;
 and still-pending durable handles re-register with the wake-router
 
@@ -187,10 +188,10 @@ THE SYSTEM SHALL support the following condition kind in v1:
   — fires when the named handle reaches a terminal state.
 
 For `Bash`, fired payloads SHALL include the terminal statuses reported by the
-synchronous wait surface for an observed handle, including exited, killed,
-signaled, and `kill_pending_kernel`. A bash handle that is lost across restart or
-teardown resolves through the wake contract's `Forgotten` cause, not through a
-fired bash payload.
+synchronous wait surface for an observed handle, including exited, killed (with
+signal metadata when relevant), and `kill_pending_kernel`. A bash handle that is
+lost across restart or teardown resolves through the wake contract's `Forgotten`
+cause, not through a fired bash payload.
 
 For `TmuxPane`, fired payloads SHALL include observing the Phoenix tmux-run exit
 marker for the watched `window_id`, or observing that the watched window was
@@ -202,8 +203,9 @@ state, the contract SHALL resolve as `Forgotten`, not as a fired tmux payload.
 
 For `SubAgent`, terminal fired payloads SHALL include every durable child
 terminal cause admitted by bedrock: explicit `submit_result`, explicit
-`submit_error`, wall-clock timeout, parent/child cancellation, turn-limit
-hard-stop fallback, implicit text completion, non-retryable runtime failure, and
+`submit_error`, wall-clock timeout, child cancellation observed independently of
+parent wake cancellation, turn-limit hard-stop fallback, implicit text completion,
+non-retryable runtime failure, and
 context exhaustion. A missing child handle is not a fired payload; it resolves the
 contract as `Forgotten` per REQ-WAKE-011 and REQ-WAKE-017.
 
@@ -282,8 +284,10 @@ to spend money. Unbounded waits are not expressible. The cap is enforced at
 registration so the contract row's `expires_at` is always the delivery deadline:
 while Phoenix is running, the router resolves the contract no later than the
 first tick at or after that timestamp; after downtime, startup reconciliation
-resolves overdue contracts before normal serving resumes. The deadline bounds the
-wait obligation, not the lifetime of the underlying process or child agent.
+resolves contracts before normal serving resumes, delivering in-deadline durable
+terminal evidence before expiring contracts with no such evidence. The deadline
+bounds the wait obligation, not the lifetime of the underlying process or child
+agent.
 
 ---
 
@@ -349,9 +353,12 @@ honest semantics.
 
 ### REQ-WAKE-011: Terminal-Cause Distinction
 
-Every accepted wake contract SHALL transition from pending to exactly one
-terminal outcome and SHALL deliver that outcome to the registering conversation.
-The wake event payload SHALL distinguish:
+Every accepted wake contract whose registering conversation remains queryable
+SHALL transition from pending to exactly one terminal outcome and SHALL deliver
+that outcome to the registering conversation. Hard-delete paths that remove the
+registering conversation cancel/remove the contract before deleting the row and do
+not append a synthetic result into the deleted conversation. The wake event
+payload SHALL distinguish:
 - `Fired { observed_payload }` — condition held
 - `Expired` — delivery deadline reached before the condition held
 - `Cancelled` — user cancelled, or lifecycle cascade
@@ -493,9 +500,14 @@ THE SYSTEM SHALL preserve that timeout as the child's durable terminal cause and
 deliver a tagged `timed_out` outcome with a message stating that the child
 exceeded its configured timeout and the child conversation / agent id.
 
-WHEN the child is cancelled by the parent, user, or lifecycle cascade
+WHEN the child independently reaches a durable cancellation terminal state while
+the parent wake contract remains active
 THE SYSTEM SHALL deliver a tagged `cancelled` outcome with the cancellation reason
 when available and the child conversation / agent id.
+
+WHEN the waiting parent or wake contract itself is cancelled
+THE SYSTEM SHALL resolve the wake contract with the top-level `Cancelled` cause,
+not a fired sub-agent `cancelled` payload.
 
 WHEN the child exhausts its turn-limit grace path and the runtime performs the
 hard-stop fallback
@@ -550,9 +562,9 @@ WorkScope inheritance. Because active sub-agent runtimes do not survive Phoenix
 restart, startup resync SHALL first inspect the persisted child conversation and
 its durable terminal cause: children whose terminal cause occurred before the
 contract deadline deliver the corresponding tagged terminal payload;
-non-terminal children fire `Forgotten { reason: "phoenix_restart" }`. Parent
-cancellation and
-child cancellation produce a terminal cancelled payload. Parent hard-delete SHALL
+non-terminal children fire `Forgotten { reason: "phoenix_restart" }`. Child
+cancellation observed independently of parent wake cancellation produces a fired
+sub-agent `cancelled` payload. Parent hard-delete SHALL
 cancel pending wake contracts before deleting the child; hard-delete MUST NOT
 report lifecycle cancellation as a missing child handle.
 

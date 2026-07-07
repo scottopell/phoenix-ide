@@ -23,7 +23,7 @@ V1 supports one condition kind over three concrete handle kinds:
 `HandleTerminal { handle_kind, handle_id }` — fires when a named bash, tmux
 `window_id`, or sub-agent handle reaches a terminal state. For sub-agents, the
 terminal payload covers every durable child terminal cause admitted by bedrock:
-explicit `submit_result`, explicit `submit_error`, timeout, cancellation,
+explicit `submit_result`, explicit `submit_error`, timeout, child cancellation,
 turn-limit hard-stop fallback, implicit completion, runtime failure, and context
 exhaustion. Missing child handles resolve as `Forgotten`, not as fired child
 payloads. V1 does not define parent-to-child
@@ -74,9 +74,9 @@ consequence of continuation.
 Mandatory `expires_at` (default 600s, cap 1800s) is the delivery deadline for the
 wait obligation and prevents unbounded commitments. While Phoenix is running, the
 router resolves a pending contract no later than the first tick at or after that
-timestamp. After downtime, restart resync resolves overdue contracts before normal
-serving resumes; it re-registers still-pending durable handles, delivers persisted
-child terminal state with its durable cause, or emits `Forgotten` for handles that
+timestamp. After downtime, restart resync first delivers in-deadline durable
+terminal evidence, then expires overdue contracts with no such evidence,
+re-registers still-pending durable handles, or emits `Forgotten` for handles that
 cannot still produce an answer.
 
 The LLM-facing surface is a single unified `wait_until { handle: {

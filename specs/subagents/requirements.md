@@ -181,8 +181,9 @@ conversation / agent id
 WHEN that handle is watched by a wake contract
 THE SYSTEM SHALL report fired terminal outcomes for every durable child terminal
 cause admitted by bedrock, including successful `submit_result`, `submit_error`,
-wall-clock timeout, cancellation, turn-limit hard-stop fallback, implicit text
-completion, non-retryable runtime failure, and context exhaustion, and SHALL
+wall-clock timeout, independently observed child cancellation, turn-limit
+hard-stop fallback, implicit text completion, non-retryable runtime failure, and
+context exhaustion, and SHALL
 resolve missing child handles through the wake contract's `Forgotten` cause
 
 WHEN Phoenix restarts while a sub-agent wake contract is pending

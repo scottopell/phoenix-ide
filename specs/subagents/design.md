@@ -179,7 +179,7 @@ A wake on a sub-agent handle delivers only terminal outcomes:
 - explicit `submit_result` success;
 - explicit `submit_error` failure with `error_kind`;
 - wall-clock timeout;
-- cancellation;
+- independently observed child cancellation;
 - turn-limit hard-stop fallback with extracted partial text when available;
 - implicit text completion, if bedrock admits it as a child terminal state;
 - non-retryable runtime failure;

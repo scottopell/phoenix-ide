@@ -152,7 +152,7 @@ enum SubAgentTerminalOutcome {
     success                 -- explicit submit_result
     | submitted_error       -- explicit submit_error
     | timed_out             -- child timeout cause preserved durably
-    | cancelled             -- user/lifecycle cancellation cause preserved durably
+    | cancelled             -- independently observed child cancellation cause preserved durably
     | turn_limit_exhausted  -- grace-turn hard-stop cause preserved durably
     | implicit_success      -- text-only implicit completion, if admitted by bedrock
     | runtime_failure       -- non-retryable LLM/tool/runtime failure
@@ -541,15 +541,26 @@ rule ContinuationBoundaryHandlesContracts {
 }
 
 -- REQ-WAKE-002 + REQ-WAKE-011: restart resync. Startup reconciles persisted
--- wait obligations before normal serving. Expiry has first priority because
--- expires_at is the delivery deadline. Then non-durable or absent handles are
--- forgotten. Sub-agent terminal payloads fire only when their durable child cause
--- was persisted before the deadline. Still-pending durable handles re-register.
+-- wait obligations before normal serving. Durable terminal evidence recorded
+-- before expires_at fires first; then overdue contracts with no terminal evidence
+-- expire. Non-durable or
+-- absent handles are forgotten only when no in-deadline terminal evidence exists.
+-- Still-pending durable handles re-register.
 rule PhoenixStartupResyncsContracts {
     when: PhoenixStartupReachesWakeRouterInit()
 
     ensures: ForEveryPendingContract(
-        if_overdue: ContractTransitionsToTerminalAndQueuesDelivery(
+        if_tmux_terminal_state_recorded_before_deadline: ContractTransitionsToTerminalAndQueuesDelivery(
+                contract,
+                fired,
+                FirePayload(cause: fired, fired: payload_from_persisted_tmux_terminal(contract))
+            ),
+        else_if_subagent_and_child_terminal_before_deadline: ContractTransitionsToTerminalAndQueuesDelivery(
+                contract,
+                fired,
+                FirePayload(cause: fired, fired: payload_from_persisted_child_terminal(contract))
+            ),
+        else_if_overdue: ContractTransitionsToTerminalAndQueuesDelivery(
                 contract,
                 expired,
                 FirePayload(cause: expired)
@@ -560,15 +571,10 @@ rule PhoenixStartupResyncsContracts {
                 forgotten,
                 FirePayload(cause: forgotten, forgotten_reason: "phoenix_restart")
             ),
-        else_if_tmux_handle_absent: ContractTransitionsToTerminalAndQueuesDelivery(
+        else_if_tmux_handle_absent_without_recorded_terminal: ContractTransitionsToTerminalAndQueuesDelivery(
                 contract,
                 forgotten,
                 FirePayload(cause: forgotten, forgotten_reason: "tmux_handle_missing")
-            ),
-        else_if_subagent_and_child_terminal_before_deadline: ContractTransitionsToTerminalAndQueuesDelivery(
-                contract,
-                fired,
-                FirePayload(cause: fired, fired: payload_from_persisted_child_terminal(contract))
             ),
         else_if_subagent_and_child_not_terminal: ContractTransitionsToTerminalAndQueuesDelivery(
                 contract,
@@ -591,9 +597,10 @@ rule PhoenixStartupResyncsContracts {
         -- ContractTransitionsToTerminalAndQueuesDelivery so a restart-resolved
         -- contract still appends the synthetic tool result and triggers the parent
         -- LLM turn on first load. A sub-agent child is read before forgetting the
-        -- contract; if it persisted a terminal cause before the deadline, the wake
-        -- delivers that tagged terminal payload. Only non-terminal children are
-        -- forgotten because their active runtimes died with the process.
+        -- contract; if tmux or a child sub-agent persisted terminal evidence
+        -- before the deadline, the wake delivers that tagged terminal payload even
+        -- if Phoenix restarts after expires_at. Only contracts with no in-deadline
+        -- terminal evidence expire or become forgotten.
 }
 
 -- REQ-WAKE-004: is_busy() consults the contract table.
