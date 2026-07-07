@@ -51,6 +51,36 @@ in-app toggle governs what is actually trusted.
 For reaching your server away from home (the actual subway case), put the
 server on a tailnet/VPN and use its tailnet hostname.
 
+## Testing
+
+```bash
+cd ios/PhoenixMobile
+xcodegen generate
+xcodebuild test -project PhoenixMobile.xcodeproj -scheme PhoenixMobile \
+  -destination 'platform=iOS Simulator,name=iPhone 16'
+```
+
+CI runs the same thing on a macOS runner for any change under `ios/`
+(`.github/workflows/ios.yml`) — the Linux-based `./dev.py check` lanes
+cannot cover Swift.
+
+**The testing pattern:** pure components get *contract tests* — one test
+per rule of the contract they implement, named after that rule — and
+views stay untested. The two exemplars to mimic:
+
+- `Tests/SSEParserTests.swift` — contract: the SSE wire format.
+- `Tests/OutboxTests.swift` — contract: the delivery rules in
+  `specs/user_message_queue/user_message_queue.allium` (+ REQ-IOS-002
+  deviations). Persistence runs for real against a per-test temp
+  directory via the `DiskStore.baseDirectory` seam.
+
+When adding logic, keep it out of views and in a pure type so it can be
+tested this way. Next candidates, in value order: `PhoenixEvent` decoding
+(init snapshot + pending-events replay shapes), `BashResult` envelope
+parsing, and the `ConversationSession` reducer (sequence guard, init
+replay floor, dedup-by-message_id) — the reducer needs its API/SSE
+dependencies made injectable first.
+
 ## How offline works
 
 | Concern | Mechanism |

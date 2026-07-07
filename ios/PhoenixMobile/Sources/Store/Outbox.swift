@@ -130,13 +130,17 @@ final class Outbox {
         }
     }
 
-    /// RetryFailedMessage.
+    /// RetryFailedMessage. Clears `acceptedByServer` so the drain loop
+    /// (which skips already-accepted entries) actually re-POSTs — safe by
+    /// message_id idempotency, and required for the recoverable-
+    /// inconsistency path where the previous accept evidently went nowhere.
     func retry(_ localId: String) {
         update(localId) { entry in
             guard entry.status == .failed || entry.status == .recoverableInconsistency else {
                 return
             }
             entry.status = .pending
+            entry.acceptedByServer = false
             entry.lastError = nil
         }
     }

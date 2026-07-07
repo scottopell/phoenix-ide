@@ -6,11 +6,20 @@ Initial implementation. The app lives in `ios/PhoenixMobile/` (SwiftUI,
 iOS 17+, no third-party dependencies; Xcode project generated via XcodeGen
 from `project.yml` — see `ios/README.md` for build instructions).
 
-The codebase is Swift and cannot be compiled or tested by this repo's CI
-(`./dev.py check` does not cover `ios/`). Verification so far is
-design-level review against the server contracts; first device build and
-an on-device offline test pass (airplane-mode queue/drain cycle) are the
-next verification steps.
+Swift is outside `./dev.py check` (Linux lanes); the iOS client has its
+own CI job (`.github/workflows/ios.yml`, macOS runner) that generates the
+Xcode project and runs the unit-test target on a simulator for any change
+under `ios/`.
+
+Unit coverage follows a contract-test pattern (see `ios/README.md`
+"Testing"): pure components get one test per rule of the contract they
+implement; views stay untested. Covered so far: `SSEParser` (SSE wire
+format) and `Outbox` (the user_message_queue delivery rules, exercised
+against real disk persistence via a test seam). Remaining verification
+steps: on-device build and an airplane-mode queue/drain test pass;
+next unit-test candidates are `PhoenixEvent` decoding, `BashResult`
+parsing, and the `ConversationSession` reducer (needs dependency
+injection first).
 
 ## Requirement Coverage
 

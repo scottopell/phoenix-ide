@@ -40,3 +40,30 @@ targets:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+
+  PhoenixMobileTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+    dependencies:
+      - target: PhoenixMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+
+# Shared scheme so `xcodebuild test -scheme PhoenixMobile` works in CI
+# without anyone having opened Xcode first.
+schemes:
+  PhoenixMobile:
+    build:
+      targets:
+        PhoenixMobile: all
+        PhoenixMobileTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - PhoenixMobileTests

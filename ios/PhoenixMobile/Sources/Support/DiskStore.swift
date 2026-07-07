@@ -3,11 +3,19 @@ import Foundation
 /// JSON file persistence under Application Support. All offline state —
 /// conversation list, per-conversation snapshots, outboxes — goes through
 /// here so the app renders instantly with no network.
+///
+/// MainActor-isolated: every caller (stores, sessions, AppModel) is already
+/// MainActor, and isolation is what makes the mutable `baseDirectory` test
+/// seam safe.
+@MainActor
 enum DiskStore {
+    /// Test seam: contract tests point this at a fresh temp directory so
+    /// they never touch (or depend on) the app's real cache.
+    static var baseDirectory: URL = FileManager.default.urls(
+        for: .applicationSupportDirectory, in: .userDomainMask)[0]
+
     private static var directory: URL {
-        let base = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = base.appendingPathComponent("PhoenixMobile", isDirectory: true)
+        let dir = baseDirectory.appendingPathComponent("PhoenixMobile", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
