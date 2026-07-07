@@ -996,7 +996,7 @@ describe('Mobile conversation list redesign', () => {
     expect(container.querySelector('[data-id="needs-leaf"] .conv-state-dot')).toHaveClass('awaiting-approval');
   });
 
-  it('marks context-full mobile rows as actionable without an extra status badge', () => {
+  it('shows a visible context-full status label in mobile metadata', () => {
     const conv = makeConv('context-full', 'context-full', {
       presentation_mode: 'needs_action',
       state: { type: 'context_exhausted', summary: 'Context is full' },
@@ -1010,10 +1010,10 @@ describe('Mobile conversation list redesign', () => {
 
     expect(container.querySelector('[data-id="context-full"] .conv-state-dot')).toHaveClass('awaiting-approval');
     expect(container.querySelector('[data-id="context-full"] .conv-state-dot')).toHaveAttribute('title', 'Context full');
-    expect(container.querySelector('[data-id="context-full"] .conv-state-chip')).toBeNull();
+    expect(container.querySelector('[data-id="context-full"] .conv-state-chip')?.textContent).toBe('Context full');
   });
 
-  it('marks mobile question-blocked rows as actionable without an extra status badge', () => {
+  it('shows a visible needs-reply status label in mobile metadata', () => {
     const conv = makeConv('needs-reply', 'needs-reply', {
       presentation_mode: 'needs_action',
       state: { type: 'awaiting_user_response', questions: [] },
@@ -1027,13 +1027,17 @@ describe('Mobile conversation list redesign', () => {
 
     expect(container.querySelector('[data-id="needs-reply"] .conv-state-dot')).toHaveClass('awaiting-approval');
     expect(container.querySelector('[data-id="needs-reply"] .conv-state-dot')).toHaveAttribute('title', 'Needs reply');
-    expect(container.querySelector('[data-id="needs-reply"] .conv-state-chip')).toBeNull();
+    expect(container.querySelector('[data-id="needs-reply"] .conv-state-chip')?.textContent).toBe('Needs reply');
   });
 
   it('uses semantic title fallbacks instead of GUID-like primary labels on mobile rows', () => {
     const withTaskTitle = makeConv('task-title', 'f872dd1a-f701-49f3-ad25-2605c6b6f3dc', {
       task_title: 'Iterate mobile conversation list fixtures',
       branch_name: 'task-26004-iterate-mobile-conversation-list-fixtures',
+    });
+    const withForkPrefix = makeConv('fork-title', 'fork-123e4567-e89b-42d3-a456-426614174000', {
+      task_title: 'Fix forked task title display',
+      branch_name: 'task-26004-fork-display',
     });
     const withBranch = makeConv('branch-title', '9d1b4cc93b7845228e4fdbe566761f44', {
       task_title: null,
@@ -1048,13 +1052,29 @@ describe('Mobile conversation list redesign', () => {
 
     const { container } = render(
       <MemoryRouter>
-        <ConversationList {...defaultProps} listDensity="mobile" conversations={[withTaskTitle, withBranch, withContext]} />
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[withTaskTitle, withForkPrefix, withBranch, withContext]} />
       </MemoryRouter>,
     );
 
     expect(container.querySelector('[data-id="task-title"] .conv-item-title')?.textContent).toBe('Iterate mobile conversation list fixtures');
+    expect(container.querySelector('[data-id="fork-title"] .conv-item-title')?.textContent).toBe('Fix forked task title display');
     expect(container.querySelector('[data-id="branch-title"] .conv-item-title')?.textContent).toBe('scott/mobile-row-overflow-audit');
     expect(container.querySelector('[data-id="context-title"] .conv-item-title')?.textContent).toBe('readable-context-leaf');
+  });
+
+  it('keeps project context visible on hydrated mobile rows', () => {
+    const conv = makeConv('project-context', 'project-context', {
+      project_name: 'phoenix-ide',
+      cwd: '/tmp/phoenix-ide',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[conv]} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-id="project-context"] .conv-project-label')?.textContent).toBe('phoenix-ide');
   });
 
   it('uses semantic chain and latest-title fallbacks in collapsed mobile chain summaries', () => {

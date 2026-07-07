@@ -113,11 +113,15 @@ function compactContextLabel(conv: Conversation): string | null {
   return leaf || null;
 }
 
+const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/i;
+const LONG_HEX_TOKEN_PATTERN = /(?:^|[-_])[0-9a-f]{24,}(?:$|[-_])/i;
+
 function isLowValueIdentifier(value: string | null | undefined): boolean {
   const normalized = value?.trim();
   if (!normalized) return true;
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)
-    || /^[0-9a-f]{24,}$/i.test(normalized);
+  return UUID_PATTERN.test(normalized)
+    || /^[0-9a-f]{24,}$/i.test(normalized)
+    || LONG_HEX_TOKEN_PATTERN.test(normalized);
 }
 
 function displayTitleFromConversation(conv: Conversation, fallback = 'Untitled conversation'): string {
@@ -287,6 +291,9 @@ export const ConversationRow = memo(function ConversationRow({
             <span className="conv-mode-badge">{conv.conv_mode_label}</span>
           )}
           {isMobileList && cachedPrForBadge && <PrBadge pr={cachedPrForBadge} interactive={false} />}
+          {isMobileList && isActionableDisplayState(displayState) && (
+            <span className={`conv-state-chip ${displayState}`}>{stateLabel(conv, displayState)}</span>
+          )}
           {isMobileList && (
             <span
               className="conv-item-time conv-item-time-inline"
@@ -295,7 +302,7 @@ export const ConversationRow = memo(function ConversationRow({
               {formatRelativeTime(conv.updated_at)}
             </span>
           )}
-          {contextLabel && (!isMobileList || !conv.project_name) && (
+          {contextLabel && (
             <span className="conv-project-label">{contextLabel}</span>
           )}
           <span className="conv-item-model">{conv.model}</span>
