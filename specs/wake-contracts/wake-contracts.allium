@@ -91,6 +91,8 @@ value BashTerminalPayload {
     status: bash/HandleStatus
     exit_code: Integer?
     duration_ms: Integer?
+    signal_number: Integer?        -- mirrors bash wait signal metadata when known
+    kill_signal_sent: bash/KillSignal? -- mirrors kill_pending_kernel metadata
     tail: List<bash/RingLine>
 }
 
@@ -542,10 +544,9 @@ rule ContinuationBoundaryHandlesContracts {
 
 -- REQ-WAKE-002 + REQ-WAKE-011: restart resync. Startup reconciles persisted
 -- wait obligations before normal serving. Durable terminal evidence recorded
--- before expires_at fires first; then overdue contracts with no terminal evidence
--- expire. Non-durable or
--- absent handles are forgotten only when no in-deadline terminal evidence exists.
--- Still-pending durable handles re-register.
+-- before expires_at fires first; non-durable and absent handles are forgotten
+-- because the target became unknowable at restart; then overdue contracts with no
+-- terminal evidence expire. Still-pending durable handles re-register.
 rule PhoenixStartupResyncsContracts {
     when: PhoenixStartupReachesWakeRouterInit()
 
@@ -560,11 +561,6 @@ rule PhoenixStartupResyncsContracts {
                 fired,
                 FirePayload(cause: fired, fired: payload_from_persisted_child_terminal(contract))
             ),
-        else_if_overdue: ContractTransitionsToTerminalAndQueuesDelivery(
-                contract,
-                expired,
-                FirePayload(cause: expired)
-            ),
         else_if_kind_in_set: config.forgotten_on_restart_for_kinds,
             then: ContractTransitionsToTerminalAndQueuesDelivery(
                 contract,
@@ -576,10 +572,20 @@ rule PhoenixStartupResyncsContracts {
                 forgotten,
                 FirePayload(cause: forgotten, forgotten_reason: "tmux_handle_missing")
             ),
+        else_if_subagent_child_missing: ContractTransitionsToTerminalAndQueuesDelivery(
+                contract,
+                forgotten,
+                FirePayload(cause: forgotten, forgotten_reason: "subagent_handle_missing")
+            ),
         else_if_subagent_and_child_not_terminal: ContractTransitionsToTerminalAndQueuesDelivery(
                 contract,
                 forgotten,
                 FirePayload(cause: forgotten, forgotten_reason: "phoenix_restart")
+            ),
+        else_if_overdue: ContractTransitionsToTerminalAndQueuesDelivery(
+                contract,
+                expired,
+                FirePayload(cause: expired)
             ),
         else: ContractReRegisteredWithRouter(contract)
     )
@@ -599,8 +605,11 @@ rule PhoenixStartupResyncsContracts {
         -- LLM turn on first load. A sub-agent child is read before forgetting the
         -- contract; if tmux or a child sub-agent persisted terminal evidence
         -- before the deadline, the wake delivers that tagged terminal payload even
-        -- if Phoenix restarts after expires_at. Only contracts with no in-deadline
-        -- terminal evidence expire or become forgotten.
+        -- if Phoenix restarts after expires_at. If restart makes the target
+        -- unknowable (bash registry gone, tmux window missing, child row missing,
+        -- non-terminal child runtime gone), forgotten wins over generic expiry.
+        -- Expiry is only for evaluable contracts with no in-deadline terminal
+        -- evidence.
 }
 
 -- REQ-WAKE-004: is_busy() consults the contract table.

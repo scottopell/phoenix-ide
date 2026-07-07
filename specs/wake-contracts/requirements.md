@@ -112,17 +112,20 @@ delivery semantics; ADR-006 records the explicit non-state rationale.
 
 ### REQ-WAKE-002: Contract Persistence
 
-THE SYSTEM SHALL persist every active wake contract in a `wake_contracts`
-SQLite table with columns `(id, conv_id, handle_kind, handle_id,
-condition_json, expires_at, registered_at, fire_template_json,
-registering_tool_use_id)`
+THE SYSTEM SHALL persist every wake contract in a `wake_contracts` SQLite table
+with columns `(id, conv_id, handle_kind, handle_id, condition_json, expires_at,
+registered_at, fire_template_json, registering_tool_use_id, status,
+terminal_cause, fired_payload, forgotten_reason, resolved_at)`
+
+THE SYSTEM SHALL update `status`, `terminal_cause`, the terminal payload fields,
+and `resolved_at` atomically when a contract resolves
 
 WHEN Phoenix restarts
 THE SYSTEM SHALL reconcile every non-terminal contract before normal serving:
 durable terminal evidence recorded before `expires_at` delivers a fired payload;
-overdue contracts with no in-deadline terminal evidence resolve through the expiry
-path; contracts whose handles cannot still be evaluated resolve as `forgotten`;
-and still-pending durable handles re-register with the wake-router
+contracts whose handles cannot still be evaluated resolve as `forgotten`; overdue
+evaluable contracts with no in-deadline terminal evidence resolve through the
+expiry path; and still-pending durable handles re-register with the wake-router
 
 **Rationale:** The contract is the durable thing AND the single source of truth
 for "is this conv waiting on something." The underlying handle may or may not be
@@ -285,9 +288,9 @@ registration so the contract row's `expires_at` is always the delivery deadline:
 while Phoenix is running, the router resolves the contract no later than the
 first tick at or after that timestamp; after downtime, startup reconciliation
 resolves contracts before normal serving resumes, delivering in-deadline durable
-terminal evidence before expiring contracts with no such evidence. The deadline
-bounds the wait obligation, not the lifetime of the underlying process or child
-agent.
+terminal evidence, forgetting handles that became unknowable, and expiring only
+evaluable contracts with no such evidence. The deadline bounds the wait
+obligation, not the lifetime of the underlying process or child agent.
 
 ---
 
@@ -298,6 +301,10 @@ with at least one pending wake contract, showing:
 - the count of pending contracts (or a per-contract list if N <= 3)
 - the soonest `expires_at` timestamp
 - a cancel affordance per contract (button or chip dropdown)
+
+THE `phoenix-client.py` CLI SHALL expose a wake-status command that reports the
+same pending contract count, soonest `expires_at`, per-contract ids, handle kinds,
+and terminal status for non-browser inspection
 
 WHEN the cancel endpoint
 (`POST /api/conversations/:id/wake/:contract_id/cancel`) is invoked
@@ -452,7 +459,8 @@ THE SYSTEM SHALL emit metrics on:
 - average fire latency (registration to fire)
 - expired-vs-fired ratio
 - forgotten-vs-fired ratio (broken out by forgotten reason:
-  `phoenix_restart`, `cascade_destroyed_handle`)
+  `phoenix_restart`, `cascade_destroyed_handle`, `subagent_handle_missing`,
+  `tmux_handle_missing`)
 
 **Rationale:** A wake contract is a Phoenix-side commitment to spend
 money. Operators must be able to see "how much wake is happening"

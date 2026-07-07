@@ -33,9 +33,9 @@ framework.
 
 ## Technical Summary
 
-A new `wake_contracts` SQLite table persists every active contract
-with `(id, conv_id, handle_kind, handle_id, condition_json,
-expires_at, registered_at, fire_template_json, registering_tool_use_id)`.
+A new `wake_contracts` SQLite table persists every contract with registration
+fields plus terminal accounting fields: `status`, `terminal_cause`,
+`fired_payload`, `forgotten_reason`, and `resolved_at`.
 A new background `wake_router` task polls contracts each tick (1s for
 HandleTerminal) and on resolution: marks the row terminal, appends a
 synthetic tool result to the conv message log, triggers the conv's
@@ -74,10 +74,10 @@ consequence of continuation.
 Mandatory `expires_at` (default 600s, cap 1800s) is the delivery deadline for the
 wait obligation and prevents unbounded commitments. While Phoenix is running, the
 router resolves a pending contract no later than the first tick at or after that
-timestamp. After downtime, restart resync first delivers in-deadline durable
-terminal evidence, then expires overdue contracts with no such evidence,
-re-registers still-pending durable handles, or emits `Forgotten` for handles that
-cannot still produce an answer.
+timestamp. After downtime, restart resync delivers in-deadline durable terminal
+evidence, emits `Forgotten` for handles that became unknowable, expires only
+evaluable contracts with no such evidence, or re-registers still-pending durable
+handles.
 
 The LLM-facing surface is a single unified `wait_until { handle: {
 kind, id }, condition, max_wait_seconds }` tool with a `#[serde(tag
@@ -97,7 +97,7 @@ land separately.
 | REQ-WAKE-005 V1 Condition Kinds | Proposed | HandleTerminal only; regex/file/port/webhook deferred |
 | REQ-WAKE-006 Wake Event Delivery | Proposed | Synthetic tool result; shape-identical to `op=wait` response |
 | REQ-WAKE-007 Mandatory Timeout | Proposed | Default 600s, cap 1800s |
-| REQ-WAKE-008 User Status + Cancel | Proposed | UI indicator on Idle conv + cancel endpoint |
+| REQ-WAKE-008 User Status + Cancel | Proposed | UI/CLI wake status on Idle conv + cancel endpoint |
 | REQ-WAKE-009 Conv-Scoped | Proposed | Not WorkScope-scoped; explicit deconfliction |
 | REQ-WAKE-010 Independent Contracts | Proposed | No auto-cancel on sibling fire |
 | REQ-WAKE-011 Terminal Cause | Proposed | Fired / Expired / Cancelled / Forgotten |

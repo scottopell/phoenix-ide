@@ -92,8 +92,8 @@ contract can encode first-wins semantics if that behavior is needed.
   with pending wake contracts.
 - **Positive:** Restart handling is explicit: the wait obligation survives, and
   startup either re-registers durable handles, delivers persisted in-deadline
-  terminal evidence, expires overdue contracts with no such evidence, or emits a
-  forgotten result for handles that cannot still resolve.
+  terminal evidence, emits a forgotten result for handles that became unknowable,
+  or expires overdue evaluable contracts with no terminal evidence.
 - **Negative:** Every accepted contract creates a bounded future delivery of a
   synthetic result and possible LLM turn, even when the final answer is only
   `Expired` or `Forgotten`.
