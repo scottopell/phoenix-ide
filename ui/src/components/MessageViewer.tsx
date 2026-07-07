@@ -141,6 +141,7 @@ function useMessageReviewNotes(
   useEffect(() => {
     setAnnotating(null);
     setHighlightedLine(null);
+    setShowPanel(false);
   }, [sequenceId]);
 
   const startAnnotate = useCallback((lineNumber: number, lineContent: string) => {

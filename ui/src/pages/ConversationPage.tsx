@@ -1107,7 +1107,8 @@ function ConversationPageContent() {
   const openFileState = fileRootPath ? fileExplorer.openFileState : null;
   const browserViewerOpen = !isArchived && browserOpen;
   const inspectViewerOpen = !isArchived && inspectOpen;
-  const messageViewerOpen = !isArchived && messageOpen;
+  const canOpenMessageSidepanel = !isArchived && !isTerminalConversationState(convStateForChildren);
+  const messageViewerOpen = canOpenMessageSidepanel && messageOpen;
   const stateBarContinuation = useMemo(
     () => !isArchived && convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }
@@ -1376,7 +1377,7 @@ function ConversationPageContent() {
         onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
         workScopeKey={isArchived ? undefined : conversation.work_scope_key}
-        enableMessageSidepanel={!isArchived}
+        enableMessageSidepanel={canOpenMessageSidepanel}
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}

@@ -59,6 +59,37 @@ describe('MessageViewer', () => {
     expect(screen.getByText('Second proposal line')).toBeInTheDocument();
   });
 
+  it('closes the notes panel when switching messages', async () => {
+    const messages = [
+      agentTextMessage(1, 'First proposal line'),
+      agentTextMessage(2, 'Second proposal line'),
+    ];
+    const view = renderViewer(1, messages);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add note to line 1' }));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Check this' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
+    fireEvent.click(screen.getByRole('button', { name: '1 notes' }));
+    expect(screen.getByText('Notes (1)')).toBeInTheDocument();
+
+    view.rerender(
+      <ReviewNotesProvider>
+        <MessageViewer
+          sequenceId={2}
+          messages={messages}
+          onClose={vi.fn()}
+          onSendNotes={vi.fn()}
+          inline
+        />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText(/Notes \(/)).not.toBeInTheDocument();
+    });
+    expect(screen.getByText('Second proposal line')).toBeInTheDocument();
+  });
+
   it('keeps line refs registered so note jumps can highlight the target line', async () => {
     Element.prototype.scrollIntoView = vi.fn();
     const messages = [agentTextMessage(1, 'First proposal line')];
