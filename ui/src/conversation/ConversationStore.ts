@@ -68,7 +68,7 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
    * Returns true iff this atom changed.
    */
   upsertSnapshot(slug: string, conversation: Conversation): boolean {
-    const indexedSlug = this.slugByConvId.get(conversation.id);
+    const indexedSlug = this.slugByConvId.get(conversation.id) ?? this.findSlugForConversationId(conversation.id, slug);
     const indexedAtom = indexedSlug && indexedSlug !== slug ? this.atomByKey(indexedSlug) : undefined;
     const moveFromSlug = indexedAtom?.conversation?.id === conversation.id ? indexedSlug : undefined;
     const current = moveFromSlug ? indexedAtom! : this.getSnapshot(slug);
@@ -148,6 +148,13 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     return this.upsertSnapshot(newSlug, conversation);
   }
 
+  private findSlugForConversationId(convId: string, exceptSlug?: string): string | undefined {
+    for (const [slug, atom] of this.entries()) {
+      if (slug !== exceptSlug && atom.conversation?.id === convId) return slug;
+    }
+    return undefined;
+  }
+
   /**
    * Read all currently-held conversation snapshots. Returns a fresh
    * array — callers that need reference stability across calls should
@@ -155,11 +162,16 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
    * a snapshot equality function).
    */
   listSnapshots(): Conversation[] {
-    const out: Conversation[] = [];
+    const byId = new Map<string, Conversation>();
     for (const [, atom] of this.entries()) {
-      if (atom.conversation) out.push(atom.conversation);
+      const conversation = atom.conversation;
+      if (!conversation) continue;
+      const existing = byId.get(conversation.id);
+      if (!existing || conversation.updated_at > existing.updated_at) {
+        byId.set(conversation.id, conversation);
+      }
     }
-    return out;
+    return [...byId.values()];
   }
 
   /**

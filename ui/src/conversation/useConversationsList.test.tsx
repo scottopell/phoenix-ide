@@ -224,14 +224,28 @@ describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
     );
 
     act(() => {
-      store!.upsertSnapshot('old-slug', makeConv('old-slug', {
-        id: 'conv-shared',
-        updated_at: '2024-06-01T00:00:00Z',
-      }));
-      store!.upsertSnapshot('new-slug', makeConv('new-slug', {
-        id: 'conv-shared',
-        updated_at: '2024-06-02T00:00:00Z',
-      }));
+      store!.dispatch('old-slug', {
+        type: 'set_initial_data',
+        conversationId: 'conv-shared',
+        conversation: makeConv('old-slug', {
+          id: 'conv-shared',
+          updated_at: '2024-06-01T00:00:00Z',
+        }),
+        messages: [],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+      });
+      store!.dispatch('new-slug', {
+        type: 'set_initial_data',
+        conversationId: 'conv-shared',
+        conversation: makeConv('new-slug', {
+          id: 'conv-shared',
+          updated_at: '2024-06-02T00:00:00Z',
+        }),
+        messages: [],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+      });
     });
 
     await waitFor(() => {

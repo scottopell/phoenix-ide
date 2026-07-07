@@ -210,6 +210,59 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.listSnapshots().map((c) => c.slug)).toEqual(['current-slug']);
   });
 
+  it('discovers unindexed same-id atoms created by direct page hydration', () => {
+    const store = new ConversationStore();
+    store.dispatch('old-slug', {
+      type: 'set_initial_data',
+      conversationId: 'conv-shared',
+      conversation: makeConv('old-slug', {
+        id: 'conv-shared',
+        updated_at: '2024-06-01T00:00:00Z',
+      }),
+      messages: [],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+    });
+
+    expect(store.slugForId('conv-shared')).toBeUndefined();
+    expect(store.upsertSnapshot('new-slug', makeConv('new-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-02T00:00:00Z',
+    }))).toBe(true);
+
+    expect(store.getSnapshot('old-slug').conversation).toBeNull();
+    expect(store.getSnapshot('new-slug').conversation?.id).toBe('conv-shared');
+    expect(store.listSnapshots().map((c) => c.slug)).toEqual(['new-slug']);
+  });
+
+  it('listSnapshots dedupes same-id atoms as a final render-path guard', () => {
+    const store = new ConversationStore();
+    store.dispatch('old-slug', {
+      type: 'set_initial_data',
+      conversationId: 'conv-shared',
+      conversation: makeConv('old-slug', {
+        id: 'conv-shared',
+        updated_at: '2024-06-01T00:00:00Z',
+      }),
+      messages: [],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+    });
+    store.dispatch('new-slug', {
+      type: 'set_initial_data',
+      conversationId: 'conv-shared',
+      conversation: makeConv('new-slug', {
+        id: 'conv-shared',
+        updated_at: '2024-06-02T00:00:00Z',
+      }),
+      messages: [],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+    });
+
+    expect(store.listSnapshots().map((c) => c.slug)).toEqual(['new-slug']);
+  });
+
   it('does not remove a slug that has been reused by a different conversation id', () => {
     const store = new ConversationStore();
     store.upsertSnapshot('shared-slug', makeConv('shared-slug', {
