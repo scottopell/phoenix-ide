@@ -122,6 +122,7 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
         ) {
           return false;
         }
+        return false;
       }
     }
     return this.setConversationSnapshot(slug, conversation, destination);
@@ -178,7 +179,7 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
 
     const changed = this.upsertSnapshot(newSlug, conversation);
     const oldAtom = this.atomByKey(oldSlug);
-    if (oldAtom?.conversation?.id === conversation.id && this.isSnapshotOnly(oldAtom)) {
+    if (oldAtom?.conversation?.id === conversation.id && this.isSnapshotOnly(oldSlug, oldAtom)) {
       this.removeAtom(oldSlug);
     }
     return changed;
@@ -197,14 +198,15 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
   private removeInactiveAliases(convId: string, keepSlug: string): void {
     for (const [slug, atom] of this.entries()) {
       if (slug === keepSlug || atom.conversation?.id !== convId) continue;
-      if (this.isSnapshotOnly(atom)) {
+      if (this.isSnapshotOnly(slug, atom)) {
         this.removeAtom(slug);
       }
     }
   }
 
-  private isSnapshotOnly(atom: ConversationAtom): boolean {
-    return atom.conversationId === null
+  private isSnapshotOnly(slug: string, atom: ConversationAtom): boolean {
+    return !this.hasSubscribers(slug)
+      && atom.conversationId === null
       && atom.messages.length === 0
       && atom.connectionEpoch === null
       && atom.streamingBuffer === null

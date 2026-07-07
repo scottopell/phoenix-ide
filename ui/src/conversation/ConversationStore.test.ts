@@ -249,6 +249,24 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.listSnapshots().map((c) => c.slug)).toEqual(['new-slug']);
   });
 
+  it('rejects same-timestamp stale aliases that do not carry fresher data', () => {
+    const store = new ConversationStore();
+    store.upsertSnapshot('canonical-slug', makeConv('canonical-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-01T00:00:00Z',
+    }));
+
+    expect(store.upsertSnapshot('stale-alias', makeConv('stale-alias', {
+      id: 'conv-shared',
+      updated_at: '2024-06-01T00:00:00Z',
+    }))).toBe(false);
+
+    expect(store.slugForId('conv-shared')).toBe('canonical-slug');
+    expect(store.getSnapshot('canonical-slug').conversation?.slug).toBe('canonical-slug');
+    expect(store.getSnapshot('stale-alias').conversation).toBeNull();
+    expect(store.listSnapshots().map((c) => c.slug)).toEqual(['canonical-slug']);
+  });
+
   it('rejects stale aliases without moving the canonical newer snapshot', () => {
     const store = new ConversationStore();
     const fresh = makeConv('current-slug', {
@@ -351,6 +369,26 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.getSnapshot('old-slug').conversation?.slug).toBe('old-slug');
     expect(store.slugForId('conv-shared')).toBe('new-slug');
     expect(store.listSnapshots().map((c) => c.slug)).toEqual(['new-slug']);
+  });
+
+  it('does not drop a subscribed snapshot row before page hydration completes', () => {
+    const store = new ConversationStore();
+    store.upsertSnapshot('old-slug', makeConv('old-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-01T00:00:00Z',
+    }));
+    const unsubscribe = store.subscribe('old-slug', () => {});
+
+    expect(store.upsertSnapshot('new-slug', makeConv('new-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-02T00:00:00Z',
+    }))).toBe(true);
+
+    expect(store.getSnapshot('old-slug').conversation?.slug).toBe('old-slug');
+    expect(store.getSnapshot('old-slug').conversationId).toBeNull();
+    expect(store.slugForId('conv-shared')).toBe('new-slug');
+    expect(store.listSnapshots().map((c) => c.slug)).toEqual(['new-slug']);
+    unsubscribe();
   });
 
   it('notifies list subscribers when direct hydration changes the alias index', () => {

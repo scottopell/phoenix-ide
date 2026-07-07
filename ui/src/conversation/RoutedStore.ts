@@ -152,6 +152,10 @@ export class RoutedStore<K, S, A> {
     this.notifyAny();
   }
 
+  protected hasSubscribers(key: K): boolean {
+    return (this.listenersByKey.get(key)?.size ?? 0) > 0;
+  }
+
   private notify(key: K): void {
     const listeners = this.listenersByKey.get(key);
     if (!listeners) return;
