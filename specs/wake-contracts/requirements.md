@@ -115,10 +115,13 @@ delivery semantics; ADR-006 records the explicit non-state rationale.
 THE SYSTEM SHALL persist every wake contract in a `wake_contracts` SQLite table
 with columns `(id, conv_id, handle_kind, handle_id, condition_json, expires_at,
 registered_at, fire_template_json, registering_tool_use_id, status,
-terminal_cause, fired_payload, forgotten_reason, resolved_at)`
+terminal_cause, terminal_payload, resolved_at)`
 
-THE SYSTEM SHALL update `status`, `terminal_cause`, the terminal payload fields,
-and `resolved_at` atomically when a contract resolves
+THE `terminal_payload` column SHALL be the sole persisted representation of the
+terminal payload, including `forgotten_reason` when `terminal_cause = Forgotten`
+
+THE SYSTEM SHALL update `status`, `terminal_cause`, `terminal_payload`, and
+`resolved_at` atomically when a contract resolves
 
 WHEN Phoenix restarts
 THE SYSTEM SHALL reconcile every non-terminal contract before normal serving:

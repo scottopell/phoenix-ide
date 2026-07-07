@@ -35,7 +35,8 @@ framework.
 
 A new `wake_contracts` SQLite table persists every contract with registration
 fields plus terminal accounting fields: `status`, `terminal_cause`,
-`fired_payload`, `forgotten_reason`, and `resolved_at`.
+`terminal_payload`, and `resolved_at`. The terminal payload is the sole persisted
+source for fired payloads and forgotten reasons.
 A new background `wake_router` task polls contracts each tick (1s for
 HandleTerminal) and on resolution: marks the row terminal, appends a
 synthetic tool result to the conv message log, triggers the conv's

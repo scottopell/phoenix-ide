@@ -1207,9 +1207,12 @@ rule SubAgentTurnLimitGraceTurn {
         -- allows one more LLM request. Status stays at llm_requesting (no
         -- transition). Explore guidance asks for findings via submit_result;
         -- Work guidance says submit_result is useful only for completed work and
-        -- routes unfinished required edits through submit_error. Other tool calls
-        -- are not modeled as forbidden by the runtime; they simply do not produce
-        -- the terminal outcome needed to avoid GraceTurnExhausted.
+        -- routes unfinished required edits through submit_error. Text-only
+        -- implicit completion remains a bedrock terminal path when admitted by the
+        -- reducer; wake delivery preserves that cause separately from explicit
+        -- submit_result. Other tool calls are not modeled as forbidden by the
+        -- runtime; they simply do not produce the terminal outcome needed to avoid
+        -- GraceTurnExhausted.
 }
 
 rule SubAgentTurnLimitHardStop {

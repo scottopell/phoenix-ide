@@ -108,15 +108,15 @@ value SubAgentTerminalPayload {
     sub_agent_id: String              -- single identity; child conversation id == agent id
     task_label: String?
     outcome: SubAgentTerminalOutcome
-    success_result: String?           when outcome = success
-    submitted_error: String?          when outcome = submitted_error
-    submitted_error_kind: String?     when outcome = submitted_error
-    timed_out_message: String?        when outcome = timed_out
+    success_result: String            when outcome = success
+    submitted_error: String           when outcome = submitted_error
+    submitted_error_kind: String      when outcome = submitted_error
+    timed_out_message: String         when outcome = timed_out
     cancelled_reason: String?         when outcome = cancelled
     turn_limit_partial_text: String?  when outcome = turn_limit_exhausted
-    implicit_success_text: String?    when outcome = implicit_success
-    runtime_failure_message: String?  when outcome = runtime_failure
-    context_exhausted_message: String? when outcome = context_exhausted
+    implicit_success_text: String     when outcome = implicit_success
+    runtime_failure_message: String   when outcome = runtime_failure
+    context_exhausted_message: String when outcome = context_exhausted
 }
 
 ------------------------------------------------------------
@@ -213,14 +213,15 @@ entity Contract {
     }
 
     -- Terminal cause. Populated iff status = terminal.
-    terminal_cause: TerminalCause?    when status = terminal
+    terminal_cause: TerminalCause     when status = terminal
 
     -- The full delivered payload. Persisted so a late SSE reconnect
-    -- can re-deliver the wake event without losing data.
-    fired_payload: FirePayload?       when status = terminal
+    -- can re-deliver the wake event without losing data. This is the sole
+    -- persisted representation of forgotten reasons and fired handle payloads.
+    terminal_payload: FirePayload     when status = terminal
 
     -- When the router resolved the contract.
-    resolved_at: Timestamp?           when status = terminal
+    resolved_at: Timestamp            when status = terminal
 }
 
 ------------------------------------------------------------
@@ -655,7 +656,7 @@ invariant TerminalContractsAreFullyPopulated {
     for c in Contract where c.status = terminal:
         c.terminal_cause != null
         and c.resolved_at != null
-        and c.fired_payload != null
+        and c.terminal_payload != null
 }
 
 -- REQ-WAKE-011: every contract's terminal_cause is one of exactly
