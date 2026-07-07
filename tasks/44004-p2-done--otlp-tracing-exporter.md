@@ -66,10 +66,10 @@ Constraints/preferences:
 Dependency decision reached during implementation:
 
 ```toml
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "hyper-client"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 ```
 
-This avoids a second `reqwest` major version and avoids OTLP gRPC transport. The upstream `opentelemetry-proto` generated message feature still pulls `tonic`/`tonic-prost` codegen types for protobuf message definitions; avoiding those would require a different exporter implementation rather than the supported `opentelemetry-otlp` HTTP/protobuf path.
+The async hyper client panics when the OTel batch processor exports from its own worker thread without a Tokio reactor. The blocking HTTP client avoids that and still avoids OTLP gRPC transport. The upstream `opentelemetry-proto` generated message feature still pulls `tonic`/`tonic-prost` codegen types for protobuf message definitions; avoiding those would require a different exporter implementation rather than the supported `opentelemetry-otlp` HTTP/protobuf path.
 
 ## Implementation plan
 

@@ -106,16 +106,17 @@ tracing-appender = "0.2"
 # Trace export: `tracing-opentelemetry` bridges Phoenix `tracing` spans into
 # OpenTelemetry, then logging.rs selects exactly one exporter at startup.
 # `datadog-opentelemetry` sends Datadog native v0.4 trace payloads over HTTP.
-# `opentelemetry-otlp` is compiled for OTLP HTTP/protobuf over hyper only, so
-# local Jaeger support does not pull in a reqwest duplicate or gRPC transport.
-# The upstream generated proto messages still depend on tonic's codegen types.
+# `opentelemetry-otlp` is compiled for OTLP HTTP/protobuf with its blocking
+# HTTP client: the OTel batch processor exports from its own worker thread,
+# where async hyper/reqwest clients have no Tokio reactor. This avoids OTLP
+# gRPC transport; upstream proto messages still depend on tonic codegen types.
 # Version pinning: published datadog-opentelemetry 0.4 uses opentelemetry 0.31,
 # so tracing-opentelemetry must be 0.32 (not 0.33, which needs otel 0.32).
 datadog-opentelemetry = "0.4"
 tracing-opentelemetry = "0.32"
 opentelemetry = "0.31"
 opentelemetry_sdk = "0.31"
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "hyper-client"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 base64 = "0.22"
 sha2 = "0.11"
 rand = "0.10"
