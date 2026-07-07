@@ -1556,11 +1556,8 @@ async fn create_conversation_with_id(
         }
         None => uuid::Uuid::new_v4().to_string(),
     };
-    if req.cwd.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "Working directory cannot be empty".to_string(),
-        ));
-    }
+    let valid_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     // REQ-SEED-001: seeded conversations may be created empty so the UI can
     // hydrate the input area with a draft and let the user review before
@@ -1648,9 +1645,9 @@ async fn create_conversation_with_id(
     let slug = format!("conv-{short_id}");
     let project_id: Option<String> = None;
     let conv_mode = crate::db::ConvMode::Direct;
-    let effective_cwd = req.cwd.clone();
+    let effective_cwd = valid_cwd.into_raw();
     let desired_base_branch = req.base_branch.as_deref();
-    let resolved_model = req
+    let shell_model = req
         .model
         .clone()
         .unwrap_or_else(|| state.llm_registry.default_model_id().to_string());
@@ -1683,7 +1680,7 @@ async fn create_conversation_with_id(
             &effective_cwd,
             true,
             None,
-            Some(resolved_model.as_str()),
+            Some(shell_model.as_str()),
             project_id.as_deref(),
             &conv_mode,
             desired_base_branch,
@@ -1714,7 +1711,7 @@ async fn create_conversation_with_id(
 
     let intent = crate::db::ConversationCreationIntent {
         cwd: req.cwd.clone(),
-        model: Some(resolved_model.clone()),
+        model: req.model.clone(),
         text: req.text.clone(),
         message_id: req.message_id.clone(),
         images: req
@@ -1749,6 +1746,32 @@ async fn create_conversation_with_id(
         Err(crate::db::DbError::Sqlx(sqlx::Error::Database(db_err)))
             if db_err.code().as_deref() == Some("2067") =>
         {
+            if let Ok(Some(existing_job)) = state
+                .runtime
+                .db()
+                .get_conversation_creation_job_for_message(&req.message_id)
+                .await
+            {
+                rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
+                    .await;
+                let existing_conversation = state
+                    .runtime
+                    .db()
+                    .get_conversation(&existing_job.conversation_id)
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                let mut conversation_json =
+                    conversation_to_json(&state, &existing_conversation, None);
+                inject_creation_job_state_fields(
+                    &state,
+                    &existing_conversation,
+                    &mut conversation_json,
+                )
+                .await;
+                return Ok(Json(ConversationResponse {
+                    conversation: conversation_json,
+                }));
+            }
             if let Ok(Some(existing_job)) = state
                 .runtime
                 .db()
@@ -5890,33 +5913,29 @@ mod conversation_cwd_validation_tests {
     }
 
     #[tokio::test]
-    async fn create_conversation_accepts_filesystem_root_as_async_failed_record_candidate() {
+    async fn create_conversation_rejects_filesystem_root_cwd() {
         let state = hard_delete_cascade_tests::make_test_state().await;
-        let Json(response) =
-            create_conversation_with_id(state, create_request("/".to_string()), Vec::new())
-                .await
-                .expect("root cwd is accepted for async provisioning");
+        let err = create_conversation_with_id(state, create_request("/".to_string()), Vec::new())
+            .await
+            .expect_err("root cwd rejected before shell creation");
 
-        assert_eq!(response.conversation["cwd"].as_str(), Some("/"));
-        assert_eq!(
-            response.conversation["state"]["type"].as_str(),
-            Some("provisioning")
-        );
+        match err {
+            AppError::BadRequest(msg) => assert!(msg.contains("filesystem root"), "got: {msg}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn create_conversation_accepts_cwd_that_resolves_to_root_for_async_validation() {
+    async fn create_conversation_rejects_cwd_that_resolves_to_root() {
         let state = hard_delete_cascade_tests::make_test_state().await;
-        let Json(response) =
-            create_conversation_with_id(state, create_request("/..".to_string()), Vec::new())
-                .await
-                .expect("canonical root is accepted for async provisioning");
+        let err = create_conversation_with_id(state, create_request("/..".to_string()), Vec::new())
+            .await
+            .expect_err("canonical root rejected before shell creation");
 
-        assert_eq!(response.conversation["cwd"].as_str(), Some("/.."));
-        assert_eq!(
-            response.conversation["state"]["type"].as_str(),
-            Some("provisioning")
-        );
+        match err {
+            AppError::BadRequest(msg) => assert!(msg.contains("filesystem root"), "got: {msg}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -5934,9 +5953,10 @@ mod conversation_cwd_validation_tests {
         .await
         .expect("deep cwd accepted");
 
+        let canonical = deep.canonicalize().unwrap();
         assert_eq!(
             response.conversation["cwd"].as_str(),
-            Some(deep.to_string_lossy().as_ref())
+            Some(canonical.to_str().unwrap())
         );
         assert_eq!(
             response.conversation["state"]["type"].as_str(),

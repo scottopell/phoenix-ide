@@ -743,6 +743,7 @@ mod tests {
                 conv_mode_label: Some("work".to_string()),
                 base_branch: None,
                 task_title: None,
+                work_scope_key: None,
             },
         };
         assert_parity(&event);

@@ -1890,6 +1890,28 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    /// Load the creation job for an initial message id, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the database read fails.
+    pub async fn get_conversation_creation_job_for_message(
+        &self,
+        message_id: &str,
+    ) -> DbResult<Option<ConversationCreationJob>> {
+        sqlx::query(
+            "SELECT id, conversation_id, message_id, phase, intent_json, error,
+                    accepted_at, provisioning_started_at, completed_at, failed_at,
+                    created_at, updated_at
+             FROM conversation_creation_jobs WHERE message_id = ?1",
+        )
+        .bind(message_id)
+        .try_map(parse_conversation_creation_job_row)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
     /// List accepted/provisioning creation jobs in processing order.
     ///
     /// # Errors
@@ -3556,47 +3578,70 @@ impl Database {
         id: &str,
         update: &ConversationCreationMetadataUpdate,
     ) -> DbResult<()> {
-        let now = Utc::now().to_rfc3339();
-        let result = sqlx::query(
-            "UPDATE conversations
-             SET slug = COALESCE(?1, slug),
-                 title = CASE
-                     WHEN ?2 = 1 THEN ?3
-                     ELSE title
-                 END,
-                 cwd = COALESCE(?4, cwd),
-                 project_id = CASE
-                     WHEN ?5 = 1 THEN ?6
-                     ELSE project_id
-                 END,
-                 desired_base_branch = CASE
-                     WHEN ?7 = 1 THEN ?8
-                     ELSE desired_base_branch
-                 END,
-                 updated_at = ?9
-             WHERE id = ?10",
-        )
-        .bind(update.slug.as_deref())
-        .bind(update.title.is_some())
-        .bind(update.title.as_ref().and_then(|v| v.as_deref()))
-        .bind(update.cwd.as_deref())
-        .bind(update.project_id.is_some())
-        .bind(update.project_id.as_ref().and_then(|v| v.as_deref()))
-        .bind(update.desired_base_branch.is_some())
-        .bind(
-            update
-                .desired_base_branch
-                .as_ref()
-                .and_then(|v| v.as_deref()),
-        )
-        .bind(now)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(id.to_string()));
+        let base_slug = update.slug.clone();
+        let mut candidate_slug = base_slug.clone();
+        let mut attempts = 0u8;
+        loop {
+            let now = Utc::now().to_rfc3339();
+            let result = sqlx::query(
+                "UPDATE conversations
+                 SET slug = COALESCE(?1, slug),
+                     title = CASE
+                         WHEN ?2 = 1 THEN ?3
+                         ELSE title
+                     END,
+                     cwd = COALESCE(?4, cwd),
+                     project_id = CASE
+                         WHEN ?5 = 1 THEN ?6
+                         ELSE project_id
+                     END,
+                     desired_base_branch = CASE
+                         WHEN ?7 = 1 THEN ?8
+                         ELSE desired_base_branch
+                     END,
+                     updated_at = ?9
+                 WHERE id = ?10",
+            )
+            .bind(candidate_slug.as_deref())
+            .bind(update.title.is_some())
+            .bind(update.title.as_ref().and_then(|v| v.as_deref()))
+            .bind(update.cwd.as_deref())
+            .bind(update.project_id.is_some())
+            .bind(update.project_id.as_ref().and_then(|v| v.as_deref()))
+            .bind(update.desired_base_branch.is_some())
+            .bind(
+                update
+                    .desired_base_branch
+                    .as_ref()
+                    .and_then(|v| v.as_deref()),
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await;
+            match result {
+                Ok(result) => {
+                    if result.rows_affected() == 0 {
+                        return Err(DbError::ConversationNotFound(id.to_string()));
+                    }
+                    return Ok(());
+                }
+                Err(sqlx::Error::Database(ref e))
+                    if e.code().as_deref() == Some("2067") && base_slug.is_some() =>
+                {
+                    attempts += 1;
+                    let slug = base_slug.as_deref().unwrap_or_default();
+                    if attempts >= 10 {
+                        let uuid_str = uuid::Uuid::new_v4().to_string();
+                        candidate_slug =
+                            Some(format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str)));
+                    } else {
+                        candidate_slug = Some(format!("{slug}-{:04x}", rand::random::<u16>()));
+                    }
+                }
+                Err(e) => return Err(DbError::Sqlx(e)),
+            }
         }
-        Ok(())
     }
 
     /// Get all non-archived Work/Branch conversations (for startup worktree reconciliation).

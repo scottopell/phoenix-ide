@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { TaskEntry } from '../api';
 import { useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
+import { generateUUID } from '../utils/uuid';
 import './TaskViewer.css';
 
 interface TaskViewerProps {
@@ -94,12 +95,8 @@ export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBac
     try {
       const promptText = buildTaskPrompt(task, rawContent);
       const seedLabel = `Work on task ${task.id}: ${task.slug}`;
-      const messageId =
-        crypto.randomUUID?.() ??
-        `seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      const clientConversationId =
-        crypto.randomUUID?.() ??
-        `conv-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const messageId = generateUUID();
+      const clientConversationId = generateUUID();
       const newConv = await createConversationWithStore(
         parentConversation.cwd,
         '', // empty — server accepts empty text when seed_parent_id is set

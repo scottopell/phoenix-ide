@@ -1,6 +1,7 @@
 use crate::api::handlers::{
     create_branch_worktree_blocking, create_managed_explore_worktree_blocking, generate_slug,
-    slugify_label, validate_user_ref, AppError, BranchWorktreeError, ManagedWorktreeError,
+    slugify_label, validate_user_ref, AppError, BranchWorktreeError, BranchWorktreeInfo,
+    ManagedWorktreeError,
 };
 use crate::db::{
     ConvMode, ConversationCreationMetadataUpdate, ConversationCreationPhase, ErrorKind, ImageData,
@@ -56,13 +57,42 @@ async fn process_job(
         });
     }
 
+    if manager
+        .db()
+        .message_exists(&job.intent.message_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        manager
+            .db()
+            .mark_conversation_creation_job_complete(&job.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
     match provision_conversation(manager, &job).await {
-        Ok(()) => {
+        Ok(ProvisionOutcome::SeededEmpty) => {
             manager
                 .db()
                 .mark_conversation_creation_job_complete(&job.id)
                 .await
                 .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        Ok(ProvisionOutcome::InitialMessageSubmitted) => {
+            if manager
+                .db()
+                .message_exists(&job.intent.message_id)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                manager
+                    .db()
+                    .mark_conversation_creation_job_complete(&job.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             Ok(())
         }
         Err((message, kind)) => {
@@ -97,11 +127,16 @@ async fn process_job(
     }
 }
 
+enum ProvisionOutcome {
+    SeededEmpty,
+    InitialMessageSubmitted,
+}
+
 #[allow(clippy::too_many_lines)]
 async fn provision_conversation(
     manager: &Arc<RuntimeManager>,
     job: &crate::db::ConversationCreationJob,
-) -> Result<(), (String, ErrorKind)> {
+) -> Result<ProvisionOutcome, (String, ErrorKind)> {
     let intent = &job.intent;
     let valid_cwd = crate::conversation_cwd::validate_conversation_cwd(&intent.cwd)
         .map_err(|e| (e.to_string(), ErrorKind::InvalidRequest))?;
@@ -150,18 +185,39 @@ async fn provision_conversation(
                 )
             })?;
             validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
-            let db = manager.db().clone();
-            let conv_id = job.conversation_id.clone();
-            let info = tokio::task::spawn_blocking(move || {
-                create_branch_worktree_blocking(&repo_root, &conv_id, &branch_name, &db)
-            })
-            .await
-            .map_err(|e| {
-                (
-                    format!("spawn_blocking failed: {e}"),
-                    ErrorKind::ServerError,
+            let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
+            let info = if existing_path.exists() {
+                let worktree_path = existing_path.to_string_lossy().to_string();
+                let default_branch = crate::git_ops::run_git(
+                    Path::new(&repo_root),
+                    &["symbolic-ref", "refs/remotes/origin/HEAD"],
                 )
-            })?;
+                .ok()
+                .and_then(|s| {
+                    s.trim()
+                        .strip_prefix("refs/remotes/origin/")
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| branch_name.clone());
+                Ok(BranchWorktreeInfo {
+                    branch_name: branch_name.clone(),
+                    worktree_path,
+                    base_branch: default_branch,
+                })
+            } else {
+                let db = manager.db().clone();
+                let conv_id = job.conversation_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    create_branch_worktree_blocking(&repo_root, &conv_id, &branch_name, &db)
+                })
+                .await
+                .map_err(|e| {
+                    (
+                        format!("spawn_blocking failed: {e}"),
+                        ErrorKind::ServerError,
+                    )
+                })?
+            };
             let info = match info {
                 Ok(info) => info,
                 Err(BranchWorktreeError::Conflict { slug }) => {
@@ -185,6 +241,7 @@ async fn provision_conversation(
                     .map_err(|_| ("empty base branch".to_string(), ErrorKind::ServerError))?,
             };
         }
+        "auto" if repo_root.is_none() => {}
         "managed" | "auto" => {
             let repo_root = repo_root.ok_or_else(|| {
                 (
@@ -214,23 +271,28 @@ async fn provision_conversation(
                 })?
                 .to_string();
             validate_user_ref(&base_branch).map_err(app_error_to_kind)?;
-            let conv_id = job.conversation_id.clone();
-            let repo_for_blocking = repo_root.clone();
-            let base_branch_for_blocking = base_branch.clone();
-            let worktree = tokio::task::spawn_blocking(move || {
-                create_managed_explore_worktree_blocking(
-                    &repo_for_blocking,
-                    &conv_id,
-                    &base_branch_for_blocking,
-                )
-            })
-            .await
-            .map_err(|e| {
-                (
-                    format!("spawn_blocking failed: {e}"),
-                    ErrorKind::ServerError,
-                )
-            })?;
+            let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
+            let worktree = if existing_path.exists() {
+                Ok(existing_path.to_string_lossy().to_string())
+            } else {
+                let conv_id = job.conversation_id.clone();
+                let repo_for_blocking = repo_root.clone();
+                let base_branch_for_blocking = base_branch.clone();
+                tokio::task::spawn_blocking(move || {
+                    create_managed_explore_worktree_blocking(
+                        &repo_for_blocking,
+                        &conv_id,
+                        &base_branch_for_blocking,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    (
+                        format!("spawn_blocking failed: {e}"),
+                        ErrorKind::ServerError,
+                    )
+                })?
+            };
             let worktree = match worktree {
                 Ok(path) => path,
                 Err(ManagedWorktreeError::BadRequest(msg)) => {
@@ -325,6 +387,13 @@ async fn provision_conversation(
                 conv_mode_label: Some(conv_mode.label().to_string()),
                 base_branch: conv_mode.base_branch().map(ToString::to_string),
                 task_title: conv_mode.task_title().map(ToString::to_string),
+                work_scope_key: Some(
+                    crate::work_scope::WorkScope::resolve(
+                        &job.conversation_id,
+                        conv_mode.worktree_path().map(Path::new),
+                    )
+                    .stable_key(),
+                ),
             },
         });
     }
@@ -339,9 +408,6 @@ async fn provision_conversation(
             .update_conversation_state(&job.conversation_id, &ConvState::Idle)
             .await
             .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
-        manager
-            .evict_runtime(&job.conversation_id, EvictionReason::CreationProvisioned)
-            .await;
         if let Some(broadcast_tx) = {
             let runtimes = manager.runtimes.read().await;
             runtimes
@@ -356,7 +422,10 @@ async fn provision_conversation(
                 state_updated_at: chrono::Utc::now(),
             });
         }
-        return Ok(());
+        manager
+            .evict_runtime(&job.conversation_id, EvictionReason::CreationProvisioned)
+            .await;
+        return Ok(ProvisionOutcome::SeededEmpty);
     }
 
     let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
@@ -391,7 +460,14 @@ async fn provision_conversation(
         .send_event(&job.conversation_id, event)
         .await
         .map_err(|e| (e, ErrorKind::ServerError))?;
-    Ok(())
+    Ok(ProvisionOutcome::InitialMessageSubmitted)
+}
+
+fn deterministic_worktree_path(repo_root: &str, conv_id: &str) -> std::path::PathBuf {
+    Path::new(repo_root)
+        .join(".phoenix")
+        .join("worktrees")
+        .join(conv_id)
 }
 
 fn app_error_to_kind(error: AppError) -> (String, ErrorKind) {

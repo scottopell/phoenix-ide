@@ -245,7 +245,11 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'creation_failed':
       return {
         type: 'creation_failed',
-        message: typeof obj['message'] === 'string' ? obj['message'] : null,
+        message: typeof obj['message'] === 'string'
+          ? obj['message']
+          : typeof obj['error'] === 'string'
+            ? obj['error']
+            : null,
         prompt: typeof obj['prompt'] === 'string' ? obj['prompt'] : null,
       };
     case 'llm_requesting':

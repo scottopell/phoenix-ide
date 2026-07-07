@@ -4,6 +4,7 @@ import { api, canChangeModelInState, isTerminalConversationState, ExpansionError
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
+import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import { ConversationNavStack } from '../components/ConversationNavStack';
@@ -1072,9 +1073,8 @@ function ConversationPageContent() {
   const handleAssistShellSetup = useCallback(
     async (promptText: string, seedLabel: string, homeDir: string) => {
       if (!conversation?.id) return;
-      const messageId =
-        crypto.randomUUID?.() ??
-        `seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const messageId = generateUUID();
+      const clientConversationId = generateUUID();
       // Stash the seed draft BEFORE navigation so it's visible to the new
       // page on first render (useDraft reads localStorage synchronously in
       // its initializer).
@@ -1582,6 +1582,71 @@ function ConversationPageContent() {
           <button className="sse-error-dismiss" onClick={() => dispatch({ type: 'clear_error' })}>
             Dismiss
           </button>
+        </div>
+      )}
+      {convStateForChildren.type === 'provisioning' && (
+        <div className="terminal-banner">
+          <span>
+            Creating conversation… shell ready{provisioningPrompt ? ' • prompt queued' : ''}
+          </span>
+          {provisioningPrompt && (
+            <button
+              type="button"
+              className="context-exhausted-copy"
+              onClick={async () => {
+                const ok = await copyToClipboard(provisioningPrompt);
+                showInfo(ok ? 'Queued prompt copied to clipboard' : 'Copy failed -- select and copy manually');
+              }}
+            >
+              Copy prompt
+            </button>
+          )}
+          <button
+            type="button"
+            className="context-exhausted-copy"
+            disabled
+            title="Delete is available after provisioning finishes."
+          >
+            Delete
+          </button>
+        </div>
+      )}
+      {convStateForChildren.type === 'creation_failed' && (
+        <div className="context-exhausted-banner context-exhausted-banner--expanded">
+          <div className="context-exhausted-summary">
+            <div className="error-body-title">Conversation creation failed</div>
+            <div className="error-body-details">
+              {convStateForChildren.message ?? 'Phoenix created the shell but could not finish setup.'}
+            </div>
+            <div className="context-exhausted-actions">
+              <button type="button" className="context-exhausted-continue" onClick={handleStartOverFromFailedCreation}>
+                Start over
+              </button>
+              <button
+                type="button"
+                className="context-exhausted-copy"
+                disabled={deletingConversation}
+                onClick={() => void handleDeleteProvisioningConversation()}
+              >
+                {deletingConversation ? 'Deleting…' : 'Delete'}
+              </button>
+              {creationFailedPrompt && (
+                <button
+                  type="button"
+                  className="context-exhausted-copy"
+                  onClick={async () => {
+                    const ok = await copyToClipboard(creationFailedPrompt);
+                    showInfo(ok ? 'Prompt copied to clipboard' : 'Copy failed -- select and copy manually');
+                  }}
+                >
+                  Copy prompt
+                </button>
+              )}
+            </div>
+            {creationFailedPrompt && (
+              <pre className="context-exhausted-content">{creationFailedPrompt}</pre>
+            )}
+          </div>
         </div>
       )}
       {convStateForChildren.type === 'context_exhausted' && (

@@ -5298,6 +5298,7 @@ where
                     conv_mode_label: None,
                     base_branch: None,
                     task_title: None,
+                    work_scope_key: None,
                 },
             });
 
@@ -5514,6 +5515,13 @@ where
                             conv_mode_label: Some("Work".to_string()),
                             base_branch: Some(approval_result.base_branch.clone()),
                             task_title: Some(approval_result.task_title.clone()),
+                            work_scope_key: Some(
+                                crate::work_scope::WorkScope::resolve(
+                                    &self.context.conversation_id,
+                                    Some(std::path::Path::new(&approval_result.worktree_path)),
+                                )
+                                .stable_key(),
+                            ),
                         },
                     });
 
