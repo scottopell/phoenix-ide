@@ -163,6 +163,76 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.upsertSnapshots([aPrime, b])).toEqual(['alpha']);
   });
 
+  it('moves a conversation to its current slug instead of keeping duplicate id snapshots', () => {
+    const store = new ConversationStore();
+    const original = makeConv('old-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-01T00:00:00Z',
+    });
+    const renamed = makeConv('new-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-02T00:00:00Z',
+      cwd: '/renamed',
+    });
+
+    expect(store.upsertSnapshot('old-slug', original)).toBe(true);
+    expect(store.upsertSnapshot('new-slug', renamed)).toBe(true);
+
+    expect(store.slugForId('conv-shared')).toBe('new-slug');
+    expect(store.getSnapshot('old-slug').conversation).toBeNull();
+    expect(store.getSnapshot('new-slug').conversation).toMatchObject({
+      id: 'conv-shared',
+      slug: 'new-slug',
+      cwd: '/renamed',
+    });
+    expect(store.listSnapshots().map((c) => c.id)).toEqual(['conv-shared']);
+  });
+
+  it('rejects stale aliases without moving the canonical newer snapshot', () => {
+    const store = new ConversationStore();
+    const fresh = makeConv('current-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-02T00:00:00Z',
+      cwd: '/fresh',
+    });
+    const staleAlias = makeConv('old-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-01T00:00:00Z',
+      cwd: '/stale',
+    });
+
+    store.upsertSnapshot('current-slug', fresh);
+    expect(store.upsertSnapshot('old-slug', staleAlias)).toBe(false);
+
+    expect(store.slugForId('conv-shared')).toBe('current-slug');
+    expect(store.getSnapshot('current-slug').conversation?.cwd).toBe('/fresh');
+    expect(store.getSnapshot('old-slug').conversation).toBeNull();
+    expect(store.listSnapshots().map((c) => c.slug)).toEqual(['current-slug']);
+  });
+
+  it('does not remove a slug that has been reused by a different conversation id', () => {
+    const store = new ConversationStore();
+    store.upsertSnapshot('shared-slug', makeConv('shared-slug', {
+      id: 'conv-old',
+      updated_at: '2024-06-01T00:00:00Z',
+    }));
+    store.upsertSnapshot('shared-slug', makeConv('shared-slug', {
+      id: 'conv-new',
+      updated_at: '2024-06-02T00:00:00Z',
+    }));
+
+    expect(store.slugForId('conv-old')).toBeUndefined();
+    expect(store.slugForId('conv-new')).toBe('shared-slug');
+    expect(store.upsertSnapshot('fresh-slug', makeConv('fresh-slug', {
+      id: 'conv-old',
+      updated_at: '2024-06-03T00:00:00Z',
+    }))).toBe(true);
+
+    expect(store.getSnapshot('shared-slug').conversation?.id).toBe('conv-new');
+    expect(store.getSnapshot('fresh-slug').conversation?.id).toBe('conv-old');
+    expect(store.listSnapshots().map((c) => c.id).sort()).toEqual(['conv-new', 'conv-old']);
+  });
+
   it('listSnapshots returns every conversation currently held', () => {
     const store = new ConversationStore();
     store.upsertSnapshot('alpha', makeConv('alpha'));

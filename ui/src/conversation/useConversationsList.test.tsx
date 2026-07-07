@@ -211,6 +211,35 @@ describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
     expect(screen.getByTestId('cwd-alpha').textContent).toBe('/fresh');
   });
 
+  it('dedupes slug aliases for the same conversation id before rendering the sidebar list', async () => {
+    let store: ConversationStore | undefined;
+    const captureStore = (s: ConversationStore) => {
+      store = s;
+    };
+
+    render(
+      <ConversationProvider>
+        <Consumer onStore={captureStore} />
+      </ConversationProvider>,
+    );
+
+    act(() => {
+      store!.upsertSnapshot('old-slug', makeConv('old-slug', {
+        id: 'conv-shared',
+        updated_at: '2024-06-01T00:00:00Z',
+      }));
+      store!.upsertSnapshot('new-slug', makeConv('new-slug', {
+        id: 'conv-shared',
+        updated_at: '2024-06-02T00:00:00Z',
+      }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('row-new-slug')).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId('row-old-slug')).not.toBeInTheDocument();
+  });
+
   it('excludes sub-agent snapshots from the sidebar list', async () => {
     // A sub-agent snapshot can reach the store by side channels (e.g.
     // navigating to its page via the spawn_agents "open" button, or cache

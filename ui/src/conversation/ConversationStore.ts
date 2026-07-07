@@ -68,7 +68,10 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
    * Returns true iff this atom changed.
    */
   upsertSnapshot(slug: string, conversation: Conversation): boolean {
-    const current = this.getSnapshot(slug);
+    const indexedSlug = this.slugByConvId.get(conversation.id);
+    const indexedAtom = indexedSlug && indexedSlug !== slug ? this.atomByKey(indexedSlug) : undefined;
+    const moveFromSlug = indexedAtom?.conversation?.id === conversation.id ? indexedSlug : undefined;
+    const current = moveFromSlug ? indexedAtom! : this.getSnapshot(slug);
     if (current.conversation) {
       // Monotonic: only accept newer or equal-but-different rows.
       // We compare ISO timestamps as strings (lexicographic = chronological).
@@ -86,14 +89,32 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
           } else {
             merged.cached_pr = conversation.cached_pr;
           }
-          this.slugByConvId.set(merged.id, slug);
-          notifyConversationSnapshotChange(merged);
-          return this.setAtom(slug, { ...current, conversation: merged });
+          return this.setConversationSnapshot(slug, merged, current, moveFromSlug);
         }
         if (conversation.id === current.conversation.id) {
+          if (moveFromSlug) {
+            return this.setConversationSnapshot(slug, conversation, current, moveFromSlug);
+          }
           return false;
         }
       }
+    }
+    return this.setConversationSnapshot(slug, conversation, current, moveFromSlug);
+  }
+
+  private setConversationSnapshot(
+    slug: string,
+    conversation: Conversation,
+    current: ConversationAtom,
+    moveFromSlug?: string,
+  ): boolean {
+    if (moveFromSlug && moveFromSlug !== slug) {
+      this.removeAtom(moveFromSlug);
+    }
+    const destinationAtom = this.atomByKey(slug);
+    const overwrittenId = destinationAtom?.conversation?.id;
+    if (overwrittenId && overwrittenId !== conversation.id && this.slugByConvId.get(overwrittenId) === slug) {
+      this.slugByConvId.delete(overwrittenId);
     }
     this.slugByConvId.set(conversation.id, slug);
     notifyConversationSnapshotChange(conversation);
