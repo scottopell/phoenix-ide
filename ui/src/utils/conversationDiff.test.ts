@@ -29,7 +29,7 @@ describe('conversationListsEqual', () => {
     expect(conversationListsEqual(list, list)).toBe(true);
   });
 
-  it('returns true when contents match by (id, updated_at)', () => {
+  it('returns true when contents match by (id, slug, updated_at)', () => {
     const a = [makeConv('a', '2025-01-01T00:00:00Z'), makeConv('b', '2025-01-02T00:00:00Z')];
     const b = [makeConv('a', '2025-01-01T00:00:00Z'), makeConv('b', '2025-01-02T00:00:00Z')];
     expect(conversationListsEqual(a, b)).toBe(true);
@@ -80,13 +80,15 @@ describe('conversationListsEqual', () => {
     expect(conversationListsEqual(a, b)).toBe(false);
   });
 
-  it('ignores fields outside (id, updated_at, cached_pr) — server bumps updated_at when those change', () => {
-    // If the server changed something material (state, message_count, slug,
-    // model, archived, etc.) it would also bump updated_at — see src/db.rs.
-    // Within a single (id, updated_at) tuple, all other fields are by
-    // definition unchanged. The helper is deliberately not a deep-equal.
-    const a = [makeConv('a', '2025-01-01T00:00:00Z', { message_count: 0, slug: 'old' })];
-    const b = [makeConv('a', '2025-01-01T00:00:00Z', { message_count: 99, slug: 'new' })];
+  it('detects slug-only moves without an updated_at change', () => {
+    const a = [makeConv('a', '2025-01-01T00:00:00Z', { slug: 'old' })];
+    const b = [makeConv('a', '2025-01-01T00:00:00Z', { slug: 'new' })];
+    expect(conversationListsEqual(a, b)).toBe(false);
+  });
+
+  it('ignores fields outside (id, slug, updated_at, cached_pr)', () => {
+    const a = [makeConv('a', '2025-01-01T00:00:00Z', { message_count: 0 })];
+    const b = [makeConv('a', '2025-01-01T00:00:00Z', { message_count: 99 })];
     expect(conversationListsEqual(a, b)).toBe(true);
   });
 });

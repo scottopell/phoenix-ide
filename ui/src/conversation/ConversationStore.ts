@@ -68,49 +68,40 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
    * Returns true iff this atom changed.
    */
   upsertSnapshot(slug: string, conversation: Conversation): boolean {
-    const indexedSlug = this.slugByConvId.get(conversation.id) ?? this.findSlugForConversationId(conversation.id, slug);
-    const indexedAtom = indexedSlug && indexedSlug !== slug ? this.atomByKey(indexedSlug) : undefined;
-    const moveFromSlug = indexedAtom?.conversation?.id === conversation.id ? indexedSlug : undefined;
-    const current = moveFromSlug ? indexedAtom! : this.getSnapshot(slug);
-    if (current.conversation) {
+    const destination = this.getSnapshot(slug);
+    const existingForId = this.bestConversationForId(conversation.id);
+    if (existingForId) {
       // Monotonic: only accept newer or equal-but-different rows.
       // We compare ISO timestamps as strings (lexicographic = chronological).
-      if (conversation.updated_at < current.conversation.updated_at) {
+      if (conversation.updated_at < existingForId.updated_at) {
         return false;
       }
-      if (conversation.updated_at === current.conversation.updated_at) {
-        if (
-          conversation.id === current.conversation.id &&
-          !cachedPrEqual(conversation.cached_pr, current.conversation.cached_pr)
-        ) {
-          const merged: Conversation = { ...current.conversation };
-          if (conversation.cached_pr === undefined) {
-            delete merged.cached_pr;
-          } else {
-            merged.cached_pr = conversation.cached_pr;
-          }
-          return this.setConversationSnapshot(slug, merged, current, moveFromSlug);
+      if (conversation.updated_at === existingForId.updated_at) {
+        if (!cachedPrEqual(conversation.cached_pr, existingForId.cached_pr)) {
+          const destinationConversation = destination.conversation;
+          const nextConversation = destinationConversation?.id === conversation.id && destinationConversation.slug === conversation.slug
+            ? this.withCachedPr(destinationConversation, conversation.cached_pr)
+            : conversation;
+          return this.setConversationSnapshot(slug, nextConversation, destination);
         }
-        if (conversation.id === current.conversation.id) {
-          if (moveFromSlug) {
-            return this.setConversationSnapshot(slug, conversation, current, moveFromSlug);
-          }
+        const destinationConversation = destination.conversation;
+        if (
+          destinationConversation?.id === conversation.id &&
+          destinationConversation.slug === conversation.slug
+        ) {
           return false;
         }
       }
     }
-    return this.setConversationSnapshot(slug, conversation, current, moveFromSlug);
+    return this.setConversationSnapshot(slug, conversation, destination);
   }
 
   private setConversationSnapshot(
     slug: string,
     conversation: Conversation,
-    current: ConversationAtom,
-    moveFromSlug?: string,
+    destination: ConversationAtom,
   ): boolean {
-    if (moveFromSlug && moveFromSlug !== slug) {
-      this.removeAtom(moveFromSlug);
-    }
+    this.removeInactiveAliases(conversation.id, slug);
     const destinationAtom = this.atomByKey(slug);
     const overwrittenId = destinationAtom?.conversation?.id;
     if (overwrittenId && overwrittenId !== conversation.id && this.slugByConvId.get(overwrittenId) === slug) {
@@ -118,7 +109,20 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     }
     this.slugByConvId.set(conversation.id, slug);
     notifyConversationSnapshotChange(conversation);
-    return this.setAtom(slug, { ...current, conversation });
+    return this.setAtom(slug, { ...destination, conversation });
+  }
+
+  private withCachedPr(
+    conversation: Conversation,
+    cachedPr: CachedPrSummary | null | undefined,
+  ): Conversation {
+    const merged: Conversation = { ...conversation };
+    if (cachedPr === undefined) {
+      delete merged.cached_pr;
+    } else {
+      merged.cached_pr = cachedPr;
+    }
+    return merged;
   }
 
   /**
@@ -141,18 +145,47 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       return this.upsertSnapshot(newSlug, conversation);
     }
 
+    const changed = this.upsertSnapshot(newSlug, conversation);
     const oldAtom = this.atomByKey(oldSlug);
-    if (oldAtom?.conversation?.id === conversation.id) {
+    if (oldAtom?.conversation?.id === conversation.id && this.isSnapshotOnly(oldAtom)) {
       this.removeAtom(oldSlug);
     }
-    return this.upsertSnapshot(newSlug, conversation);
+    return changed;
   }
 
-  private findSlugForConversationId(convId: string, exceptSlug?: string): string | undefined {
-    for (const [slug, atom] of this.entries()) {
-      if (slug !== exceptSlug && atom.conversation?.id === convId) return slug;
+  private bestConversationForId(convId: string): Conversation | undefined {
+    let best: Conversation | undefined;
+    for (const [, atom] of this.entries()) {
+      const conversation = atom.conversation;
+      if (conversation?.id !== convId) continue;
+      if (!best || this.preferForSidebar(conversation, best)) best = conversation;
     }
-    return undefined;
+    return best;
+  }
+
+  private removeInactiveAliases(convId: string, keepSlug: string): void {
+    for (const [slug, atom] of this.entries()) {
+      if (slug === keepSlug || atom.conversation?.id !== convId) continue;
+      if (this.isSnapshotOnly(atom)) {
+        this.removeAtom(slug);
+      }
+    }
+  }
+
+  private isSnapshotOnly(atom: ConversationAtom): boolean {
+    return atom.messages.length === 0
+      && atom.connectionEpoch === null
+      && atom.streamingBuffer === null
+      && atom.systemPrompt === null;
+  }
+
+  private preferForSidebar(candidate: Conversation, existing: Conversation): boolean {
+    const indexedSlug = this.slugByConvId.get(candidate.id);
+    if (candidate.slug === indexedSlug && existing.slug !== indexedSlug) return true;
+    if (existing.slug === indexedSlug && candidate.slug !== indexedSlug) return false;
+    if (candidate.updated_at > existing.updated_at) return true;
+    if (candidate.updated_at < existing.updated_at) return false;
+    return candidate.slug > existing.slug;
   }
 
   /**
@@ -167,7 +200,7 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       const conversation = atom.conversation;
       if (!conversation) continue;
       const existing = byId.get(conversation.id);
-      if (!existing || conversation.updated_at > existing.updated_at) {
+      if (!existing || this.preferForSidebar(conversation, existing)) {
         byId.set(conversation.id, conversation);
       }
     }

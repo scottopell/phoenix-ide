@@ -5,11 +5,11 @@
 // causing every consumer (Sidebar, ConversationList, chain-grouping memo,
 // every <li> row) to re-render even when nothing changed.
 //
-// We compare by `(id, updated_at)` per row in order. The server returns the
-// list ordered by `updated_at DESC`, and bumps `updated_at` on every mutation
-// that should affect display (state transitions, message inserts, archive,
-// rename — see src/db.rs). So `(id, updated_at)` is a sufficient signature for
-// “something the sidebar would render differently changed.”
+// We compare by `(id, slug, updated_at)` per row in order. The server returns
+// the list ordered by `updated_at DESC`, and bumps `updated_at` on every
+// mutation that should affect display (state transitions, message inserts,
+// archive). Slug remains part of the signature because client-side alias
+// reconciliation can move a row between slug keys without a timestamp bump.
 //
 // Pure function, no React deps — unit-tested independently.
 
@@ -28,13 +28,14 @@ function cachedPrEqual(a: CachedPrSummary | null | undefined, b: CachedPrSummary
 
 function sidebarRowEqual(a: Conversation, b: Conversation): boolean {
   return a.id === b.id
+    && a.slug === b.slug
     && a.updated_at === b.updated_at
     && cachedPrEqual(a.cached_pr, b.cached_pr);
 }
 
 /**
  * True iff `a` and `b` describe the same sidebar render: same length, same
- * order, same row identity/update timestamp, and same cached PR badge data.
+ * order, same row identity/slug/update timestamp, and same cached PR badge data.
  */
 export function conversationListsEqual(
   a: readonly Conversation[],
