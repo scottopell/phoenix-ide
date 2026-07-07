@@ -121,6 +121,23 @@ pub enum DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
+#[derive(Debug, Clone)]
+pub struct InsertConversationCreationJob {
+    pub id: String,
+    pub conversation_id: String,
+    pub message_id: Option<String>,
+    pub intent: ConversationCreationIntent,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConversationCreationMetadataUpdate {
+    pub slug: Option<String>,
+    pub title: Option<Option<String>>,
+    pub cwd: Option<String>,
+    pub project_id: Option<Option<String>>,
+    pub desired_base_branch: Option<Option<String>>,
+}
+
 /// Outcome of [`Database::continue_conversation`] (REQ-BED-030).
 ///
 /// The DB layer returns a typed outcome so the handler can map each arm to a
@@ -1797,6 +1814,181 @@ impl Database {
         Ok(rows)
     }
 
+    /// Insert a durable async conversation-creation job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the insert fails, the intent cannot be serialized,
+    /// or the inserted row cannot be read back.
+    pub async fn insert_conversation_creation_job(
+        &self,
+        job: &InsertConversationCreationJob,
+    ) -> DbResult<ConversationCreationJob> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let intent_json = serde_json::to_string(&job.intent)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                id, conversation_id, message_id, phase, intent_json, error,
+                accepted_at, provisioning_started_at, completed_at, failed_at,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, NULL, NULL, ?6, ?6)",
+        )
+        .bind(&job.id)
+        .bind(&job.conversation_id)
+        .bind(&job.message_id)
+        .bind(ConversationCreationPhase::Accepted.as_str())
+        .bind(intent_json)
+        .bind(&now_str)
+        .execute(&self.pool)
+        .await?;
+        self.get_conversation_creation_job(&job.id).await
+    }
+
+    /// Load a creation job by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the database read fails or no row exists for `job_id`.
+    pub async fn get_conversation_creation_job(
+        &self,
+        job_id: &str,
+    ) -> DbResult<ConversationCreationJob> {
+        sqlx::query(
+            "SELECT id, conversation_id, message_id, phase, intent_json, error,
+                    accepted_at, provisioning_started_at, completed_at, failed_at,
+                    created_at, updated_at
+             FROM conversation_creation_jobs WHERE id = ?1",
+        )
+        .bind(job_id)
+        .try_map(parse_conversation_creation_job_row)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// Load the creation job for a conversation, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the database read fails.
+    pub async fn get_conversation_creation_job_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<ConversationCreationJob>> {
+        sqlx::query(
+            "SELECT id, conversation_id, message_id, phase, intent_json, error,
+                    accepted_at, provisioning_started_at, completed_at, failed_at,
+                    created_at, updated_at
+             FROM conversation_creation_jobs WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .try_map(parse_conversation_creation_job_row)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// List accepted/provisioning creation jobs in processing order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the database read fails.
+    pub async fn list_pending_conversation_creation_jobs(
+        &self,
+    ) -> DbResult<Vec<ConversationCreationJob>> {
+        sqlx::query(
+            "SELECT id, conversation_id, message_id, phase, intent_json, error,
+                    accepted_at, provisioning_started_at, completed_at, failed_at,
+                    created_at, updated_at
+             FROM conversation_creation_jobs
+             WHERE phase IN ('accepted', 'provisioning')
+             ORDER BY updated_at ASC",
+        )
+        .try_map(parse_conversation_creation_job_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// Mark a creation job with a new phase and phase timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails or `job_id` does not exist.
+    pub async fn mark_conversation_creation_job_phase(
+        &self,
+        job_id: &str,
+        phase: ConversationCreationPhase,
+    ) -> DbResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET phase = ?1,
+                 updated_at = ?2,
+                 provisioning_started_at = CASE
+                     WHEN ?1 = 'provisioning' AND provisioning_started_at IS NULL THEN ?2
+                     ELSE provisioning_started_at
+                 END,
+                 completed_at = CASE
+                     WHEN ?1 = 'ready' THEN ?2
+                     ELSE completed_at
+                 END,
+                 failed_at = CASE
+                     WHEN ?1 = 'failed' THEN ?2
+                     ELSE failed_at
+                 END
+             WHERE id = ?3",
+        )
+        .bind(phase.as_str())
+        .bind(&now)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        }
+        Ok(())
+    }
+
+    /// Mark a creation job failed and record the failure message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails or `job_id` does not exist.
+    pub async fn mark_conversation_creation_job_failed(
+        &self,
+        job_id: &str,
+        error: &str,
+    ) -> DbResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET phase = 'failed', error = ?1, updated_at = ?2, failed_at = ?2
+             WHERE id = ?3",
+        )
+        .bind(error)
+        .bind(&now)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        }
+        Ok(())
+    }
+
+    /// Mark a creation job ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails or `job_id` does not exist.
+    pub async fn mark_conversation_creation_job_complete(&self, job_id: &str) -> DbResult<()> {
+        self.mark_conversation_creation_job_phase(job_id, ConversationCreationPhase::Ready)
+            .await
+    }
+
     /// Update conversation state, stamping `state_updated_at = now()`.
     /// Callers that own the authoritative entry timestamp (the runtime
     /// executor) should use [`Self::update_conversation_state_at`] so the
@@ -3344,6 +3536,63 @@ impl Database {
                 .bind(id)
                 .execute(&self.pool)
                 .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Update creation-time conversation metadata after async provisioning.
+    ///
+    /// Fields left as `None` are untouched; `Some(None)` clears a nullable
+    /// column; `Some(Some(v))` writes the value.
+    /// Update conversation metadata after async creation provisioning completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails or the conversation does not exist.
+    pub async fn update_conversation_creation_metadata(
+        &self,
+        id: &str,
+        update: &ConversationCreationMetadataUpdate,
+    ) -> DbResult<()> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE conversations
+             SET slug = COALESCE(?1, slug),
+                 title = CASE
+                     WHEN ?2 = 1 THEN ?3
+                     ELSE title
+                 END,
+                 cwd = COALESCE(?4, cwd),
+                 project_id = CASE
+                     WHEN ?5 = 1 THEN ?6
+                     ELSE project_id
+                 END,
+                 desired_base_branch = CASE
+                     WHEN ?7 = 1 THEN ?8
+                     ELSE desired_base_branch
+                 END,
+                 updated_at = ?9
+             WHERE id = ?10",
+        )
+        .bind(update.slug.as_deref())
+        .bind(update.title.is_some())
+        .bind(update.title.as_ref().and_then(|v| v.as_deref()))
+        .bind(update.cwd.as_deref())
+        .bind(update.project_id.is_some())
+        .bind(update.project_id.as_ref().and_then(|v| v.as_deref()))
+        .bind(update.desired_base_branch.is_some())
+        .bind(
+            update
+                .desired_base_branch
+                .as_ref()
+                .and_then(|v| v.as_deref()),
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
@@ -4904,6 +5153,51 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         chain_name,
         llm_language,
         spawned_from_conversation_id,
+    })
+}
+
+/// Parse a `conversation_creation_jobs` row from the database.
+#[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
+fn parse_conversation_creation_job_row(
+    row: SqliteRow,
+) -> Result<ConversationCreationJob, sqlx::Error> {
+    let phase_str: String = row.try_get("phase")?;
+    let phase = ConversationCreationPhase::from_db_str(&phase_str).ok_or_else(|| {
+        sqlx::Error::Decode(
+            format!("unknown conversation_creation_jobs.phase value: {phase_str:?}").into(),
+        )
+    })?;
+
+    let intent_json: String = row.try_get("intent_json")?;
+    let intent = serde_json::from_str::<ConversationCreationIntent>(&intent_json).map_err(|e| {
+        sqlx::Error::Decode(format!("invalid conversation_creation_jobs.intent_json: {e}").into())
+    })?;
+
+    Ok(ConversationCreationJob {
+        id: row.try_get("id")?,
+        conversation_id: row.try_get("conversation_id")?,
+        message_id: row.try_get("message_id")?,
+        phase,
+        intent,
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
+        updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?),
+        accepted_at: row
+            .try_get::<Option<String>, _>("accepted_at")?
+            .as_deref()
+            .map(parse_datetime),
+        provisioning_started_at: row
+            .try_get::<Option<String>, _>("provisioning_started_at")?
+            .as_deref()
+            .map(parse_datetime),
+        completed_at: row
+            .try_get::<Option<String>, _>("completed_at")?
+            .as_deref()
+            .map(parse_datetime),
+        failed_at: row
+            .try_get::<Option<String>, _>("failed_at")?
+            .as_deref()
+            .map(parse_datetime),
+        error: row.try_get("error")?,
     })
 }
 

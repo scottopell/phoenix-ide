@@ -22,6 +22,7 @@ use super::sse::sse_stream;
 use super::types::{
     AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry,
     CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
+<<<<<<< ours
     ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
@@ -32,6 +33,25 @@ use super::types::{
     SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
     TaskAvailabilityResponse, TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse,
     UpgradeModelRequest, ValidateCwdResponse,
+||||||| base
+    ConversationListResponse, ConversationResponse, ConversationWithMessagesResponse,
+    CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
+    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
+    FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
+    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
+    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
+    SuggestResponse, SystemPromptResponse, TaskAvailabilityResponse, TaskCountQuery,
+    TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+=======
+    ConversationListResponse, ConversationResponse, ConversationWithMessagesResponse,
+    CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
+    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
+    FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
+    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
+    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
+    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
+    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+>>>>>>> theirs
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -42,10 +62,8 @@ use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
     GitOpError, PhoenixIgnoreStrategy,
 };
-use crate::git_start::{GitStartError, GitStartPoint};
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
-use crate::task_listing::TaskEntryParts;
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -245,10 +263,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/archive", post(archive_conversation))
         .route("/api/conversations/:id/delete", post(delete_conversation))
         .route("/api/conversations/:id/rename", post(rename_conversation))
-        .route(
-            "/api/conversations/:id/regenerate-name",
-            post(regenerate_conversation_name),
-        )
         // Token usage (Phase 4)
         .route(
             "/api/conversations/:id/usage",
@@ -364,10 +378,6 @@ pub fn create_router(state: AppState) -> Router {
             post(create_pr_auto_fix_context),
         )
         // Project task files available before a conversation exists
-        .route(
-            "/api/tasks/availability",
-            get(get_project_task_availability),
-        )
         .route("/api/tasks", get(list_project_tasks))
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
@@ -836,6 +846,37 @@ fn conversation_to_json(
     val
 }
 
+async fn inject_creation_job_state_fields(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+    val: &mut Value,
+) {
+    if !matches!(
+        conv.state,
+        ConvState::Provisioning { .. } | ConvState::CreationFailed { .. }
+    ) {
+        return;
+    }
+    let Ok(Some(job)) = state
+        .runtime
+        .db()
+        .get_conversation_creation_job_for_conversation(&conv.id)
+        .await
+    else {
+        return;
+    };
+    let Value::Object(map) = val else {
+        return;
+    };
+    let Some(Value::Object(state_obj)) = map.get_mut("state") else {
+        return;
+    };
+    state_obj.insert("prompt".to_string(), Value::String(job.intent.text));
+    if let Some(error) = job.error {
+        state_obj.insert("message".to_string(), Value::String(error));
+    }
+}
+
 /// Like [`conversation_to_json`] but also resolves `seed_parent_slug` via the
 /// database so the frontend can render the seed breadcrumb (REQ-SEED-003).
 /// Prefer this on single-conversation endpoints; the list endpoints stay
@@ -863,6 +904,7 @@ async fn conversation_to_json_with_seed(
             );
         }
     }
+    inject_creation_job_state_fields(state, conv, &mut val).await;
     Ok(val)
 }
 
@@ -1496,19 +1538,29 @@ async fn create_conversation(
     State(state): State<AppState>,
     Json(req): Json<CreateConversationRequest>,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    create_conversation_with_id(state, uuid::Uuid::new_v4().to_string(), req, Vec::new()).await
+    create_conversation_with_id(state, req, Vec::new()).await
 }
 
 #[allow(clippy::too_many_lines)]
 async fn create_conversation_with_id(
     state: AppState,
-    id: String,
     mut req: CreateConversationRequest,
     raw_files: Vec<RawAttachmentPart>,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    let valid_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let path = valid_cwd.as_path();
+    let id = match req.conversation_id.as_deref() {
+        Some(conversation_id) => {
+            uuid::Uuid::parse_str(conversation_id).map_err(|_| {
+                AppError::BadRequest("conversation_id must be a valid UUID".to_string())
+            })?;
+            conversation_id.to_string()
+        }
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    if req.cwd.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "Working directory cannot be empty".to_string(),
+        ));
+    }
 
     // REQ-SEED-001: seeded conversations may be created empty so the UI can
     // hydrate the input area with a draft and let the user review before
@@ -1521,6 +1573,20 @@ async fn create_conversation_with_id(
         ));
     }
 
+    if req.message_id.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "message_id must not be empty".to_string(),
+        ));
+    }
+
+    if let Some(mode) = req.mode.as_deref() {
+        if !matches!(mode, "direct" | "managed" | "branch" | "auto") {
+            return Err(AppError::BadRequest(format!(
+                "Invalid mode '{mode}'. Expected one of: direct, managed, branch, auto"
+            )));
+        }
+    }
+
     // Validate requested model exists in the registry
     if let Some(ref model) = req.model {
         if state.llm_registry.get(model).is_none() {
@@ -1529,6 +1595,13 @@ async fn create_conversation_with_id(
                 "Model '{model}' is not available. Available models: {available}"
             )));
         }
+    }
+
+    if let Ok(conv) = state.runtime.db().get_conversation(&id).await {
+        tracing::info!(conversation_id = %id, "Create request hit existing conversation id");
+        return Ok(Json(ConversationResponse {
+            conversation: conversation_to_json(&state, &conv, None),
+        }));
     }
 
     // Idempotency check: if message_id already exists, find and return that conversation
@@ -1551,7 +1624,7 @@ async fn create_conversation_with_id(
                 .await
             {
                 return Ok(Json(ConversationResponse {
-                    conversation: serde_json::to_value(conv).unwrap_or(Value::Null),
+                    conversation: conversation_to_json(&state, &conv, None),
                 }));
             }
         }
@@ -1571,260 +1644,16 @@ async fn create_conversation_with_id(
             .collect();
     }
 
-    // Try to generate a title using a cheap LLM model.
-    //
-    // Seeded conversations with empty text skip LLM title generation — we
-    // derive the slug from `seed_label` (or fall back to a random slug)
-    // because the LLM hallucinates titles from empty input.
-    let seed_slug_source = if is_seeded && req.text.trim().is_empty() {
-        req.seed_label
-            .as_deref()
-            .map(slugify_label)
-            .filter(|s| !s.is_empty())
-    } else {
-        None
-    };
-    let slug = if let Some(s) = seed_slug_source {
-        s
-    } else if let Some(cheap_model) = state.runtime.model_registry().get_cheap_model() {
-        match crate::title_generator::generate_title(&req.text, cheap_model).await {
-            Some(title) if !title.is_empty() => {
-                tracing::info!(title = %title, "Generated conversation title");
-                title
-            }
-            _ => {
-                tracing::info!("Title generation failed, using random slug");
-                generate_slug()
-            }
-        }
-    } else {
-        tracing::info!("No cheap model available for title generation, using random slug");
-        generate_slug()
-    };
-
-    // Detect project from git repo root (REQ-PROJ-001)
-    let project_id = if let Some(repo_root) = phoenix_core::git::detect_git_repo_root(path) {
-        match state.db.find_or_create_project(&repo_root).await {
-            Ok(project) => {
-                tracing::info!(project_id = %project.id, path = %repo_root, "Associated conversation with project");
-                Some(project.id)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to create project, continuing without");
-                None
-            }
-        }
-    } else {
-        tracing::debug!(cwd = %req.cwd, "Directory is not in a git repo, no project association");
-        None
-    };
-
-    // Direct mode is the default. "managed" opts in to Explore/Work lifecycle (requires git).
-    // "auto" delegates the choice to the backend: managed if cwd is in a git repo,
-    // direct otherwise (REQ-SEED-002).
-    // "branch" checks out an existing branch in a worktree (REQ-PROJ-024).
-    let resolved_mode: &str = match req.mode.as_deref() {
-        Some("auto") => {
-            if project_id.is_some() {
-                tracing::info!(cwd = %req.cwd, "auto mode resolved to managed (git repo detected)");
-                "managed"
-            } else {
-                tracing::info!(cwd = %req.cwd, "auto mode resolved to direct (no git repo)");
-                "direct"
-            }
-        }
-        Some(other) => other,
-        None => "direct",
-    };
-
-    // For Managed mode, the *resolved* base branch (explicit `req.base_branch`
-    // or, for `mode=auto`, the branch inferred from the repo HEAD) is recorded
-    // on the conversation as `desired_base_branch` so task approval has a
-    // reliable base — the early Explore worktree sits on a `task-pending-…`
-    // temp branch, so HEAD there is not the base.
-    let mut managed_base_branch: Option<String> = None;
-
-    // Branch mode: create worktree on existing branch (REQ-PROJ-024)
-    let (conv_mode, effective_cwd) = if resolved_mode == "branch" {
-        let branch_name = req.base_branch.as_deref().ok_or_else(|| {
-            AppError::BadRequest(
-                "Branch mode requires base_branch (the branch name to check out)".to_string(),
-            )
-        })?;
-        validate_user_ref(branch_name)?;
-        if project_id.is_none() {
-            return Err(AppError::BadRequest(
-                "Branch mode requires a git repository".to_string(),
-            ));
-        }
-        let repo_root = phoenix_core::git::detect_git_repo_root(path).ok_or_else(|| {
-            AppError::BadRequest("Could not determine git repository root".to_string())
-        })?;
-
-        let conv_id = id.clone();
-        let branch = branch_name.to_string();
-        let repo = repo_root.clone();
-        let db = state.db.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            create_branch_worktree_blocking(&repo, &conv_id, &branch, &db)
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
-
-        match result {
-            Ok(info) => {
-                let mode = crate::db::ConvMode::Branch {
-                    branch_name: crate::db::NonEmptyString::new(info.branch_name.clone())
-                        .expect("branch_name from worktree creation must be non-empty"),
-                    worktree_path: crate::db::NonEmptyString::new(info.worktree_path.clone())
-                        .expect("worktree_path from worktree creation must be non-empty"),
-                    base_branch: crate::db::NonEmptyString::new(info.base_branch)
-                        .expect("base_branch from worktree creation must be non-empty"),
-                };
-                (mode, info.worktree_path)
-            }
-            Err(BranchWorktreeError::Conflict { slug }) => {
-                return Err(AppError::Conflict(Box::new(
-                    ConflictErrorResponse::new(
-                        format!(
-                            "Branch already has an active conversation: {slug}. \
-                             Navigate to that conversation or abandon it first."
-                        ),
-                        "branch_already_active",
-                    )
-                    .with_conflict_slug(slug),
-                )));
-            }
-            Err(BranchWorktreeError::Git(msg)) => {
-                return Err(AppError::Internal(msg));
-            }
-            Err(BranchWorktreeError::BadRequest(msg)) => {
-                return Err(AppError::BadRequest(msg));
-            }
-        }
-    } else if resolved_mode == "managed" {
-        if project_id.is_none() {
-            return Err(AppError::BadRequest(
-                "Managed mode requires a git repository".to_string(),
-            ));
-        }
-
-        // REQ-PROJ-028: Managed mode allocates an Explore worktree on the chosen
-        // branch up-front so the agent's view tracks the selected branch (not the
-        // main checkout) from message zero. base_branch is required — silently
-        // falling back to the repo root creates a divergence between the LLM's
-        // worktree (correct after task approval) and the terminal pane (frozen
-        // at the original spawn cwd) that surfaces as a footgun later.
-        //
-        // For `mode=auto` (the SDK / seed path), the caller has not made an
-        // explicit branch choice — they delegated the decision to the backend.
-        // Infer the current branch from the cwd. For an explicit `mode=managed`
-        // (the form path), require an explicit base_branch — the form picks one
-        // deliberately and the caller deserves a 400 if it's missing.
-        let repo_root = phoenix_core::git::detect_git_repo_root(path).ok_or_else(|| {
-            AppError::BadRequest("Could not determine git repository root".to_string())
-        })?;
-        let inferred_base = if req.mode.as_deref() == Some("auto") && req.base_branch.is_none() {
-            run_git(
-                std::path::Path::new(&repo_root),
-                &["rev-parse", "--abbrev-ref", "HEAD"],
-            )
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && s != "HEAD")
-        } else {
-            None
-        };
-        let base_branch = req
-            .base_branch
-            .as_deref()
-            .or(inferred_base.as_deref())
-            .ok_or_else(|| {
-                AppError::BadRequest(
-                    "Managed mode requires base_branch (the branch to allocate \
-                     the Explore worktree against)"
-                        .to_string(),
-                )
-            })?;
-        validate_user_ref(base_branch)?;
-        if let Some(checkout_ref) = req.checkout_ref.as_deref() {
-            validate_user_ref(checkout_ref)?;
-        }
-        let logical_base = base_branch.to_string();
-        managed_base_branch = Some(logical_base.clone());
-
-        let conv_id = id.clone();
-        let checkout = req.checkout_ref.clone();
-        let repo = repo_root.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            create_managed_explore_worktree_blocking(
-                &repo,
-                &conv_id,
-                &logical_base,
-                checkout.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
-
-        let worktree_path = match result {
-            Ok(p) => p,
-            Err(ManagedWorktreeError::BadRequest(msg)) => return Err(AppError::BadRequest(msg)),
-            Err(ManagedWorktreeError::Git(msg)) => return Err(AppError::Internal(msg)),
-        };
-
-        let next_taskmd_id_hint = {
-            let tasks_dir_name =
-                taskmd_core::discover::discover_or_default(std::path::Path::new(&worktree_path));
-            crate::system_prompt::snapshot_next_taskmd_id_hint(
-                std::path::Path::new(&worktree_path),
-                &tasks_dir_name.to_string_lossy(),
-            )
-        };
-        let worktree_nes = crate::db::NonEmptyString::new(&worktree_path)
-            .map_err(|_| AppError::Internal("managed worktree path was empty".to_string()))?;
-        (
-            crate::db::ConvMode::Explore {
-                worktree_path: Some(worktree_nes),
-                next_taskmd_id_hint,
-            },
-            worktree_path,
-        )
-    } else {
-        (crate::db::ConvMode::Direct, valid_cwd.into_raw())
-    };
-
-    let desired_base_branch = managed_base_branch.as_deref();
-    // Resolve the model NOW so the conversation record reflects what is
-    // actually being used (instead of leaving NULL and forcing every
-    // consumer to reach for a default).
-    //
-    // - Explicit `req.model` always wins.
-    // - Explore mode with no explicit model: drop to the cheap model for
-    //   the registry's default-provider family (task 08670). Explore is
-    //   read-only planning — Haiku-tier is fast enough for the iterative
-    //   "think out loud, refine" loop and avoids charging Sonnet rates
-    //   for plan iteration. Mirrors the sub-agent path at
-    //   `runtime/executor.rs:914`.
-    // - All other modes default to the registry default.
-    //   Task 08609: a NULL `model` field surfaces as a literal "null" in
-    //   tooltips, so we always persist a concrete id.
-    let registry_default = state.llm_registry.default_model_id();
-    let cheap_for_explore = state
-        .llm_registry
-        .cheap_model_id_for_provider(registry_default);
-    let resolved_model = req.model.as_deref().map_or_else(
-        || {
-            if matches!(conv_mode, crate::db::ConvMode::Explore { .. }) {
-                cheap_for_explore
-            } else {
-                registry_default.to_string()
-            }
-        },
-        String::from,
-    );
+    let short_id: String = id.chars().take(8).collect();
+    let slug = format!("conv-{short_id}");
+    let project_id: Option<String> = None;
+    let conv_mode = crate::db::ConvMode::Direct;
+    let effective_cwd = req.cwd.clone();
+    let desired_base_branch = req.base_branch.as_deref();
+    let resolved_model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| state.llm_registry.default_model_id().to_string());
     // New conversations are pinned to the current global default LLM language.
     // Once set, this conversation (and all its chain continuations / sub-agents)
     // stays in that language even if the global default later changes.
@@ -1845,16 +1674,16 @@ async fn create_conversation_with_id(
             crate::llm_language::LlmLanguage::default()
         }
     };
-    let conversation = state
+    let mut conversation = state
         .runtime
         .db()
         .create_conversation_with_project(
             &id,
             &slug,
             &effective_cwd,
-            true,                          // user_initiated
-            None,                          // no parent
-            Some(resolved_model.as_str()), // resolved model (default if not explicit)
+            true,
+            None,
+            Some(resolved_model.as_str()),
             project_id.as_deref(),
             &conv_mode,
             desired_base_branch,
@@ -1883,72 +1712,79 @@ async fn create_conversation_with_id(
         }
     }
 
-    // REQ-SEED-001: seeded conversations may be created with an empty
-    // `text` — the UI will hydrate the input area from localStorage and the
-    // user sends the first message manually. Skip expansion + initial event
-    // dispatch in that case.
-    if !(is_seeded && req.text.trim().is_empty() && req.images.is_empty() && req.files.is_empty()) {
-        // Expand `@file`/`/skill` inline references before sending
-        // (REQ-IR-001, REQ-IR-007). Resolve against the conversation's actual
-        // working directory: for a branch/managed conversation that is the
-        // freshly-created worktree (`effective_cwd`), a faithful checkout of the
-        // chosen branch. The composer discovered candidates against that same
-        // branch's committed tree, which the clean worktree mirrors exactly — so
-        // every candidate still resolves. Unlike a bare git tree, the worktree
-        // also carries skill companion files and gives `/skill` invocations a
-        // durable base directory (the temp tree materialization would be both
-        // incomplete and gone by the time the agent reads it).
-        let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
-        let expanded_initial = match crate::message_expander::expand(&req.text, &resolution_root) {
-            Ok(expanded) => expanded,
-            Err(e) => {
-                rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
-                    .await;
-                return Err(AppError::UnprocessableEntity(ExpansionErrorResponse {
-                    error: e.to_string(),
-                    error_type: e.error_type().to_string(),
-                    reference: e.reference(),
-                }));
-            }
-        };
-
-        // Convert images
-        let images: Vec<ImageData> = req
+    let intent = crate::db::ConversationCreationIntent {
+        cwd: req.cwd.clone(),
+        model: Some(resolved_model.clone()),
+        text: req.text.clone(),
+        message_id: req.message_id.clone(),
+        images: req
             .images
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|img| ImageData {
                 data: img.data,
                 media_type: img.media_type,
             })
-            .collect();
+            .collect(),
+        files: req.files.iter().cloned().map(Into::into).collect(),
+        mode: req.mode.clone(),
+        base_branch: req.base_branch.clone(),
+        seed_parent_id: req.seed_parent_id.clone(),
+        seed_label: req.seed_label.clone(),
+    };
+    let mut job_id = uuid::Uuid::new_v4().to_string();
 
-        let files: Vec<phoenix_core::domain::db_schema::FileAttachment> =
-            req.files.into_iter().map(Into::into).collect();
-
-        // Only set llm_text when expansion actually changed the text (REQ-IR-001)
-        let initial_llm_text = (expanded_initial.llm_text != expanded_initial.display_text)
-            .then_some(expanded_initial.llm_text);
-
-        // Send the initial message to the runtime
-        let event = Event::UserMessage {
-            text: expanded_initial.display_text,
-            llm_text: initial_llm_text,
-            images,
-            files,
-            message_id: req.message_id,
-            user_agent: None,
-            skill_invocation: expanded_initial.skill_invocation,
-        };
-
-        if let Err(e) = state.runtime.send_event(&id, event).await {
+    match state
+        .runtime
+        .db()
+        .insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
+            id: job_id.clone(),
+            conversation_id: id.clone(),
+            message_id: Some(req.message_id.clone()),
+            intent,
+        })
+        .await
+    {
+        Ok(_) => {}
+        Err(crate::db::DbError::Sqlx(sqlx::Error::Database(db_err)))
+            if db_err.code().as_deref() == Some("2067") =>
+        {
+            if let Ok(Some(existing_job)) = state
+                .runtime
+                .db()
+                .get_conversation_creation_job_for_conversation(&id)
+                .await
+            {
+                job_id.clone_from(&existing_job.id);
+            }
+        }
+        Err(e) => {
             rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
                 .await;
-            return Err(AppError::Internal(e));
+            return Err(AppError::Internal(e.to_string()));
         }
     }
 
+    let provisioning_state = ConvState::Provisioning {
+        job_id: job_id.clone(),
+        phase: phoenix_core::domain::db_schema::ConversationCreationPhase::Accepted,
+    };
+    state
+        .runtime
+        .db()
+        .update_conversation_state(&id, &provisioning_state)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    conversation.state = provisioning_state;
+    conversation.state_updated_at = chrono::Utc::now();
+    conversation.updated_at = conversation.state_updated_at;
+
+    state.runtime.kick_creation_worker();
+
+    let mut conversation_json = conversation_to_json(&state, &conversation, None);
+    inject_creation_job_state_fields(&state, &conversation, &mut conversation_json).await;
     Ok(Json(ConversationResponse {
-        conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
+        conversation: conversation_json,
     }))
 }
 
@@ -1957,22 +1793,21 @@ async fn create_conversation_with_attachments(
     State(state): State<AppState>,
     multipart: Multipart,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    let id = uuid::Uuid::new_v4().to_string();
     let (req, raw_files) = read_multipart_create_parts(multipart).await?;
-    create_conversation_with_id(state, id, req, raw_files).await
+    create_conversation_with_id(state, req, raw_files).await
 }
 
 // ============================================================
 // Branch Mode Worktree Creation (REQ-PROJ-024)
 // ============================================================
 
-struct BranchWorktreeInfo {
-    branch_name: String,
-    worktree_path: String,
-    base_branch: String,
+pub(crate) struct BranchWorktreeInfo {
+    pub(crate) branch_name: String,
+    pub(crate) worktree_path: String,
+    pub(crate) base_branch: String,
 }
 
-enum BranchWorktreeError {
+pub(crate) enum BranchWorktreeError {
     Conflict { slug: String },
     Git(String),
     BadRequest(String),
@@ -1983,7 +1818,7 @@ enum BranchWorktreeError {
 /// branch names cannot begin with `-`, so this rejects no legitimate input
 /// while closing the `-`-prefixed-ref vector at the HTTP boundary — before the
 /// name is interpolated into any `git worktree add` / `rev-parse` argv.
-fn validate_user_ref(name: &str) -> Result<(), AppError> {
+pub(crate) fn validate_user_ref(name: &str) -> Result<(), AppError> {
     if name.starts_with('-') {
         return Err(AppError::BadRequest(format!(
             "Invalid branch name '{name}': must not begin with '-'"
@@ -1995,7 +1830,7 @@ fn validate_user_ref(name: &str) -> Result<(), AppError> {
 /// Create a git worktree for an existing branch. Runs on a blocking thread.
 ///
 /// Delegates to `git_ops::{materialize_branch, check_branch_conflict, create_worktree}`.
-fn create_branch_worktree_blocking(
+pub(crate) fn create_branch_worktree_blocking(
     repo_root: &str,
     conv_id: &str,
     branch_name: &str,
@@ -2079,32 +1914,26 @@ fn create_branch_worktree_blocking(
 /// Creates a temporary branch `task-pending-{conv_id_prefix}` from the
 /// base branch. At approval time, `execute_approve_task_blocking` detects
 /// the existing worktree and renames the branch.
-enum ManagedWorktreeError {
+pub(crate) enum ManagedWorktreeError {
     /// User-input failure (e.g. branch doesn't exist locally or at origin).
     BadRequest(String),
     /// Infrastructure failure (worktree creation, generic git errors).
     Git(String),
 }
 
-fn managed_worktree_error_from_git_start(error: GitStartError) -> ManagedWorktreeError {
-    match error {
-        GitStartError::BranchNotFound(_) | GitStartError::DetachedHead => {
-            ManagedWorktreeError::BadRequest(error.to_string())
-        }
-        GitStartError::Git(message) => ManagedWorktreeError::Git(message),
-    }
-}
-
-fn create_managed_explore_worktree_blocking(
+pub(crate) fn create_managed_explore_worktree_blocking(
     repo_root: &str,
     conv_id: &str,
     base_branch: &str,
-    checkout_ref: Option<&str>,
 ) -> Result<String, ManagedWorktreeError> {
     let cwd = std::path::Path::new(repo_root);
-    let start = GitStartPoint::for_create_request(cwd, base_branch, checkout_ref)
-        .map_err(managed_worktree_error_from_git_start)?;
-    let checkout_ref = start.checkout_ref();
+
+    materialize_branch(cwd, base_branch).map_err(|e| match e {
+        GitOpError::BranchNotFound(b) => ManagedWorktreeError::BadRequest(format!(
+            "Branch '{b}' not found locally or at origin",
+        )),
+        other => ManagedWorktreeError::Git(other.to_string()),
+    })?;
 
     let id_prefix: String = conv_id.chars().take(8).collect();
     let temp_branch = format!("task-pending-{id_prefix}");
@@ -2113,19 +1942,18 @@ fn create_managed_explore_worktree_blocking(
         cwd,
         conv_id,
         &temp_branch,
-        Some(checkout_ref),
+        Some(base_branch),
         PhoenixIgnoreStrategy::StageGitignore,
     )
     .map_err(|e| {
         ManagedWorktreeError::Git(format!(
-            "Failed to create early worktree from '{checkout_ref}': {e}",
+            "Failed to create early worktree from '{base_branch}': {e}",
         ))
     })?;
 
     tracing::info!(
         conv_id = %conv_id,
         base_branch = %base_branch,
-        checkout_ref = %checkout_ref,
         temp_branch = %temp_branch,
         worktree = %worktree_path_str,
         "Created early Managed-mode worktree (REQ-PROJ-028)"
@@ -4097,71 +3925,22 @@ async fn rename_conversation(
     Path(id): Path<String>,
     Json(req): Json<RenameRequest>,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    rename_conversation_slug(&state, &id, &req.name).await?;
-    conversation_response(&state, &id).await
-}
-
-async fn regenerate_conversation_name(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<ConversationResponse>, AppError> {
-    let opening = state
-        .runtime
-        .db()
-        .first_opening_message_text(&id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .ok_or_else(|| {
-            tracing::debug!(
-                conv_id = %id,
-                "conversation regenerate-name: no opening message; leaving slug unchanged"
-            );
-            AppError::Internal(
-                "cannot regenerate conversation name: no opening message to summarize".to_string(),
-            )
-        })?;
-
-    let cheap_model = state.llm_registry.get_cheap_model().ok_or_else(|| {
-        AppError::Internal("no cheap LLM model is available for name regeneration".to_string())
-    })?;
-
-    let generated = crate::title_generator::generate_title(&opening, cheap_model)
-        .await
-        .filter(|slug| !slug.is_empty())
-        .ok_or_else(|| {
-            AppError::Internal(
-                "conversation name regeneration failed — the existing name is unchanged"
-                    .to_string(),
-            )
-        })?;
-
-    rename_conversation_slug(&state, &id, &generated).await?;
-    conversation_response(&state, &id).await
-}
-
-async fn rename_conversation_slug(state: &AppState, id: &str, slug: &str) -> Result<(), AppError> {
     state
         .runtime
         .db()
-        .rename_conversation(id, slug)
+        .rename_conversation(&id, &req.name)
         .await
         .map_err(|e| match e {
             crate::db::DbError::SlugExists(_) => {
                 AppError::BadRequest("Slug already exists".to_string())
             }
-            crate::db::DbError::ConversationNotFound(_) => AppError::NotFound(e.to_string()),
-            _ => AppError::Internal(e.to_string()),
-        })
-}
+            _ => AppError::NotFound(e.to_string()),
+        })?;
 
-async fn conversation_response(
-    state: &AppState,
-    id: &str,
-) -> Result<Json<ConversationResponse>, AppError> {
     let conversation = state
         .runtime
         .db()
-        .get_conversation(id)
+        .get_conversation(&id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -5303,10 +5082,12 @@ fn skill_entries_from_dir(
 // Tasks
 // ============================================================
 
-async fn task_conversation_slug_map(
-    state: &AppState,
-    cwd: &std::path::Path,
-) -> std::collections::HashMap<String, String> {
+async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<TaskEntry> {
+    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = cwd.join(&tasks_dir_name);
+
     let all_convs = state
         .runtime
         .db()
@@ -5322,7 +5103,7 @@ async fn task_conversation_slug_map(
         .into_iter()
         .find(|p| std::path::Path::new(&p.canonical_path) == cwd)
         .map(|p| p.id);
-    all_convs
+    let task_to_slug: std::collections::HashMap<String, String> = all_convs
         .iter()
         .filter(|c| match target_project_id.as_deref() {
             Some(project_id) => c.project_id.as_deref() == Some(project_id),
@@ -5333,129 +5114,22 @@ async fn task_conversation_slug_map(
             let slug = c.slug.as_deref()?;
             Some((task_id.to_string(), slug.to_string()))
         })
-        .collect()
-}
-
-async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<TaskEntry> {
-    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
-        .to_string_lossy()
-        .into_owned();
-    let tasks_dir = cwd.join(&tasks_dir_name);
-    let task_to_slug = task_conversation_slug_map(state, cwd).await;
+        .collect();
 
     taskmd_core::tasks::list_tasks(&tasks_dir)
         .into_iter()
         .map(|t| {
             let conversation_slug = task_to_slug.get(&t.id).cloned();
-            task_entry_with_conversation(
-                TaskEntryParts {
-                    id: t.id,
-                    priority: t.priority.to_string(),
-                    status: t.status.to_string(),
-                    slug: t.slug,
-                    path: t.path.to_string_lossy().into_owned(),
-                    source_ref: None,
-                    content: None,
-                },
+            TaskEntry {
+                id: t.id,
+                priority: t.priority.to_string(),
+                status: t.status.to_string(),
+                slug: t.slug,
+                path: t.path.to_string_lossy().into_owned(),
                 conversation_slug,
-            )
+            }
         })
         .collect()
-}
-
-fn task_entry_with_conversation(
-    parts: TaskEntryParts,
-    conversation_slug: Option<String>,
-) -> TaskEntry {
-    TaskEntry {
-        id: parts.id,
-        priority: parts.priority,
-        status: parts.status,
-        slug: parts.slug,
-        path: parts.path,
-        source_ref: parts.source_ref,
-        content: parts.content,
-        conversation_slug,
-    }
-}
-
-fn local_task_entry_parts(
-    cwd: &std::path::Path,
-    tasks_dir_name: &str,
-    limit: Option<usize>,
-) -> Vec<TaskEntryParts> {
-    taskmd_core::tasks::list_tasks(&cwd.join(tasks_dir_name))
-        .into_iter()
-        .take(limit.unwrap_or(usize::MAX))
-        .map(|t| TaskEntryParts {
-            id: t.id,
-            priority: t.priority.to_string(),
-            status: t.status.to_string(),
-            slug: t.slug,
-            path: t.path.to_string_lossy().into_owned(),
-            source_ref: None,
-            content: None,
-        })
-        .collect()
-}
-
-fn project_task_entries_from_default_ref(cwd: &std::path::Path) -> Vec<TaskEntryParts> {
-    let Some(start) = GitStartPoint::for_default_task_start(cwd) else {
-        let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
-            .to_string_lossy()
-            .into_owned();
-        return local_task_entry_parts(cwd, &tasks_dir_name, None);
-    };
-    let root = crate::resolution_root::ResolutionRoot::from_start_point(cwd, &start);
-    let tasks_dir_name = crate::task_listing::discover_task_dir(&root, cwd);
-    crate::task_listing::list_task_entries(&root, cwd, &tasks_dir_name, None)
-}
-
-async fn project_task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<TaskEntry> {
-    let task_to_slug = task_conversation_slug_map(state, cwd).await;
-    let scan_cwd = cwd.to_path_buf();
-    let task_parts =
-        tokio::task::spawn_blocking(move || project_task_entries_from_default_ref(&scan_cwd))
-            .await
-            .unwrap_or_default();
-    task_parts
-        .into_iter()
-        .map(|parts| {
-            let conversation_slug = task_to_slug.get(&parts.id).cloned();
-            task_entry_with_conversation(parts, conversation_slug)
-        })
-        .collect()
-}
-
-fn project_tasks_available(cwd: &std::path::Path) -> bool {
-    let Some(start) = GitStartPoint::for_default_task_start(cwd) else {
-        let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
-            .to_string_lossy()
-            .into_owned();
-        return local_task_entry_parts(cwd, &tasks_dir_name, Some(1))
-            .into_iter()
-            .next()
-            .is_some();
-    };
-    let root = crate::resolution_root::ResolutionRoot::from_start_point(cwd, &start);
-    let tasks_dir_name = crate::task_listing::discover_task_dir(&root, cwd);
-    crate::task_listing::list_task_entries(&root, cwd, &tasks_dir_name, Some(1))
-        .into_iter()
-        .next()
-        .is_some()
-}
-
-async fn get_project_task_availability(
-    Query(query): Query<ProjectTasksQuery>,
-) -> Result<Json<TaskAvailabilityResponse>, AppError> {
-    let cwd = std::path::PathBuf::from(&query.cwd);
-    if !cwd.exists() || !cwd.is_dir() {
-        return Err(AppError::BadRequest("Directory does not exist".to_string()));
-    }
-    let available = tokio::task::spawn_blocking(move || project_tasks_available(&cwd))
-        .await
-        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
-    Ok(Json(TaskAvailabilityResponse { available }))
 }
 
 /// List task files from a project's tasks/ directory before a conversation exists.
@@ -5468,7 +5142,7 @@ async fn list_project_tasks(
         return Err(AppError::BadRequest("Directory does not exist".to_string()));
     }
     Ok(Json(TasksResponse {
-        tasks: project_task_entries_for_cwd(&state, &cwd).await,
+        tasks: task_entries_for_cwd(&state, &cwd).await,
     }))
 }
 
@@ -5837,7 +5511,7 @@ async fn enable_mcp_server(
 /// Slugify a human-readable label (e.g. "Shell integration setup (zsh)") into
 /// a kebab-case slug (e.g. "shell-integration-setup-zsh"). Used for seeded
 /// conversation titles when the LLM title generator would receive empty text.
-fn slugify_label(label: &str) -> String {
+pub(crate) fn slugify_label(label: &str) -> String {
     let mut out = String::with_capacity(label.len());
     let mut prev_dash = true;
     for ch in label.chars() {
@@ -5852,7 +5526,7 @@ fn slugify_label(label: &str) -> String {
     out.trim_end_matches('-').to_string()
 }
 
-fn generate_slug() -> String {
+pub(crate) fn generate_slug() -> String {
     let now = Local::now();
 
     // Day of week
@@ -6201,6 +5875,7 @@ mod conversation_cwd_validation_tests {
 
     fn create_request(cwd: String) -> CreateConversationRequest {
         CreateConversationRequest {
+            conversation_id: None,
             cwd,
             model: None,
             text: "hello".to_string(),
@@ -6209,46 +5884,39 @@ mod conversation_cwd_validation_tests {
             files: Vec::new(),
             mode: Some("direct".to_string()),
             base_branch: None,
-            checkout_ref: None,
             seed_parent_id: None,
             seed_label: None,
         }
     }
 
     #[tokio::test]
-    async fn create_conversation_rejects_filesystem_root_cwd() {
+    async fn create_conversation_accepts_filesystem_root_as_async_failed_record_candidate() {
         let state = hard_delete_cascade_tests::make_test_state().await;
-        let err = create_conversation_with_id(
-            state,
-            "conv-root-cwd".to_string(),
-            create_request("/".to_string()),
-            Vec::new(),
-        )
-        .await
-        .expect_err("root cwd rejected");
+        let Json(response) =
+            create_conversation_with_id(state, create_request("/".to_string()), Vec::new())
+                .await
+                .expect("root cwd is accepted for async provisioning");
 
-        match err {
-            AppError::BadRequest(msg) => assert!(msg.contains("filesystem root"), "got: {msg}"),
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
+        assert_eq!(response.conversation["cwd"].as_str(), Some("/"));
+        assert_eq!(
+            response.conversation["state"]["type"].as_str(),
+            Some("provisioning")
+        );
     }
 
     #[tokio::test]
-    async fn create_conversation_rejects_cwd_that_resolves_to_root() {
+    async fn create_conversation_accepts_cwd_that_resolves_to_root_for_async_validation() {
         let state = hard_delete_cascade_tests::make_test_state().await;
-        let err = create_conversation_with_id(
-            state,
-            "conv-dotdot-root-cwd".to_string(),
-            create_request("/..".to_string()),
-            Vec::new(),
-        )
-        .await
-        .expect_err("canonical root rejected");
+        let Json(response) =
+            create_conversation_with_id(state, create_request("/..".to_string()), Vec::new())
+                .await
+                .expect("canonical root is accepted for async provisioning");
 
-        match err {
-            AppError::BadRequest(msg) => assert!(msg.contains("filesystem root"), "got: {msg}"),
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
+        assert_eq!(response.conversation["cwd"].as_str(), Some("/.."));
+        assert_eq!(
+            response.conversation["state"]["type"].as_str(),
+            Some("provisioning")
+        );
     }
 
     #[tokio::test]
@@ -6260,17 +5928,19 @@ mod conversation_cwd_validation_tests {
 
         let Json(response) = create_conversation_with_id(
             state,
-            "conv-deep-cwd".to_string(),
             create_request(deep.to_string_lossy().to_string()),
             Vec::new(),
         )
         .await
         .expect("deep cwd accepted");
 
-        let canonical = deep.canonicalize().unwrap();
         assert_eq!(
             response.conversation["cwd"].as_str(),
-            Some(canonical.to_str().unwrap())
+            Some(deep.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            response.conversation["state"]["type"].as_str(),
+            Some("provisioning")
         );
     }
 
@@ -8888,6 +8558,7 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 }
 
+<<<<<<< ours
 #[cfg(test)]
 mod regenerate_conversation_name_tests {
     use super::*;
@@ -9098,6 +8769,219 @@ mod regenerate_conversation_name_tests {
     }
 }
 
+||||||| base
+#[cfg(test)]
+mod regenerate_conversation_name_tests {
+    use super::*;
+    use crate::chain_qa::ChainQa;
+    use crate::db::Database;
+    use crate::platform::PlatformCapability;
+    use crate::runtime::RuntimeManager;
+    use crate::tools::mcp::McpClientManager;
+    use async_trait::async_trait;
+    use phoenix_core::domain::db_schema::{MessageContent, UserContent};
+    use phoenix_llm::{
+        ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
+    };
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    #[derive(Debug)]
+    enum StubLlm {
+        Ok(&'static str),
+        Err,
+    }
+
+    #[async_trait]
+    impl LlmService for StubLlm {
+        async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            match self {
+                StubLlm::Ok(text) => Ok(LlmResponse {
+                    content: vec![ContentBlock::text(*text)],
+                    end_turn: true,
+                    usage: Usage::default(),
+                }),
+                StubLlm::Err => Err(LlmError::server_error("temporary outage")),
+            }
+        }
+
+        async fn complete_streaming(
+            &self,
+            r: &LlmRequest,
+            _: &broadcast::Sender<phoenix_llm::TokenChunk>,
+        ) -> Result<LlmResponse, LlmError> {
+            self.complete(r).await
+        }
+
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "claude-sonnet-4-6"
+        }
+    }
+
+    async fn make_test_state(llm_registry: Arc<ModelRegistry>) -> AppState {
+        let db = Database::open_in_memory().await.expect("open db");
+        let platform = PlatformCapability::None {
+            details: "test".into(),
+        };
+        let mcp_manager = Arc::new(McpClientManager::new());
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            llm_registry.clone(),
+            platform.clone(),
+            mcp_manager.clone(),
+            None,
+        ));
+        let terminals = runtime.terminals.clone();
+        let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
+        let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
+        AppState {
+            runtime,
+            llm_registry,
+            db,
+            platform,
+            mcp_manager,
+            credential_helper: None,
+            password: None,
+            sessions,
+            login_throttle: super::super::auth::LoginThrottle::new(),
+            terminals,
+            chain_qa,
+            message_retriever,
+            codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
+            suggest_token: String::new(),
+            discovery: crate::discovery::start(crate::discovery::DiscoveryConfig {
+                enabled: false,
+                ..crate::discovery::DiscoveryConfig::from_env()
+            }),
+        }
+    }
+
+    async fn seed_conversation(state: &AppState, id: &str, slug: &str) {
+        state
+            .db
+            .create_conversation(id, slug, "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+    }
+
+    async fn seed_opening(state: &AppState, conv_id: &str, text: &str) {
+        state
+            .db
+            .add_message(
+                &format!("msg-{conv_id}"),
+                conv_id,
+                &MessageContent::User(UserContent::new(text)),
+                None,
+                None,
+            )
+            .await
+            .expect("add opening message");
+    }
+
+    async fn regenerate(
+        state: &AppState,
+        id: &str,
+    ) -> Result<Json<ConversationResponse>, AppError> {
+        regenerate_conversation_name(State(state.clone()), Path(id.to_string())).await
+    }
+
+    #[tokio::test]
+    async fn successful_generation_renames_with_existing_slug_rules() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("Useful Auth Fix"),
+        ))))
+        .await;
+        seed_conversation(&state, "conv-ok", "deterministic-conv-ok").await;
+        seed_opening(
+            &state,
+            "conv-ok",
+            "fix authentication retry after quota errors",
+        )
+        .await;
+
+        let Json(response) = regenerate(&state, "conv-ok").await.expect("regenerate");
+        assert_eq!(response.conversation["slug"], "useful-auth-fix");
+        let reloaded = state.db.get_conversation("conv-ok").await.expect("reload");
+        assert_eq!(reloaded.slug.as_deref(), Some("useful-auth-fix"));
+    }
+
+    #[tokio::test]
+    async fn missing_opening_leaves_slug_unchanged() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("Useful Name"),
+        ))))
+        .await;
+        seed_conversation(&state, "conv-empty", "deterministic-conv-empty").await;
+
+        assert!(regenerate(&state, "conv-empty").await.is_err());
+        let reloaded = state
+            .db
+            .get_conversation("conv-empty")
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-empty"));
+    }
+
+    #[tokio::test]
+    async fn llm_failure_leaves_slug_unchanged() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Err,
+        ))))
+        .await;
+        seed_conversation(&state, "conv-fail", "deterministic-conv-fail").await;
+        seed_opening(&state, "conv-fail", "rename this later").await;
+
+        assert!(regenerate(&state, "conv-fail").await.is_err());
+        let reloaded = state
+            .db
+            .get_conversation("conv-fail")
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-fail"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_generated_slug_returns_error_and_leaves_slug_unchanged() {
+        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
+            StubLlm::Ok("Taken Slug"),
+        ))))
+        .await;
+        seed_conversation(&state, "conv-taken", "taken-slug").await;
+        seed_conversation(&state, "conv-rename", "deterministic-conv-rename").await;
+        seed_opening(&state, "conv-rename", "rename this later").await;
+
+        assert!(regenerate(&state, "conv-rename").await.is_err());
+        let reloaded = state
+            .db
+            .get_conversation("conv-rename")
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-rename"));
+    }
+
+    #[tokio::test]
+    async fn missing_cheap_model_leaves_slug_unchanged() {
+        let state = make_test_state(Arc::new(ModelRegistry::new_empty())).await;
+        seed_conversation(&state, "conv-nomodel", "deterministic-conv-nomodel").await;
+        seed_opening(&state, "conv-nomodel", "rename this later").await;
+
+        assert!(regenerate(&state, "conv-nomodel").await.is_err());
+        let reloaded = state
+            .db
+            .get_conversation("conv-nomodel")
+            .await
+            .expect("reload");
+        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-nomodel"));
+    }
+}
+
+=======
+>>>>>>> theirs
 /// Task 02713: `upgrade_conversation_model` must accept the change from
 /// `Idle` and `Error`, and reject it while an operation is in flight.
 /// Exercises the real axum handler end to end against an in-memory DB.
@@ -9855,116 +9739,6 @@ mod file_read_tests {
             ReadFileResponse::Text { content, .. } => assert_eq!(content, "skill prompt\n"),
             other @ ReadFileResponse::Image { .. } => panic!("expected text, got {other:?}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod project_task_ref_tests {
-    use super::*;
-
-    fn git(cwd: &std::path::Path, args: &[&str]) -> String {
-        run_git(cwd, args).unwrap_or_else(|e| panic!("git {args:?} failed: {e}"))
-    }
-
-    fn repo_with_remote_only_task() -> tempfile::TempDir {
-        repo_with_remote_only_task_in("tasks")
-    }
-
-    fn repo_with_remote_only_task_in(tasks_dir: &str) -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = tmp.path();
-        git(repo, &["init", "--initial-branch=main"]);
-        git(repo, &["config", "user.email", "test@phoenix"]);
-        git(repo, &["config", "user.name", "phoenix-test"]);
-        std::fs::write(repo.join("README.md"), "base\n").expect("write readme");
-        git(repo, &["add", "README.md"]);
-        git(repo, &["commit", "-m", "base"]);
-        let base = git(repo, &["rev-parse", "HEAD"]);
-
-        let queue_path = repo.join(tasks_dir);
-        std::fs::create_dir_all(&queue_path).expect("tasks dir");
-        std::fs::write(
-            queue_path.join(taskmd_core::constants::TEMPLATE_FILENAME),
-            "# Template\n",
-        )
-        .expect("write template");
-        let task_rel = format!("{tasks_dir}/07004-p1-ready--merged-target-task.md");
-        std::fs::write(repo.join(&task_rel), "# merged task\n").expect("write task");
-        git(repo, &["add", tasks_dir]);
-        git(repo, &["commit", "-m", "add task"]);
-        let remote_default = git(repo, &["rev-parse", "HEAD"]);
-        git(
-            repo,
-            &["update-ref", "refs/remotes/origin/main", &remote_default],
-        );
-        git(
-            repo,
-            &[
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            ],
-        );
-        git(repo, &["checkout", "-b", "feature", &base]);
-        assert!(!repo.join(tasks_dir).exists());
-        tmp
-    }
-
-    #[test]
-    fn project_task_availability_reads_refreshed_default_ref() {
-        let repo = repo_with_remote_only_task();
-
-        assert!(project_tasks_available(repo.path()));
-    }
-
-    #[test]
-    fn project_task_discovery_reads_task_dir_from_ref() {
-        let repo = repo_with_remote_only_task_in("work-items");
-
-        assert!(project_tasks_available(repo.path()));
-        let entries = project_task_entries_from_default_ref(repo.path());
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0]
-            .path
-            .ends_with("work-items/07004-p1-ready--merged-target-task.md"));
-    }
-
-    #[test]
-    fn project_task_listing_reads_refreshed_default_ref() {
-        let repo = repo_with_remote_only_task();
-
-        let entries = project_task_entries_from_default_ref(repo.path());
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].id, "07004");
-        assert_eq!(entries[0].slug, "merged-target-task");
-        assert_eq!(entries[0].status, "ready");
-        assert_eq!(entries[0].source_ref.as_deref(), Some("origin/main"));
-        assert_eq!(entries[0].content.as_deref(), Some("# merged task"));
-        assert!(entries[0]
-            .path
-            .ends_with("tasks/07004-p1-ready--merged-target-task.md"));
-    }
-
-    #[test]
-    fn managed_worktree_can_start_from_listed_remote_ref() {
-        let repo = repo_with_remote_only_task();
-
-        let worktree = match create_managed_explore_worktree_blocking(
-            repo.path().to_str().unwrap(),
-            "12345678-1234-1234-1234-123456789abc",
-            "main",
-            Some("origin/main"),
-        ) {
-            Ok(path) => path,
-            Err(ManagedWorktreeError::BadRequest(e) | ManagedWorktreeError::Git(e)) => {
-                panic!("{e}")
-            }
-        };
-
-        assert!(std::path::Path::new(&worktree)
-            .join("tasks/07004-p1-ready--merged-target-task.md")
-            .exists());
     }
 }
 

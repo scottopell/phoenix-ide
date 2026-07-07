@@ -1,7 +1,7 @@
 //! Conversation state types
 
 use crate::domain::bash_types::BashToolInput;
-use crate::domain::db_schema::{ErrorKind, ToolResult, UsageData};
+use crate::domain::db_schema::{ConversationCreationPhase, ErrorKind, ToolResult, UsageData};
 use crate::domain::llm_types::ContentBlock;
 use crate::domain::patch_types::PatchInput;
 use serde::{Deserialize, Serialize};
@@ -692,6 +692,15 @@ mod tests {
                 error: "boom".into(),
                 error_kind: ErrorKind::SubAgentError,
             },
+            ConvState::Provisioning {
+                job_id: "job".into(),
+                phase: ConversationCreationPhase::Provisioning,
+            },
+            ConvState::CreationFailed {
+                job_id: "job".into(),
+                error: "failed".into(),
+                error_kind: ErrorKind::ServerError,
+            },
             err(),
             ConvState::AwaitingRecovery {
                 message: "auth".into(),
@@ -733,12 +742,14 @@ mod tests {
                 ConvState::Idle | ConvState::Error { .. } => true,
                 ConvState::LlmRequesting { .. }
                 | ConvState::SeededLlmRequesting { .. }
+                | ConvState::Provisioning { .. }
                 | ConvState::ToolExecuting { .. }
                 | ConvState::CancellingTool { .. }
                 | ConvState::AwaitingSubAgents { .. }
                 | ConvState::CancellingSubAgents { .. }
                 | ConvState::Completed { .. }
                 | ConvState::Failed { .. }
+                | ConvState::CreationFailed { .. }
                 | ConvState::AwaitingRecovery { .. }
                 | ConvState::AwaitingContinuation { .. }
                 | ConvState::AwaitingTaskApproval { .. }
@@ -921,6 +932,12 @@ pub enum ConvState {
         attempt: u32,
     },
 
+    /// Conversation shell accepted; asynchronous creation work is still provisioning.
+    Provisioning {
+        job_id: String,
+        phase: ConversationCreationPhase,
+    },
+
     /// Executing tools serially.
     /// The assistant message is held here (NOT yet persisted) — persistence is atomic
     /// at the end of the tool round via `CheckpointData::ToolRound` (REQ-BED-007).
@@ -996,6 +1013,13 @@ pub enum ConvState {
 
     /// Sub-agent failed (terminal state, sub-agent only)
     Failed {
+        error: String,
+        error_kind: ErrorKind,
+    },
+
+    /// Asynchronous conversation creation failed after the shell was accepted.
+    CreationFailed {
+        job_id: String,
         error: String,
         error_kind: ErrorKind,
     },
@@ -1477,7 +1501,10 @@ impl TryFrom<ConvState> for ParentState {
             }
             ConvState::Terminal => Ok(ParentState::Terminal),
             // Sub-agent-only states are invalid for parent
-            ConvState::Completed { .. } | ConvState::Failed { .. } => Err(StateConversionError {
+            ConvState::Completed { .. }
+            | ConvState::Failed { .. }
+            | ConvState::Provisioning { .. }
+            | ConvState::CreationFailed { .. } => Err(StateConversionError {
                 from_variant: cs.variant_name(),
                 target_type: "ParentState",
             }),
@@ -1564,7 +1591,9 @@ impl TryFrom<ConvState> for SubAgentState {
                 Ok(SubAgentState::Failed { error, error_kind })
             }
             // Parent-only states are invalid for sub-agent
-            ConvState::AwaitingRecovery { .. }
+            ConvState::Provisioning { .. }
+            | ConvState::CreationFailed { .. }
+            | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
@@ -1784,12 +1813,14 @@ impl ConvState {
     #[must_use]
     pub fn error_kind(&self) -> Option<&ErrorKind> {
         match self {
-            Self::Error { error_kind, .. }
+            Self::CreationFailed { error_kind, .. }
+            | Self::Error { error_kind, .. }
             | Self::Failed { error_kind, .. }
             | Self::AwaitingRecovery { error_kind, .. } => Some(error_kind),
             Self::Idle
             | Self::LlmRequesting { .. }
             | Self::SeededLlmRequesting { .. }
+            | Self::Provisioning { .. }
             | Self::ToolExecuting { .. }
             | Self::CancellingTool { .. }
             | Self::AwaitingSubAgents { .. }
@@ -1817,6 +1848,8 @@ impl ConvState {
             ConvState::Idle => "Idle",
             ConvState::LlmRequesting { .. } => "LlmRequesting",
             ConvState::SeededLlmRequesting { .. } => "SeededLlmRequesting",
+            ConvState::Provisioning { .. } => "Provisioning",
+            ConvState::CreationFailed { .. } => "CreationFailed",
             ConvState::ToolExecuting { .. } => "ToolExecuting",
             ConvState::CancellingTool { .. } => "CancellingTool",
             ConvState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
@@ -1847,9 +1880,10 @@ impl ConvState {
             ConvState::Completed { result } => {
                 StepResult::Terminal(TerminalOutcome::Completed(result.clone()))
             }
-            ConvState::Failed { error, error_kind } => {
-                StepResult::Terminal(TerminalOutcome::Failed(error.clone(), error_kind.clone()))
-            }
+            ConvState::Failed { error, error_kind }
+            | ConvState::CreationFailed {
+                error, error_kind, ..
+            } => StepResult::Terminal(TerminalOutcome::Failed(error.clone(), error_kind.clone())),
             ConvState::ContextExhausted { summary, .. } => {
                 StepResult::Terminal(TerminalOutcome::ContextExhausted {
                     summary: summary.clone(),
@@ -1861,6 +1895,7 @@ impl ConvState {
             ConvState::Idle
             | ConvState::LlmRequesting { .. }
             | ConvState::SeededLlmRequesting { .. }
+            | ConvState::Provisioning { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }
@@ -1884,7 +1919,7 @@ impl ConvState {
     pub fn presentation_mode(&self) -> &'static str {
         match self {
             ConvState::Idle => "idle",
-            ConvState::Error { .. } => "error",
+            ConvState::CreationFailed { .. } | ConvState::Error { .. } => "error",
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
@@ -1895,6 +1930,7 @@ impl ConvState {
             | ConvState::Failed { .. } => "done",
             ConvState::LlmRequesting { .. }
             | ConvState::SeededLlmRequesting { .. }
+            | ConvState::Provisioning { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }
@@ -1910,7 +1946,7 @@ impl ConvState {
     pub fn display_state(&self) -> DisplayState {
         match self {
             ConvState::Idle => DisplayState::Idle,
-            ConvState::Error { .. } => DisplayState::Error,
+            ConvState::CreationFailed { .. } | ConvState::Error { .. } => DisplayState::Error,
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. } => DisplayState::AwaitingApproval,
@@ -1921,6 +1957,7 @@ impl ConvState {
             | ConvState::Terminal => DisplayState::Terminal,
             ConvState::LlmRequesting { .. }
             | ConvState::SeededLlmRequesting { .. }
+            | ConvState::Provisioning { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }

@@ -567,6 +567,10 @@ export function StateBar({
             dotClass += " error";
             stateText = "error";
             break;
+          case "creation_failed":
+            dotClass += " error";
+            stateText = "creation failed";
+            break;
           case "context_exhausted":
             dotClass += " error";
             stateText = "context full";
@@ -581,6 +585,7 @@ export function StateBar({
           case "cancelling_tool":
           case "cancelling_sub_agents":
           case "awaiting_recovery":
+          case "provisioning":
             // REQ-WPV-001/003: elapsed counter is keyed off the
             // server-authoritative `phaseStateUpdatedAt`, so every
             // working phase gets a live "<reason> Ns" display (not

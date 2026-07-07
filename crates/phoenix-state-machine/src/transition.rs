@@ -418,6 +418,7 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         // transition_core: AgentBusy
         ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
+        | ConvState::Provisioning { .. }
         | ConvState::ToolExecuting { .. }
         | ConvState::AwaitingSubAgents { .. } => Err(TransitionError::AgentBusy),
 
@@ -442,6 +443,7 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         // adding a new state forces a decision here.
         ConvState::AwaitingRecovery { .. }
         | ConvState::AwaitingContinuation { .. }
+        | ConvState::CreationFailed { .. }
         | ConvState::Completed { .. }
         | ConvState::Failed { .. } => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
@@ -3436,6 +3438,8 @@ fn current_attempt(state: &ConvState) -> u32 {
         | ConvState::AwaitingTaskApproval { .. }
         | ConvState::AwaitingUserResponse { .. }
         | ConvState::AwaitingCommissionReviewApproval { .. }
+        | ConvState::Provisioning { .. }
+        | ConvState::CreationFailed { .. }
         | ConvState::ContextExhausted { .. }
         | ConvState::HandedOff { .. }
         | ConvState::Terminal => 1,
@@ -3818,12 +3822,14 @@ mod tests {
             other @ (ConvState::Idle
             | ConvState::LlmRequesting { .. }
             | ConvState::SeededLlmRequesting { .. }
+            | ConvState::Provisioning { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }
             | ConvState::CancellingSubAgents { .. }
             | ConvState::Completed { .. }
             | ConvState::Failed { .. }
+            | ConvState::CreationFailed { .. }
             | ConvState::Error { .. }
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingContinuation { .. }

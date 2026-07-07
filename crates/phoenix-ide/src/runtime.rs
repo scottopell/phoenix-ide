@@ -9,6 +9,7 @@
 //! REQ-BED-008: Sub-Agent Spawning
 //! REQ-BED-009: Sub-Agent Isolation
 
+pub(crate) mod creation_worker;
 pub mod deny_gate;
 pub(crate) mod executor;
 pub(crate) mod fork_resolve;
@@ -118,6 +119,9 @@ pub enum EvictionReason {
     /// The conversation's model was changed; the runtime is recreated so the
     /// new model takes effect.
     ModelUpgrade,
+    /// Async creation finished provisioning cwd/mode/model metadata; recreate
+    /// any shell runtime so it uses the provisioned conversation row.
+    CreationProvisioned,
 }
 
 #[derive(Debug)]
@@ -220,6 +224,8 @@ pub struct RuntimeManager {
     work_scope_browser_tx: mpsc::UnboundedSender<WorkScope>,
     /// Matching receiver, taken once by `start_work_scope_bridge`.
     work_scope_browser_rx: RwLock<Option<mpsc::UnboundedReceiver<WorkScope>>>,
+    creation_kick_tx: tokio::sync::watch::Sender<u64>,
+    creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
 }
 
 /// Handle to interact with a running conversation
@@ -1164,6 +1170,7 @@ impl RuntimeManager {
         // bridge sends the affected scope here after broadcasting its own
         // edge, so the work-scope bridge re-broadcasts a `WorkScopeUpdate`.
         let (work_scope_browser_tx, work_scope_browser_rx) = mpsc::unbounded_channel();
+        let (creation_kick_tx, creation_kick_rx) = watch::channel(0u64);
         Self {
             db,
             llm_registry,
@@ -1194,6 +1201,8 @@ impl RuntimeManager {
             tmux_lifecycle_rx: RwLock::new(Some(tmux_lifecycle_rx)),
             work_scope_browser_tx,
             work_scope_browser_rx: RwLock::new(Some(work_scope_browser_rx)),
+            creation_kick_tx,
+            creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
         }
     }
 
@@ -1699,6 +1708,34 @@ impl RuntimeManager {
             }
         }
         Ok(false)
+    }
+
+    pub async fn start_creation_worker(self: &Arc<Self>) {
+        let rx = self.creation_kick_rx.write().await.take();
+        let Some(mut rx) = rx else {
+            tracing::debug!("creation worker already started; skipping");
+            return;
+        };
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) =
+                    crate::runtime::creation_worker::drain_pending_jobs(&manager).await
+                {
+                    tracing::error!(error = %error, "conversation creation worker drain failed");
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            tracing::info!("Conversation creation worker stopped");
+        });
+        self.kick_creation_worker();
+    }
+
+    pub fn kick_creation_worker(&self) {
+        let next = self.creation_kick_tx.borrow().wrapping_add(1);
+        let _ = self.creation_kick_tx.send(next);
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests
@@ -2500,6 +2537,7 @@ impl RuntimeManager {
                     .await
                     .insert(conversation_id.to_string());
             }
+            EvictionReason::CreationProvisioned => {}
         }
 
         if let Some(handle) = old {

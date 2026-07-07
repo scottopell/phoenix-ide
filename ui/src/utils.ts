@@ -54,13 +54,13 @@ export function formatShortDateTime(isoStr: string): string {
 
 export function isAgentWorking(state: ConversationState): boolean {
   switch (state.type) {
-    case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
+    case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted': case 'creation_failed':
     case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
       return false;
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
-    case 'awaiting_recovery':
+    case 'awaiting_recovery': case 'provisioning':
       return true;
     default: state satisfies never; return false;
   }
@@ -71,7 +71,7 @@ export function canCancelConversationState(state: ConversationState): boolean {
     case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_commission_review_approval': case 'awaiting_recovery':
       return true;
-    case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
+    case 'idle': case 'provisioning': case 'creation_failed': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_llm': case 'awaiting_continuation': case 'awaiting_user_response':
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return false;
@@ -83,7 +83,7 @@ export function isCancellingState(state: ConversationState): boolean {
   switch (state.type) {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return true;
-    case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
+    case 'idle': case 'provisioning': case 'creation_failed': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_task_approval': case 'awaiting_user_response': case 'awaiting_commission_review_approval':
     case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
@@ -136,6 +136,10 @@ export function getStateDescription(state: ConversationState): string {
       return 'cancelling...';
     case 'idle': case 'terminal':
       return 'ready';
+    case 'provisioning':
+      return 'provisioning';
+    case 'creation_failed':
+      return 'creation failed';
     case 'handed_off':
       return 'handed off';
     case 'awaiting_task_approval':
@@ -236,6 +240,14 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'cancelling':
     case 'terminal':
       return { type };
+    case 'provisioning':
+      return { type: 'provisioning', prompt: typeof obj['prompt'] === 'string' ? obj['prompt'] : null };
+    case 'creation_failed':
+      return {
+        type: 'creation_failed',
+        message: typeof obj['message'] === 'string' ? obj['message'] : null,
+        prompt: typeof obj['prompt'] === 'string' ? obj['prompt'] : null,
+      };
     case 'llm_requesting':
     case 'awaiting_continuation':
       return { type, attempt: (obj['attempt'] as number) ?? 1 };

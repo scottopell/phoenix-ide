@@ -328,6 +328,81 @@ fn default_transcript_generation() -> i64 {
     1
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationCreationPhase {
+    Accepted,
+    Provisioning,
+    Ready,
+    Failed,
+}
+
+impl ConversationCreationPhase {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Provisioning => "provisioning",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    #[must_use]
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        Some(match value {
+            "accepted" => Self::Accepted,
+            "provisioning" => Self::Provisioning,
+            "ready" => Self::Ready,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConversationCreationIntent {
+    pub cwd: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub text: String,
+    pub message_id: String,
+    #[serde(default)]
+    pub images: Vec<ImageData>,
+    #[serde(default)]
+    pub files: Vec<FileAttachment>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    #[serde(default)]
+    pub seed_parent_id: Option<String>,
+    #[serde(default)]
+    pub seed_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConversationCreationJob {
+    pub id: String,
+    pub conversation_id: String,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    pub phase: ConversationCreationPhase,
+    pub intent: ConversationCreationIntent,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub accepted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub provisioning_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub failed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// Conversation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {

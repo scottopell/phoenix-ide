@@ -117,6 +117,25 @@ CREATE TABLE IF NOT EXISTS steering_message_images (
     PRIMARY KEY (message_id, image_ordinal)
 );
 
+CREATE TABLE IF NOT EXISTS conversation_creation_jobs (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT UNIQUE,
+    phase TEXT NOT NULL,
+    intent_json TEXT NOT NULL,
+    error TEXT,
+    accepted_at TEXT,
+    provisioning_started_at TEXT,
+    completed_at TEXT,
+    failed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (phase IN ('accepted', 'provisioning', 'ready', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_creation_jobs_phase_updated
+    ON conversation_creation_jobs(phase, updated_at);
+
 CREATE TABLE IF NOT EXISTS turn_usage (
     id INTEGER PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

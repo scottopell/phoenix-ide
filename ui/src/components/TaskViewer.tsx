@@ -25,6 +25,8 @@ const STATUS_CLASS: Record<string, string> = {
 };
 
 const TERMINAL_STATUSES = new Set(['done', 'wont-do']);
+const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
+
 
 export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBack }: TaskViewerProps) {
   const navigate = useNavigate();
@@ -95,6 +97,9 @@ export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBac
       const messageId =
         crypto.randomUUID?.() ??
         `seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const clientConversationId =
+        crypto.randomUUID?.() ??
+        `conv-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const newConv = await createConversationWithStore(
         parentConversation.cwd,
         '', // empty — server accepts empty text when seed_parent_id is set
@@ -105,15 +110,15 @@ export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBac
         null,
         parentConversation.id,
         seedLabel,
+        [],
+        clientConversationId,
       );
       try {
         localStorage.setItem(`seed-draft:${newConv.id}`, promptText);
       } catch {
         // ignore — non-fatal
       }
-      if (newConv.slug) {
-        navigate(`/c/${newConv.slug}`);
-      }
+      navigate(routeForConversation(newConv));
     } catch (err) {
       setSeedError(err instanceof Error ? err.message : 'Failed to start task');
       setSeeding(false);

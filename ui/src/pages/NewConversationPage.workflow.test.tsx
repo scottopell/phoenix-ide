@@ -301,6 +301,10 @@ describe('/new workflow modes', () => {
       [],
       'direct',
       null,
+      undefined,
+      undefined,
+      [],
+      expect.any(String),
     );
     expect(api.listGitBranches).not.toHaveBeenCalled();
   });
@@ -325,6 +329,10 @@ describe('/new workflow modes', () => {
       [],
       'managed',
       'main',
+      undefined,
+      undefined,
+      [],
+      expect.any(String),
     );
     expect(screen.queryByText('Pick a Git branch to start from.')).not.toBeInTheDocument();
     expect(screen.queryByText('Pick a Git starting point')).not.toBeInTheDocument();
@@ -349,6 +357,10 @@ describe('/new workflow modes', () => {
       [],
       'managed',
       'main',
+      undefined,
+      undefined,
+      [],
+      expect.any(String),
     );
   });
   it('submits continue-branch as branch mode with the selected branch', async () => {
@@ -372,6 +384,10 @@ describe('/new workflow modes', () => {
       [],
       'branch',
       'feature/demo',
+      undefined,
+      undefined,
+      [],
+      expect.any(String),
     );
   });
 
@@ -411,6 +427,10 @@ describe('/new workflow modes', () => {
       [],
       'managed',
       'trunk',
+      undefined,
+      undefined,
+      [],
+      expect.any(String),
     );
   });
 
@@ -447,6 +467,10 @@ describe('/new workflow modes', () => {
       [],
       'managed',
       'trunk',
+      undefined,
+      undefined,
+      [],
+      expect.any(String),
     );
   });
 

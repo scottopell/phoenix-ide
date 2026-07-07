@@ -839,8 +839,10 @@ mod random_walk {
             ConvState::ContextExhausted { .. }
             | ConvState::HandedOff { .. }
             | ConvState::Terminal
+            | ConvState::Provisioning { .. }
             | ConvState::Completed { .. }
-            | ConvState::Failed { .. } => Event::UserCancel {
+            | ConvState::Failed { .. }
+            | ConvState::CreationFailed { .. } => Event::UserCancel {
                 reason: None,
                 cause: CancelCause::UserRequested,
             },

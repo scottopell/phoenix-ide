@@ -32,7 +32,13 @@ import { OPEN_MESSAGE_VIEWER_EVENT } from '../components/MessageContextMenu';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
-import { useConversationEventCursorRef, useConversationView, useCreateConversationWithStore } from '../conversation';
+import {
+  useConversationEventCursorRef,
+  useConversationView,
+  useCreateConversationWithStore,
+  readCreateIntent,
+  clearCreateIntent,
+} from '../conversation';
 import {
   useResizablePane,
   useIsDesktop,
@@ -491,7 +497,7 @@ function ConversationPageContent() {
         let cached = atomRef.current.conversation;
         let cachedMessages: Message[] = hadAtomData ? atomRef.current.messages : [];
         if (!hadAtomData) {
-          cached = await cacheDB.getConversationBySlug(slug);
+          cached = await cacheDB.getConversationBySlug(slug) ?? await cacheDB.getConversation(slug);
           if (cached) {
             cachedMessages = await cacheDB.getMessages(cached.id);
             if (!cancelled) {
@@ -616,7 +622,14 @@ function ConversationPageContent() {
 
           try {
             const snapshotStartedAtEventSeq = eventCursorRef.current;
-            const result = await api.getConversationBySlug(slug);
+            const result = await (async () => {
+              try {
+                return await api.getConversationBySlug(slug);
+              } catch (err) {
+                if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+                return api.getConversation(slug);
+              }
+            })();
             if (!cancelled) {
               const replacesDifferentConversation = atomRef.current.conversationId !== null
                 && atomRef.current.conversationId !== result.conversation.id;
@@ -683,7 +696,14 @@ function ConversationPageContent() {
     const confirmArchiveStatus = async () => {
       try {
         const snapshotStartedAtEventSeq = eventCursorRef.current;
-        const result = await api.getConversationBySlug(slug);
+        const result = await (async () => {
+          try {
+            return await api.getConversationBySlug(slug);
+          } catch (err) {
+            if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+            return api.getConversation(slug);
+          }
+        })();
         if (cancelled) return;
         const replacesDifferentConversation = atomRef.current.conversationId !== null
           && atomRef.current.conversationId !== result.conversation.id;

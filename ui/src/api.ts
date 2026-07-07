@@ -363,6 +363,8 @@ export interface CommissionReviewApprovalScope {
 
 export type ConversationState =
   | { type: 'idle' }
+  | { type: 'provisioning'; prompt?: string | null }
+  | { type: 'creation_failed'; message?: string | null; prompt?: string | null }
   | { type: 'awaiting_llm' }
   | { type: 'llm_requesting'; attempt: number }
   | { type: 'seeded_llm_requesting'; seed_message_id: string; attempt: number }
@@ -389,7 +391,7 @@ export type ConversationState =
 /** Mirror of the backend `ConvState::allows_model_change`: true only for
  *  `idle` and `error`. */
 export function canChangeModelInState(state: ConversationState): boolean {
-  return state.type === 'idle' || state.type === 'error';
+  return state.type === 'idle' || state.type === 'error' || state.type === 'creation_failed';
 }
 
 /** A conversation in a terminal state can no longer act on its pending fork
@@ -402,6 +404,7 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'terminal':
     case 'context_exhausted':
     case 'handed_off':
+    case 'creation_failed':
       return true;
     case 'idle':
     case 'awaiting_llm':
@@ -418,6 +421,7 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'awaiting_user_response':
     case 'error':
     case 'awaiting_recovery':
+    case 'provisioning':
       return false;
     default:
       state satisfies never;
@@ -625,10 +629,6 @@ export interface TaskEntry {
   slug: string;
   /** Absolute path to the task file on disk. */
   path: string;
-  /** Git ref the task was listed from, when different from the current checkout. */
-  source_ref?: string;
-  /** Task body loaded from source_ref for preview. */
-  content?: string;
   /** Slug of the conversation working on this task, if any. */
   conversation_slug?: string;
 }
@@ -640,10 +640,6 @@ export interface TaskCountResponse {
   blocked: number;
   /** Whether the branch-derived current task is present among the tasks. */
   current: boolean;
-}
-
-export interface TaskAvailabilityResponse {
-  available: boolean;
 }
 
 /** Expansion error returned by the server when an @reference or /skill fails (REQ-IR-007) */
@@ -1337,20 +1333,20 @@ export const api = {
     seedParentId?: string | null,
     seedLabel?: string | null,
     files: File[] = [],
-    checkoutRef?: string | null,
+    conversationId?: string,
   ): Promise<Conversation> {
     const body: Record<string, unknown> = { cwd, model, text, message_id: messageId, images, mode };
     if (baseBranch) {
       body['base_branch'] = baseBranch;
-    }
-    if (checkoutRef) {
-      body['checkout_ref'] = checkoutRef;
     }
     if (seedParentId) {
       body['seed_parent_id'] = seedParentId;
     }
     if (seedLabel) {
       body['seed_label'] = seedLabel;
+    }
+    if (conversationId) {
+      body['conversation_id'] = conversationId;
     }
     if (files.length > 0) {
       const form = new FormData();
@@ -1694,7 +1690,7 @@ export const api = {
     return resp.json();
   },
 
-  async renameConversation(convId: string, name: string): Promise<{ conversation: Conversation }> {
+  async renameConversation(convId: string, name: string): Promise<{ ok: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/rename`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1703,17 +1699,6 @@ export const api = {
     if (!resp.ok) {
       const err = await resp.json();
       throw new Error(err.error || 'Failed to rename');
-    }
-    return resp.json();
-  },
-
-  async regenerateConversationName(convId: string): Promise<{ conversation: Conversation }> {
-    const resp = await fetch(`/api/conversations/${convId}/regenerate-name`, {
-      method: 'POST',
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to generate name');
     }
     return resp.json();
   },
@@ -1772,16 +1757,6 @@ export const api = {
       signal ? { signal } : {},
     );
     if (!resp.ok) throw new Error('Failed to list skills');
-    return resp.json();
-  },
-
-  /** Lightweight project task availability for the new-conversation workflow. */
-  async getProjectTaskAvailability(cwd: string, signal?: AbortSignal): Promise<TaskAvailabilityResponse> {
-    const resp = await fetch(
-      `/api/tasks/availability?cwd=${encodeURIComponent(cwd)}`,
-      signal ? { signal } : {},
-    );
-    if (!resp.ok) throw new Error('Failed to check task availability');
     return resp.json();
   },
 

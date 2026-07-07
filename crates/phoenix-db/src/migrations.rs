@@ -186,6 +186,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_global_recall_sessions",
         sql: MIGRATION_034,
     },
+    Migration {
+        version: 35,
+        name: "create_conversation_creation_jobs",
+        sql: MIGRATION_035,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -976,6 +981,27 @@ ALTER TABLE conversations ADD COLUMN clear_watermark INTEGER NOT NULL DEFAULT 0;
 
 const MIGRATION_032: &str = r"
 ALTER TABLE work_scope_pr_associations ADD COLUMN feedback_status TEXT NOT NULL DEFAULT 'open';
+";
+
+const MIGRATION_035: &str = r"
+CREATE TABLE IF NOT EXISTS conversation_creation_jobs (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT UNIQUE,
+    phase TEXT NOT NULL,
+    intent_json TEXT NOT NULL,
+    error TEXT,
+    accepted_at TEXT,
+    provisioning_started_at TEXT,
+    completed_at TEXT,
+    failed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (phase IN ('accepted', 'provisioning', 'ready', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_creation_jobs_phase_updated
+    ON conversation_creation_jobs(phase, updated_at);
 ";
 
 /// Run all pending migrations against the database.

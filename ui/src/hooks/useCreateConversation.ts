@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { api, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import type { GitBranchEntry, ImageData, ModelsResponse, TaskEntry } from '../api';
@@ -13,6 +13,8 @@ const LAST_MODEL_KEY = 'phoenix-last-model';
 const RECENT_DIRS_KEY = 'phoenix-recent-dirs';
 const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
 const MAX_RECENT = 5;
+
+const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
 
 function readNewConversationDraft(): string {
   try {
@@ -121,16 +123,15 @@ export function effectiveWorkflow(
   }
 }
 
-function deriveSubmission(workflow: NewConversationWorkflow): { mode: 'direct' | 'managed' | 'branch'; baseBranch: string | null; checkoutRef: string | null } {
+function deriveSubmission(workflow: NewConversationWorkflow): { mode: 'direct' | 'managed' | 'branch'; baseBranch: string | null } {
   switch (workflow.kind) {
     case 'direct':
-      return { mode: 'direct', baseBranch: null, checkoutRef: null };
+      return { mode: 'direct', baseBranch: null };
     case 'planFromBranch':
-      return { mode: 'managed', baseBranch: workflow.baseBranch, checkoutRef: null };
     case 'planFromTask':
-      return { mode: 'managed', baseBranch: workflow.baseBranch, checkoutRef: workflow.task?.source_ref ?? null };
+      return { mode: 'managed', baseBranch: workflowBranch(workflow) };
     case 'continueBranch':
-      return { mode: 'branch', baseBranch: workflow.branch, checkoutRef: null };
+      return { mode: 'branch', baseBranch: workflow.branch };
   }
 }
 
@@ -169,10 +170,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
   // from this plus git status via effectiveWorkflow. null = follow the default.
   const [workflowOverride, setWorkflowOverride] = useState<NewConversationWorkflow | null>(null);
   const [tasks, setTasks] = useState<TaskEntry[]>([]);
-  const [taskAvailabilityLoading, setTaskAvailabilityLoading] = useState(false);
-  const [taskAvailable, setTaskAvailable] = useState<boolean | null>(null);
-  const [tasksLoading, setTasksLoading] = useState(false);
-  const [tasksLoaded, setTasksLoaded] = useState(false);
   const [branches, setBranches] = useState<GitBranchEntry[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
@@ -189,8 +186,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [interimText, setInterimText] = useState('');
   const draftBeforeVoiceRef = useRef<string>('');
   const metadataRequestSeqRef = useRef(0);
-  const taskAvailabilityRequestSeqRef = useRef(0);
-  const taskListRequestSeqRef = useRef(0);
 
   const workflow = effectiveWorkflow(workflowOverride, isGitDir, defaultBranch ?? currentBranch, branchUnavailable);
 
@@ -232,12 +227,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => {
     setBranches([]);
     setTasks([]);
-    taskAvailabilityRequestSeqRef.current += 1;
-    taskListRequestSeqRef.current += 1;
-    setTaskAvailabilityLoading(false);
-    setTaskAvailable(null);
-    setTasksLoading(false);
-    setTasksLoaded(false);
     setCurrentBranch(null);
     setDefaultBranch(null);
     setGitMetadataLoading(false);
@@ -250,12 +239,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
     if (!isGitDir) {
       setBranches([]);
       setTasks([]);
-      taskAvailabilityRequestSeqRef.current += 1;
-      taskListRequestSeqRef.current += 1;
-      setTaskAvailabilityLoading(false);
-      setTaskAvailable(null);
-      setTasksLoading(false);
-      setTasksLoaded(false);
       setCurrentBranch(null);
       setDefaultBranch(null);
       setGitMetadataLoading(false);
@@ -270,80 +253,42 @@ export function useCreateConversation(navigate: (path: string) => void) {
     let cancelled = false;
     setGitMetadataLoading(true);
     setBranchUnavailable(false);
-    api.listGitBranches(trimmedCwd).then(resp => {
+    Promise.allSettled([
+      api.listGitBranches(trimmedCwd),
+      api.listProjectTasks(trimmedCwd),
+    ]).then(([branchesResult, tasksResult]) => {
       if (cancelled || requestSeq !== metadataRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      setBranches(resp.branches);
-      setCurrentBranch(resp.current);
-      setDefaultBranch(resp.default_branch ?? null);
-      // Unborn/branchless repo: HEAD points at no commit, so neither a
-      // default nor a current branch resolves. Record it so the default
-      // workflow degrades to 'direct' instead of a branchless planFromBranch
-      // the user can't send.
-      setBranchUnavailable(!(resp.default_branch || resp.current));
-    }).catch(err => {
-      if (cancelled || requestSeq !== metadataRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      console.warn('Failed to fetch git branches:', err);
-      setBranches([]);
-      setCurrentBranch(null);
-      setDefaultBranch(null);
-      setBranchUnavailable(true);
+
+      if (branchesResult.status === 'fulfilled') {
+        const resp = branchesResult.value;
+        setBranches(resp.branches);
+        setCurrentBranch(resp.current);
+        setDefaultBranch(resp.default_branch ?? null);
+        // Unborn/branchless repo: HEAD points at no commit, so neither a
+        // default nor a current branch resolves. Record it so the default
+        // workflow degrades to 'direct' instead of a branchless planFromBranch
+        // the user can't send.
+        setBranchUnavailable(!(resp.default_branch || resp.current));
+      } else {
+        console.warn('Failed to fetch git branches:', branchesResult.reason);
+        setBranches([]);
+        setCurrentBranch(null);
+        setDefaultBranch(null);
+        setBranchUnavailable(true);
+      }
+
+      if (tasksResult.status === 'fulfilled') {
+        setTasks(tasksResult.value.tasks);
+      } else {
+        console.warn('Failed to fetch tasks:', tasksResult.reason);
+        setTasks([]);
+      }
     }).finally(() => {
       if (!cancelled && requestSeq === metadataRequestSeqRef.current) setGitMetadataLoading(false);
     });
 
     return () => { cancelled = true; };
   }, [isGitDir, cwd]);
-
-  useEffect(() => {
-    if (!isGitDir) return;
-    const trimmedCwd = cwd.trim();
-    if (!trimmedCwd) return;
-
-    const requestSeq = ++taskAvailabilityRequestSeqRef.current;
-    let cancelled = false;
-    setTaskAvailabilityLoading(true);
-    setTaskAvailable(null);
-    setTasks([]);
-    setTasksLoaded(false);
-    setTasksLoading(false);
-    api.getProjectTaskAvailability(trimmedCwd).then(resp => {
-      if (cancelled || requestSeq !== taskAvailabilityRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      setTaskAvailable(resp.available);
-    }).catch(err => {
-      if (cancelled || requestSeq !== taskAvailabilityRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      console.warn('Failed to check task availability:', err);
-      setTaskAvailable(false);
-    }).finally(() => {
-      if (!cancelled && requestSeq === taskAvailabilityRequestSeqRef.current) setTaskAvailabilityLoading(false);
-    });
-
-    return () => { cancelled = true; };
-  }, [isGitDir, cwd]);
-
-  const loadProjectTasks = useCallback(() => {
-    if (!isGitDir || tasksLoading || tasksLoaded) return;
-    const trimmedCwd = cwd.trim();
-    if (!trimmedCwd || taskAvailable === false) return;
-
-    const requestSeq = ++taskListRequestSeqRef.current;
-    setTasksLoading(true);
-    api.listProjectTasks(trimmedCwd).then(resp => {
-      if (requestSeq !== taskListRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      setTasks(resp.tasks);
-      setTasksLoaded(true);
-    }).catch(err => {
-      if (requestSeq !== taskListRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
-      console.warn('Failed to fetch tasks:', err);
-      setTasks([]);
-      setTasksLoaded(true);
-    }).finally(() => {
-      if (requestSeq === taskListRequestSeqRef.current) setTasksLoading(false);
-    });
-  }, [cwd, isGitDir, taskAvailable, tasksLoaded, tasksLoading]);
-
-  useEffect(() => {
-    if (workflow.kind === 'planFromTask') loadProjectTasks();
-  }, [loadProjectTasks, workflow.kind]);
 
   useEffect(() => {
     if (!isGitDir || !branchSearch.trim()) return;
@@ -479,6 +424,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       }
 
       const messageId = generateUUID();
+      const clientConversationId = generateUUID();
       const trimmedCwd = cwd.trim();
       if (workflowNeedsGit(workflow) && isGitDir !== true) {
         setError('Choose a Git repository before starting an isolated workflow.');
@@ -510,62 +456,39 @@ export function useCreateConversation(navigate: (path: string) => void) {
         ? buildTaskStartPrompt(trimmedCwd, selectedTask, trimmed)
         : trimmed;
       const conv = files.length > 0
-        ? submission.checkoutRef
-          ? await createConversationWithStore(
-              trimmedCwd,
-              submitText,
-              messageId,
-              selectedModel || undefined,
-              images,
-              submission.mode,
-              submission.baseBranch,
-              undefined,
-              undefined,
-              files,
-              submission.checkoutRef,
-            )
-          : await createConversationWithStore(
-              trimmedCwd,
-              submitText,
-              messageId,
-              selectedModel || undefined,
-              images,
-              submission.mode,
-              submission.baseBranch,
-              undefined,
-              undefined,
-              files,
-            )
-        : submission.checkoutRef
-          ? await createConversationWithStore(
-              trimmedCwd,
-              submitText,
-              messageId,
-              selectedModel || undefined,
-              images,
-              submission.mode,
-              submission.baseBranch,
-              undefined,
-              undefined,
-              [],
-              submission.checkoutRef,
-            )
-          : await createConversationWithStore(
-              trimmedCwd,
-              submitText,
-              messageId,
-              selectedModel || undefined,
-              images,
-              submission.mode,
-              submission.baseBranch,
-            );
+        ? await createConversationWithStore(
+            trimmedCwd,
+            submitText,
+            messageId,
+            selectedModel || undefined,
+            images,
+            submission.mode,
+            submission.baseBranch,
+            undefined,
+            undefined,
+            files,
+            clientConversationId,
+          )
+        : await createConversationWithStore(
+            trimmedCwd,
+            submitText,
+            messageId,
+            selectedModel || undefined,
+            images,
+            submission.mode,
+            submission.baseBranch,
+            undefined,
+            undefined,
+            [],
+            clientConversationId,
+          );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
       setDraft('');
       setImages([]);
       setFiles([]);
       clearNewConversationDraft();
-      navigate(`/c/${conv.slug}`);
+      navigate(routeForConversation(conv));
     } catch (err) {
       setCreating(false);
       // An unresolvable @reference in the first message rejects with a 422.
@@ -607,11 +530,6 @@ export function useCreateConversation(navigate: (path: string) => void) {
     workflow,
     setWorkflow: setWorkflowFromUser,
     tasks,
-    taskAvailabilityLoading,
-    taskAvailable,
-    tasksLoading,
-    tasksLoaded,
-    loadProjectTasks,
     branches,
     currentBranch,
     defaultBranch,

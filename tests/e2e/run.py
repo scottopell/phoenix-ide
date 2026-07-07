@@ -485,15 +485,20 @@ def scenario_continuation(base_url: str) -> None:
 def scenario_mid_stream_cancel(base_url: str) -> None:
     """Cancel during streaming; verify state reaches idle cleanly."""
     conv = _new_conv(base_url, "[[scenario:long]] start streaming")
-    # Observe the stream just long enough to know it has started, then cancel.
+    # Creation returns an instant provisioning shell; wait until the first turn
+    # has actually left idle/provisioning before cancelling.
     url = f"{base_url}/api/conversations/{conv['id']}/stream"
     with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)) as client:
         with connect_sse(client, "GET", url) as src:
-            t_start = time.monotonic()
+            deadline = time.monotonic() + 10.0
             for event in src.iter_sse():
-                if event.event in ("init", "message", "state_change"):
-                    pass
-                if time.monotonic() - t_start > 0.3:
+                if time.monotonic() > deadline:
+                    raise AssertionError("conversation did not start before cancel deadline")
+                if event.event != "state_change":
+                    continue
+                data = json.loads(event.data) if event.data else {}
+                state = _state_str(data.get("state"))
+                if state not in ("idle", "provisioning"):
                     break
     resp = _cancel(base_url, conv["id"])
     assert not resp.get("no_op", False), "cancel was a no-op — conversation already idle before we cancelled"

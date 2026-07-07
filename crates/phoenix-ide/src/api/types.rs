@@ -7,6 +7,8 @@ use std::path::Path;
 /// Request to create a new conversation with initial message
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
+    #[serde(default)]
+    pub conversation_id: Option<String>,
     pub cwd: String,
     pub model: Option<String>,
     /// Initial message text (required)

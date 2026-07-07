@@ -22,3 +22,19 @@ export type {
   StreamingBuffer,
   UIError,
 } from './atom';
+
+const createIntentByConversationId = new Map<string, { prompt: string | null }>();
+
+export function rememberCreateIntent(conversationId: string, prompt: string | null): void {
+  createIntentByConversationId.set(conversationId, { prompt });
+}
+
+export function readCreateIntent(conversationId: string | null | undefined): { prompt: string | null } | null {
+  if (!conversationId) return null;
+  return createIntentByConversationId.get(conversationId) ?? null;
+}
+
+export function clearCreateIntent(conversationId: string | null | undefined): void {
+  if (!conversationId) return;
+  createIntentByConversationId.delete(conversationId);
+}
