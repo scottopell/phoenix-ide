@@ -135,4 +135,30 @@ describe('TaskApprovalReader feedback action emphasis', () => {
 
     expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' })).toBeInTheDocument();
   });
+
+  it('clears approving state and shows async approval errors', () => {
+    const onApprove = vi.fn();
+    const { rerender } = renderTaskApprovalReader(undefined, onApprove);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve and start here' }));
+    expect(screen.getByText('Approving...')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' })).toBeDisabled();
+
+    rerender(
+      <TaskApprovalReader
+        title="Review task"
+        priority="p2"
+        plan="# Plan\n\nAdd the thing."
+        approvalError="Target branch already exists"
+        onApprove={onApprove}
+        onReject={vi.fn()}
+        onSendFeedback={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Target branch already exists');
+    expect(screen.queryByText('Approving...')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approve and start here' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' })).toBeEnabled();
+  });
 });

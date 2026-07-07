@@ -65,6 +65,7 @@ export interface TaskApprovalReaderProps {
   plan: string;
   contextWindowUsed?: number | undefined;
   modelContextWindow?: number | undefined;
+  approvalError?: string | null | undefined;
   onApprove: (handoff: TaskApprovalHandoff) => void;
   onReject: () => void;
   onSendFeedback: (annotations: string) => void;
@@ -206,6 +207,7 @@ export function TaskApprovalReader({
   plan,
   contextWindowUsed,
   modelContextWindow,
+  approvalError,
   onApprove,
   onReject,
   onSendFeedback,
@@ -254,6 +256,12 @@ export function TaskApprovalReader({
     }
     return undefined;
   }, [highlightedLine]);
+
+  useEffect(() => {
+    if (approvalError) {
+      setApprovingHandoff(null);
+    }
+  }, [approvalError]);
 
   const handleAddNote = useCallback(() => {
     if (!annotatingLine || !noteInput.trim()) return;
@@ -501,6 +509,12 @@ export function TaskApprovalReader({
           <span className="task-approval-context-cue__hint">
             Start here keeps this discussion; New chat starts a summarized continuation.
           </span>
+        </div>
+      )}
+
+      {approvalError && (
+        <div className="task-approval-error" role="alert">
+          {approvalError}
         </div>
       )}
 

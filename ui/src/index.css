@@ -8834,6 +8834,14 @@ html * {
   white-space: nowrap;
 }
 
+.task-approval-error {
+  padding: 8px 16px;
+  border-top: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--accent-red) 12%, var(--bg-secondary));
+  color: var(--accent-red);
+  font-size: 13px;
+}
+
 .task-approval-actions {
   display: flex;
   align-items: center;
