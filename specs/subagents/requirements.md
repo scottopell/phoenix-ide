@@ -189,8 +189,9 @@ resolve missing child handles through the wake contract's `Forgotten` cause
 WHEN Phoenix restarts while a sub-agent wake contract is pending
 THE SYSTEM SHALL deliver the child conversation's persisted terminal state and its
 durable terminal cause when that cause occurred before the contract deadline,
-otherwise treat the sub-agent handle as forgotten because active sub-agent
-runtimes do not survive restart
+expire the wake contract when the child has durable terminal state only after the
+contract deadline, and otherwise treat the sub-agent handle as forgotten because
+active sub-agent runtimes do not survive restart
 
 THE sub-agent wake handle SHALL NOT be keyed by the parent's WorkScope and SHALL
 NOT imply parent-to-child continuation or automatic budget extension

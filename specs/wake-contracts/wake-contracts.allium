@@ -212,9 +212,6 @@ entity Contract {
         terminal: terminal
     }
 
-    -- Terminal cause. Populated iff status = terminal.
-    terminal_cause: TerminalCause     when status = terminal
-
     -- The full delivered payload. Persisted so a late SSE reconnect
     -- can re-deliver the wake event without losing data. This is the sole
     -- persisted representation of forgotten reasons and fired handle payloads.
@@ -654,19 +651,19 @@ invariant ContractsFireOnlyTheirConversation {
 -- terminal fields populated.
 invariant TerminalContractsAreFullyPopulated {
     for c in Contract where c.status = terminal:
-        c.terminal_cause != null
-        and c.resolved_at != null
+        c.resolved_at != null
         and c.terminal_payload != null
 }
 
--- REQ-WAKE-011: every contract's terminal_cause is one of exactly
--- the four documented causes. Forbids silent abandonment.
-invariant TerminalCauseIsOneOfFour {
+-- REQ-WAKE-011: every contract's terminal_payload cause is one of exactly
+-- the four documented causes. Forbids silent abandonment while keeping the cause
+-- in one persisted field.
+invariant TerminalPayloadCauseIsOneOfFour {
     for c in Contract where c.status = terminal:
-        c.terminal_cause = fired
-        or c.terminal_cause = expired
-        or c.terminal_cause = cancelled
-        or c.terminal_cause = forgotten
+        c.terminal_payload.cause = fired
+        or c.terminal_payload.cause = expired
+        or c.terminal_payload.cause = cancelled
+        or c.terminal_payload.cause = forgotten
 }
 
 -- REQ-WAKE-007: every pending contract has expires_at strictly in

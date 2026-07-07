@@ -115,13 +115,14 @@ delivery semantics; ADR-006 records the explicit non-state rationale.
 THE SYSTEM SHALL persist every wake contract in a `wake_contracts` SQLite table
 with columns `(id, conv_id, handle_kind, handle_id, condition_json, expires_at,
 registered_at, fire_template_json, registering_tool_use_id, status,
-terminal_cause, terminal_payload, resolved_at)`
+terminal_payload, resolved_at)`
 
 THE `terminal_payload` column SHALL be the sole persisted representation of the
-terminal payload, including `forgotten_reason` when `terminal_cause = Forgotten`
+terminal cause and payload, including `forgotten_reason` when the payload cause is
+`Forgotten`
 
-THE SYSTEM SHALL update `status`, `terminal_cause`, `terminal_payload`, and
-`resolved_at` atomically when a contract resolves
+THE SYSTEM SHALL update `status`, `terminal_payload`, and `resolved_at` atomically
+when a contract resolves
 
 WHEN Phoenix restarts
 THE SYSTEM SHALL reconcile every non-terminal contract before normal serving:
@@ -325,11 +326,13 @@ the wait is non-blocking from the user's standpoint.
 
 ### REQ-WAKE-009: Conversation-Scoped, Not WorkScope-Scoped
 
-A wake contract SHALL be owned by the conversation that registered it
+A wake contract SHALL be owned by the conversation id currently stored on the
+contract row
 
-THE wake-router SHALL fire only the registering conversation, even
-when the underlying handle is WorkScope-keyed and shared across
-continuation
+THE wake-router SHALL fire only the contract's current conversation id, even when
+the underlying handle is WorkScope-keyed and shared across continuation. When
+REQ-WAKE-012 transfers a contract to an inheriting conversation, that successor is
+the only wake delivery target.
 
 **Rationale:** WorkScope governs *resource* sharing across continuation
 boundaries; wake governs *conversation* resumption. Conflating them
@@ -363,19 +366,22 @@ honest semantics.
 
 ### REQ-WAKE-011: Terminal-Cause Distinction
 
-Every accepted wake contract whose registering conversation remains queryable
-SHALL transition from pending to exactly one terminal outcome and SHALL deliver
-that outcome to the registering conversation. Hard-delete paths that remove the
-registering conversation cancel/remove the contract before deleting the row and do
-not append a synthetic result into the deleted conversation. The wake event
-payload SHALL distinguish:
+Every accepted wake contract whose current `conv_id` remains queryable SHALL
+transition from pending to exactly one terminal outcome and SHALL deliver that
+outcome to the contract's current `conv_id`. If REQ-WAKE-012 re-keys a contract
+to an inheriting conversation, delivery targets the inheriting conversation, not
+the original registering conversation. Hard-delete paths that remove the current
+conversation cancel/remove the contract before deleting the row and do not append
+a synthetic result into the deleted conversation. The wake event payload SHALL
+distinguish:
 - `Fired { observed_payload }` — condition held
 - `Expired` — delivery deadline reached before the condition held
 - `Cancelled` — user cancelled, or lifecycle cascade
 - `Forgotten { reason }` — underlying handle became unknowable before the
   condition could be evaluated: a hard-delete cascade with no inheriting
-  WorkScope, a Phoenix restart that dropped an in-memory handle (bash), or a
-  missing sub-agent child
+  WorkScope, a Phoenix restart that dropped an in-memory handle (bash), a missing
+  tmux window/session with no recorded terminal state, or a missing sub-agent
+  child
 
 **Rationale:** "The wait returned" is not a sufficient description.
 Forgotten is structurally different from expired — the contract was
