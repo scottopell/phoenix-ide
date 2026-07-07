@@ -4032,9 +4032,11 @@ where
                     &self.context.mode_context,
                     Some(ModeContext::Explore { .. })
                 ) {
-                    "You have reached your turn limit. Please call submit_result now \
-                         with whatever findings you have so far. Other tool calls will not help \
-                         complete this grace turn."
+                    "You have reached your turn limit. Only submit_result or submit_error can \
+                         produce a useful terminal outcome from this grace turn. Call submit_result \
+                         with whatever findings you have so far, or call submit_error if you are \
+                         blocked and do not have useful findings to report. Other tool calls will \
+                         not help complete this grace turn."
                 } else {
                     "You have reached your turn limit. Only submit_result or submit_error can \
                          produce a useful terminal outcome from this grace turn. If your assigned \

@@ -144,7 +144,7 @@ enum TerminalCause {
 }
 
 enum TmuxTerminalStatus {
-    window_process_exited
+    tmux_run_exit_marker_observed
     | window_killed
 }
 
@@ -332,7 +332,9 @@ rule WaitUntilRejectedByRange {
     )
 }
 
--- REQ-WAKE-003: router fires when the underlying condition holds.
+-- REQ-WAKE-003: router fires when the underlying condition holds. For tmux_run,
+-- the condition holds when the Phoenix exit marker is observed in the watched
+-- window, not when the tmux window process exits.
 -- Other pending contracts on the same conversation are NOT
 -- cancelled (REQ-WAKE-010 independent semantics) - they continue to
 -- be evaluated and may fire later.
@@ -398,9 +400,9 @@ rule WakeRouterForgetsMissingSubAgentHandle {
     ensures: SseEmitted(WakeContractForgotten, contract.id)
 }
 
--- REQ-WAKE-011 + REQ-WAKE-018: an absent tmux window/session is forgotten, not
--- a fired tmux terminal payload. This preserves the same retry/escalation signal
--- as other destroyed handles.
+-- REQ-WAKE-011 + REQ-WAKE-018: an absent tmux window/session is forgotten only
+-- when no recorded tmux terminal state exists. A killed window or observed
+-- tmux_run exit marker fires through evaluator_reports_fired instead.
 rule WakeRouterForgetsMissingTmuxHandle {
     when: WakeRouterTick(contract)
 
@@ -408,6 +410,7 @@ rule WakeRouterForgetsMissingTmuxHandle {
     requires: contract.condition.handle?.kind = tmux_pane
     requires: contract.expires_at > now()
     requires: not tmux_window_exists(contract.condition.handle?.id)
+    requires: not tmux_terminal_state_recorded(contract.condition.handle?.id)
 
     let payload = FirePayload(cause: forgotten, forgotten_reason: "tmux_handle_missing")
 

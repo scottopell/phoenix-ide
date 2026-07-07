@@ -186,14 +186,19 @@ THE SYSTEM SHALL support the following condition kind in v1:
 - `HandleTerminal { handle_kind: Bash | TmuxPane | SubAgent, handle_id }`
   — fires when the named handle reaches a terminal state.
 
-For `Bash`, terminal states SHALL include exited, killed, signaled,
-`kill_pending_kernel`, forgotten, and the synchronous wait surface's other
-terminal statuses.
+For `Bash`, fired payloads SHALL include the terminal statuses reported by the
+synchronous wait surface for an observed handle, including exited, killed,
+signaled, and `kill_pending_kernel`. A bash handle that is lost across restart or
+teardown resolves through the wake contract's `Forgotten` cause, not through a
+fired bash payload.
 
-For `TmuxPane`, fired payloads SHALL include the watched tmux `window_id` process
-exiting or the window being explicitly killed. If the tmux server/session or
-registered window handle is absent because of lifecycle teardown or restart
-resync, the contract SHALL resolve as `Forgotten`, not as a fired tmux payload.
+For `TmuxPane`, fired payloads SHALL include observing the Phoenix tmux-run exit
+marker for the watched `window_id`, or observing that the watched window was
+explicitly killed after the registry recorded that terminal state. The evaluator
+SHALL NOT require the tmux window process to exit, because `tmux_run` keeps the
+window inspectable after command exit by default. If the tmux server/session or
+registered window handle is absent without a recorded killed/exit-marker terminal
+state, the contract SHALL resolve as `Forgotten`, not as a fired tmux payload.
 
 For `SubAgent`, terminal fired payloads SHALL include every durable child
 terminal cause admitted by bedrock: explicit `submit_result`, explicit
@@ -211,12 +216,17 @@ THE SYSTEM SHALL NOT support in v1:
 - `FileChanged { path }` — deferred
 - `PortListening { host, port }` — deferred
 - `WebhookFired { id }` — deferred (security surface)
+- deadline-only waits with no owned handle, such as usage-limit reset sweeps —
+  deferred to their owning scheduler instead of `wait_until`
 
 **Rationale:** HandleTerminal covers the highest-leverage cases: build/test
 processes finishing and delegated sub-agents reaching their terminal result. It
 validates the persistence, delivery, and wake-router edges without committing
 Phoenix to a general actor framework. Other condition kinds are separate
-evaluators; actor-style messaging is a separate product contract.
+evaluators; actor-style messaging is a separate product contract. Deadline-only
+wakes are also separate: they have no handle ownership, no substrate terminal
+payload, and no `Forgotten` semantics, so modeling them as `wait_until` contracts
+would create a parallel scheduler inside the handle-wake plane.
 
 ---
 
@@ -527,10 +537,11 @@ inherits the same WorkScope, and a pending wake contract transfers with it per
 REQ-WAKE-012. Because bash handles are in-memory, Phoenix restart fires pending
 bash waits as `Forgotten { reason: "phoenix_restart" }`.
 
-A `TmuxPane` wake handle SHALL be addressed by the tmux registry's stable pane or
-window handle id. It is WorkScope-keyed for continuation inheritance and lifecycle
+A `TmuxPane` wake handle SHALL be addressed by the tmux registry's stable
+`window_id`. It is WorkScope-keyed for continuation inheritance and lifecycle
 teardown. A hard-delete or WorkScope teardown with no inheriting successor fires
-pending tmux waits as forgotten; a surviving tmux handle is re-registered on
+pending tmux waits as forgotten unless the registry already recorded a terminal
+exit-marker or killed-window state; a surviving tmux handle is re-registered on
 router startup.
 
 A `SubAgent` wake handle SHALL be addressed by the child conversation / agent id
