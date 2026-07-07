@@ -1147,6 +1147,10 @@ pub(crate) struct ResponsesApiUsage {
 // Chat Completions API
 // ===========================================================================
 
+fn chat_supports_openai_optional_fields(spec: &ModelSpec) -> bool {
+    spec.source == super::models::ModelSource::BuiltIn
+}
+
 /// Complete using the `OpenAI` Chat Completions API (non-streaming).
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_chat(
@@ -1158,7 +1162,7 @@ pub async fn complete_chat(
     request: &LlmRequest,
 ) -> Result<LlmResponse, LlmError> {
     let url = resolve_chat_endpoint(base_url_override);
-    let mut chat_request = translate_to_chat_request(&spec.api_name, request);
+    let mut chat_request = translate_to_chat_request(spec, request);
     if !request_tags.is_empty() {
         chat_request.tags = Some(request_tags.clone());
     }
@@ -1215,11 +1219,13 @@ pub async fn complete_streaming_chat(
     use futures::StreamExt;
 
     let url = resolve_chat_endpoint(base_url_override);
-    let mut chat_request = translate_to_chat_request(&spec.api_name, request);
+    let mut chat_request = translate_to_chat_request(spec, request);
     chat_request.stream = Some(true);
-    chat_request.stream_options = Some(ChatStreamOptions {
-        include_usage: true,
-    });
+    if chat_supports_openai_optional_fields(spec) {
+        chat_request.stream_options = Some(ChatStreamOptions {
+            include_usage: true,
+        });
+    }
     if !request_tags.is_empty() {
         chat_request.tags = Some(request_tags.clone());
     }
@@ -1291,7 +1297,7 @@ pub async fn complete_streaming_chat(
 
 /// Translate `LlmRequest` to `ChatCompletionsRequest`.
 #[allow(clippy::too_many_lines)] // single-pass message translation
-fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatCompletionsRequest {
+fn translate_to_chat_request(spec: &ModelSpec, request: &LlmRequest) -> ChatCompletionsRequest {
     use super::types::ImageSource;
 
     let mut messages = Vec::new();
@@ -1452,7 +1458,7 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
 
     let has_tools = !request.tools.is_empty();
     ChatCompletionsRequest {
-        model: api_name.to_string(),
+        model: spec.api_name.clone(),
         messages,
         tools,
         max_tokens: request.max_tokens,
@@ -1463,7 +1469,11 @@ fn translate_to_chat_request(api_name: &str, request: &LlmRequest) -> ChatComple
         } else {
             None
         },
-        parallel_tool_calls: if has_tools { Some(true) } else { None },
+        parallel_tool_calls: if has_tools && chat_supports_openai_optional_fields(spec) {
+            Some(true)
+        } else {
+            None
+        },
         tags: None,
     }
 }
@@ -2662,6 +2672,17 @@ mod tests {
             }
         }
 
+        fn chat_spec(api_name: &str, source: crate::ModelSource) -> ModelSpec {
+            let mut spec = crate::all_models()
+                .into_iter()
+                .find(|model| model.id == "gpt-5.5")
+                .expect("gpt-5.5 must be in the model registry");
+            spec.backend = crate::ModelBackend::OpenAIChatCompletions;
+            spec.api_name = api_name.to_string();
+            spec.source = source;
+            spec
+        }
+
         // --- endpoint resolution ---
 
         #[test]
@@ -2694,7 +2715,8 @@ mod tests {
         fn chat_request_system_becomes_system_message() {
             let mut req = empty_request();
             req.system = vec![SystemContent::new("You are helpful.")];
-            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             assert_eq!(chat_req.messages.len(), 1);
             assert_eq!(chat_req.messages[0].role, "system");
             let json = serde_json::to_value(&chat_req).unwrap();
@@ -2719,7 +2741,8 @@ mod tests {
                     }],
                 },
             ];
-            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             // system + user + assistant
             assert_eq!(chat_req.messages.len(), 3);
             assert_eq!(chat_req.messages[1].role, "user");
@@ -2744,7 +2767,8 @@ mod tests {
                     },
                 ],
             }];
-            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             let json = serde_json::to_value(&chat_req).unwrap();
             let parts = &json["messages"][0]["content"];
             assert!(parts.is_array(), "content should be parts array");
@@ -2778,7 +2802,8 @@ mod tests {
                     },
                 ],
             }];
-            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             let json = serde_json::to_value(&chat_req).unwrap();
             let parts = &json["messages"][0]["content"];
             assert_eq!(parts[0]["type"], "text");
@@ -2799,7 +2824,8 @@ mod tests {
                     input: serde_json::json!({"path": "/tmp/foo"}),
                 }],
             }];
-            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             let json = serde_json::to_value(&chat_req).unwrap();
             let tool_calls = &json["messages"][0]["tool_calls"];
             assert!(tool_calls.is_array());
@@ -2820,7 +2846,8 @@ mod tests {
                     is_error: false,
                 }],
             }];
-            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             let json = serde_json::to_value(&chat_req).unwrap();
             let msg = &json["messages"][0];
             assert_eq!(msg["role"], "tool");
@@ -2840,7 +2867,8 @@ mod tests {
                     is_error: true,
                 }],
             }];
-            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             let json = serde_json::to_value(&chat_req).unwrap();
             assert_eq!(json["messages"][0]["content"], "Error: command not found");
         }
@@ -2855,7 +2883,8 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
                 defer_loading: false,
             }];
-            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             let json = serde_json::to_value(&chat_req).unwrap();
             assert_eq!(json["tools"][0]["type"], "function");
             assert_eq!(json["tools"][0]["function"]["name"], "bash");
@@ -2864,10 +2893,42 @@ mod tests {
         }
 
         #[test]
+        fn chat_request_external_model_omits_parallel_tool_calls() {
+            use crate::types::ToolDefinition;
+            let mut req = empty_request();
+            req.tools = vec![ToolDefinition {
+                name: "bash".to_string(),
+                description: "Run a bash command".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                defer_loading: false,
+            }];
+            let chat_req = translate_to_chat_request(
+                &chat_spec("gateway/model", crate::ModelSource::External),
+                &req,
+            );
+            let json = serde_json::to_value(&chat_req).unwrap();
+            assert_eq!(json["tool_choice"], "auto");
+            assert!(json.get("parallel_tool_calls").is_none());
+        }
+
+        #[test]
+        fn chat_stream_usage_options_are_builtin_only() {
+            assert!(chat_supports_openai_optional_fields(&chat_spec(
+                "gpt-4o",
+                crate::ModelSource::BuiltIn
+            )));
+            assert!(!chat_supports_openai_optional_fields(&chat_spec(
+                "gateway/model",
+                crate::ModelSource::External
+            )));
+        }
+
+        #[test]
         fn chat_request_max_tokens_forwarded() {
             let mut req = empty_request();
             req.max_tokens = Some(4096);
-            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             let json = serde_json::to_value(&chat_req).unwrap();
             assert_eq!(json["max_tokens"], 4096);
         }
@@ -2875,7 +2936,8 @@ mod tests {
         #[test]
         fn chat_request_no_tools_omits_tool_choice_and_parallel() {
             let req = empty_request();
-            let chat_req = translate_to_chat_request("gpt-4o", &req);
+            let chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             let json = serde_json::to_value(&chat_req).unwrap();
             assert!(json.get("tool_choice").is_none());
             assert!(json.get("parallel_tool_calls").is_none());
@@ -2886,7 +2948,8 @@ mod tests {
         #[test]
         fn chat_streaming_request_sets_stream_and_include_usage() {
             let req = empty_request();
-            let mut chat_req = translate_to_chat_request("gpt-4o", &req);
+            let mut chat_req =
+                translate_to_chat_request(&chat_spec("gpt-4o", crate::ModelSource::BuiltIn), &req);
             chat_req.stream = Some(true);
             chat_req.stream_options = Some(ChatStreamOptions {
                 include_usage: true,

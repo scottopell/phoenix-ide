@@ -457,12 +457,13 @@ fn legacy_openai_base_url_for_chat(url: Option<&str>) -> Option<String> {
     }
 }
 
-fn legacy_openai_base_url_is_chat_only(config: &LlmConfig) -> bool {
+fn openai_config_has_chat_only_endpoint(config: &LlmConfig) -> bool {
     config.openai_responses_base_url.is_none()
-        && config
-            .openai_base_url
-            .as_deref()
-            .is_some_and(|url| url.contains("/chat/completions"))
+        && (config.openai_chat_completions_base_url.is_some()
+            || config
+                .openai_base_url
+                .as_deref()
+                .is_some_and(|url| url.contains("/chat/completions")))
 }
 
 fn warn_if_endpoint_url_has_no_path(name: &str, url: &str) {
@@ -845,7 +846,7 @@ impl ModelRegistry {
         config: &LlmConfig,
     ) -> Option<Arc<dyn LlmService>> {
         if spec.backend == ModelBackend::OpenAIResponses
-            && legacy_openai_base_url_is_chat_only(config)
+            && openai_config_has_chat_only_endpoint(config)
         {
             tracing::debug!(
                 model = %spec.id,
@@ -2114,6 +2115,23 @@ mod tests {
                 Duration::from_hours(1),
             )),
             openai_base_url: Some("https://gateway.example/v1/chat/completions".to_string()),
+            openai_chat_completions_base_url: Some(
+                "https://gateway.example/v1/chat/completions".to_string(),
+            ),
+            external_models: vec![external_chat_completions_model()],
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(registry.get("gpt-5.5").is_none());
+        assert!(registry
+            .get("gateway-provider/example-org/Code-Model")
+            .is_some());
+    }
+
+    #[test]
+    fn chat_specific_endpoint_without_responses_url_suppresses_responses_models() {
+        let config = LlmConfig {
+            openai_api_key: Some("gateway-key".to_string()),
             openai_chat_completions_base_url: Some(
                 "https://gateway.example/v1/chat/completions".to_string(),
             ),
