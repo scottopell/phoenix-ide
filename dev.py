@@ -3017,6 +3017,11 @@ _LANE_TO_CI_GROUP = {
 }
 
 
+_LANE_ALIASES = {
+    "fast": {"task"},
+}
+
+
 def _categorize_changed_paths(paths) -> set:
     """Map repo-relative changed paths to coarse lane-input categories.
 
@@ -3229,13 +3234,17 @@ def _resolve_check_lanes(gate: bool = True, lanes: str | None = None):
         active, skipped = _all_lanes(), {}
 
     if lanes is not None:
-        requested = {l.strip() for l in lanes.split(",") if l.strip()}
+        requested_raw = {l.strip() for l in lanes.split(",") if l.strip()}
         known = _all_lanes()
-        unknown = requested - known
+        valid = known | set(_LANE_ALIASES)
+        unknown = requested_raw - valid
         if unknown:
             print(f"✗ unknown lane(s): {', '.join(sorted(unknown))}\n"
-                  f"  valid lanes: {', '.join(sorted(known))}", file=sys.stderr)
+                  f"  valid lanes: {', '.join(sorted(valid))}", file=sys.stderr)
             sys.exit(1)
+        requested = set()
+        for lane in requested_raw:
+            requested |= _LANE_ALIASES.get(lane, {lane})
         active &= requested
         skipped = {k: v for k, v in skipped.items() if k in requested}
     return active, skipped
