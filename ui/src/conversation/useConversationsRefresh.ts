@@ -180,11 +180,10 @@ export function useConversationsRefreshDriver(): void {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<{ conversationId?: string }>).detail;
       if (!detail?.conversationId) return;
-      const slug = store.slugForId(detail.conversationId);
-      if (slug) {
+      const removedSlugs = store.removeByConversationId(detail.conversationId);
+      for (const slug of removedSlugs) {
         // REQ-VS-014: drop all per-slug state so a future conversation
         // that reuses this slug doesn't inherit any of it.
-        store.remove(slug);
         clearLastViewer(slug);
         clearTerminalPaneStorage(slug);
         draftStore.remove(slug);

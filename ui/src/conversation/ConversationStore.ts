@@ -51,6 +51,27 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     super(() => createInitialAtom(), conversationReducer);
   }
 
+  override dispatch(slug: string, action: SSEAction): void {
+    super.dispatch(slug, action);
+    if (action.type === 'sse_init' || action.type === 'set_initial_data') {
+      this.indexDirectHydration(slug);
+    }
+  }
+
+  private indexDirectHydration(slug: string): void {
+    const conversation = this.atomByKey(slug)?.conversation;
+    if (!conversation) return;
+    const indexedSlug = this.slugByConvId.get(conversation.id);
+    if (!indexedSlug) {
+      this.slugByConvId.set(conversation.id, slug);
+      return;
+    }
+    const indexedConversation = this.atomByKey(indexedSlug)?.conversation;
+    if (!indexedConversation || conversation.updated_at >= indexedConversation.updated_at) {
+      this.slugByConvId.set(conversation.id, slug);
+    }
+  }
+
   /**
    * Upsert a single conversation snapshot. Creates a snapshot-only atom
    * if the slug is unknown; otherwise updates `atom.conversation` if the
@@ -69,6 +90,14 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
    */
   upsertSnapshot(slug: string, conversation: Conversation): boolean {
     const destination = this.getSnapshot(slug);
+    const destinationConversation = destination.conversation;
+    if (
+      destinationConversation &&
+      destinationConversation.id !== conversation.id &&
+      conversation.updated_at <= destinationConversation.updated_at
+    ) {
+      return false;
+    }
     const existingForId = this.bestConversationForId(conversation.id);
     if (existingForId) {
       // Monotonic: only accept newer or equal-but-different rows.
@@ -180,11 +209,11 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
   }
 
   private preferForSidebar(candidate: Conversation, existing: Conversation): boolean {
+    if (candidate.updated_at > existing.updated_at) return true;
+    if (candidate.updated_at < existing.updated_at) return false;
     const indexedSlug = this.slugByConvId.get(candidate.id);
     if (candidate.slug === indexedSlug && existing.slug !== indexedSlug) return true;
     if (existing.slug === indexedSlug && candidate.slug !== indexedSlug) return false;
-    if (candidate.updated_at > existing.updated_at) return true;
-    if (candidate.updated_at < existing.updated_at) return false;
     return candidate.slug > existing.slug;
   }
 
@@ -227,10 +256,18 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     const existing = this.atomByKey(slug);
     if (existing) {
       const convId = existing.conversation?.id;
-      if (convId) this.slugByConvId.delete(convId);
+      if (convId && this.slugByConvId.get(convId) === slug) this.slugByConvId.delete(convId);
     }
-    if (this.removeAtom(slug)) {
-      // notify already happened inside removeAtom
+    this.removeAtom(slug);
+  }
+
+  removeByConversationId(convId: string): string[] {
+    const removed: string[] = [];
+    for (const [slug, atom] of this.entries()) {
+      if (atom.conversation?.id !== convId) continue;
+      if (this.removeAtom(slug)) removed.push(slug);
     }
+    this.slugByConvId.delete(convId);
+    return removed;
   }
 }

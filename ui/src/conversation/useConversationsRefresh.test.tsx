@@ -185,6 +185,70 @@ describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () 
     });
   });
 
+  it('clears every retained alias for a hard-deleted conversation', async () => {
+    let store: ConversationStore | undefined;
+    let draftStore: DraftStore | undefined;
+    function CaptureBoth() {
+      store = useContext(ConversationContext) ?? undefined;
+      draftStore = useContext(DraftContext) ?? undefined;
+      return null;
+    }
+
+    render(
+      <ConversationProvider>
+        <CaptureBoth />
+      </ConversationProvider>,
+    );
+    expect(store).toBeDefined();
+    expect(draftStore).toBeDefined();
+
+    act(() => {
+      store!.dispatch('old-slug', {
+        type: 'set_initial_data',
+        conversationId: 'conv-doomed',
+        conversation: makeConv('old-slug', 'conv-doomed'),
+        messages: [{
+          message_id: 'msg-1',
+          sequence_id: 1,
+          conversation_id: 'conv-doomed',
+          message_type: 'user',
+          content: { text: 'active alias' },
+          created_at: '2024-06-01T00:00:00Z',
+        } as never],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+      });
+      store!.upsertSnapshot('new-slug', {
+        ...makeConv('new-slug', 'conv-doomed'),
+        updated_at: '2024-06-02T00:00:00Z',
+      });
+      draftStore!.dispatch('old-slug', { type: 'set_draft', text: 'old draft' });
+      draftStore!.dispatch('new-slug', { type: 'set_draft', text: 'new draft' });
+    });
+    setLastViewer('old-slug', 'file=%2Frepo%2Fold&root=%2Frepo');
+    setLastViewer('new-slug', 'file=%2Frepo%2Fnew&root=%2Frepo');
+    localStorage.setItem(terminalPaneStorageKey('old-slug'), '1');
+    localStorage.setItem(terminalPaneStorageKey('new-slug'), '2');
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent('phoenix:conversation-hard-deleted', {
+          detail: { conversationId: 'conv-doomed' },
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(store!.listSnapshots()).toEqual([]);
+      expect(getLastViewer('old-slug')).toBeNull();
+      expect(getLastViewer('new-slug')).toBeNull();
+      expect(localStorage.getItem(terminalPaneStorageKey('old-slug'))).toBeNull();
+      expect(localStorage.getItem(terminalPaneStorageKey('new-slug'))).toBeNull();
+      expect(draftStore!.getSnapshot('old-slug').draft).toBe('');
+      expect(draftStore!.getSnapshot('new-slug').draft).toBe('');
+    });
+  });
+
   it('does not throw when the deleted id is unknown to the store', () => {
     render(
       <ConversationProvider>
