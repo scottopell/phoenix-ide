@@ -22,9 +22,11 @@ every watched handle durable.
 V1 supports one condition kind over three concrete handle kinds:
 `HandleTerminal { handle_kind, handle_id }` — fires when a named bash, tmux
 `window_id`, or sub-agent handle reaches a terminal state. For sub-agents, the
-terminal payload covers `submit_result`, `submit_error`, wall-clock timeout,
-cancellation, and turn-limit hard-stop fallback. Missing child handles resolve as
-`Forgotten`, not as fired child payloads. V1 does not define parent-to-child
+terminal payload covers every durable child terminal cause admitted by bedrock:
+explicit `submit_result`, explicit `submit_error`, timeout, cancellation,
+turn-limit hard-stop fallback, implicit completion, runtime failure, and context
+exhaustion. Missing child handles resolve as `Forgotten`, not as fired child
+payloads. V1 does not define parent-to-child
 continuation, `NeedMoreBudget`, arbitrary child
 questions, automatic sub-agent budget extension, or a general conversation-actor
 framework.
@@ -74,8 +76,8 @@ wait obligation and prevents unbounded commitments. While Phoenix is running, th
 router resolves a pending contract no later than the first tick at or after that
 timestamp. After downtime, restart resync resolves overdue contracts before normal
 serving resumes; it re-registers still-pending durable handles, delivers persisted
-child terminal state, or emits `Forgotten` for handles that cannot still produce
-an answer.
+child terminal state with its durable cause, or emits `Forgotten` for handles that
+cannot still produce an answer.
 
 The LLM-facing surface is a single unified `wait_until { handle: {
 kind, id }, condition, max_wait_seconds }` tool with a `#[serde(tag
@@ -104,7 +106,7 @@ land separately.
 | REQ-WAKE-014 Tool Description | Proposed | Explicit cost model + when-to-use guidance |
 | REQ-WAKE-015 Cost Observability | Proposed | Metrics on registration / fire / forgotten breakdown |
 | REQ-WAKE-016 Unified Tool Surface | Proposed | Single `wait_until` tool, tagged-enum handle discriminator |
-| REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Tagged success, submitted_error, timed_out, cancellation, turn-limit fallback; missing child is Forgotten |
+| REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Tagged exhaustive sub-agent terminal causes; missing child is Forgotten |
 | REQ-WAKE-018 Handle Identity + Lifecycle | Proposed | Bash/tmux WorkScope-keyed; sub-agent keyed by child conversation / agent id |
 
 **Progress:** 0 of 18 implemented.

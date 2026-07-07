@@ -1198,7 +1198,7 @@ rule SubAgentTurnLimitGraceTurn {
     requires: not conversation.grace_turn_granted
     ensures: conversation.grace_turn_granted = true
     ensures: MetaUserMessageInjected(conversation, content: GraceTurnTerminalGuidance(conversation.mode))
-    ensures: GraceTurnAllowsOnlyTerminalTools(conversation, allowed: {"submit_result", "submit_error"})
+    ensures: GraceTurnGuidanceNamesUsefulTerminalTools(conversation, tools: {"submit_result", "submit_error"})
     ensures: LlmRequestDispatched(conversation)
 
     @guidance
@@ -1206,9 +1206,10 @@ rule SubAgentTurnLimitGraceTurn {
         -- user-role meta message so the guidance is visible to the LLM, then
         -- allows one more LLM request. Status stays at llm_requesting (no
         -- transition). Explore guidance asks for findings via submit_result;
-        -- Work guidance permits submit_result only for completed work and routes
-        -- unfinished required edits through submit_error. If the model doesn't
-        -- call submit_result or submit_error, GraceTurnExhausted fires.
+        -- Work guidance says submit_result is useful only for completed work and
+        -- routes unfinished required edits through submit_error. Other tool calls
+        -- are not modeled as forbidden by the runtime; they simply do not produce
+        -- the terminal outcome needed to avoid GraceTurnExhausted.
 }
 
 rule SubAgentTurnLimitHardStop {

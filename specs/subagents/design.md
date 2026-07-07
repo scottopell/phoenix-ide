@@ -176,11 +176,14 @@ terminal state when present and fires forgotten only for non-terminal children.
 
 A wake on a sub-agent handle delivers only terminal outcomes:
 
-- `submit_result` success;
-- `submit_error` failure with `error_kind`;
+- explicit `submit_result` success;
+- explicit `submit_error` failure with `error_kind`;
 - wall-clock timeout;
 - cancellation;
-- turn-limit hard-stop fallback with extracted partial text when available.
+- turn-limit hard-stop fallback with extracted partial text when available;
+- implicit text completion, if bedrock admits it as a child terminal state;
+- non-retryable runtime failure;
+- context exhaustion.
 
 A missing child handle resolves the wake as `Forgotten` rather than as a fired
 sub-agent terminal payload. The wake payload is not a continuation channel. It

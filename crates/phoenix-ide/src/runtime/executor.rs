@@ -4033,13 +4033,15 @@ where
                     Some(ModeContext::Explore { .. })
                 ) {
                     "You have reached your turn limit. Please call submit_result now \
-                         with whatever findings you have so far. Do not call any other tools."
+                         with whatever findings you have so far. Other tool calls will not help \
+                         complete this grace turn."
                 } else {
-                    "You have reached your turn limit. Do not call any tools except submit_result \
-                         or submit_error. If your assigned task required code changes and you have \
-                         not made them, call submit_error and include the useful analysis, plan, \
-                         blockers, and any partial progress for the parent. Only call submit_result \
-                         if the assigned implementation is actually complete."
+                    "You have reached your turn limit. Only submit_result or submit_error can \
+                         produce a useful terminal outcome from this grace turn. If your assigned \
+                         task required code changes and you have not made them, call submit_error \
+                         and include the useful analysis, plan, blockers, and any partial progress \
+                         for the parent. Only call submit_result if the assigned implementation is \
+                         actually complete."
                 };
                 let content = MessageContent::User(crate::db::UserContent::meta(grace_prompt));
                 if let Err(e) = self

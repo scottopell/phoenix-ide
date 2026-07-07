@@ -190,14 +190,17 @@ For `Bash`, terminal states SHALL include exited, killed, signaled,
 `kill_pending_kernel`, forgotten, and the synchronous wait surface's other
 terminal statuses.
 
-For `TmuxPane`, terminal states SHALL include the watched tmux `window_id` process
-exiting, the window being explicitly killed, or the tmux server/session being
-forgotten by lifecycle teardown.
+For `TmuxPane`, fired payloads SHALL include the watched tmux `window_id` process
+exiting or the window being explicitly killed. If the tmux server/session or
+registered window handle is absent because of lifecycle teardown or restart
+resync, the contract SHALL resolve as `Forgotten`, not as a fired tmux payload.
 
-For `SubAgent`, terminal fired payloads SHALL include successful
-`submit_result`, `submit_error`, wall-clock timeout, parent/child cancellation,
-and turn-limit hard-stop fallback. A missing child handle is not a fired payload;
-it resolves the contract as `Forgotten` per REQ-WAKE-011 and REQ-WAKE-017.
+For `SubAgent`, terminal fired payloads SHALL include every durable child
+terminal cause admitted by bedrock: explicit `submit_result`, explicit
+`submit_error`, wall-clock timeout, parent/child cancellation, turn-limit
+hard-stop fallback, implicit text completion, non-retryable runtime failure, and
+context exhaustion. A missing child handle is not a fired payload; it resolves the
+contract as `Forgotten` per REQ-WAKE-011 and REQ-WAKE-017.
 
 THE SYSTEM SHALL NOT support in v1:
 - arbitrary conversation-actor messages or request/reply continuation
@@ -232,7 +235,8 @@ window per REQ-BASH-004.
 For `HandleTerminal/TmuxPane`, the tool result MUST carry the watched `window_id`
 identity, terminal status, exit information when available, and a final captured
 tail window equivalent to the information the LLM would gather by inspecting the
-window after exit.
+window after exit. The captured tail MUST be represented as a list; no output is
+an empty list, not an absent field.
 
 For `HandleTerminal/SubAgent`, the tool result MUST carry one sub-agent identity
 field — the child conversation / agent id — plus task label/description when
@@ -475,8 +479,9 @@ THE SYSTEM SHALL deliver a tagged `submitted_error` outcome with the submitted
 error text, `error_kind`, and the child conversation / agent id.
 
 WHEN the child reaches wall-clock timeout
-THE SYSTEM SHALL deliver a tagged `timed_out` outcome with a message stating that
-the child exceeded its configured timeout and the child conversation / agent id.
+THE SYSTEM SHALL preserve that timeout as the child's durable terminal cause and
+deliver a tagged `timed_out` outcome with a message stating that the child
+exceeded its configured timeout and the child conversation / agent id.
 
 WHEN the child is cancelled by the parent, user, or lifecycle cascade
 THE SYSTEM SHALL deliver a tagged `cancelled` outcome with the cancellation reason
@@ -484,13 +489,24 @@ when available and the child conversation / agent id.
 
 WHEN the child exhausts its turn-limit grace path and the runtime performs the
 hard-stop fallback
-THE SYSTEM SHALL deliver a tagged `turn_limit_exhausted` outcome with the
-extracted partial assistant text when available and the child conversation / agent
-id.
+THE SYSTEM SHALL preserve that hard-stop cause as the child's durable terminal
+cause and deliver a tagged `turn_limit_exhausted` outcome with the extracted
+partial assistant text when available and the child conversation / agent id.
 
-The tagged outcome SHALL make invalid combinations unrepresentable: a success
-requires result text; submitted errors require error text and kind; and at most
-one terminal outcome variant is present.
+WHEN the child reaches another bedrock terminal failure cause, including context
+exhaustion or non-retryable runtime failure
+THE SYSTEM SHALL preserve that cause as the child's durable terminal cause and
+deliver the corresponding tagged terminal outcome.
+
+WHEN bedrock admits text-only implicit completion as a child terminal state
+THE SYSTEM SHALL preserve that cause as the child's durable terminal cause and
+deliver a tagged `implicit_success` outcome rather than relabeling it as explicit
+`submit_result`.
+
+The tagged outcome SHALL make invalid combinations unrepresentable: each durable
+child terminal cause maps to exactly one payload variant; success requires result
+text; submitted errors require error text and kind; and at most one terminal
+outcome variant is present.
 
 WHEN the child conversation/agent id cannot be found during router evaluation
 THE SYSTEM SHALL fire the contract with cause `Forgotten` and reason
@@ -520,9 +536,11 @@ router startup.
 A `SubAgent` wake handle SHALL be addressed by the child conversation / agent id
 created for the sub-agent. It is not WorkScope-keyed and SHALL NOT transfer across
 WorkScope inheritance. Because active sub-agent runtimes do not survive Phoenix
-restart, startup resync SHALL first inspect the persisted child conversation:
-completed or failed children deliver their durable terminal payload; non-terminal
-children fire `Forgotten { reason: "phoenix_restart" }`. Parent cancellation and
+restart, startup resync SHALL first inspect the persisted child conversation and
+its durable terminal cause: children whose terminal cause occurred before the
+contract deadline deliver the corresponding tagged terminal payload;
+non-terminal children fire `Forgotten { reason: "phoenix_restart" }`. Parent
+cancellation and
 child cancellation produce a terminal cancelled payload. Parent hard-delete SHALL
 cancel pending wake contracts before deleting the child; hard-delete MUST NOT
 report lifecycle cancellation as a missing child handle.
@@ -553,7 +571,7 @@ does not treat sub-agents as WorkScope resources.
 | REQ-WAKE-014 | Proposed | Tool description discipline |
 | REQ-WAKE-015 | Proposed | Cost observability metrics |
 | REQ-WAKE-016 | Proposed | Unified `wait_until` tool, not per-substrate |
-| REQ-WAKE-017 | Proposed | Tagged success, submitted_error, timed_out, cancellation, turn-limit fallback; missing child is Forgotten |
+| REQ-WAKE-017 | Proposed | Tagged exhaustive sub-agent terminal causes; missing child is Forgotten |
 | REQ-WAKE-018 | Proposed | V1 handle identity/lifecycle for bash, tmux, and sub-agent handles |
 
 **Progress:** 0 of 18 implemented.
