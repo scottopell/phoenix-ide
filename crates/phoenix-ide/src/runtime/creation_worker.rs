@@ -271,6 +271,9 @@ async fn provision_conversation(
                 })?
                 .to_string();
             validate_user_ref(&base_branch).map_err(app_error_to_kind)?;
+            if let Some(checkout_ref) = intent.checkout_ref.as_deref() {
+                validate_user_ref(checkout_ref).map_err(app_error_to_kind)?;
+            }
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
             let worktree = if existing_path.exists() {
                 Ok(existing_path.to_string_lossy().to_string())
@@ -278,11 +281,13 @@ async fn provision_conversation(
                 let conv_id = job.conversation_id.clone();
                 let repo_for_blocking = repo_root.clone();
                 let base_branch_for_blocking = base_branch.clone();
+                let checkout_ref = intent.checkout_ref.clone();
                 tokio::task::spawn_blocking(move || {
                     create_managed_explore_worktree_blocking(
                         &repo_for_blocking,
                         &conv_id,
                         &base_branch_for_blocking,
+                        checkout_ref.as_deref(),
                     )
                 })
                 .await

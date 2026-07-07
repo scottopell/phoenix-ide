@@ -304,6 +304,7 @@ describe('/new workflow modes', () => {
       undefined,
       undefined,
       [],
+      null,
       expect.any(String),
     );
     expect(api.listGitBranches).not.toHaveBeenCalled();
@@ -332,6 +333,7 @@ describe('/new workflow modes', () => {
       undefined,
       undefined,
       [],
+      null,
       expect.any(String),
     );
     expect(screen.queryByText('Pick a Git branch to start from.')).not.toBeInTheDocument();
@@ -360,6 +362,7 @@ describe('/new workflow modes', () => {
       undefined,
       undefined,
       [],
+      null,
       expect.any(String),
     );
   });
@@ -387,6 +390,7 @@ describe('/new workflow modes', () => {
       undefined,
       undefined,
       [],
+      null,
       expect.any(String),
     );
   });
@@ -430,6 +434,7 @@ describe('/new workflow modes', () => {
       undefined,
       undefined,
       [],
+      null,
       expect.any(String),
     );
   });
@@ -470,6 +475,7 @@ describe('/new workflow modes', () => {
       undefined,
       undefined,
       [],
+      null,
       expect.any(String),
     );
   });

@@ -376,6 +376,8 @@ pub struct ConversationCreationIntent {
     #[serde(default)]
     pub base_branch: Option<String>,
     #[serde(default)]
+    pub checkout_ref: Option<String>,
+    #[serde(default)]
     pub seed_parent_id: Option<String>,
     #[serde(default)]
     pub seed_label: Option<String>,

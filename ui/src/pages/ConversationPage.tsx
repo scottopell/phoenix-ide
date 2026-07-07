@@ -1088,6 +1088,9 @@ function ConversationPageContent() {
         null,
         conversation.id,
         seedLabel,
+        [],
+        null,
+        clientConversationId,
       );
       try {
         localStorage.setItem(`seed-draft:${newConv.id}`, promptText);

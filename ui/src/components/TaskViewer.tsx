@@ -108,6 +108,7 @@ export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBac
         parentConversation.id,
         seedLabel,
         [],
+        null,
         clientConversationId,
       );
       try {
