@@ -410,6 +410,29 @@ describe('message copy affordances', () => {
     });
   });
 
+  it('keeps user message status grouped with metadata instead of copy actions', () => {
+    const { container } = render(
+      <UserMessage
+        message={{
+          message_id: 'user-layout',
+          sequence_id: 1,
+          conversation_id: 'agent-1',
+          message_type: 'user',
+          content: { text: 'Great, push and open a PR please' },
+          display_data: null,
+          created_at: '2026-01-01T00:00:00Z',
+        }}
+      />,
+    );
+
+    const meta = container.querySelector('.message-header-meta');
+    const actions = container.querySelector('.message-header-actions');
+
+    expect(meta?.querySelector('.message-status.sent')).toBeInTheDocument();
+    expect(actions?.querySelector('.message-status.sent')).not.toBeInTheDocument();
+    expect(actions?.querySelector('.message-mobile-copy')).toBeInTheDocument();
+  });
+
   it('copies finalized agent text blocks as markdown from the mobile copy button', async () => {
     const message = agentMessage('agent-copy', [
       { type: 'text', text: 'First **markdown** block.' },

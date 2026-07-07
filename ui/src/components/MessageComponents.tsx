@@ -621,14 +621,18 @@ function UserMessageImpl({ message }: { message: Message }) {
   return (
     <div className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
       <div className="message-header">
-        {!isMeta && <span className="message-sender">You</span>}
-        {timestamp && (
-          <span className="message-time" title={new Date(timestamp).toLocaleString()}>
-            {formatMessageTime(timestamp)}
-          </span>
-        )}
-        {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
-        <MessageCopyButton message={message} title="Copy your message" />
+        <span className="message-header-meta">
+          {!isMeta && <span className="message-sender">You</span>}
+          {timestamp && (
+            <span className="message-time" title={new Date(timestamp).toLocaleString()}>
+              {formatMessageTime(timestamp)}
+            </span>
+          )}
+          {!isMeta && <span className="message-status sent" title="Sent">&#x2713;</span>}
+        </span>
+        <span className="message-header-actions">
+          <MessageCopyButton message={message} title="Copy your message" />
+        </span>
       </div>
       <div className="message-content">
         <SkillCommandText text={text} />
@@ -1046,7 +1050,9 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
             }
             return null;
           })()}
-          <MessageCopyButton message={message} title="Copy Phoenix message" />
+          <span className="message-header-actions">
+            <MessageCopyButton message={message} title="Copy Phoenix message" />
+          </span>
         </div>
       )}
       <div className="message-content">

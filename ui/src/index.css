@@ -796,6 +796,23 @@ body {
   letter-spacing: 0.5px;
 }
 
+.message-header-meta {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.message-header-actions {
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+}
+
+.message-header-actions:empty {
+  display: none;
+}
+
 .message-sender {
   font-weight: 600;
 }
@@ -820,11 +837,12 @@ body {
 
 .message-mobile-copy.copy-btn {
   display: none;
-  width: 44px;
-  height: 44px;
+  width: 32px;
+  height: 32px;
   margin-left: auto;
-  border: 1px solid var(--border-color);
-  background: var(--bg-secondary);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
 }
 
 .message-content {
@@ -1667,6 +1685,18 @@ pre:hover .copy-btn {
 
   .message-mobile-copy.copy-btn {
     display: inline-flex;
+  }
+}
+
+@media (hover: none), (width <= 768px) {
+  .message-header:has(.message-header-actions:not(:empty)) {
+    padding-right: 40px;
+  }
+
+  .message-header-actions:not(:empty) {
+    position: absolute;
+    top: 8px;
+    right: 8px;
   }
 }
 
@@ -2840,6 +2870,10 @@ pre:hover .copy-btn {
   font-size: 14px;
   text-transform: none;
   letter-spacing: normal;
+}
+
+.message-header-meta .message-status {
+  margin-left: 0;
 }
 
 .message-status.sent {
