@@ -534,7 +534,7 @@ export const ChainBlock = memo(function ChainBlock({
             <span className="conv-item-time">{formatRelativeTime(latestMember.updated_at)}</span>
           </span>
           <span className="conv-chain-summary-meta">
-            {latestContext && !latestMember.project_name && <span className="conv-project-label">{latestContext}</span>}
+            {latestContext && <span className="conv-project-label">{latestContext}</span>}
             {latestMember.cached_pr && <PrBadge pr={latestMember.cached_pr} interactive={false} />}
           </span>
         </button>

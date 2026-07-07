@@ -905,6 +905,7 @@ describe('Mobile conversation list redesign', () => {
     const summary = container.querySelector('.conv-chain-latest-summary') as HTMLButtonElement;
     expect(summary).not.toBeNull();
     expect(summary.textContent).toContain('Latest #2');
+    expect(summary.querySelector('.conv-project-label')?.textContent).toBe('project');
     expect(summary.querySelector('span.sidebar-pr-badge')?.textContent).toBe('#375');
     expect(summary.querySelector('a.sidebar-pr-badge')).toBeNull();
 
