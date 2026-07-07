@@ -718,6 +718,7 @@ fn sidebar_cached_pr_summary(
         display_state: pr.display_state.clone(),
         base: pr.base.clone(),
         head: pr.head.clone(),
+        feedback_status: pr.feedback_status,
     }
 }
 

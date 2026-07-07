@@ -2,8 +2,8 @@ use super::types::{
     PrAutoFixContextResponse, PrCheckDetail, PrCheckLogSnippet, PrCheckLogSource, PrCheckState,
     PrCheckSummary, PrDisplayState, PrFeedbackCoverage, PrFeedbackCoverageHealth,
     PrFeedbackCoverageStatus, PrFeedbackCoverageSurface, PrFeedbackFreshness, PrFeedbackItem,
-    PrFeedbackSource, PrFeedbackSummary, PrIdentity, PrRefreshMetadata, PrRefreshState,
-    PrStatusResponse, PrUnavailableReason,
+    PrFeedbackReaction, PrFeedbackSource, PrFeedbackStatus, PrFeedbackSummary, PrIdentity,
+    PrRefreshMetadata, PrRefreshState, PrStatusResponse, PrUnavailableReason,
 };
 use crate::db::{
     WorkScopePrAssociation, WorkScopePrFeedbackBaseline, WorkScopePrFeedbackBaselineInput,
@@ -280,7 +280,7 @@ impl GhClient for ShellGhClient<'_> {
           repository(owner:$owner, name:$name) {
             pullRequest(number:$number) {
               reviewThreads(first:100) {
-                nodes { id isResolved path comments(first:100) { nodes { id body url createdAt author { login } } } }
+                nodes { id isResolved path comments(first:100) { nodes { id body url createdAt author { login } reactionGroups { content users { totalCount } } } } }
               }
             }
           }
@@ -528,6 +528,7 @@ pub(crate) struct PrAutoFixCapture {
     pub response: PrAutoFixContextResponse,
     pub observations: Vec<WorkScopePrObservation>,
     pub baseline: WorkScopePrFeedbackBaselineInput,
+    pub feedback_status: PrFeedbackStatus,
 }
 
 pub(crate) fn fetch_pr_feedback_for_pr(
@@ -567,24 +568,28 @@ pub(crate) fn capture_pr_auto_fix_context_for_pr(
             None
         }
     };
-    let CapturedPrAutoFixContext { response, baseline } =
-        match capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client, llm_language) {
-            Ok(captured) => captured,
-            Err(PrMonitorError::BadRequest(message)) => {
-                if let Some(observation) = observation {
-                    return Err(PrMonitorError::BadRequestWithObservations {
-                        message,
-                        observations: vec![observation],
-                    });
-                }
-                return Err(PrMonitorError::BadRequest(message));
+    let CapturedPrAutoFixContext {
+        response,
+        baseline,
+        feedback_status,
+    } = match capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client, llm_language) {
+        Ok(captured) => captured,
+        Err(PrMonitorError::BadRequest(message)) => {
+            if let Some(observation) = observation {
+                return Err(PrMonitorError::BadRequestWithObservations {
+                    message,
+                    observations: vec![observation],
+                });
             }
-            Err(err) => return Err(err),
-        };
+            return Err(PrMonitorError::BadRequest(message));
+        }
+        Err(err) => return Err(err),
+    };
     Ok(PrAutoFixCapture {
         response,
         observations: observation.into_iter().collect(),
         baseline,
+        feedback_status,
     })
 }
 
@@ -639,31 +644,36 @@ fn capture_pr_auto_fix_context_for_branch_with_client(
     let pr = choose_pr(prs).ok_or_else(|| {
         PrMonitorError::BadRequest("No pull request found for this branch".to_string())
     })?;
-    let CapturedPrAutoFixContext { response, baseline } =
-        capture_pr_auto_fix_context_for_pr_item(worktree, pr, client, llm_language).map_err(
-            |err| {
-                if let PrMonitorError::BadRequest(message) = err {
-                    if !observations.is_empty() {
-                        return PrMonitorError::BadRequestWithObservations {
-                            message,
-                            observations: observations.clone(),
-                        };
-                    }
-                    return PrMonitorError::BadRequest(message);
+    let CapturedPrAutoFixContext {
+        response,
+        baseline,
+        feedback_status,
+    } = capture_pr_auto_fix_context_for_pr_item(worktree, pr, client, llm_language).map_err(
+        |err| {
+            if let PrMonitorError::BadRequest(message) = err {
+                if !observations.is_empty() {
+                    return PrMonitorError::BadRequestWithObservations {
+                        message,
+                        observations: observations.clone(),
+                    };
                 }
-                err
-            },
-        )?;
+                return PrMonitorError::BadRequest(message);
+            }
+            err
+        },
+    )?;
     Ok(PrAutoFixCapture {
         response,
         observations,
         baseline,
+        feedback_status,
     })
 }
 
 struct CapturedPrAutoFixContext {
     response: PrAutoFixContextResponse,
     baseline: WorkScopePrFeedbackBaselineInput,
+    feedback_status: PrFeedbackStatus,
 }
 
 fn capture_pr_auto_fix_context_for_pr_item(
@@ -696,6 +706,7 @@ fn capture_pr_auto_fix_context_for_pr_item(
         .filter(is_actionable_feedback)
         .collect();
     let actionable_total = u32::try_from(actionable_items.len()).unwrap_or(u32::MAX);
+    let feedback_status = aggregate_feedback_status(&actionable_items);
     let fetched_at = Utc::now().to_rfc3339();
     let artifact = PrAutoFixContextArtifact {
         manifest_version: ARTIFACT_VERSION,
@@ -719,6 +730,7 @@ fn capture_pr_auto_fix_context_for_pr_item(
         feedback: PrFeedbackSummary {
             total: actionable_total,
             unresolved: actionable_total,
+            feedback_status,
             items: actionable_items,
             coverage: feedback.coverage,
         },
@@ -750,6 +762,7 @@ fn capture_pr_auto_fix_context_for_pr_item(
             message,
         },
         baseline,
+        feedback_status,
     })
 }
 
@@ -812,6 +825,7 @@ fn fresh_response(
         feedback_summary: None,
         updated_at: pr.updated_at.clone().or_else(|| Some(refreshed_at.clone())),
         display_state: Some(pr.display_state.clone()),
+        feedback_status: None,
         feedback_freshness: None,
         feedback_coverage: None,
         work_change: crate::api::types::WorkChangeSummary::Loading,
@@ -890,6 +904,7 @@ pub(crate) fn stale_response_with_refresh_state(
         feedback_summary: None,
         updated_at: identity.updated_at.clone(),
         display_state: Some(identity.display_state.clone()),
+        feedback_status: Some(pr.feedback_status),
         feedback_freshness: None,
         feedback_coverage: None,
         work_change: crate::api::types::WorkChangeSummary::Loading,
@@ -948,6 +963,7 @@ pub(crate) fn persisted_primary_response(
         feedback_summary: None,
         updated_at: identity.updated_at.clone(),
         display_state: Some(identity.display_state.clone()),
+        feedback_status: Some(pr.feedback_status),
         feedback_freshness: None,
         feedback_coverage: None,
         work_change: crate::api::types::WorkChangeSummary::Loading,
@@ -1066,6 +1082,30 @@ fn is_actionable_feedback(item: &PrFeedbackItem) -> bool {
 
 fn actionable_feedback_items(items: &[PrFeedbackItem]) -> impl Iterator<Item = &PrFeedbackItem> {
     items.iter().filter(|item| is_actionable_feedback(item))
+}
+
+fn status_from_reactions(reactions: &[PrFeedbackReaction]) -> PrFeedbackStatus {
+    if reactions.iter().any(|r| r.content == "+1" && r.count > 0) {
+        PrFeedbackStatus::Approved
+    } else if reactions.iter().any(|r| r.content == "eyes" && r.count > 0) {
+        PrFeedbackStatus::InProgress
+    } else {
+        PrFeedbackStatus::Open
+    }
+}
+
+fn aggregate_feedback_status<'a>(
+    items: impl IntoIterator<Item = &'a PrFeedbackItem>,
+) -> PrFeedbackStatus {
+    let mut status = PrFeedbackStatus::Open;
+    for item in items {
+        match item.feedback_status {
+            PrFeedbackStatus::Approved => return PrFeedbackStatus::Approved,
+            PrFeedbackStatus::InProgress => status = PrFeedbackStatus::InProgress,
+            PrFeedbackStatus::Open => {}
+        }
+    }
+    status
 }
 
 impl PrAutoFixContextArtifact {
@@ -1246,6 +1286,7 @@ fn fetch_pr_feedback(client: &dyn GhClient, number: u64) -> PrFeedbackSummary {
             return PrFeedbackSummary {
                 total: 0,
                 unresolved: 0,
+                feedback_status: PrFeedbackStatus::Open,
                 items,
                 coverage,
             };
@@ -1289,10 +1330,12 @@ fn fetch_pr_feedback(client: &dyn GhClient, number: u64) -> PrFeedbackSummary {
     );
 
     let items = dedupe_feedback(items);
+    let feedback_status = aggregate_feedback_status(actionable_feedback_items(&items));
     let unresolved = u32::try_from(actionable_feedback_items(&items).count()).unwrap_or(u32::MAX);
     PrFeedbackSummary {
         total: u32::try_from(items.len()).unwrap_or(u32::MAX),
         unresolved,
+        feedback_status,
         items,
         coverage,
     }
@@ -1328,11 +1371,10 @@ fn review_threads_to_items(threads: Vec<GhReviewThread>) -> Vec<PrFeedbackItem> 
     threads
         .into_iter()
         .flat_map(|thread| {
-            thread
-                .comments
-                .nodes
-                .into_iter()
-                .map(move |comment| PrFeedbackItem {
+            thread.comments.nodes.into_iter().map(move |comment| {
+                let reactions = reaction_groups_to_reactions(comment.reaction_groups);
+                let feedback_status = status_from_reactions(&reactions);
+                PrFeedbackItem {
                     id: comment.id,
                     thread_id: thread.id.clone(),
                     source: PrFeedbackSource::ReviewThread,
@@ -1343,8 +1385,11 @@ fn review_threads_to_items(threads: Vec<GhReviewThread>) -> Vec<PrFeedbackItem> 
                     path: thread.path.clone(),
                     url: comment.url,
                     created_at: comment.created_at,
+                    reactions,
+                    feedback_status,
                     resolved: Some(thread.is_resolved),
-                })
+                }
+            })
         })
         .collect()
 }
@@ -1366,7 +1411,31 @@ fn feedback_identity(item: &PrFeedbackItem) -> String {
     )
 }
 
+fn feedback_reaction_fingerprint(item: &PrFeedbackItem) -> String {
+    let mut reactions: Vec<_> = item
+        .reactions
+        .iter()
+        .map(|reaction| format!("{}:{}", reaction.content, reaction.count))
+        .collect();
+    reactions.sort();
+    reactions.join(",")
+}
+
 fn feedback_fingerprint(item: &PrFeedbackItem) -> String {
+    format!(
+        "{:?}:{}:{}:{}:{}:{}:{}|{}",
+        item.source,
+        item.id.clone().unwrap_or_default(),
+        item.url.clone().unwrap_or_default(),
+        item.author,
+        item.path.clone().unwrap_or_default(),
+        item.created_at.clone().unwrap_or_default(),
+        feedback_reaction_fingerprint(item),
+        item.body
+    )
+}
+
+fn legacy_feedback_fingerprint_without_reactions(item: &PrFeedbackItem) -> String {
     format!(
         "{:?}:{}:{}:{}:{}:{}|{}",
         item.source,
@@ -1442,9 +1511,12 @@ pub(crate) fn actionable_feedback_freshness_from_baseline(
     let edited_count = actionable_feedback_items(&feedback.items)
         .filter(|item| {
             let fingerprint = feedback_fingerprint(item);
-            let legacy_fingerprint = legacy_feedback_fingerprint_with_resolution(item);
+            let legacy_resolution_fingerprint = legacy_feedback_fingerprint_with_resolution(item);
+            let legacy_no_reactions_fingerprint =
+                legacy_feedback_fingerprint_without_reactions(item);
             !baseline_fingerprints.contains(fingerprint.as_str())
-                && !baseline_fingerprints.contains(legacy_fingerprint.as_str())
+                && !baseline_fingerprints.contains(legacy_resolution_fingerprint.as_str())
+                && !baseline_fingerprints.contains(legacy_no_reactions_fingerprint.as_str())
         })
         .count();
     if edited_count > 0 {
@@ -1544,6 +1616,21 @@ fn feedback_dedupe_keys(item: &PrFeedbackItem) -> Vec<String> {
     keys
 }
 
+fn merge_feedback_reactions(existing: &mut PrFeedbackItem, duplicate: Vec<PrFeedbackReaction>) {
+    for reaction in duplicate {
+        if let Some(current) = existing
+            .reactions
+            .iter_mut()
+            .find(|current| current.content == reaction.content)
+        {
+            current.count = current.count.max(reaction.count);
+        } else {
+            existing.reactions.push(reaction);
+        }
+    }
+    existing.feedback_status = status_from_reactions(&existing.reactions);
+}
+
 fn merge_duplicate_feedback(existing: &mut PrFeedbackItem, duplicate: PrFeedbackItem) {
     if duplicate.thread_id.is_some() {
         existing.thread_id = duplicate.thread_id;
@@ -1554,6 +1641,7 @@ fn merge_duplicate_feedback(existing: &mut PrFeedbackItem, duplicate: PrFeedback
     } else if existing.resolved.is_none() {
         existing.resolved = duplicate.resolved;
     }
+    merge_feedback_reactions(existing, duplicate.reactions);
     if existing.url.is_none() {
         existing.url = duplicate.url;
     }
@@ -1732,6 +1820,34 @@ struct GhUser {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct GhReactionSummary {
+    #[serde(default, rename = "+1")]
+    plus_one: u32,
+    #[serde(default)]
+    eyes: u32,
+}
+
+fn rest_reactions_to_reactions(summary: Option<GhReactionSummary>) -> Vec<PrFeedbackReaction> {
+    let Some(summary) = summary else {
+        return Vec::new();
+    };
+    let mut reactions = Vec::new();
+    if summary.plus_one > 0 {
+        reactions.push(PrFeedbackReaction {
+            content: "+1".to_string(),
+            count: summary.plus_one,
+        });
+    }
+    if summary.eyes > 0 {
+        reactions.push(PrFeedbackReaction {
+            content: "eyes".to_string(),
+            count: summary.eyes,
+        });
+    }
+    reactions
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct GhIssueComment {
     id: Option<u64>,
     user: Option<GhUser>,
@@ -1740,10 +1856,14 @@ struct GhIssueComment {
     html_url: Option<String>,
     #[serde(rename = "created_at")]
     created_at: Option<String>,
+    #[serde(default)]
+    reactions: Option<GhReactionSummary>,
 }
 
 impl From<GhIssueComment> for PrFeedbackItem {
     fn from(comment: GhIssueComment) -> Self {
+        let reactions = rest_reactions_to_reactions(comment.reactions);
+        let feedback_status = status_from_reactions(&reactions);
         Self {
             id: comment.id.map(|id| id.to_string()),
             thread_id: None,
@@ -1755,6 +1875,8 @@ impl From<GhIssueComment> for PrFeedbackItem {
             path: None,
             url: comment.html_url,
             created_at: comment.created_at,
+            reactions,
+            feedback_status,
             resolved: None,
         }
     }
@@ -1770,10 +1892,14 @@ struct GhReviewComment {
     html_url: Option<String>,
     #[serde(rename = "created_at")]
     created_at: Option<String>,
+    #[serde(default)]
+    reactions: Option<GhReactionSummary>,
 }
 
 impl From<GhReviewComment> for PrFeedbackItem {
     fn from(comment: GhReviewComment) -> Self {
+        let reactions = rest_reactions_to_reactions(comment.reactions);
+        let feedback_status = status_from_reactions(&reactions);
         Self {
             id: comment.id.map(|id| id.to_string()),
             thread_id: None,
@@ -1785,6 +1911,8 @@ impl From<GhReviewComment> for PrFeedbackItem {
             path: comment.path,
             url: comment.html_url,
             created_at: comment.created_at,
+            reactions,
+            feedback_status,
             resolved: None,
         }
     }
@@ -1799,10 +1927,14 @@ struct GhReviewSummary {
     html_url: Option<String>,
     #[serde(rename = "submitted_at")]
     submitted_at: Option<String>,
+    #[serde(default)]
+    reactions: Option<GhReactionSummary>,
 }
 
 impl From<GhReviewSummary> for PrFeedbackItem {
     fn from(review: GhReviewSummary) -> Self {
+        let reactions = rest_reactions_to_reactions(review.reactions);
+        let feedback_status = status_from_reactions(&reactions);
         Self {
             id: review.id.map(|id| id.to_string()),
             thread_id: None,
@@ -1814,6 +1946,8 @@ impl From<GhReviewSummary> for PrFeedbackItem {
             path: None,
             url: review.html_url,
             created_at: review.submitted_at,
+            reactions,
+            feedback_status,
             resolved: None,
         }
     }
@@ -1861,7 +1995,37 @@ struct GhReviewThreadComment {
     #[serde(rename = "createdAt")]
     created_at: Option<String>,
     author: Option<GhGraphqlAuthor>,
+    #[serde(rename = "reactionGroups", default)]
+    reaction_groups: Vec<GhReactionGroup>,
 }
+#[derive(Debug, Clone, Deserialize)]
+struct GhReactionGroup {
+    content: String,
+    users: GhReactionGroupUsers,
+}
+#[derive(Debug, Clone, Deserialize)]
+struct GhReactionGroupUsers {
+    #[serde(rename = "totalCount")]
+    total_count: u32,
+}
+
+fn reaction_groups_to_reactions(groups: Vec<GhReactionGroup>) -> Vec<PrFeedbackReaction> {
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let content = match group.content.as_str() {
+                "THUMBS_UP" => "+1",
+                "EYES" => "eyes",
+                _ => return None,
+            };
+            (group.users.total_count > 0).then(|| PrFeedbackReaction {
+                content: content.to_string(),
+                count: group.users.total_count,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct GhGraphqlAuthor {
     login: String,
@@ -2049,6 +2213,7 @@ mod tests {
             base: "main".to_string(),
             head: "old-branch".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            feedback_status: PrFeedbackStatus::Open,
             first_seen_at: "2026-01-01T00:00:00Z".to_string(),
             last_seen_at: "2026-01-02T00:00:00Z".to_string(),
         };
@@ -2098,6 +2263,7 @@ mod tests {
                 body: Some("same".to_string()),
                 html_url: Some("https://c/1".to_string()),
                 created_at: Some("t".to_string()),
+                reactions: None,
             }]),
             review_comments: Ok(vec![GhReviewComment {
                 id: None,
@@ -2108,6 +2274,7 @@ mod tests {
                 path: Some("src/lib.rs".to_string()),
                 html_url: Some("https://c/1".to_string()),
                 created_at: Some("t".to_string()),
+                reactions: None,
             }]),
             review_summaries: Ok(vec![]),
             review_threads: Err(GhFailure::default()),
@@ -2142,6 +2309,7 @@ mod tests {
                     author: Some(GhGraphqlAuthor {
                         login: "u".to_string(),
                     }),
+                    reaction_groups: Vec::new(),
                 }],
             },
         }
@@ -2161,6 +2329,7 @@ mod tests {
                 path: Some("src/lib.rs".to_string()),
                 html_url: Some("https://c/rest".to_string()),
                 created_at: Some("t".to_string()),
+                reactions: None,
             }]),
             review_summaries: Ok(vec![]),
             review_threads: Ok(vec![review_thread(
@@ -2194,6 +2363,8 @@ mod tests {
             path: None,
             url: None,
             created_at: None,
+            reactions: Vec::new(),
+            feedback_status: PrFeedbackStatus::Open,
             resolved,
         }
     }
@@ -2203,6 +2374,7 @@ mod tests {
         PrFeedbackSummary {
             total: u32::try_from(items.len()).unwrap(),
             unresolved,
+            feedback_status: aggregate_feedback_status(actionable_feedback_items(&items)),
             coverage: vec![PrFeedbackCoverage {
                 surface: PrFeedbackCoverageSurface::IssueComments,
                 status: PrFeedbackCoverageStatus::Fetched,
@@ -2225,6 +2397,76 @@ mod tests {
             "body",
             Some(true)
         )));
+    }
+
+    #[test]
+    fn feedback_reactions_derive_in_progress_and_approved_status() {
+        let eyes = PrFeedbackReaction {
+            content: "eyes".to_string(),
+            count: 1,
+        };
+        let thumbs = PrFeedbackReaction {
+            content: "+1".to_string(),
+            count: 1,
+        };
+        assert_eq!(
+            status_from_reactions(std::slice::from_ref(&eyes)),
+            PrFeedbackStatus::InProgress
+        );
+        assert_eq!(
+            status_from_reactions(&[eyes, thumbs]),
+            PrFeedbackStatus::Approved
+        );
+    }
+
+    #[test]
+    fn fetch_feedback_aggregates_reaction_status_and_keeps_reaction_metadata() {
+        let gh = FakeGh {
+            repo: Ok(repo()),
+            issue_comments: Ok(vec![GhIssueComment {
+                id: Some(1),
+                user: Some(GhUser {
+                    login: "u".to_string(),
+                }),
+                body: Some("looking".to_string()),
+                html_url: Some("https://c/1".to_string()),
+                created_at: Some("t".to_string()),
+                reactions: Some(GhReactionSummary {
+                    plus_one: 0,
+                    eyes: 1,
+                }),
+            }]),
+            review_comments: Ok(vec![GhReviewComment {
+                id: Some(2),
+                user: Some(GhUser {
+                    login: "u".to_string(),
+                }),
+                body: Some("approved".to_string()),
+                path: Some("src/lib.rs".to_string()),
+                html_url: Some("https://c/2".to_string()),
+                created_at: Some("t".to_string()),
+                reactions: Some(GhReactionSummary {
+                    plus_one: 1,
+                    eyes: 0,
+                }),
+            }]),
+            review_summaries: Ok(vec![]),
+            review_threads: Ok(vec![]),
+            ..FakeGh::default()
+        };
+
+        let feedback = fetch_pr_feedback(&gh, 7);
+
+        assert_eq!(feedback.feedback_status, PrFeedbackStatus::Approved);
+        assert_eq!(
+            feedback.items[0].feedback_status,
+            PrFeedbackStatus::InProgress
+        );
+        assert_eq!(feedback.items[0].reactions[0].content, "eyes");
+        assert_eq!(
+            feedback.items[1].feedback_status,
+            PrFeedbackStatus::Approved
+        );
     }
 
     #[test]
@@ -2371,7 +2613,7 @@ mod tests {
         );
         assert_eq!(
             baseline.feedback_fingerprints,
-            vec!["IssueComment:1::u::|todo".to_string()]
+            vec!["IssueComment:1::u:::|todo".to_string()]
         );
     }
 
@@ -2392,6 +2634,7 @@ mod tests {
         PrFeedbackSummary {
             total: 0,
             unresolved: 0,
+            feedback_status: PrFeedbackStatus::Open,
             items: vec![],
             coverage,
         }
@@ -2480,6 +2723,7 @@ mod tests {
                         author: Some(GhGraphqlAuthor {
                             login: "reviewer".to_string(),
                         }),
+                        reaction_groups: Vec::new(),
                     }],
                 },
             }]),

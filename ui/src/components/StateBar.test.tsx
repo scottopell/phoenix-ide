@@ -257,7 +257,7 @@ describe('StateBar PR badge', () => {
         failing_names: ['test'],
         pending_names: [],
       },
-      feedback_summary: { total: 2, unresolved: 2, items: [], coverage: [] },
+      feedback_summary: { total: 2, unresolved: 2, feedback_status: 'open', items: [], coverage: [] },
     }) });
 
     const badge = await screen.findByRole('link', { name: /#12 checks ✗/i });

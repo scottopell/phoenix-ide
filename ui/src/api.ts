@@ -156,6 +156,7 @@ export interface Conversation {
 export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';
 export type PrCheckState = 'passing' | 'pending' | 'failing' | 'unknown';
 export type PrDisplayState = 'open' | 'draft' | 'merged' | 'closed';
+export type PrFeedbackStatus = 'open' | 'in_progress' | 'approved';
 
 export interface CachedPrSummary {
   number: number;
@@ -164,6 +165,7 @@ export interface CachedPrSummary {
   display_state: PrDisplayState;
   base: string;
   head: string;
+  feedback_status?: PrFeedbackStatus;
 }
 
 export interface PrCheckSummary {
@@ -186,6 +188,11 @@ export interface PrFeedbackCoverage {
   detail?: string;
 }
 
+export interface PrFeedbackReaction {
+  content: string;
+  count: number;
+}
+
 export interface PrFeedbackItem {
   id?: string;
   /** GraphQL `pullRequestReviewThread` node id (`PRRT_…`); present only for review_thread items. */
@@ -196,12 +203,15 @@ export interface PrFeedbackItem {
   path?: string;
   url?: string;
   created_at?: string;
+  reactions: PrFeedbackReaction[];
+  feedback_status: PrFeedbackStatus;
   resolved?: boolean;
 }
 
 export interface PrFeedbackSummary {
   total: number;
   unresolved: number;
+  feedback_status: PrFeedbackStatus;
   items: PrFeedbackItem[];
   coverage: PrFeedbackCoverage[];
 }
@@ -289,6 +299,7 @@ export interface PrStatusResponse {
   updated_at?: string;
   display_state?: PrDisplayState;
   feedback_freshness?: PrFeedbackFreshness;
+  feedback_status?: PrFeedbackStatus;
   feedback_coverage?: PrFeedbackCoverageHealth;
   work_change: WorkChangeSummary;
 }

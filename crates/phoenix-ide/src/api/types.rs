@@ -1,5 +1,6 @@
 //! API request and response types
 
+pub use phoenix_core::domain::pr_feedback_status::PrFeedbackStatus;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -899,6 +900,12 @@ pub struct PrFeedbackCoverage {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct PrFeedbackReaction {
+    pub content: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PrFeedbackItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -916,6 +923,8 @@ pub struct PrFeedbackItem {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    pub reactions: Vec<PrFeedbackReaction>,
+    pub feedback_status: PrFeedbackStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved: Option<bool>,
 }
@@ -924,6 +933,7 @@ pub struct PrFeedbackItem {
 pub struct PrFeedbackSummary {
     pub total: u32,
     pub unresolved: u32,
+    pub feedback_status: PrFeedbackStatus,
     pub items: Vec<PrFeedbackItem>,
     pub coverage: Vec<PrFeedbackCoverage>,
 }
@@ -1068,6 +1078,7 @@ pub struct PrStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_state: Option<PrDisplayState>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_status: Option<PrFeedbackStatus>,
     pub feedback_freshness: Option<PrFeedbackFreshness>,
     /// Degraded coverage of the feedback fetch, if any — distinct from
     /// `feedback_freshness` so an incomplete fetch is never mistaken for a
@@ -1106,6 +1117,7 @@ impl PrStatusResponse {
             feedback_summary: None,
             updated_at: None,
             display_state: None,
+            feedback_status: None,
             feedback_freshness: None,
             feedback_coverage: None,
             work_change: WorkChangeSummary::Loading,

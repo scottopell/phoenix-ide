@@ -838,6 +838,51 @@ describe('Mobile conversation list redesign', () => {
     expect(desktop.querySelector('[data-id="with-pr"] a.sidebar-pr-badge')).not.toBeNull();
   });
 
+  it('renders sidebar PR feedback reaction status with compact accessible indicators', () => {
+    const convs = [
+      makeConv('open-pr', 'open-pr', { cached_pr: pr(375), conv_mode_label: 'WORK' }),
+      makeConv('eyes-pr', 'eyes-pr', { cached_pr: { ...pr(376), feedback_status: 'in_progress' }, conv_mode_label: 'WORK' }),
+      makeConv('approved-pr', 'approved-pr', { cached_pr: { ...pr(377), feedback_status: 'approved' }, conv_mode_label: 'WORK' }),
+    ];
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} sidebarMode conversations={convs} />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector('[data-id="open-pr"] .sidebar-pr-badge')?.textContent).toBe('#375');
+    const eyes = container.querySelector('[data-id="eyes-pr"] .sidebar-pr-badge') as HTMLElement;
+    expect(eyes.textContent).toBe('#376 👀');
+    expect(eyes.title).toContain('Feedback status: in progress (eyes reaction)');
+    expect(eyes).toHaveAttribute('aria-label', 'PR 376, feedback in progress (eyes reaction)');
+    expect(eyes).toHaveClass('sidebar-pr-badge--feedback-in-progress');
+
+    const approved = container.querySelector('[data-id="approved-pr"] .sidebar-pr-badge') as HTMLElement;
+    expect(approved.textContent).toBe('#377 👍');
+    expect(approved.title).toContain('Feedback status: approved (thumbs-up reaction)');
+    expect(approved).toHaveAttribute('aria-label', 'PR 377, feedback approved (thumbs-up reaction)');
+    expect(approved).toHaveClass('sidebar-pr-badge--feedback-approved');
+  });
+
+  it('keeps mobile reaction-status PR badges non-interactive and accessible', () => {
+    const conv = makeConv('mobile-eyes-pr', 'mobile-eyes-pr', {
+      cached_pr: { ...pr(378), feedback_status: 'in_progress' },
+      conv_mode_label: 'WORK',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} listDensity="mobile" conversations={[conv]} />
+      </MemoryRouter>,
+    );
+
+    const badge = container.querySelector('[data-id="mobile-eyes-pr"] span.sidebar-pr-badge') as HTMLElement;
+    expect(badge.textContent).toBe('#378 👀');
+    expect(badge).toHaveAttribute('aria-label', 'PR 378, feedback in progress (eyes reaction)');
+    expect(container.querySelector('[data-id="mobile-eyes-pr"] a.sidebar-pr-badge')).toBeNull();
+  });
+
   it('keeps the mobile title in the primary row and moves metadata below it', () => {
     const conv = makeConv('with-long-mobile-row', 'very-long-mobile-conversation-title-that-must-truncate', {
       cached_pr: pr(),

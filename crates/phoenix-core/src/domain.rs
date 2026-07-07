@@ -11,6 +11,7 @@ pub mod message_text;
 pub mod mode_context;
 pub mod patch_types;
 pub mod pr_display_state;
+pub mod pr_feedback_status;
 pub mod process_inspection;
 pub mod quota_details;
 pub mod retry_policy;

@@ -59,25 +59,50 @@ interface ConversationRowProps {
   menuRef?: React.RefObject<HTMLDivElement> | undefined;
 }
 
+function sidebarFeedbackStatusSuffix(pr: CachedPrSummary): string {
+  if (pr.feedback_status === 'approved') return ' 👍';
+  if (pr.feedback_status === 'in_progress') return ' 👀';
+  return '';
+}
+
+function sidebarFeedbackStatusText(pr: CachedPrSummary): string | null {
+  if (pr.feedback_status === 'approved') return 'approved (thumbs-up reaction)';
+  if (pr.feedback_status === 'in_progress') return 'in progress (eyes reaction)';
+  return null;
+}
+
 function sidebarPrBadgeLabel(pr: CachedPrSummary): string {
   const n = `#${pr.number}`;
-  if (pr.display_state === 'draft') return `${n} draft`;
-  if (pr.display_state === 'merged') return `${n} merged`;
-  if (pr.display_state === 'closed') return `${n} closed`;
-  return n;
+  const suffix = sidebarFeedbackStatusSuffix(pr);
+  if (pr.display_state === 'draft') return `${n} draft${suffix}`;
+  if (pr.display_state === 'merged') return `${n} merged${suffix}`;
+  if (pr.display_state === 'closed') return `${n} closed${suffix}`;
+  return `${n}${suffix}`;
 }
 
 function sidebarPrBadgeClass(pr: CachedPrSummary): string {
-  if (pr.display_state === 'merged') return 'pr-badge pr-badge--merged sidebar-pr-badge';
-  if (pr.display_state === 'closed') return 'pr-badge pr-badge--failing sidebar-pr-badge';
-  if (pr.display_state === 'draft') return 'pr-badge pr-badge--pending sidebar-pr-badge';
-  return 'pr-badge pr-badge--unknown sidebar-pr-badge';
+  const statusClass = pr.feedback_status === 'approved'
+    ? ' sidebar-pr-badge--feedback-approved'
+    : pr.feedback_status === 'in_progress'
+      ? ' sidebar-pr-badge--feedback-in-progress'
+      : '';
+  if (pr.display_state === 'merged') return `pr-badge pr-badge--merged sidebar-pr-badge${statusClass}`;
+  if (pr.display_state === 'closed') return `pr-badge pr-badge--failing sidebar-pr-badge${statusClass}`;
+  if (pr.display_state === 'draft') return `pr-badge pr-badge--pending sidebar-pr-badge${statusClass}`;
+  return `pr-badge pr-badge--unknown sidebar-pr-badge${statusClass}`;
 }
 
 function sidebarPrTooltip(pr: CachedPrSummary): string {
   const parts = [`PR #${pr.number}${pr.title ? ` — ${pr.title}` : ''}`];
   if (pr.head || pr.base) parts.push(`${pr.head || '?'} → ${pr.base || '?'}`);
+  const feedbackStatus = sidebarFeedbackStatusText(pr);
+  if (feedbackStatus) parts.push(`Feedback status: ${feedbackStatus}`);
   return parts.join('\n');
+}
+
+function sidebarPrAriaLabel(pr: CachedPrSummary): string {
+  const feedbackStatus = sidebarFeedbackStatusText(pr);
+  return feedbackStatus ? `PR ${pr.number}, feedback ${feedbackStatus}` : `PR ${pr.number}`;
 }
 
 function PrBadge({ pr, interactive = true }: { pr: CachedPrSummary; interactive?: boolean }) {
@@ -86,7 +111,7 @@ function PrBadge({ pr, interactive = true }: { pr: CachedPrSummary; interactive?
       <span
         className={sidebarPrBadgeClass(pr)}
         title={sidebarPrTooltip(pr)}
-        aria-label={`PR ${pr.number}`}
+        aria-label={sidebarPrAriaLabel(pr)}
       >
         {sidebarPrBadgeLabel(pr)}
       </span>
@@ -100,6 +125,7 @@ function PrBadge({ pr, interactive = true }: { pr: CachedPrSummary; interactive?
       rel="noreferrer"
       title={sidebarPrTooltip(pr)}
       onClick={(e) => e.stopPropagation()}
+      aria-label={sidebarPrAriaLabel(pr)}
     >
       {sidebarPrBadgeLabel(pr)}
     </a>

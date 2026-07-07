@@ -646,6 +646,14 @@ async fn attach_pr_feedback_freshness(
                 // Content change and coverage health are independent signals
                 // derived from the same fetch: the count reflects only the
                 // surfaces that were read, and coverage flags any that weren't.
+                response.feedback_status = Some(feedback.feedback_status);
+                db.update_work_scope_pr_feedback_status(
+                    work_scope,
+                    pr_number,
+                    feedback.feedback_status,
+                )
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
                 response.feedback_freshness =
                     crate::api::pr_monitoring::actionable_feedback_freshness_from_baseline(
                         &baseline,
@@ -725,16 +733,17 @@ pub(crate) async fn create_pr_auto_fix_context(
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
 
-    let (response, observations, _result_baseline) = match result {
+    let (response, observations, _result_baseline, feedback_status) = match result {
         Ok(capture) => (
             Ok(capture.response),
             capture.observations,
             Some(capture.baseline),
+            Some(capture.feedback_status),
         ),
         Err(crate::api::pr_monitoring::PrMonitorError::BadRequestWithObservations {
             message,
             observations,
-        }) => (Err(AppError::BadRequest(message)), observations, None),
+        }) => (Err(AppError::BadRequest(message)), observations, None, None),
         Err(crate::api::pr_monitoring::PrMonitorError::BadRequest(message)) => {
             return Err(AppError::BadRequest(message));
         }
@@ -745,6 +754,12 @@ pub(crate) async fn create_pr_auto_fix_context(
 
     if !observations.is_empty() {
         db.upsert_work_scope_pr_observations(&work_scope, &observations)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+    }
+
+    if let (Ok(response), Some(feedback_status)) = (&response, feedback_status) {
+        db.update_work_scope_pr_feedback_status(&work_scope, response.pr_number, feedback_status)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
     }

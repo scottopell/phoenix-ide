@@ -171,6 +171,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_turn_usage_first_byte_at",
         sql: MIGRATION_031,
     },
+    Migration {
+        version: 32,
+        name: "add_pr_feedback_status_cache",
+        sql: MIGRATION_032,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -959,6 +964,10 @@ const MIGRATION_030: &str = r"
 ALTER TABLE conversations ADD COLUMN clear_watermark INTEGER NOT NULL DEFAULT 0;
 ";
 
+const MIGRATION_032: &str = r"
+ALTER TABLE work_scope_pr_associations ADD COLUMN feedback_status TEXT NOT NULL DEFAULT 'open';
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -1097,7 +1106,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 31);
+        assert_eq!(first, 32);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -1134,9 +1143,9 @@ mod tests {
             .unwrap();
 
         // Every version except the stamped 29 must run: 1–28 below the stamp
-        // and 30–31 above it.
+        // and 30–32 above it.
         let applied = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(applied, 30);
+        assert_eq!(applied, 31);
 
         // Migration 005's effects must be present.
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")

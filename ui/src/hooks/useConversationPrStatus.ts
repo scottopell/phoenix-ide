@@ -20,6 +20,7 @@ function displayStateToGhState(displayState: CachedPrSummary['display_state']): 
 function cachedPrToStatus(cachedPr: CachedPrSummary, attemptedAt = new Date().toISOString()): PrStatusResponse {
   const draft = cachedPr.display_state === 'draft';
   const state = displayStateToGhState(cachedPr.display_state);
+  const feedbackStatus = cachedPr.feedback_status ?? 'open';
   return {
     found: true,
     number: cachedPr.number,
@@ -30,6 +31,7 @@ function cachedPrToStatus(cachedPr: CachedPrSummary, attemptedAt = new Date().to
     base: cachedPr.base,
     head: cachedPr.head,
     display_state: cachedPr.display_state,
+    feedback_status: feedbackStatus,
     pr: {
       number: cachedPr.number,
       title: cachedPr.title,
@@ -56,6 +58,7 @@ function cachedSeedMatchesStatus(cachedSeed: PrStatusResponse, prStatus: PrStatu
     && (prStatus.title ?? prStatus.pr?.title) === cachedSeed.title
     && (prStatus.url ?? prStatus.pr?.url) === cachedSeed.url
     && prStatus.display_state === cachedSeed.display_state
+    && (prStatus.feedback_status ?? 'open') === (cachedSeed.feedback_status ?? 'open')
     && (prStatus.base ?? prStatus.pr?.base) === cachedSeed.base
     && (prStatus.head ?? prStatus.pr?.head) === cachedSeed.head;
 }

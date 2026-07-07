@@ -200,6 +200,8 @@ pub struct WorkScopePrFeedbackBaselineInput {
     pub feedback_fingerprints: Vec<String>,
 }
 
+type PrFeedbackStatus = phoenix_core::domain::pr_feedback_status::PrFeedbackStatus;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkScopePrAssociation {
     pub work_scope_id: i64,
@@ -214,6 +216,7 @@ pub struct WorkScopePrAssociation {
     pub base: String,
     pub head: String,
     pub github_updated_at: Option<String>,
+    pub feedback_status: PrFeedbackStatus,
     pub first_seen_at: String,
     pub last_seen_at: String,
 }
@@ -243,6 +246,25 @@ fn pr_display_state_from_db(
     }
 }
 
+fn pr_feedback_status_db(status: PrFeedbackStatus) -> &'static str {
+    match status {
+        PrFeedbackStatus::Open => "open",
+        PrFeedbackStatus::InProgress => "in_progress",
+        PrFeedbackStatus::Approved => "approved",
+    }
+}
+
+fn pr_feedback_status_from_db(value: &str) -> DbResult<PrFeedbackStatus> {
+    match value {
+        "open" => Ok(PrFeedbackStatus::Open),
+        "in_progress" => Ok(PrFeedbackStatus::InProgress),
+        "approved" => Ok(PrFeedbackStatus::Approved),
+        other => Err(DbError::Serialization(format!(
+            "invalid PR feedback_status in database: {other}"
+        ))),
+    }
+}
+
 fn row_to_work_scope_pr(row: &SqliteRow) -> DbResult<WorkScopePrAssociation> {
     let display_state: String = row.get("display_state");
     Ok(WorkScopePrAssociation {
@@ -258,6 +280,7 @@ fn row_to_work_scope_pr(row: &SqliteRow) -> DbResult<WorkScopePrAssociation> {
         base: row.get("base"),
         head: row.get("head"),
         github_updated_at: row.get("github_updated_at"),
+        feedback_status: pr_feedback_status_from_db(&row.get::<String, _>("feedback_status"))?,
         first_seen_at: row.get("first_seen_at"),
         last_seen_at: row.get("last_seen_at"),
     })
@@ -368,8 +391,8 @@ impl Database {
             sqlx::query(
                 "INSERT INTO work_scope_pr_associations (
                     work_scope_id, repo_owner, repo_name, pr_number, title, url, state, draft,
-                    display_state, base, head, github_updated_at, first_seen_at, last_seen_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+                    display_state, base, head, github_updated_at, feedback_status, first_seen_at, last_seen_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open', ?13, ?13)
                  ON CONFLICT(work_scope_id, repo_owner, repo_name, pr_number) DO UPDATE SET
                     title = excluded.title,
                     url = excluded.url,
@@ -412,7 +435,7 @@ impl Database {
         };
         let rows = sqlx::query(
             "SELECT work_scope_id, repo_owner, repo_name, pr_number, title, url, state, draft,
-                    display_state, base, head, github_updated_at, first_seen_at, last_seen_at
+                    display_state, base, head, github_updated_at, feedback_status, first_seen_at, last_seen_at
              FROM work_scope_pr_associations
              WHERE work_scope_id = ?1",
         )
@@ -461,7 +484,7 @@ impl Database {
         let mut query = sqlx::QueryBuilder::new(
             "SELECT s.scope_type, s.scope_value,
                     p.work_scope_id, p.repo_owner, p.repo_name, p.pr_number, p.title, p.url, p.state, p.draft,
-                    p.display_state, p.base, p.head, p.github_updated_at, p.first_seen_at, p.last_seen_at
+                    p.display_state, p.base, p.head, p.github_updated_at, p.feedback_status, p.first_seen_at, p.last_seen_at
              FROM work_scopes s
              JOIN work_scope_pr_associations p ON p.work_scope_id = s.id
              WHERE (s.scope_type, s.scope_value) IN ",
@@ -500,6 +523,30 @@ impl Database {
             }
         }
         Ok(out)
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn update_work_scope_pr_feedback_status(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScope,
+        pr_number: u64,
+        status: PrFeedbackStatus,
+    ) -> DbResult<()> {
+        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+            return Ok(());
+        };
+        sqlx::query(
+            "UPDATE work_scope_pr_associations
+             SET feedback_status = ?1
+             WHERE work_scope_id = ?2 AND pr_number = ?3",
+        )
+        .bind(pr_feedback_status_db(status))
+        .bind(work_scope_id)
+        .bind(pr_number.cast_signed())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// # Errors
