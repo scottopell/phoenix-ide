@@ -132,7 +132,7 @@ describe('AboutDeploymentPage disk usage health', () => {
           size: { kind: 'measured', bytes: 2000 },
           repository: '/repo',
           branch_name: 'task-live',
-          disposition: { kind: 'live', conversation_id: 'live-conv', title: 'Live task', state: 'Idle', archived: false },
+          disposition: { kind: 'live', conversation_id: 'live-conv', slug: 'live-task', title: 'Live task', state: 'Idle', archived: false },
         },
         {
           path: '/repo/.phoenix/worktrees/leftover',

@@ -352,7 +352,7 @@ export function AboutDeploymentPage() {
                                       </td>
                                       <td className="deploy-table__action">
                                         {disposition.kind === 'live' ? (
-                                          <button type="button" className="deploy-reveal-btn" onClick={() => navigate(`/c/${disposition.conversation_id}`)}>
+                                          <button type="button" className="deploy-reveal-btn" onClick={() => navigate(`/c/${disposition.slug ?? disposition.conversation_id}`)}>
                                             Open conversation
                                           </button>
                                         ) : disposition.cleanup_allowed ? (
