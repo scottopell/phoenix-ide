@@ -75,10 +75,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - name: Set up Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          install-dependencies: true
       - name: Configure git identity
         run: |
           git config --global user.email "ci@phoenix-ide.invalid"
