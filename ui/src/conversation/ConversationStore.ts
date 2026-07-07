@@ -68,7 +68,7 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       return;
     }
     const indexedConversation = this.atomByKey(indexedSlug)?.conversation;
-    if (indexedSlug !== slug && (!indexedConversation || conversation.updated_at >= indexedConversation.updated_at)) {
+    if (indexedSlug !== slug && (!indexedConversation || conversation.updated_at > indexedConversation.updated_at)) {
       this.slugByConvId.set(conversation.id, slug);
       this.notifyChanged(slug);
     }
@@ -110,10 +110,20 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       if (conversation.updated_at === existingForId.updated_at) {
         if (!cachedPrEqual(conversation.cached_pr, existingForId.cached_pr)) {
           const destinationConversation = destination.conversation;
-          const nextConversation = destinationConversation?.id === conversation.id && destinationConversation.slug === conversation.slug
-            ? this.withCachedPr(destinationConversation, conversation.cached_pr)
-            : conversation;
-          return this.setConversationSnapshot(slug, nextConversation, destination);
+          if (destinationConversation?.id === conversation.id && destinationConversation.slug === conversation.slug) {
+            return this.setConversationSnapshot(
+              slug,
+              this.withCachedPr(destinationConversation, conversation.cached_pr),
+              destination,
+            );
+          }
+          const canonicalSlug = this.slugByConvId.get(conversation.id) ?? existingForId.slug;
+          const canonicalDestination = this.getSnapshot(canonicalSlug);
+          return this.setConversationSnapshot(
+            canonicalSlug,
+            this.withCachedPr(existingForId, conversation.cached_pr),
+            canonicalDestination,
+          );
         }
         const destinationConversation = destination.conversation;
         if (
@@ -179,7 +189,7 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
 
     const changed = this.upsertSnapshot(newSlug, conversation);
     const oldAtom = this.atomByKey(oldSlug);
-    if (oldAtom?.conversation?.id === conversation.id && this.isSnapshotOnly(oldSlug, oldAtom)) {
+    if (oldAtom?.conversation?.id === conversation.id) {
       this.removeAtom(oldSlug);
     }
     return changed;
