@@ -70,6 +70,41 @@ describe('ViewerSlot — open/close transitions', () => {
   });
 });
 
+describe('ViewerSlot — message kind', () => {
+  it('opens a message, encoding sequence id in the URL', () => {
+    const h = renderSlot();
+    act(() => { h.get().openMessage(42); });
+    expect(h.get().slot).toEqual({ kind: 'message', sequenceId: 42 });
+    expect(h.search()).toContain('viewer=message');
+    expect(h.search()).toContain('message=42');
+  });
+
+  it('parses a message URL on cold entry', () => {
+    const h = renderSlot('/c/conv-A?viewer=message&message=7');
+    expect(h.get().slot).toEqual({ kind: 'message', sequenceId: 7 });
+  });
+
+  it('normalizes message URLs with invalid ids to none', async () => {
+    const missing = renderSlot('/c/conv-A?viewer=message');
+    expect(missing.get().slot.kind).toBe('none');
+    await waitFor(() => { expect(missing.search()).not.toContain('viewer='); });
+
+    const zero = renderSlot('/c/conv-A?viewer=message&message=0');
+    expect(zero.get().slot.kind).toBe('none');
+    await waitFor(() => { expect(zero.search()).not.toContain('viewer='); });
+  });
+
+  it('clears message params when switching to another viewer kind', () => {
+    const h = renderSlot();
+    act(() => { h.get().openMessage(42); });
+    expect(h.search()).toContain('message=42');
+
+    act(() => { h.get().openProse('/repo/a.ts', '/repo'); });
+    expect(h.get().slot.kind).toBe('prose');
+    expect(h.search()).not.toContain('message=');
+  });
+});
+
 describe('ViewerSlot — inspect kind (REQ-PINSP-007)', () => {
   it('opens the inspector, encoding (scope, handle) in the URL', () => {
     const h = renderSlot();

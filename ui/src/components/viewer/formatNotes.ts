@@ -38,6 +38,10 @@ export function formatNotesForSend(notes: ReviewNote[]): string | null {
     if (n.anchor.kind === 'file') {
       const s = sectionFor(`file:${n.anchor.filePath}`, `\`${n.anchor.filePath}\``);
       s.entries.push(formatLineEntry(`Line ${n.anchor.lineNumber}`, n.lineContent, n.body));
+    } else if (n.anchor.kind === 'message') {
+      const title = `Message #${n.anchor.sequenceId}`;
+      const s = sectionFor(`message:${n.anchor.sequenceId}`, title);
+      s.entries.push(formatLineEntry(`Line ${n.anchor.lineNumber}`, n.lineContent, n.body));
     } else if (n.anchor.kind === 'diff') {
       const sectionLabel = n.anchor.section === 'committed' ? 'committed' : 'uncommitted';
       const s = sectionFor(

@@ -4,7 +4,7 @@ import { fireEvent, render, screen, waitFor, act } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { SubAgentStatus, AgentMessage, UserMessage } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
-import { MessageContextMenu } from './MessageContextMenu';
+import { MessageContextMenu, OPEN_MESSAGE_VIEWER_EVENT } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
 import { api, ConflictError, type ConversationState, type Message, type ForkProposalSummary } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
@@ -510,6 +510,62 @@ describe('message copy affordances', () => {
     await waitFor(() => {
       expect(copyToClipboard).toHaveBeenCalledWith('Context **markdown**.\n\nMore markdown.');
     });
+  });
+
+  it('opens message markdown in the sidepanel from the context menu', () => {
+    const message = agentMessage('agent-open-sidepanel', [
+      { type: 'text', text: 'Long **proposal**.' },
+    ], 15);
+    const opened: number[] = [];
+    const handler = (event: Event) => {
+      opened.push((event as CustomEvent<{ sequenceId: number }>).detail.sequenceId);
+    };
+    window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
+    try {
+      render(
+        <MemoryRouter>
+          <div id="messages">
+            <AgentMessage
+              message={message}
+              toolResults={new Map()}
+              onOpenFile={vi.fn()}
+            />
+          </div>
+          <MessageContextMenu messages={[message]} />
+        </MemoryRouter>,
+      );
+
+      fireEvent.contextMenu(screen.getByText(/Long/), { clientX: 20, clientY: 30 });
+      fireEvent.click(screen.getByRole('button', { name: 'Open in sidepanel' }));
+
+      expect(opened).toEqual([15]);
+    } finally {
+      window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
+    }
+  });
+
+  it('does not offer sidepanel open when the message has no markdown text', () => {
+    const message = agentMessage('agent-tool-only-menu', [
+      { type: 'tool_use', id: 'tool-1', name: 'bash', input: { cmd: 'pwd' } },
+    ], 16);
+
+    render(
+      <MemoryRouter>
+        <div id="messages">
+          <AgentMessage
+            message={message}
+            toolResults={new Map()}
+            onOpenFile={vi.fn()}
+          />
+        </div>
+        <MessageContextMenu messages={[message]} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.contextMenu(screen.getByText('$ pwd'), { clientX: 20, clientY: 30 });
+
+    expect(screen.queryByRole('button', { name: 'Open in sidepanel' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Copy command' }).length).toBeGreaterThan(0);
   });
 });
 

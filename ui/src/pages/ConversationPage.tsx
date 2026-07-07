@@ -28,6 +28,7 @@ import { useToast } from '../hooks/useToast';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
+import { OPEN_MESSAGE_VIEWER_EVENT } from '../components/MessageContextMenu';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
@@ -70,6 +71,9 @@ const BrowserViewPanel = lazy(() =>
 );
 const ProcessInspectorPanel = lazy(() =>
   import('../components/ProcessInspectorPanel').then((m) => ({ default: m.ProcessInspectorPanel })),
+);
+const MessageViewer = lazy(() =>
+  import('../components/MessageViewer').then((m) => ({ default: m.MessageViewer })),
 );
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
@@ -202,10 +206,14 @@ function ConversationPageContent() {
   // diff / browser viewers in each presentation branch below.
   const inspectSlot = viewerSlot.slot.kind === 'inspect' ? viewerSlot.slot : null;
   const inspectOpen = inspectSlot !== null;
+  const messageSlot = viewerSlot.slot.kind === 'message' ? viewerSlot.slot : null;
+  const messageOpen = messageSlot !== null;
   const handleCloseDiff = viewerSlot.close;
   const handleCloseBrowserView = viewerSlot.close;
   const handleCloseInspector = viewerSlot.close;
+  const handleCloseMessageViewer = viewerSlot.close;
   const handleOpenBrowserView = viewerSlot.openBrowser;
+  const handleOpenMessageViewer = viewerSlot.openMessage;
   // ConversationPage was previously snapshotting `isDesktop` at mount and
   // never resubscribing — a window resize across 1025px wouldn't update
   // the layout until the user navigated. The shared hooks now subscribe
@@ -403,6 +411,7 @@ function ConversationPageContent() {
     () => derivePendingMessages(queuedMessages, atom.messages.map((m) => m.message_id)),
     [atom.messages, queuedMessages],
   );
+  const viewableMessages = atom.messages;
 
   // Failed messages are rendered in InputArea with retry/dismiss controls.
   const failedMessages = useMemo(
@@ -1033,6 +1042,16 @@ function ConversationPageContent() {
     return () => window.removeEventListener('phoenix:insert-draft', handler);
   }, [appendDraftCb, requestComposerFocus]);
 
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const sequenceId = (e as CustomEvent<{ sequenceId: number }>).detail?.sequenceId;
+      if (!Number.isSafeInteger(sequenceId) || sequenceId <= 0) return;
+      handleOpenMessageViewer(sequenceId);
+    };
+    window.addEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
+    return () => window.removeEventListener(OPEN_MESSAGE_VIEWER_EVENT, handler);
+  }, [handleOpenMessageViewer]);
+
   const handleSendNotes = useCallback(
     (formattedNotes: string) => {
       // Dispatching into `DraftStore` works the same whether `<InputArea>`
@@ -1088,6 +1107,7 @@ function ConversationPageContent() {
   const openFileState = fileRootPath ? fileExplorer.openFileState : null;
   const browserViewerOpen = !isArchived && browserOpen;
   const inspectViewerOpen = !isArchived && inspectOpen;
+  const messageViewerOpen = !isArchived && messageOpen;
   const stateBarContinuation = useMemo(
     () => !isArchived && convStateForChildren.type === 'idle'
       ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }
@@ -1193,6 +1213,21 @@ function ConversationPageContent() {
         </div>
       );
     }
+    if (messageViewerOpen && messageSlot) {
+      return (
+        <div id="app">
+          <Suspense fallback={null}>
+            <MessageViewer
+              sequenceId={messageSlot.sequenceId}
+              messages={viewableMessages}
+              onClose={handleCloseMessageViewer}
+              onSendNotes={handleSendNotes}
+              inline
+            />
+          </Suspense>
+        </div>
+      );
+    }
   }
 
   // Terminal cleanup (Clean up / Abandon) for a Work/Branch
@@ -1269,7 +1304,7 @@ function ConversationPageContent() {
   const showSplitPaneViewer =
     isDesktop
     && isWideDesktop
-    && (splitPanePrs !== null || paneDiffOpen || browserViewerOpen || inspectViewerOpen);
+    && (splitPanePrs !== null || paneDiffOpen || browserViewerOpen || inspectViewerOpen || messageViewerOpen);
 
   const terminalSplitPane = showTerminal ? (
     <>
@@ -1763,6 +1798,16 @@ function ConversationPageContent() {
           />
         </Suspense>
       )}
+      {messageViewerOpen && messageSlot && !showSplitPaneViewer && (
+        <Suspense fallback={null}>
+          <MessageViewer
+            sequenceId={messageSlot.sequenceId}
+            messages={viewableMessages}
+            onClose={handleCloseMessageViewer}
+            onSendNotes={handleSendNotes}
+          />
+        </Suspense>
+      )}
       {showSplitPaneViewer && (
         <>
           <div
@@ -1831,6 +1876,14 @@ function ConversationPageContent() {
                   scopeKey={inspectSlot.scopeKey}
                   handleId={inspectSlot.handleId}
                   onClose={handleCloseInspector}
+                  inline
+                />
+              ) : messageViewerOpen && messageSlot ? (
+                <MessageViewer
+                  sequenceId={messageSlot.sequenceId}
+                  messages={viewableMessages}
+                  onClose={handleCloseMessageViewer}
+                  onSendNotes={handleSendNotes}
                   inline
                 />
               ) : null}

@@ -39,7 +39,8 @@ export type ViewerSlot =
   | { kind: 'prose'; file: ProseFile; patchContext: PatchContext | null }
   | { kind: 'diff'; presentation: DiffPresentation }
   | { kind: 'browser' }
-  | { kind: 'inspect'; scopeKey: string; handleId: string };
+  | { kind: 'inspect'; scopeKey: string; handleId: string }
+  | { kind: 'message'; sequenceId: number };
 
 /** The slot's imperative surface. Identity-stable across slot / browser-session
  *  changes, so a command-only consumer (a button that opens a viewer) does not
@@ -52,6 +53,8 @@ export interface ViewerSlotCommands {
   /** Open the process inspector on a single bash handle, addressed by its
    *  `(scope_key, handle_id)` pair (REQ-PINSP-007). */
   openInspect: (scopeKey: string, handleId: string) => void;
+  /** Open a finalized chat message in the annotatable markdown viewer. */
+  openMessage: (sequenceId: number) => void;
   close: () => void;
 }
 
@@ -77,6 +80,7 @@ const ROOT_PARAM = 'root';
 const LINE_PARAM = 'line';
 const SCOPE_PARAM = 'scope';
 const HANDLE_PARAM = 'handle';
+const MESSAGE_PARAM = 'message';
 
 /** The full set of slot-owned search params. Every transition clears all of
  *  them and writes only the ones its kind needs, so a stale param from a prior
@@ -89,6 +93,7 @@ const SLOT_PARAMS = [
   LINE_PARAM,
   SCOPE_PARAM,
   HANDLE_PARAM,
+  MESSAGE_PARAM,
 ] as const;
 
 function clearSlotParams(next: URLSearchParams) {
@@ -139,6 +144,11 @@ function deriveSlot(
       if (!scope || !handle) return { slot: { kind: 'none' }, malformed: true };
       return { slot: { kind: 'inspect', scopeKey: scope, handleId: handle }, malformed: false };
     }
+    case 'message': {
+      const sequenceId = parseMessageParam(searchParams.get(MESSAGE_PARAM));
+      if (sequenceId === undefined) return { slot: { kind: 'none' }, malformed: true };
+      return { slot: { kind: 'message', sequenceId }, malformed: false };
+    }
     case null:
       return { slot: { kind: 'none' }, malformed: false };
     default:
@@ -155,6 +165,12 @@ function parseFocusLineParam(lineParam: string | null): number | undefined {
 
 function validFocusLine(lineNumber: number): number | undefined {
   return Number.isSafeInteger(lineNumber) && lineNumber > 0 ? lineNumber : undefined;
+}
+
+function parseMessageParam(messageParam: string | null): number | undefined {
+  if (!messageParam || !/^[1-9]\d*$/.test(messageParam)) return undefined;
+  const sequenceId = Number(messageParam);
+  return Number.isSafeInteger(sequenceId) && sequenceId > 0 ? sequenceId : undefined;
 }
 
 interface ViewerSlotProviderProps {
@@ -236,6 +252,17 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
       next.set(VIEWER_PARAM, 'inspect');
       next.set(SCOPE_PARAM, inspectScopeKey);
       next.set(HANDLE_PARAM, handleId);
+    });
+  }, [setPatchContext, writeUrl]);
+
+  const openMessage = useCallback((sequenceId: number) => {
+    const validSequenceId = Number.isSafeInteger(sequenceId) && sequenceId > 0 ? sequenceId : undefined;
+    if (validSequenceId === undefined) return;
+    setPatchContext(null);
+    writeUrl((next) => {
+      clearSlotParams(next);
+      next.set(VIEWER_PARAM, 'message');
+      next.set(MESSAGE_PARAM, String(validSequenceId));
     });
   }, [setPatchContext, writeUrl]);
 
@@ -324,8 +351,8 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   }, [scopeKey, browserSessionActive, slotKind, openBrowser, clearSlot]);
 
   const commands = useMemo<ViewerSlotCommands>(
-    () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, close }),
-    [openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, close],
+    () => ({ openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, close }),
+    [openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, openMessage, close],
   );
 
   return (

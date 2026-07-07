@@ -5,7 +5,7 @@
 --
 -- Scope: The single-slot, user-action-driven viewer system that overlays
 --        or sits beside a conversation's chat column. Governs which
---        viewer is open (prose / diff / browser), the data each viewer
+--        viewer is open (prose / diff / browser / inspect / message), the data each viewer
 --        carries, and the mutex rules between them.
 -- Includes: Open / close transitions, browser-session edge auto-open
 --           and auto-close, conversation-change reset, the URL contract
@@ -32,7 +32,7 @@
 --     state is component-local UI affordance, out of scope here.
 --
 -- Architecture: the slot is a discriminated union -- `kind` selects
---   exactly one of {none, prose, diff, browser}, and the data each
+--   exactly one of {none, prose, diff, browser, inspect, message}, and the data each
 --   variant carries lives only in the variant that needs it. This
 --   makes "prose open without a file path" or "diff open without a
 --   comparator" structurally unrepresentable.
@@ -41,6 +41,8 @@
 --     ?viewer=prose&file=<absolute-path>&root=<absolute-path>
 --     ?viewer=diff&presentation=<fullscreen|pane>
 --     ?viewer=browser
+--     ?viewer=inspect&scope=<scope-key>&handle=<handle-id>
+--     ?viewer=message&message=<sequence-id>
 --   patchContext (modifiedLines: Set<Integer>) rides alongside in
 --   conversation-scoped state, not in the URL -- it is patch-
 --   provenance, not view identity. Loss on cold reload is acceptable.
@@ -69,6 +71,15 @@ use "../bedrock/bedrock.allium" as bedrock
 value ProseFile {
     path: String        -- non-empty, absolute
     root_dir: String    -- non-empty, absolute
+}
+
+value InspectHandle {
+    scope_key: String   -- non-empty
+    handle_id: String   -- non-empty
+}
+
+value MessageRef {
+    sequence_id: Integer -- positive, conversation-local message sequence
 }
 
 -- The diff viewer carries presentation data but no payload data. The
@@ -124,9 +135,9 @@ value ViewerUrlSnapshot {
 -- Enumerations
 ------------------------------------------------------------
 
--- The four kinds of slot state. Encoded in URL as ?viewer=<kind>.
+-- The slot state kinds. Encoded in URL as ?viewer=<kind>.
 -- `none` corresponds to "no ?viewer= param present."
-enum ViewerKind { none | prose | diff | browser }
+enum ViewerKind { none | prose | diff | browser | inspect | message }
 
 enum DiffPresentation { fullscreen | pane }
 
@@ -164,10 +175,14 @@ entity ViewerSlot {
     -- Diff presentation is slot identity: fullscreen is a dismissible
     -- takeover over app chrome; pane is the intentional split-pane surface.
     diff_presentation: DiffPresentation when kind = diff
+    inspect_handle: InspectHandle when kind = inspect
+    message_ref: MessageRef when kind = message
 
     -- The diff variant carries no payload data: the diff is identified by the
     -- conversation (conversation-keyed endpoint), and the browser
-    -- variant's liveness signal is conversation.browser_session_active.
+    -- variant's liveness signal is conversation.browser_session_active. The
+    -- message variant carries only identity; the markdown is resolved from the
+    -- loaded conversation messages on viewer mount.
 
     -- patchContext is conversation-scoped, NOT slot-scoped: it
     -- accompanies the prose file when set, but is preserved across
@@ -183,18 +198,36 @@ entity ViewerSlot {
     -- step (user opens a file while diff was showing, etc.); none is
     -- the start state and the universal close target.
     transitions kind {
-        none   -> prose
-        none   -> diff
-        none   -> browser
-        prose  -> none
-        prose  -> diff
-        prose  -> browser
-        diff   -> none
-        diff   -> prose
-        diff   -> browser
+        none    -> prose
+        none    -> diff
+        none    -> browser
+        none    -> inspect
+        none    -> message
+        prose   -> none
+        prose   -> diff
+        prose   -> browser
+        prose   -> inspect
+        prose   -> message
+        diff    -> none
+        diff    -> prose
+        diff    -> browser
+        diff    -> inspect
+        diff    -> message
         browser -> none
         browser -> prose
         browser -> diff
+        browser -> inspect
+        browser -> message
+        inspect -> none
+        inspect -> prose
+        inspect -> diff
+        inspect -> browser
+        inspect -> message
+        message -> none
+        message -> prose
+        message -> diff
+        message -> browser
+        message -> inspect
     }
 }
 
@@ -218,10 +251,13 @@ entity ViewerSlot {
 ------------------------------------------------------------
 
 -- User-driven events: clicking a file row, a View Diff button, the
--- browser launcher, or the close button on the active viewer.
+-- browser launcher, a process inspector control, a message context-menu item,
+-- or the close button on the active viewer.
 --   UserOpensProse(slot, file, patch?)
 --   UserOpensDiff(slot, presentation)
 --   UserOpensBrowser(slot)
+--   UserOpensInspect(slot, handle)
+--   UserOpensMessage(slot, message)
 --   UserClosesViewer(slot)
 --
 -- URL-driven event: the URL search params changed (back button,
@@ -231,7 +267,7 @@ entity ViewerSlot {
 -- restoration on mount, browser back, or another tab's pushState
 -- via storage events. Treating it as one event keeps the rule set
 -- tight; the implementation reads the URL once and dispatches.
---   UrlSlotChanged(slot, next_kind, next_prose_file?, next_diff_presentation?)
+--   UrlSlotChanged(slot, next_kind, next_prose_file?, next_diff_presentation?, next_inspect_handle?, next_message_ref?)
 --
 -- Server-driven events: bedrock's Conversation.browser_session_active
 -- transitioned. The slot listens for the rising edge to auto-open
@@ -300,6 +336,20 @@ rule UserOpensBrowserViewer {
     ensures: slot.kind = browser
 }
 
+rule UserOpensInspectViewer {
+    when: UserOpensInspect(slot, handle)
+    requires: not slot.conversation.is_terminal
+    ensures: slot.kind = inspect
+    ensures: slot.inspect_handle = handle
+}
+
+rule UserOpensMessageViewer {
+    when: UserOpensMessage(slot, message)
+    requires: not slot.conversation.is_terminal
+    ensures: slot.kind = message
+    ensures: slot.message_ref = message
+}
+
 -- ===========================================================
 -- VS 2. CLOSING A VIEWER (REQ-VS-004)
 -- ===========================================================
@@ -330,12 +380,12 @@ rule UserClosesActiveViewer {
 --   identity (file path), drop ephemeral provenance (which lines
 --   were modified by the message that opened it).
 rule UrlHydratesNone {
-    when: UrlSlotChanged(slot, none, _, _)
+    when: UrlSlotChanged(slot, none, _, _, _, _)
     ensures: slot.kind = none
 }
 
 rule UrlHydratesProse {
-    when: UrlSlotChanged(slot, prose, file, _)
+    when: UrlSlotChanged(slot, prose, file, _, _, _)
     requires: file != null
     ensures: slot.kind = prose
     ensures: slot.prose_file = file
@@ -343,14 +393,14 @@ rule UrlHydratesProse {
 }
 
 rule UrlHydratesDiff {
-    when: UrlSlotChanged(slot, diff, _, presentation)
+    when: UrlSlotChanged(slot, diff, _, presentation, _, _)
     requires: presentation != null
     ensures: slot.kind = diff
     ensures: slot.diff_presentation = presentation
 }
 
 rule UrlHydratesBrowser {
-    when: UrlSlotChanged(slot, browser, _, _)
+    when: UrlSlotChanged(slot, browser, _, _, _, _)
     -- No requires on browser_session_active here: the URL might
     -- restore ?viewer=browser after the session has died. The viewer
     -- mount path renders an "ended" state when active=false; spec'd
@@ -360,14 +410,27 @@ rule UrlHydratesBrowser {
     ensures: slot.kind = browser
 }
 
--- Defensive: the URL has ?viewer=prose but no file param, ?viewer=diff with
--- no presentation mode, or an unknown ?viewer= value. The implementation
--- normalizes this away (treat as ?viewer=none), and the spec asserts the rule
--- for correctness. ?viewer=browser is always well-formed because it carries no
--- required params.
+rule UrlHydratesInspect {
+    when: UrlSlotChanged(slot, inspect, _, _, handle, _)
+    requires: handle != null
+    ensures: slot.kind = inspect
+    ensures: slot.inspect_handle = handle
+}
+
+rule UrlHydratesMessage {
+    when: UrlSlotChanged(slot, message, _, _, _, message_ref)
+    requires: message_ref != null
+    ensures: slot.kind = message
+    ensures: slot.message_ref = message_ref
+}
+
+-- Defensive: the URL has a viewer kind without its required params, or an
+-- unknown ?viewer= value. The implementation normalizes this away (treat as
+-- ?viewer=none), and the spec asserts the rule for correctness. ?viewer=browser
+-- is always well-formed because it carries no required params.
 rule UrlMalformedNormalizesToNone {
-    when: UrlSlotChanged(slot, kind, file, presentation)
-    requires: (kind = prose and file = null) or (kind = diff and presentation = null)
+    when: UrlSlotChanged(slot, kind, file, presentation, handle, message_ref)
+    requires: (kind = prose and file = null) or (kind = diff and presentation = null) or (kind = inspect and handle = null) or (kind = message and message_ref = null)
     ensures: slot.kind = none
     ensures: UrlNormalizationRequested(slot)  -- triggers a setSearchParams clearing the bogus params
 }
@@ -495,20 +558,42 @@ rule UserOpensBrowserWritesStorage {
     ensures: ViewerSnapshotPersisted(slot)
 }
 
+rule UserOpensInspectWritesStorage {
+    when: UserOpensInspect(slot, handle)
+    ensures: ViewerSnapshotPersisted(slot)
+}
+
+rule UserOpensMessageWritesStorage {
+    when: UserOpensMessage(slot, message)
+    ensures: ViewerSnapshotPersisted(slot)
+}
+
 rule UrlHydratesProseWritesStorage {
-    when: UrlSlotChanged(slot, prose, file, _)
+    when: UrlSlotChanged(slot, prose, file, _, _, _)
     requires: file != null
     ensures: ViewerSnapshotPersisted(slot)
 }
 
 rule UrlHydratesDiffWritesStorage {
-    when: UrlSlotChanged(slot, diff, _, presentation)
+    when: UrlSlotChanged(slot, diff, _, presentation, _, _)
     requires: presentation != null
     ensures: ViewerSnapshotPersisted(slot)
 }
 
 rule UrlHydratesBrowserWritesStorage {
-    when: UrlSlotChanged(slot, browser, _, _)
+    when: UrlSlotChanged(slot, browser, _, _, _, _)
+    ensures: ViewerSnapshotPersisted(slot)
+}
+
+rule UrlHydratesInspectWritesStorage {
+    when: UrlSlotChanged(slot, inspect, _, _, handle, _)
+    requires: handle != null
+    ensures: ViewerSnapshotPersisted(slot)
+}
+
+rule UrlHydratesMessageWritesStorage {
+    when: UrlSlotChanged(slot, message, _, _, _, message_ref)
+    requires: message_ref != null
     ensures: ViewerSnapshotPersisted(slot)
 }
 
@@ -612,6 +697,8 @@ surface ConversationViewer {
         slot.kind
         slot.prose_file when slot.kind = prose
         slot.diff_presentation when slot.kind = diff
+        slot.inspect_handle when slot.kind = inspect
+        slot.message_ref when slot.kind = message
 
     provides:
         UserOpensProse(slot, file, patch?)
@@ -620,6 +707,10 @@ surface ConversationViewer {
             when not slot.conversation.is_terminal
         UserOpensBrowser(slot)
             when slot.conversation.browser_session_active
+        UserOpensInspect(slot, handle)
+            when not slot.conversation.is_terminal
+        UserOpensMessage(slot, message)
+            when not slot.conversation.is_terminal
         UserClosesViewer(slot)
             when slot.kind != none
 }
@@ -630,7 +721,8 @@ surface ConversationViewer {
 
 -- @invariant VariantDataPresence
 --   prose_file is set iff kind = prose. diff_presentation is set iff kind =
---   diff. Browser carries no slot data. The `when kind = ...` annotations on
+--   diff. inspect_handle is set iff kind = inspect. message_ref is set iff
+--   kind = message. Browser carries no slot data. The `when kind = ...` annotations on
 --   entity fields are the structural enforcement; this invariant restates
 --   the contract for spec consumers (and gives `allium analyse` a
 --   target to verify against the rule set).
@@ -654,6 +746,26 @@ invariant DiffPresentationAbsentWhenNotDiffKind {
         (s.kind != diff) implies (s.diff_presentation = null)
 }
 
+invariant InspectHandlePresentIffInspectKind {
+    for s in ViewerSlot:
+        (s.kind = inspect) implies (s.inspect_handle != null)
+}
+
+invariant InspectHandleAbsentWhenNotInspectKind {
+    for s in ViewerSlot:
+        (s.kind != inspect) implies (s.inspect_handle = null)
+}
+
+invariant MessageRefPresentIffMessageKind {
+    for s in ViewerSlot:
+        (s.kind = message) implies (s.message_ref != null)
+}
+
+invariant MessageRefAbsentWhenNotMessageKind {
+    for s in ViewerSlot:
+        (s.kind != message) implies (s.message_ref = null)
+}
+
 -- @invariant PatchContextOnlyDuringProse
 --   patch_context can only be populated when kind = prose. Otherwise
 --   it is null. (The `when kind = prose` annotation enforces this
@@ -664,7 +776,7 @@ invariant PatchContextOnlyDuringProse {
 }
 
 -- SingleSlotKind is enforced structurally by the enum -- kind is
--- a single field with values in { none, prose, diff, browser }.
+-- a single field with values in { none, prose, diff, browser, inspect, message }.
 -- An invariant restating this would be tautological.
 
 -- UrlIsSourceOfTruth is documented in the entity comment and the
@@ -682,7 +794,7 @@ invariant PatchContextOnlyDuringProse {
 -- (ui/src/contexts/ViewerSlotContext.tsx), mounted in DesktopLayout
 -- so it wraps every conversation route. It derives the discriminated
 -- union from the URL on every render; the `?viewer=` param covers all
--- three kinds. The single-slot mutex is structural -- one `viewer`
+-- non-empty kinds. The single-slot mutex is structural -- one `viewer`
 -- value at a time -- so there are no coordinating effects: adding a
 -- fourth viewer kind is a new enum variant, not another effect.
 -- `FileExplorerProvider` is a thin adapter that projects the slot's

@@ -81,6 +81,8 @@ function anchorLabel(n: ReviewNote): string {
   switch (n.anchor.kind) {
     case 'file':
       return `Line ${n.anchor.lineNumber}`;
+    case 'message':
+      return `Line ${n.anchor.lineNumber}`;
     case 'diff':
       if (n.anchor.newLine !== undefined) return `New line ${n.anchor.newLine}`;
       if (n.anchor.oldLine !== undefined) return `Removed line ${n.anchor.oldLine}`;

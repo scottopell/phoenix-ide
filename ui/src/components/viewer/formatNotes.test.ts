@@ -30,6 +30,20 @@ describe('formatNotesForSend', () => {
     expect(out).toContain('why empty?');
   });
 
+  it('formats message notes distinctly from file paths', () => {
+    const out = formatNotesForSend([
+      note({
+        anchor: { kind: 'message', sequenceId: 9, messageId: 'agent-9', lineNumber: 3 },
+        lineContent: 'proposal detail',
+        body: 'respond to this point',
+      }),
+    ]);
+    expect(out).toContain('### Message #9');
+    expect(out).toContain('**Line 3**');
+    expect(out).toContain('`proposal detail`');
+    expect(out).toContain('respond to this point');
+  });
+
   it('groups file notes by path and diff notes by (filePath, section)', () => {
     const out = formatNotesForSend([
       note({
