@@ -4215,9 +4215,8 @@ where
             );
 
             // Build request — normalize messages against current tool set
-            let mut tool_names: std::collections::HashSet<&str> =
+            let tool_names: std::collections::HashSet<&str> =
                 tools.iter().map(|t| t.name.as_str()).collect();
-            tool_names.insert("commission_review");
             let messages = strip_unavailable_tool_blocks(messages, &tool_names);
 
             let request = LlmRequest {
@@ -5912,13 +5911,21 @@ fn strip_unavailable_tool_blocks(
 ) -> Vec<LlmMessage> {
     use phoenix_llm::ContentBlock;
 
-    // First pass: collect IDs of tool_use blocks we're going to strip
+    // First pass: collect IDs of tool_use blocks we're going to strip.
+    // Historical commission_review results remain useful context even when the
+    // tool is hidden for new calls; preserve their result text without sending
+    // undeclared tool_use/tool_result blocks to the provider.
     let mut stripped_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut flatten_result_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for msg in &messages {
         for block in &msg.content {
             if let ContentBlock::ToolUse { id, name, .. } = block {
                 if !available_tools.contains(name.as_str()) {
                     stripped_ids.insert(id.clone());
+                    if name == "commission_review" {
+                        flatten_result_ids.insert(id.clone());
+                    }
                 }
             }
         }
@@ -5951,9 +5958,15 @@ fn strip_unavailable_tool_blocks(
                         }
                     }
                     ContentBlock::ToolResult {
-                        ref tool_use_id, ..
+                        ref tool_use_id,
+                        ref content,
+                        ..
                     } => {
-                        if stripped_ids.contains(tool_use_id) {
+                        if flatten_result_ids.contains(tool_use_id) {
+                            Some(ContentBlock::Text {
+                                text: format!("[historical commission_review result]\n{content}"),
+                            })
+                        } else if stripped_ids.contains(tool_use_id) {
                             None
                         } else {
                             Some(block)
@@ -6480,6 +6493,30 @@ mod strip_tool_blocks_tests {
         assert!(
             matches!(&out[1].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "keep")
         );
+    }
+
+    #[test]
+    fn strip_unavailable_flattens_hidden_commission_review_result() {
+        let available: std::collections::HashSet<&str> = ["bash"].into_iter().collect();
+        let msgs = vec![
+            assistant(vec![tool_use("review", "commission_review")]),
+            user(vec![ContentBlock::ToolResult {
+                tool_use_id: "review".to_string(),
+                content: "review finding summary".to_string(),
+                images: Vec::new(),
+                is_error: false,
+            }]),
+        ];
+
+        let out = strip_unavailable_tool_blocks(msgs, &available);
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0].content[0],
+            ContentBlock::Text { text }
+                if text.contains("historical commission_review result")
+                    && text.contains("review finding summary")
+        ));
     }
 
     #[test]
