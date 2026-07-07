@@ -111,7 +111,7 @@ fn resolve_commission_review_approval_from_parts(
         return CommissionReviewApprovalAvailability::Unavailable { reason };
     }
 
-    let (base, head) = if let Some(
+    let (base, head, diff_head) = if let Some(
         ModeContext::Work {
             base_branch,
             branch_name,
@@ -124,7 +124,7 @@ fn resolve_commission_review_approval_from_parts(
         },
     ) = mode_context
     {
-        let current_branch = match git_capture(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        let current_branch = match git_capture(&repo_root, &["branch", "--show-current"]) {
             Ok(branch) => branch.trim().to_string(),
             Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
         };
@@ -144,7 +144,7 @@ fn resolve_commission_review_approval_from_parts(
                 ),
             };
         }
-        (base_ref, branch_name.clone())
+        (base_ref, branch_name.clone(), "HEAD".to_string())
     } else {
         let remote = match git_capture(
             &repo_root,
@@ -168,11 +168,13 @@ fn resolve_commission_review_approval_from_parts(
                 reason: COMMISSION_REVIEW_MISSING_ORIGIN_HEAD.to_string(),
             };
         }
-        (base_ref, "HEAD".to_string())
+        (base_ref, "HEAD".to_string(), "HEAD".to_string())
     };
 
-    let (changed_files, insertions, deletions) =
-        diff_numstat(&repo_root, &base, &head).unwrap_or((0, 0, 0));
+    let (changed_files, insertions, deletions) = match diff_numstat(&repo_root, &base, &diff_head) {
+        Ok(stats) => stats,
+        Err(reason) => return CommissionReviewApprovalAvailability::Unavailable { reason },
+    };
 
     CommissionReviewApprovalAvailability::Available(CommissionReviewApprovalScope {
         kind: "committed_branch_diff".to_string(),
@@ -249,12 +251,21 @@ fn git_capture(repo: &Path, args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .arg("--no-optional-locks")
         .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .current_dir(repo)
         .output()
         .map_err(|_| COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE.to_string())?;
 
     if !output.status.success() {
-        return Err(COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE.to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(if detail.is_empty() {
+            COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE.to_string()
+        } else {
+            format!("{COMMISSION_REVIEW_GIT_STATUS_UNAVAILABLE}: {detail}")
+        });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -449,8 +460,10 @@ mod commission_review_approval_tests {
             dir.path(),
             &["update-ref", "refs/remotes/origin/main", &base],
         );
+        git_ok(dir.path(), &["tag", "task"]);
         git_ok(dir.path(), &["checkout", "-qb", "task"]);
         std::fs::write(dir.path().join("src.txt"), "one\ntwo\n").expect("write file");
+
         git_ok(dir.path(), &["add", "src.txt"]);
         git_ok(dir.path(), &["commit", "-qm", "change"]);
         let mut context = repo_context(dir.path());
@@ -462,11 +475,38 @@ mod commission_review_approval_tests {
 
         let availability = resolve_commission_review_approval(&context);
         let CommissionReviewApprovalAvailability::Available(scope) = availability else {
-            panic!("expected available review scope");
+            panic!("expected available review scope, got {availability:?}");
         };
         assert_eq!(scope.changed_files, 1);
         assert_eq!(scope.insertions, 2);
         assert_eq!(scope.deletions, 0);
+    }
+
+    #[test]
+    fn commission_review_approval_rejects_uncollectable_diff_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let base = git_output(dir.path(), &["rev-parse", "HEAD"]);
+        git_ok(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", &base],
+        );
+        git_ok(dir.path(), &["checkout", "--orphan", "task"]);
+        std::fs::write(dir.path().join("orphan.txt"), "orphan\n").expect("write orphan file");
+        git_ok(dir.path(), &["add", "orphan.txt"]);
+        git_ok(dir.path(), &["commit", "-qm", "orphan"]);
+        let mut context = repo_context(dir.path());
+        context.mode_context = Some(ModeContext::Work {
+            branch_name: "task".to_string(),
+            base_branch: "main".to_string(),
+            worktree_path: dir.path().display().to_string(),
+        });
+
+        let availability = resolve_commission_review_approval(&context);
+        let CommissionReviewApprovalAvailability::Unavailable { reason } = availability else {
+            panic!("expected unavailable review scope");
+        };
+        assert!(reason.contains("no merge base"), "reason was {reason}");
     }
 
     #[test]

@@ -942,8 +942,11 @@ fn interrupted_after_output(
         reason,
         None,
     ));
-    let (status, review_status, findings_status, findings_trust, retry_recommendation) =
+    let (status, review_status, findings_status, mut findings_trust, retry_recommendation) =
         interrupted_contract(interruption, true);
+    if has_warning(&warnings, "model_output_parse") {
+        findings_trust = FindingsTrust::Low;
+    }
     finalize_review_output(ReviewOutputDraft {
         status,
         review_status,
@@ -2920,6 +2923,28 @@ mod tests {
         assert!(output
             .warnings_summary
             .contains(&"review request timed out after partial output".to_string()));
+    }
+
+    #[test]
+    fn timeout_after_output_with_parse_failure_has_low_trust() {
+        let output = interrupted_review_output(
+            Instant::now(),
+            sample_target(),
+            &sample_collection(),
+            InterruptedReview {
+                findings: vec![sample_finding("high", "src/lib.rs", "Bug")],
+                warnings: vec![warning("model_output_parse", "bad json", None)],
+                reviewer_summaries: Vec::new(),
+                usage: phoenix_core::domain::llm_types::Usage::default(),
+                reason: "request timed out".to_string(),
+                interruption: ReviewInterruption::Timeout,
+            },
+        );
+
+        assert_eq!(output.status, ReviewStatus::Partial);
+        assert_eq!(output.findings_status, FindingsStatus::Partial);
+        assert_eq!(output.findings_trust, FindingsTrust::Low);
+        assert_eq!(output.stage_status.json_parse, StageStatus::Failed);
     }
 
     #[test]
