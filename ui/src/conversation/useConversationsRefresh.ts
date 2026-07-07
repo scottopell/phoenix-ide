@@ -78,8 +78,8 @@ async function refreshOnce(store: ConversationStore): Promise<void> {
       api.listConversations(),
       api.listArchivedConversations(),
     ]);
-    store.upsertSnapshots(freshActive);
-    store.upsertSnapshots(freshArchived);
+    store.upsertSnapshots(freshActive, { allowEqualTimestampSlugMove: true });
+    store.upsertSnapshots(freshArchived, { allowEqualTimestampSlugMove: true });
     try {
       await cacheDB.syncConversations([...freshActive, ...freshArchived]);
     } catch {

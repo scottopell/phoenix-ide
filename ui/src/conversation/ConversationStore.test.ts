@@ -271,6 +271,75 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.listSnapshots().map((c) => c.slug)).toEqual(['canonical-slug']);
   });
 
+  it('allows same-timestamp slug moves from authoritative snapshots', () => {
+    const store = new ConversationStore();
+    store.upsertSnapshot('old-slug', makeConv('old-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-01T00:00:00Z',
+    }));
+
+    expect(store.upsertSnapshot('new-slug', makeConv('new-slug', {
+      id: 'conv-shared',
+      updated_at: '2024-06-01T00:00:00Z',
+    }), { allowEqualTimestampSlugMove: true })).toBe(true);
+
+    expect(store.slugForId('conv-shared')).toBe('new-slug');
+    expect(store.getSnapshot('old-slug').conversation).toBeNull();
+    expect(store.getSnapshot('new-slug').conversation?.slug).toBe('new-slug');
+    expect(store.listSnapshots().map((c) => c.slug)).toEqual(['new-slug']);
+  });
+
+  it('does not use a stale indexed slug as the cached PR merge destination', () => {
+    const store = new ConversationStore();
+    store.upsertSnapshot('shared-slug', makeConv('shared-slug', {
+      id: 'conv-old',
+      updated_at: '2024-06-01T00:00:00Z',
+    }));
+    store.dispatch('old-slug', {
+      type: 'set_initial_data',
+      conversationId: 'conv-old',
+      conversation: makeConv('old-slug', {
+        id: 'conv-old',
+        updated_at: '2024-06-01T00:00:00Z',
+      }),
+      messages: [],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+    });
+    store.dispatch('shared-slug', {
+      type: 'set_initial_data',
+      conversationId: 'conv-new',
+      conversation: makeConv('shared-slug', {
+        id: 'conv-new',
+        updated_at: '2024-06-02T00:00:00Z',
+      }),
+      messages: [],
+      phase: { type: 'idle' },
+      contextWindow: { used: 0 },
+    });
+
+    expect(store.upsertSnapshot('cache-alias', makeConv('cache-alias', {
+      id: 'conv-old',
+      updated_at: '2024-06-01T00:00:00Z',
+      cached_pr: {
+        number: 12,
+        title: 'Cached PR',
+        url: 'https://example.test/pr/12',
+        display_state: 'open',
+        base: 'main',
+        head: 'feature',
+      },
+    }))).toBe(true);
+
+    expect(store.getSnapshot('shared-slug').conversation?.id).toBe('conv-new');
+    expect(store.getSnapshot('old-slug').conversation).toMatchObject({
+      id: 'conv-old',
+      cached_pr: { number: 12 },
+    });
+    expect(store.slugForId('conv-old')).toBe('old-slug');
+    expect(store.slugForId('conv-new')).toBe('shared-slug');
+  });
+
   it('rejects stale aliases without moving the canonical newer snapshot', () => {
     const store = new ConversationStore();
     const fresh = makeConv('current-slug', {
@@ -662,6 +731,24 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     store.upsertSnapshot('alpha', original);
 
     expect(store.replaceSlugSnapshot('alpha', renamed)).toBe(true);
+
+    expect(store.getSnapshot('alpha').conversation).toBeNull();
+    expect(store.getSnapshot('beta').conversation?.id).toBe('conv-1');
+    expect(store.slugForId('conv-1')).toBe('beta');
+    expect(store.listSnapshots().map((c) => c.slug)).toEqual(['beta']);
+  });
+
+  it('replaceSlugSnapshot allows same-timestamp slug-only local renames', () => {
+    const store = new ConversationStore();
+    store.upsertSnapshot('alpha', makeConv('alpha', {
+      id: 'conv-1',
+      updated_at: '2024-06-01T00:00:00Z',
+    }));
+
+    expect(store.replaceSlugSnapshot('alpha', makeConv('beta', {
+      id: 'conv-1',
+      updated_at: '2024-06-01T00:00:00Z',
+    }))).toBe(true);
 
     expect(store.getSnapshot('alpha').conversation).toBeNull();
     expect(store.getSnapshot('beta').conversation?.id).toBe('conv-1');
