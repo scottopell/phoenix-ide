@@ -179,7 +179,7 @@ export interface PrCheckSummary {
 }
 
 export type PrFeedbackSource = 'issue_comment' | 'review_comment' | 'review_summary' | 'review_thread';
-export type PrFeedbackCoverageSurface = 'issue_comments' | 'review_comments' | 'review_summaries' | 'review_threads';
+export type PrFeedbackCoverageSurface = 'issue_comments' | 'issue_comment_reactions' | 'review_comments' | 'review_comment_reactions' | 'review_summaries' | 'review_summary_reactions' | 'review_threads';
 export type PrFeedbackCoverageStatus = 'fetched' | 'unavailable' | 'auth_failed';
 
 export interface PrFeedbackCoverage {

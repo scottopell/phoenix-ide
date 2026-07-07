@@ -656,49 +656,62 @@ async fn attach_pr_feedback_freshness(
         .filter(|pr| pr.pr_number == pr_number)
         .map(|pr| pr.feedback_status);
 
-    let cwd_for_feedback = cwd.to_path_buf();
-    let feedback = tokio::task::spawn_blocking(move || {
-        crate::api::pr_monitoring::fetch_pr_feedback_for_pr(&cwd_for_feedback, pr_number)
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
-    match feedback {
-        Ok(feedback) => {
-            // Content change and coverage health are independent signals
-            // derived from the same fetch: the count reflects only the
-            // surfaces that were read, and coverage flags any that weren't.
-            let coverage_health = crate::api::pr_monitoring::coverage_health(&feedback);
-            let (effective_feedback_status, should_update_cache) =
-                effective_feedback_status_for_cache(
-                    previous_feedback_status,
-                    feedback.feedback_status,
-                    coverage_health.is_some(),
-                );
-            response.feedback_status = effective_feedback_status;
-            if should_update_cache {
-                db.update_work_scope_pr_feedback_status(
-                    work_scope,
-                    pr_number,
-                    feedback.feedback_status,
-                )
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            }
-            if crate::api::pr_monitoring::pr_updated_after_baseline(&baseline, updated_at)
-                || response.feedback_status != previous_feedback_status
-            {
+    if crate::api::pr_monitoring::pr_updated_after_baseline(&baseline, updated_at) {
+        let cwd_for_feedback = cwd.to_path_buf();
+        let feedback = tokio::task::spawn_blocking(move || {
+            crate::api::pr_monitoring::fetch_pr_feedback_for_pr(&cwd_for_feedback, pr_number)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+        match feedback {
+            Ok(feedback) => {
+                let coverage_health = crate::api::pr_monitoring::coverage_health(&feedback);
+                let (effective_feedback_status, should_update_cache) =
+                    effective_feedback_status_for_cache(
+                        previous_feedback_status,
+                        feedback.feedback_status,
+                        coverage_health.is_some(),
+                    );
+                response.feedback_status = effective_feedback_status;
+                if should_update_cache {
+                    db.update_work_scope_pr_feedback_status(
+                        work_scope,
+                        pr_number,
+                        feedback.feedback_status,
+                    )
+                    .await
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                }
                 response.feedback_freshness =
                     crate::api::pr_monitoring::actionable_feedback_freshness_from_baseline(
                         &baseline,
                         Some(&feedback),
                     );
+                response.feedback_coverage = coverage_health;
             }
-            response.feedback_coverage = coverage_health;
+            Err(err) => {
+                tracing::debug!(pr = pr_number, error = %err, "could not fetch PR feedback to classify freshness");
+            }
         }
-        Err(err) => {
-            // Couldn't fetch feedback at all (e.g. not a git repo) — leave
-            // both signals absent rather than guessing.
-            tracing::debug!(pr = pr_number, error = %err, "could not fetch PR feedback to classify freshness");
+    } else {
+        let cwd_for_status = cwd.to_path_buf();
+        let status = tokio::task::spawn_blocking(move || {
+            crate::api::pr_monitoring::fetch_pr_feedback_status_for_pr(&cwd_for_status, pr_number)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
+        match status {
+            Ok(status) => {
+                response.feedback_status = Some(status);
+                if Some(status) != previous_feedback_status {
+                    db.update_work_scope_pr_feedback_status(work_scope, pr_number, status)
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                }
+            }
+            Err(err) => {
+                tracing::debug!(pr = pr_number, error = %err, "could not fetch bounded PR feedback reaction status");
+            }
         }
     }
 

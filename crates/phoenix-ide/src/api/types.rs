@@ -878,8 +878,11 @@ pub struct PrCheckLogSnippet {
 #[serde(rename_all = "snake_case")]
 pub enum PrFeedbackCoverageSurface {
     IssueComments,
+    IssueCommentReactions,
     ReviewComments,
+    ReviewCommentReactions,
     ReviewSummaries,
+    ReviewSummaryReactions,
     ReviewThreads,
 }
 
