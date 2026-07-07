@@ -21,7 +21,7 @@ use phoenix_core::domain::db_schema::{ConvMode, Conversation};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use ts_rs::TS;
 
 // ============================================================
@@ -326,7 +326,10 @@ async fn cleanup_managed_worktree_inner(
             "worktree path is not a Phoenix-managed worktree path".to_string(),
         )
     })?;
-    if owners.iter().any(|conv| managed_worktree_scope_owner(conv)) {
+    if owners
+        .iter()
+        .any(|conv| managed_worktree_scope_owner(conv, &conversations))
+    {
         return Err((
             StatusCode::CONFLICT,
             "worktree is still owned by a live conversation".to_string(),
@@ -339,14 +342,10 @@ async fn cleanup_managed_worktree_inner(
         });
     }
 
-    let mode = &owners[0].conv_mode;
-    let branch_to_delete = match mode {
-        ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
-        ConvMode::Explore { .. } | ConvMode::Branch { .. } | ConvMode::Direct => None,
-    };
+    let branch_to_delete = cleanup_branch_for_leftover(owners[0]);
     let cleanup_repo_root = repo_root.clone();
     let cleanup_worktree = worktree.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    let removed = tokio::task::spawn_blocking(move || {
         remove_leftover_worktree(&cleanup_repo_root, &cleanup_worktree, branch_to_delete)
     })
     .await
@@ -355,11 +354,19 @@ async fn cleanup_managed_worktree_inner(
 
     Ok(ManagedWorktreeCleanupResponse {
         path: path.to_string(),
-        removed: true,
+        removed,
     })
 }
 
 fn exact_phoenix_worktree_root(path: &Path) -> Option<PathBuf> {
+    match path.components().next_back()? {
+        Component::Normal(name) if !name.is_empty() => {}
+        Component::Prefix(_)
+        | Component::RootDir
+        | Component::CurDir
+        | Component::ParentDir
+        | Component::Normal(_) => return None,
+    }
     let parent = path.parent()?;
     if parent.file_name()? != "worktrees" {
         return None;
@@ -375,24 +382,55 @@ fn remove_leftover_worktree(
     repo_root: &Path,
     worktree: &Path,
     branch_to_delete: Option<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let worktree_str = worktree.to_string_lossy().to_string();
-    crate::git_ops::run_git(repo_root, &["worktree", "remove", &worktree_str, "--force"])
-        .or_else(|git_err| {
+    let removed = match crate::git_ops::run_git(
+        repo_root,
+        &["worktree", "remove", &worktree_str, "--force"],
+    ) {
+        Ok(_) => true,
+        Err(git_err) => {
             tracing::debug!(error = %git_err, path = %worktree.display(), "leftover worktree cleanup: git remove failed; trying filesystem removal");
-            std::fs::remove_dir_all(worktree).map_err(|e| e.to_string())?;
-            let _ = crate::git_ops::run_git(repo_root, &["worktree", "prune"]);
-            Ok::<String, String>(String::new())
-        })?;
+            match std::fs::remove_dir_all(worktree) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    };
+    if removed {
+        let _ = crate::git_ops::run_git(repo_root, &["worktree", "prune"]);
+    }
 
-    if let Some(branch) = branch_to_delete {
-        if crate::git_ops::find_branch_in_worktree_list(repo_root, &branch).is_none() {
-            if let Err(e) = crate::git_ops::run_git(repo_root, &["branch", "-D", &branch]) {
-                tracing::debug!(error = %e, branch, "leftover worktree cleanup: branch delete failed after worktree removal");
+    if removed {
+        if let Some(branch) = branch_to_delete {
+            if crate::git_ops::find_branch_in_worktree_list(repo_root, &branch).is_none() {
+                if let Err(e) = crate::git_ops::run_git(repo_root, &["branch", "-D", &branch]) {
+                    tracing::debug!(error = %e, branch, "leftover worktree cleanup: branch delete failed after worktree removal");
+                }
             }
         }
     }
-    Ok(())
+    Ok(removed)
+}
+
+fn cleanup_branch_for_leftover(conv: &Conversation) -> Option<String> {
+    match &conv.conv_mode {
+        ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
+        ConvMode::Explore {
+            worktree_path: Some(_),
+            ..
+        } => {
+            let id_prefix: String = conv.id.chars().take(8).collect();
+            Some(format!("task-pending-{id_prefix}"))
+        }
+        ConvMode::Explore {
+            worktree_path: None,
+            ..
+        }
+        | ConvMode::Branch { .. }
+        | ConvMode::Direct => None,
+    }
 }
 
 async fn build_disk_info(state: &AppState) -> DeploymentDiskInfo {
@@ -494,7 +532,13 @@ fn managed_worktrees_from_conversations(
             DiskSize::Absent
         };
         if let Some(convs) = by_path.get(path) {
-            details.push(managed_worktree_detail(path, size, repository, convs));
+            details.push(managed_worktree_detail(
+                path,
+                size,
+                repository,
+                convs,
+                conversations,
+            ));
         }
     }
 
@@ -538,13 +582,14 @@ fn managed_worktree_detail(
     path: &str,
     size: DiskSize,
     repository: Option<String>,
-    conversations: &[&Conversation],
+    path_conversations: &[&Conversation],
+    all_conversations: &[Conversation],
 ) -> ManagedWorktreeDiskEntry {
-    let source = conversations[0];
-    let live = conversations
+    let source = path_conversations[0];
+    let live = path_conversations
         .iter()
         .copied()
-        .find(|conv| managed_worktree_scope_owner(conv));
+        .find(|conv| managed_worktree_scope_owner(conv, all_conversations));
     let owner = live.unwrap_or(source);
     ManagedWorktreeDiskEntry {
         path: path.to_string(),
@@ -569,7 +614,60 @@ fn managed_worktree_detail(
     }
 }
 
-fn managed_worktree_scope_owner(conv: &Conversation) -> bool {
+fn managed_worktree_scope_owner(conv: &Conversation, conversations: &[Conversation]) -> bool {
+    use phoenix_core::domain::sm_state::ConvState;
+    if conv.archived {
+        return false;
+    }
+    match &conv.state {
+        ConvState::ContextExhausted { .. } => match conv.continued_in_conv_id.as_deref() {
+            Some(_) => continuation_chain_has_live_owner(conv, conversations),
+            None => true,
+        },
+        ConvState::HandedOff { .. } => match conv.continued_in_conv_id.as_deref() {
+            Some(_) => !continuation_chain_has_live_owner(conv, conversations),
+            None => true,
+        },
+        ConvState::Completed { .. } | ConvState::Failed { .. } | ConvState::Terminal => false,
+        ConvState::Idle
+        | ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Error { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. }
+        | ConvState::AwaitingTaskApproval { .. }
+        | ConvState::AwaitingUserResponse { .. }
+        | ConvState::AwaitingCommissionReviewApproval { .. } => true,
+    }
+}
+
+fn continuation_chain_has_live_owner(conv: &Conversation, conversations: &[Conversation]) -> bool {
+    let by_id: BTreeMap<&str, &Conversation> = conversations
+        .iter()
+        .map(|candidate| (candidate.id.as_str(), candidate))
+        .collect();
+    let mut next = conv.continued_in_conv_id.as_deref();
+    let mut seen = BTreeSet::new();
+    while let Some(id) = next {
+        if !seen.insert(id) {
+            return false;
+        }
+        let Some(member) = by_id.get(id).copied() else {
+            return false;
+        };
+        if managed_worktree_single_node_owner(member) {
+            return true;
+        }
+        next = member.continued_in_conv_id.as_deref();
+    }
+    false
+}
+
+fn managed_worktree_single_node_owner(conv: &Conversation) -> bool {
     use phoenix_core::domain::sm_state::ConvState;
     if conv.archived {
         return false;
@@ -1028,6 +1126,24 @@ mod tests {
     }
 
     #[test]
+    fn exact_phoenix_worktree_root_rejects_parent_dir_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let parent_leaf = repo.join(".phoenix").join("worktrees").join("..");
+
+        assert_eq!(exact_phoenix_worktree_root(&parent_leaf), None);
+    }
+
+    #[test]
+    fn remove_leftover_worktree_treats_missing_fallback_as_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let missing = repo.join(".phoenix").join("worktrees").join("gone");
+
+        assert_eq!(remove_leftover_worktree(&repo, &missing, None), Ok(false));
+    }
+
+    #[test]
     fn managed_worktrees_aggregate_dedupes_and_sums_existing_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -1125,6 +1241,78 @@ mod tests {
             details[0].disposition,
             ManagedWorktreeDisposition::Live { .. }
         ));
+    }
+
+    #[test]
+    fn handed_off_dead_end_protector_is_live_not_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let wt = repo.join(".phoenix").join("worktrees").join("handoff");
+        fs::create_dir_all(&wt).unwrap();
+        let wt = wt.to_string_lossy().to_string();
+        let mut source = conversation(
+            "source",
+            &wt,
+            phoenix_core::domain::sm_state::ConvState::HandedOff {
+                successor_conv_id: "successor".to_string(),
+            },
+        );
+        source.continued_in_conv_id = Some("successor".to_string());
+        let mut successor = conversation(
+            "successor",
+            &wt,
+            phoenix_core::domain::sm_state::ConvState::Terminal,
+        );
+        successor.archived = true;
+        let conversations = vec![source, successor];
+
+        let (_, details) = managed_worktrees_from_conversations(
+            "Managed worktrees",
+            ".phoenix/worktrees/*",
+            &conversations,
+            &[wt],
+        );
+
+        assert!(matches!(
+            details[0].disposition,
+            ManagedWorktreeDisposition::Live { .. }
+        ));
+    }
+
+    #[test]
+    fn cleanup_branch_for_leftover_deletes_explore_temp_branch() {
+        let mut conv = conversation(
+            "abcdef123456",
+            "/repo/.phoenix/worktrees/abcdef123456",
+            phoenix_core::domain::sm_state::ConvState::Terminal,
+        );
+        conv.conv_mode = ConvMode::Explore {
+            worktree_path: Some(
+                NonEmptyString::new("/repo/.phoenix/worktrees/abcdef123456").unwrap(),
+            ),
+            next_taskmd_id_hint: None,
+        };
+
+        assert_eq!(
+            cleanup_branch_for_leftover(&conv),
+            Some("task-pending-abcdef12".to_string())
+        );
+    }
+
+    #[test]
+    fn cleanup_branch_for_leftover_preserves_branch_mode_branch() {
+        let mut conv = conversation(
+            "branchy",
+            "/repo/.phoenix/worktrees/branchy",
+            phoenix_core::domain::sm_state::ConvState::Terminal,
+        );
+        conv.conv_mode = ConvMode::Branch {
+            branch_name: NonEmptyString::new("user-branch").unwrap(),
+            worktree_path: NonEmptyString::new("/repo/.phoenix/worktrees/branchy").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        };
+
+        assert_eq!(cleanup_branch_for_leftover(&conv), None);
     }
 
     #[test]
