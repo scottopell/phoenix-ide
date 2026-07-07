@@ -191,6 +191,7 @@ export function SharePage() {
           convState={convState}
           onRetry={() => {}}
           onOpenFile={undefined}
+          enableMessageSidepanel={false}
           conversationId={conversation.id}
         />
       </main>

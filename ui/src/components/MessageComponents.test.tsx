@@ -567,6 +567,30 @@ describe('message copy affordances', () => {
     expect(screen.queryByRole('button', { name: 'Open in sidepanel' })).not.toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: 'Copy command' }).length).toBeGreaterThan(0);
   });
+
+  it('does not offer sidepanel open when disabled for read-only surfaces', () => {
+    const message = agentMessage('agent-read-only-menu', [
+      { type: 'text', text: 'Read-only **proposal**.' },
+    ], 17);
+
+    render(
+      <MemoryRouter>
+        <div id="messages">
+          <AgentMessage
+            message={message}
+            toolResults={new Map()}
+            onOpenFile={vi.fn()}
+          />
+        </div>
+        <MessageContextMenu messages={[message]} enableMessageSidepanel={false} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.contextMenu(screen.getByText(/Read-only/), { clientX: 20, clientY: 30 });
+
+    expect(screen.queryByRole('button', { name: 'Open in sidepanel' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy as Markdown' })).toBeInTheDocument();
+  });
 });
 
 describe('skill command rendering', () => {

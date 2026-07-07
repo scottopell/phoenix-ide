@@ -1376,6 +1376,7 @@ function ConversationPageContent() {
         onOpenFile={isArchived ? undefined : handleOpenFileFromPatch}
         filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
         workScopeKey={isArchived ? undefined : conversation.work_scope_key}
+        enableMessageSidepanel={!isArchived}
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}

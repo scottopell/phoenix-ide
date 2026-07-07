@@ -9,6 +9,7 @@ import { NotesPanel } from './viewer/NotesPanel';
 import { AnnotationDialog } from './viewer/AnnotationDialog';
 import { CopyButton } from './CopyButton';
 import { formatNotesForSend } from './viewer/formatNotes';
+import { useRegisterFocusScope } from '../hooks/useFocusScope';
 
 interface MessageViewerProps {
   sequenceId: number;
@@ -19,6 +20,7 @@ interface MessageViewerProps {
 }
 
 export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, inline }: MessageViewerProps) {
+  useRegisterFocusScope('message-viewer');
   const message = useMemo(
     () => messages.find((m) => m.sequence_id === sequenceId) ?? null,
     [messages, sequenceId],
@@ -28,16 +30,16 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, inli
   const title = message ? messageTitle(message) : `Message #${sequenceId}`;
   const notes = useMessageReviewNotes(sequenceId, message?.message_id, onSendNotes);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
-  const contentRef = useRef<HTMLDivElement>(null);
+  const lineRefsSequenceId = useRef(sequenceId);
+  if (lineRefsSequenceId.current !== sequenceId) {
+    lineRefs.current.clear();
+    lineRefsSequenceId.current = sequenceId;
+  }
 
   const registerLineRef = useCallback((lineNumber: number, el: HTMLElement | null) => {
     if (el) lineRefs.current.set(lineNumber, el);
     else lineRefs.current.delete(lineNumber);
   }, []);
-
-  useEffect(() => {
-    lineRefs.current.clear();
-  }, [sequenceId]);
 
   const handleJumpTo = useCallback(
     (note: ReviewNote) => {
@@ -91,7 +93,7 @@ export function MessageViewer({ sequenceId, messages, onClose, onSendNotes, inli
         ) : null
       }
     >
-      <div className="viewer-content" ref={contentRef}>
+      <div className="viewer-content">
         {message && content ? (
           <MarkdownViewerBody
             content={content}
@@ -126,7 +128,7 @@ function useMessageReviewNotes(
 ) {
   const commands = useReviewNotesCommands();
   const messageNotes = useMessageReviewNotesData(sequenceId);
-  const [annotating, setAnnotating] = useState<{ lineNumber: number; lineContent: string } | null>(null);
+  const [annotating, setAnnotating] = useState<{ sequenceId: number; lineNumber: number; lineContent: string } | null>(null);
   const [showPanel, setShowPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
 
@@ -136,13 +138,18 @@ function useMessageReviewNotes(
     return () => clearTimeout(timer);
   }, [highlightedLine]);
 
+  useEffect(() => {
+    setAnnotating(null);
+    setHighlightedLine(null);
+  }, [sequenceId]);
+
   const startAnnotate = useCallback((lineNumber: number, lineContent: string) => {
-    setAnnotating({ lineNumber, lineContent });
-  }, []);
+    setAnnotating({ sequenceId, lineNumber, lineContent });
+  }, [sequenceId]);
   const cancelAnnotate = useCallback(() => setAnnotating(null), []);
   const submitNote = useCallback(
     (body: string) => {
-      if (!annotating) return;
+      if (!annotating || annotating.sequenceId !== sequenceId) return;
       commands.addNote(
         {
           kind: 'message',

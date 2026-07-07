@@ -23,6 +23,7 @@ interface MenuState {
 
 interface MessageContextMenuProps {
   messages: Message[];
+  enableMessageSidepanel?: boolean | undefined;
 }
 
 /** Extract plain text (strip markdown) by reading innerText from the DOM */
@@ -33,7 +34,7 @@ function getPlainText(element: HTMLElement): string {
 
 export const OPEN_MESSAGE_VIEWER_EVENT = 'phoenix:open-message-viewer';
 
-export function MessageContextMenu({ messages }: MessageContextMenuProps) {
+export function MessageContextMenu({ messages, enableMessageSidepanel = true }: MessageContextMenuProps) {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -233,7 +234,7 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
           Copy output
         </button>
       )}
-      {getMessageMarkdown(menu.message).trim() && (
+      {enableMessageSidepanel && getMessageMarkdown(menu.message).trim() && (
         <button className="msg-context-item" onClick={openInSidepanel}>
           Open in sidepanel
         </button>

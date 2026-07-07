@@ -66,6 +66,7 @@ interface MessageListProps {
   slug?: string | undefined;
   filePathRootDir?: string | undefined;
   workScopeKey?: string | undefined;
+  enableMessageSidepanel?: boolean | undefined;
   /** Scroll-spy: the inclusive range of `historicalUnits`/virtuoso item
    *  indices currently rendered. Fired (debounced by virtuoso) as the user
    *  scrolls. The conversation nav uses it to highlight the active chapter. */
@@ -307,6 +308,7 @@ function MessageListImpl({
   slug,
   filePathRootDir,
   workScopeKey,
+  enableMessageSidepanel = true,
   onVisibleRangeChange,
   onChaptersChange,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
@@ -755,7 +757,7 @@ function MessageListImpl({
         </button>
       )}
       <FilePathContextMenu />
-      <MessageContextMenu messages={messages} />
+      <MessageContextMenu messages={messages} enableMessageSidepanel={enableMessageSidepanel} />
     </main>
   );
 }
