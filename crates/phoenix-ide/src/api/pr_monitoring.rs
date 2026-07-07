@@ -2618,6 +2618,61 @@ mod tests {
     }
 
     #[test]
+    fn artifact_deserialization_defaults_reaction_status_for_legacy_contexts() {
+        let artifact: PrAutoFixContextArtifact = serde_json::from_value(serde_json::json!({
+            "manifest_version": ARTIFACT_VERSION,
+            "fetched_at": "now",
+            "pr": {
+                "number": 1,
+                "title": "t",
+                "url": "u",
+                "state": "OPEN",
+                "draft": false,
+                "base": "main",
+                "head": "feature",
+                "updated_at": "now"
+            },
+            "checks": {
+                "state": "passing",
+                "summary": {
+                    "passing": 0,
+                    "pending": 0,
+                    "failing": 0,
+                    "skipped": 0,
+                    "unknown": 0,
+                    "failing_names": [],
+                    "pending_names": []
+                },
+                "details": [],
+                "log_snippets": []
+            },
+            "feedback": {
+                "total": 1,
+                "unresolved": 1,
+                "items": [{
+                    "id": "1",
+                    "source": "issue_comment",
+                    "author": "u",
+                    "body": "todo"
+                }],
+                "coverage": []
+            }
+        }))
+        .expect("legacy manifest-version-1 artifact should remain readable");
+
+        assert_eq!(artifact.feedback.feedback_status, PrFeedbackStatus::Open);
+        assert_eq!(artifact.feedback.items[0].reactions, Vec::new());
+        assert_eq!(
+            artifact.feedback.items[0].feedback_status,
+            PrFeedbackStatus::Open
+        );
+        assert_eq!(
+            artifact.baseline().feedback_identities,
+            vec!["IssueComment:1".to_string()]
+        );
+    }
+
+    #[test]
     fn no_feedback_to_compare_yields_no_freshness() {
         let baseline = WorkScopePrFeedbackBaseline {
             work_scope_id: 1,

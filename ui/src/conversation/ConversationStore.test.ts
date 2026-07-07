@@ -65,6 +65,42 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(row?.browser_session_active).toBe(true);
   });
 
+  it('updates only cached PR when same-timestamp snapshot changes feedback status', () => {
+    const store = new ConversationStore();
+    const base = makeConv('alpha', {
+      updated_at: '2024-06-01T00:00:00Z',
+      browser_session_active: true,
+      cached_pr: {
+        number: 12,
+        title: 'Cached PR',
+        url: 'https://example.test/pr/12',
+        display_state: 'open',
+        feedback_status: 'open',
+        base: 'main',
+        head: 'feature',
+      },
+    });
+    const withStatusAndStaleLiveFlag = makeConv('alpha', {
+      updated_at: '2024-06-01T00:00:00Z',
+      browser_session_active: false,
+      cached_pr: {
+        number: 12,
+        title: 'Cached PR',
+        url: 'https://example.test/pr/12',
+        display_state: 'open',
+        feedback_status: 'in_progress',
+        base: 'main',
+        head: 'feature',
+      },
+    });
+
+    expect(store.upsertSnapshot('alpha', base)).toBe(true);
+    expect(store.upsertSnapshot('alpha', withStatusAndStaleLiveFlag)).toBe(true);
+    const row = store.getSnapshot('alpha').conversation;
+    expect(row?.cached_pr?.feedback_status).toBe('in_progress');
+    expect(row?.browser_session_active).toBe(true);
+  });
+
   it('clears only cached PR when same-timestamp snapshot drops cached PR', () => {
     const store = new ConversationStore();
     const withPr = makeConv('alpha', {

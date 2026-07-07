@@ -11,6 +11,7 @@ function cachedPrEqual(a: CachedPrSummary | null | undefined, b: CachedPrSummary
     && a.title === b.title
     && a.url === b.url
     && a.display_state === b.display_state
+    && (a.feedback_status ?? 'open') === (b.feedback_status ?? 'open')
     && a.base === b.base
     && a.head === b.head;
 }

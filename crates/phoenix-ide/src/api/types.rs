@@ -923,7 +923,9 @@ pub struct PrFeedbackItem {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    #[serde(default)]
     pub reactions: Vec<PrFeedbackReaction>,
+    #[serde(default)]
     pub feedback_status: PrFeedbackStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved: Option<bool>,
@@ -933,6 +935,7 @@ pub struct PrFeedbackItem {
 pub struct PrFeedbackSummary {
     pub total: u32,
     pub unresolved: u32,
+    #[serde(default)]
     pub feedback_status: PrFeedbackStatus,
     pub items: Vec<PrFeedbackItem>,
     pub coverage: Vec<PrFeedbackCoverage>,

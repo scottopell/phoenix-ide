@@ -80,6 +80,32 @@ describe('conversationListsEqual', () => {
     expect(conversationListsEqual(a, b)).toBe(false);
   });
 
+  it('detects cached PR feedback-status changes without an updated_at change', () => {
+    const a = [makeConv('a', '2025-01-01T00:00:00Z', {
+      cached_pr: {
+        number: 12,
+        title: 'Cached PR',
+        url: 'https://example.test/pr/12',
+        display_state: 'open',
+        feedback_status: 'open',
+        base: 'main',
+        head: 'feature',
+      },
+    })];
+    const b = [makeConv('a', '2025-01-01T00:00:00Z', {
+      cached_pr: {
+        number: 12,
+        title: 'Cached PR',
+        url: 'https://example.test/pr/12',
+        display_state: 'open',
+        feedback_status: 'in_progress',
+        base: 'main',
+        head: 'feature',
+      },
+    })];
+    expect(conversationListsEqual(a, b)).toBe(false);
+  });
+
   it('detects slug-only moves without an updated_at change', () => {
     const a = [makeConv('a', '2025-01-01T00:00:00Z', { slug: 'old' })];
     const b = [makeConv('a', '2025-01-01T00:00:00Z', { slug: 'new' })];
