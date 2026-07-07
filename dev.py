@@ -4361,17 +4361,26 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         # machines back off, while leaving fast machines effectively unchanged.
         cpus = os.cpu_count() or 4
         try:
-            with open("/proc/meminfo") as f:
-                mem_gib = next(
-                    int(l.split()[1]) for l in f if l.startswith("MemTotal:")
-                ) / (1024 * 1024)
+            # SC_PHYS_PAGES * SC_PAGE_SIZE is the POSIX-portable total-RAM
+            # query (verified to match `sysctl hw.memsize` on macOS; the
+            # same call also works on Linux). os.sysconf doesn't exist on
+            # Windows at all, hence AttributeError alongside the value/OS
+            # errors a missing sysconf name can raise.
+            mem_gib = (
+                os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            ) / (1024**3)
             mem_cap = max(1, int(mem_gib // 1.5))
-        except (OSError, StopIteration):
+        except (ValueError, OSError, AttributeError):
             mem_cap = cpus
         test_threads = max(2, min(cpus - 1, mem_cap))
         if test_threads < cpus:
+            try:
+                load1, load5, load15 = os.getloadavg()
+                load_note = f", loadavg={load1:.1f}/{load5:.1f}/{load15:.1f}"
+            except OSError:
+                load_note = ""
             reporter.info(f"cargo test: capping to {test_threads} threads "
-                          f"(cpus={cpus}, mem_cap={mem_cap})")
+                          f"(cpus={cpus}, mem_cap={mem_cap}{load_note})")
 
         # ts-rs emits a `#[test] export_bindings_*` per `#[ts(export)]` type;
         # those tests' side effect IS the codegen. In check they run with

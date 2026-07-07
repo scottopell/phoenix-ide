@@ -1284,14 +1284,32 @@ async fn poll(
 ) -> Result<(), String> {
     let start = Instant::now();
     let interval = Duration::from_millis(100);
+    let mut attempts = 0u32;
+    let mut eval_errors = 0u32;
+    let mut slowest_round_trip = Duration::ZERO;
     loop {
-        if let Ok(res) = guard.page.evaluate(predicate.to_string()).await {
-            if let Ok(true) = res.into_value::<bool>() {
-                return Ok(());
+        attempts += 1;
+        let eval_start = Instant::now();
+        let outcome = guard.page.evaluate(predicate.to_string()).await;
+        slowest_round_trip = slowest_round_trip.max(eval_start.elapsed());
+        match outcome {
+            Ok(res) => {
+                if let Ok(true) = res.into_value::<bool>() {
+                    return Ok(());
+                }
             }
+            Err(_) => eval_errors += 1,
         }
         if start.elapsed() >= timeout {
-            return Err(format!("{step_name} not satisfied within {timeout:?}"));
+            // slowest_round_trip >> the 100ms poll interval implicates CDP/
+            // scheduler contention (the page may already be ready, just not
+            // heard from); low latency with zero errors implicates the page
+            // itself never satisfying the predicate.
+            return Err(format!(
+                "{step_name} not satisfied within {timeout:?} ({attempts} checks, \
+                 {eval_errors} CDP eval errors, slowest eval round-trip \
+                 {slowest_round_trip:?})"
+            ));
         }
         tokio::time::sleep(interval).await;
     }
