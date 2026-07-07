@@ -3,8 +3,13 @@ import SwiftUI
 /// Renders one authoritative message. Content is polymorphic on the wire
 /// (see ui/src/api.ts MessageContent); shapes we don't recognize fall back
 /// to a compact JSON rendering rather than disappearing.
+///
+/// `toolIndex` joins tool result messages to the tool_use block that
+/// invoked them (results carry only `tool_use_id`), so ToolResultMessageView
+/// can pick a native renderer.
 struct MessageView: View {
     let message: Message
+    var toolIndex: [String: ToolUseRef] = [:]
 
     var body: some View {
         switch message.message_type {
@@ -13,7 +18,7 @@ struct MessageView: View {
         case "agent":
             AgentMessageView(content: message.content)
         case "tool":
-            ToolResultView(content: message.content)
+            ToolResultMessageView(content: message.content, toolUse: invokingToolUse)
         case "error":
             SystemNote(text: noteText, style: .red)
         case "system", "continuation", "skill":
@@ -21,6 +26,10 @@ struct MessageView: View {
         default:
             SystemNote(text: noteText, style: .secondary)
         }
+    }
+
+    private var invokingToolUse: ToolUseRef? {
+        message.content["tool_use_id"]?.stringValue.flatMap { toolIndex[$0] }
     }
 
     private var noteText: String {
@@ -80,7 +89,7 @@ struct AgentMessageView: View {
                 proseView(text)
             }
         case "tool_use":
-            ToolUseCard(block: block)
+            ToolUseBlockView(block: block)  // dispatches to native renderers
         default:
             EmptyView()  // thinking/unknown blocks are omitted from the transcript
         }
@@ -108,9 +117,10 @@ struct AgentMessageView: View {
     }
 }
 
-/// Collapsed tool invocation: name + one-line input summary; expands to the
-/// full input. Progressive disclosure keeps transcripts scannable.
-struct ToolUseCard: View {
+/// Fallback tool invocation card for tools without a native renderer (see
+/// ToolViews.swift for the dispatch pattern): name + one-line input summary,
+/// expandable to the full input.
+struct GenericToolUseCard: View {
     let block: JSONValue
     @State private var expanded = false
 
@@ -168,8 +178,9 @@ struct ToolUseCard: View {
     }
 }
 
-/// Tool result: status line + collapsible output, error-tinted on failure.
-struct ToolResultView: View {
+/// Fallback tool result card for tools without a native renderer: status
+/// line + collapsible output, error-tinted on failure.
+struct GenericToolResultCard: View {
     let content: JSONValue
     @State private var expanded = false
 

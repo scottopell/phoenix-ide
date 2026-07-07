@@ -87,4 +87,7 @@ PhoenixMobile/Sources/
     ConversationListStore.swift  Cached conversation list
     ConversationSession.swift    Per-conversation reducer + SSE loop + drains
   Views/                    SwiftUI screens (list, conversation, composer, setup…)
+    ToolViews.swift         Per-tool native renderers (bash, think) + dispatch;
+                            unknown tools fall back to the generic JSON cards
 ```
+

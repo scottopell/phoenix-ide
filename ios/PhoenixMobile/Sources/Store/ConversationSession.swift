@@ -30,6 +30,10 @@ final class ConversationSession {
     /// finalized message arrives or the turn ends.
     private(set) var streamingText = ""
     private(set) var lastErrorToast: String?
+    /// tool_use_id -> the invoking block's tool name + input. Lets a tool
+    /// result message (which carries only `tool_use_id`) find its native
+    /// renderer. Rebuilt on message changes, not per render.
+    private(set) var toolUseIndex: [String: ToolUseRef] = [:]
 
     private var lastSequenceId: Int64 = 0
     private var streamingRequestId: String?
@@ -63,6 +67,7 @@ final class ConversationSession {
             conversation = snap.conversation
             messages = snap.messages
             lastSequenceId = snap.lastSequenceId
+            rebuildToolUseIndex()
         }
     }
 
@@ -276,6 +281,7 @@ final class ConversationSession {
                 }
             }
             lastSequenceId = max(lastSequenceId, snap.lastSequenceId)
+            rebuildToolUseIndex()
             reconcileOutbox()
             drainOutbox()
             persistSnapshot()
@@ -298,6 +304,7 @@ final class ConversationSession {
             if message.message_type == "agent" {
                 streamingText = ""
                 streamingRequestId = nil
+                rebuildToolUseIndex()
             }
             reconcileOutbox()
             persistSnapshot()
@@ -309,6 +316,7 @@ final class ConversationSession {
             }
             if let content, content != .null { messages[idx].content = content }
             if let displayData, displayData != .null { messages[idx].display_data = displayData }
+            if messages[idx].message_type == "agent" { rebuildToolUseIndex() }
             persistSnapshot()
 
         case .stateChange(let seq, let state, let mode):
@@ -384,4 +392,25 @@ final class ConversationSession {
         outbox.reconcile(
             authoritativeMessageIds: Set(messages.map(\.message_id)))
     }
+
+    private func rebuildToolUseIndex() {
+        var index: [String: ToolUseRef] = [:]
+        for message in messages where message.message_type == "agent" {
+            guard let blocks = message.content.arrayValue else { continue }
+            for block in blocks where block["type"]?.stringValue == "tool_use" {
+                guard let id = block["id"]?.stringValue,
+                      let name = block["name"]?.stringValue
+                else { continue }
+                index[id] = ToolUseRef(name: name, input: block["input"])
+            }
+        }
+        toolUseIndex = index
+    }
+}
+
+/// The identity of a tool invocation, joined from an agent message's
+/// tool_use block to the tool result that answers it.
+struct ToolUseRef: Equatable {
+    var name: String
+    var input: JSONValue?
 }

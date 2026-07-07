@@ -40,7 +40,7 @@ struct ConversationView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     ForEach(session.messages) { message in
-                        MessageView(message: message)
+                        MessageView(message: message, toolIndex: session.toolUseIndex)
                             .id(message.message_id)
                     }
                     if !session.streamingText.isEmpty {
