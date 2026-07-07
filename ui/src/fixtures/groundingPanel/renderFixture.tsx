@@ -11,6 +11,10 @@ interface Props {
   showToolbar?: boolean;
 }
 
+function fileTreeExpansionKey(conversationId: string): string {
+  return `phoenix:file-tree-expansion:${conversationId}`;
+}
+
 export function GroundingPanelFixture({ scenario, showToolbar = true }: Props) {
   const [ready, setReady] = useState(false);
 
@@ -19,14 +23,17 @@ export function GroundingPanelFixture({ scenario, showToolbar = true }: Props) {
     delete document.documentElement.dataset['groundingFixtureReady'];
     document.documentElement.dataset['theme'] = scenario.theme;
     const restore = installGroundingPanelFixtureFetch(scenario);
+    const expansionKey = fileTreeExpansionKey(scenario.conversationId);
     if (scenario.kind === 'file-tree') {
       localStorage.setItem(
-        `phoenix:file-tree-expansion:${scenario.conversationId}`,
+        expansionKey,
         JSON.stringify([
           `${GROUNDING_PANEL_ROOT}/examples`,
           `${GROUNDING_PANEL_ROOT}/examples/nested`,
         ]),
       );
+    } else {
+      localStorage.removeItem(expansionKey);
     }
     setReady(true);
     return restore;
