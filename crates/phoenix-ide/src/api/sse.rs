@@ -746,6 +746,7 @@ mod tests {
                 base_branch: None,
                 task_title: None,
                 work_scope_key: None,
+                model: None,
             },
         };
         assert_parity(&event);

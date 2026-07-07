@@ -31,6 +31,20 @@ async fn process_job(
     job: crate::db::ConversationCreationJob,
 ) -> Result<(), String> {
     let conv_id = job.conversation_id.clone();
+    if manager
+        .db()
+        .message_exists(&job.intent.message_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        manager
+            .db()
+            .mark_conversation_creation_job_complete(&job.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
     manager
         .db()
         .mark_conversation_creation_job_phase(&job.id, ConversationCreationPhase::Provisioning)
@@ -55,20 +69,6 @@ async fn process_job(
             presentation_mode: provisioning.presentation_mode().to_string(),
             state_updated_at: chrono::Utc::now(),
         });
-    }
-
-    if manager
-        .db()
-        .message_exists(&job.intent.message_id)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        manager
-            .db()
-            .mark_conversation_creation_job_complete(&job.id)
-            .await
-            .map_err(|e| e.to_string())?;
-        return Ok(());
     }
 
     match provision_conversation(manager, &job).await {
@@ -122,6 +122,9 @@ async fn process_job(
                     state_updated_at: chrono::Utc::now(),
                 });
             }
+            manager
+                .evict_runtime(&conv_id, EvictionReason::CreationProvisioned)
+                .await;
             Err(message)
         }
     }
@@ -399,6 +402,7 @@ async fn provision_conversation(
                     )
                     .stable_key(),
                 ),
+                model: Some(resolved_model.clone()),
             },
         });
     }

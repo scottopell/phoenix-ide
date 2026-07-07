@@ -828,6 +828,8 @@ pub struct ConversationMetadataUpdate {
     pub task_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_scope_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
