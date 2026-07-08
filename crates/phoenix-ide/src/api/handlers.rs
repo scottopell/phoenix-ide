@@ -1224,20 +1224,6 @@ async fn delete_conversation_attachments(conversation_id: &str) {
     delete_conversation_attachments_at_root(attachment_root(), conversation_id).await;
 }
 
-async fn rollback_created_conversation_after_attachment_failure(
-    state: &AppState,
-    conversation: &Conversation,
-    id: &str,
-) {
-    delete_conversation_attachments(id).await;
-    if let Err(cleanup_err) = run_resource_cleanup_cascade(state, conversation).await {
-        tracing::warn!(conversation_id = %id, error = ?cleanup_err, "failed to clean resources after initial attachment failure");
-    }
-    if let Err(delete_err) = state.runtime.db().delete_conversation(id).await {
-        tracing::warn!(conversation_id = %id, error = %delete_err, "failed to delete conversation row after initial attachment failure");
-    }
-}
-
 fn sanitize_attachment_name(name: &str) -> String {
     let basename = FsPath::new(name)
         .file_name()
@@ -1653,10 +1639,26 @@ async fn create_conversation_with_id(
             "Worktree mode requires a git repository".to_string(),
         ));
     }
-    if mode_for_preflight == "managed" {
+    if matches!(mode_for_preflight, "managed" | "auto")
+        && (mode_for_preflight == "managed" || repo_root_for_preflight.is_some())
+    {
+        let inferred_base = if mode_for_preflight == "auto" && req.base_branch.is_none() {
+            repo_root_for_preflight.as_deref().and_then(|repo_root| {
+                crate::git_ops::run_git(
+                    std::path::Path::new(repo_root),
+                    &["rev-parse", "--abbrev-ref", "HEAD"],
+                )
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != "HEAD")
+            })
+        } else {
+            None
+        };
         let base_branch = req
             .base_branch
             .as_deref()
+            .or(inferred_base.as_deref())
             .ok_or_else(|| AppError::BadRequest("Managed mode requires base_branch".to_string()))?;
         validate_user_ref(base_branch)?;
         if let Some(checkout_ref) = req.checkout_ref.as_deref() {
@@ -1726,8 +1728,6 @@ async fn create_conversation_with_id(
         }
     }
 
-    let existing_shell: Option<crate::db::Conversation> = None;
-
     if !req.files.is_empty() {
         let validated = validate_submitted_attachments(&id, &req.files).await?;
         req.files = validated
@@ -1743,7 +1743,6 @@ async fn create_conversation_with_id(
 
     let short_id: String = id.chars().take(8).collect();
     let slug = format!("conv-{short_id}");
-    let project_id: Option<String> = None;
     let conv_mode = crate::db::ConvMode::Direct;
     let effective_cwd = valid_cwd.into_raw();
     let desired_base_branch = req.base_branch.as_deref();
@@ -1771,26 +1770,6 @@ async fn create_conversation_with_id(
             crate::llm_language::LlmLanguage::default()
         }
     };
-    let mut conversation = state
-        .runtime
-        .db()
-        .create_conversation_with_project(
-            &id,
-            &slug,
-            &effective_cwd,
-            true,
-            None,
-            Some(shell_model.as_str()),
-            project_id.as_deref(),
-            &conv_mode,
-            desired_base_branch,
-            req.seed_parent_id.as_deref(),
-            req.seed_label.as_deref(),
-            default_language,
-        )
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
     for raw_file in raw_files {
         match store_attachment_bytes(
             &id,
@@ -1802,8 +1781,7 @@ async fn create_conversation_with_id(
         {
             Ok(file) => req.files.push(file),
             Err(e) => {
-                rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
-                    .await;
+                delete_conversation_attachments(&id).await;
                 return Err(e);
             }
         }
@@ -1829,31 +1807,43 @@ async fn create_conversation_with_id(
         seed_parent_id: req.seed_parent_id.clone(),
         seed_label: req.seed_label.clone(),
     };
-    let mut job_id = uuid::Uuid::new_v4().to_string();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let creation_job = crate::db::InsertConversationCreationJob {
+        id: job_id.clone(),
+        conversation_id: id.clone(),
+        message_id: Some(req.message_id.clone()),
+        intent,
+    };
 
-    match state
+    let mut conversation = match state
         .runtime
         .db()
-        .insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
-            id: job_id.clone(),
-            conversation_id: id.clone(),
-            message_id: Some(req.message_id.clone()),
-            intent,
-        })
+        .create_conversation_with_creation_job(
+            &id,
+            &slug,
+            &effective_cwd,
+            true,
+            Some(shell_model.as_str()),
+            &conv_mode,
+            desired_base_branch,
+            req.seed_parent_id.as_deref(),
+            req.seed_label.as_deref(),
+            default_language,
+            &creation_job,
+        )
         .await
     {
-        Ok(_) => {}
+        Ok(conversation) => conversation,
         Err(crate::db::DbError::Sqlx(sqlx::Error::Database(db_err)))
             if db_err.code().as_deref() == Some("2067") =>
         {
+            delete_conversation_attachments(&id).await;
             if let Ok(Some(existing_job)) = state
                 .runtime
                 .db()
                 .get_conversation_creation_job_for_message(&req.message_id)
                 .await
             {
-                rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
-                    .await;
                 let existing_conversation = state
                     .runtime
                     .db()
@@ -1872,21 +1862,15 @@ async fn create_conversation_with_id(
                     conversation: conversation_json,
                 }));
             }
-            if let Ok(Some(existing_job)) = state
-                .runtime
-                .db()
-                .get_conversation_creation_job_for_conversation(&id)
-                .await
-            {
-                job_id.clone_from(&existing_job.id);
-            }
+            return Err(AppError::Internal(
+                "failed to create conversation shell".to_string(),
+            ));
         }
         Err(e) => {
-            rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
-                .await;
+            delete_conversation_attachments(&id).await;
             return Err(AppError::Internal(e.to_string()));
         }
-    }
+    };
 
     let provisioning_state = ConvState::Provisioning {
         job_id: job_id.clone(),
@@ -6236,6 +6220,36 @@ mod conversation_cwd_validation_tests {
             .expect("idempotent retry returns existing shell before git checks");
 
         assert_eq!(response.conversation["id"].as_str(), Some(conv_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn auto_mode_stale_checkout_ref_rejects_before_shell_creation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        init_git_repo(tmp.path());
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let mut req = create_request(tmp.path().to_string_lossy().to_string());
+        req.mode = Some("auto".to_string());
+        req.checkout_ref = Some("does-not-exist".to_string());
+
+        let err = create_conversation_with_id(state.clone(), req, Vec::new())
+            .await
+            .expect_err("auto mode must validate inferred managed start ref before shell creation");
+
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("not found"), "got: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        assert!(
+            state
+                .db
+                .list_conversations()
+                .await
+                .expect("list")
+                .is_empty(),
+            "rejected auto create must not leave a failed shell"
+        );
     }
 
     #[tokio::test]

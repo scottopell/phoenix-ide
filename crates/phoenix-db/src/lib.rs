@@ -1852,6 +1852,133 @@ impl Database {
         self.get_conversation_creation_job(&job.id).await
     }
 
+    /// Create the visible async-conversation shell and its durable replay job atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if either row cannot be inserted or the job intent cannot be serialized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the idle state cannot be serialized.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_conversation_with_creation_job(
+        &self,
+        id: &str,
+        slug: &str,
+        cwd: &str,
+        user_initiated: bool,
+        model: Option<&str>,
+        conv_mode: &ConvMode,
+        desired_base_branch: Option<&str>,
+        seed_parent_id: Option<&str>,
+        seed_label: Option<&str>,
+        llm_language: phoenix_core::llm_language::LlmLanguage,
+        job: &InsertConversationCreationJob,
+    ) -> DbResult<Conversation> {
+        let now = Utc::now();
+        let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
+        let cm = conv_mode_columns(conv_mode);
+        let now_str = now.to_rfc3339();
+        let intent_json = serde_json::to_string(&job.intent)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let mut tx = self.pool.begin().await?;
+
+        let mut actual_slug = slug.to_string();
+        let mut attempts = 0u8;
+        loop {
+            let title_str = schema::title_from_slug(&actual_slug);
+            let result = sqlx::query(
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?7, ?7, 0, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            )
+            .bind(id)
+            .bind(&actual_slug)
+            .bind(&title_str)
+            .bind(cwd)
+            .bind(user_initiated)
+            .bind(&idle_state)
+            .bind(&now_str)
+            .bind(model)
+            .bind(desired_base_branch)
+            .bind(seed_parent_id)
+            .bind(seed_label)
+            .bind(llm_language.as_str())
+            .bind(cm.kind)
+            .bind(cm.branch_name)
+            .bind(cm.worktree_path)
+            .bind(cm.base_branch)
+            .bind(cm.task_id)
+            .bind(cm.task_title)
+            .bind(cm.next_taskmd_id_hint)
+            .execute(&mut *tx)
+            .await;
+
+            match result {
+                Ok(_) => break,
+                Err(sqlx::Error::Database(ref e))
+                    if e.code().as_deref() == Some("2067")
+                        && e.message().contains("conversations.id") =>
+                {
+                    return Err(DbError::Serialization(e.message().to_string()));
+                }
+                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
+                    attempts += 1;
+                    if attempts >= 10 {
+                        let uuid_str = uuid::Uuid::new_v4().to_string();
+                        actual_slug = format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str));
+                    } else {
+                        actual_slug = format!("{slug}-{:04x}", rand::random::<u16>());
+                    }
+                }
+                Err(e) => return Err(DbError::Sqlx(e)),
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                id, conversation_id, message_id, phase, intent_json, error,
+                accepted_at, provisioning_started_at, completed_at, failed_at,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, NULL, NULL, ?6, ?6)",
+        )
+        .bind(&job.id)
+        .bind(&job.conversation_id)
+        .bind(&job.message_id)
+        .bind(ConversationCreationPhase::Accepted.as_str())
+        .bind(intent_json)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        let title = schema::title_from_slug(&actual_slug);
+        Ok(Conversation {
+            id: id.to_string(),
+            slug: Some(actual_slug),
+            title: Some(title),
+            cwd: cwd.to_string(),
+            parent_conversation_id: None,
+            user_initiated,
+            state: ConvState::Idle,
+            state_updated_at: now,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            model: model.map(String::from),
+            project_id: None,
+            conv_mode: conv_mode.clone(),
+            desired_base_branch: desired_base_branch.map(String::from),
+            message_count: 0,
+            seed_parent_id: seed_parent_id.map(String::from),
+            seed_label: seed_label.map(String::from),
+            continued_in_conv_id: None,
+            chain_name: None,
+            llm_language,
+            spawned_from_conversation_id: None,
+        })
+    }
+
     /// Load a creation job by id.
     ///
     /// # Errors
@@ -3658,6 +3785,100 @@ impl Database {
                     if result.rows_affected() == 0 {
                         return Err(DbError::ConversationNotFound(id.to_string()));
                     }
+                    return Ok(());
+                }
+                Err(sqlx::Error::Database(ref e))
+                    if e.code().as_deref() == Some("2067") && base_slug.is_some() =>
+                {
+                    attempts += 1;
+                    let slug = base_slug.as_deref().unwrap_or_default();
+                    if attempts >= 10 {
+                        let uuid_str = uuid::Uuid::new_v4().to_string();
+                        candidate_slug =
+                            Some(format!("{slug}-{}", uuid_str.get(..8).unwrap_or(&uuid_str)));
+                    } else {
+                        candidate_slug = Some(format!("{slug}-{:04x}", rand::random::<u16>()));
+                    }
+                }
+                Err(e) => return Err(DbError::Sqlx(e)),
+            }
+        }
+    }
+
+    /// Update async creation metadata and ownership mode in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the conversation does not exist or either write fails.
+    pub async fn update_conversation_creation_metadata_and_mode(
+        &self,
+        id: &str,
+        update: &ConversationCreationMetadataUpdate,
+        mode: &ConvMode,
+    ) -> DbResult<()> {
+        let cm = conv_mode_columns(mode);
+        let base_slug = update.slug.clone();
+        let mut candidate_slug = base_slug.clone();
+        let mut attempts = 0u8;
+        loop {
+            let now = Utc::now().to_rfc3339();
+            let mut tx = self.pool.begin().await?;
+            let result = sqlx::query(
+                "UPDATE conversations
+                 SET slug = COALESCE(?1, slug),
+                     title = CASE
+                         WHEN ?2 = 1 THEN ?3
+                         ELSE title
+                     END,
+                     cwd = COALESCE(?4, cwd),
+                     project_id = CASE
+                         WHEN ?5 = 1 THEN ?6
+                         ELSE project_id
+                     END,
+                     desired_base_branch = CASE
+                         WHEN ?7 = 1 THEN ?8
+                         ELSE desired_base_branch
+                     END,
+                     cm_kind = ?9,
+                     cm_branch_name = ?10,
+                     cm_worktree_path = ?11,
+                     cm_base_branch = ?12,
+                     cm_task_id = ?13,
+                     cm_task_title = ?14,
+                     cm_next_taskmd_id_hint = ?15,
+                     updated_at = ?16
+                 WHERE id = ?17",
+            )
+            .bind(candidate_slug.as_deref())
+            .bind(update.title.is_some())
+            .bind(update.title.as_ref().and_then(|v| v.as_deref()))
+            .bind(update.cwd.as_deref())
+            .bind(update.project_id.is_some())
+            .bind(update.project_id.as_ref().and_then(|v| v.as_deref()))
+            .bind(update.desired_base_branch.is_some())
+            .bind(
+                update
+                    .desired_base_branch
+                    .as_ref()
+                    .and_then(|v| v.as_deref()),
+            )
+            .bind(cm.kind)
+            .bind(cm.branch_name)
+            .bind(cm.worktree_path)
+            .bind(cm.base_branch)
+            .bind(cm.task_id)
+            .bind(cm.task_title)
+            .bind(cm.next_taskmd_id_hint)
+            .bind(now)
+            .bind(id)
+            .execute(&mut *tx)
+            .await;
+            match result {
+                Ok(result) => {
+                    if result.rows_affected() == 0 {
+                        return Err(DbError::ConversationNotFound(id.to_string()));
+                    }
+                    tx.commit().await?;
                     return Ok(());
                 }
                 Err(sqlx::Error::Database(ref e))

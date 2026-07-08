@@ -9,7 +9,7 @@ use crate::db::{
 };
 use crate::runtime::{ConversationMetadataUpdate, EvictionReason, RuntimeManager, SseEvent};
 use crate::state_machine::{ConvState, Event};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
@@ -164,18 +164,23 @@ async fn provision_conversation(
     let mut desired_base_branch = intent.base_branch.clone();
 
     if let Some(repo_root) = repo_root.clone() {
-        let project = manager
-            .db()
-            .find_or_create_project(&repo_root)
-            .await
-            .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
-        project_id = Some(project.id);
+        match manager.db().find_or_create_project(&repo_root).await {
+            Ok(project) => project_id = Some(project.id),
+            Err(e) => {
+                tracing::warn!(
+                    conversation_id = %job.conversation_id,
+                    repo_root,
+                    error = %e,
+                    "project association failed during async conversation creation; continuing without project"
+                );
+            }
+        }
     }
 
     match requested_mode {
         "direct" => {}
         "branch" => {
-            let repo_root = repo_root.ok_or_else(|| {
+            let repo_root = repo_root.clone().ok_or_else(|| {
                 (
                     "Branch mode requires a git repository".to_string(),
                     ErrorKind::InvalidRequest,
@@ -255,7 +260,7 @@ async fn provision_conversation(
         }
         "auto" if repo_root.is_none() => {}
         "managed" | "auto" => {
-            let repo_root = repo_root.ok_or_else(|| {
+            let repo_root = repo_root.clone().ok_or_else(|| {
                 (
                     "Could not determine git repository root".to_string(),
                     ErrorKind::InvalidRequest,
@@ -365,9 +370,9 @@ async fn provision_conversation(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(generate_slug);
 
-    manager
+    if let Err(e) = manager
         .db()
-        .update_conversation_creation_metadata(
+        .update_conversation_creation_metadata_and_mode(
             &job.conversation_id,
             &ConversationCreationMetadataUpdate {
                 slug: Some(slug.clone()),
@@ -376,14 +381,13 @@ async fn provision_conversation(
                 project_id: Some(project_id.clone()),
                 desired_base_branch: Some(desired_base_branch.clone()),
             },
+            &conv_mode,
         )
         .await
-        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
-    manager
-        .db()
-        .update_conversation_mode(&job.conversation_id, &conv_mode)
-        .await
-        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
+    {
+        cleanup_unpersisted_worktree(repo_root.as_deref(), &job.conversation_id, &conv_mode);
+        return Err((e.to_string(), ErrorKind::ServerError));
+    }
     manager
         .db()
         .update_conversation_model(&job.conversation_id, &resolved_model)
@@ -520,6 +524,55 @@ fn deterministic_worktree_path(repo_root: &str, conv_id: &str) -> std::path::Pat
         .join(".phoenix")
         .join("worktrees")
         .join(conv_id)
+}
+
+fn cleanup_unpersisted_worktree(
+    repo_root: Option<&str>,
+    conversation_id: &str,
+    conv_mode: &ConvMode,
+) {
+    let Some(worktree_path) = conv_mode.worktree_path() else {
+        return;
+    };
+    let worktree = PathBuf::from(worktree_path);
+    let branch_to_delete = match conv_mode {
+        ConvMode::Explore {
+            worktree_path: Some(_),
+            ..
+        } => {
+            let id_prefix: String = conversation_id.chars().take(8).collect();
+            Some(format!("task-pending-{id_prefix}"))
+        }
+        ConvMode::Work { .. }
+        | ConvMode::Branch { .. }
+        | ConvMode::Explore {
+            worktree_path: None,
+            ..
+        }
+        | ConvMode::Direct => None,
+    };
+
+    if let Some(repo_root) = repo_root {
+        let worktree_str = worktree.to_string_lossy().to_string();
+        if let Err(e) = crate::git_ops::run_git(
+            Path::new(repo_root),
+            &["worktree", "remove", &worktree_str, "--force"],
+        ) {
+            tracing::warn!(conversation_id, worktree = %worktree.display(), error = %e, "failed to remove unpersisted worktree via git; trying filesystem fallback");
+            if let Err(rm_err) = std::fs::remove_dir_all(&worktree) {
+                tracing::warn!(conversation_id, worktree = %worktree.display(), error = %rm_err, "failed to remove unpersisted worktree via filesystem fallback");
+            }
+        }
+        if let Some(branch) = branch_to_delete {
+            if let Err(e) =
+                crate::git_ops::run_git(Path::new(repo_root), &["branch", "-D", &branch])
+            {
+                tracing::debug!(conversation_id, branch, error = %e, "failed to delete unpersisted temporary branch");
+            }
+        }
+    } else if let Err(e) = std::fs::remove_dir_all(&worktree) {
+        tracing::warn!(conversation_id, worktree = %worktree.display(), error = %e, "failed to remove unpersisted worktree without repo root");
+    }
 }
 
 fn app_error_to_kind(error: AppError) -> (String, ErrorKind) {
