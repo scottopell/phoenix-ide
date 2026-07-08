@@ -919,6 +919,87 @@ fn fresh_response_is_text_only(content: &[ContentBlock]) -> bool {
             .all(|block| matches!(block, ContentBlock::Text { .. }))
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+fn response_exceeds_context_threshold(usage: &phoenix_llm::Usage, context_window: usize) -> bool {
+    let threshold = (context_window as f64 * 0.90) as u64;
+    usage.context_window_used() >= threshold
+}
+
+fn grace_response_can_enter_reducer(content: &[ContentBlock], tool_calls: &[ToolCall]) -> bool {
+    match tool_calls {
+        [] => fresh_response_is_text_only(content),
+        [tool_call] => tool_call.input.is_terminal_tool(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod grace_response_admission_tests {
+    use super::*;
+    use crate::state_machine::state::{SubmitResultInput, ToolInput};
+
+    fn tool_call(input: ToolInput) -> ToolCall {
+        ToolCall::new("toolu_1", input)
+    }
+
+    #[test]
+    fn admits_text_only_implicit_completion() {
+        assert!(grace_response_can_enter_reducer(
+            &[ContentBlock::text("done")],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn rejects_server_tool_blocks_without_phoenix_tool_calls() {
+        assert!(!grace_response_can_enter_reducer(
+            &[ContentBlock::ServerToolUse {
+                id: "srv_1".to_string(),
+                name: "web_search".to_string(),
+                input: serde_json::json!({}),
+            }],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn admits_single_terminal_tool_call() {
+        assert!(grace_response_can_enter_reducer(
+            &[],
+            &[tool_call(ToolInput::SubmitResult(SubmitResultInput {
+                result: "done".to_string(),
+            }))]
+        ));
+    }
+
+    #[test]
+    fn rejects_non_terminal_or_mixed_tool_calls() {
+        assert!(!grace_response_can_enter_reducer(
+            &[],
+            &[tool_call(ToolInput::Unknown {
+                name: "bash".to_string(),
+                input: serde_json::json!({}),
+            })]
+        ));
+        assert!(!grace_response_can_enter_reducer(
+            &[],
+            &[
+                tool_call(ToolInput::SubmitResult(SubmitResultInput {
+                    result: "done".to_string(),
+                })),
+                tool_call(ToolInput::Unknown {
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                }),
+            ]
+        ));
+    }
+}
+
 /// Await an LLM task's oneshot outcome and forward it, generation-tagged, to
 /// the executor's LLM-outcome channel, mapping a dropped sender to a typed
 /// `NetworkError` outcome.
@@ -2255,17 +2336,18 @@ where
         if let EffectOutcome::Llm(LlmOutcome::Response {
             content,
             tool_calls,
+            usage,
             ..
         }) = &outcome
         {
             if self.context.is_sub_agent
                 && self.grace_turn_granted
-                && tool_calls.is_empty()
-                && !fresh_response_is_text_only(content)
+                && !grace_response_can_enter_reducer(content, tool_calls)
+                && !response_exceeds_context_threshold(usage, self.context.context_window)
             {
                 tracing::debug!(
                     conv_id = %self.context.conversation_id,
-                    "Grace-turn response contained non-text blocks without terminal tool use; failing turn-limit path"
+                    "Grace-turn response produced neither terminal tool nor text-only implicit completion; failing turn-limit path"
                 );
                 return self
                     .process_event(Event::GraceTurnExhausted { result: None })
