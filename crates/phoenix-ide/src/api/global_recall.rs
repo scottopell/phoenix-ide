@@ -836,6 +836,9 @@ fn render_message_page(
     let mut pos = 0usize;
     let mut has_more = false;
     'outer: for message in messages {
+        if message_is_hidden(message) {
+            continue;
+        }
         let line = render_global_message_line(conv, message);
         for ch in line.chars() {
             if pos >= end {
@@ -856,6 +859,15 @@ fn render_message_page(
     } else {
         out
     }
+}
+
+fn message_is_hidden(message: &crate::db::Message) -> bool {
+    message
+        .display_data
+        .as_ref()
+        .and_then(|d| d.get("hidden"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn render_global_message_line(conv: &Conversation, message: &crate::db::Message) -> String {
