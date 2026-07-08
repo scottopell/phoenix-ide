@@ -184,6 +184,9 @@ also the natural surface for any future non-UI client (REQ-WSUI-011).
 WHEN a client issues `DELETE /api/work-scope/:scope_key/browser-session`
 THE SYSTEM SHALL parse `:scope_key` as a `WorkScope::stable_key()` and terminate the browser session owned by that scope via `BrowserSessionManager::kill_session`.
 
+WHEN a client issues `DELETE /api/conversations/:id/browser-session`
+THE SYSTEM SHALL resolve the conversation's current server-side `WorkScope` and terminate the browser session owned by that scope via `BrowserSessionManager::kill_session`.
+
 WHEN no browser session exists for the scope
 THE SYSTEM SHALL treat the request as a successful no-op.
 
@@ -309,7 +312,7 @@ THE section MAY present the browser row as "idle" — a purely client-side
 rendering derived from `idle_ms`, distinct from the wire `state` (REQ-WSUI-004).
 
 WHEN the browser row reports `state` `live`
-THE section and standalone dock SHALL expose a stop action that invokes REQ-WSUI-006b for the row's `scope_key`. The conversation-page section MAY also expose an open action for the live browser viewer; the standalone dock SHALL NOT require a viewer slot in order to stop the session.
+THE section and standalone dock SHALL expose a stop action that invokes REQ-WSUI-006b with the inventory's `scope_key`. The conversation-page section MAY also expose an open action for the live browser viewer; the standalone dock SHALL NOT require a viewer slot in order to stop the session.
 
 **Rationale:** The right side of the layout is reserved for the meta viewer
 (prose/diff/browser); the work scope is an always-present resource view, so it

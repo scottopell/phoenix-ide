@@ -123,6 +123,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Conversation retrieval (REQ-API-003)
         .route("/api/conversations/:id", get(get_conversation))
+        .route(
+            "/api/conversations/:id/browser-session",
+            delete(stop_conversation_browser_session),
+        )
         .route("/api/conversations/:id/slug", get(get_conversation_slug))
         // SSE streaming (REQ-API-005)
         .route("/api/conversations/:id/stream", get(stream_conversation))
@@ -2168,6 +2172,33 @@ async fn get_work_scope_inventory(
     .await;
 
     Ok(Json(inventory))
+}
+
+async fn stop_conversation_browser_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let work_scope = crate::work_scope::WorkScope::resolve(
+        &conversation.id,
+        conversation
+            .conv_mode
+            .worktree_path()
+            .map(std::path::Path::new),
+    );
+
+    state
+        .runtime
+        .browser_sessions()
+        .kill_session(&work_scope)
+        .await;
+
+    Ok(Json(SuccessResponse { success: true }))
 }
 
 /// `DELETE /api/work-scope/:scope_key/browser-session` — user-initiated
@@ -6138,6 +6169,18 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect_err("malformed key must be rejected");
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn stop_conversation_browser_session_rejects_missing_conversation() {
+        let state = make_test_state().await;
+        let err = super::stop_conversation_browser_session(
+            State(state),
+            Path("missing-conversation".into()),
+        )
+        .await
+        .expect_err("missing conversation must be rejected");
+        assert!(matches!(err, AppError::NotFound(_)));
     }
 
     #[tokio::test]

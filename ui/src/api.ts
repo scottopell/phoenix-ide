@@ -1246,6 +1246,17 @@ export const api = {
     return resp.json();
   },
 
+  /** Terminate the live browser session owned by the conversation's current
+   *  server-side work scope. Used by the browser viewer so approval/rekey races
+   *  cannot leave it holding a stale pre-approval scope key. */
+  async stopConversationBrowserSession(conversationId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(conversationId)}/browser-session`, {
+      method: 'DELETE',
+    });
+    if (!resp.ok) throw new Error('Failed to stop browser session');
+    return resp.json();
+  },
+
   /** Terminate the live browser session owned by a work scope. Closing the
    *  viewer only hides UI; this calls the server-side session lifecycle path so
    *  browser_session_active and work-scope inventory update from server truth. */

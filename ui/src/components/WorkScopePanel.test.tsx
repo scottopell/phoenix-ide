@@ -54,7 +54,7 @@ function tombSuccess(over: Partial<BashHandleInventory> = {}): BashHandleInvento
 
 function inv(
   bashes: BashHandleInventory[],
-  over: Partial<Pick<WorkScopeInventory, 'tmux' | 'browser'>> = {},
+  over: Partial<Pick<WorkScopeInventory, 'scope_key' | 'tmux' | 'browser'>> = {},
 ): WorkScopeInventory {
   return { scope_key: 'ws-1', bash: bashes, tmux: null, browser: null, ...over };
 }
@@ -638,6 +638,29 @@ describe('browser open affordance (Phase 3)', () => {
     });
 
     expect(stopBrowser).toHaveBeenCalledWith('ws-1');
+  });
+
+  it('browser stop uses the live inventory scope rather than the requested prop scope', async () => {
+    const liveBrowser = inv([], {
+      scope_key: 'worktree:/tmp/promoted',
+      browser: { state: 'live', idle_ms: 0 },
+    });
+    getInv.mockResolvedValue(liveBrowser);
+    stopBrowser.mockResolvedValue({ success: true });
+
+    await act(async () => {
+      render(browserSectionTree({ inventory: liveBrowser, onSlot: () => {} }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('browser-stop-button'));
+      await Promise.resolve();
+    });
+
+    expect(stopBrowser).toHaveBeenCalledWith('worktree:/tmp/promoted');
   });
 
   it('stop failure is rendered visibly in the work-scope body', async () => {

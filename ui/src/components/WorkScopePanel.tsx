@@ -520,7 +520,7 @@ function WorkScopeBody({
               <BrowserRow
                 state={inventory.browser.state}
                 idleMs={inventory.browser.idle_ms}
-                scopeKey={scopeKey}
+                scopeKey={inventory.scope_key}
                 inspectable={inspectable}
                 onStopped={refreshAfterStop}
                 onError={setActionError}

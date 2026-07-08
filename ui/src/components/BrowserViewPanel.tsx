@@ -47,8 +47,6 @@ type Status =
 
 interface BrowserViewPanelProps {
   conversationId: string;
-  /** Work-scope key that owns this browser session. Required for stop-session. */
-  scopeKey?: string;
   /** Click handler for the close button in the header. */
   onClose?: () => void;
   /** When true, render with the inline split-pane chrome (no overlay). */
@@ -57,7 +55,6 @@ interface BrowserViewPanelProps {
 
 export function BrowserViewPanel({
   conversationId,
-  scopeKey,
   onClose,
   inline,
 }: BrowserViewPanelProps) {
@@ -77,17 +74,17 @@ export function BrowserViewPanel({
   const [stopError, setStopError] = useState<string | null>(null);
 
   const stopBrowserSession = useCallback(async () => {
-    if (!scopeKey || stopping) return;
+    if (stopping) return;
     setStopping(true);
     setStopError(null);
     try {
-      await api.stopWorkScopeBrowserSession(scopeKey);
+      await api.stopConversationBrowserSession(conversationId);
     } catch (err) {
       setStopError(err instanceof Error ? err.message : 'Failed to stop browser session');
     } finally {
       setStopping(false);
     }
-  }, [scopeKey, stopping]);
+  }, [conversationId, stopping]);
 
   const drawJpeg = useCallback((bytes: Uint8Array) => {
     const canvas = canvasRef.current;
@@ -243,18 +240,16 @@ export function BrowserViewPanel({
         >
           view-only
         </span>
-        {scopeKey && (
-          <button
-            type="button"
-            className="browser-view-panel__stop"
-            onClick={() => void stopBrowserSession()}
-            disabled={stopping}
-            aria-label="Stop browser session"
-            title="Terminate the agent's browser session for this work scope"
-          >
-            {stopping ? 'Stopping…' : 'Stop browser'}
-          </button>
-        )}
+        <button
+          type="button"
+          className="browser-view-panel__stop"
+          onClick={() => void stopBrowserSession()}
+          disabled={stopping}
+          aria-label="Stop browser session"
+          title="Terminate the agent's browser session for this conversation's current work scope"
+        >
+          {stopping ? 'Stopping…' : 'Stop browser'}
+        </button>
         {onClose && (
           <button
             type="button"

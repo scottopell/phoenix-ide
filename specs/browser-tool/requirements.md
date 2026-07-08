@@ -726,6 +726,9 @@ THE SYSTEM SHALL terminate the underlying `BrowserSessionManager` session for th
 WHEN user-initiated browser-session termination succeeds
 THE SYSTEM SHALL emit the normal `browser_session_state` false edge and corresponding work-scope inventory update so the browser viewer, launcher, and work-scope row all return to not-live from server truth.
 
+WHEN an in-flight browser tool holds the browser session guard during user-initiated termination
+THE SYSTEM SHALL time-bound teardown waiting so the user-facing stop action is not blocked indefinitely behind that tool.
+
 **Non-goals (locked in for MVP):**
 
 - **REQ-BT-018-NG-INPUT** — User input into the browser view (clicks, typing, scroll, keyboard shortcuts) is out of scope. The mirror is read-only. Adding input would create an arbitration problem with the agent's tool-driven activity (REQ-BT-008 / REQ-BT-009 / REQ-BT-016) that this feature deliberately avoids.

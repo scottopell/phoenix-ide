@@ -66,6 +66,7 @@ const MAX_CONSOLE_LOGS: usize = 1000;
 
 /// Idle timeout before session cleanup (30 minutes)
 const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
+const KILL_SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Cleanup check interval (60 seconds)
 const CLEANUP_INTERVAL: Duration = Duration::from_mins(1);
@@ -1131,11 +1132,24 @@ impl BrowserSessionManager {
             tracing::info!(work_scope = %work_scope, "Killing browser session");
 
             // Force-close Chrome under a write lock on the session itself
-            // (independent of the sessions map lock). Other `Arc` holders
-            // will observe a dead `Browser`/`Page` on their next CDP call.
-            {
+            // (independent of the sessions map lock). A browser tool may be
+            // holding this guard across an awaited CDP call, so teardown is
+            // time-bounded: removing the map entry and emitting the lifecycle
+            // edge must not block the user's Stop browser action indefinitely.
+            match tokio::time::timeout(KILL_SESSION_LOCK_TIMEOUT, async {
                 let mut session_guard = entry.session.write().await;
                 session_guard.terminate().await;
+            })
+            .await
+            {
+                Ok(()) => {}
+                Err(_) => {
+                    tracing::warn!(
+                        work_scope = %work_scope,
+                        timeout_ms = KILL_SESSION_LOCK_TIMEOUT.as_millis(),
+                        "Timed out waiting for browser session guard during kill; dropping manager entry"
+                    );
+                }
             }
             // Drop our `Arc` clone. If we were the last holder,
             // `BrowserSession::drop` re-aborts (no-op) and frees memory.
