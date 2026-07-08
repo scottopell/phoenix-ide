@@ -1,0 +1,176 @@
+.global-recall-page {
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+  color: var(--text-primary);
+}
+
+.global-recall-header,
+.global-recall-section-title,
+.global-recall-item,
+.global-recall-session-pane {
+  display: flex;
+  gap: 16px;
+}
+
+.global-recall-header,
+.global-recall-section-title,
+.global-recall-item {
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.global-recall-header h1,
+.global-recall-project h3,
+.global-recall-section-title h2,
+.global-recall-sessions h2 {
+  margin: 0;
+}
+
+.global-recall-header p,
+.global-recall-muted,
+.global-recall-path,
+.global-recall-meta,
+.global-recall-work-meta,
+.global-recall-sessions span {
+  color: var(--text-secondary);
+}
+
+.global-recall-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.global-recall-error {
+  margin: 16px 0;
+  color: var(--accent-red);
+}
+
+.global-recall-open-work,
+.global-recall-session-pane {
+  margin-top: 24px;
+}
+
+.global-recall-project {
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 16px;
+  margin-top: 12px;
+  background: var(--bg-secondary);
+}
+
+.global-recall-items {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.global-recall-item {
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 12px;
+  background: var(--bg-primary);
+}
+
+.global-recall-item-main {
+  min-width: 0;
+}
+
+.global-recall-meta,
+.global-recall-signals,
+.global-recall-work-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.global-recall-meta span,
+.global-recall-signals span,
+.global-recall-work-meta span {
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.global-recall-signals span {
+  color: var(--accent-green);
+}
+
+.global-recall-session-pane {
+  align-items: stretch;
+}
+
+.global-recall-sessions {
+  width: 260px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.global-recall-sessions button {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  text-align: left;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px;
+  background: var(--bg-primary);
+  color: inherit;
+}
+
+.global-recall-sessions button.active {
+  border-color: var(--accent-blue);
+}
+
+.global-recall-sessions strong,
+.global-recall-sessions span {
+  display: block;
+}
+
+.global-recall-chat {
+  flex: 1 1 auto;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  min-height: 420px;
+  display: flex;
+  flex-direction: column;
+}
+
+.global-recall-messages {
+  flex: 1;
+  padding: 16px;
+  overflow: auto;
+}
+
+.global-recall-message {
+  margin-bottom: 16px;
+}
+
+.global-recall-message-role {
+  text-transform: uppercase;
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.global-recall-message.assistant {
+  border-left: 3px solid var(--accent-blue);
+  padding-left: 12px;
+}
+
+.global-recall-composer {
+  border-top: 1px solid var(--border-color);
+  padding: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+.global-recall-composer textarea {
+  flex: 1;
+  min-height: 72px;
+  resize: vertical;
+}

@@ -12,6 +12,7 @@ pub mod codex_login;
 mod deployment;
 mod discovery;
 mod git_handlers;
+mod global_recall;
 pub(crate) mod handlers;
 mod lifecycle_handlers;
 mod local_reveal;

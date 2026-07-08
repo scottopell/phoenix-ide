@@ -60,6 +60,7 @@ pub const SPA_ROUTES: &[SpaRoute] = &[
     SpaRoute::Exact("/terminal"),
     SpaRoute::Exact("/about"),
     SpaRoute::Exact("/usage"),
+    SpaRoute::Exact("/global"),
     SpaRoute::Exact("/settings/llm-language"),
     SpaRoute::Exact("/codex/login"),
     SpaRoute::Param {
@@ -88,6 +89,7 @@ mod tests {
         assert!(is_spa_route("/terminal"));
         assert!(is_spa_route("/about"));
         assert!(is_spa_route("/usage"));
+        assert!(is_spa_route("/global"));
         assert!(is_spa_route("/settings/llm-language"));
         assert!(is_spa_route("/codex/login"));
         assert!(is_spa_route("/c/some-slug"));

@@ -323,6 +323,7 @@ export function Sidebar({
 
   const isOnNewPage = location.pathname === '/' || location.pathname === '/new';
   const isOnTerminalPage = location.pathname === '/terminal';
+  const isOnGlobalPage = location.pathname === '/global';
   const collapsedConversations = collapsedDotConversations(conversations, activeSlug);
   const collapsedOverflowCount = Math.max(0, conversations.length - collapsedConversations.length);
 
@@ -348,6 +349,13 @@ export function Sidebar({
           title="Home terminal"
         >
           <TerminalGlyph />
+        </button>
+        <button
+          className={`sidebar-icon-btn ${isOnGlobalPage ? 'active' : ''}`}
+          onClick={() => navigate('/global')}
+          title="Global Recall"
+        >
+          ◎
         </button>
         <SettingsDropdown
           theme={theme}
@@ -416,6 +424,14 @@ export function Sidebar({
           aria-label="Home terminal"
         >
           <TerminalGlyph />
+        </button>
+        <button
+          className={`sidebar-icon-btn ${isOnGlobalPage ? 'active' : ''}`}
+          onClick={() => navigate('/global')}
+          title="Global Recall"
+          aria-label="Global Recall"
+        >
+          ◎
         </button>
         <SettingsDropdown
           theme={theme}

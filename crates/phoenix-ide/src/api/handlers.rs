@@ -12,6 +12,7 @@ use super::git_handlers::{
     create_pr_auto_fix_context, get_conversation_diff, get_conversation_pr_status,
     list_git_branches, record_pr_auto_fix_context_baseline,
 };
+use super::global_recall;
 use super::lifecycle_handlers::{
     abandon_task, approve_commission_review, approve_fork_proposal, approve_task,
     dismiss_fork_proposal, list_fork_proposals, mark_merged, reject_commission_review, reject_task,
@@ -112,6 +113,23 @@ pub fn create_router(state: AppState) -> Router {
         .route("/preview/*filepath", get(serve_preview_file))
         // Conversation listing (REQ-API-001)
         .route("/api/conversations", get(list_conversations))
+        .route("/api/global/open-work", get(global_recall::open_work))
+        .route(
+            "/api/global/recall/sessions",
+            get(global_recall::list_sessions).post(global_recall::create_session),
+        )
+        .route(
+            "/api/global/recall/sessions/:id",
+            get(global_recall::get_session),
+        )
+        .route(
+            "/api/global/recall/sessions/:id/ask",
+            post(global_recall::ask_session),
+        )
+        .route(
+            "/api/global/resolve",
+            post(global_recall::resolve_reference),
+        )
         .route(
             "/api/conversations/archived",
             get(list_archived_conversations),
@@ -6113,7 +6131,7 @@ async fn shared_sse_stream(
 // ============================================================
 
 #[derive(Debug)]
-pub(super) enum AppError {
+pub(crate) enum AppError {
     BadRequest(String),
     NotFound(String),
     /// 403 — the action is restricted to a caller on the server host.
