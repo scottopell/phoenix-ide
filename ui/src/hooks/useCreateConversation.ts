@@ -48,7 +48,7 @@ function relativeTaskPath(cwd: string, taskPath: string): string {
   return taskPath.startsWith(root) ? taskPath.slice(root.length) : taskPath;
 }
 
-const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.slug || conv.id}`;
+const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
 
 function buildTaskStartPrompt(cwd: string, task: TaskEntry, extraInstructions: string): string {
   const taskFile = relativeTaskPath(cwd, task.path);

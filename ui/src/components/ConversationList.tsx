@@ -578,7 +578,7 @@ export const ChainBlock = memo(function ChainBlock({
               conv={m}
               isMenuOpen={expandedRowId === m.id}
               isKeyboardSelected={keyboardSelectedId === m.id}
-              isActive={!!activeSlug && m.slug === activeSlug}
+              isActive={matchesRouteSegment(m, activeSlug)}
               isChainMember
               isChainLatest={m.id === item.latestMemberId}
               listDensity={listDensity}
@@ -598,6 +598,9 @@ export const ChainBlock = memo(function ChainBlock({
     </li>
   );
 });
+
+const matchesRouteSegment = (conv: Pick<Conversation, 'id' | 'slug'>, segment: string | null | undefined) =>
+  !!segment && (conv.slug === segment || conv.id === segment);
 
 const TerminalGlyph = () => (
   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -673,7 +676,7 @@ export function ConversationList({
     const isCompleted = getConvDisplayState(latestMember) === 'terminal';
     if (effectiveListDensity === 'mobile') {
       const hasPriorityMember = item.members.some((m) =>
-        m.slug === activeSlug || isActionableDisplayState(getConvDisplayState(m))
+        matchesRouteSegment(m, activeSlug) || isActionableDisplayState(getConvDisplayState(m))
       );
       return hasPriorityMember ? false : !collapsedChains.has(item.rootId);
     }
@@ -738,7 +741,7 @@ export function ConversationList({
 
     for (const item of groupedItems) {
       if (item.kind === 'single') {
-        if (item.conversation.slug !== activeSlug) continue;
+        if (!matchesRouteSegment(item.conversation, activeSlug)) continue;
         listRootRef.current
           ?.querySelector<HTMLElement>('.conv-item.active')
           ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -746,7 +749,7 @@ export function ConversationList({
         return;
       }
 
-      if (!item.members.some((m) => m.slug === activeSlug)) continue;
+      if (!item.members.some((m) => matchesRouteSegment(m, activeSlug))) continue;
 
       const latestMember = item.members.find(m => m.id === item.latestMemberId);
       const isCompleted = getConvDisplayState(latestMember) === 'terminal';
@@ -847,7 +850,7 @@ export function ConversationList({
                   conv={conv}
                   isMenuOpen={expandedId === conv.id}
                   isKeyboardSelected={selectedId === conv.id}
-                  isActive={!!activeSlug && conv.slug === activeSlug}
+                  isActive={matchesRouteSegment(conv, activeSlug)}
                   isChainMember={false}
                   isChainLatest={false}
                   listDensity={effectiveListDensity}
@@ -873,7 +876,7 @@ export function ConversationList({
                 ? selectedId
                 : null;
             const chainActiveSlug =
-              activeSlug != null && item.members.some((m) => m.slug === activeSlug)
+              activeSlug != null && item.members.some((m) => matchesRouteSegment(m, activeSlug))
                 ? activeSlug
                 : null;
             return (

@@ -1599,6 +1599,53 @@ async fn create_conversation_with_id(
         }
     }
 
+    if let Ok(conv) = state.runtime.db().get_conversation(&id).await {
+        if state
+            .runtime
+            .db()
+            .get_conversation_creation_job_for_conversation(&id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            tracing::info!(conversation_id = %id, "Create request hit existing conversation id");
+            let mut conversation_json = conversation_to_json(&state, &conv, None);
+            inject_creation_job_state_fields(&state, &conv, &mut conversation_json).await;
+            return Ok(Json(ConversationResponse {
+                conversation: conversation_json,
+            }));
+        }
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "conversation_id already belongs to an existing conversation",
+            "conversation_id_exists",
+        ))));
+    }
+
+    if state
+        .db
+        .message_exists(&req.message_id)
+        .await
+        .unwrap_or(false)
+    {
+        tracing::info!(
+            message_id = %req.message_id,
+            "Duplicate create request detected, returning existing conversation"
+        );
+        if let Ok(msg) = state.db.get_message_by_id(&req.message_id).await {
+            if let Ok(conv) = state
+                .runtime
+                .db()
+                .get_conversation(&msg.conversation_id)
+                .await
+            {
+                return Ok(Json(ConversationResponse {
+                    conversation: conversation_to_json(&state, &conv, None),
+                }));
+            }
+        }
+    }
+
     let mode_for_preflight = req.mode.as_deref().unwrap_or("direct");
     let repo_root_for_preflight = detect_git_repo_root(valid_cwd.as_path());
     if matches!(mode_for_preflight, "managed" | "branch") && repo_root_for_preflight.is_none() {
@@ -1679,59 +1726,7 @@ async fn create_conversation_with_id(
         }
     }
 
-    let existing_shell: Option<crate::db::Conversation> = if let Ok(conv) =
-        state.runtime.db().get_conversation(&id).await
-    {
-        if state
-            .runtime
-            .db()
-            .get_conversation_creation_job_for_conversation(&id)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            tracing::info!(conversation_id = %id, "Create request hit existing conversation id");
-            let mut conversation_json = conversation_to_json(&state, &conv, None);
-            inject_creation_job_state_fields(&state, &conv, &mut conversation_json).await;
-            return Ok(Json(ConversationResponse {
-                conversation: conversation_json,
-            }));
-        }
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "conversation_id already belongs to an existing conversation",
-            "conversation_id_exists",
-        ))));
-    } else {
-        None
-    };
-
-    // Idempotency check: if message_id already exists, find and return that conversation
-    if state
-        .db
-        .message_exists(&req.message_id)
-        .await
-        .unwrap_or(false)
-    {
-        tracing::info!(
-            message_id = %req.message_id,
-            "Duplicate create request detected, returning existing conversation"
-        );
-        // Find the conversation for this message
-        if let Ok(msg) = state.db.get_message_by_id(&req.message_id).await {
-            if let Ok(conv) = state
-                .runtime
-                .db()
-                .get_conversation(&msg.conversation_id)
-                .await
-            {
-                return Ok(Json(ConversationResponse {
-                    conversation: conversation_to_json(&state, &conv, None),
-                }));
-            }
-        }
-        // If we can't find it, fall through to create (shouldn't happen)
-    }
+    let existing_shell: Option<crate::db::Conversation> = None;
 
     if !req.files.is_empty() {
         let validated = validate_submitted_attachments(&id, &req.files).await?;
@@ -4098,7 +4093,10 @@ async fn regenerate_conversation_name(
     } else {
         title_from_text(&first_text)
     };
-    let slug = slugify_label(&title);
+    let mut slug = slugify_label(&title);
+    if slug.is_empty() {
+        slug = generate_slug();
+    }
     state
         .runtime
         .db()
@@ -6186,6 +6184,58 @@ mod conversation_cwd_validation_tests {
                 .is_empty(),
             "rejected managed create must not leave a failed shell"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_existing_creation_shell_bypasses_git_preflight() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        init_git_repo(tmp.path());
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let conv_id = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .create_conversation(
+                &conv_id,
+                "conv-existing-shell",
+                tmp.path().to_str().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("existing shell");
+        state
+            .db
+            .insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
+                id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conv_id.clone(),
+                message_id: Some("msg-existing-shell".to_string()),
+                intent: crate::db::ConversationCreationIntent {
+                    cwd: tmp.path().to_string_lossy().to_string(),
+                    model: None,
+                    text: "retry".to_string(),
+                    message_id: "msg-existing-shell".to_string(),
+                    images: vec![],
+                    files: vec![],
+                    mode: Some("branch".to_string()),
+                    base_branch: Some("does-not-exist".to_string()),
+                    checkout_ref: None,
+                    seed_parent_id: None,
+                    seed_label: None,
+                },
+            })
+            .await
+            .expect("creation job");
+        let mut req = create_request(tmp.path().to_string_lossy().to_string());
+        req.conversation_id = Some(conv_id.clone());
+        req.mode = Some("branch".to_string());
+        req.base_branch = Some("does-not-exist".to_string());
+
+        let Json(response) = create_conversation_with_id(state, req, Vec::new())
+            .await
+            .expect("idempotent retry returns existing shell before git checks");
+
+        assert_eq!(response.conversation["id"].as_str(), Some(conv_id.as_str()));
     }
 
     #[tokio::test]

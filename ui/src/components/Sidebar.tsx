@@ -52,6 +52,9 @@ const TerminalGlyph = () => (
   </svg>
 );
 
+const matchesRouteSegment = (conv: Pick<Conversation, 'id' | 'slug'>, segment: string | null | undefined) =>
+  !!segment && (conv.slug === segment || conv.id === segment);
+
 interface SidebarProps {
   collapsed: boolean;
   onToggle: () => void;
@@ -183,7 +186,7 @@ export function Sidebar({
     if (lastProjectFilterRevealSlugRef.current === activeSlug) return;
 
     const activeConversation = [...conversations, ...archivedConversations]
-      .find((c) => c.slug === activeSlug);
+      .find((c) => matchesRouteSegment(c, activeSlug));
     if (!activeConversation) return;
 
     if (activeProjectId && activeConversation.project_id !== activeProjectId) {
@@ -199,8 +202,8 @@ export function Sidebar({
     }
     if (lastArchiveRevealSlugRef.current === activeSlug) return;
 
-    const inActiveList = conversations.some((c) => c.slug === activeSlug);
-    const inArchivedList = archivedConversations.some((c) => c.slug === activeSlug);
+    const inActiveList = conversations.some((c) => matchesRouteSegment(c, activeSlug));
+    const inArchivedList = archivedConversations.some((c) => matchesRouteSegment(c, activeSlug));
     if (!inActiveList && !inArchivedList) return;
 
     if (inArchivedList && !inActiveList && !showArchived) {
@@ -368,7 +371,7 @@ export function Sidebar({
         <div className="sidebar-collapsed-dots">
           {collapsedConversations.map(conv => {
             const displayState = getConvDisplayState(conv);
-            const isActive = conv.slug === activeSlug;
+            const isActive = matchesRouteSegment(conv, activeSlug);
             return (
               <button
                 key={conv.id}

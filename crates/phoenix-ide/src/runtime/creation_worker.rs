@@ -202,6 +202,14 @@ async fn provision_conversation(
                         .strip_prefix("refs/remotes/origin/")
                         .map(String::from)
                 })
+                .or_else(|| {
+                    crate::git_ops::run_git(
+                        Path::new(&repo_root),
+                        &["rev-parse", "--abbrev-ref", "HEAD"],
+                    )
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                })
                 .unwrap_or_else(|| branch_name.clone());
                 Ok(BranchWorktreeInfo {
                     branch_name: branch_name.clone(),

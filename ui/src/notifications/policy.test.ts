@@ -80,6 +80,15 @@ describe('notification policy reducer', () => {
     expect(first.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked');
   });
 
+  it('suppresses when focused by stable conversation id', () => {
+    const focused = env({ visible: true, hasFocus: true, activeSlug: 'conv-1' });
+    const first = notificationPolicyReducer(loadedState(),
+      { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', questions: [] } },
+      focused);
+    expect(first.effects).toHaveLength(0);
+    expect(first.state.attentionSeenByConversationId.get('conv-1')).toBe('conv-1:question_asked');
+  });
+
   it('queues a permission cue without consuming dedupe when permission is default', () => {
     const result = notificationPolicyReducer(loadedState(),
       { type: 'conversation_state_changed', conversation: conversation(), previousState: { type: 'idle' }, nextState: { type: 'awaiting_user_response', questions: [] } },

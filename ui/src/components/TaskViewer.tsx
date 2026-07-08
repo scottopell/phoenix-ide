@@ -26,7 +26,7 @@ const STATUS_CLASS: Record<string, string> = {
 };
 
 const TERMINAL_STATUSES = new Set(['done', 'wont-do']);
-const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.slug || conv.id}`;
+const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
 
 
 export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBack }: TaskViewerProps) {

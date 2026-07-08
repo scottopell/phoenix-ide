@@ -1760,6 +1760,7 @@ impl ConvState {
                 | ConvState::Failed { .. }
                 | ConvState::ContextExhausted { .. }
                 | ConvState::HandedOff { .. }
+                | ConvState::CreationFailed { .. }
                 | ConvState::Terminal
         )
     }

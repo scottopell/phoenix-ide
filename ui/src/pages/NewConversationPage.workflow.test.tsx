@@ -184,7 +184,7 @@ describe('/new workflow modes', () => {
     expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('');
   });
 
-  it('routes an accepted shell by slug so slug-keyed desktop consumers stay active', async () => {
+  it('routes an accepted shell by stable id', async () => {
     vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
     renderPage();
     await settleValidation();
@@ -192,7 +192,7 @@ describe('/new workflow modes', () => {
     fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, { target: { value: 'route by slug' } });
     fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
 
-    await waitFor(() => expect(screen.getByTestId('location-path')).toHaveTextContent('/c/conv-1'));
+    await waitFor(() => expect(screen.getByTestId('location-path')).toHaveTextContent('/c/c1'));
   });
 
   it('shows a stable acknowledgement while create is pending and preserves the draft', async () => {

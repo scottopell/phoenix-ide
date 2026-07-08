@@ -170,7 +170,7 @@ export function notificationTagFor(event: PolicyNotificationEvent): string {
 }
 
 function shouldSuppressForFocus(env: NotificationEnv, conversation: Conversation): boolean {
-  return env.visible && env.hasFocus && env.activeSlug === conversation.slug;
+  return env.visible && env.hasFocus && (env.activeSlug === conversation.slug || env.activeSlug === conversation.id);
 }
 
 function markAttentionSeen(state: NotificationPolicyState, event: PolicyNotificationEvent): NotificationPolicyState {

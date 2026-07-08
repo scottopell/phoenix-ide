@@ -118,7 +118,7 @@ const ChevronRightSmall = () => (
     <polyline points="9 18 15 12 9 6" />
   </svg>
 );
-const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.slug || conv.id}`;
+const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
 
 
 export function ConversationPage() {
