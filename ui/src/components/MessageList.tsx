@@ -187,6 +187,7 @@ function renderHistoricalUnit(
 function renderTailUnit(
   unit: TailUnit,
   slug: string | undefined,
+  filePathRootDir: string | undefined,
 ): JSX.Element | null {
   switch (unit.kind) {
     case 'sub_agent_status':
@@ -195,7 +196,7 @@ function renderTailUnit(
       if (!slug) return null;
       return (
         <RenderProfiler id="StreamingMessage">
-          <StreamingMessage slug={slug} isFirstInTurn={unit.isFirstInTurn} />
+          <StreamingMessage slug={slug} isFirstInTurn={unit.isFirstInTurn} rootDir={filePathRootDir} />
         </RenderProfiler>
       );
   }
@@ -216,7 +217,7 @@ function renderUnit(
     unit.kind === 'sub_agent_status' ||
     unit.kind === 'streaming_agent'
   ) {
-    return renderTailUnit(unit, slug);
+    return renderTailUnit(unit, slug, filePathRootDir);
   }
   return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, isLatestAgentMessage);
 }

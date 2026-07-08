@@ -6,7 +6,8 @@ import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter
 import type { StreamingBuffer } from '../conversation/atom';
 import { useStreamingBuffer } from '../conversation/useConversationAtom';
 import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
-import { ConversationMarkdownAnchor } from './conversationMarkdown';
+import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
+import { resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { formatMessageTime } from './MessageComponents';
 
@@ -24,10 +25,24 @@ function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
   );
 }
 
-const MARKDOWN_COMPONENTS = {
-  a: ConversationMarkdownAnchor,
-  table: MarkdownTable,
+type StreamingMarkdownComponentsContext = {
+  rootDir?: string | undefined;
 };
+
+function createStreamingMarkdownComponents({ rootDir }: StreamingMarkdownComponentsContext) {
+  return {
+    a: ConversationMarkdownAnchor,
+    table: MarkdownTable,
+    img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
+      <ConversationMarkdownImage
+        {...props}
+        src={resolveConversationMarkdownImageSrc(src, rootDir)}
+      />
+    ),
+  };
+}
+
+const MARKDOWN_COMPONENTS = createStreamingMarkdownComponents({});
 
 /**
  * Subscribes to the streaming buffer for the given slug and renders it.
@@ -35,9 +50,9 @@ const MARKDOWN_COMPONENTS = {
  * re-render only this component — `<MessageList>` and its
  * `<MessageListBody>` are untouched by token churn (REQ-MLRU-010).
  */
-export function StreamingMessage({ slug, isFirstInTurn }: { slug: string; isFirstInTurn: boolean }) {
+export function StreamingMessage({ slug, isFirstInTurn, rootDir }: { slug: string; isFirstInTurn: boolean; rootDir?: string | undefined }) {
   const buffer = useStreamingBuffer(slug);
-  return <StreamingMessageView buffer={buffer} isFirstInTurn={isFirstInTurn} />;
+  return <StreamingMessageView buffer={buffer} isFirstInTurn={isFirstInTurn} rootDir={rootDir} />;
 }
 
 interface StreamingMessageViewProps {
@@ -46,6 +61,7 @@ interface StreamingMessageViewProps {
   // message, so the header row is present during streaming and does not pop in
   // (shifting content down) on finalize. Defaults true for tests/standalone use.
   isFirstInTurn?: boolean;
+  rootDir?: string | undefined;
 }
 
 /**
@@ -67,7 +83,7 @@ interface StreamingMessageViewProps {
  * - Open code fence → <pre><code className="streaming-code"> with matching
  *   dimensions so the swap to SyntaxHighlighter causes no layout shift.
  */
-export function StreamingMessageView({ buffer, isFirstInTurn = true }: StreamingMessageViewProps) {
+export function StreamingMessageView({ buffer, isFirstInTurn = true, rootDir }: StreamingMessageViewProps) {
   if (!buffer) return null;
   const startedAtIso = new Date(buffer.startedAt).toISOString();
   return (
@@ -81,7 +97,7 @@ export function StreamingMessageView({ buffer, isFirstInTurn = true }: Streaming
         </div>
       )}
       <div className="message-content">
-        <StreamingBlocks text={buffer.text ?? ''} />
+        <StreamingBlocks text={buffer.text ?? ''} rootDir={rootDir} />
       </div>
       <span className="streaming-cursor" aria-hidden="true" />
     </div>
@@ -95,7 +111,7 @@ export function StreamingMessageView({ buffer, isFirstInTurn = true }: Streaming
  * growing tail rather than re-parsing the whole buffer every token (REQ-MLRU-010).
  * Caller supplies the wrapping chrome (cursor, container classes).
  */
-export function StreamingBlocks({ text }: { text: string }) {
+export function StreamingBlocks({ text, rootDir }: { text: string; rootDir?: string | undefined }) {
   const { theme } = useTheme();
   const syntaxStyle = theme === 'light' ? oneLight : oneDark;
   // rAF-gated display buffer: accumulates incoming text and flushes once per frame.
@@ -132,11 +148,15 @@ export function StreamingBlocks({ text }: { text: string }) {
 
   // Parse once per text change, not on theme-only re-renders.
   const blocks = useMemo(() => parseStreamingBlocks(displayText), [displayText]);
+  const markdownComponents = useMemo(
+    () => (rootDir ? createStreamingMarkdownComponents({ rootDir }) : MARKDOWN_COMPONENTS),
+    [rootDir],
+  );
 
   return (
     <>
       {blocks.map((block, i) => (
-        <StreamingBlock key={`${block.type}-${i}`} block={block} syntaxStyle={syntaxStyle} />
+        <StreamingBlock key={`${block.type}-${i}`} block={block} syntaxStyle={syntaxStyle} markdownComponents={markdownComponents} />
       ))}
     </>
   );
@@ -145,6 +165,7 @@ export function StreamingBlocks({ text }: { text: string }) {
 type StreamingBlockProps = {
   block: StreamingBlock;
   syntaxStyle: Record<string, React.CSSProperties>;
+  markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'];
 };
 
 // Each parse returns fresh block objects, so referential `memo` would never
@@ -153,7 +174,7 @@ type StreamingBlockProps = {
 // Comparing those fields lets every block except the growing tail skip the
 // per-frame ReactMarkdown re-parse / Prism re-highlight during streaming.
 function streamingBlocksEqual(prev: StreamingBlockProps, next: StreamingBlockProps): boolean {
-  if (prev.syntaxStyle !== next.syntaxStyle) return false;
+  if (prev.syntaxStyle !== next.syntaxStyle || prev.markdownComponents !== next.markdownComponents) return false;
   const a = prev.block;
   const b = next.block;
   if (a.type !== b.type || a.content !== b.content) return false;
@@ -163,11 +184,11 @@ function streamingBlocksEqual(prev: StreamingBlockProps, next: StreamingBlockPro
   return true;
 }
 
-const StreamingBlock = memo(function StreamingBlock({ block, syntaxStyle }: StreamingBlockProps) {
+const StreamingBlock = memo(function StreamingBlock({ block, syntaxStyle, markdownComponents }: StreamingBlockProps) {
   if (block.type === 'markdown') {
     return (
       <div className="agent-text-block">
-        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents}>
           {block.content}
         </ReactMarkdown>
       </div>

@@ -38,7 +38,8 @@ import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './Browse
 import { PillStrip, type PillItem } from './PillStrip';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
-import { ConversationMarkdownAnchor, CONVERSATION_MARKDOWN_COMPONENTS } from './conversationMarkdown';
+import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
+import { CONVERSATION_MARKDOWN_COMPONENTS, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 
@@ -990,8 +991,14 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
       li: ({ children }: { children?: React.ReactNode }) => <li>{processChildren(children)}</li>,
       a: ConversationMarkdownAnchor,
       table: MarkdownTable,
+      img: ({ src, ...props }: React.ComponentPropsWithoutRef<'img'> & { node?: unknown }) => (
+        <ConversationMarkdownImage
+          {...props}
+          src={resolveConversationMarkdownImageSrc(src, filePathRootDir)}
+        />
+      ),
     } satisfies Components;
-  }, [onOpenFile, filePathCopyContext, syntaxStyle]);
+  }, [onOpenFile, filePathCopyContext, filePathRootDir, syntaxStyle]);
 
   // Check if there's any renderable content
   const hasRenderableContent = blocks.some(block => {

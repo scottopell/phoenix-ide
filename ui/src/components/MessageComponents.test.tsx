@@ -758,6 +758,49 @@ describe('conversation markdown links', () => {
     expect(link).toHaveAttribute('rel', 'noopener noreferrer');
   });
 
+  it('renders finalized agent local Markdown images through the preview allowlist path', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-local-image', [{
+            type: 'text',
+            text: 'Preview:\n\n![file-tree-dark-single-slot](ui/qa-artifacts/grounding-panel/file-tree-dark-single-slot.png)',
+          }])}
+          toolResults={new Map()}
+          filePathRootDir="/repo/project"
+        />
+      </MemoryRouter>,
+    );
+
+    const image = screen.getByRole('img', { name: 'file-tree-dark-single-slot' });
+    expect(image).toHaveAttribute(
+      'src',
+      '/preview/repo/project/ui/qa-artifacts/grounding-panel/file-tree-dark-single-slot.png',
+    );
+    expect(image).toHaveClass('conversation-markdown-image');
+    expect(image).toHaveAttribute('loading', 'lazy');
+  });
+
+  it('keeps finalized agent remote Markdown image URLs unchanged', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-remote-image', [{
+            type: 'text',
+            text: '![remote screenshot](https://example.com/screenshot.png)',
+          }])}
+          toolResults={new Map()}
+          filePathRootDir="/repo/project"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('img', { name: 'remote screenshot' })).toHaveAttribute(
+      'src',
+      'https://example.com/screenshot.png',
+    );
+  });
+
   it('opens streaming agent Markdown links in a new tab with safe rel attributes', async () => {
     render(
       <MemoryRouter>
@@ -775,6 +818,29 @@ describe('conversation markdown links', () => {
       expect(link).toHaveAttribute('href', 'https://github.com/acme/repo/pull/789');
       expect(link).toHaveAttribute('target', '_blank');
       expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    });
+  });
+
+  it('renders streaming agent local Markdown images through the preview allowlist path', async () => {
+    render(
+      <MemoryRouter>
+        <StreamingMessageView
+          buffer={{
+            text: 'Streaming image: ![capture](./ui/qa-artifacts/capture.png)',
+            lastSequence: 1,
+            startedAt: Date.now(),
+            requestId: 'test-req-id',
+          }}
+          rootDir="/repo/project/"
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: 'capture' })).toHaveAttribute(
+        'src',
+        '/preview/repo/project/ui/qa-artifacts/capture.png',
+      );
     });
   });
 });

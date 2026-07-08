@@ -969,6 +969,18 @@ body {
   margin: 16px 0;
 }
 
+/* Images in agent messages */
+.agent-text-block .conversation-markdown-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 12px 0;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  object-fit: contain;
+}
+
 /* Links in agent messages */
 .agent-text-block a {
   color: var(--accent-color);
