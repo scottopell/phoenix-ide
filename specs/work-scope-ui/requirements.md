@@ -187,6 +187,9 @@ THE SYSTEM SHALL parse `:scope_key` as a `WorkScope::stable_key()` and request t
 WHEN a client issues `DELETE /api/conversations/:id/browser-session`
 THE SYSTEM SHALL resolve the conversation's current server-side `WorkScope` and request termination of the browser session owned by that scope via `BrowserSessionManager::kill_session`.
 
+WHEN the conversation's current server-side `WorkScope` differs from its conversation scope
+THE SYSTEM SHALL also request termination for the conversation scope so a stop request during an Explore-to-Work approval window cannot miss a pre-rekey browser session.
+
 WHEN no browser session exists for the scope
 THE SYSTEM SHALL treat the request as a successful no-op.
 

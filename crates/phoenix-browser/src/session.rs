@@ -20,7 +20,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
@@ -858,7 +858,14 @@ struct ScopedSession {
     scope: WorkScope,
     session: Arc<RwLock<BrowserSession>>,
     user_data_key: String,
+    kill_done: Arc<Notify>,
     kill_requested: Arc<AtomicBool>,
+}
+
+enum KillSessionOutcome {
+    Absent,
+    Started(JoinHandle<()>),
+    AlreadyRequested { key: String, done: Arc<Notify> },
 }
 
 /// Global manager for all browser sessions
@@ -1032,6 +1039,7 @@ impl BrowserSessionManager {
                 scope: work_scope.clone(),
                 session: session_arc.clone(),
                 user_data_key: key.clone(),
+                kill_done: Arc::new(Notify::new()),
                 kill_requested: Arc::new(AtomicBool::new(false)),
             },
         );
@@ -1127,26 +1135,32 @@ impl BrowserSessionManager {
     /// lock-free so concurrent `get_session` / `get_existing` /
     /// `is_active` calls on unrelated scopes are not blocked for the
     /// duration of fs deletion + Chrome shutdown.
-    async fn spawn_kill_session(
-        self: &Arc<Self>,
-        work_scope: &WorkScope,
-    ) -> Option<JoinHandle<()>> {
+    async fn spawn_kill_session(self: &Arc<Self>, work_scope: &WorkScope) -> KillSessionOutcome {
         let key = work_scope.stable_key();
-        let (session, kill_requested) = {
+        let Some((session, kill_requested, kill_done)) = ({
             let sessions = self.sessions.read().await;
-            sessions
-                .get(&key)
-                .map(|entry| (entry.session.clone(), entry.kill_requested.clone()))
-        }?;
+            sessions.get(&key).map(|entry| {
+                (
+                    entry.session.clone(),
+                    entry.kill_requested.clone(),
+                    entry.kill_done.clone(),
+                )
+            })
+        }) else {
+            return KillSessionOutcome::Absent;
+        };
 
         if kill_requested.swap(true, Ordering::SeqCst) {
             tracing::debug!(work_scope = %work_scope, "browser kill already requested");
-            return None;
+            return KillSessionOutcome::AlreadyRequested {
+                key,
+                done: kill_done,
+            };
         }
 
         let requested_scope = work_scope.clone();
         let manager = Arc::clone(self);
-        Some(tokio::spawn(async move {
+        KillSessionOutcome::Started(tokio::spawn(async move {
             tracing::info!(work_scope = %requested_scope, "Killing browser session");
 
             // Force-close Chrome under a write lock on the session itself,
@@ -1169,6 +1183,7 @@ impl BrowserSessionManager {
 
             let Some(entry) = removed else {
                 tracing::debug!(work_scope = %requested_scope, "browser kill completed after session was already removed");
+                kill_done.notify_waiters();
                 return;
             };
             let removed_scope = entry.scope.clone();
@@ -1181,6 +1196,7 @@ impl BrowserSessionManager {
             }
 
             manager.emit_lifecycle(&removed_scope, false);
+            kill_done.notify_waiters();
         }))
     }
 
@@ -1199,11 +1215,20 @@ impl BrowserSessionManager {
     /// [`Self::request_kill_session`] so they do not block behind an in-flight
     /// browser tool guard.
     pub async fn kill_session(self: &Arc<Self>, work_scope: &WorkScope) {
-        let Some(handle) = self.spawn_kill_session(work_scope).await else {
-            return;
-        };
-        if let Err(err) = handle.await {
-            tracing::warn!(work_scope = %work_scope, error = %err, "browser kill task failed");
+        match self.spawn_kill_session(work_scope).await {
+            KillSessionOutcome::Absent => {}
+            KillSessionOutcome::Started(handle) => {
+                if let Err(err) = handle.await {
+                    tracing::warn!(work_scope = %work_scope, error = %err, "browser kill task failed");
+                }
+            }
+            KillSessionOutcome::AlreadyRequested { key, done } => loop {
+                let notified = done.notified();
+                if !self.sessions.read().await.contains_key(&key) {
+                    break;
+                }
+                notified.await;
+            },
         }
     }
 

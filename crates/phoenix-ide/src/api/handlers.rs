@@ -2198,6 +2198,15 @@ async fn stop_conversation_browser_session(
         .request_kill_session(&work_scope)
         .await;
 
+    let conversation_scope = crate::work_scope::WorkScope::Conversation(conversation.id.clone());
+    if conversation_scope != work_scope {
+        state
+            .runtime
+            .browser_sessions()
+            .request_kill_session(&conversation_scope)
+            .await;
+    }
+
     Ok(Json(SuccessResponse { success: true }))
 }
 
