@@ -331,6 +331,16 @@ export type SSEAction =
       phase: ConversationState;
       contextWindow: { used: number };
       transcriptGeneration: number;
+      eventCursorFloor?: number;
+    }
+  | {
+      type: 'merge_conversation_data';
+      conversationId: string;
+      conversation: Conversation;
+      messages: Message[];
+      phase: ConversationState;
+      contextWindow: { used: number };
+      transcriptGeneration: number;
     }
   | {
       type: 'set_system_prompt';
@@ -414,6 +424,24 @@ function deriveMessageSyncState(messages: Message[]): Pick<ConversationAtom, 'me
 
 function withDerivedMessageSyncState(atom: ConversationAtom, messages: Message[]): ConversationAtom {
   return { ...atom, messages, ...deriveMessageSyncState(messages) };
+}
+
+function mergeMessagesByIdentity(existing: Message[], incoming: Message[]): Message[] {
+  const byMessageId = new Map<string, Message>();
+  const bySequenceId = new Map<number, Message>();
+
+  const upsert = (message: Message) => {
+    const priorByMessageId = byMessageId.get(message.message_id);
+    if (priorByMessageId) bySequenceId.delete(priorByMessageId.sequence_id);
+    const priorBySequenceId = bySequenceId.get(message.sequence_id);
+    if (priorBySequenceId) byMessageId.delete(priorBySequenceId.message_id);
+    byMessageId.set(message.message_id, message);
+    bySequenceId.set(message.sequence_id, message);
+  };
+
+  for (const message of existing) upsert(message);
+  for (const message of incoming) upsert(message);
+  return [...byMessageId.values()].sort((a, b) => a.sequence_id - b.sequence_id);
 }
 
 function sortPendingPatches(patches: PendingMessagePatch[]): PendingMessagePatch[] {
@@ -1203,6 +1231,21 @@ export function conversationReducer(
         phase: action.phase,
         contextWindow: action.contextWindow,
         transcriptGeneration: action.transcriptGeneration,
+        lastAppliedEventSeq: Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0),
+      };
+
+    case 'merge_conversation_data':
+      if (atom.conversationId !== null && atom.conversationId !== action.conversationId) return atom;
+      const messages = mergeMessagesByIdentity(atom.messages, action.messages);
+      return {
+        ...atom,
+        conversationId: action.conversationId,
+        conversation: action.conversation,
+        messages,
+        phase: action.phase,
+        contextWindow: action.contextWindow,
+        transcriptGeneration: action.transcriptGeneration,
+        ...deriveMessageSyncState(messages),
       };
 
     case 'set_system_prompt':

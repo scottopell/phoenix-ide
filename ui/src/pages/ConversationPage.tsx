@@ -498,6 +498,7 @@ function ConversationPageContent() {
                 phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
                 contextWindow: { used: 0 },
                 transcriptGeneration: cached.transcript_generation ?? 1,
+                eventCursorFloor: latestMessageSequenceId(cachedMessages) ?? 0,
               });
             }
           }
@@ -567,7 +568,7 @@ function ConversationPageContent() {
 
                 if (!atomRef.current.conversation || atomRef.current.conversation.slug === slug) {
                   dispatch({
-                    type: 'set_initial_data',
+                    type: 'merge_conversation_data',
                     conversationId: authoritativeConversation.id,
                     conversation: authoritativeConversation,
                     messages: mergedMessages,
@@ -604,6 +605,7 @@ function ConversationPageContent() {
                   used: result.context_window_size || 0,
                 },
                 transcriptGeneration: result.conversation.transcript_generation ?? 1,
+                eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
               });
               setArchiveStatusConfirmedConversationId(result.conversation.id);
               await cacheDB.putConversation(result.conversation);
@@ -665,6 +667,7 @@ function ConversationPageContent() {
             used: result.context_window_size || 0,
           },
           transcriptGeneration: result.conversation.transcript_generation ?? 1,
+          eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
         });
         setArchiveStatusConfirmedConversationId(result.conversation.id);
         await cacheDB.putConversation(result.conversation);

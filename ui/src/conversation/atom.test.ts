@@ -1846,6 +1846,44 @@ describe('conversationReducer', () => {
       expect(next.contextWindow.used).toBe(500);
     });
 
+    it('can seed the event cursor from a cached transcript tail', () => {
+      const next = dispatch(createInitialAtom(), {
+        type: 'set_initial_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(42)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        transcriptGeneration: 1,
+        eventCursorFloor: 42,
+      });
+
+      expect(next.lastAppliedEventSeq).toBe(42);
+      expect(next.messages.map((m) => m.sequence_id)).toEqual([42]);
+    });
+
+    it('merge_conversation_data updates messages even after SSE cursor exists', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        lastAppliedEventSeq: 10,
+      };
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1), makeMessage(2)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        transcriptGeneration: 1,
+      });
+
+      expect(next.lastAppliedEventSeq).toBe(10);
+      expect(next.messages.map((m) => m.sequence_id)).toEqual([1, 2]);
+    });
+
     it('is a no-op if SSE data already present', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 5 };
 
