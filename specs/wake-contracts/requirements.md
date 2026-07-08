@@ -381,10 +381,10 @@ distinguish:
 - `Expired` — delivery deadline reached before the condition held
 - `Cancelled` — user cancelled, or lifecycle cascade
 - `Forgotten { reason }` — underlying handle became unknowable before the
-  condition could be evaluated: a hard-delete cascade with no inheriting
-  WorkScope, a Phoenix restart that dropped an in-memory handle (bash), a missing
-  tmux window/session with no recorded terminal state, or a missing sub-agent
-  child
+  condition could be evaluated while the contract's current conversation remains
+  queryable: a WorkScope teardown with no inheriting WorkScope, a Phoenix restart
+  that dropped an in-memory handle (bash), a missing tmux window/session with no
+  recorded terminal state, or a missing sub-agent child
 
 **Rationale:** "The wait returned" is not a sufficient description.
 Forgotten is structurally different from expired — the contract was
@@ -405,8 +405,13 @@ conversation, so subsequent fires deliver into the child — the
 WorkScope-keyed handle transfers to the child along with the contract
 
 WHEN a WorkScope-keyed handle's `WorkScope` is torn down with no
-inheriting successor (the handle is therefore destroyed)
+inheriting successor (the handle is therefore destroyed) AND the contract's
+current conversation remains queryable
 THE SYSTEM SHALL fire the contract with cause `Forgotten`
+
+WHEN the same teardown deletes the contract's current conversation
+THE SYSTEM SHALL cancel/remove the contract before deleting the row and SHALL NOT
+append a synthetic result into the deleted conversation
 
 A wake contract whose watched handle is a subagent handle is keyed by
 the sub-agent's own agent / child-conversation id (per

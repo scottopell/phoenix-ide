@@ -912,6 +912,13 @@ fn forward_denial_outcome(
     ));
 }
 
+fn fresh_response_is_text_only(content: &[ContentBlock]) -> bool {
+    !content.is_empty()
+        && content
+            .iter()
+            .all(|block| matches!(block, ContentBlock::Text { .. }))
+}
+
 /// Await an LLM task's oneshot outcome and forward it, generation-tagged, to
 /// the executor's LLM-outcome channel, mapping a dropped sender to a typed
 /// `NetworkError` outcome.
@@ -2245,6 +2252,27 @@ where
 
         refresh_commission_review_approval_for_outcome(&mut self.context, &outcome);
 
+        if let EffectOutcome::Llm(LlmOutcome::Response {
+            content,
+            tool_calls,
+            ..
+        }) = &outcome
+        {
+            if self.context.is_sub_agent
+                && self.grace_turn_granted
+                && tool_calls.is_empty()
+                && !fresh_response_is_text_only(content)
+            {
+                tracing::debug!(
+                    conv_id = %self.context.conversation_id,
+                    "Grace-turn response contained non-text blocks without terminal tool use; failing turn-limit path"
+                );
+                return self
+                    .process_event(Event::GraceTurnExhausted { result: None })
+                    .await;
+            }
+        }
+
         let result = match handle_outcome(&self.state, &self.context, outcome) {
             Ok(r) => r,
             Err(invalid) => {
@@ -3115,9 +3143,7 @@ where
                                 _ => None,
                             })
                             .collect();
-                        let text_only = blocks
-                            .iter()
-                            .all(|b| matches!(b, ContentBlock::Text { .. }));
+                        let text_only = fresh_response_is_text_only(blocks);
                         if !text_parts.is_empty() && text_only {
                             text = Some(text_parts.join("\n\n"));
                             break;

@@ -81,7 +81,7 @@ value FirePayload {
 }
 
 value TerminalPayloadBody {
-    fired: FiredHandlePayload when terminal_cause = fired
+    fired: FiredHandlePayload?
 }
 
 value FiredHandlePayload {
@@ -706,6 +706,11 @@ invariant FiredContractsCarryFiredPayloadBody {
     for c in Contract where c.status = terminal and c.terminal_cause = fired:
         c.terminal_payload.fired != null
 }
+invariant NonFiredTerminalRowsCarryNoFiredBody {
+    for c in Contract where c.status = terminal and c.terminal_cause != fired:
+        c.terminal_payload.fired = null
+}
+
 
 invariant ForgottenContractsCarryReason {
     for c in Contract where c.status = terminal and c.terminal_cause = forgotten:
