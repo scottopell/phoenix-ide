@@ -515,35 +515,40 @@ function ConversationPageContent() {
                 const catchUp = await api.getConversationMessagesAfter(cachedConversationId, maxSequenceId, 200);
                 if (cancelled) return;
 
+                const mergedMessages = catchUp.messages.length > 0
+                  ? mergeConversationMessages(cachedMessages, catchUp.messages)
+                  : cachedMessages;
+                const mergedLatestSequenceId = latestMessageSequenceId(mergedMessages);
+
                 if (catchUp.messages.length > 0) {
-                  const mergedMessages = mergeConversationMessages(cachedMessages, catchUp.messages);
-                  const mergedLatestSequenceId = latestMessageSequenceId(mergedMessages);
-
                   await cacheDB.putMessages(catchUp.messages);
-                  await cacheDB.putReplicaMeta({
-                    conversationId: cachedConversationId,
-                    latestMessageSequenceId: catchUp.server_message_tail ?? mergedLatestSequenceId,
-                    latestEventSequenceId: null,
-                    transcriptGeneration: catchUp.transcript_generation,
-                    lastHydratedAt: new Date().toISOString(),
-                  });
+                }
+                await cacheDB.putReplicaMeta({
+                  conversationId: cachedConversationId,
+                  latestMessageSequenceId: catchUp.server_message_tail ?? mergedLatestSequenceId,
+                  latestEventSequenceId: null,
+                  transcriptGeneration: catchUp.transcript_generation,
+                  lastHydratedAt: new Date().toISOString(),
+                });
 
-                  const cachedForDispatch = cached;
-                  if (
-                    cachedForDispatch &&
-                    !cancelled &&
-                    (!atomRef.current.conversation || atomRef.current.conversation.slug === slug)
-                  ) {
-                    dispatch({
-                      type: 'set_initial_data',
-                      conversationId: cachedConversationId,
-                      conversation: cachedForDispatch,
-                      messages: mergedMessages,
-                      phase: cachedForDispatch.state ? parseConversationState(cachedForDispatch.state) : { type: 'idle' },
-                      contextWindow: { used: 0 },
-                      transcriptGeneration: cachedForDispatch.transcript_generation ?? 1,
-                    });
-                  }
+                const metadata = await api.getConversationBySlug(slug);
+                if (cancelled) return;
+                const authoritativeConversation = metadata.conversation;
+                setArchiveStatusConfirmedConversationId(authoritativeConversation.id);
+                await cacheDB.putConversation(authoritativeConversation);
+
+                if (!atomRef.current.conversation || atomRef.current.conversation.slug === slug) {
+                  dispatch({
+                    type: 'set_initial_data',
+                    conversationId: cachedConversationId,
+                    conversation: authoritativeConversation,
+                    messages: mergedMessages,
+                    phase: authoritativeConversation.state
+                      ? parseConversationState(authoritativeConversation.state)
+                      : { type: 'idle' },
+                    contextWindow: { used: metadata.context_window_size || 0 },
+                    transcriptGeneration: authoritativeConversation.transcript_generation ?? catchUp.transcript_generation,
+                  });
                 }
                 return;
               }

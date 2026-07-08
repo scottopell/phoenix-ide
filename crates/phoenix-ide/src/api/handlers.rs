@@ -2629,7 +2629,8 @@ fn snapshot_pending_for_stream(
         broadcast_tx
             .snapshot_pending_after(after_event_sequence)
             .unwrap_or_else(|| {
-                broadcast_tx.observe_seq(after_event_sequence);
+                let server_tip = broadcast_tx.current_seq();
+                broadcast_tx.observe_seq(after_event_sequence.min(server_tip));
                 broadcast_tx.snapshot_pending()
             })
     } else {

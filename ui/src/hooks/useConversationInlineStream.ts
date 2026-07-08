@@ -1,4 +1,4 @@
-import { useEffect, useReducer } from 'react';
+import { useEffect, useReducer, type Dispatch } from 'react';
 import type { Message } from '../api';
 import { api, type Conversation } from '../api';
 import {
@@ -7,9 +7,16 @@ import {
   SseInitDataSchema,
   SseLlmAttemptDataSchema,
   SseLlmFirstByteDataSchema,
+  SseConversationBecameTerminalDataSchema,
+  SseConversationHardDeletedDataSchema,
+  SseConversationUpdateDataSchema,
+  SseBrowserSessionStateDataSchema,
   SseMessageDataSchema,
   SseMessageUpdatedDataSchema,
   SseStateChangeDataSchema,
+  SseSteerMessageQueuedDataSchema,
+  SseRateLimitSnapshotDataSchema,
+  SseWorkScopeUpdateDataSchema,
   SseTokenDataSchema,
   type SseInitData,
 } from '../sseSchemas';
@@ -69,6 +76,14 @@ function parseEventData(event: Event): unknown | null {
   } catch {
     return null;
   }
+}
+
+function consumeSequencedEvent(event: Event, schema: v.GenericSchema<unknown, { sequence_id: number }>, dispatch: Dispatch<InlineStreamAction>) {
+  const raw = parseEventData(event);
+  if (raw === null) return;
+  const res = v.safeParse(schema, raw);
+  if (!res.success) return;
+  dispatch({ type: 'atom', atomAction: { type: 'sse_sequence_consumed', sequenceId: res.output.sequence_id } });
 }
 
 // Bounded retry for a 404 on the initial snapshot. A freshly-spawned sub-agent
@@ -268,6 +283,34 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         const res = v.safeParse(SseAgentDoneDataSchema, raw);
         if (!res.success) return;
         dispatch({ type: 'atom', atomAction: { type: 'sse_agent_done', sequenceId: res.output.sequence_id } });
+      });
+
+      source.addEventListener('conversation_update', (event) => {
+        consumeSequencedEvent(event, SseConversationUpdateDataSchema, dispatch);
+      });
+
+      source.addEventListener('browser_session_state', (event) => {
+        consumeSequencedEvent(event, SseBrowserSessionStateDataSchema, dispatch);
+      });
+
+      source.addEventListener('conversation_became_terminal', (event) => {
+        consumeSequencedEvent(event, SseConversationBecameTerminalDataSchema, dispatch);
+      });
+
+      source.addEventListener('conversation_hard_deleted', (event) => {
+        consumeSequencedEvent(event, SseConversationHardDeletedDataSchema, dispatch);
+      });
+
+      source.addEventListener('steer_message_queued', (event) => {
+        consumeSequencedEvent(event, SseSteerMessageQueuedDataSchema, dispatch);
+      });
+
+      source.addEventListener('rate_limit_snapshot', (event) => {
+        consumeSequencedEvent(event, SseRateLimitSnapshotDataSchema, dispatch);
+      });
+
+      source.addEventListener('work_scope_update', (event) => {
+        consumeSequencedEvent(event, SseWorkScopeUpdateDataSchema, dispatch);
       });
 
       source.addEventListener('error', (event) => {
