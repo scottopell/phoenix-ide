@@ -79,6 +79,7 @@ We're starting conservatively to learn how agents consume skills:
 | Skill | Description |
 |-------|-------------|
 | [phoenix-development](phoenix-development/SKILL.md) | Dev workflow: `./dev.py up/down/restart/check`, testing, code conventions |
+| [phoenix-ladle-fixture](phoenix-ladle-fixture/SKILL.md) | End-to-end workflow for adding Phoenix UI Ladle fixtures, QA capture scripts, `./dev.py qa` wiring, and fixture best practices |
 | [phoenix-extract-crate](phoenix-extract-crate/SKILL.md) | Methodology for splitting a large crate into a layered, acyclic workspace: what sinks to the base crate vs. stays, breaking cycles, sequencing incremental refactors that stay shippable |
 | [phoenix-deployment](phoenix-deployment/SKILL.md) | Production deployment across native launchd (macOS), native systemd, and daemon modes |
 | [phoenix-task-tracking](phoenix-task-tracking/SKILL.md) | Task file format, CLI commands, issue discovery protocol |

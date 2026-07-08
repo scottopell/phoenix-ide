@@ -23,6 +23,7 @@
     "qa:task-approval": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-task-approval.mjs",
     "qa:mobile-conversation-list": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-mobile-conversation-list.mjs",
     "qa:message-list": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-message-list.mjs",
+    "qa:work-actions": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-work-actions.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

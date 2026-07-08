@@ -2557,6 +2557,16 @@ def cmd_qa_message_list() -> None:
     )
 
 
+def cmd_qa_work_actions() -> None:
+    """Capture Work Actions Ladle screenshots into ignored local artifacts."""
+    subprocess.run(
+        ["pnpm", "qa:work-actions"],
+        cwd=ROOT / "ui",
+        check=True,
+        env=node_env(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # TLS
 # ---------------------------------------------------------------------------
@@ -7503,6 +7513,7 @@ def main():
     qa_sub.add_parser("task-approval", help="Capture task approval Ladle screenshots")
     qa_sub.add_parser("mobile-conversation-list", help="Capture mobile conversation list Ladle screenshots")
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
+    qa_sub.add_parser("work-actions", help="Capture Work Actions Ladle screenshots")
 
     # tls
     tls_parser = sub.add_parser("tls", help="Manage Phoenix HTTPS certificates")
@@ -7604,6 +7615,8 @@ def main():
             cmd_qa_mobile_conversation_list()
         elif args.qa_command == "message-list":
             cmd_qa_message_list()
+        elif args.qa_command == "work-actions":
+            cmd_qa_work_actions()
     elif args.command == "tls":
         if args.tls_command == "ca":
             cmd_tls_ca(args.dir)
