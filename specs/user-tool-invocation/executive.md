@@ -42,8 +42,10 @@ recorded, attributable event in the same history the agent reads.
 - User-as-director tools (`spawn_agents`, `propose_task`) — meaningful but not
   self-service (they launch agent activity), deferred until concrete use cases
   emerge
-- Dominated tools (`patch`, `keyword_search`, `read_image`, `read_file`) — the
-  inline terminal already serves their journey (`!nvim`, `!rg`, `!cat`)
+- Dominated tools (`patch`, `keyword_search`, `read_file`) — the inline terminal
+  already serves their journey (`!nvim`, `!rg`, `!cat`). `read_image` is *not*
+  dominated (a viewer shows pixels to the human; only the tool records them into
+  history) and stays eligible.
 - LLM-internal / inter-agent-protocol tools (`think`, `submit_result`,
   `ask_user_question`) — no user journey
 - The exact sigil and argument grammar (a design choice, possibly per-tool)

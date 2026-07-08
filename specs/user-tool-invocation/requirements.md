@@ -57,18 +57,21 @@ A tool is exposed to direct user invocation only when all three hold:
    conversation to idle without launching further agent activity (REQ-UTI-006).
    Tools that start agent work are user-as-director actions, deferred (see Out
    of Scope).
-3. **Not dominated** — no native affordance gives the user the same effect more
-   directly. The inline terminal dominates every tool with a shell equivalent:
-   `patch` (use `!nvim`), `keyword_search` / `read_file` (use `!rg` / `!cat`),
-   `read_image` (view it directly). These are excluded not because they are
-   forbidden but because `bash` already serves their journey and records to the
-   same history.
+3. **Not dominated** — no native affordance gives the user the *same effect*
+   more directly. The inline terminal dominates every tool with a shell
+   equivalent that also records to shared history: `patch` (use `!nvim`),
+   `keyword_search` / `read_file` (use `!rg` / `!cat`). Domination is about
+   effect, not surface: a viewer is *not* a substitute for `read_image`, which
+   carries the image bytes through the typed image channel into LLM context —
+   viewing shows the pixels to the human only. `read_image` is therefore
+   eligible: a user can self-service a screenshot or generated image into shared
+   history without an agent turn.
 
 The members that survive are `bash` — realized by the inline terminal
-(REQ-UTI-007) — and self-service tools with no shell equivalent, chiefly MCP and
-project-registered integrations. The eligible set is defined by this criterion,
-not a fixed list, so a newly registered tool is evaluated against it rather than
-hardcoded.
+(REQ-UTI-007) — `read_image`, and self-service tools with no shell equivalent,
+chiefly MCP and project-registered integrations. The eligible set is defined by
+this criterion, not a fixed list, so a newly registered tool is evaluated against
+it rather than hardcoded.
 
 ### REQ-UTI-004 — Track B shared history
 

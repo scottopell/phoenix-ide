@@ -67,12 +67,21 @@ enum OpenRejectReason {
 ------------------------------------------------------------
 
 -- The `bash` tool-use of an inline round, encoded so REQ-IT-004 holds by
--- construction: this type carries only a command, so the backgrounded ops
--- (wait / kill / handle / label / since) are structurally unrepresentable — an
--- inline round cannot be anything but `bash` `run`. Maps to `BashToolInput { op:
--- BashOp::Run, cmd }`.
+-- construction: apart from the recorded cwd it carries only a command, so the
+-- backgrounded ops (wait / kill / handle / label / since) are structurally
+-- unrepresentable — an inline round cannot be anything but `bash` `run`. Maps to
+-- `BashToolInput { op: BashOp::Run, cmd }`.
+--
+-- `cwd` is recorded because the inline shell is *persistent* — a `cd` carries
+-- across later commands in the session — while agent `bash` rounds are
+-- independent and run from the conversation cwd. Without the cwd, `cd ui`
+-- followed by `pnpm test` would persist as a bare `pnpm test` that a later agent
+-- reads as running in the conversation root. The cwd is the shell's OSC 7
+-- report at command time (terminal/CwdReportedFromOsc7 → reported_cwd), so each
+-- round is self-describing.
 value BashRunToolUse {
     cmd: String                    -- the user's typed command (OSC 133;C payload)
+    cwd: String                    -- working directory at execution (OSC 7 reported_cwd)
 }
 
 -- The tool-result half of an inline round. bedrock/ToolResult models only
@@ -122,24 +131,40 @@ value InlineCommandRound {
 --       never depends on the underlying terminal's transient current_command
 --       (undefined after terminal teardown). (REQ-IT-005)
 --
---   completed_round(record: terminal/CommandRecord) -> InlineCommandRound
---       The round for a command that finished (OSC 133;D). tool_use_id = a fresh
---       generated id; tool_use = BashRunToolUse(cmd: record.command_text); the
---       `bash` tool-result comes from the finalized `record` (captured output +
---       exit-code annotation, using the bash tool's existing result formatting;
---       a None exit_code renders as "no exit code", never fabricated as 0).
---       outcome = completed, origin = user (REQ-IT-007 — origin is fixed by this
---       path, not a caller choice).
+--   command_cwd(session: InlineTerminalSession) -> String
+--       The working directory for a command committed now: the session's most
+--       recent OSC 7 report (terminal/CwdReportedFromOsc7 → reported_cwd),
+--       falling back to the conversation cwd when the shell has emitted no OSC 7.
 --
---   interrupted_round(command_text: String) -> InlineCommandRound
+--   command_text_or_unknown(raw: String) -> String
+--       `raw` when the OSC 133;C payload is non-empty; otherwise an explicit
+--       "[command unavailable]" marker. Some shells emit C with no payload; a
+--       blank `cmd` beside real output would misrepresent what the user ran, so
+--       it is recorded as unavailable rather than an empty `bash` command. The
+--       inline terminal installs integration hooks that populate the payload, so
+--       this fallback is defensive, not the norm.
+--
+--   completed_round(session: InlineTerminalSession, record: terminal/CommandRecord)
+--           -> InlineCommandRound
+--       The round for a command that finished (OSC 133;D). tool_use_id = a fresh
+--       generated id; tool_use = BashRunToolUse(cmd:
+--       command_text_or_unknown(record.command_text), cwd: command_cwd(session));
+--       the `bash` tool-result comes from the finalized `record` (captured output
+--       + exit-code annotation, using the bash tool's existing result
+--       formatting; a None exit_code renders as "no exit code", never fabricated
+--       as 0). outcome = completed, origin = user (REQ-IT-007 — origin is fixed
+--       by this path, not a caller choice).
+--
+--   interrupted_round(session: InlineTerminalSession, command_text: String)
+--           -> InlineCommandRound
 --       The round for a command whose bracket was superseded or closed without a
---       D. tool_use_id = a fresh generated id; tool_use =
---       BashRunToolUse(cmd: command_text); a best-effort tool-result — the
---       guarantee is that the command is recorded, its output may be empty
---       (output fidelity for a cut-off command is the shared CommandTracker
---       concern, Deferred: TuiCursorAddressedOutput). outcome = interrupted,
---       origin = user. The inline layer keeps only the command text for an open
---       bracket (session.open_command), which is all an interrupted round needs.
+--       D. tool_use_id = a fresh generated id; tool_use = BashRunToolUse(cmd:
+--       command_text_or_unknown(command_text), cwd: command_cwd(session)); a
+--       best-effort tool-result — the guarantee is that the command is recorded,
+--       its output may be empty (output fidelity for a cut-off command is the
+--       shared CommandTracker concern, Deferred: TuiCursorAddressedOutput).
+--       outcome = interrupted, origin = user. The inline layer keeps only the
+--       command text for an open bracket (session.open_command).
 
 ------------------------------------------------------------
 -- Entities
@@ -277,7 +302,7 @@ rule UserClosesInlineTerminal {
         if inline_bracket_open(session):
             InlineRoundCommitted(
                 session.conversation,
-                interrupted_round(session.open_command)
+                interrupted_round(session, session.open_command)
             )
 
     ensures: session.open_command = None
@@ -327,7 +352,7 @@ rule TransportLossClosesInlineSession {
         if inline_bracket_open(session):
             InlineRoundCommitted(
                 session.conversation,
-                interrupted_round(session.open_command)
+                interrupted_round(session, session.open_command)
             )
 
     ensures: session.open_command = None
@@ -369,7 +394,7 @@ rule InlineCommandStarting {
         if inline_bracket_open(session):
             InlineRoundCommitted(
                 session.conversation,
-                interrupted_round(session.open_command)
+                interrupted_round(session, session.open_command)
             )
 
     ensures: session.open_command = command_text
@@ -394,7 +419,7 @@ rule InlineCommandCompleted {
     -- C and D, exit_code from the D payload (None when D omits it — never
     -- fabricated as 0, matching terminal/CommandRecord). Committed as a
     -- user-originated bash-run round (Track B), then the bracket is cleared.
-    ensures: InlineRoundCommitted(session.conversation, completed_round(record))
+    ensures: InlineRoundCommitted(session.conversation, completed_round(session, record))
     ensures: session.open_command = None
 
     @guidance
@@ -562,7 +587,15 @@ deferred BedrockInlineTerminalBusyState
     -- enum variant and its idle-return transition, added in `specs/bedrock`
     -- (`Conversation.core_status`, `Conversation.is_busy`), which consume these
     -- two transitions.
-    -- Location: specs/bedrock/
+    --
+    -- The `inline_terminal` busy state must also be NON-STEERABLE:
+    -- `specs/steering-messages` queues a message for any busy conversation and
+    -- drains it — issuing an agent request — on the next transition to idle.
+    -- Since close transitions inline_terminal → idle, a queued steering message
+    -- would fire an agent turn on close, breaking the no-agent-turn contract
+    -- (NoAgentTurn). So steering acceptance must exclude `inline_terminal`
+    -- (reject rather than queue), alongside the bedrock enum change.
+    -- Location: specs/bedrock/, specs/steering-messages/
 
 deferred OriginDiscriminatorSchema
     -- REQ-IT-007's single `origin` marker (user | agent) is a new persisted

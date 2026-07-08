@@ -31,9 +31,12 @@ anything better already serves that journey.
 2. **Eligibility criterion, narrow to self-service.** Expose a tool only when
    authorship is *meaningful* (a human would run it), it is *self-service*
    (produces a result and returns the conversation to idle, launching no agent
-   activity), and it is *not dominated* by a native affordance. Survivors: `bash`
-   (the inline terminal) plus tools with no shell equivalent — chiefly MCP /
-   project integrations. Defer "user-as-director" tools.
+   activity), and it is *not dominated* by a native affordance (domination is
+   about *effect*, not surface). Survivors: `bash` (the inline terminal),
+   `read_image` (a viewer shows pixels to the human, but only the tool records
+   them into LLM context — not the same effect), plus tools with no shell
+   equivalent — chiefly MCP / project integrations. Defer "user-as-director"
+   tools.
 3. **Expose the whole registry, including director tools now.** Broadest reach,
    but `spawn_agents` / `propose_task` *launch* agent activity rather than
    returning to idle (breaking the no-agent-turn property), and a user-authored
@@ -61,9 +64,10 @@ preserves a clean "no agent turn, returns to idle" contract.
   hardcodes a list that rots.
 - **Positive:** the no-agent-turn / return-to-idle contract stays clean, because
   every eligible tool is self-service by construction.
-- **Negative:** the built-in worker tools (`patch`, `keyword_search`,
-  `read_image`) are all dominated by the terminal, so the general `$tool` syntax
-  has few members beyond `bash` until MCP / project integrations arrive.
+- **Negative:** most built-in worker tools (`patch`, `keyword_search`,
+  `read_file`) are dominated by the terminal, so the general `$tool` syntax has
+  few members beyond `bash` and `read_image` until MCP / project integrations
+  arrive.
 - **Negative:** director use cases (a user directly fanning out sub-agents or
   authoring a task) wait for a follow-up design.
 - **Neutral:** the inline terminal is the concrete `bash` consumer of the model;

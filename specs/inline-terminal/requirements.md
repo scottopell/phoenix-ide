@@ -49,6 +49,14 @@ still yields a working interactive terminal, but commits no rounds and leaves
 shell exit (`Ctrl-D`) as the only close path; the implementation surfaces this
 degradation to the user rather than the spec modeling it.
 
+The inline terminal uses an **inline-specific integration-detection policy**: it
+detects integration on the first OSC 133 marker of any kind (prompt markers
+`A`/`B`, which fire when the shell renders its prompt — before the user types —
+as well as `C`). It does **not** inherit the panel terminal's "a `C` within a
+fixed window from spawn or lock absent" policy (`specs/terminal`, REQ-TERM-015):
+`C` fires only when the first command runs, so a user who pauses before typing
+would otherwise be locked to `absent` and commit no rounds in normal use.
+
 ### REQ-IT-002 — Opening is gated to an idle conversation
 
 An inline terminal session may be opened only when the conversation is idle.
@@ -56,6 +64,16 @@ While a session is live the conversation is busy: it does not accept an
 agent-triggering user message, and the agent does not run. Attempting to open a
 session while the conversation is busy is rejected. At most one live inline
 terminal session exists per conversation.
+
+The inline-terminal busy state is **non-steerable**. A chat message submitted
+from another surface while a session is live is rejected, not queued as a
+steering message. This is deliberate: `specs/steering-messages` queues messages
+for any busy conversation and drains them — issuing an agent request — on the
+next transition to idle. Since closing an inline session transitions the
+conversation to idle, a queued steering message would fire an agent turn on
+close, contradicting the no-agent-turn contract. The `inline_terminal` busy
+state is therefore excluded from steering acceptance (a bedrock/steering
+coordination point; see the Allium `BedrockInlineTerminalBusyState`).
 
 ### REQ-IT-003 — Each command is committed as a user-originated tool round
 
