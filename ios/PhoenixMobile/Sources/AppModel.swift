@@ -11,6 +11,10 @@ final class AppModel {
     private static let serverURLKey = "phoenix.serverURL"
     private static let trustSelfSignedKey = "phoenix.trustSelfSigned"
     private static let passwordAccount = "server-password"
+    /// Shared with NewConversationView's @AppStorage. Cleared on sign-out:
+    /// the value is a server-local filesystem path and must not leak (or be
+    /// sent) to a different server configured later.
+    static let lastCwdKey = "phoenix.lastCwd"
 
     var serverURLString: String {
         didSet {
@@ -97,10 +101,13 @@ final class AppModel {
         for session in sessions.values { session.stop() }
     }
 
-    /// Sign-out also clears all cached data: conversations are per-server
-    /// state and must not leak across a server/account switch.
+    /// Sign-out also clears all cached data: conversations, the last-used
+    /// working directory, and the pinned certificate are per-server state
+    /// and must not leak across a server/account switch.
     func signOut() {
         clearCache()
+        UserDefaults.standard.removeObject(forKey: Self.lastCwdKey)
+        CertPinStore.forget()
         password = ""
         Keychain.deletePassword(account: Self.passwordAccount)
         serverURLString = ""

@@ -172,6 +172,10 @@ final class ConversationSession {
                         text: entry.text,
                         images: entry.images,
                         messageId: entry.localId)
+                    // A completion racing stop() (cache clear, sign-out)
+                    // must not mutate — and re-persist — the outbox after
+                    // its files were deleted.
+                    guard !Task.isCancelled else { return }
                     outbox.markAccepted(entry.localId, steering: response.steering ?? false)
                 } catch let error as APIError where error.isTransport {
                     // Offline or unreachable: stay pending. The next drain
@@ -179,6 +183,7 @@ final class ConversationSession {
                     // retries automatically.
                     return
                 } catch {
+                    guard !Task.isCancelled else { return }
                     outbox.markFailed(
                         entry.localId,
                         error: (error as? APIError)?.errorDescription

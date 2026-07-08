@@ -44,9 +44,12 @@ On first launch, enter the server URL and password:
   auth disabled.
 
 Phoenix servers usually serve TLS with a self-signed certificate — leave
-**Trust self-signed certificate** on for those. The bundled ATS exception
-(`NSAllowsArbitraryLoads`) exists for this personal-tool posture; the
-in-app toggle governs what is actually trusted.
+**Trust self-signed certificate** on for those. Trust is **pinned on first
+use**: the first successful connection records the certificate's SHA-256
+fingerprint, and a later mismatch fails closed until you explicitly forget
+the pin in Settings → Security (e.g. after reinstalling the server). The
+bundled ATS exception (`NSAllowsArbitraryLoads`) exists for this
+personal-tool posture; the pin governs what is actually trusted.
 
 For reaching your server away from home (the actual subway case), put the
 server on a tailnet/VPN and use its tailnet hostname.
@@ -106,6 +109,7 @@ PhoenixMobile/Sources/
   Support/
     JSONValue.swift         Generic JSON tree for polymorphic wire payloads
     Keychain.swift          Password storage
+    CertPinStore.swift      Trust-on-first-use certificate pin (self-signed TLS)
     ConnectivityMonitor.swift  NWPathMonitor -> offline banner + drain triggers
     DiskStore.swift         Atomic JSON persistence (Application Support)
   API/

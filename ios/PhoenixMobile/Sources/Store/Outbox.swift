@@ -115,13 +115,17 @@ final class Outbox {
     }
 
     /// PostAcceptedAsSteeringQueued / PostAcceptedAsPendingReflection.
+    /// Terminal entries are immune: a replayed steer_message_queued event
+    /// (SSE pending-events ring) or a POST completing after dismissal must
+    /// not resurrect an entry the user discarded or that already reconciled.
     func markAccepted(_ localId: String, steering: Bool) {
-        update(localId) {
-            $0.acceptedByServer = true
-            $0.acceptedAt = Date()
-            $0.lastError = nil
+        update(localId) { entry in
+            guard entry.isVisible else { return }
+            entry.acceptedByServer = true
+            entry.acceptedAt = Date()
+            entry.lastError = nil
             if steering {
-                $0.status = .steeringQueued
+                entry.status = .steeringQueued
             }
             // Non-steering accept stays `pending` until authoritative
             // history reflects it (reconcile below).
@@ -133,9 +137,10 @@ final class Outbox {
     /// `pending` and are auto-retried when connectivity returns, which is
     /// safe because message_id makes resends idempotent.
     func markFailed(_ localId: String, error: String) {
-        update(localId) {
-            $0.status = .failed
-            $0.lastError = error
+        update(localId) { entry in
+            guard entry.isVisible else { return }
+            entry.status = .failed
+            entry.lastError = error
         }
     }
 

@@ -7,7 +7,7 @@ struct NewConversationView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
 
-    @AppStorage("phoenix.lastCwd") private var cwd = ""
+    @AppStorage(AppModel.lastCwdKey) private var cwd = ""
     @State private var firstMessage = ""
     @State private var modelIDs: [String] = []
     @State private var selectedModel: String?
@@ -15,6 +15,11 @@ struct NewConversationView: View {
     @State private var creating = false
     @State private var errorText: String?
     @State private var validationTask: Task<Void, Never>?
+    /// One id per draft, minted at sheet presentation and reused across
+    /// retries: if the create POST reaches the server but the response is
+    /// lost, retrying with the same message_id lets the server's duplicate
+    /// guard converge instead of creating a second conversation.
+    @State private var createMessageId = UUID().uuidString.lowercased()
 
     enum CwdStatus: Equatable {
         case unknown
@@ -149,7 +154,7 @@ struct NewConversationView: View {
                 cwd: cwd.trimmingCharacters(in: .whitespaces),
                 text: firstMessage.trimmingCharacters(in: .whitespacesAndNewlines),
                 model: selectedModel,
-                messageId: UUID().uuidString.lowercased())
+                messageId: createMessageId)
             model.listStore.upsert(conversation)
             dismiss()
         } catch {

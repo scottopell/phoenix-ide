@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import Security
 
 enum APIError: Error, LocalizedError {
     /// Network-level failure — no HTTP response was received. Retryable:
@@ -29,9 +31,11 @@ enum APIError: Error, LocalizedError {
     }
 }
 
-/// Accepts self-signed certificates when the user has opted in. Phoenix dev
-/// and prod deployments typically serve TLS with a self-signed or local-CA
-/// cert (see TLS.md), mirroring phoenix-client.py's trust-by-locality.
+/// Server trust handling for Phoenix's self-signed TLS posture (TLS.md):
+/// CA-valid certificates pass standard evaluation untouched; when the user
+/// enabled self-signed trust, a failing chain is accepted only under the
+/// trust-on-first-use pin in CertPinStore (REQ-IOS-008) — never blindly,
+/// because every request carries the Bearer password.
 final class ServerTrustDelegate: NSObject, URLSessionDelegate {
     let allowSelfSigned: Bool
 
@@ -44,13 +48,39 @@ final class ServerTrustDelegate: NSObject, URLSessionDelegate {
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        if allowSelfSigned,
-           challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-           let trust = challenge.protectionSpace.serverTrust {
-            completionHandler(.useCredential, URLCredential(trust: trust))
-        } else {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust
+        else {
             completionHandler(.performDefaultHandling, nil)
+            return
         }
+        // Properly CA-signed certificates need no pinning.
+        if SecTrustEvaluateWithError(trust, nil) {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+            return
+        }
+        guard allowSelfSigned, let fingerprint = Self.leafFingerprint(trust) else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        let space = challenge.protectionSpace
+        switch CertPinStore.evaluate(host: space.host, port: space.port, fingerprint: fingerprint) {
+        case .accept:
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        case .reject:
+            // Pin mismatch: fail closed. Settings shows the mismatch and
+            // offers an explicit "forget pin" re-trust path.
+            completionHandler(.cancelAuthenticationChallenge, nil)
+        }
+    }
+
+    /// SHA-256 over the leaf certificate's DER bytes, lowercase hex.
+    private static func leafFingerprint(_ trust: SecTrust) -> String? {
+        guard let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
+              let leaf = chain.first
+        else { return nil }
+        let der = SecCertificateCopyData(leaf) as Data
+        return SHA256.hash(data: der).map { String(format: "%02x", $0) }.joined()
     }
 }
 
