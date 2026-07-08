@@ -967,6 +967,18 @@ impl BrowserSessionManager {
         }
     }
 
+    async fn wait_for_kill_completion(&self, key: &str, done: Arc<Notify>) {
+        loop {
+            let notified = done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.sessions.read().await.contains_key(key) {
+                break;
+            }
+            notified.await;
+        }
+    }
+
     /// Get a session for a `work_scope` (creates if needed).
     /// Returns Arc to the session - caller manages locking.
     ///
@@ -985,21 +997,34 @@ impl BrowserSessionManager {
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
         let key = work_scope.stable_key();
 
-        // Check if session exists
-        {
-            let sessions = self.sessions.read().await;
+        let mut sessions = loop {
+            {
+                let sessions = self.sessions.read().await;
+                if let Some(entry) = sessions.get(&key) {
+                    if entry.kill_requested.load(Ordering::SeqCst) {
+                        let kill_done = entry.kill_done.clone();
+                        drop(sessions);
+                        self.wait_for_kill_completion(&key, kill_done).await;
+                        continue;
+                    }
+                    return Ok(entry.session.clone());
+                }
+            }
+
+            let sessions = self.sessions.write().await;
             if let Some(entry) = sessions.get(&key) {
+                if entry.kill_requested.load(Ordering::SeqCst) {
+                    let kill_done = entry.kill_done.clone();
+                    drop(sessions);
+                    self.wait_for_kill_completion(&key, kill_done).await;
+                    continue;
+                }
                 return Ok(entry.session.clone());
             }
-        }
+            break sessions;
+        };
 
         // Create new session
-        let mut sessions = self.sessions.write().await;
-
-        // Double-check after acquiring write lock
-        if let Some(entry) = sessions.get(&key) {
-            return Ok(entry.session.clone());
-        }
 
         tracing::info!(work_scope = %work_scope, "Creating new browser session");
         // BrowserSession::new bounds its own CDP launch (and may legitimately
@@ -1233,13 +1258,9 @@ impl BrowserSessionManager {
                     tracing::warn!(work_scope = %work_scope, error = %err, "browser kill task failed");
                 }
             }
-            KillSessionOutcome::AlreadyRequested { key, done } => loop {
-                let notified = done.notified();
-                if !self.sessions.read().await.contains_key(&key) {
-                    break;
-                }
-                notified.await;
-            },
+            KillSessionOutcome::AlreadyRequested { key, done } => {
+                self.wait_for_kill_completion(&key, done).await;
+            }
         }
     }
 
