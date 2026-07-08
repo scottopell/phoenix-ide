@@ -140,7 +140,7 @@ function renderHistoricalUnit(
       const c = unit.message.content as { name?: string; trigger?: string; args?: string; source?: string; snippet?: string; files?: { original_name: string; size_bytes: number; stored_path?: string }[] };
       const trigger = c.trigger?.trim() || [c.name ? `/${c.name}` : '/skill', c.args?.trim()].filter(Boolean).join(' ');
       return (
-        <div className="message user" data-sequence-id={unit.message.sequence_id}>
+        <div id={`message-${unit.message.message_id}`} className="message user" data-sequence-id={unit.message.sequence_id}>
           <div className="message-header">
             <span className="message-sender">You</span>
             {unit.message.created_at && (

@@ -50,9 +50,22 @@ export function GlobalRecallPage() {
       setMessages([]);
       return;
     }
-    api.getGlobalRecallSession(activeSessionId)
-      .then((res) => setMessages(res.messages))
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    const requestedSessionId = activeSessionId;
+    let cancelled = false;
+    api.getGlobalRecallSession(requestedSessionId)
+      .then((res) => {
+        if (!cancelled && requestedSessionId === activeSessionId) {
+          setMessages(res.messages);
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [activeSessionId]);
 
   const itemCount = useMemo(

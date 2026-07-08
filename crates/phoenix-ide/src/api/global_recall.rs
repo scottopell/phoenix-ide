@@ -764,12 +764,10 @@ async fn global_index_is_fresh(state: &AppState) -> Result<bool, crate::db::Retr
     if !state.message_retriever.index_reconciled() {
         return Ok(false);
     }
-    let conversations = state
-        .db
-        .list_conversations()
+    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM conversations")
+        .fetch_all(state.db.pool())
         .await
-        .map_err(|e| crate::db::RetrievalError::Db(sqlx::Error::Protocol(e.to_string())))?;
-    let ids: Vec<String> = conversations.into_iter().map(|c| c.id).collect();
+        .map_err(crate::db::RetrievalError::Db)?;
     state.message_retriever.is_fresh_for(&ids).await
 }
 
@@ -949,13 +947,22 @@ fn format_open_work_for_agent(view: &GlobalOpenWorkResponse) -> String {
         for item in &group.items {
             let _ = writeln!(
                 out,
-                "- {} {} ({:?}) current @conv:{} link {} updated {} signals: {}",
+                "- {} {} ({:?}) current @conv:{} root @conv:{} link {} updated {} mode {} state {} task {} {} {} branch {} base {} worktree {} signals: {}",
                 item.reference,
                 item.title,
                 item.source,
                 item.current_conversation_id,
+                item.root_conversation_id,
                 item.href,
                 item.updated_at,
+                item.mode,
+                item.state,
+                item.task_id.as_deref().unwrap_or("none"),
+                item.task_status.as_deref().unwrap_or(""),
+                item.task_title.as_deref().unwrap_or(""),
+                item.branch_name.as_deref().unwrap_or("none"),
+                item.base_branch.as_deref().unwrap_or("none"),
+                item.worktree_path.as_deref().unwrap_or("none"),
                 item.signals.join(", ")
             );
         }
@@ -1041,6 +1048,16 @@ async fn resolve_chain(
         .chain_members_forward(root_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+    let resolved_root = state
+        .db
+        .chain_root_of(root_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if resolved_root.as_deref() != Some(root_id) || members.len() < 2 {
+        return Err(AppError::NotFound(
+            "chain reference target not found".to_string(),
+        ));
+    }
     Ok(ResolveGlobalReferenceResponse {
         kind: "chain".to_string(),
         id: root_id.to_string(),
@@ -1064,7 +1081,7 @@ async fn resolve_work(
     let view = build_open_work(state).await?;
     for group in view.groups {
         for item in group.items {
-            if item.id == id || item.reference.ends_with(id) {
+            if item.id == id || item.reference == format!("@work:{id}") {
                 return Ok(ResolveGlobalReferenceResponse {
                     kind: "work".to_string(),
                     id: item.id,

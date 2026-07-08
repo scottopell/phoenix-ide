@@ -619,7 +619,7 @@ function UserMessageImpl({ message }: { message: Message }) {
   const timestamp = message.created_at;
 
   return (
-    <div className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
+    <div id={`message-${message.message_id}`} className={`message ${isMeta ? 'meta' : 'user'}`} data-sequence-id={message.sequence_id}>
       <div className="message-header">
         <span className="message-header-meta">
           {!isMeta && <span className="message-sender">You</span>}
@@ -1027,7 +1027,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
   }
 
   return (
-    <div className="message agent" data-sequence-id={message.sequence_id}>
+    <div id={`message-${message.message_id}`} className="message agent" data-sequence-id={message.sequence_id}>
       {!isFirstInTurn && (
         <div className="message-mobile-copy-row">
           <MessageCopyButton message={message} title="Copy Phoenix message" />
