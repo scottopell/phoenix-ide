@@ -13,3 +13,6 @@ CompactLatestExpanded.storyName = 'compact-latest-expanded';
 
 export const CompactToolStrip = storyFor('compact-tool-strip');
 CompactToolStrip.storyName = 'compact-tool-strip';
+
+export const MarkdownImageDark = storyFor('markdown-image-dark');
+MarkdownImageDark.storyName = 'markdown-image-dark';

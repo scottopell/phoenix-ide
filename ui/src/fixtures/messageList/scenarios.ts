@@ -112,6 +112,38 @@ const toolStripMessages: Message[] = [
   },
 ];
 
+const markdownImageMessages: Message[] = [
+  {
+    message_id: 'user-image-1',
+    conversation_id: 'fixture-message-list',
+    sequence_id: 1,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T10:00:00.000Z',
+    content: { text: 'Please include the screenshot preview in your summary.' },
+    display_data: {},
+  },
+  {
+    message_id: 'agent-image-1',
+    conversation_id: 'fixture-message-list',
+    sequence_id: 2,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:00.000Z',
+    content: [{
+      type: 'text',
+      text: [
+        'Here is the Markdown screenshot preview using the same syntax agents paste into conversations:',
+        '',
+        '![file-tree-dark-single-slot](qa/message-list/markdown-image-fixture.svg)',
+        '',
+        'The image is constrained to the message column and keeps its aspect ratio.',
+      ].join('\n'),
+    }],
+    display_data: {},
+  },
+];
+
 
 export const messageListScenarios = [
   {
@@ -126,6 +158,12 @@ export const messageListScenarios = [
     description: 'Compact density still collapses tool detail into the inline pill strip.',
     theme: 'dark',
   },
+  {
+    id: 'markdown-image-dark',
+    title: 'Markdown image',
+    description: 'Assistant Markdown image syntax renders an inline screenshot preview.',
+    theme: 'dark',
+  },
 ] as const satisfies readonly MessageListScenario[];
 
 export type MessageListScenarioId = (typeof messageListScenarios)[number]['id'];
@@ -137,7 +175,11 @@ export function getMessageListScenario(id: MessageListScenarioId): MessageListSc
 }
 
 export function messageListFixtureData(scenario: MessageListScenario): MessageListFixtureData {
-  const messages = scenario.id === 'compact-tool-strip' ? toolStripMessages : baseMessages;
+  const messages = scenario.id === 'compact-tool-strip'
+    ? toolStripMessages
+    : scenario.id === 'markdown-image-dark'
+      ? markdownImageMessages
+      : baseMessages;
   return {
     conversationId: `fixture-message-list-${scenario.id}`,
     slug: `fixture-message-list-${scenario.id}`,
