@@ -72,6 +72,7 @@ final class ConversationSession {
             messages = snap.messages
             lastSequenceId = snap.lastSequenceId
             typedState = ConversationState.parse(snap.conversation?.state)
+            presentationMode = snap.conversation?.presentation_mode
             rebuildToolUseIndex()
         }
     }
@@ -293,6 +294,13 @@ final class ConversationSession {
             messages = snap.messages.sorted { $0.sequence_id < $1.sequence_id }
             agentWorking = snap.agentWorking
             presentationMode = snap.presentationMode
+            // Init carries presentation_mode as a top-level field, not on
+            // the conversation record — fold it in so the persisted
+            // snapshot preserves it for offline cold opens (the
+            // needs-action gating reads it).
+            if let mode = snap.presentationMode {
+                conversation?.presentation_mode = mode
+            }
             streamingText = ""
             streamingRequestId = nil
             // Replay the ring through the same reducer so an in-flight turn

@@ -79,9 +79,16 @@ struct StateDetailView: View {
             }
 
         case .other(let type):
-            // Unhandled variant: label it rather than guessing. The busy
-            // spinner still comes from agentWorking (presentation_mode).
-            if session.agentWorking {
+            // Unhandled variant: label it rather than guessing. The server's
+            // presentation mode decides the family — an untyped variant that
+            // needs the user still gets a card, not silence.
+            if session.presentationMode == "needs_action" {
+                needsActionCard(
+                    icon: "person.crop.circle.badge.exclamationmark",
+                    title: "Action needed",
+                    detail: type.replacingOccurrences(of: "_", with: " "),
+                    footnote: "Handle this from the web UI.")
+            } else if session.agentWorking {
                 workingRow {
                     Text(type.replacingOccurrences(of: "_", with: " "))
                         .font(.caption)

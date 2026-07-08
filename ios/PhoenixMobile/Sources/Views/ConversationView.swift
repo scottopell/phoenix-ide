@@ -12,7 +12,26 @@ struct ConversationView: View {
         VStack(spacing: 0) {
             OfflineBanner()
             ConnectionStateBar(session: session)
-            messageList
+            if !session.outbox.persistenceHealthy {
+                Label(
+                    "Storage write failed — queued messages may not survive a restart",
+                    systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.caption2)
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                    .background(.red.gradient)
+            }
+            if isUncachedOffline {
+                ContentUnavailableView {
+                    Label("Not cached on this device", systemImage: "icloud.slash")
+                } description: {
+                    Text("Open this conversation once while connected to read it offline.")
+                }
+                .frame(maxHeight: .infinity)
+            } else {
+                messageList
+            }
             StateDetailView(session: session)
             ComposerView(session: session, draft: $draft)
         }
@@ -34,6 +53,15 @@ struct ConversationView: View {
             // draining, but flush a snapshot at navigation boundaries.
             session.persistOnNavigate()
         }
+    }
+
+    /// Offline with nothing cached and nothing queued: an empty transcript
+    /// would read as data loss — name the actual situation instead.
+    private var isUncachedOffline: Bool {
+        !model.connectivity.isOnline
+            && session.conversation == nil
+            && session.messages.isEmpty
+            && session.outbox.visibleEntries.isEmpty
     }
 
     private var messageList: some View {
