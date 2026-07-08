@@ -122,7 +122,8 @@ SHALL be populated whenever `terminal_cause = Forgotten` and SHALL be drawn from
 finite set: `phoenix_restart`, `cascade_destroyed_handle`,
 `subagent_handle_missing`, or `tmux_handle_missing`. The `terminal_payload` column
 SHALL hold only the cause-specific body and SHALL NOT repeat those discriminator
-values.
+values or the watched `handle_kind`; replay derives the fired payload variant
+from the contract row.
 
 THE SYSTEM SHALL update `status`, `terminal_cause`, `forgotten_reason`,
 `terminal_payload`, and `resolved_at` atomically when a contract resolves

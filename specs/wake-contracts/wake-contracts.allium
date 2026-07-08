@@ -70,10 +70,9 @@ value Condition {
 }
 
 -- The payload delivered to the conversation when the contract resolves. The
--- top-level cause is the first discriminator; fired payloads carry a second
--- discriminator for the watched handle kind. This avoids the invalid states that
--- nullable sibling payloads permit (for example, cause = fired with no handle
--- payload, or cause = fired with both bash and tmux payloads).
+-- top-level cause is the only persisted cause discriminator. For fired payloads,
+-- the watched handle kind is derived from the contract row, not repeated inside
+-- terminal_payload.
 value FirePayload {
     cause: TerminalCause
     fired: FiredHandlePayload when cause = fired
@@ -85,10 +84,9 @@ value TerminalPayloadBody {
 }
 
 value FiredHandlePayload {
-    handle_kind: HandleKind
-    bash: BashTerminalPayload when handle_kind = bash
-    tmux: TmuxTerminalPayload when handle_kind = tmux_pane
-    sub_agent: SubAgentTerminalPayload when handle_kind = subagent
+    bash: BashTerminalPayload?
+    tmux: TmuxTerminalPayload?
+    sub_agent: SubAgentTerminalPayload?
 }
 
 value BashTerminalPayload {
@@ -717,6 +715,27 @@ invariant FiredContractsCarryFiredPayloadBody {
     for c in Contract where c.status = terminal and c.terminal_cause = fired:
         c.terminal_payload.fired != null
 }
+invariant FiredBashContractsCarryOnlyBashBody {
+    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.handle_kind = bash:
+        c.terminal_payload.fired.bash != null
+        and c.terminal_payload.fired.tmux = null
+        and c.terminal_payload.fired.sub_agent = null
+}
+
+invariant FiredTmuxContractsCarryOnlyTmuxBody {
+    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.handle_kind = tmux_pane:
+        c.terminal_payload.fired.tmux != null
+        and c.terminal_payload.fired.bash = null
+        and c.terminal_payload.fired.sub_agent = null
+}
+
+invariant FiredSubAgentContractsCarryOnlySubAgentBody {
+    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.handle_kind = subagent:
+        c.terminal_payload.fired.sub_agent != null
+        and c.terminal_payload.fired.bash = null
+        and c.terminal_payload.fired.tmux = null
+}
+
 invariant NonFiredTerminalRowsCarryNoFiredBody {
     for c in Contract where c.status = terminal and c.terminal_cause != fired:
         c.terminal_payload.fired = null
