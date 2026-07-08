@@ -267,6 +267,10 @@ describe('Sidebar — active conversation project filter', () => {
       </MemoryRouter>,
     );
 
+    await waitFor(() => {
+      expect(apiMock.getProjects).toHaveBeenCalled();
+    });
+
     expect(container.querySelectorAll('.sidebar-dot-btn')).toHaveLength(9);
     expect(container.querySelector('[title="conv-11"]')).not.toBeNull();
 

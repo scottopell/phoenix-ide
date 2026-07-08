@@ -2527,6 +2527,16 @@ def cmd_qa_conversation_panel() -> None:
     )
 
 
+def cmd_qa_sidebar() -> None:
+    """Capture sidebar Ladle screenshots into ignored local artifacts."""
+    subprocess.run(
+        ["pnpm", "qa:sidebar"],
+        cwd=ROOT / "ui",
+        check=True,
+        env=node_env(),
+    )
+
+
 def cmd_qa_task_approval() -> None:
     """Capture task approval Ladle screenshots into ignored local artifacts."""
     subprocess.run(
@@ -7500,6 +7510,7 @@ def main():
     qa_sub.add_parser("grounding-panel", help="Capture grounding panel Ladle screenshots")
     qa_sub.add_parser("meta-viewer", help="Capture MetaViewer edge-state Ladle screenshots")
     qa_sub.add_parser("conversation-panel", help="Capture conversation side panel Ladle screenshots")
+    qa_sub.add_parser("sidebar", help="Capture sidebar Ladle screenshots")
     qa_sub.add_parser("task-approval", help="Capture task approval Ladle screenshots")
     qa_sub.add_parser("mobile-conversation-list", help="Capture mobile conversation list Ladle screenshots")
     qa_sub.add_parser("message-list", help="Capture message list Ladle screenshots")
@@ -7598,6 +7609,8 @@ def main():
             cmd_qa_meta_viewer()
         elif args.qa_command == "conversation-panel":
             cmd_qa_conversation_panel()
+        elif args.qa_command == "sidebar":
+            cmd_qa_sidebar()
         elif args.qa_command == "task-approval":
             cmd_qa_task_approval()
         elif args.qa_command == "mobile-conversation-list":

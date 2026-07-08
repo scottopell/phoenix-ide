@@ -20,6 +20,7 @@
     "qa:grounding-panel": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-grounding-panel.mjs",
     "qa:meta-viewer": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-meta-viewer.mjs",
     "qa:conversation-panel": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-conversation-panel.mjs",
+    "qa:sidebar": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-sidebar.mjs",
     "qa:task-approval": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-task-approval.mjs",
     "qa:mobile-conversation-list": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-mobile-conversation-list.mjs",
     "qa:message-list": "playwright install chromium && PHOENIX_LADLE=1 node scripts/capture-message-list.mjs",

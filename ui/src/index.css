@@ -8061,6 +8061,38 @@ html * {
   font-size: 12px;
 }
 
+.sidebar-fixture {
+  min-height: 100vh;
+  display: flex;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.sidebar-fixture .sidebar {
+  position: relative;
+  height: 100vh;
+  border-right: 1px solid var(--border-color);
+}
+
+.sidebar-fixture-notes {
+  flex: 1;
+  padding: 32px;
+  color: var(--text-muted);
+}
+
+.sidebar-fixture-title {
+  margin: 0 0 8px;
+  color: var(--text-primary);
+  font-size: 20px;
+}
+
+.sidebar-fixture-copy {
+  max-width: 520px;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 /* --- New Conversation Page styles (REQ-CONV-017, REQ-CONV-018) --- */
 
 /* The "+ New" sidebar entry navigates to /new; the page below renders
