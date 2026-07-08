@@ -3115,7 +3115,10 @@ where
                                 _ => None,
                             })
                             .collect();
-                        if !text_parts.is_empty() {
+                        let text_only = blocks
+                            .iter()
+                            .all(|b| matches!(b, ContentBlock::Text { .. }));
+                        if !text_parts.is_empty() && text_only {
                             text = Some(text_parts.join("\n\n"));
                             break;
                         }

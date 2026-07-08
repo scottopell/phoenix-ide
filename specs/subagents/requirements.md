@@ -197,6 +197,12 @@ expire the wake contract when the child has durable terminal state only after th
 contract deadline, and otherwise treat the sub-agent handle as forgotten because
 active sub-agent runtimes do not survive restart
 
+Existing `spawn_agents` fan-in SHALL remain compatibility sugar. The runtime MAY
+lower that fan-in onto wake contracts internally. Explicit `wait_until` for
+sub-agent handles SHALL be usable only when a parent already has a stable child id
+from another surface; adding a non-blocking `spawn_agents` mode is out of scope
+for v1.
+
 THE sub-agent wake handle SHALL NOT be keyed by the parent's WorkScope and SHALL
 NOT imply parent-to-child continuation or automatic budget extension
 
