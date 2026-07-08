@@ -972,7 +972,13 @@ impl BrowserSessionManager {
             let notified = done.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if !self.sessions.read().await.contains_key(key) {
+            let still_waiting_for_same_kill = {
+                let sessions = self.sessions.read().await;
+                sessions
+                    .get(key)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.kill_done, &done))
+            };
+            if !still_waiting_for_same_kill {
                 break;
             }
             notified.await;
