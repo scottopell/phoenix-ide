@@ -125,6 +125,10 @@ SHALL hold only the cause-specific body and SHALL NOT repeat those discriminator
 values or the watched `handle_kind`; replay derives the fired payload variant
 from the contract row.
 
+THE SYSTEM SHALL persist captured bash and tmux wake tails in child tables keyed
+by `(contract_id, ordinal)` rather than inside `terminal_payload`. A missing tail
+row set means no captured tail output; ordering is the `ordinal` column.
+
 THE SYSTEM SHALL update `status`, `terminal_cause`, `forgotten_reason`,
 `terminal_payload`, and `resolved_at` atomically when a contract resolves
 
@@ -253,15 +257,17 @@ returned.
 For `HandleTerminal/Bash`, the tool result MUST carry the handle's terminal
 status (`exited` / `killed` / `kill_pending_kernel` / `forgotten` and any other
 status exposed by `bash op=wait`), `exit_code`, `duration_ms`, and a final tail
-window per REQ-BASH-004.
+window per REQ-BASH-004. The final tail is reconstructed from normalized
+wake-tail child rows, not from `terminal_payload`.
 
 For `HandleTerminal/TmuxPane`, the delivered tool result MUST identify the
 watched `window_id` from the contract's `handle_id` and carry terminal status,
 exit information when available, and a final captured tail window equivalent to
 the information the LLM would gather by inspecting the window after exit. The
-captured tail MUST be represented as a list; no output is an empty list, not an
-absent field. The persisted terminal payload body MUST NOT repeat `window_id`;
-replay derives the delivered identity from the contract row.
+captured tail MUST be represented as a list in the delivered result; no output is
+an empty list, not an absent field. Persisted captured tail lines live in
+normalized wake-tail child rows. The persisted terminal payload body MUST NOT
+repeat `window_id`; replay derives the delivered identity from the contract row.
 
 For `HandleTerminal/SubAgent`, the delivered tool result MUST identify the child
 conversation / agent id from the contract's `handle_id` and carry the spawned
@@ -300,7 +306,9 @@ while Phoenix is running, the router resolves the contract no later than the
 first tick at or after that timestamp; after downtime, startup reconciliation
 resolves contracts before normal serving resumes, delivering in-deadline durable
 terminal evidence, forgetting handles that became unknowable, and expiring only
-evaluable contracts with no such evidence. The deadline bounds the wait
+evaluable contracts with no such evidence. The running wake router uses the same
+precedence: durable terminal evidence recorded before `expires_at` fires even when
+the next router tick happens after `expires_at`. The deadline bounds the wait
 obligation, not the lifetime of the underlying process or child agent.
 
 ---

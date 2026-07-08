@@ -44,7 +44,9 @@ Add a normalized wake-contract persistence model with queryable discriminator co
 - `terminal_payload`
 - `resolved_at`
 
-`terminal_cause` and `forgotten_reason` are columns because metrics/operator views group on them. `terminal_payload` is only the cause-specific body and must not repeat those discriminator values.
+`terminal_cause` and `forgotten_reason` are columns because metrics/operator views group on them. `terminal_payload` is only the cause-specific body and must not repeat those discriminator values or the watched `handle_kind`.
+
+Persist captured bash/tmux wake tails as normalized child rows keyed by `(contract_id, ordinal)`, not as arrays inside `terminal_payload`.
 
 ### `wait_until` tool
 

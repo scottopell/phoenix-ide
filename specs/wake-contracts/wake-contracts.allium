@@ -95,14 +95,12 @@ value BashTerminalPayload {
     duration_ms: Integer?
     signal_number: Integer?        -- mirrors bash wait signal metadata when known
     kill_signal_sent: bash/KillSignal? -- mirrors kill_pending_kernel metadata
-    tail: List<bash/RingLine>
 }
 
 value TmuxTerminalPayload {
     terminal_status: TmuxTerminalStatus
     exit_code: Integer?
     duration_ms: Integer?
-    tail: List<String>       -- empty list means no captured output
 }
 
 value SubAgentTerminalPayload {
@@ -268,6 +266,18 @@ entity Contract {
     resolved_at: Timestamp            when status = terminal
 }
 
+entity BashWakeTailLine {
+    contract: Contract
+    ordinal: Integer
+    line: bash/RingLine
+}
+
+entity TmuxWakeTailLine {
+    contract: Contract
+    ordinal: Integer
+    line: String
+}
+
 ------------------------------------------------------------
 -- Config
 ------------------------------------------------------------
@@ -379,9 +389,12 @@ rule WaitUntilRejectedByRange {
     )
 }
 
--- REQ-WAKE-003: router fires when the underlying condition holds. For tmux_run,
--- the condition holds when the Phoenix exit marker is observed in the watched
--- window, not when the tmux window process exits.
+-- REQ-WAKE-003: router fires when the underlying condition holds. For durable
+-- tmux/sub-agent terminal evidence, the evidence timestamp is compared with the
+-- contract deadline so a terminal event recorded before expires_at still fires if
+-- the next router tick happens after expires_at. For tmux_run, the condition holds
+-- when the Phoenix exit marker is observed in the watched window, not when the
+-- tmux window process exits.
 -- Other pending contracts on the same conversation are NOT
 -- cancelled (REQ-WAKE-010 independent semantics) - they continue to
 -- be evaluated and may fire later.
@@ -389,8 +402,8 @@ rule WakeRouterFiresOnConditionHold {
     when: WakeRouterTick(contract)
 
     requires: contract.status = pending
-    requires: contract.expires_at > now()
     requires: evaluator_reports_fired(contract.condition)
+    requires: now() < contract.expires_at or evaluator_terminal_evidence_recorded_at(contract.condition) < contract.expires_at
 
     let payload = evaluator_payload(contract.condition)
 
@@ -469,13 +482,14 @@ rule WakeRouterForgetsMissingTmuxHandle {
     ensures: SseEmitted(WakeContractForgotten, contract.id)
 }
 
--- REQ-WAKE-003 + REQ-WAKE-007: router fires when expires_at has
--- passed without the condition holding.
+-- REQ-WAKE-003 + REQ-WAKE-007: router fires when expires_at has passed without
+-- the condition holding and without in-deadline durable terminal evidence.
 rule WakeRouterFiresOnExpiry {
     when: WakeRouterTick(contract)
 
     requires: contract.status = pending
     requires: contract.expires_at <= now()
+    requires: not in_deadline_terminal_evidence_exists(contract)
 
     let payload = FirePayload(cause: expired)
 
@@ -489,12 +503,10 @@ rule WakeRouterFiresOnExpiry {
     ensures: SseEmitted(WakeContractExpired, contract.id)
 
     @guidance
-        -- Expiry is evaluated BEFORE condition-hold on each tick,
-        -- so a contract whose expires_at coincides with
-        -- condition-hold fires as expired, not fired. Rationale:
-        -- the cap is the hard delivery deadline for the wait obligation;
-        -- "condition held at the last possible instant" is not distinguishable
-        -- from clock-skew effects, and expired is the safer report.
+        -- Expiry is generic fallback, not precedence over durable terminal
+        -- evidence. A tmux/sub-agent terminal event recorded before expires_at
+        -- fires even if this router tick runs after expires_at; otherwise a
+        -- continuously running Phoenix would disagree with startup reconciliation.
 }
 
 -- REQ-WAKE-008: explicit user cancel (UI button click).
@@ -716,21 +728,21 @@ invariant FiredContractsCarryFiredPayloadBody {
         c.terminal_payload.fired != null
 }
 invariant FiredBashContractsCarryOnlyBashBody {
-    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.handle_kind = bash:
+    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.condition.handle.kind = bash:
         c.terminal_payload.fired.bash != null
         and c.terminal_payload.fired.tmux = null
         and c.terminal_payload.fired.sub_agent = null
 }
 
 invariant FiredTmuxContractsCarryOnlyTmuxBody {
-    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.handle_kind = tmux_pane:
+    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.condition.handle.kind = tmux_pane:
         c.terminal_payload.fired.tmux != null
         and c.terminal_payload.fired.bash = null
         and c.terminal_payload.fired.sub_agent = null
 }
 
 invariant FiredSubAgentContractsCarryOnlySubAgentBody {
-    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.handle_kind = subagent:
+    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.condition.handle.kind = subagent:
         c.terminal_payload.fired.sub_agent != null
         and c.terminal_payload.fired.bash = null
         and c.terminal_payload.fired.tmux = null
