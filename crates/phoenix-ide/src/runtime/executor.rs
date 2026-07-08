@@ -929,10 +929,43 @@ fn response_exceeds_context_threshold(usage: &phoenix_llm::Usage, context_window
     usage.context_window_used() >= threshold
 }
 
+fn content_contains_only_terminal_tool_call(
+    content: &[ContentBlock],
+    tool_call: &ToolCall,
+) -> bool {
+    let mut saw_terminal_tool = false;
+    for block in content {
+        match block {
+            ContentBlock::Text { .. } => {}
+            ContentBlock::ToolUse { id, name, .. }
+                if id == &tool_call.id && name == tool_call.name() && !saw_terminal_tool =>
+            {
+                saw_terminal_tool = true;
+            }
+            ContentBlock::ToolUse { .. }
+            | ContentBlock::ServerToolUse { .. }
+            | ContentBlock::ToolSearchToolResult { .. }
+            | ContentBlock::WebSearchToolResult { .. }
+            | ContentBlock::WebFetchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+            | ContentBlock::BashCodeExecutionToolResult { .. }
+            | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+            | ContentBlock::McpToolUse { .. }
+            | ContentBlock::McpToolResult { .. }
+            | ContentBlock::ToolResult { .. }
+            | ContentBlock::Image { .. } => return false,
+        }
+    }
+    saw_terminal_tool
+}
+
 fn grace_response_can_enter_reducer(content: &[ContentBlock], tool_calls: &[ToolCall]) -> bool {
     match tool_calls {
         [] => fresh_response_is_text_only(content),
-        [tool_call] => tool_call.input.is_terminal_tool(),
+        [tool_call] => {
+            tool_call.input.is_terminal_tool()
+                && content_contains_only_terminal_tool_call(content, tool_call)
+        }
         _ => false,
     }
 }
@@ -944,6 +977,14 @@ mod grace_response_admission_tests {
 
     fn tool_call(input: ToolInput) -> ToolCall {
         ToolCall::new("toolu_1", input)
+    }
+
+    fn terminal_tool_block() -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: "toolu_1".to_string(),
+            name: "submit_result".to_string(),
+            input: serde_json::json!({ "result": "done" }),
+        }
     }
 
     #[test]
@@ -969,7 +1010,24 @@ mod grace_response_admission_tests {
     #[test]
     fn admits_single_terminal_tool_call() {
         assert!(grace_response_can_enter_reducer(
-            &[],
+            &[ContentBlock::text("final answer"), terminal_tool_block()],
+            &[tool_call(ToolInput::SubmitResult(SubmitResultInput {
+                result: "done".to_string(),
+            }))]
+        ));
+    }
+
+    #[test]
+    fn rejects_terminal_tool_call_with_server_tool_blocks() {
+        assert!(!grace_response_can_enter_reducer(
+            &[
+                terminal_tool_block(),
+                ContentBlock::ServerToolUse {
+                    id: "srv_1".to_string(),
+                    name: "web_search".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
             &[tool_call(ToolInput::SubmitResult(SubmitResultInput {
                 result: "done".to_string(),
             }))]
@@ -979,14 +1037,25 @@ mod grace_response_admission_tests {
     #[test]
     fn rejects_non_terminal_or_mixed_tool_calls() {
         assert!(!grace_response_can_enter_reducer(
-            &[],
+            &[ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "bash".to_string(),
+                input: serde_json::json!({}),
+            }],
             &[tool_call(ToolInput::Unknown {
                 name: "bash".to_string(),
                 input: serde_json::json!({}),
             })]
         ));
         assert!(!grace_response_can_enter_reducer(
-            &[],
+            &[
+                terminal_tool_block(),
+                ContentBlock::ToolUse {
+                    id: "toolu_2".to_string(),
+                    name: "bash".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
             &[
                 tool_call(ToolInput::SubmitResult(SubmitResultInput {
                     result: "done".to_string(),
