@@ -5,6 +5,13 @@
   "findings": [
     {
       "spec": "specs/inline-terminal/inline-terminal.allium",
+      "trigger": "InlineSessionTransportLost",
+      "listening_rules": [
+        "TransportLossClosesInlineSession"
+      ]
+    },
+    {
+      "spec": "specs/inline-terminal/inline-terminal.allium",
       "trigger": "Osc133CommandFinish",
       "listening_rules": [
         "InlineCommandCompleted"

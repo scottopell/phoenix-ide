@@ -81,23 +81,30 @@ value BashRunToolUse {
 -- type instead. `output` is a String, not a richer structure, so
 -- cursor-addressing-output resolution (empty for alt-screen, vt100-resolved for
 -- in-place rewriting; Deferred: TuiCursorAddressedOutput) fits without a shape
--- change. For an interrupted command `output` is best-effort and `exit_code` is
--- None.
+-- change. For an interrupted command `output` is best-effort (may be empty; the
+-- guarantee is that the command is recorded, not that its output survives) and
+-- `exit_code` is None.
 value InlineToolResult {
-    tool_use_id: String            -- pairs the result to its tool-use; also the
-                                   -- key origin is derived by (OriginDiscriminatorSchema)
-    output:      String            -- captured command output (best-effort if interrupted)
-    exit_code:   Integer?          -- from OSC 133;D; None when omitted or interrupted
+    output:    String              -- captured command output (best-effort if interrupted)
+    exit_code: Integer?            -- from OSC 133;D; None when omitted or interrupted
 }
 
 -- The unit committed to conversation history for one inline command: a `bash`
 -- `run` tool-use plus its tool-result, so the LLM history builder reads it on
 -- the same path as an agent `bash` round (Track B shared history, REQ-IT-003).
+-- `tool_use_id` is a fresh Phoenix-generated id (the user authored the call, so
+-- there is no LLM-provided id): it stamps the persisted `tool_use` block and is
+-- referenced by the `tool_result`, the single unique wire-pairing key for the
+-- pair. Origin is NOT derived by scanning history for this id (ids can recur
+-- across turns); it is a property of the round, carried on the round's Agent
+-- message and inherited by the round's Tool message through atomic same-round
+-- commit (OriginDiscriminatorSchema).
 value InlineCommandRound {
-    tool_use: BashRunToolUse       -- structurally `bash` `run` (REQ-IT-004)
-    result:   InlineToolResult
-    outcome:  CommandOutcome
-    origin:   Origin               -- always user on this path (REQ-IT-007)
+    tool_use_id: String            -- generated, unique; on both the tool_use and tool_result
+    tool_use:    BashRunToolUse    -- structurally `bash` `run` (REQ-IT-004)
+    result:      InlineToolResult
+    outcome:     CommandOutcome
+    origin:      Origin            -- always user on this path (REQ-IT-007)
 }
 
 ------------------------------------------------------------
@@ -116,21 +123,23 @@ value InlineCommandRound {
 --       (undefined after terminal teardown). (REQ-IT-005)
 --
 --   completed_round(record: terminal/CommandRecord) -> InlineCommandRound
---       The round for a command that finished (OSC 133;D). tool_use =
---       BashRunToolUse(cmd: record.command_text); the `bash` tool-result comes
---       from the finalized `record` (captured output + exit-code annotation,
---       using the bash tool's existing result formatting; a None exit_code
---       renders as "no exit code", never fabricated as 0). outcome = completed,
---       origin = user (REQ-IT-007 — origin is fixed by this path, not a caller
---       choice).
+--       The round for a command that finished (OSC 133;D). tool_use_id = a fresh
+--       generated id; tool_use = BashRunToolUse(cmd: record.command_text); the
+--       `bash` tool-result comes from the finalized `record` (captured output +
+--       exit-code annotation, using the bash tool's existing result formatting;
+--       a None exit_code renders as "no exit code", never fabricated as 0).
+--       outcome = completed, origin = user (REQ-IT-007 — origin is fixed by this
+--       path, not a caller choice).
 --
 --   interrupted_round(command_text: String) -> InlineCommandRound
 --       The round for a command whose bracket was superseded or closed without a
---       D. tool_use = BashRunToolUse(cmd: command_text); a best-effort
---       tool-result (output fidelity for a cut-off command is the shared
---       CommandTracker concern, Deferred: TuiCursorAddressedOutput). outcome =
---       interrupted, origin = user. The inline layer keeps only the command text
---       for an open bracket (session.open_command), which is all this needs.
+--       D. tool_use_id = a fresh generated id; tool_use =
+--       BashRunToolUse(cmd: command_text); a best-effort tool-result — the
+--       guarantee is that the command is recorded, its output may be empty
+--       (output fidelity for a cut-off command is the shared CommandTracker
+--       concern, Deferred: TuiCursorAddressedOutput). outcome = interrupted,
+--       origin = user. The inline layer keeps only the command text for an open
+--       bracket (session.open_command), which is all an interrupted round needs.
 
 ------------------------------------------------------------
 -- Entities
@@ -298,6 +307,40 @@ rule UserClosesInlineTerminal {
         -- request (REQ-IT-006); see the NoAgentTurn guarantee and Deferred:
         -- BedrockInlineTerminalBusyState for the core_status return-to-idle
         -- coupling. The PTY is torn down (`specs/terminal` teardown path).
+}
+
+-- REQ-IT-006: transport loss is a close path, not a stuck busy state. A live
+-- session owns the conversation busy state, but the close events above are all
+-- user-driven; if the transport drops (WebSocket disconnect, browser tab
+-- reload, composer unmount) no user actor remains to close it. Transport loss
+-- therefore drives the same close-and-flush as UserClosesInlineTerminal, so the
+-- conversation cannot be left non-idle — rejecting messages and reopening —
+-- with no way back.
+rule TransportLossClosesInlineSession {
+    when: InlineSessionTransportLost(session)
+
+    requires: session.status = live
+
+    -- Identical close semantics to UserClosesInlineTerminal: flush any open
+    -- bracket interrupted, clear it, close, and return the conversation to idle.
+    ensures:
+        if inline_bracket_open(session):
+            InlineRoundCommitted(
+                session.conversation,
+                interrupted_round(session.open_command)
+            )
+
+    ensures: session.open_command = None
+    ensures: session.status = closed
+    ensures: ExitInlineTerminalToIdle(session.conversation)
+
+    @guidance
+        -- Emitted when the session's transport is lost: the composer WebSocket
+        -- disconnects, the tab reloads, or the composer unmounts while the shell
+        -- is still live. Mirrors the panel terminal's teardown-on-disconnect
+        -- (`specs/terminal`: master fd closed on WebSocket disconnect). The
+        -- inline PTY is ephemeral, so the session is closed rather than held for
+        -- reconnection; the committed rounds are the durable record.
 }
 
 -- ===========================================================
@@ -488,6 +531,12 @@ surface InlineCommandBridge {
             -- CommandRecord (output + exit_code, or None). Drives
             -- InlineCommandCompleted: commit the completed round, clear bracket.
 
+        InlineSessionTransportLost(session)
+            -- The session's transport dropped (WebSocket disconnect, tab reload,
+            -- composer unmount) with no user actor to close it. Drives
+            -- TransportLossClosesInlineSession: flush, close, return to idle —
+            -- so a live session cannot strand the conversation non-idle.
+
     @guarantee CommitOrderingPinned
         -- The commit layer holds its own open_command, so supersession
         -- (flush-then-reopen in InlineCommandStarting) and the close flush both
@@ -520,9 +569,13 @@ deferred OriginDiscriminatorSchema
     -- field. A tool round is two message rows — an Agent message carrying the
     -- `tool_use` and a Tool message carrying the `tool_result` — so "stored
     -- once" means origin lives on exactly one: the Agent message (the authored
-    -- `tool_use`). The paired Tool message stores no copy; its attribution is
-    -- derived by pairing on `tool_use_id`, so origin cannot diverge across the
-    -- pair. `MessageContent` carries no `origin` today; no new variant is added
+    -- `tool_use`). The paired Tool message stores no copy; it inherits origin by
+    -- belonging to the same round — the Agent + Tool pair is committed
+    -- atomically and adjacently — NOT by scanning history for a matching
+    -- `tool_use_id`, which is unsafe because ids can recur across turns.
+    -- `tool_use_id` is the LLM-format wire pairing key (generated unique per
+    -- round; see InlineCommandRound), a separate concern from origin.
+    -- `MessageContent` carries no `origin` today; no new variant is added
     -- (inline rounds reuse Agent + Tool messages), but the Agent message gains
     -- an `origin` column (default `agent` for existing rows — a true-absence
     -- default, since pre-feature messages were all agent-authored). Tracked here

@@ -78,11 +78,14 @@ interrupts it, as in any native terminal.
 
 A command that has started (OSC 133 `C`) but produced no completion marker
 (OSC 133 `D`) is committed as an **interrupted** round when its bracket is
-superseded — by the next command's `C`, or by the session closing — capturing
-the output observed so far with the exit code absent. Every started command
-resolves to exactly one committed round, either completed or interrupted; none
-vanishes silently. The agent's view of user activity is therefore complete even
-when the user kills a command or closes the session mid-run.
+superseded — by the next command's `C`, or by the session closing. The guarantee
+is that the command itself is recorded (its text, marked interrupted, exit code
+absent); its captured output is best-effort and may be empty, since the
+terminal's output buffer can already be cleared or torn down by the time the
+round commits. Every started command resolves to exactly one committed round,
+either completed or interrupted; none vanishes silently. The agent's view of
+*what the user ran* is therefore complete even when the user kills a command or
+closes the session mid-run.
 
 ### REQ-IT-006 — Closing the session never triggers an agent turn
 
@@ -91,6 +94,13 @@ the deliberate return-to-composer gesture (a debounced backspace on an empty
 input line, distinguished from clearing input) — returns the conversation to
 idle. No rule on the inline terminal path issues an LLM request. Driving the
 conversation through the inline terminal advances it without any agent turn.
+
+Losing the session's transport (WebSocket disconnect, browser tab reload,
+composer unmount) is also a close path: because a live session holds the
+conversation busy, transport loss flushes and closes the session and returns the
+conversation to idle, so it is never stranded non-idle with no user actor to
+close it. The inline PTY is ephemeral — it is torn down, not held for
+reconnection.
 
 ### REQ-IT-007 — User origin is the single source of truth for attribution
 

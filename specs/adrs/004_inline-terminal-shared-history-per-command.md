@@ -54,10 +54,14 @@ own tool call. Three coupled choices make this coherent:
   terminal and does not fall under `specs/terminal`'s `OneTerminalPerWorkScope`
   invariant.
 - **User origin as a single stored fact.** One `origin` marker on the `Agent`
-  message (the `tool_use` carrier); the paired `Tool` message derives origin by
-  `tool_use_id`. The LLM-history role and the UI attribution are both derived
-  from that one marker, never stored twice — the same role-vs-attribution split
-  `MessageContent::Skill` already uses.
+  message (the `tool_use` carrier); the paired `Tool` message inherits origin by
+  belonging to the same round (the pair is committed atomically and adjacently),
+  not by scanning history for a matching `tool_use_id` — ids can recur across
+  turns. `tool_use_id` is a fresh Phoenix-generated, unique wire-pairing key
+  stamped on both halves; it is a separate concern from origin. The LLM-history
+  role and the UI attribution are both derived from the one `origin` marker,
+  never stored twice — the same role-vs-attribution split `MessageContent::Skill`
+  already uses.
 
 The interrupted-round rule (a command that starts but never emits OSC 133 `D`
 still commits when superseded by the next command or by session close) exists so
