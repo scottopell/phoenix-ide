@@ -559,13 +559,16 @@ function ConversationPageContent() {
                 const metadata = await api.getConversationMetaBySlug(slug);
                 if (cancelled) return;
                 const authoritativeConversation = metadata.conversation;
+                if (authoritativeConversation.id !== cachedConversationId) {
+                  throw new Error('Cached conversation no longer owns the requested slug');
+                }
                 setArchiveStatusConfirmedConversationId(authoritativeConversation.id);
                 await cacheDB.putConversation(authoritativeConversation);
 
                 if (!atomRef.current.conversation || atomRef.current.conversation.slug === slug) {
                   dispatch({
                     type: 'set_initial_data',
-                    conversationId: cachedConversationId,
+                    conversationId: authoritativeConversation.id,
                     conversation: authoritativeConversation,
                     messages: mergedMessages,
                     phase: authoritativeConversation.state

@@ -2703,24 +2703,43 @@ async fn stream_conversation(
     let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
         snapshot_pending_for_stream(&broadcast_tx, &query);
 
-    let messages = state
-        .runtime
-        .db()
-        .get_messages(&id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let highest_message_seq = messages.iter().map(|m| m.sequence_id).max().unwrap_or(0);
+    let messages = if query.after_event_sequence.is_some() {
+        Vec::new()
+    } else {
+        state
+            .runtime
+            .db()
+            .get_messages(&id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+    };
+    let highest_message_seq = if query.after_event_sequence.is_some() {
+        last_sequence_id
+    } else {
+        messages.iter().map(|m| m.sequence_id).max().unwrap_or(0)
+    };
     let init_seq = std::cmp::max(
         std::cmp::max(last_sequence_id, highest_pending_seq),
         highest_message_seq,
     );
     broadcast_tx.observe_seq(init_seq);
 
-    let context_window_size = messages
-        .iter()
-        .filter_map(|m| m.usage_data.as_ref())
-        .next_back()
-        .map_or(0, crate::db::UsageData::context_window_used);
+    let context_window_size = if query.after_event_sequence.is_some() {
+        state
+            .runtime
+            .db()
+            .get_latest_usage_data(&id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .as_ref()
+            .map_or(0, crate::db::UsageData::context_window_used)
+    } else {
+        messages
+            .iter()
+            .filter_map(|m| m.usage_data.as_ref())
+            .next_back()
+            .map_or(0, crate::db::UsageData::context_window_used)
+    };
 
     // Derive project_name from the project's canonical_path (repo root dirname).
     let project_name = if let Some(ref project_id) = conversation.project_id {

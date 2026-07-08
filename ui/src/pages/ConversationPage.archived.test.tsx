@@ -215,6 +215,57 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('#state-bar'));
   });
 
+  it('falls back to authoritative slug fetch when cached slug owner changed', async () => {
+    const staleConversation = makeConversation({ id: 'stale-conv' });
+    const authoritativeConversation = makeConversation({ id: 'authoritative-conv' });
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(staleConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([{ ...historyMessage, conversation_id: staleConversation.id }]);
+    vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
+    vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
+      messages: [],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 1,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 1,
+    });
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: authoritativeConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationBySlug).mockResolvedValue({
+      conversation: authoritativeConversation,
+      messages: [],
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    await waitFor(() => {
+      expect(api.getConversationBySlug).toHaveBeenCalledWith(slug);
+    });
+  });
+
   it('renders cached messages immediately and incrementally catches up newer messages without a full fetch', async () => {
     const cachedConversation = makeConversation();
     vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
@@ -239,6 +290,13 @@ describe('ConversationPage archived read-only rendering', () => {
       context_window_size: 0,
     });
     vi.mocked(api.getConversationBySlug).mockClear();
+    vi.mocked(api.getConversationBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      messages: [historyMessage],
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
 
     render(
       <ConversationContext.Provider value={new ConversationStore()}>
