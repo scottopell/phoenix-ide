@@ -1615,8 +1615,11 @@ where
     active_work_subagents: u32,
     /// LLM turn counter for sub-agents (REQ-PROJ-008 max turns enforcement)
     llm_turn_count: u32,
-    /// Whether this sub-agent has been given its grace turn (one extra LLM turn to call `submit_result`)
+    /// Whether this sub-agent has been given its grace turn (one extra LLM turn to produce a terminal outcome)
     grace_turn_granted: bool,
+    /// Wall-clock marker for the start of the grace turn. The hard-stop fallback
+    /// only treats assistant text after this marker as a fresh implicit result.
+    grace_turn_started_at: Option<DateTime<Utc>>,
     /// LLM request counter for parent conversations. Resets on every
     /// `Event::UserMessage`, so a long conversation with many turns is fine;
     /// only runaway tool-use bursts within a single user turn trip the cap.
@@ -1745,6 +1748,7 @@ where
             active_work_subagents: 0,
             llm_turn_count: 0,
             grace_turn_granted: false,
+            grace_turn_started_at: None,
             parent_tool_cycle_count: 0,
             parent_tool_cycle_cap: parent_tool_cycle_cap_from_env(),
             credential_helper: None,
@@ -3082,22 +3086,27 @@ where
         }
     }
 
-    /// Handle the hard stop after grace turn (REQ-BED-026 `SubAgentTurnLimitHardStop`):
-    /// extract last assistant text from conversation history and notify parent.
+    /// Handle the hard stop after grace turn (REQ-BED-026 `SubAgentTurnLimitHardStop`).
     ///
-    /// Extract partial result from conversation history and send `GraceTurnExhausted`
-    /// event to the state machine. The SM handles the transition and emits `NotifyParent`.
+    /// Extract fresh grace-turn text and send `GraceTurnExhausted` event to the
+    /// state machine. The SM handles the transition and emits `NotifyParent`.
     async fn handle_grace_turn_hard_stop(&mut self) {
-        // Extract last assistant text from conversation history (I/O — belongs in executor)
+        let grace_started_at = self.grace_turn_started_at;
+        // Extract assistant text produced during the grace turn (I/O — belongs in executor).
         let partial_result = match self
             .storage
             .get_messages(&self.context.conversation_id)
             .await
         {
             Ok(messages) => {
-                // Walk backward to find the last assistant message with text content blocks
                 let mut text = None;
                 for msg in messages.iter().rev() {
+                    let Some(grace_started_at) = grace_started_at else {
+                        break;
+                    };
+                    if msg.created_at <= grace_started_at {
+                        break;
+                    }
                     if let MessageContent::Agent(blocks) = &msg.content {
                         let text_parts: Vec<&str> = blocks
                             .iter()
@@ -4022,6 +4031,7 @@ where
                     max = self.context.max_turns,
                     "Sub-agent reached turn limit, granting grace turn"
                 );
+                self.grace_turn_started_at = Some(Utc::now());
 
                 // Inject a meta user message with mode-specific terminal guidance.
                 // Uses UserContent::meta() so it appears in the LLM context

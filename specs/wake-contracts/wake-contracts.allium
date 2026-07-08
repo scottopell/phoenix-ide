@@ -386,7 +386,6 @@ rule WakeRouterForgetsMissingSubAgentHandle {
 
     requires: contract.status = pending
     requires: contract.condition.handle?.kind = subagent
-    requires: contract.expires_at > now()
     requires: not subagent_child_exists(contract.condition.handle?.id)
 
     let payload = FirePayload(cause: forgotten, forgotten_reason: "subagent_handle_missing")
@@ -409,7 +408,6 @@ rule WakeRouterForgetsMissingTmuxHandle {
 
     requires: contract.status = pending
     requires: contract.condition.handle?.kind = tmux_pane
-    requires: contract.expires_at > now()
     requires: not tmux_window_exists(contract.condition.handle?.id)
     requires: not tmux_terminal_state_recorded(contract.condition.handle?.id)
 

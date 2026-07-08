@@ -186,6 +186,10 @@ hard-stop fallback, implicit text completion, non-retryable runtime failure, and
 context exhaustion, and SHALL
 resolve missing child handles through the wake contract's `Forgotten` cause
 
+THE SYSTEM SHALL persist the sub-agent terminal-cause discriminator required to
+distinguish those outcomes durably; coarse success/failure state alone SHALL NOT
+be the source for wake terminal payload reconstruction
+
 WHEN Phoenix restarts while a sub-agent wake contract is pending
 THE SYSTEM SHALL deliver the child conversation's persisted terminal state and its
 durable terminal cause when that cause occurred before the contract deadline,
