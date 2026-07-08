@@ -140,11 +140,11 @@ class FakeEventSource {
   }
 }
 
-function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: unknown[] = []) {
+function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: unknown[] = [], conversation: unknown = baseConversation) {
   source.emit('init', {
     type: 'init',
     sequence_id: 100,
-    conversation: baseConversation,
+    conversation,
     messages,
     agent_working: false,
     last_sequence_id: 100,
@@ -801,6 +801,46 @@ describe('conversation markdown links', () => {
     );
   });
 
+  it('preserves percent-escaped finalized agent local Markdown image paths', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-escaped-image', [{
+            type: 'text',
+            text: '![escaped screenshot](ui/qa-artifacts/Screenshot%202026.png)',
+          }])}
+          toolResults={new Map()}
+          filePathRootDir="/repo/project"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('img', { name: 'escaped screenshot' })).toHaveAttribute(
+      'src',
+      '/preview/repo/project/ui/qa-artifacts/Screenshot%202026.png',
+    );
+  });
+
+  it('keeps already-preview Markdown image URLs unchanged', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-preview-image', [{
+            type: 'text',
+            text: '![preview screenshot](/preview/repo/project/shot.png)',
+          }])}
+          toolResults={new Map()}
+          filePathRootDir="/repo/project"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('img', { name: 'preview screenshot' })).toHaveAttribute(
+      'src',
+      '/preview/repo/project/shot.png',
+    );
+  });
+
   it('opens streaming agent Markdown links in a new tab with safe rel attributes', async () => {
     render(
       <MemoryRouter>
@@ -1250,6 +1290,101 @@ describe('SubAgentStatus inline activity', () => {
     expect(screen.getByText('cache')).toBeInTheDocument();
     expect(screen.getByText('final outcome')).toBeInTheDocument();
     expect(screen.getByText(/Found the config issue/)).toBeInTheDocument();
+  });
+
+  it('resolves sub-agent transcript and final-result Markdown images against the child root', async () => {
+    const childConversation = {
+      ...baseConversation,
+      cwd: '/repo/child-worktree',
+      worktree_path: '/repo/child-worktree',
+    };
+    const childMessages = [
+      agentMessage('agent-msg-image', [{
+        type: 'text',
+        text: 'Child transcript image: ![child-shot](ui/qa-artifacts/child.png)',
+      }]),
+    ];
+
+    const state: ConversationState = {
+      type: 'awaiting_sub_agents',
+      pending: [],
+      completed_results: [{
+        agent_id: 'agent-1',
+        task: 'Capture screenshot evidence',
+        outcome: { type: 'success', result: 'Final image: ![final-shot](ui/qa-artifacts/final.png)' },
+      }],
+    };
+
+    render(
+      <MemoryRouter>
+        <SubAgentStatus stateData={state} />
+      </MemoryRouter>,
+    );
+
+    (api.getConversation as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      conversation: childConversation,
+      messages: childMessages,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    fireEvent.click(screen.getByText(/Capture screenshot evidence/));
+    await waitFor(() => expect(api.getConversation).toHaveBeenCalledTimes(1));
+
+    expect(await screen.findByRole('img', { name: 'child-shot' })).toHaveAttribute(
+      'src',
+      '/preview/repo/child-worktree/ui/qa-artifacts/child.png',
+    );
+    expect(screen.getByRole('img', { name: 'final-shot' })).toHaveAttribute(
+      'src',
+      '/preview/repo/child-worktree/ui/qa-artifacts/final.png',
+    );
+  });
+
+  it('resolves streaming sub-agent Markdown images against the child root', async () => {
+    const childConversation = {
+      ...baseConversation,
+      cwd: '/repo/streaming-child',
+      worktree_path: '/repo/streaming-child',
+      state: { type: 'llm_requesting' as const, attempt: 1 },
+    };
+    const state: ConversationState = {
+      type: 'awaiting_sub_agents',
+      pending: [{ agent_id: 'agent-1', task: 'Stream screenshot evidence' }],
+      completed_results: [],
+    };
+
+    (api.getConversation as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      conversation: childConversation,
+      messages: [],
+      agent_working: true,
+      presentation_mode: 'working',
+      context_window_size: 0,
+    });
+
+    render(
+      <MemoryRouter>
+        <SubAgentStatus stateData={state} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByText(/Stream screenshot evidence/));
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    act(() => {
+      emitInit(FakeEventSource.instances[0]!, [], [], childConversation);
+      FakeEventSource.instances[0]!.emit('token', {
+        sequence_id: 101,
+        request_id: 'child-req-1',
+        text: '![live-shot](ui/qa-artifacts/live.png)',
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: 'live-shot' })).toHaveAttribute(
+        'src',
+        '/preview/repo/streaming-child/ui/qa-artifacts/live.png',
+      );
+    });
   });
 
   it('folds child stream init pending events before advancing sequence floor', async () => {

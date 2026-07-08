@@ -8,8 +8,16 @@ function trimTrailingSlash(path: string): string {
   return path.endsWith('/') ? path.slice(0, -1) : path;
 }
 
-function previewUrlForAbsolutePath(path: string): string {
-  return `/preview${path.split('/').map((part) => encodeURIComponent(part)).join('/')}`;
+function encodePathSegment(segment: string): string {
+  try {
+    return encodeURIComponent(decodeURIComponent(segment));
+  } catch {
+    return encodeURIComponent(segment);
+  }
+}
+
+function encodedPreviewUrlForAbsolutePath(path: string): string {
+  return `/preview${path.split('/').map(encodePathSegment).join('/')}`;
 }
 
 export function resolveConversationMarkdownImageSrc(src: string | undefined, rootDir?: string | undefined): string | undefined {
@@ -25,13 +33,17 @@ export function resolveConversationMarkdownImageSrc(src: string | undefined, roo
     return undefined;
   }
 
+  if (trimmed === '/preview' || trimmed.startsWith('/preview/')) {
+    return trimmed;
+  }
+
   if (trimmed.startsWith('/')) {
-    return previewUrlForAbsolutePath(trimmed);
+    return encodedPreviewUrlForAbsolutePath(trimmed);
   }
 
   if (!rootDir) return trimmed;
   const relative = trimmed.replace(/^\.\//, '');
-  return previewUrlForAbsolutePath(`${trimTrailingSlash(rootDir)}/${relative}`);
+  return encodedPreviewUrlForAbsolutePath(`${trimTrailingSlash(rootDir)}/${relative}`);
 }
 
 export interface ConversationMarkdownContext {
