@@ -100,6 +100,7 @@ final class ConversationSession {
             snapshotSyncedAt = snap.syncedAt
             replayFromPendingAnchor = true
             typedState = ConversationState.parse(snap.conversation?.state)
+            presentationMode = snap.conversation?.presentation_mode
             rebuildToolUseIndex()
             // A prior crash can leave the authoritative snapshot durable but
             // the matching outbox row not yet pruned. Reconcile at load so the
