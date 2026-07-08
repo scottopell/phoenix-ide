@@ -272,6 +272,7 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         | ErrorKind::Cancelled
         | ErrorKind::SubAgentError
         | ErrorKind::ContextExhausted
+        | ErrorKind::TurnLimitExhausted
         | ErrorKind::ContentFilter => {
             tracing::error!(
                 ?kind,
@@ -2871,16 +2872,16 @@ pub fn transition_sub_agent(
             _state,
             SubAgentEvent::SubAgent(SubAgentOnlyEvent::GraceTurnExhausted { result: None }),
         ) => {
-            let error = "Sub-agent exceeded turn limit with no output".to_string();
+            let error = "Sub-agent exceeded turn limit with no terminal output".to_string();
             Ok(SubAgentTransitionResult::new(SubAgentState::Failed {
                 error: error.clone(),
-                error_kind: ErrorKind::Cancelled,
+                error_kind: ErrorKind::TurnLimitExhausted,
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::NotifyParent {
                 outcome: SubAgentOutcome::Failure {
                     error,
-                    error_kind: ErrorKind::Cancelled,
+                    error_kind: ErrorKind::TurnLimitExhausted,
                 },
             }))
         }
@@ -3645,6 +3646,35 @@ mod tests {
                 thoughts: "inspect".to_string(),
             }),
         )
+    }
+
+    #[test]
+    fn grace_turn_exhausted_without_result_preserves_turn_limit_cause() {
+        let result = transition_sub_agent(
+            &SubAgentState::Core(CoreState::LlmRequesting { attempt: 0 }),
+            &test_context(),
+            SubAgentEvent::SubAgent(SubAgentOnlyEvent::GraceTurnExhausted { result: None }),
+        )
+        .expect("transition succeeds");
+
+        assert_eq!(
+            result.new_state,
+            SubAgentState::Failed {
+                error: "Sub-agent exceeded turn limit with no terminal output".to_string(),
+                error_kind: ErrorKind::TurnLimitExhausted,
+            }
+        );
+        assert!(result.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::NotifyParent {
+                    outcome: SubAgentOutcome::Failure {
+                        error_kind: ErrorKind::TurnLimitExhausted,
+                        ..
+                    }
+                }
+            )
+        }));
     }
 
     // A usage-limit 429's `resets_at` must survive the outcome→event

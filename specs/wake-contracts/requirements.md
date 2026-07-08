@@ -254,18 +254,20 @@ status (`exited` / `killed` / `kill_pending_kernel` / `forgotten` and any other
 status exposed by `bash op=wait`), `exit_code`, `duration_ms`, and a final tail
 window per REQ-BASH-004.
 
-For `HandleTerminal/TmuxPane`, the tool result MUST carry the watched `window_id`
-identity, terminal status, exit information when available, and a final captured
-tail window equivalent to the information the LLM would gather by inspecting the
-window after exit. The captured tail MUST be represented as a list; no output is
-an empty list, not an absent field.
+For `HandleTerminal/TmuxPane`, the delivered tool result MUST identify the
+watched `window_id` from the contract's `handle_id` and carry terminal status,
+exit information when available, and a final captured tail window equivalent to
+the information the LLM would gather by inspecting the window after exit. The
+captured tail MUST be represented as a list; no output is an empty list, not an
+absent field. The persisted terminal payload body MUST NOT repeat `window_id`;
+replay derives the delivered identity from the contract row.
 
-For `HandleTerminal/SubAgent`, the tool result MUST carry one sub-agent identity
-field — the child conversation / agent id — plus the spawned task text, an
-optional label, and the structured sub-agent terminal payload defined by
-REQ-WAKE-017. The
-payload MUST NOT persist separate agent-id and conversation-id fields for the same
-handle identity.
+For `HandleTerminal/SubAgent`, the delivered tool result MUST identify the child
+conversation / agent id from the contract's `handle_id` and carry the spawned
+task text, an optional label, and the structured sub-agent terminal payload
+defined by REQ-WAKE-017. The persisted terminal payload body MUST NOT repeat the
+handle identity and MUST NOT persist separate agent-id and conversation-id fields
+for the same handle identity.
 
 THE delivered tool result SHALL be addressable back to the original
 tool call that registered the contract (via `tool_use_id`)
@@ -513,23 +515,25 @@ there is no bash handle named `t-3`.
 WHEN a `HandleTerminal/SubAgent` contract fires because the child called
 `submit_result`
 THE SYSTEM SHALL deliver a tagged `success` outcome with the submitted result text
-and the child conversation / agent id.
+and the child conversation / agent id derived from the contract's `handle_id`.
 
 WHEN a `HandleTerminal/SubAgent` contract fires because the child called
 `submit_error`
 THE SYSTEM SHALL deliver a tagged `submitted_error` outcome with the submitted
 error text, the same typed `ErrorKind` taxonomy used by normal sub-agent failure,
-and the child conversation / agent id.
+and the child conversation / agent id derived from the contract's `handle_id`.
 
 WHEN the child reaches wall-clock timeout
 THE SYSTEM SHALL preserve that timeout as the child's durable terminal cause and
 deliver a tagged `timed_out` outcome with a message stating that the child
-exceeded its configured timeout and the child conversation / agent id.
+exceeded its configured timeout and the child conversation / agent id derived
+from the contract's `handle_id`.
 
 WHEN the child independently reaches a durable cancellation terminal state while
 the parent wake contract remains active
 THE SYSTEM SHALL deliver a tagged `cancelled` outcome with the cancellation reason
-when available and the child conversation / agent id.
+when available and the child conversation / agent id derived from the contract's
+`handle_id`.
 
 WHEN the waiting parent or wake contract itself is cancelled
 THE SYSTEM SHALL resolve the wake contract with the top-level `Cancelled` cause,
@@ -539,14 +543,16 @@ WHEN the child exhausts its turn-limit grace path and the runtime performs the
 hard-stop fallback
 THE SYSTEM SHALL preserve that hard-stop cause as the child's durable terminal
 cause and deliver a tagged `turn_limit_exhausted` outcome with the extracted
-partial assistant text when available and the child conversation / agent id.
+partial assistant text when available and the child conversation / agent id
+derived from the contract's `handle_id`.
 
 WHEN the child reaches another bedrock terminal failure cause, including context
 exhaustion or non-retryable runtime failure
 THE SYSTEM SHALL preserve that cause as the child's durable terminal cause and
 deliver the corresponding tagged terminal outcome. Runtime-failure outcomes SHALL
 include the same typed `ErrorKind` taxonomy used by normal sub-agent failure,
-including `invalid_response`.
+including `invalid_response`, excluding durable terminal causes that have their
+own tagged outcome (`timed_out`, `cancelled`, and `context_exhausted`).
 
 WHEN bedrock admits text-only implicit completion as a child terminal state
 THE SYSTEM SHALL preserve that cause as the child's durable terminal cause and

@@ -917,6 +917,10 @@ fn fresh_response_is_text_only(content: &[ContentBlock]) -> bool {
         && content
             .iter()
             .all(|block| matches!(block, ContentBlock::Text { .. }))
+        && content.iter().any(|block| match block {
+            ContentBlock::Text { text } => !text.trim().is_empty(),
+            _ => false,
+        })
 }
 
 #[allow(
@@ -991,6 +995,14 @@ mod grace_response_admission_tests {
     fn admits_text_only_implicit_completion() {
         assert!(grace_response_can_enter_reducer(
             &[ContentBlock::text("done")],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn rejects_blank_text_only_implicit_completion() {
+        assert!(!grace_response_can_enter_reducer(
+            &[ContentBlock::text("   \n\t")],
             &[]
         ));
     }

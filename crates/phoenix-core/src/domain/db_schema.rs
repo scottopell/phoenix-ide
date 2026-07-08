@@ -576,6 +576,8 @@ pub enum ErrorKind {
     SubAgentError,
     /// Context window exhausted - not retryable
     ContextExhausted,
+    /// Sub-agent exhausted its grace turn without a terminal outcome - not retryable
+    TurnLimitExhausted,
     /// Content filter or safety block - not retryable
     ContentFilter,
 }
@@ -597,6 +599,7 @@ impl ErrorKind {
             | Self::Cancelled
             | Self::SubAgentError
             | Self::ContextExhausted
+            | Self::TurnLimitExhausted
             | Self::ContentFilter => AutoRetryPolicy::NoAutoRetry,
         }
     }
@@ -626,6 +629,7 @@ impl ErrorKind {
             | Self::Cancelled
             | Self::SubAgentError
             | Self::ContextExhausted
+            | Self::TurnLimitExhausted
             | Self::ContentFilter => UserResumePolicy::NotResumable,
         }
     }
@@ -1703,7 +1707,7 @@ mod error_kind_tests {
         use ErrorKind::{
             Auth, Cancelled, ContentFilter, ContextExhausted, InvalidRequest, InvalidResponse,
             Network, RateLimit, ServerError, ServerOverloaded, SubAgentError, TimedOut,
-            UsageLimitReached,
+            TurnLimitExhausted, UsageLimitReached,
         };
 
         let cases = [
@@ -1764,6 +1768,11 @@ mod error_kind_tests {
             ),
             (
                 ContextExhausted,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                TurnLimitExhausted,
                 AutoRetryPolicy::NoAutoRetry,
                 UserResumePolicy::NotResumable,
             ),

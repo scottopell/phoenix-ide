@@ -80,6 +80,7 @@ pub(crate) fn arb_error_kind() -> impl Strategy<Value = ErrorKind> {
         Just(ErrorKind::InvalidRequest),
         Just(ErrorKind::ContentFilter),
         Just(ErrorKind::ContextExhausted),
+        Just(ErrorKind::TurnLimitExhausted),
         Just(ErrorKind::TimedOut),
         Just(ErrorKind::Cancelled),
         Just(ErrorKind::SubAgentError),

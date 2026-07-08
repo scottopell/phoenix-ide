@@ -101,7 +101,6 @@ value BashTerminalPayload {
 }
 
 value TmuxTerminalPayload {
-    window_id: String        -- unique tmux target returned by tmux_run
     terminal_status: TmuxTerminalStatus
     exit_code: Integer?
     duration_ms: Integer?
@@ -109,7 +108,6 @@ value TmuxTerminalPayload {
 }
 
 value SubAgentTerminalPayload {
-    sub_agent_id: String              -- single identity; child conversation id == agent id
     task_text: String                 -- spawned task string supplied to the child
     task_label: String?
     outcome: SubAgentTerminalOutcome
@@ -121,7 +119,7 @@ value SubAgentTerminalPayload {
     turn_limit_partial_text: String?  when outcome = turn_limit_exhausted
     implicit_success_text: String     when outcome = implicit_success
     runtime_failure_message: String   when outcome = runtime_failure
-    runtime_failure_kind: SubAgentErrorKind  when outcome = runtime_failure
+    runtime_failure_kind: SubAgentRuntimeFailureKind  when outcome = runtime_failure
     context_exhausted_message: String when outcome = context_exhausted
 }
 
@@ -175,6 +173,19 @@ enum SubAgentErrorKind {
     | context_exhausted
     | timed_out
     | cancelled
+    | sub_agent_error
+    | usage_limit_reached
+    | server_overloaded
+}
+
+enum SubAgentRuntimeFailureKind {
+    network
+    | rate_limit
+    | server_error
+    | auth
+    | invalid_request
+    | invalid_response
+    | content_filter
     | sub_agent_error
     | usage_limit_reached
     | server_overloaded

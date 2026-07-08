@@ -7,4 +7,4 @@
  * Adding a new error class requires handling it in every consumer — the compiler
  * forces it.
  */
-export type ErrorKind = "auth" | "rate_limit" | "usage_limit_reached" | "network" | "invalid_request" | "invalid_response" | "server_error" | "server_overloaded" | "timed_out" | "cancelled" | "sub_agent_error" | "context_exhausted" | "content_filter";
+export type ErrorKind = "auth" | "rate_limit" | "usage_limit_reached" | "network" | "invalid_request" | "invalid_response" | "server_error" | "server_overloaded" | "timed_out" | "cancelled" | "sub_agent_error" | "context_exhausted" | "turn_limit_exhausted" | "content_filter";
