@@ -721,13 +721,13 @@ WHEN no browser session exists for a conversation
 THE SYSTEM SHALL NOT poll or reconnect the live-view WebSocket for that conversation. Reconnect attempts are reserved for transient drops on a session that the server-authoritative signal indicates is still live.
 
 WHEN the user chooses to stop a live browser session from a browser-session UI affordance
-THE SYSTEM SHALL terminate the underlying `BrowserSessionManager` session for that `WorkScope`, using the same destroy lifecycle path as idle cleanup and hard-delete cascade.
+THE SYSTEM SHALL request termination of the underlying `BrowserSessionManager` session for that `WorkScope`, using the same destroy lifecycle path as idle cleanup and hard-delete cascade.
 
-WHEN user-initiated browser-session termination succeeds
+WHEN user-initiated browser-session termination completes
 THE SYSTEM SHALL emit the normal `browser_session_state` false edge and corresponding work-scope inventory update so the browser viewer, launcher, and work-scope row all return to not-live from server truth.
 
 WHEN an in-flight browser tool holds the browser session guard during user-initiated termination
-THE SYSTEM SHALL time-bound teardown waiting so the user-facing stop action is not blocked indefinitely behind that tool.
+THE SYSTEM SHALL keep the browser session tracked as live until the guard is released and Chrome has actually been terminated, without blocking the user-facing stop request indefinitely.
 
 **Non-goals (locked in for MVP):**
 

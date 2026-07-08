@@ -2195,7 +2195,7 @@ async fn stop_conversation_browser_session(
     state
         .runtime
         .browser_sessions()
-        .kill_session(&work_scope)
+        .request_kill_session(&work_scope)
         .await;
 
     Ok(Json(SuccessResponse { success: true }))
@@ -2216,7 +2216,7 @@ async fn stop_work_scope_browser_session(
     state
         .runtime
         .browser_sessions()
-        .kill_session(&work_scope)
+        .request_kill_session(&work_scope)
         .await;
 
     Ok(Json(SuccessResponse { success: true }))
