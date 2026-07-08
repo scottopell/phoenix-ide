@@ -80,6 +80,10 @@ value FirePayload {
     forgotten_reason: String when cause = forgotten
 }
 
+value TerminalPayloadBody {
+    fired: FiredHandlePayload?        -- present only when terminal_cause column = fired
+}
+
 value FiredHandlePayload {
     handle_kind: HandleKind
     bash: BashTerminalPayload when handle_kind = bash
@@ -88,7 +92,7 @@ value FiredHandlePayload {
 }
 
 value BashTerminalPayload {
-    status: bash/HandleStatus
+    status: BashTerminalStatus
     exit_code: Integer?
     duration_ms: Integer?
     signal_number: Integer?        -- mirrors bash wait signal metadata when known
@@ -111,7 +115,7 @@ value SubAgentTerminalPayload {
     outcome: SubAgentTerminalOutcome
     success_result: String            when outcome = success
     submitted_error: String           when outcome = submitted_error
-    submitted_error_kind: String      when outcome = submitted_error
+    submitted_error_kind: SubAgentErrorKind  when outcome = submitted_error
     timed_out_message: String         when outcome = timed_out
     cancelled_reason: String?         when outcome = cancelled
     turn_limit_partial_text: String?  when outcome = turn_limit_exhausted
@@ -144,6 +148,27 @@ enum TerminalCause {
                   -- restart that drops an in-memory bash handle, or
                   -- a hard-delete that tears down a WorkScope with
                   -- no inheritor)
+}
+
+enum BashTerminalStatus {
+    exited
+    | killed
+    | kill_pending_kernel
+}
+
+enum SubAgentErrorKind {
+    network
+    | rate_limit
+    | server_error
+    | auth
+    | invalid_request
+    | content_filter
+    | context_exhausted
+    | timed_out
+    | cancelled
+    | sub_agent_error
+    | usage_limit_reached
+    | server_overloaded
 }
 
 enum TmuxTerminalStatus {
@@ -213,10 +238,13 @@ entity Contract {
         terminal: terminal
     }
 
-    -- The full delivered payload. Persisted so a late SSE reconnect
-    -- can re-deliver the wake event without losing data. This is the sole
-    -- persisted representation of forgotten reasons and fired handle payloads.
-    terminal_payload: FirePayload     when status = terminal
+    -- Queryable terminal discriminator columns. These are columns, not JSON paths,
+    -- because metrics group by them.
+    terminal_cause: TerminalCause     when status = terminal
+    forgotten_reason: String?         when terminal_cause = forgotten
+
+    -- Cause-specific body. Does not repeat terminal_cause or forgotten_reason.
+    terminal_payload: TerminalPayloadBody when status = terminal
 
     -- When the router resolved the contract.
     resolved_at: Timestamp            when status = terminal
@@ -654,15 +682,15 @@ invariant TerminalContractsAreFullyPopulated {
         and c.terminal_payload != null
 }
 
--- REQ-WAKE-011: every contract's terminal_payload cause is one of exactly
+-- REQ-WAKE-011: every contract's terminal_cause is one of exactly
 -- the four documented causes. Forbids silent abandonment while keeping the cause
--- in one persisted field.
-invariant TerminalPayloadCauseIsOneOfFour {
+-- queryable without JSON extraction.
+invariant TerminalCauseIsOneOfFour {
     for c in Contract where c.status = terminal:
-        c.terminal_payload.cause = fired
-        or c.terminal_payload.cause = expired
-        or c.terminal_payload.cause = cancelled
-        or c.terminal_payload.cause = forgotten
+        c.terminal_cause = fired
+        or c.terminal_cause = expired
+        or c.terminal_cause = cancelled
+        or c.terminal_cause = forgotten
 }
 
 -- REQ-WAKE-007: every pending contract has expires_at strictly in

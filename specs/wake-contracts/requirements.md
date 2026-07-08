@@ -114,14 +114,15 @@ delivery semantics; ADR-006 records the explicit non-state rationale.
 THE SYSTEM SHALL persist every wake contract in a `wake_contracts` SQLite table
 with columns `(id, conv_id, handle_kind, handle_id, condition_json, expires_at,
 registered_at, fire_template_json, registering_tool_use_id, status,
-terminal_payload, resolved_at)`
+terminal_cause, forgotten_reason, terminal_payload, resolved_at)`
 
-THE `terminal_payload` column SHALL be the sole persisted representation of the
-terminal cause and payload, including `forgotten_reason` when the payload cause is
-`Forgotten`
+THE `terminal_cause` and `forgotten_reason` columns SHALL be the queryable
+terminal discriminators used for metrics and operator views. The
+`terminal_payload` column SHALL hold only the cause-specific body and SHALL NOT
+repeat those discriminator values.
 
-THE SYSTEM SHALL update `status`, `terminal_payload`, and `resolved_at` atomically
-when a contract resolves
+THE SYSTEM SHALL update `status`, `terminal_cause`, `forgotten_reason`,
+`terminal_payload`, and `resolved_at` atomically when a contract resolves
 
 WHEN Phoenix restarts
 THE SYSTEM SHALL reconcile every non-terminal contract before normal serving:
@@ -509,7 +510,8 @@ and the child conversation / agent id.
 WHEN a `HandleTerminal/SubAgent` contract fires because the child called
 `submit_error`
 THE SYSTEM SHALL deliver a tagged `submitted_error` outcome with the submitted
-error text, `error_kind`, and the child conversation / agent id.
+error text, the same typed `ErrorKind` taxonomy used by normal sub-agent failure,
+and the child conversation / agent id.
 
 WHEN the child reaches wall-clock timeout
 THE SYSTEM SHALL preserve that timeout as the child's durable terminal cause and
