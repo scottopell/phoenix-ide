@@ -26,7 +26,8 @@ final class OutboxTests: XCTestCase {
         conversationId: String,
         status: OutboxEntry.Status = .pending,
         acceptedByServer: Bool = false,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        acceptedAt: Date? = nil
     ) -> OutboxEntry {
         OutboxEntry(
             localId: UUID().uuidString.lowercased(),
@@ -36,6 +37,7 @@ final class OutboxTests: XCTestCase {
             status: status,
             acceptedByServer: acceptedByServer,
             createdAt: createdAt,
+            acceptedAt: acceptedAt,
             lastError: nil,
             attemptCount: 0)
     }
@@ -199,11 +201,28 @@ final class OutboxTests: XCTestCase {
         freshDiskStore()
         let stale = makeEntry(
             conversationId: "c1", status: .pending, acceptedByServer: true,
-            createdAt: Date().addingTimeInterval(-120))
+            createdAt: Date().addingTimeInterval(-300),
+            acceptedAt: Date().addingTimeInterval(-120))
         DiskStore.save([stale], name: "outbox-c1")
         let outbox = Outbox(conversationId: "c1")
         outbox.surfaceStaleAcceptedEntries(window: 60)
         XCTAssertEqual(outbox.entries[0].status, .recoverableInconsistency)
+    }
+
+    @MainActor
+    func testStalenessWindowRunsFromAcceptanceNotComposition() {
+        // A message composed offline long ago but accepted just now must
+        // get the full window before being flagged — otherwise every
+        // subway-composed message briefly shows a false alarm on arrival.
+        freshDiskStore()
+        let justAccepted = makeEntry(
+            conversationId: "c1", status: .pending, acceptedByServer: true,
+            createdAt: Date().addingTimeInterval(-3600),
+            acceptedAt: Date())
+        DiskStore.save([justAccepted], name: "outbox-c1")
+        let outbox = Outbox(conversationId: "c1")
+        outbox.surfaceStaleAcceptedEntries(window: 60)
+        XCTAssertEqual(outbox.entries[0].status, .pending)
     }
 
     @MainActor

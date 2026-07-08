@@ -97,9 +97,10 @@ final class AppModel {
         for session in sessions.values { session.stop() }
     }
 
+    /// Sign-out also clears all cached data: conversations are per-server
+    /// state and must not leak across a server/account switch.
     func signOut() {
-        for session in sessions.values { session.stop() }
-        sessions.removeAll()
+        clearCache()
         password = ""
         Keychain.deletePassword(account: Self.passwordAccount)
         serverURLString = ""
@@ -109,5 +110,6 @@ final class AppModel {
         for session in sessions.values { session.stop() }
         sessions.removeAll()
         DiskStore.removeAll()
+        listStore.reset()
     }
 }

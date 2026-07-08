@@ -310,7 +310,9 @@ final class ConversationSession {
             persistSnapshot()
 
         case .messageUpdated(let seq, let messageId, let content, let displayData):
-            _ = applyIfNewer(seq)
+            // Stale guard applies here too: a replayed update from before
+            // the floor must not clobber content a newer update already set.
+            guard applyIfNewer(seq) else { return }
             guard let idx = messages.firstIndex(where: { $0.message_id == messageId }) else {
                 return  // update for an unknown target is a silent no-op
             }
@@ -323,15 +325,22 @@ final class ConversationSession {
             guard applyIfNewer(seq) else { return }
             convState = state
             if let mode { presentationMode = mode }
-            let type = state.stringValue ?? state["type"]?.stringValue
-            // States where the agent is waiting on the user (or finished),
-            // mirroring the ConversationState union in ui/src/api.ts.
-            let restingStates: Set<String> = [
-                "idle", "error", "terminal", "context_exhausted", "handed_off",
-                "awaiting_user_response", "awaiting_task_approval",
-                "awaiting_commission_review_approval", "awaiting_recovery",
-            ]
-            agentWorking = type.map { !restingStates.contains($0) } ?? false
+            if let mode {
+                // The server's presentation_mode (idle | working |
+                // needs_action | error | done) is authoritative and covers
+                // state variants this client predates.
+                agentWorking = mode == "working"
+            } else {
+                // Fallback: states where the agent is waiting on the user
+                // (or finished), mirroring ConversationState in ui/src/api.ts.
+                let type = state.stringValue ?? state["type"]?.stringValue
+                let restingStates: Set<String> = [
+                    "idle", "error", "terminal", "context_exhausted", "handed_off",
+                    "awaiting_user_response", "awaiting_task_approval",
+                    "awaiting_commission_review_approval", "awaiting_recovery",
+                ]
+                agentWorking = type.map { !restingStates.contains($0) } ?? false
+            }
 
         case .token(let seq, let text, let requestId):
             guard applyIfNewer(seq) else { return }
@@ -352,8 +361,21 @@ final class ConversationSession {
             drainOutbox()
             persistSnapshot()
 
-        case .conversationUpdate(let seq, _):
-            _ = applyIfNewer(seq)
+        case .conversationUpdate(let seq, let update):
+            guard applyIfNewer(seq) else { return }
+            // Shallow-merge the partial metadata payload (cwd, branch,
+            // title, mode label after e.g. task approval) onto the local
+            // conversation — this event exists precisely so clients don't
+            // need a reconnect to see it.
+            if var conv = conversation {
+                if let v = update["cwd"]?.stringValue { conv.cwd = v }
+                if let v = update["branch_name"]?.stringValue { conv.branch_name = v }
+                if let v = update["task_title"]?.stringValue { conv.task_title = v }
+                if let v = update["conv_mode_label"]?.stringValue { conv.conv_mode_label = v }
+                if let v = update["slug"]?.stringValue { conv.slug = v }
+                conversation = conv
+                persistSnapshot()
+            }
 
         case .steerMessageQueued(let seq, let messageId):
             _ = applyIfNewer(seq)

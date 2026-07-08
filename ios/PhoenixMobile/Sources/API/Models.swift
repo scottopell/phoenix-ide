@@ -19,6 +19,13 @@ struct Conversation: Codable, Identifiable, Equatable, Hashable {
     var archived: Bool?
     var project_name: String?
     var conv_mode_label: String?
+    /// Server-derived display mode: idle | working | needs_action | error |
+    /// done. Authoritative over any client-side guess from `state` — e.g. a
+    /// `context_exhausted` conversation is needs-action until continued,
+    /// done after, which is not decidable from the state type alone.
+    var presentation_mode: String?
+    /// Server-derived "user must act" flag paired with presentation_mode.
+    var requires_action: Bool?
 
     /// `state` is a discriminated union on the wire — either a bare string
     /// or `{ "type": "...", ... }`. Both shapes collapse to the type name.

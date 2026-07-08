@@ -90,8 +90,17 @@ struct AgentMessageView: View {
             }
         case "tool_use":
             ToolUseBlockView(block: block)  // dispatches to native renderers
+        case "thinking", "redacted_thinking":
+            // Deliberately suppressed: interleaved reasoning is rendered via
+            // the think tool card, not raw thinking blocks.
+            EmptyView()
         default:
-            EmptyView()  // thinking/unknown blocks are omitted from the transcript
+            // Unknown block type (e.g. a newer server): degrade visibly to
+            // compact JSON, never silently drop (REQ-IOS-010).
+            Text(block.compactDescription)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(4)
         }
     }
 
