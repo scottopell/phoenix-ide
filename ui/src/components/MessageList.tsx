@@ -166,6 +166,7 @@ function renderHistoricalUnit(
           activeToolUseId={activeToolUseId}
           isFirstInTurn={unit.isFirstInTurn}
           forceExpandedText={isLatestAgentMessage}
+          isLatestAgentMessage={isLatestAgentMessage}
         />
       );
     case 'system': {

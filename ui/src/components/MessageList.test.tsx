@@ -25,7 +25,9 @@ function withConvContext(ui: React.ReactElement): React.ReactElement {
 // real component, so this counts actual re-renders — the render-unit
 // identity regression test (task 58044) asserts state ticks don't bump it.
 const agentRenderCounter = vi.hoisted(() => ({ count: 0 }));
-const agentMessageProps = vi.hoisted(() => [] as Array<{ message: Message; forceExpandedText: boolean | undefined }>);
+const agentMessageProps = vi.hoisted(
+  () => [] as Array<{ message: Message; forceExpandedText: boolean | undefined; isLatestAgentMessage: boolean | undefined }>,
+);
 
 vi.mock('./MessageComponents', async () => {
   const React = await import('react');
@@ -36,9 +38,9 @@ vi.mock('./MessageComponents', async () => {
     QueuedUserMessage: () => (
       <div className="message queued" data-payload-kind="pending">pending</div>
     ),
-    AgentMessage: React.memo(({ message, forceExpandedText }: { message: Message; forceExpandedText?: boolean }) => {
+    AgentMessage: React.memo(({ message, forceExpandedText, isLatestAgentMessage }: { message: Message; forceExpandedText?: boolean; isLatestAgentMessage?: boolean }) => {
       agentRenderCounter.count++;
-      agentMessageProps.push({ message, forceExpandedText });
+      agentMessageProps.push({ message, forceExpandedText, isLatestAgentMessage });
       return <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>;
     }),
     SubAgentStatus: () => null,
@@ -181,6 +183,8 @@ describe('latest assistant expansion in compact mode', () => {
     expect(agentMessageProps).toHaveLength(2);
     expect(agentMessageProps[0]?.forceExpandedText).toBe(false);
     expect(agentMessageProps[1]?.forceExpandedText).toBe(true);
+    expect(agentMessageProps[0]?.isLatestAgentMessage).toBe(false);
+    expect(agentMessageProps[1]?.isLatestAgentMessage).toBe(true);
   });
 });
 

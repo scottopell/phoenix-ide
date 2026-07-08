@@ -775,54 +775,59 @@ export function conversationReducer(
     }
 
     case 'sse_message_updated': {
-      const idx = atom.messages.findIndex((m) => m.message_id === action.messageId);
-      if (idx < 0) return atom;
-      const existing = atom.messages[idx]!;
-      const existingDisplay = (existing.display_data ?? {}) as Record<string, unknown>;
-      // Metadata updates are allowed to arrive with sequence ids higher than
-      // persisted message rows that are already queued behind them. They must
-      // not advance `lastSequenceId`, whose replay floor protects `sse_message`
-      // rows. The merge itself is idempotent for replayed updates.
-      let mergedDisplay = existingDisplay;
-      if (action.displayData !== undefined) {
-        mergedDisplay = { ...existingDisplay, ...action.displayData };
-        // `tool_starts` is an accumulating map keyed by tool_use_id; each
-        // `dispatch_tool_execution` patch carries ONLY the newly-started
-        // tool. The shallow spread above would replace the whole map, so a
-        // second tool's start wipes the first tool's timestamp. Deep-merge
-        // the nested map so every in-flight tool keeps its start time
-        // (REQ-WPV-002).
-        const prevStarts = existingDisplay['tool_starts'];
-        const nextStarts = action.displayData['tool_starts'];
-        const isObj = (v: unknown): v is Record<string, unknown> =>
-          typeof v === 'object' && v !== null && !Array.isArray(v);
-        if (isObj(prevStarts) && isObj(nextStarts)) {
-          mergedDisplay = {
-            ...mergedDisplay,
-            tool_starts: { ...prevStarts, ...nextStarts },
-          };
+      return applyIfNewer(atom, 'sse_message_updated', action.sequenceId, (a) => {
+        const idx = a.messages.findIndex((m) => m.message_id === action.messageId);
+        if (idx < 0) return a;
+        const existing = a.messages[idx]!;
+        const existingDisplay = (existing.display_data ?? {}) as Record<string, unknown>;
+        // REQ-WPV-002: shallow-merge `displayData` rather than replace
+        // wholesale. The runtime emits partial patches (e.g. just
+        // `{tool_starts: {...}}` from `dispatch_tool_execution`) and
+        // wholesale replacement would wipe existing keys (`bash`,
+        // `retry_count`, `duration_ms`, etc.) that earlier broadcasts
+        // or the persisted message set. Each emitter is responsible
+        // for sending only the keys it owns.
+        let mergedDisplay = existingDisplay;
+        if (action.displayData !== undefined) {
+          mergedDisplay = { ...existingDisplay, ...action.displayData };
+          // `tool_starts` is an accumulating map keyed by tool_use_id; each
+          // `dispatch_tool_execution` patch carries ONLY the newly-started
+          // tool. The shallow spread above would replace the whole map, so a
+          // second tool's start wipes the first tool's timestamp. Deep-merge
+          // the nested map so every in-flight tool keeps its start time
+          // (REQ-WPV-002).
+          const prevStarts = existingDisplay['tool_starts'];
+          const nextStarts = action.displayData['tool_starts'];
+          const isObj = (v: unknown): v is Record<string, unknown> =>
+            typeof v === 'object' && v !== null && !Array.isArray(v);
+          if (isObj(prevStarts) && isObj(nextStarts)) {
+            mergedDisplay = {
+              ...mergedDisplay,
+              tool_starts: { ...prevStarts, ...nextStarts },
+            };
+          }
         }
-      }
-      // `durationMs` is a typed convenience field for tool-result
-      // updates — merge into the same display_data so consumers
-      // read from a single place regardless of source path.
-      const withDuration =
-        action.durationMs !== undefined
-          ? { ...mergedDisplay, duration_ms: action.durationMs }
-          : mergedDisplay;
-      const merged = {
-        ...existing,
-        // Only overwrite display_data when at least one of the
-        // contributing fields was present; otherwise preserve the
-        // existing reference for cheap downstream equality checks.
-        ...((action.displayData !== undefined || action.durationMs !== undefined) && {
-          display_data: withDuration,
-        }),
-        ...(action.content !== undefined && { content: action.content }),
-      };
-      const newMessages = [...atom.messages];
-      newMessages[idx] = merged;
-      return { ...atom, messages: newMessages };
+        // `durationMs` is a typed convenience field for tool-result
+        // updates — merge into the same display_data so consumers
+        // read from a single place regardless of source path.
+        const withDuration =
+          action.durationMs !== undefined
+            ? { ...mergedDisplay, duration_ms: action.durationMs }
+            : mergedDisplay;
+        const merged = {
+          ...existing,
+          // Only overwrite display_data when at least one of the
+          // contributing fields was present; otherwise preserve the
+          // existing reference for cheap downstream equality checks.
+          ...((action.displayData !== undefined || action.durationMs !== undefined) && {
+            display_data: withDuration,
+          }),
+          ...(action.content !== undefined && { content: action.content }),
+        };
+        const newMessages = [...a.messages];
+        newMessages[idx] = merged;
+        return { ...a, messages: newMessages };
+      });
     }
 
     case 'sse_state_change': {
