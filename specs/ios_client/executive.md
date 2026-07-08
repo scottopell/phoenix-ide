@@ -32,7 +32,7 @@ injection first).
 | REQ-IOS-005 SSE + reconnect | `SSEParser`, `PhoenixEvent`, `ConversationSession.streamLoop` |
 | REQ-IOS-006 steering visibility | `Outbox.markAccepted(steering:)`, `OutboxEntryView` |
 | REQ-IOS-007 connectivity transparency | `OfflineBanner`, `ConnectionStateBar`, composer send tint |
-| REQ-IOS-008 auth/TLS | `PhoenixAPI` (Bearer), `ServerTrustDelegate`, `Keychain` |
+| REQ-IOS-008 auth/TLS | `PhoenixAPI` (Bearer), `ServerTrustDelegate` + `CertPinStore` (TOFU pinning), `Keychain` |
 | REQ-IOS-009 creation flow | `NewConversationView` |
 | REQ-IOS-010 rendering | `MessageViews.swift` (generic fallback), `ToolViews.swift` (dispatch + native bash/think renderers), `ConversationSession.toolUseIndex` (result join) |
 

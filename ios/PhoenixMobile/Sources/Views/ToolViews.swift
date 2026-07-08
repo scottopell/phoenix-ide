@@ -206,9 +206,16 @@ struct BashResult {
         durationMs = json["duration_ms"]?.numberValue
         waitedMs = json["waited_ms"]?.numberValue
         truncatedBefore = json["truncated_before"]?.boolValue ?? false
-        outputText = (json["lines"]?.arrayValue ?? [])
+        // `partial` is the live trailing un-newlined line (progress bars,
+        // prompts); without it a command that hasn't flushed a newline
+        // renders as silent.
+        var text = (json["lines"]?.arrayValue ?? [])
             .compactMap { $0["bytes"]?.stringValue }
             .joined(separator: "\n")
+        if let partial = json["partial"]?.stringValue, !partial.isEmpty {
+            text = text.isEmpty ? partial : text + "\n" + partial
+        }
+        outputText = text
 
         guard status != nil || errorId != nil else { return nil }
     }

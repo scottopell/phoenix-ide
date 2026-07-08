@@ -19,6 +19,11 @@ final class ConversationListStore {
         var lastRefreshed: Date
     }
 
+    /// Bumped by reset(); a refresh started under an older generation
+    /// discards its response, so an in-flight fetch from the previous
+    /// server cannot repopulate a just-cleared cache.
+    private var generation = 0
+
     init() {
         conversations = DiskStore.load([Conversation].self, name: Self.cacheName) ?? []
         lastRefreshed = DiskStore.load(Meta.self, name: Self.metaName)?.lastRefreshed
@@ -28,11 +33,14 @@ final class ConversationListStore {
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
+        let startedGeneration = generation
         do {
             let fresh = try await api.listConversations()
+            guard generation == startedGeneration else { return }
             apply(fresh)
             lastError = nil
         } catch {
+            guard generation == startedGeneration else { return }
             // Keep the cached list — stale data beats no data offline.
             lastError = (error as? APIError)?.errorDescription ?? error.localizedDescription
         }
@@ -68,8 +76,11 @@ final class ConversationListStore {
 
     /// Drop in-memory state after the disk cache is cleared (or the user
     /// signs out). Without this the long-lived store keeps showing
-    /// supposedly-deleted rows until a successful refresh.
+    /// supposedly-deleted rows until a successful refresh. Also invalidates
+    /// any in-flight refresh so its late response can't repopulate the
+    /// cleared cache with the previous server's data.
     func reset() {
+        generation += 1
         conversations = []
         lastRefreshed = nil
         lastError = nil

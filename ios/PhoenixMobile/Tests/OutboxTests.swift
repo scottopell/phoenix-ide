@@ -253,6 +253,22 @@ final class OutboxTests: XCTestCase {
     }
 
     @MainActor
+    func testDismissedEntryIsNotResurrectedByLateAcceptOrFailure() {
+        // A replayed steer_message_queued event or a POST that completes
+        // after the user discarded the entry must not bring it back.
+        freshDiskStore()
+        let outbox = Outbox(conversationId: "c1")
+        let entry = outbox.enqueue(text: "hi")
+        outbox.markFailed(entry.localId, error: "boom")
+        outbox.dismiss(entry.localId)
+        outbox.markAccepted(entry.localId, steering: true)
+        XCTAssertEqual(outbox.entries[0].status, .dismissed)
+        outbox.markFailed(entry.localId, error: "late failure")
+        XCTAssertEqual(outbox.entries[0].status, .dismissed)
+        XCTAssertTrue(outbox.visibleEntries.isEmpty)
+    }
+
+    @MainActor
     func testRecoverableEntryCanBeRetriedOrDismissed() {
         freshDiskStore()
         let stale = makeEntry(

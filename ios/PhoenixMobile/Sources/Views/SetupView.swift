@@ -48,7 +48,10 @@ struct SetupView: View {
                 } footer: {
                     Text(
                         "Phoenix dev and prod servers usually serve TLS with a "
-                        + "self-signed certificate; leave the trust toggle on for those.")
+                        + "self-signed certificate; leave the trust toggle on for those. "
+                        + "The certificate is pinned on first use — if the server later "
+                        + "presents a different one, connections fail until you re-trust "
+                        + "it in Settings.")
                 }
             }
             .navigationTitle("Phoenix")

@@ -154,14 +154,29 @@ THE SYSTEM SHALL authenticate every request with `Authorization: Bearer
 <password>`
 AND store the password in the iOS Keychain
 
-WHEN the server presents a self-signed certificate and the user has enabled
-the trust toggle for that server configuration
-THE SYSTEM SHALL accept the certificate; otherwise standard trust
-evaluation applies
+WHEN the server presents a certificate that passes standard trust evaluation
+THE SYSTEM SHALL accept it without pinning
+
+WHEN the server presents a self-signed certificate, the user has enabled the
+trust toggle, and no certificate is pinned for that host and port
+THE SYSTEM SHALL accept the certificate
+AND pin its SHA-256 fingerprint (trust on first use)
+
+WHEN a pinned host presents a certificate whose fingerprint differs from
+the pin
+THE SYSTEM SHALL reject the connection
+AND surface the mismatch with an explicit re-trust affordance that forgets
+the pin (the next connection then re-pins)
+
+WHEN the user signs out
+THE SYSTEM SHALL forget the pin along with all other per-server state
 
 **Rationale:** Matches the non-browser client auth scheme (the phoenix-auth
 cookie is a browser session token, not a client credential) and the
-self-signed TLS posture of typical Phoenix deployments.
+self-signed TLS posture of typical Phoenix deployments. Blanket acceptance
+of any certificate would let a MITM on a hostile network capture the Bearer
+password; trust-on-first-use pinning closes that after first contact with
+zero configuration.
 
 ---
 
