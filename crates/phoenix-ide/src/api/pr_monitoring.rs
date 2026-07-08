@@ -167,6 +167,21 @@ impl<'a> ShellGhClient<'a> {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         self.run_json(&refs, label)
     }
+
+    fn graphql_args(repo: &GhRepoView, number: u64, query: &str) -> Vec<String> {
+        vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={query}"),
+            "-F".to_string(),
+            format!("owner={}", repo.owner.login),
+            "-F".to_string(),
+            format!("name={}", repo.name),
+            "-F".to_string(),
+            format!("number={number}"),
+        ]
+    }
     fn rest_paginated_json<T: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
@@ -342,36 +357,41 @@ impl GhClient for ShellGhClient<'_> {
         repo: &GhRepoView,
         number: u64,
     ) -> Result<Vec<GhReviewSummaryReaction>, GhFailure> {
-        let query = r"query($owner:String!, $name:String!, $number:Int!) {
-          repository(owner:$owner, name:$name) {
-            pullRequest(number:$number) {
-              reviews(first:100) {
-                nodes { databaseId reactionGroups { content reactors { totalCount } } }
+        let mut reactions = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let query = r"query($owner:String!, $name:String!, $number:Int!, $after:String) {
+              repository(owner:$owner, name:$name) {
+                pullRequest(number:$number) {
+                  reviews(first:100, after:$after) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes { databaseId reactionGroups { content reactors { totalCount } } }
+                  }
+                }
               }
+            }";
+            let mut args = Self::graphql_args(repo, number, query);
+            if let Some(cursor) = &after {
+                args.push("-F".to_string());
+                args.push(format!("after={cursor}"));
             }
-          }
-        }";
-        let parsed: GhReviewSummaryReactionsResponse = self.run_json(
-            &[
-                "api",
-                "graphql",
-                "-f",
-                &format!("query={query}"),
-                "-F",
-                &format!("owner={}", repo.owner.login),
-                "-F",
-                &format!("name={}", repo.name),
-                "-F",
-                &format!("number={number}"),
-            ],
-            "review summary reactions",
-        )?;
-        Ok(parsed
-            .data
-            .and_then(|d| d.repository)
-            .and_then(|r| r.pull_request)
-            .map(|pr| pr.reviews.nodes)
-            .unwrap_or_default())
+            let parsed: serde_json::Value =
+                self.run_json_owned(&args, "review summary reactions")?;
+            if let Some(nodes) = parsed.pointer("/data/repository/pullRequest/reviews/nodes") {
+                let page: Vec<GhReviewSummaryReaction> = serde_json::from_value(nodes.clone())
+                    .map_err(|e| GhFailure {
+                        kind: GhFailureKind::CommandFailed,
+                        message: format!("failed to parse review summary reaction page: {e}"),
+                    })?;
+                reactions.extend(page);
+            }
+            let Some(cursor) = next_page_cursor(&parsed, "/data/repository/pullRequest/reviews")
+            else {
+                break;
+            };
+            after = Some(cursor);
+        }
+        Ok(reactions)
     }
 
     fn review_threads(
@@ -379,36 +399,42 @@ impl GhClient for ShellGhClient<'_> {
         repo: &GhRepoView,
         number: u64,
     ) -> Result<Vec<GhReviewThread>, GhFailure> {
-        let query = r"query($owner:String!, $name:String!, $number:Int!) {
-          repository(owner:$owner, name:$name) {
-            pullRequest(number:$number) {
-              reviewThreads(first:100) {
-                nodes { id isResolved path comments(first:100) { nodes { id body url createdAt author { login } reactionGroups { content reactors { totalCount } } } } }
+        let mut threads = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let query = r"query($owner:String!, $name:String!, $number:Int!, $after:String) {
+              repository(owner:$owner, name:$name) {
+                pullRequest(number:$number) {
+                  reviewThreads(first:100, after:$after) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes { id isResolved path comments(first:100) { nodes { id body url createdAt author { login } reactionGroups { content reactors { totalCount } } } } }
+                  }
+                }
               }
+            }";
+            let mut args = Self::graphql_args(repo, number, query);
+            if let Some(cursor) = &after {
+                args.push("-F".to_string());
+                args.push(format!("after={cursor}"));
             }
-          }
-        }";
-        let parsed: GhReviewThreadsResponse = self.run_json(
-            &[
-                "api",
-                "graphql",
-                "-f",
-                &format!("query={query}"),
-                "-F",
-                &format!("owner={}", repo.owner.login),
-                "-F",
-                &format!("name={}", repo.name),
-                "-F",
-                &format!("number={number}"),
-            ],
-            "review threads",
-        )?;
-        Ok(parsed
-            .data
-            .and_then(|d| d.repository)
-            .and_then(|r| r.pull_request)
-            .map(|pr| pr.review_threads.nodes)
-            .unwrap_or_default())
+            let parsed: serde_json::Value = self.run_json_owned(&args, "review threads")?;
+            if let Some(nodes) = parsed.pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            {
+                let page: Vec<GhReviewThread> =
+                    serde_json::from_value(nodes.clone()).map_err(|e| GhFailure {
+                        kind: GhFailureKind::CommandFailed,
+                        message: format!("failed to parse review thread page: {e}"),
+                    })?;
+                threads.extend(page);
+            }
+            let Some(cursor) =
+                next_page_cursor(&parsed, "/data/repository/pullRequest/reviewThreads")
+            else {
+                break;
+            };
+            after = Some(cursor);
+        }
+        Ok(threads)
     }
 
     fn reaction_status(
@@ -1295,6 +1321,21 @@ fn is_actionable_feedback(item: &PrFeedbackItem) -> bool {
 
 fn actionable_feedback_items(items: &[PrFeedbackItem]) -> impl Iterator<Item = &PrFeedbackItem> {
     items.iter().filter(|item| is_actionable_feedback(item))
+}
+
+fn next_page_cursor(value: &serde_json::Value, connection_pointer: &str) -> Option<String> {
+    let page_info = value.pointer(connection_pointer)?.get("pageInfo")?;
+    (page_info
+        .get("hasNextPage")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true))
+    .then(|| {
+        page_info
+            .get("endCursor")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+    .flatten()
 }
 
 fn status_from_reactions(reactions: &[PrFeedbackReaction]) -> PrFeedbackStatus {
@@ -2356,28 +2397,6 @@ impl From<GhReviewSummary> for PrFeedbackItem {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct GhReviewThreadsResponse {
-    data: Option<GhReviewThreadsData>,
-}
-#[derive(Debug, Deserialize)]
-struct GhReviewThreadsData {
-    repository: Option<GhReviewThreadsRepo>,
-}
-#[derive(Debug, Deserialize)]
-struct GhReviewThreadsRepo {
-    #[serde(rename = "pullRequest")]
-    pull_request: Option<GhReviewThreadsPr>,
-}
-#[derive(Debug, Deserialize)]
-struct GhReviewThreadsPr {
-    #[serde(rename = "reviewThreads")]
-    review_threads: GhReviewThreadsConnection,
-}
-#[derive(Debug, Deserialize)]
-struct GhReviewThreadsConnection {
-    nodes: Vec<GhReviewThread>,
-}
 #[derive(Debug, Clone, Deserialize)]
 struct GhReviewThread {
     id: Option<String>,
@@ -2441,27 +2460,6 @@ fn reaction_groups_to_summary(groups: &[GhReactionGroup]) -> GhReactionSummary {
     summary
 }
 
-#[derive(Debug, Deserialize)]
-struct GhReviewSummaryReactionsResponse {
-    data: Option<GhReviewSummaryReactionsData>,
-}
-#[derive(Debug, Deserialize)]
-struct GhReviewSummaryReactionsData {
-    repository: Option<GhReviewSummaryReactionsRepo>,
-}
-#[derive(Debug, Deserialize)]
-struct GhReviewSummaryReactionsRepo {
-    #[serde(rename = "pullRequest")]
-    pull_request: Option<GhReviewSummaryReactionsPr>,
-}
-#[derive(Debug, Deserialize)]
-struct GhReviewSummaryReactionsPr {
-    reviews: GhReviewSummaryReactionsConnection,
-}
-#[derive(Debug, Deserialize)]
-struct GhReviewSummaryReactionsConnection {
-    nodes: Vec<GhReviewSummaryReaction>,
-}
 #[derive(Debug, Clone, Deserialize)]
 struct GhReviewSummaryReaction {
     #[serde(rename = "databaseId")]

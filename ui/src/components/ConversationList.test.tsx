@@ -865,6 +865,23 @@ describe('Mobile conversation list redesign', () => {
     expect(approved).toHaveClass('sidebar-pr-badge--feedback-approved');
   });
 
+  it('preserves non-open PR state in sidebar badge accessible text', () => {
+    const conv = makeConv('draft-pr', 'draft-pr', {
+      cached_pr: { ...pr(379), display_state: 'draft' as const, feedback_status: 'approved' },
+      conv_mode_label: 'WORK',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} sidebarMode conversations={[conv]} />
+      </MemoryRouter>,
+    );
+
+    const badge = container.querySelector('[data-id="draft-pr"] .sidebar-pr-badge') as HTMLElement;
+    expect(badge.textContent).toBe('#379 draft 👍');
+    expect(badge).toHaveAttribute('aria-label', 'PR 379, draft, feedback approved (thumbs-up reaction)');
+  });
+
   it('keeps mobile reaction-status PR badges non-interactive and accessible', () => {
     const conv = makeConv('mobile-eyes-pr', 'mobile-eyes-pr', {
       cached_pr: { ...pr(378), feedback_status: 'in_progress' },

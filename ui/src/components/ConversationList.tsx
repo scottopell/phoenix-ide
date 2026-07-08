@@ -101,8 +101,11 @@ function sidebarPrTooltip(pr: CachedPrSummary): string {
 }
 
 function sidebarPrAriaLabel(pr: CachedPrSummary): string {
+  const parts = [`PR ${pr.number}`];
+  if (pr.display_state !== 'open') parts.push(pr.display_state);
   const feedbackStatus = sidebarFeedbackStatusText(pr);
-  return feedbackStatus ? `PR ${pr.number}, feedback ${feedbackStatus}` : `PR ${pr.number}`;
+  if (feedbackStatus) parts.push(`feedback ${feedbackStatus}`);
+  return parts.join(', ');
 }
 
 function PrBadge({ pr, interactive = true }: { pr: CachedPrSummary; interactive?: boolean }) {
