@@ -4075,6 +4075,13 @@ where
                     });
                 }
 
+                let reserved_until = tool_msgs
+                    .last()
+                    .map_or(agent_msg.sequence_id, |msg| msg.sequence_id);
+                let _reserved_broadcast_range = self
+                    .broadcast_tx
+                    .reserve_persisted_message_range(reserved_until);
+
                 // Persist the assistant message and every tool result in one
                 // transaction: either the full round is durable or none of it
                 // is. A partial write would leave an unpaired `tool_use` that
@@ -4167,6 +4174,13 @@ where
                 created_at: Utc::now(),
             });
         }
+
+        let reserved_until = tool_msgs
+            .last()
+            .map_or(agent_msg.sequence_id, |msg| msg.sequence_id);
+        let _reserved_broadcast_range = self
+            .broadcast_tx
+            .reserve_persisted_message_range(reserved_until);
 
         let proposal = crate::db::ForkProposal {
             id: proposal_id,
