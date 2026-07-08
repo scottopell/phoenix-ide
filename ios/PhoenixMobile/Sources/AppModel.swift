@@ -132,6 +132,12 @@ final class AppModel {
             sessions[conversationId]?.stop()
             sessions[conversationId] = nil
             listStore.remove(id: conversationId)
+            // Archiving abandons the conversation's local state, including
+            // any queued drafts: the server rejects chat to archived
+            // conversations, so a surviving outbox file would only feed the
+            // drain sweep undeliverable text (or an unreachable failure).
+            DiskStore.remove(name: "outbox-\(conversationId)")
+            DiskStore.remove(name: "conv-\(conversationId)")
             return true
         } catch {
             lastActionError = (error as? APIError)?.errorDescription
