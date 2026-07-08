@@ -1,0 +1,116 @@
+import XCTest
+
+@testable import PhoenixMobile
+
+// Contract tests for the typed conversation-state decode. The contract is
+// the ConvState discriminated union as serialized on the wire (mirrored by
+// ConversationState in ui/src/api.ts): one test per parsing rule, plus the
+// fallback rules that keep a newer server from breaking rendering.
+final class ConversationStateTests: XCTestCase {
+
+    private func parse(_ raw: String) -> ConversationState {
+        let json = try? JSONDecoder().decode(JSONValue.self, from: Data(raw.utf8))
+        return ConversationState.parse(json)
+    }
+
+    func testBareStringState() {
+        XCTAssertEqual(parse("\"idle\""), .idle)
+    }
+
+    func testTaggedObjectState() {
+        XCTAssertEqual(parse("{\"type\":\"idle\"}"), .idle)
+    }
+
+    func testLlmRequestingCarriesAttempt() {
+        XCTAssertEqual(
+            parse("{\"type\":\"llm_requesting\",\"attempt\":3}"),
+            .llmRequesting(attempt: 3))
+    }
+
+    func testSeededLlmRequestingCollapsesToLlmRequesting() {
+        XCTAssertEqual(
+            parse("{\"type\":\"seeded_llm_requesting\",\"seed_message_id\":\"m1\",\"attempt\":1}"),
+            .llmRequesting(attempt: 1))
+    }
+
+    func testToolExecutingCarriesToolAndCounts() {
+        let raw = """
+        {"type":"tool_executing",
+         "current_tool":{"id":"t3","name":"bash","input":{"cmd":"ls"}},
+         "remaining_tools":[{"id":"t4","name":"patch"},{"id":"t5","name":"think"}],
+         "completed_results":[{"tool_use_id":"t1"},{"tool_use_id":"t2"}]}
+        """
+        XCTAssertEqual(
+            parse(raw),
+            .toolExecuting(toolName: "bash", remainingCount: 2, completedCount: 2))
+    }
+
+    func testAwaitingSubAgentsCarriesCounts() {
+        let raw = """
+        {"type":"awaiting_sub_agents",
+         "pending":[{"id":"a"},{"id":"b"},{"id":"c"}],
+         "completed_results":[{"id":"d"}]}
+        """
+        XCTAssertEqual(parse(raw), .awaitingSubAgents(pendingCount: 3, completedCount: 1))
+    }
+
+    func testAwaitingUserResponseCarriesQuestions() {
+        let raw = """
+        {"type":"awaiting_user_response",
+         "questions":[{"question":"Which db?","header":"DB","options":[],"multiSelect":false},
+                      {"question":"Which port?","header":"Port","options":[],"multiSelect":false}]}
+        """
+        XCTAssertEqual(
+            parse(raw),
+            .awaitingUserResponse(questionCount: 2, firstQuestion: "Which db?"))
+    }
+
+    func testAwaitingTaskApprovalCarriesTitle() {
+        XCTAssertEqual(
+            parse("{\"type\":\"awaiting_task_approval\",\"title\":\"Fix login\",\"priority\":\"p1\",\"plan\":\"...\"}"),
+            .awaitingTaskApproval(title: "Fix login"))
+    }
+
+    func testErrorCarriesMessage() {
+        XCTAssertEqual(
+            parse("{\"type\":\"error\",\"message\":\"rate limited\",\"error_kind\":\"llm_rate_limit\"}"),
+            .error(message: "rate limited"))
+    }
+
+    func testCancellingVariantsCollapse() {
+        XCTAssertEqual(parse("{\"type\":\"cancelling\"}"), .cancelling)
+        XCTAssertEqual(
+            parse("{\"type\":\"cancelling_tool\",\"tool_use_id\":\"t1\"}"), .cancelling)
+        XCTAssertEqual(parse("{\"type\":\"cancelling_sub_agents\",\"pending\":[]}"), .cancelling)
+    }
+
+    // MARK: - Fallback rules (a newer server must degrade, not break)
+
+    func testUnhandledVariantBecomesOtherWithTypeName() {
+        XCTAssertEqual(
+            parse("{\"type\":\"awaiting_commission_review_approval\",\"brief\":\"x\"}"),
+            .other(type: "awaiting_commission_review_approval"))
+    }
+
+    func testFutureUnknownVariantBecomesOther() {
+        XCTAssertEqual(
+            parse("{\"type\":\"quantum_reticulating\",\"spline_count\":7}"),
+            .other(type: "quantum_reticulating"))
+    }
+
+    func testMissingTypeBecomesUnknown() {
+        XCTAssertEqual(parse("{\"attempt\":1}"), .unknown)
+        XCTAssertEqual(ConversationState.parse(nil), .unknown)
+    }
+
+    func testFieldlessPayloadsUseDefaults() {
+        // Absent detail fields degrade to defaults rather than failing.
+        XCTAssertEqual(
+            parse("{\"type\":\"llm_requesting\"}"), .llmRequesting(attempt: 1))
+        XCTAssertEqual(
+            parse("{\"type\":\"tool_executing\"}"),
+            .toolExecuting(toolName: "tool", remainingCount: 0, completedCount: 0))
+        XCTAssertEqual(
+            parse("{\"type\":\"error\"}"), .error(message: "Unknown error"))
+    }
+}

@@ -45,6 +45,16 @@ struct ConversationListView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView()
             }
+            .alert(
+                "Couldn't archive",
+                isPresented: Binding(
+                    get: { model.lastActionError != nil },
+                    set: { if !$0 { model.lastActionError = nil } })
+            ) {
+                Button("OK") { model.lastActionError = nil }
+            } message: {
+                Text(model.lastActionError ?? "")
+            }
             .task {
                 await model.refreshList()
             }
@@ -73,6 +83,15 @@ struct ConversationListView: View {
                 ForEach(model.listStore.conversations) { conversation in
                     NavigationLink(value: conversation.id) {
                         ConversationRow(conversation: conversation)
+                    }
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button {
+                            Task { await model.archive(conversationId: conversation.id) }
+                        } label: {
+                            Label("Archive", systemImage: "archivebox")
+                        }
+                        .tint(.orange)
+                        .disabled(!model.connectivity.isOnline)
                     }
                 }
             }

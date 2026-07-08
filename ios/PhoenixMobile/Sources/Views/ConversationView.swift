@@ -13,6 +13,7 @@ struct ConversationView: View {
             OfflineBanner()
             ConnectionStateBar(session: session)
             messageList
+            StateDetailView(session: session)
             ComposerView(session: session, draft: $draft)
         }
         .navigationTitle(session.conversation?.displayTitle ?? "Conversation")
@@ -48,10 +49,6 @@ struct ConversationView: View {
                             .id("streaming")
                     }
                     OutboxSection(session: session)
-                    if session.agentWorking && session.streamingText.isEmpty {
-                        WorkingIndicator(stateType: currentStateType)
-                            .id("working")
-                    }
                     Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(.horizontal, 12)
@@ -67,10 +64,6 @@ struct ConversationView: View {
                 proxy.scrollTo("bottom", anchor: .bottom)
             }
         }
-    }
-
-    private var currentStateType: String? {
-        session.convState?.stringValue ?? session.convState?["type"]?.stringValue
     }
 }
 
@@ -98,31 +91,6 @@ struct ConnectionStateBar: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 3)
             .background(.thinMaterial)
-    }
-}
-
-/// The state-machine phase indicator while the agent works.
-struct WorkingIndicator: View {
-    let stateType: String?
-
-    var body: some View {
-        HStack(spacing: 8) {
-            ProgressView()
-                .controlSize(.small)
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 4)
-    }
-
-    private var label: String {
-        switch stateType {
-        case "llm_requesting": return "Thinking…"
-        case "tool_executing": return "Running tools…"
-        case "awaiting_sub_agents": return "Waiting on sub-agents…"
-        default: return "Working…"
-        }
     }
 }
 

@@ -24,7 +24,7 @@ struct ComposerView: View {
 
                 if session.agentWorking {
                     Button {
-                        session.cancelAgent()
+                        session.perform(.cancel)
                     } label: {
                         Image(systemName: "stop.circle.fill")
                             .font(.title2)

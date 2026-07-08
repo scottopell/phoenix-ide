@@ -116,12 +116,16 @@ PhoenixMobile/Sources/
     Models.swift            Wire types (Conversation, Message, envelopes)
     PhoenixAPI.swift        REST client, Bearer auth, self-signed trust delegate
     SSE.swift               Byte-level SSE parser + PhoenixEvent decoding
+    ConversationState.swift Typed state decode with .other/.unknown fallback
   Store/
     Outbox.swift            Persistent offline message queue (the contract)
+    ConversationAction.swift  Action seam: online-only vs outboxed policy axis
     ConversationListStore.swift  Cached conversation list
     ConversationSession.swift    Per-conversation reducer + SSE loop + drains
   Views/                    SwiftUI screens (list, conversation, composer, setup…)
     ToolViews.swift         Per-tool native renderers (bash, think) + dispatch;
                             unknown tools fall back to the generic JSON cards
+    StateViews.swift        Typed-state detail dispatch (working detail,
+                            needs-action cards, error card + dismiss)
 ```
 

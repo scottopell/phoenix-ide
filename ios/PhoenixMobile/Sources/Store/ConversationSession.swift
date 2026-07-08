@@ -25,6 +25,10 @@ final class ConversationSession {
     private(set) var agentWorking = false
     private(set) var presentationMode: String?
     private(set) var convState: JSONValue?
+    /// Typed decode of convState, kept in lockstep by the reducer (and
+    /// seeded from the cached conversation on cold open). Views render
+    /// from this; the raw JSONValue exists only for persistence.
+    private(set) var typedState: ConversationState = .unknown
     private(set) var connection: ConnectionState = .idle
     /// In-flight LLM text accumulated from token events; cleared when the
     /// finalized message arrives or the turn ends.
@@ -67,6 +71,7 @@ final class ConversationSession {
             conversation = snap.conversation
             messages = snap.messages
             lastSequenceId = snap.lastSequenceId
+            typedState = ConversationState.parse(snap.conversation?.state)
             rebuildToolUseIndex()
         }
     }
@@ -193,10 +198,27 @@ final class ConversationSession {
         }
     }
 
-    func cancelAgent() {
+    /// Execute a session-scoped action per its declared delivery policy
+    /// (ConversationAction). Online-only actions fail fast with a toast
+    /// when offline — deliberately not queued, see the policy doc.
+    func perform(_ action: ConversationAction) {
+        switch action.policy {
+        case .onlineOnly:
+            guard connectivity.isOnline else {
+                lastErrorToast = "This action needs a connection — it can't be queued."
+                return
+            }
+        case .outboxed:
+            break  // never blocked on connectivity by definition
+        }
         Task {
             do {
-                _ = try await api.cancel(conversationId: conversationId)
+                switch action {
+                case .cancel:
+                    _ = try await api.cancel(conversationId: conversationId)
+                case .dismissError:
+                    try await api.dismissError(conversationId: conversationId)
+                }
             } catch {
                 lastErrorToast = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
@@ -267,6 +289,7 @@ final class ConversationSession {
         case .initSnapshot(let snap):
             conversation = snap.conversation
             convState = snap.conversation.state
+            typedState = ConversationState.parse(snap.conversation.state)
             messages = snap.messages.sorted { $0.sequence_id < $1.sequence_id }
             agentWorking = snap.agentWorking
             presentationMode = snap.presentationMode
@@ -334,6 +357,7 @@ final class ConversationSession {
         case .stateChange(let seq, let state, let mode):
             guard applyIfNewer(seq) else { return }
             convState = state
+            typedState = ConversationState.parse(state)
             if let mode { presentationMode = mode }
             if let mode {
                 // The server's presentation_mode (idle | working |
