@@ -90,6 +90,11 @@ pub trait MessageRetriever: Send + Sync {
         top_k: usize,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError>;
 
+    /// Whether startup reconciliation has completed. Consumers that query broad
+    /// scopes use this to avoid treating a warming derived index as
+    /// authoritative.
+    fn index_reconciled(&self) -> bool;
+
     /// Whether the index **fully and freshly** covers the given conversations:
     /// every message present AND its indexed `content_hash` matching the
     /// current extraction (so a swallowed best-effort reindex that left a
@@ -224,6 +229,10 @@ impl Fts5Retriever {
 
 #[async_trait]
 impl MessageRetriever for Fts5Retriever {
+    fn index_reconciled(&self) -> bool {
+        self.index_reconciled()
+    }
+
     async fn retrieve(
         &self,
         query: &str,

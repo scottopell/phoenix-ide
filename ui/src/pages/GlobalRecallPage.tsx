@@ -74,8 +74,14 @@ export function GlobalRecallPage() {
     setAsking(true);
     setError(null);
     try {
-      const res = await api.askGlobalRecallSession(activeSessionId, text);
-      setMessages((prev) => [...prev, res.user_message, res.assistant_message]);
+      const submittedSessionId = activeSessionId;
+      const res = await api.askGlobalRecallSession(submittedSessionId, text);
+      setActiveSessionId((current) => {
+        if (current === submittedSessionId) {
+          setMessages((prev) => [...prev, res.user_message, res.assistant_message]);
+        }
+        return current;
+      });
       refreshSessions();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -126,12 +132,13 @@ export function GlobalRecallPage() {
                     <div className="global-recall-signals">
                       {item.signals.map((signal) => <span key={signal}>{signal}</span>)}
                     </div>
-                    {(item.task_title || item.branch_name) && (
-                      <div className="global-recall-work-meta">
-                        {item.task_title && <span>TASK {item.task_id ?? ''} {item.task_status ? `· ${item.task_status}` : ''} · {item.task_title}</span>}
-                        {item.branch_name && <span>BRANCH {item.branch_name}{item.base_branch ? ` ← ${item.base_branch}` : ''}</span>}
-                      </div>
-                    )}
+                    <div className="global-recall-work-meta">
+                      <span>CURRENT {shortId(item.current_conversation_id)}</span>
+                      {item.source === 'chain' && <span>ROOT {shortId(item.root_conversation_id)}</span>}
+                      {item.worktree_path && <span>WORKTREE {item.worktree_path}</span>}
+                      {item.task_title && <span>TASK {item.task_id ?? ''} {item.task_status ? `· ${item.task_status}` : ''} · {item.task_title}</span>}
+                      {item.branch_name && <span>BRANCH {item.branch_name}{item.base_branch ? ` ← ${item.base_branch}` : ''}</span>}
+                    </div>
                   </div>
                   <button type="button" onClick={() => navigator.clipboard.writeText(item.reference)}>
                     Copy {item.reference}
@@ -191,4 +198,8 @@ export function GlobalRecallPage() {
       </section>
     </div>
   );
+}
+
+function shortId(id: string): string {
+  return id.slice(0, 8);
 }

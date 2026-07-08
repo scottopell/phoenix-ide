@@ -1,4 +1,5 @@
 use super::AppState;
+use crate::db::MessageContent;
 use crate::db::{ConvMode, Conversation, DbError, MessageType, RetrievalScope};
 use crate::state_machine::ConvState;
 use axum::{
@@ -6,7 +7,6 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use phoenix_core::domain::message_text::index_text;
 use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, PromptCacheKey, SystemContent,
     ToolDefinition,
@@ -204,16 +204,9 @@ pub async fn ask_session(
         return Err(AppError::BadRequest("question is required".to_string()));
     }
     let _session = load_session(&state, &id).await?;
-    let user_message = insert_recall_message(&state, &id, "user", question).await?;
     let answer = run_global_recall_agent(&state, &id, question).await?;
-    let assistant_message = insert_recall_message(&state, &id, "assistant", &answer).await?;
-    let now = Utc::now();
-    sqlx::query("UPDATE global_recall_sessions SET updated_at = ?1 WHERE id = ?2")
-        .bind(now.to_rfc3339())
-        .bind(&id)
-        .execute(state.db.pool())
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let (user_message, assistant_message) =
+        insert_recall_turn(&state, &id, question, &answer).await?;
     Ok(Json(AskGlobalRecallResponse {
         user_message,
         assistant_message,
@@ -359,10 +352,7 @@ fn project_item_from_members(members: &[Conversation]) -> Option<GlobalOpenWorkI
             .as_ref()
             .map_or_else(|| format!("/c/{}", current.id), |s| format!("/c/{s}")),
     };
-    let reference = match source {
-        GlobalOpenWorkSource::Chain => format!("@chain:{}", root.id),
-        GlobalOpenWorkSource::Conversation => format!("@conv:{}", current.id),
-    };
+    let reference = format!("@work:{id}");
     Some(GlobalOpenWorkItem {
         id,
         source,
@@ -518,39 +508,63 @@ async fn load_session_messages(
     .map_err(|e| AppError::Internal(e.to_string()))
 }
 
-async fn insert_recall_message(
+async fn insert_recall_turn(
     state: &AppState,
     session_id: &str,
-    role: &str,
-    content: &str,
-) -> Result<GlobalRecallMessage, AppError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = Utc::now();
-    let ordinal: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM global_recall_messages WHERE session_id = ?1",
-    )
-    .bind(session_id)
-    .fetch_one(state.db.pool())
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+    question: &str,
+    answer: &str,
+) -> Result<(GlobalRecallMessage, GlobalRecallMessage), AppError> {
+    let user = GlobalRecallMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: "user".to_string(),
+        content: question.to_string(),
+        created_at: Utc::now(),
+    };
+    let assistant = GlobalRecallMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: "assistant".to_string(),
+        content: answer.to_string(),
+        created_at: Utc::now(),
+    };
+    let mut tx = state
+        .db
+        .pool()
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    insert_recall_message_in_tx(&mut tx, session_id, &user).await?;
+    insert_recall_message_in_tx(&mut tx, session_id, &assistant).await?;
+    sqlx::query("UPDATE global_recall_sessions SET updated_at = ?1 WHERE id = ?2")
+        .bind(assistant.created_at.to_rfc3339())
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok((user, assistant))
+}
+
+async fn insert_recall_message_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session_id: &str,
+    message: &GlobalRecallMessage,
+) -> Result<(), AppError> {
     sqlx::query(
-        "INSERT INTO global_recall_messages (id, session_id, ordinal, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO global_recall_messages (id, session_id, ordinal, role, content, created_at)
+         SELECT ?1, ?2, COALESCE(MAX(ordinal) + 1, 0), ?3, ?4, ?5
+         FROM global_recall_messages WHERE session_id = ?2",
     )
-    .bind(&id)
+    .bind(&message.id)
     .bind(session_id)
-    .bind(ordinal)
-    .bind(role)
-    .bind(content)
-    .bind(now.to_rfc3339())
-    .execute(state.db.pool())
+    .bind(&message.role)
+    .bind(&message.content)
+    .bind(message.created_at.to_rfc3339())
+    .execute(&mut **tx)
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(GlobalRecallMessage {
-        id,
-        role: role.to_string(),
-        content: content.to_string(),
-        created_at: now,
-    })
+    Ok(())
 }
 
 async fn run_global_recall_agent(
@@ -680,6 +694,16 @@ async fn execute_global_tool(
             if query.is_empty() {
                 return ("error: query is required".to_string(), true);
             }
+            match global_index_is_fresh(state).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return (
+                        "search unavailable: the global message index is still warming; try again after startup reconciliation completes".to_string(),
+                        true,
+                    );
+                }
+                Err(e) => return (format!("error: index freshness check failed: {e}"), true),
+            }
             match state
                 .message_retriever
                 .retrieve(query, RetrievalScope::Global, SEARCH_TOP_K)
@@ -734,6 +758,19 @@ async fn execute_global_tool(
         }
         other => (format!("error: unknown tool {other}"), true),
     }
+}
+
+async fn global_index_is_fresh(state: &AppState) -> Result<bool, crate::db::RetrievalError> {
+    if !state.message_retriever.index_reconciled() {
+        return Ok(false);
+    }
+    let conversations = state
+        .db
+        .list_conversations()
+        .await
+        .map_err(|e| crate::db::RetrievalError::Db(sqlx::Error::Protocol(e.to_string())))?;
+    let ids: Vec<String> = conversations.into_iter().map(|c| c.id).collect();
+    state.message_retriever.is_fresh_for(&ids).await
 }
 
 async fn format_global_search_hits(state: &AppState, hits: &[crate::db::RetrievedChunk]) -> String {
@@ -845,8 +882,64 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
         href,
         conv.id,
         message.message_id,
-        index_text(message).trim()
+        render_full_message_text(message).trim()
     )
+}
+
+fn render_full_message_text(message: &crate::db::Message) -> String {
+    match &message.content {
+        MessageContent::User(c) => {
+            let mut text = c.llm_text().to_string();
+            for f in &c.files {
+                text.push('\n');
+                text.push_str(&f.llm_context_tag());
+            }
+            if !c.images.is_empty() {
+                tracing::debug!(
+                    n = c.images.len(),
+                    "global recall read_conversation: dropping user-message images — image recall is unsupported",
+                );
+                let _ = write!(
+                    text,
+                    "\n[{} image(s) attached to this message are not shown — Global Recall reads text only]",
+                    c.images.len()
+                );
+            }
+            text
+        }
+        MessageContent::Agent(blocks) => blocks
+            .iter()
+            .map(ContentBlock::render_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        MessageContent::Tool(c) => {
+            if c.images.is_empty() {
+                c.content.clone()
+            } else {
+                tracing::debug!(
+                    tool_use_id = %c.tool_use_id,
+                    n = c.images.len(),
+                    "global recall read_conversation: dropping tool-result images — image recall is unsupported",
+                );
+                format!(
+                    "{}\n[{} image(s) in this tool result are not shown — Global Recall reads text only]",
+                    c.content,
+                    c.images.len()
+                )
+            }
+        }
+        MessageContent::System(c) => c.text.clone(),
+        MessageContent::Error(c) => c.message.clone(),
+        MessageContent::Continuation(c) => c.summary.clone(),
+        MessageContent::Skill(c) => {
+            let mut body = format!("/{} {}\n{}", c.name, c.trigger, c.body);
+            for f in &c.files {
+                body.push('\n');
+                body.push_str(&f.llm_context_tag());
+            }
+            body
+        }
+    }
 }
 
 fn format_open_work_for_agent(view: &GlobalOpenWorkResponse) -> String {
