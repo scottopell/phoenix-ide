@@ -1117,10 +1117,10 @@ async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet
          UNION
          SELECT stored_path FROM steering_message_files
          UNION
-         SELECT json_extract(file.value, '$.stored_path') AS stored_path
-         FROM conversation_creation_jobs, json_each(intent_json, '$.files') AS file
-         WHERE phase IN ('accepted', 'provisioning', 'failed')
-           AND json_extract(file.value, '$.stored_path') IS NOT NULL",
+         SELECT f.stored_path
+         FROM conversation_creation_job_files f
+         JOIN conversation_creation_jobs j ON j.id = f.job_id
+         WHERE j.phase IN ('accepted', 'provisioning', 'failed')",
     )
     .fetch_all(db.pool())
     .await
@@ -1222,6 +1222,18 @@ async fn delete_conversation_attachments_at_root(root: PathBuf, conversation_id:
 
 async fn delete_conversation_attachments(conversation_id: &str) {
     delete_conversation_attachments_at_root(attachment_root(), conversation_id).await;
+}
+
+async fn delete_files(paths: &[String]) {
+    for path in paths {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path, error = %e, "failed to delete uploaded attachment after rejected create request");
+            }
+        }
+    }
 }
 
 fn sanitize_attachment_name(name: &str) -> String {
@@ -1586,15 +1598,27 @@ async fn create_conversation_with_id(
     }
 
     if let Ok(conv) = state.runtime.db().get_conversation(&id).await {
-        if state
+        if let Some(existing_job) = state
             .runtime
             .db()
             .get_conversation_creation_job_for_conversation(&id)
             .await
             .ok()
             .flatten()
-            .is_some()
         {
+            let is_same_create =
+                existing_job.message_id.as_deref() == Some(req.message_id.as_str());
+            let is_pending = matches!(
+                existing_job.phase,
+                crate::db::ConversationCreationPhase::Accepted
+                    | crate::db::ConversationCreationPhase::Provisioning
+            );
+            if !is_same_create && !is_pending {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "conversation_id already belongs to an existing conversation",
+                    "conversation_id_exists",
+                ))));
+            }
             tracing::info!(conversation_id = %id, "Create request hit existing conversation id");
             let mut conversation_json = conversation_to_json(&state, &conv, None);
             inject_creation_job_state_fields(&state, &conv, &mut conversation_json).await;
@@ -1703,11 +1727,20 @@ async fn create_conversation_with_id(
                 }
                 Err(other) => return Err(AppError::BadRequest(other.to_string())),
             }
-            match check_branch_conflict(
-                std::path::Path::new(repo_root),
-                state.runtime.db(),
-                branch_name,
-            ) {
+            let repo_root_for_conflict = repo_root.to_string();
+            let branch_for_conflict = branch_name.to_string();
+            let db_for_conflict = state.runtime.db().clone();
+            match tokio::task::spawn_blocking(move || {
+                check_branch_conflict(
+                    std::path::Path::new(&repo_root_for_conflict),
+                    &db_for_conflict,
+                    &branch_for_conflict,
+                )
+            })
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("branch conflict preflight task failed: {e}"))
+            })? {
                 Ok(()) => {}
                 Err(BranchConflict::PhoenixConversation { slug }) => {
                     return Err(AppError::Conflict(Box::new(
@@ -1770,6 +1803,7 @@ async fn create_conversation_with_id(
             crate::llm_language::LlmLanguage::default()
         }
     };
+    let mut stored_file_paths = Vec::new();
     for raw_file in raw_files {
         match store_attachment_bytes(
             &id,
@@ -1779,9 +1813,12 @@ async fn create_conversation_with_id(
         )
         .await
         {
-            Ok(file) => req.files.push(file),
+            Ok(file) => {
+                stored_file_paths.push(file.stored_path.clone());
+                req.files.push(file);
+            }
             Err(e) => {
-                delete_conversation_attachments(&id).await;
+                delete_files(&stored_file_paths).await;
                 return Err(e);
             }
         }
@@ -1837,7 +1874,7 @@ async fn create_conversation_with_id(
         Err(crate::db::DbError::Sqlx(sqlx::Error::Database(db_err)))
             if db_err.code().as_deref() == Some("2067") =>
         {
-            delete_conversation_attachments(&id).await;
+            delete_files(&stored_file_paths).await;
             if let Ok(Some(existing_job)) = state
                 .runtime
                 .db()
@@ -1866,8 +1903,51 @@ async fn create_conversation_with_id(
                 "failed to create conversation shell".to_string(),
             ));
         }
+        Err(crate::db::DbError::ConversationAlreadyExists(_)) => {
+            delete_files(&stored_file_paths).await;
+            let existing_conversation = state
+                .runtime
+                .db()
+                .get_conversation(&id)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let existing_job = state
+                .runtime
+                .db()
+                .get_conversation_creation_job_for_conversation(&id)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let is_same_create = existing_job
+                .as_ref()
+                .and_then(|job| job.message_id.as_deref())
+                == Some(req.message_id.as_str());
+            let is_pending = existing_job.as_ref().is_some_and(|job| {
+                matches!(
+                    job.phase,
+                    crate::db::ConversationCreationPhase::Accepted
+                        | crate::db::ConversationCreationPhase::Provisioning
+                )
+            });
+            if is_same_create || is_pending {
+                let mut conversation_json =
+                    conversation_to_json(&state, &existing_conversation, None);
+                inject_creation_job_state_fields(
+                    &state,
+                    &existing_conversation,
+                    &mut conversation_json,
+                )
+                .await;
+                return Ok(Json(ConversationResponse {
+                    conversation: conversation_json,
+                }));
+            }
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "conversation_id already belongs to an existing conversation",
+                "conversation_id_exists",
+            ))));
+        }
         Err(e) => {
-            delete_conversation_attachments(&id).await;
+            delete_files(&stored_file_paths).await;
             return Err(AppError::Internal(e.to_string()));
         }
     };
@@ -6280,6 +6360,56 @@ mod conversation_cwd_validation_tests {
                 .is_empty(),
             "rejected managed create must not leave a failed shell"
         );
+    }
+
+    #[tokio::test]
+    async fn completed_creation_job_different_message_id_conflicts() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let conv_id = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .create_conversation(&conv_id, "completed-shell", "/tmp", true, None, None)
+            .await
+            .expect("existing conversation");
+        state
+            .db
+            .insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
+                id: "job-completed-shell".to_string(),
+                conversation_id: conv_id.clone(),
+                message_id: Some("msg-original".to_string()),
+                intent: crate::db::ConversationCreationIntent {
+                    cwd: "/tmp".to_string(),
+                    model: None,
+                    text: "original".to_string(),
+                    message_id: "msg-original".to_string(),
+                    images: vec![],
+                    files: vec![],
+                    mode: None,
+                    base_branch: None,
+                    checkout_ref: None,
+                    seed_parent_id: None,
+                    seed_label: None,
+                },
+            })
+            .await
+            .expect("insert job");
+        state
+            .db
+            .mark_conversation_creation_job_complete("job-completed-shell")
+            .await
+            .expect("complete job");
+        let mut req = create_request("/tmp".to_string());
+        req.conversation_id = Some(conv_id);
+        req.message_id = "msg-different".to_string();
+
+        let err = create_conversation_with_id(state, req, Vec::new())
+            .await
+            .expect_err("completed creation id reuse with a new message must conflict");
+
+        match err {
+            AppError::Conflict(detail) => assert_eq!(detail.error_type, "conversation_id_exists"),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -106,6 +106,8 @@ pub enum DbError {
     Sqlx(#[from] sqlx::Error),
     #[error("Conversation not found: {0}")]
     ConversationNotFound(String),
+    #[error("Conversation already exists: {0}")]
+    ConversationAlreadyExists(String),
     #[error("Message not found: {0}")]
     MessageNotFound(String),
     #[error("Slug already exists: {0}")]
@@ -339,6 +341,32 @@ pub struct Database {
     /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
     /// permissions can be re-tightened after migrations create the WAL sidecars.
     path: String,
+}
+
+async fn insert_creation_job_files_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    job: &InsertConversationCreationJob,
+) -> DbResult<()> {
+    for (ordinal, file) in job.intent.files.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| DbError::Serialization("attachment ordinal exceeds i64".to_string()))?;
+        let size_bytes = i64::try_from(file.size_bytes)
+            .map_err(|_| DbError::Serialization("attachment size exceeds i64".to_string()))?;
+        sqlx::query(
+            "INSERT INTO conversation_creation_job_files (
+                job_id, ordinal, original_name, media_type, size_bytes, stored_path
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&job.id)
+        .bind(ordinal)
+        .bind(&file.original_name)
+        .bind(&file.media_type)
+        .bind(size_bytes)
+        .bind(&file.stored_path)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 impl Database {
@@ -1537,7 +1565,7 @@ impl Database {
                     if e.code().as_deref() == Some("2067")
                         && e.message().contains("conversations.id") =>
                 {
-                    return Err(DbError::Serialization(e.message().to_string()));
+                    return Err(DbError::ConversationAlreadyExists(id.to_string()));
                 }
                 Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
                     attempts += 1;
@@ -1834,6 +1862,7 @@ impl Database {
         let now_str = now.to_rfc3339();
         let intent_json = serde_json::to_string(&job.intent)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO conversation_creation_jobs (
                 id, conversation_id, message_id, phase, intent_json, error,
@@ -1847,8 +1876,10 @@ impl Database {
         .bind(ConversationCreationPhase::Accepted.as_str())
         .bind(intent_json)
         .bind(&now_str)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        insert_creation_job_files_tx(&mut tx, job).await?;
+        tx.commit().await?;
         self.get_conversation_creation_job(&job.id).await
     }
 
@@ -1861,7 +1892,7 @@ impl Database {
     /// # Panics
     ///
     /// Panics if the idle state cannot be serialized.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn create_conversation_with_creation_job(
         &self,
         id: &str,
@@ -1920,7 +1951,7 @@ impl Database {
                     if e.code().as_deref() == Some("2067")
                         && e.message().contains("conversations.id") =>
                 {
-                    return Err(DbError::Serialization(e.message().to_string()));
+                    return Err(DbError::ConversationAlreadyExists(id.to_string()));
                 }
                 Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
                     attempts += 1;
@@ -1950,6 +1981,7 @@ impl Database {
         .bind(&now_str)
         .execute(&mut *tx)
         .await?;
+        insert_creation_job_files_tx(&mut tx, job).await?;
 
         tx.commit().await?;
         let title = schema::title_from_slug(&actual_slug);

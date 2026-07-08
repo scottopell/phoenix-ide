@@ -1567,7 +1567,8 @@ fn map_db_resolve_error(e: DbError) -> ForkResolveError {
         DbError::Sqlx(_)
         | DbError::MessageNotFound(_)
         | DbError::SlugExists(_)
-        | DbError::Serialization(_) => ForkResolveError::Internal(e.to_string()),
+        | DbError::Serialization(_)
+        | DbError::ConversationAlreadyExists(_) => ForkResolveError::Internal(e.to_string()),
     }
 }
 

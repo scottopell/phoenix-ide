@@ -136,6 +136,19 @@ CREATE TABLE IF NOT EXISTS conversation_creation_jobs (
 CREATE INDEX IF NOT EXISTS idx_creation_jobs_phase_updated
     ON conversation_creation_jobs(phase, updated_at);
 
+CREATE TABLE IF NOT EXISTS conversation_creation_job_files (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_creation_job_files_stored_path
+    ON conversation_creation_job_files(stored_path);
+
 CREATE TABLE IF NOT EXISTS turn_usage (
     id INTEGER PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

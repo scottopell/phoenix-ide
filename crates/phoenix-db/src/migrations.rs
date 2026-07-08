@@ -191,6 +191,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_conversation_creation_jobs",
         sql: MIGRATION_035,
     },
+    Migration {
+        version: 36,
+        name: "create_conversation_creation_job_files",
+        sql: MIGRATION_036,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -1002,6 +1007,37 @@ CREATE TABLE IF NOT EXISTS conversation_creation_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_creation_jobs_phase_updated
     ON conversation_creation_jobs(phase, updated_at);
+";
+
+const MIGRATION_036: &str = r"
+CREATE TABLE IF NOT EXISTS conversation_creation_job_files (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_creation_job_files_stored_path
+    ON conversation_creation_job_files(stored_path);
+
+INSERT OR IGNORE INTO conversation_creation_job_files (
+    job_id, ordinal, original_name, media_type, size_bytes, stored_path
+)
+SELECT j.id,
+       file.key,
+       json_extract(file.value, '$.original_name'),
+       json_extract(file.value, '$.media_type'),
+       json_extract(file.value, '$.size_bytes'),
+       json_extract(file.value, '$.stored_path')
+FROM conversation_creation_jobs j, json_each(j.intent_json, '$.files') AS file
+WHERE json_type(j.intent_json, '$.files') = 'array'
+  AND json_extract(file.value, '$.original_name') IS NOT NULL
+  AND json_extract(file.value, '$.media_type') IS NOT NULL
+  AND json_extract(file.value, '$.size_bytes') IS NOT NULL
+  AND json_extract(file.value, '$.stored_path') IS NOT NULL;
 ";
 
 /// Run all pending migrations against the database.
@@ -1818,6 +1854,59 @@ mod tests {
         assert!(
             state.contains("tool_executing"),
             "State should be preserved: {state}"
+        );
+    }
+
+    /// Migration 35: creates the durable async conversation-creation job table.
+    #[tokio::test]
+    async fn migration_035_creates_conversation_creation_jobs_table() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(
+            columns.iter().any(|c| c == "conversation_id"),
+            "Expected conversation_creation_jobs table to exist after migration 35; got {columns:?}"
+        );
+
+        let phase_index: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_creation_jobs_phase_updated'"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            phase_index,
+            vec!["idx_creation_jobs_phase_updated".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_036_creates_creation_job_files_table() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> =
+            sqlx::query("PRAGMA table_info(conversation_creation_job_files)")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<String, _>("name"))
+                .collect();
+        assert!(
+            columns.iter().any(|c| c == "stored_path"),
+            "Expected conversation_creation_job_files table to exist after migration 36; got {columns:?}"
         );
     }
 
