@@ -23,7 +23,14 @@ export function useCreateConversationWithStore() {
       ...args: Parameters<typeof api.createConversation>
     ): Promise<Conversation> => {
       const conv = await api.createConversation(...args);
-      const prompt = typeof args[1] === 'string' && args[1].trim().length > 0 ? args[1] : null;
+      let prompt = typeof args[1] === 'string' && args[1].trim().length > 0 ? args[1] : null;
+      if (!prompt) {
+        try {
+          prompt = localStorage.getItem(`seed-draft:${conv.id}`);
+        } catch {
+          prompt = null;
+        }
+      }
       rememberCreateIntent(conv.id, prompt);
       store.upsertSnapshot(conv.slug, conv);
       return conv;

@@ -97,6 +97,11 @@ export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBac
       const seedLabel = `Work on task ${task.id}: ${task.slug}`;
       const messageId = generateUUID();
       const clientConversationId = generateUUID();
+      try {
+        localStorage.setItem(`seed-draft:${clientConversationId}`, promptText);
+      } catch {
+        // ignore — non-fatal
+      }
       const newConv = await createConversationWithStore(
         parentConversation.cwd,
         '', // empty — server accepts empty text when seed_parent_id is set
@@ -111,11 +116,6 @@ export function TaskViewer({ task, tasksDir, activeSlug, readOnly = false, onBac
         null,
         clientConversationId,
       );
-      try {
-        localStorage.setItem(`seed-draft:${newConv.id}`, promptText);
-      } catch {
-        // ignore — non-fatal
-      }
       navigate(routeForConversation(newConv));
     } catch (err) {
       setSeedError(err instanceof Error ? err.message : 'Failed to start task');

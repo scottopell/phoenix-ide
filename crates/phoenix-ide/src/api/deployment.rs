@@ -628,8 +628,12 @@ fn managed_worktree_scope_owner(conv: &Conversation, conversations: &[Conversati
             Some(_) => !continuation_chain_has_live_owner(conv, conversations),
             None => true,
         },
-        ConvState::Completed { .. } | ConvState::Failed { .. } | ConvState::Terminal => false,
+        ConvState::Completed { .. }
+        | ConvState::Failed { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::Terminal => false,
         ConvState::Idle
+        | ConvState::Provisioning { .. }
         | ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
         | ConvState::ToolExecuting { .. }
@@ -676,8 +680,12 @@ fn managed_worktree_single_node_owner(conv: &Conversation) -> bool {
         ConvState::ContextExhausted { .. } | ConvState::HandedOff { .. } => {
             conv.continued_in_conv_id.is_none()
         }
-        ConvState::Completed { .. } | ConvState::Failed { .. } | ConvState::Terminal => false,
+        ConvState::Completed { .. }
+        | ConvState::Failed { .. }
+        | ConvState::CreationFailed { .. }
+        | ConvState::Terminal => false,
         ConvState::Idle
+        | ConvState::Provisioning { .. }
         | ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
         | ConvState::ToolExecuting { .. }
@@ -700,6 +708,7 @@ fn conv_state_name(state: &phoenix_core::domain::sm_state::ConvState) -> &'stati
         phoenix_core::domain::sm_state::ConvState::SeededLlmRequesting { .. } => {
             "SeededLlmRequesting"
         }
+        phoenix_core::domain::sm_state::ConvState::Provisioning { .. } => "Provisioning",
         phoenix_core::domain::sm_state::ConvState::ToolExecuting { .. } => "ToolExecuting",
         phoenix_core::domain::sm_state::ConvState::CancellingTool { .. } => "CancellingTool",
         phoenix_core::domain::sm_state::ConvState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
@@ -708,6 +717,7 @@ fn conv_state_name(state: &phoenix_core::domain::sm_state::ConvState) -> &'stati
         }
         phoenix_core::domain::sm_state::ConvState::Completed { .. } => "Completed",
         phoenix_core::domain::sm_state::ConvState::Failed { .. } => "Failed",
+        phoenix_core::domain::sm_state::ConvState::CreationFailed { .. } => "CreationFailed",
         phoenix_core::domain::sm_state::ConvState::Error { .. } => "Error",
         phoenix_core::domain::sm_state::ConvState::AwaitingRecovery { .. } => "AwaitingRecovery",
         phoenix_core::domain::sm_state::ConvState::AwaitingContinuation { .. } => {

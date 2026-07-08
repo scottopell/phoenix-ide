@@ -418,7 +418,6 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         // transition_core: AgentBusy
         ConvState::LlmRequesting { .. }
         | ConvState::SeededLlmRequesting { .. }
-        | ConvState::Provisioning { .. }
         | ConvState::ToolExecuting { .. }
         | ConvState::AwaitingSubAgents { .. } => Err(TransitionError::AgentBusy),
 
@@ -443,6 +442,7 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         // adding a new state forces a decision here.
         ConvState::AwaitingRecovery { .. }
         | ConvState::AwaitingContinuation { .. }
+        | ConvState::Provisioning { .. }
         | ConvState::CreationFailed { .. }
         | ConvState::Completed { .. }
         | ConvState::Failed { .. } => Err(TransitionError::InvalidTransition {

@@ -1075,6 +1075,11 @@ function ConversationPageContent() {
       if (!conversation?.id) return;
       const messageId = generateUUID();
       const clientConversationId = generateUUID();
+      try {
+        localStorage.setItem(`seed-draft:${clientConversationId}`, promptText);
+      } catch {
+        // ignore — non-fatal
+      }
       // Stash the seed draft BEFORE navigation so it's visible to the new
       // page on first render (useDraft reads localStorage synchronously in
       // its initializer).
@@ -1092,14 +1097,7 @@ function ConversationPageContent() {
         null,
         clientConversationId,
       );
-      try {
-        localStorage.setItem(`seed-draft:${newConv.id}`, promptText);
-      } catch {
-        // ignore — non-fatal
-      }
-      if (newConv.slug) {
-        navigate(`/c/${newConv.slug}`);
-      }
+      navigate(routeForConversation(newConv));
     },
     [conversation, navigate, createConversationWithStore],
   );
