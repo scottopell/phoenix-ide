@@ -22,7 +22,6 @@ use super::sse::sse_stream;
 use super::types::{
     AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry,
     CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
-<<<<<<< ours
     ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
     ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
     ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
@@ -33,25 +32,6 @@ use super::types::{
     SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
     TaskAvailabilityResponse, TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse,
     UpgradeModelRequest, ValidateCwdResponse,
-||||||| base
-    ConversationListResponse, ConversationResponse, ConversationWithMessagesResponse,
-    CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
-    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
-    FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
-    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
-    SuggestResponse, SystemPromptResponse, TaskAvailabilityResponse, TaskCountQuery,
-    TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
-=======
-    ConversationListResponse, ConversationResponse, ConversationWithMessagesResponse,
-    CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
-    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
-    FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
-    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
-    SuggestResponse, SystemPromptResponse, TaskCountQuery, TaskCountResponse, TaskEntry,
-    TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
->>>>>>> theirs
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -1626,6 +1606,65 @@ async fn create_conversation_with_id(
             conversation: conversation_to_json(&state, &conv, None),
         }));
     }
+
+    if mode_for_preflight == "branch" {
+        let branch_name = req
+            .base_branch
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("Branch mode requires base_branch".to_string()))?;
+        validate_user_ref(branch_name)?;
+        if let Some(repo_root) = detect_git_repo_root(valid_cwd.as_path()) {
+            match check_branch_conflict(
+                std::path::Path::new(&repo_root),
+                state.runtime.db(),
+                branch_name,
+            ) {
+                Ok(()) => {}
+                Err(BranchConflict::PhoenixConversation { slug }) => {
+                    return Err(AppError::Conflict(Box::new(
+                        ConflictErrorResponse::new(
+                            "branch_in_use",
+                            "Branch is already checked out by another Phoenix conversation",
+                        )
+                        .with_conflict_slug(slug),
+                    )));
+                }
+                Err(BranchConflict::ExternalCheckout { branch, location }) => {
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        "branch_checked_out",
+                        format!("Branch '{branch}' is already checked out in {location}"),
+                    ))));
+                }
+            }
+        }
+    }
+
+    let existing_shell: Option<crate::db::Conversation> = if let Ok(conv) =
+        state.runtime.db().get_conversation(&id).await
+    {
+        if state
+            .runtime
+            .db()
+            .get_conversation_creation_job_for_conversation(&id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            tracing::info!(conversation_id = %id, "Create request hit existing conversation id");
+            let mut conversation_json = conversation_to_json(&state, &conv, None);
+            inject_creation_job_state_fields(&state, &conv, &mut conversation_json).await;
+            return Ok(Json(ConversationResponse {
+                conversation: conversation_json,
+            }));
+        }
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "conversation_id_exists",
+            "conversation_id already belongs to an existing conversation",
+        ))));
+    } else {
+        None
+    };
 
     // Idempotency check: if message_id already exists, find and return that conversation
     if state
@@ -3992,10 +4031,72 @@ async fn rename_conversation(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+    let conversation = enrich_conversation_with_seed(&state, &conversation, true).await?;
 
     Ok(Json(ConversationResponse {
         conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
     }))
+}
+
+async fn regenerate_conversation_name(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    let messages = state
+        .runtime
+        .db()
+        .get_messages(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let first_text = messages
+        .iter()
+        .find_map(|m| match &m.content {
+            crate::db::MessageContent::User(content) => Some(content.text.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            AppError::BadRequest("No user message available to summarize".to_string())
+        })?;
+    let title = if let Some(cheap_model) = state.llm_registry.get_cheap_model() {
+        crate::title_generator::generate_title(first_text, cheap_model)
+            .await
+            .unwrap_or_else(|| title_from_text(first_text))
+    } else {
+        title_from_text(first_text)
+    };
+    let slug = slugify_label(&title);
+    state
+        .runtime
+        .db()
+        .update_conversation_creation_metadata(
+            &id,
+            &crate::db::ConversationCreationMetadataUpdate {
+                slug: Some(slug),
+                title: Some(Some(title)),
+                cwd: None,
+                project_id: None,
+                desired_base_branch: None,
+            },
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let conversation = enrich_conversation_with_seed(&state, &conversation, true).await?;
+    Ok(Json(ConversationResponse {
+        conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
+    }))
+}
+
+fn title_from_text(text: &str) -> String {
+    text.split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ============================================================
@@ -8604,7 +8705,6 @@ pub(crate) mod hard_delete_cascade_tests {
     }
 }
 
-<<<<<<< ours
 #[cfg(test)]
 mod regenerate_conversation_name_tests {
     use super::*;
@@ -8815,219 +8915,6 @@ mod regenerate_conversation_name_tests {
     }
 }
 
-||||||| base
-#[cfg(test)]
-mod regenerate_conversation_name_tests {
-    use super::*;
-    use crate::chain_qa::ChainQa;
-    use crate::db::Database;
-    use crate::platform::PlatformCapability;
-    use crate::runtime::RuntimeManager;
-    use crate::tools::mcp::McpClientManager;
-    use async_trait::async_trait;
-    use phoenix_core::domain::db_schema::{MessageContent, UserContent};
-    use phoenix_llm::{
-        ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
-    };
-    use std::sync::Arc;
-    use tokio::sync::broadcast;
-
-    #[derive(Debug)]
-    enum StubLlm {
-        Ok(&'static str),
-        Err,
-    }
-
-    #[async_trait]
-    impl LlmService for StubLlm {
-        async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
-            match self {
-                StubLlm::Ok(text) => Ok(LlmResponse {
-                    content: vec![ContentBlock::text(*text)],
-                    end_turn: true,
-                    usage: Usage::default(),
-                }),
-                StubLlm::Err => Err(LlmError::server_error("temporary outage")),
-            }
-        }
-
-        async fn complete_streaming(
-            &self,
-            r: &LlmRequest,
-            _: &broadcast::Sender<phoenix_llm::TokenChunk>,
-        ) -> Result<LlmResponse, LlmError> {
-            self.complete(r).await
-        }
-
-        #[allow(clippy::unnecessary_literal_bound)]
-        fn model_id(&self) -> &str {
-            "claude-sonnet-4-6"
-        }
-    }
-
-    async fn make_test_state(llm_registry: Arc<ModelRegistry>) -> AppState {
-        let db = Database::open_in_memory().await.expect("open db");
-        let platform = PlatformCapability::None {
-            details: "test".into(),
-        };
-        let mcp_manager = Arc::new(McpClientManager::new());
-        let runtime = Arc::new(RuntimeManager::new(
-            db.clone(),
-            llm_registry.clone(),
-            platform.clone(),
-            mcp_manager.clone(),
-            None,
-        ));
-        let terminals = runtime.terminals.clone();
-        let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
-            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
-        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
-        let sessions = super::super::auth::SessionStore::new(db.clone(), String::new());
-        AppState {
-            runtime,
-            llm_registry,
-            db,
-            platform,
-            mcp_manager,
-            credential_helper: None,
-            password: None,
-            sessions,
-            login_throttle: super::super::auth::LoginThrottle::new(),
-            terminals,
-            chain_qa,
-            message_retriever,
-            codex_login: super::super::codex_login::CodexLoginManager::new(),
-            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
-            runtime_env: Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::detect()),
-            suggest_token: String::new(),
-            discovery: crate::discovery::start(crate::discovery::DiscoveryConfig {
-                enabled: false,
-                ..crate::discovery::DiscoveryConfig::from_env()
-            }),
-        }
-    }
-
-    async fn seed_conversation(state: &AppState, id: &str, slug: &str) {
-        state
-            .db
-            .create_conversation(id, slug, "/tmp", true, None, None)
-            .await
-            .expect("create conversation");
-    }
-
-    async fn seed_opening(state: &AppState, conv_id: &str, text: &str) {
-        state
-            .db
-            .add_message(
-                &format!("msg-{conv_id}"),
-                conv_id,
-                &MessageContent::User(UserContent::new(text)),
-                None,
-                None,
-            )
-            .await
-            .expect("add opening message");
-    }
-
-    async fn regenerate(
-        state: &AppState,
-        id: &str,
-    ) -> Result<Json<ConversationResponse>, AppError> {
-        regenerate_conversation_name(State(state.clone()), Path(id.to_string())).await
-    }
-
-    #[tokio::test]
-    async fn successful_generation_renames_with_existing_slug_rules() {
-        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Ok("Useful Auth Fix"),
-        ))))
-        .await;
-        seed_conversation(&state, "conv-ok", "deterministic-conv-ok").await;
-        seed_opening(
-            &state,
-            "conv-ok",
-            "fix authentication retry after quota errors",
-        )
-        .await;
-
-        let Json(response) = regenerate(&state, "conv-ok").await.expect("regenerate");
-        assert_eq!(response.conversation["slug"], "useful-auth-fix");
-        let reloaded = state.db.get_conversation("conv-ok").await.expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("useful-auth-fix"));
-    }
-
-    #[tokio::test]
-    async fn missing_opening_leaves_slug_unchanged() {
-        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Ok("Useful Name"),
-        ))))
-        .await;
-        seed_conversation(&state, "conv-empty", "deterministic-conv-empty").await;
-
-        assert!(regenerate(&state, "conv-empty").await.is_err());
-        let reloaded = state
-            .db
-            .get_conversation("conv-empty")
-            .await
-            .expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-empty"));
-    }
-
-    #[tokio::test]
-    async fn llm_failure_leaves_slug_unchanged() {
-        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Err,
-        ))))
-        .await;
-        seed_conversation(&state, "conv-fail", "deterministic-conv-fail").await;
-        seed_opening(&state, "conv-fail", "rename this later").await;
-
-        assert!(regenerate(&state, "conv-fail").await.is_err());
-        let reloaded = state
-            .db
-            .get_conversation("conv-fail")
-            .await
-            .expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-fail"));
-    }
-
-    #[tokio::test]
-    async fn duplicate_generated_slug_returns_error_and_leaves_slug_unchanged() {
-        let state = make_test_state(Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(
-            StubLlm::Ok("Taken Slug"),
-        ))))
-        .await;
-        seed_conversation(&state, "conv-taken", "taken-slug").await;
-        seed_conversation(&state, "conv-rename", "deterministic-conv-rename").await;
-        seed_opening(&state, "conv-rename", "rename this later").await;
-
-        assert!(regenerate(&state, "conv-rename").await.is_err());
-        let reloaded = state
-            .db
-            .get_conversation("conv-rename")
-            .await
-            .expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-rename"));
-    }
-
-    #[tokio::test]
-    async fn missing_cheap_model_leaves_slug_unchanged() {
-        let state = make_test_state(Arc::new(ModelRegistry::new_empty())).await;
-        seed_conversation(&state, "conv-nomodel", "deterministic-conv-nomodel").await;
-        seed_opening(&state, "conv-nomodel", "rename this later").await;
-
-        assert!(regenerate(&state, "conv-nomodel").await.is_err());
-        let reloaded = state
-            .db
-            .get_conversation("conv-nomodel")
-            .await
-            .expect("reload");
-        assert_eq!(reloaded.slug.as_deref(), Some("deterministic-conv-nomodel"));
-    }
-}
-
-=======
->>>>>>> theirs
 /// Task 02713: `upgrade_conversation_model` must accept the change from
 /// `Idle` and `Error`, and reject it while an operation is in flight.
 /// Exercises the real axum handler end to end against an in-memory DB.

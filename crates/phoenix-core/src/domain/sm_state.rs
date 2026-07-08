@@ -1780,6 +1780,7 @@ impl ConvState {
             self,
             ConvState::LlmRequesting { .. }
                 | ConvState::SeededLlmRequesting { .. }
+                | ConvState::Provisioning { .. }
                 | ConvState::ToolExecuting { .. }
                 | ConvState::CancellingTool { .. }
                 | ConvState::AwaitingSubAgents { .. }
