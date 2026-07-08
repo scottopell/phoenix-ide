@@ -22,14 +22,15 @@ use super::types::{
     AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry,
     CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
     ConversationListResponse, ConversationMessageRangeResponse, ConversationMessageSliceResponse,
-    ConversationMessagesAroundResponse, ConversationResponse, ConversationWithMessagesResponse,
-    CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
-    ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
-    FileViewerKind, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
-    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse, SuggestRequest,
-    SuggestResponse, SystemPromptResponse, TaskAvailabilityResponse, TaskCountQuery,
-    TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    ConversationMessagesAroundResponse, ConversationMetaResponse, ConversationResponse,
+    ConversationWithMessagesResponse, CreateConversationRequest, CredentialStatusApi,
+    DirectoryEntry, ErrorResponse, ExpansionErrorResponse, FileEntry, FileSearchEntry,
+    FileSearchQuery, FileSearchResponse, FileViewerKind, ListDirectoryResponse, ListFilesResponse,
+    MkdirResponse, ModelsResponse, NotificationSettingsRequest, ProjectFileSearchQuery,
+    ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry,
+    SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
+    TaskAvailabilityResponse, TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse,
+    UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -243,6 +244,10 @@ pub fn create_router(state: AppState) -> Router {
         // terminal renders results as click-to-run affordances.
         .route("/api/suggest", post(suggest_handler))
         // Slug resolution (REQ-API-007)
+        .route(
+            "/api/conversations/by-slug/:slug/meta",
+            get(get_by_slug_meta),
+        )
         .route("/api/conversations/by-slug/:slug", get(get_by_slug))
         // Phoenix Chains v1 (REQ-CHN-003 / 004 / 005 / 007)
         // Work-scope observability inventory (read-projection over the
@@ -4149,6 +4154,37 @@ async fn suggest_handler(
 // ============================================================
 // Slug Resolution (REQ-API-007)
 // ============================================================
+
+async fn get_by_slug_meta(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Json<ConversationMetaResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation_by_slug(&slug)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let latest_messages = state
+        .runtime
+        .db()
+        .get_latest_messages(&conversation.id, 1)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let context_window_size = latest_messages
+        .iter()
+        .filter_map(|m| m.usage_data.as_ref())
+        .next_back()
+        .map_or(0, crate::db::UsageData::context_window_used);
+
+    Ok(Json(ConversationMetaResponse {
+        conversation: conversation_to_json_with_seed(&state, &conversation, true).await?,
+        agent_working: conversation.is_agent_working(),
+        presentation_mode: conv_presentation_mode(&conversation).to_string(),
+        context_window_size,
+    }))
+}
 
 async fn get_by_slug(
     State(state): State<AppState>,

@@ -531,7 +531,7 @@ function ConversationPageContent() {
                   lastHydratedAt: new Date().toISOString(),
                 });
 
-                const metadata = await api.getConversationBySlug(slug);
+                const metadata = await api.getConversationMetaBySlug(slug);
                 if (cancelled) return;
                 const authoritativeConversation = metadata.conversation;
                 setArchiveStatusConfirmedConversationId(authoritativeConversation.id);

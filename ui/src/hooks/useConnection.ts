@@ -391,7 +391,7 @@ export function useConnection({
           // Still validated so a future server change that adds teardown
           // detail cannot slip past this no-op without a schema update.
           on('conversation_became_terminal', (e) => {
-            parseEvent(
+            const res = parseEvent(
               SseConversationBecameTerminalDataSchema,
               e,
               'conversation_became_terminal',

@@ -1001,7 +1001,14 @@ export function conversationReducer(
         mergedMessages = p.messages;
       }
 
-      const phase1Floor = isFreshConnect ? p.pendingAnchorSequenceId : atom.lastAppliedEventSeq;
+      const snapshotMessageAnchor = p.messages.reduce(
+        (maxSeq, message) => Math.max(maxSeq, message.sequence_id),
+        0,
+      );
+      const phase1Floor = Math.max(
+        isFreshConnect ? p.pendingAnchorSequenceId : atom.lastAppliedEventSeq,
+        snapshotMessageAnchor,
+      );
       // streamingBuffer policy: fresh-connect always clears (atom had no
       // buffer to preserve). Reconnect preserves the existing buffer when
       // the snapshot phase is still llm_requesting AND the ring did not

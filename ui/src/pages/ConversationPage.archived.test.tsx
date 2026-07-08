@@ -20,6 +20,7 @@ vi.mock('../api', async () => {
     api: {
       ...actual.api,
       getConversationBySlug: vi.fn(),
+      getConversationMetaBySlug: vi.fn(),
       getConversationMessagesAfter: vi.fn(),
       listConversations: vi.fn(() => Promise.resolve([])),
       listArchivedConversations: vi.fn(() => Promise.resolve([])),
@@ -144,6 +145,12 @@ function renderPage(conversation: Conversation) {
     presentation_mode: 'idle',
     context_window_size: 0,
   });
+  vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+    conversation,
+    agent_working: false,
+    presentation_mode: 'idle',
+    context_window_size: 0,
+  });
 
   render(
     <ConversationContext.Provider value={store}>
@@ -218,6 +225,13 @@ describe('ConversationPage archived read-only rendering', () => {
       transcript_generation: 7,
       server_message_tail: 2,
     });
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationBySlug).mockClear();
 
     render(
       <ConversationContext.Provider value={new ConversationStore()}>
@@ -236,6 +250,7 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
     expect(await screen.findByText('incremental catch-up arrived')).toBeInTheDocument();
     expect(api.getConversationMessagesAfter).toHaveBeenCalledWith(conversationId, 1, 200);
+    expect(api.getConversationMetaBySlug).toHaveBeenCalledWith(cachedConversation.slug);
     expect(cacheDB.putMessages).toHaveBeenCalledWith([catchUpMessage]);
     await waitFor(() => {
       expect(cacheDB.putReplicaMeta).toHaveBeenCalledWith(

@@ -476,6 +476,13 @@ export interface Message {
   created_at: string;
 }
 
+export interface ConversationMetaResponse {
+  conversation: Conversation;
+  agent_working: boolean;
+  presentation_mode: string;
+  context_window_size: number;
+}
+
 export interface ConversationMessageTombstone {
   [key: string]: unknown;
 }
@@ -1291,6 +1298,15 @@ export const api = {
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
       throw new Error('Failed to get conversation');
+    }
+    return resp.json();
+  },
+
+  async getConversationMetaBySlug(slug: string): Promise<ConversationMetaResponse> {
+    const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}/meta`);
+    if (!resp.ok) {
+      if (resp.status === 404) throw new Error('Conversation not found');
+      throw new Error('Failed to get conversation metadata');
     }
     return resp.json();
   },
