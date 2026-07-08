@@ -5831,12 +5831,7 @@ fn open_early_worktree_and_rename_branch(
             "Expected approval worktree to be on a task-pending branch or the exact approval branch, but found '{temp_branch}'"
         ));
     }
-    let target_branch = unique_task_approval_branch(repo_root, task_branch, &temp_branch)?;
-    run_git(
-        &worktree_path,
-        &["branch", "-m", &temp_branch, &target_branch],
-    )
-    .map_err(|e| format!("Failed to rename branch '{temp_branch}' to '{target_branch}': {e}"))?;
+    let target_branch = unique_task_approval_branch(repo_root, task_branch, &temp_branch);
     if target_branch != task_branch {
         run_git(
             repo_root,
@@ -5852,6 +5847,11 @@ fn open_early_worktree_and_rename_branch(
             )
         })?;
     }
+    run_git(
+        &worktree_path,
+        &["branch", "-m", &temp_branch, &target_branch],
+    )
+    .map_err(|e| format!("Failed to rename branch '{temp_branch}' to '{target_branch}': {e}"))?;
     Ok((worktree_path, target_branch))
 }
 
@@ -5862,7 +5862,7 @@ fn branch_ref_exists(repo_root: &std::path::Path, git_ref: &str) -> bool {
 enum TaskApprovalBranchNameStatus {
     Free,
     Occupied,
-    ActiveWorktree(String),
+    ActiveWorktree,
 }
 
 fn task_approval_remote_head_exists(repo_root: &std::path::Path, branch_name: &str) -> bool {
@@ -5890,8 +5890,8 @@ fn task_approval_branch_name_status(
     branch_name: &str,
 ) -> TaskApprovalBranchNameStatus {
     if branch_ref_exists(repo_root, &format!("refs/heads/{branch_name}")) {
-        if let Some(worktree_path) = find_branch_in_worktree_list(repo_root, branch_name) {
-            return TaskApprovalBranchNameStatus::ActiveWorktree(worktree_path);
+        if find_branch_in_worktree_list(repo_root, branch_name).is_some() {
+            return TaskApprovalBranchNameStatus::ActiveWorktree;
         }
         return TaskApprovalBranchNameStatus::Occupied;
     }
@@ -5923,32 +5923,14 @@ fn task_approval_branch_is_retry_match(
     .unwrap_or(false)
 }
 
-fn is_phoenix_managed_worktree(repo_root: &std::path::Path, worktree_path: &str) -> bool {
-    let Ok(path) = std::path::Path::new(worktree_path).canonicalize() else {
-        return false;
-    };
-    let managed_root = repo_root.join(".phoenix/worktrees");
-    let Ok(managed_root) = managed_root.canonicalize() else {
-        return false;
-    };
-    path.starts_with(managed_root)
-}
-
 fn unique_task_approval_branch(
     repo_root: &std::path::Path,
     desired_branch: &str,
     temp_branch: &str,
-) -> Result<String, String> {
+) -> String {
     match task_approval_branch_name_status(repo_root, desired_branch) {
-        TaskApprovalBranchNameStatus::Free => return Ok(desired_branch.to_string()),
-        TaskApprovalBranchNameStatus::Occupied => {}
-        TaskApprovalBranchNameStatus::ActiveWorktree(worktree_path) => {
-            if is_phoenix_managed_worktree(repo_root, &worktree_path) {
-                return Err(format!(
-                    "Task approval branch '{desired_branch}' is already checked out in active Phoenix worktree {worktree_path}"
-                ));
-            }
-        }
+        TaskApprovalBranchNameStatus::Free => return desired_branch.to_string(),
+        TaskApprovalBranchNameStatus::Occupied | TaskApprovalBranchNameStatus::ActiveWorktree => {}
     }
 
     for _ in 0..8 {
@@ -5970,7 +5952,7 @@ fn unique_task_approval_branch(
                 error_class = "branch_name_collision",
                 "Task approval branch name already exists locally or at origin; using suffixed fallback"
             );
-            return Ok(candidate);
+            return candidate;
         }
     }
 
@@ -5982,7 +5964,7 @@ fn unique_task_approval_branch(
         error_class = "branch_name_collision",
         "Task approval branch name collision fallback exhausted short suffixes; using full UUID suffix"
     );
-    Ok(fallback)
+    fallback
 }
 
 /// Blocking implementation of taskmd task approval (REQ-PROJ-028).
@@ -7070,6 +7052,32 @@ mod approve_task_branch_collision_tests {
     }
 
     #[test]
+    fn fallback_marker_failure_happens_before_branch_rename() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "config-lock";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let desired_branch = "task-12345-fix-the-login-bug";
+        run_git(&repo_root, &["branch", desired_branch]).unwrap();
+        let config_lock = repo_root.join(".git/config.lock");
+        std::fs::write(&config_lock, "lock").unwrap();
+
+        let error = open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+            .expect_err("config lock should fail before the non-idempotent branch rename");
+
+        assert!(
+            error.contains("Failed to record approval fallback branch"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            run_git(&explore_wt, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .unwrap()
+                .trim(),
+            "task-pending-config-l"
+        );
+        std::fs::remove_file(config_lock).unwrap();
+    }
+
+    #[test]
     fn approve_task_uses_suffixed_fallback_when_target_branch_exists_as_fetched_origin_ref() {
         let (_tmp, repo_root) = init_repo();
         let conv_id = "remote-collision";
@@ -7209,7 +7217,7 @@ mod approve_task_branch_collision_tests {
     }
 
     #[test]
-    fn active_worktree_branch_collision_rejects_instead_of_falling_back() {
+    fn phoenix_worktree_branch_collision_uses_fallback() {
         let (_tmp, repo_root) = init_repo();
         let target_branch = "task-12345-fix-the-login-bug";
         add_worktree(&repo_root, "active-other", target_branch);
@@ -7229,15 +7237,19 @@ mod approve_task_branch_collision_tests {
             &format!("tasks/{task_filename}"),
             "Fix the login bug",
             Some("main"),
-        );
-        let Err(error) = result else {
-            panic!("active task branch collision must reject");
-        };
+        )
+        .expect("checked-out Phoenix worktree branch should be left untouched via fallback");
 
+        assert_ne!(result.branch_name, target_branch);
         assert!(
-            error.contains("already checked out in active Phoenix worktree"),
-            "unexpected error: {error}"
+            result
+                .branch_name
+                .starts_with("task-12345-fix-the-login-bug-"),
+            "unexpected fallback branch: {}",
+            result.branch_name
         );
+        assert!(branch_exists(&repo_root, target_branch));
+        assert!(branch_exists(&repo_root, &result.branch_name));
     }
 
     #[test]
