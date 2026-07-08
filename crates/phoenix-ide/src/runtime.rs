@@ -1164,6 +1164,7 @@ impl RuntimeManager {
                 };
 
                 let mut delivered = 0usize;
+                let mut refresh_scopes: HashSet<WorkScope> = HashSet::new();
                 for conv_id in conv_ids {
                     let Ok(conv) = manager.db().get_conversation(&conv_id).await else {
                         continue;
@@ -1172,9 +1173,13 @@ impl RuntimeManager {
                         &conv.id,
                         conv.conv_mode.worktree_path().map(std::path::Path::new),
                     );
-                    if conv_scope != work_scope {
+                    let direct_match = conv_scope == work_scope;
+                    let pre_rekey_stop_match = !active
+                        && matches!(work_scope, WorkScope::Conversation(ref id) if id == &conv.id);
+                    if !direct_match && !pre_rekey_stop_match {
                         continue;
                     }
+                    refresh_scopes.insert(conv_scope.clone());
                     let broadcaster = {
                         let runtimes = manager.runtimes.read().await;
                         runtimes.get(&conv_id).map(|h| h.broadcast_tx.clone())
@@ -1202,17 +1207,21 @@ impl RuntimeManager {
                 }
 
                 // A browser liveness edge is also a work-scope change
-                // (REQ-WSUI-007). Forward the scope to the work-scope bridge
-                // so it re-broadcasts a `WorkScopeUpdate` carrying the full
-                // refreshed inventory. Reuses this bridge's scope resolution
-                // rather than re-deriving it. Best-effort: a closed channel
-                // (bridge not started) is logged at debug.
-                if let Err(e) = manager.work_scope_browser_tx.send(work_scope.clone()) {
-                    tracing::debug!(
-                        work_scope = %work_scope,
-                        error = %e,
-                        "dropping work-scope forward of browser edge — channel closed"
-                    );
+                // (REQ-WSUI-007). Forward the current routed scope(s) to the
+                // work-scope bridge so it re-broadcasts `WorkScopeUpdate`
+                // carrying refreshed inventory. A pre-rekey stop may arrive as
+                // `conversation:<id>` after the DB row already resolves to a
+                // worktree; in that case refresh the current worktree scope, not
+                // only the old session key.
+                refresh_scopes.insert(work_scope.clone());
+                for refresh_scope in refresh_scopes {
+                    if let Err(e) = manager.work_scope_browser_tx.send(refresh_scope.clone()) {
+                        tracing::debug!(
+                            work_scope = %refresh_scope,
+                            error = %e,
+                            "dropping work-scope forward of browser edge — channel closed"
+                        );
+                    }
                 }
             }
             tracing::info!("Browser lifecycle bridge stopped");
