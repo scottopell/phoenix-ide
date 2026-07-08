@@ -720,11 +720,17 @@ THE SYSTEM SHALL close any active live-view WebSocket cleanly, signalling "sessi
 WHEN no browser session exists for a conversation
 THE SYSTEM SHALL NOT poll or reconnect the live-view WebSocket for that conversation. Reconnect attempts are reserved for transient drops on a session that the server-authoritative signal indicates is still live.
 
+WHEN the user chooses to stop a live browser session from a browser-session UI affordance
+THE SYSTEM SHALL terminate the underlying `BrowserSessionManager` session for that `WorkScope`, using the same destroy lifecycle path as idle cleanup and hard-delete cascade.
+
+WHEN user-initiated browser-session termination succeeds
+THE SYSTEM SHALL emit the normal `browser_session_state` false edge and corresponding work-scope inventory update so the browser viewer, launcher, and work-scope row all return to not-live from server truth.
+
 **Non-goals (locked in for MVP):**
 
 - **REQ-BT-018-NG-INPUT** — User input into the browser view (clicks, typing, scroll, keyboard shortcuts) is out of scope. The mirror is read-only. Adding input would create an arbitration problem with the agent's tool-driven activity (REQ-BT-008 / REQ-BT-009 / REQ-BT-016) that this feature deliberately avoids.
 - **REQ-BT-018-NG-MULTITAB** — Tab / window management UI is out of scope. The panel always shows `BrowserSession.page` (the canonical first page). Additional CDP targets opened by the agent or by the page are not exposed.
-- **REQ-BT-018-NG-HANDOFF** — Take-over / driving handoff between agent and user is out of scope. The agent is the sole driver.
+- **REQ-BT-018-NG-HANDOFF** — Take-over / driving handoff between agent and user is out of scope. The agent is the sole driver; user-initiated session termination is lifecycle control, not page input or handoff.
 - **REQ-BT-018-NG-HEADED** — Headed Chrome / VNC / Xvfb is not the architectural answer. The CDP screencast over the existing headless instance is.
 - **REQ-BT-018-NG-PROXY** — Inferring session liveness from `browser_*` tool calls in message history is explicitly out of scope. The server-authoritative `browser_session_state` SSE event (sourced from `BrowserSessionManager`'s create/destroy edges) is the only signal the UI is permitted to consult. Walking the message stream to decide whether a session "should" exist is a leaky proxy that diverges from server truth as soon as a session is reaped, killed, or never created in the first place.
 

@@ -408,10 +408,12 @@ rule BrowserSessionFellAutoClosesSlot {
     ensures: slot.kind = none
 }
 
--- @guidance: when the falling edge fires while slot.kind != browser,
--- no rule applies -- the slot doesn't change. The launcher chip
--- naturally disappears because it's driven by
--- conversation.browser_session_active, not by slot.kind.
+-- @guidance: the falling edge source is intentionally opaque to the slot:
+-- idle cleanup, hard-delete cascade, or a user-initiated Stop browser action
+-- all arrive as the same server-authoritative browser_session_active=false
+-- transition. When the falling edge fires while slot.kind != browser, no rule
+-- applies -- the slot doesn't change. The launcher chip naturally disappears
+-- because it's driven by conversation.browser_session_active, not by slot.kind.
 
 -- ===========================================================
 -- VS 5. CONVERSATION SWITCH (REQ-VS-010)

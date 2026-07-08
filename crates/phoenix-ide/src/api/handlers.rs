@@ -231,6 +231,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/work-scope/:scope_key/inventory",
             get(get_work_scope_inventory),
         )
+        .route(
+            "/api/work-scope/:scope_key/browser-session",
+            delete(stop_work_scope_browser_session),
+        )
         // Process inspector: per-handle drill-down (identity/state, output
         // delta, live resource sample). `:scope_key` is a
         // `WorkScope::stable_key()`; `:handle_id` names a bash handle in that
@@ -2164,6 +2168,27 @@ async fn get_work_scope_inventory(
     .await;
 
     Ok(Json(inventory))
+}
+
+/// `DELETE /api/work-scope/:scope_key/browser-session` — user-initiated
+/// lifecycle control for the live browser session owned by one `WorkScope`.
+/// Closing the viewer is separate; this terminates Chromium through the same
+/// manager path used by delete cascades and idle cleanup, so normal browser and
+/// work-scope lifecycle events drive the UI back to not-live.
+async fn stop_work_scope_browser_session(
+    State(state): State<AppState>,
+    Path(scope_key): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let work_scope = crate::work_scope::WorkScope::from_stable_key(&scope_key)
+        .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
+
+    state
+        .runtime
+        .browser_sessions()
+        .kill_session(&work_scope)
+        .await;
+
+    Ok(Json(SuccessResponse { success: true }))
 }
 
 /// Optional `since=K` incremental output cursor for the inspect endpoint.
@@ -6113,6 +6138,30 @@ pub(crate) mod hard_delete_cascade_tests {
             .await
             .expect_err("malformed key must be rejected");
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn stop_work_scope_browser_session_rejects_malformed_key() {
+        let state = make_test_state().await;
+        let err =
+            super::stop_work_scope_browser_session(State(state), Path("bogus-no-namespace".into()))
+                .await
+                .expect_err("malformed key must be rejected");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn stop_work_scope_browser_session_absent_session_is_successful_noop() {
+        let state = make_test_state().await;
+        let scope = crate::work_scope::WorkScope::Conversation("conv-no-browser".to_string());
+
+        let Json(resp) =
+            super::stop_work_scope_browser_session(State(state.clone()), Path(scope.stable_key()))
+                .await
+                .expect("absent browser stop should succeed");
+
+        assert!(resp.success);
+        assert!(!state.runtime.browser_sessions().is_active(&scope).await);
     }
 
     // ----------------------------------------------------------------

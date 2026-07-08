@@ -157,6 +157,35 @@ function BrowserOpenButton() {
   );
 }
 
+function BrowserStopButton({ scopeKey, onStopped, onError }: { scopeKey: string; onStopped: () => void; onError: (message: string) => void }) {
+  const [stopping, setStopping] = useState(false);
+  const stop = useCallback(async () => {
+    if (stopping) return;
+    setStopping(true);
+    try {
+      await api.stopWorkScopeBrowserSession(scopeKey);
+      onStopped();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : 'Failed to stop browser session');
+    } finally {
+      setStopping(false);
+    }
+  }, [scopeKey, stopping, onStopped, onError]);
+
+  return (
+    <button
+      type="button"
+      className="ws-row-stop"
+      data-testid="browser-stop-button"
+      onClick={() => void stop()}
+      disabled={stopping}
+      title="Terminate the agent's browser session for this work scope"
+    >
+      {stopping ? 'stopping…' : 'stop'}
+    </button>
+  );
+}
+
 function BashRow({
   handle,
   now,
@@ -241,11 +270,17 @@ function TmuxRow({ status }: { status: 'not_probed' | 'live' | 'gone' }) {
 function BrowserRow({
   state,
   idleMs,
+  scopeKey,
   inspectable,
+  onStopped,
+  onError,
 }: {
   state: 'live' | 'torn_down';
   idleMs: number;
+  scopeKey: string;
   inspectable: boolean;
+  onStopped: () => void;
+  onError: (message: string) => void;
 }) {
   // "idle" is a client-side display over idle_ms; the wire state stays live.
   const idle = state === 'live' && idleMs >= BROWSER_IDLE_THRESHOLD_MS;
@@ -264,6 +299,7 @@ function BrowserRow({
         <span className="ws-row-label">browser</span>
         <span className="ws-row-meta">{display.text}</span>
         {state === 'live' && inspectable && <BrowserOpenButton />}
+        {state === 'live' && <BrowserStopButton scopeKey={scopeKey} onStopped={onStopped} onError={onError} />}
       </div>
     </div>
   );
@@ -436,6 +472,12 @@ function WorkScopeBody({
    *  it omits the affordance rather than write a URL nothing displays. */
   inspectable: boolean;
 }) {
+  const [actionError, setActionError] = useState<string | null>(null);
+  const refreshAfterStop = useCallback(() => {
+    setActionError(null);
+    onRetry();
+  }, [onRetry]);
+
   return (
     <div className="ws-body">
       {error && !inventory && (
@@ -447,6 +489,11 @@ function WorkScopeBody({
         </div>
       )}
       {!error && !inventory && <div className="ws-empty">loading&hellip;</div>}
+      {actionError && (
+        <div className="ws-empty ws-empty--error" role="alert">
+          {actionError}
+        </div>
+      )}
       {inventory && (
         <>
           <section className="ws-section">
@@ -470,7 +517,14 @@ function WorkScopeBody({
           <section className="ws-section">
             <div className="ws-section-head">browser</div>
             {inventory.browser ? (
-              <BrowserRow state={inventory.browser.state} idleMs={inventory.browser.idle_ms} inspectable={inspectable} />
+              <BrowserRow
+                state={inventory.browser.state}
+                idleMs={inventory.browser.idle_ms}
+                scopeKey={scopeKey}
+                inspectable={inspectable}
+                onStopped={refreshAfterStop}
+                onError={setActionError}
+              />
             ) : (
               <div className="ws-empty">no session</div>
             )}

@@ -26,7 +26,7 @@ vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
   return {
     ...actual,
-    api: { ...actual.api, getWorkScopeInventory: vi.fn() },
+    api: { ...actual.api, getWorkScopeInventory: vi.fn(), stopWorkScopeBrowserSession: vi.fn() },
   };
 });
 
@@ -34,6 +34,7 @@ import { WorkScopeSection, WorkScopePanel } from './WorkScopePanel';
 import { useSeededLiveCount } from './useWorkScopeSeed';
 
 const getInv = vi.mocked(api.getWorkScopeInventory);
+const stopBrowser = vi.mocked(api.stopWorkScopeBrowserSession);
 
 function bash(over: Partial<BashHandleInventory> = {}): BashHandleInventory {
   return {
@@ -101,6 +102,7 @@ function sectionTree(props: { scopeKey: string; liveInventory?: WorkScopeInvento
 beforeEach(() => {
   vi.useFakeTimers();
   getInv.mockReset();
+  stopBrowser.mockReset();
 });
 
 afterEach(() => {
@@ -613,6 +615,51 @@ describe('browser open affordance (Phase 3)', () => {
     expect(slot).toEqual({ kind: 'browser' });
   });
 
+  it('a LIVE browser row renders stop and calls the work-scope browser-session endpoint', async () => {
+    const liveBrowser = inv([], { browser: { state: 'live', idle_ms: 0 } });
+    getInv.mockResolvedValue(liveBrowser);
+    stopBrowser.mockResolvedValue({ success: true });
+
+    await act(async () => {
+      render(browserSectionTree({ inventory: liveBrowser, onSlot: () => {} }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId('browser-open-button')).toBeTruthy();
+    const stop = screen.getByTestId('browser-stop-button');
+    expect(stop).toBeTruthy();
+    expect(screen.getByText('stop')).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(stop);
+      await Promise.resolve();
+    });
+
+    expect(stopBrowser).toHaveBeenCalledWith('ws-1');
+  });
+
+  it('stop failure is rendered visibly in the work-scope body', async () => {
+    const liveBrowser = inv([], { browser: { state: 'live', idle_ms: 0 } });
+    getInv.mockResolvedValue(liveBrowser);
+    stopBrowser.mockRejectedValue(new Error('nope'));
+
+    await act(async () => {
+      render(browserSectionTree({ inventory: liveBrowser, onSlot: () => {} }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('browser-stop-button'));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole('alert').textContent).toContain('nope');
+  });
+
   it('a torn_down browser does NOT render open → (even though rows are inspectable)', async () => {
     const deadBrowser = inv([], { browser: { state: 'torn_down', idle_ms: 0 } });
     getInv.mockResolvedValue(deadBrowser);
@@ -627,10 +674,12 @@ describe('browser open affordance (Phase 3)', () => {
     // The browser row is present (torn down), but no open affordance.
     expect(document.querySelector('.ws-row--dead .ws-row-label')?.textContent).toBe('browser');
     expect(screen.queryByTestId('browser-open-button')).toBeNull();
+    expect(screen.queryByTestId('browser-stop-button')).toBeNull();
   });
 
-  it('a LIVE browser in a non-inspectable dock does NOT render open →', async () => {
-    // WorkScopePanel's standalone dock renders BrowserRow with inspectable=false.
+  it('a LIVE browser in a non-inspectable dock renders stop but not open →', async () => {
+    // WorkScopePanel's standalone dock has no viewer renderer, so it omits open
+    // but still offers scope-keyed session lifecycle control.
     const liveBrowser = inv([], { browser: { state: 'live', idle_ms: 0 } });
     getInv.mockResolvedValue(liveBrowser);
 
@@ -651,6 +700,7 @@ describe('browser open affordance (Phase 3)', () => {
     const labels = Array.from(document.querySelectorAll('.ws-row-label')).map((n) => n.textContent);
     expect(labels).toContain('browser');
     expect(screen.queryByTestId('browser-open-button')).toBeNull();
+    expect(screen.getByTestId('browser-stop-button')).toBeTruthy();
   });
 });
 

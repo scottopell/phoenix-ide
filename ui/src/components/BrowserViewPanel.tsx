@@ -26,6 +26,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { api } from '../api';
 
 const TAG_FRAME = 0x00;
 const TAG_URL = 0x01;
@@ -46,6 +47,8 @@ type Status =
 
 interface BrowserViewPanelProps {
   conversationId: string;
+  /** Work-scope key that owns this browser session. Required for stop-session. */
+  scopeKey?: string;
   /** Click handler for the close button in the header. */
   onClose?: () => void;
   /** When true, render with the inline split-pane chrome (no overlay). */
@@ -54,6 +57,7 @@ interface BrowserViewPanelProps {
 
 export function BrowserViewPanel({
   conversationId,
+  scopeKey,
   onClose,
   inline,
 }: BrowserViewPanelProps) {
@@ -69,6 +73,21 @@ export function BrowserViewPanel({
   statusRef.current = status;
   /** Bumping this triggers the connect effect to retear and reconnect. */
   const [reconnectNonce, setReconnectNonce] = useState(0);
+  const [stopping, setStopping] = useState(false);
+  const [stopError, setStopError] = useState<string | null>(null);
+
+  const stopBrowserSession = useCallback(async () => {
+    if (!scopeKey || stopping) return;
+    setStopping(true);
+    setStopError(null);
+    try {
+      await api.stopWorkScopeBrowserSession(scopeKey);
+    } catch (err) {
+      setStopError(err instanceof Error ? err.message : 'Failed to stop browser session');
+    } finally {
+      setStopping(false);
+    }
+  }, [scopeKey, stopping]);
 
   const drawJpeg = useCallback((bytes: Uint8Array) => {
     const canvas = canvasRef.current;
@@ -224,6 +243,18 @@ export function BrowserViewPanel({
         >
           view-only
         </span>
+        {scopeKey && (
+          <button
+            type="button"
+            className="browser-view-panel__stop"
+            onClick={() => void stopBrowserSession()}
+            disabled={stopping}
+            aria-label="Stop browser session"
+            title="Terminate the agent's browser session for this work scope"
+          >
+            {stopping ? 'Stopping…' : 'Stop browser'}
+          </button>
+        )}
         {onClose && (
           <button
             type="button"
@@ -236,6 +267,11 @@ export function BrowserViewPanel({
           </button>
         )}
       </div>
+      {stopError && (
+        <div className="browser-view-panel__error" role="alert">
+          {stopError}
+        </div>
+      )}
       <div className="browser-view-panel__stage">
         <canvas
           ref={canvasRef}

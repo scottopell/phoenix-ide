@@ -12515,6 +12515,35 @@ html * {
   cursor: help;
 }
 
+.browser-view-panel__stop {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border: 1px solid var(--accent-danger, #d04444);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--accent-danger, #d04444);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.browser-view-panel__stop:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
+.browser-view-panel__stop:hover:not(:disabled) {
+  background: rgb(208 68 68 / 12%);
+}
+
+.browser-view-panel__error {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border-top: 1px solid var(--border-subtle, #333);
+  color: var(--accent-danger, #d04444);
+  font-size: 12px;
+  background: rgb(208 68 68 / 8%);
+}
+
 .browser-view-panel__close {
   flex-shrink: 0;
   background: transparent;

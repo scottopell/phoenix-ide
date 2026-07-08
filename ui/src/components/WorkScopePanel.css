@@ -270,8 +270,10 @@
   background: var(--bg-hover, var(--bg-tertiary));
 }
 
-/* Browser "open →" affordance — identical treatment to ws-row-inspect. */
-.ws-row-open {
+/* Browser row affordances — identical treatment to ws-row-inspect, with
+   destructive color for stop. */
+.ws-row-open,
+.ws-row-stop {
   align-self: flex-start;
   margin-top: 2px;
   padding: 1px 6px;
@@ -286,7 +288,17 @@
   align-items: center;
 }
 
-.ws-row-open:hover {
+.ws-row-stop {
+  color: var(--accent-red, #ef4444);
+}
+
+.ws-row-stop:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
+.ws-row-open:hover,
+.ws-row-stop:hover:not(:disabled) {
   background: var(--bg-hover, var(--bg-tertiary));
 }
 

@@ -1172,6 +1172,7 @@ function ConversationPageContent() {
           <Suspense fallback={null}>
             <BrowserViewPanel
               conversationId={conversationId}
+              scopeKey={conversation.work_scope_key}
               onClose={handleCloseBrowserView}
               inline
             />
@@ -1747,6 +1748,7 @@ function ConversationPageContent() {
           <div className="browser-view-overlay">
             <BrowserViewPanel
               conversationId={conversationId}
+              scopeKey={conversation.work_scope_key}
               onClose={handleCloseBrowserView}
             />
           </div>
@@ -1823,6 +1825,7 @@ function ConversationPageContent() {
               ) : browserViewerOpen && conversationId ? (
                 <BrowserViewPanel
                   conversationId={conversationId}
+                  scopeKey={conversation.work_scope_key}
                   onClose={handleCloseBrowserView}
                   inline
                 />

@@ -1246,6 +1246,17 @@ export const api = {
     return resp.json();
   },
 
+  /** Terminate the live browser session owned by a work scope. Closing the
+   *  viewer only hides UI; this calls the server-side session lifecycle path so
+   *  browser_session_active and work-scope inventory update from server truth. */
+  async stopWorkScopeBrowserSession(scopeKey: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/browser-session`, {
+      method: 'DELETE',
+    });
+    if (!resp.ok) throw new Error('Failed to stop browser session');
+    return resp.json();
+  },
+
   /** One handle's combined inspection snapshot — identity + state, an output
    *  delta (the ring read), and a live resource sample (REQ-PINSP-005). The
    *  optional `since` is the prior response's `end_offset`; omitting it returns

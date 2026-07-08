@@ -6,7 +6,7 @@ Inside a conversation, the user can open one of three viewers next to (or instea
 
 When the user navigates *back* in-app to a conversation they had a viewer open in (e.g. sidebar click on conversation A → conversation B → back to A), the previous viewer is restored from per-conversation localStorage. Cold reload deliberately does NOT restore -- a bare URL on reload reflects user intent ("I shared this link with no viewer params") and must not be silently overridden.
 
-The browser viewer auto-opens on a server-side rising edge (a tool just spawned a browser session for this conversation, slot was empty), and auto-closes on a falling edge (session ended). Manual entry via the launcher chip is the recovery path when auto-open is suppressed.
+The browser viewer auto-opens on a server-side rising edge (a tool just spawned a browser session for this conversation, slot was empty), and auto-closes on a falling edge (session ended, including user-initiated session stop). Manual entry via the launcher chip is the recovery path when auto-open is suppressed; stopping the browser terminates the underlying session rather than merely closing the viewer.
 
 ## Technical Summary
 
@@ -34,7 +34,7 @@ Each requirement maps to where its behavior lives in the implementation.
 | **REQ-VS-006:** URL Hydrates Diff and Browser | `?viewer=diff&presentation=<mode>` / `?viewer=browser` hydrate from the URL; the diff re-fetches on mount, so cold reload restores both |
 | **REQ-VS-007:** Single-Slot Mutex | Structural: one `viewer` param at a time. The discriminated union enforces it; no coordinating effects |
 | **REQ-VS-008:** Browser Session Rising Edge Auto-Open | `ViewerSlotProvider` watches the prev-vs-current `browserSessionActive` edge (scoped to the conversation) and opens the browser slot only when the slot is empty |
-| **REQ-VS-009:** Browser Session Falling Edge Auto-Close | Same effect closes the slot on the falling edge when `kind = browser`, without clearing last-viewer storage (a system close, not a user close) |
+| **REQ-VS-009:** Browser Session Falling Edge Auto-Close | Same effect closes the slot on the falling edge when `kind = browser`, including a falling edge caused by user-initiated session stop, without clearing last-viewer storage (a system close, not a user close) |
 | **REQ-VS-010:** Conversation Change Resets Slot | URL path change drops `?viewer=` params (react-router doesn't preserve search across `navigate('/c/B')`); `patchContext` resets via `useScopedState` on `scopeKey` change |
 | **REQ-VS-011:** Patch Context for Prose | `ViewerSlotProvider` carries `patchContext` in `useScopedState` alongside the URL-driven file path |
 | **REQ-VS-012:** Malformed URL Normalization | `deriveSlot` flags `?viewer=prose` without a file, `?viewer=diff` without a valid presentation, or an unknown `?viewer=` value as malformed; an effect normalizes it to none via `setSearchParams` |
