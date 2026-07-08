@@ -317,6 +317,15 @@ struct PhoenixAPI: Sendable {
             "api/conversations/\(conversationId)/archive", body: [:], as: OkResponse.self)
     }
 
+    /// Clears a user-resumable error state. The server responds 409 when
+    /// the error is not dismissable or the conversation isn't errored.
+    func dismissError(conversationId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/dismiss-error", body: [:],
+            as: SuccessResponse.self)
+    }
+
     func validateCwd(path: String) async throws -> ValidateCwdResponse {
         try await get(
             "api/validate-cwd",

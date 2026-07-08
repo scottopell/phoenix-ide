@@ -114,6 +114,32 @@ final class AppModel {
         await listStore.refresh(api: api)
     }
 
+    /// List-scoped conversation action (see ConversationAction's policy
+    /// doc — archive is online-only: it transitions live server state and
+    /// frees resources, so a queued stale archive must not replay later).
+    /// Returns false (with `lastActionError` set) on failure so callers
+    /// can leave the row in place.
+    var lastActionError: String?
+
+    @discardableResult
+    func archive(conversationId: String) async -> Bool {
+        guard let api, connectivity.isOnline else {
+            lastActionError = "Archiving needs a connection — it can't be queued."
+            return false
+        }
+        do {
+            try await api.archive(conversationId: conversationId)
+            sessions[conversationId]?.stop()
+            sessions[conversationId] = nil
+            listStore.remove(id: conversationId)
+            return true
+        } catch {
+            lastActionError = (error as? APIError)?.errorDescription
+                ?? error.localizedDescription
+            return false
+        }
+    }
+
     func foregrounded() {
         for session in sessions.values {
             session.resyncAfterForeground()
