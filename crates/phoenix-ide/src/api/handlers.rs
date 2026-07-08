@@ -1606,10 +1606,23 @@ async fn create_conversation_with_id(
             "Worktree mode requires a git repository".to_string(),
         ));
     }
-    if mode_for_preflight == "managed" && req.base_branch.is_none() {
-        return Err(AppError::BadRequest(
-            "Managed mode requires base_branch".to_string(),
-        ));
+    if mode_for_preflight == "managed" {
+        let base_branch = req
+            .base_branch
+            .as_deref()
+            .ok_or_else(|| AppError::BadRequest("Managed mode requires base_branch".to_string()))?;
+        validate_user_ref(base_branch)?;
+        if let Some(checkout_ref) = req.checkout_ref.as_deref() {
+            validate_user_ref(checkout_ref)?;
+        }
+        if let Some(repo_root) = repo_root_for_preflight.as_deref() {
+            GitStartPoint::for_create_request(
+                std::path::Path::new(repo_root),
+                base_branch,
+                req.checkout_ref.as_deref(),
+            )
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+        }
     }
     let worktree_backed = matches!(mode_for_preflight, "managed" | "branch")
         || (mode_for_preflight == "auto" && repo_root_for_preflight.is_some());
@@ -1686,8 +1699,8 @@ async fn create_conversation_with_id(
             }));
         }
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "conversation_id_exists",
             "conversation_id already belongs to an existing conversation",
+            "conversation_id_exists",
         ))));
     } else {
         None
@@ -6173,6 +6186,65 @@ mod conversation_cwd_validation_tests {
                 .is_empty(),
             "rejected managed create must not leave a failed shell"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_mode_nonexistent_base_branch_rejects_before_shell_creation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        init_git_repo(tmp.path());
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let mut req = create_request(tmp.path().to_string_lossy().to_string());
+        req.mode = Some("managed".to_string());
+        req.base_branch = Some("does-not-exist".to_string());
+
+        let err = create_conversation_with_id(state.clone(), req, Vec::new())
+            .await
+            .expect_err("managed start ref must be validated before shell creation");
+
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("not found"), "got: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        assert!(
+            state
+                .db
+                .list_conversations()
+                .await
+                .expect("list")
+                .is_empty(),
+            "rejected managed create must not leave a failed shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_non_creation_conversation_id_conflict_is_typed() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let conv_id = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .create_conversation(&conv_id, "existing", "/tmp", true, None, None)
+            .await
+            .expect("existing conversation");
+        let mut req = create_request("/tmp".to_string());
+        req.conversation_id = Some(conv_id);
+
+        let err = create_conversation_with_id(state, req, Vec::new())
+            .await
+            .expect_err("non-creation id reuse must conflict");
+
+        match err {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "conversation_id_exists");
+                assert!(
+                    detail.error.contains("existing conversation"),
+                    "got: {}",
+                    detail.error
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -48,6 +48,8 @@ function relativeTaskPath(cwd: string, taskPath: string): string {
   return taskPath.startsWith(root) ? taskPath.slice(root.length) : taskPath;
 }
 
+const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.slug || conv.id}`;
+
 function buildTaskStartPrompt(cwd: string, task: TaskEntry, extraInstructions: string): string {
   const taskFile = relativeTaskPath(cwd, task.path);
   const extra = extraInstructions.trim();
@@ -530,7 +532,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setImages([]);
       setFiles([]);
       clearNewConversationDraft();
-      navigate(`/c/${conv.id}`);
+      navigate(routeForConversation(conv));
     } catch (err) {
       setCreating(false);
       // An unresolvable @reference in the first message rejects with a 422.
