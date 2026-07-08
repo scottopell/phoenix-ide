@@ -146,6 +146,7 @@ export function eventForState(state: ConversationState, conversation: Conversati
       if (conversation.continued_in_conv_id) return null;
       return { type: 'agent_error', title: 'Agent error', conversation };
     case 'error':
+    case 'creation_failed':
       return { type: 'agent_error', title: 'Agent error', conversation };
     default:
       return null;

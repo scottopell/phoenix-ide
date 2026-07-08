@@ -82,6 +82,14 @@ pub trait MessageStore: Send + Sync {
     /// recovery (re-drain after partial steering-queue drain).
     async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
 
+    /// Mark a pending async creation job complete after its initial message is durable.
+    async fn mark_creation_job_complete_for_message(
+        &self,
+        _message_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Update `display_data` for an existing message
     async fn update_message_display_data(
         &self,
@@ -352,6 +360,12 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
     async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
         (**self).message_exists(message_id).await
+    }
+
+    async fn mark_creation_job_complete_for_message(&self, message_id: &str) -> Result<(), String> {
+        (**self)
+            .mark_creation_job_complete_for_message(message_id)
+            .await
     }
 
     async fn update_message_display_data(
@@ -641,6 +655,13 @@ impl MessageStore for DatabaseStorage {
     async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
         self.db
             .message_exists(message_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn mark_creation_job_complete_for_message(&self, message_id: &str) -> Result<(), String> {
+        self.db
+            .mark_conversation_creation_job_complete_for_message(message_id)
             .await
             .map_err(|e| e.to_string())
     }

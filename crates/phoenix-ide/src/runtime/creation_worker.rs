@@ -80,21 +80,7 @@ async fn process_job(
                 .map_err(|e| e.to_string())?;
             Ok(())
         }
-        Ok(ProvisionOutcome::InitialMessageSubmitted) => {
-            if manager
-                .db()
-                .message_exists(&job.intent.message_id)
-                .await
-                .map_err(|e| e.to_string())?
-            {
-                manager
-                    .db()
-                    .mark_conversation_creation_job_complete(&job.id)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        }
+        Ok(ProvisionOutcome::InitialMessageSubmitted) => Ok(()),
         Err((message, kind)) => {
             let failed = ConvState::CreationFailed {
                 job_id: job.id.clone(),
@@ -403,6 +389,8 @@ async fn provision_conversation(
         let _ = broadcast_tx.send_seq(|seq| SseEvent::ConversationUpdate {
             sequence_id: seq,
             update: ConversationMetadataUpdate {
+                slug: Some(slug.clone()),
+                title: title.clone(),
                 cwd: Some(effective_cwd.clone()),
                 branch_name: conv_mode.branch_name().map(ToString::to_string),
                 worktree_path: conv_mode.worktree_path().map(ToString::to_string),

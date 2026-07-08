@@ -2172,6 +2172,30 @@ impl Database {
         Ok(())
     }
 
+    /// Mark the creation job for an initial message complete after that message is durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the lookup or completion update fails.
+    pub async fn mark_conversation_creation_job_complete_for_message(
+        &self,
+        message_id: &str,
+    ) -> DbResult<()> {
+        if let Some(job) = self
+            .get_conversation_creation_job_for_message(message_id)
+            .await?
+        {
+            if matches!(
+                job.phase,
+                ConversationCreationPhase::Accepted | ConversationCreationPhase::Provisioning
+            ) {
+                self.mark_conversation_creation_job_complete(&job.id)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Update conversation state, stamping `state_updated_at = now()`.
     /// Callers that own the authoritative entry timestamp (the runtime
     /// executor) should use [`Self::update_conversation_state_at`] so the

@@ -70,6 +70,7 @@ import type { BashHandleInspection as BashHandleInspectionType } from './generat
 export interface Conversation {
   id: string;
   slug: string;
+  title?: string | null;
   model: string;
   cwd: string;
   created_at: string;

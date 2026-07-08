@@ -815,6 +815,10 @@ impl SseBroadcaster {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConversationMetadataUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_name: Option<String>,

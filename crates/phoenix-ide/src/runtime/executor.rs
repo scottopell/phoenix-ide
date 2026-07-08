@@ -3766,6 +3766,9 @@ where
                         message_id = %message_id,
                         "Skipping PersistMessage; message already exists"
                     );
+                    self.storage
+                        .mark_creation_job_complete_for_message(&message_id)
+                        .await?;
                     return Ok(None);
                 }
 
@@ -3783,6 +3786,10 @@ where
                     .await?;
 
                 // Broadcast to clients (display_data already computed at effect creation)
+                self.storage
+                    .mark_creation_job_complete_for_message(&message_id)
+                    .await?;
+
                 let _ = self.broadcast_tx.send_message(msg);
                 Ok(None)
             }
@@ -5292,6 +5299,8 @@ where
             .send_seq(|seq| SseEvent::ConversationUpdate {
                 sequence_id: seq,
                 update: crate::runtime::ConversationMetadataUpdate {
+                    slug: None,
+                    title: None,
                     cwd: Some(repo_root),
                     branch_name: None,
                     worktree_path: None,
@@ -5510,6 +5519,8 @@ where
                     .send_seq(|seq| SseEvent::ConversationUpdate {
                         sequence_id: seq,
                         update: crate::runtime::ConversationMetadataUpdate {
+                            slug: None,
+                            title: None,
                             cwd: Some(approval_result.worktree_path.clone()),
                             branch_name: Some(approval_result.branch_name.clone()),
                             worktree_path: Some(approval_result.worktree_path.clone()),

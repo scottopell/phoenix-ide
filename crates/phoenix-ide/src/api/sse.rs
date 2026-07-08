@@ -739,6 +739,8 @@ mod tests {
         let event = SseEvent::ConversationUpdate {
             sequence_id: 18,
             update: ConversationMetadataUpdate {
+                slug: None,
+                title: None,
                 cwd: Some("/new/cwd".to_string()),
                 branch_name: None,
                 worktree_path: None,
