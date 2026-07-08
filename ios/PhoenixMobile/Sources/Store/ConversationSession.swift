@@ -591,6 +591,10 @@ final class ConversationSession {
 
         case .token(let seq, let text, let requestId):
             guard applyIfNewer(seq) else { return }
+            // A late/replayed token after the turn closed would recreate a
+            // ghost bubble below the finalized message — only accumulate
+            // while a turn is actually running.
+            guard agentWorking else { return }
             if streamingRequestId != requestId {
                 streamingRequestId = requestId
                 streamingText = ""
@@ -605,6 +609,18 @@ final class ConversationSession {
             streamingText = ""
             streamingRequestId = nil
             agentWorking = false
+            // agent_done can close a turn without a trailing idle
+            // state_change; leave resting/needs-action states alone but
+            // clear in-flight ones so the spinner doesn't outlive the turn.
+            switch typedState {
+            case .llmRequesting, .toolExecuting, .awaitingSubAgents,
+                 .awaitingLlm, .cancelling:
+                typedState = .idle
+                convState = .string("idle")
+                conversation?.state = .string("idle")
+            default:
+                break
+            }
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
             // Snapshot first — same ordering rule as the message branch.
