@@ -1112,16 +1112,15 @@ fn attachment_root() -> PathBuf {
 }
 
 async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet<PathBuf>, String> {
-    // Message file attachments are normalized into `message_files`; read the
-    // stored paths directly rather than scanning the content blob. (Images are
-    // inline base64, not on-disk files, so they need no sweep entry.)
-    // Both message and steering file attachments are normalized into child
-    // tables; read the stored paths directly. (Images are inline base64, not
-    // on-disk files, so they need no sweep entry.)
     let file_rows = sqlx::query(
         "SELECT stored_path FROM message_files
          UNION
-         SELECT stored_path FROM steering_message_files",
+         SELECT stored_path FROM steering_message_files
+         UNION
+         SELECT json_extract(file.value, '$.stored_path') AS stored_path
+         FROM conversation_creation_jobs, json_each(intent_json, '$.files') AS file
+         WHERE phase IN ('accepted', 'provisioning', 'failed')
+           AND json_extract(file.value, '$.stored_path') IS NOT NULL",
     )
     .fetch_all(db.pool())
     .await
@@ -1607,6 +1606,11 @@ async fn create_conversation_with_id(
             "Worktree mode requires a git repository".to_string(),
         ));
     }
+    if mode_for_preflight == "managed" && req.base_branch.is_none() {
+        return Err(AppError::BadRequest(
+            "Managed mode requires base_branch".to_string(),
+        ));
+    }
     let worktree_backed = matches!(mode_for_preflight, "managed" | "branch")
         || (mode_for_preflight == "auto" && repo_root_for_preflight.is_some());
     if !worktree_backed && !req.text.trim().is_empty() {
@@ -1628,6 +1632,15 @@ async fn create_conversation_with_id(
             .ok_or_else(|| AppError::BadRequest("Branch mode requires base_branch".to_string()))?;
         validate_user_ref(branch_name)?;
         if let Some(repo_root) = repo_root_for_preflight.as_deref() {
+            match materialize_branch(std::path::Path::new(repo_root), branch_name) {
+                Ok(()) => {}
+                Err(GitOpError::BranchNotFound(branch)) => {
+                    return Err(AppError::BadRequest(format!(
+                        "Branch '{branch}' not found locally or at origin"
+                    )));
+                }
+                Err(other) => return Err(AppError::BadRequest(other.to_string())),
+            }
             match check_branch_conflict(
                 std::path::Path::new(repo_root),
                 state.runtime.db(),
@@ -6127,6 +6140,71 @@ mod conversation_cwd_validation_tests {
         );
     }
 
+    fn init_git_repo(path: &std::path::Path) {
+        crate::git_ops::run_git(path, &["init", "--initial-branch=main"]).expect("git init");
+        crate::git_ops::run_git(path, &["commit", "--allow-empty", "-m", "init"])
+            .expect("git commit");
+    }
+
+    #[tokio::test]
+    async fn managed_mode_without_base_branch_rejects_before_shell_creation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        init_git_repo(tmp.path());
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let mut req = create_request(tmp.path().to_string_lossy().to_string());
+        req.mode = Some("managed".to_string());
+
+        let err = create_conversation_with_id(state.clone(), req, Vec::new())
+            .await
+            .expect_err("explicit managed mode requires synchronous base_branch validation");
+
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("base_branch"), "got: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        assert!(
+            state
+                .db
+                .list_conversations()
+                .await
+                .expect("list")
+                .is_empty(),
+            "rejected managed create must not leave a failed shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_mode_nonexistent_branch_rejects_before_shell_creation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        init_git_repo(tmp.path());
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let mut req = create_request(tmp.path().to_string_lossy().to_string());
+        req.mode = Some("branch".to_string());
+        req.base_branch = Some("does-not-exist".to_string());
+
+        let err = create_conversation_with_id(state.clone(), req, Vec::new())
+            .await
+            .expect_err("branch existence must be validated before shell creation");
+
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("not found"), "got: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        assert!(
+            state
+                .db
+                .list_conversations()
+                .await
+                .expect("list")
+                .is_empty(),
+            "rejected branch create must not leave a failed shell"
+        );
+    }
+
     #[tokio::test]
     async fn creation_intent_stores_canonical_cwd() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -9779,6 +9857,56 @@ mod attachment_storage_tests {
         sweep_expired_attachments_blocking(root, cutoff, &referenced_set).expect("sweep");
         assert!(referenced.exists());
         assert!(conv.exists());
+    }
+
+    #[tokio::test]
+    async fn referenced_paths_include_creation_job_files() {
+        let db = crate::db::Database::open_in_memory()
+            .await
+            .expect("open db");
+        db.create_conversation(
+            "conv-creation-file",
+            "creation-file",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("create conversation");
+        let stored_path = "/tmp/phoenix-creation-job-attachment.txt".to_string();
+        let intent = crate::db::ConversationCreationIntent {
+            cwd: "/tmp".to_string(),
+            model: None,
+            text: "with attachment".to_string(),
+            message_id: "msg-creation-file".to_string(),
+            images: vec![],
+            files: vec![crate::db::FileAttachment {
+                original_name: "attachment.txt".to_string(),
+                media_type: "text/plain".to_string(),
+                size_bytes: 12,
+                stored_path: stored_path.clone(),
+            }],
+            mode: None,
+            base_branch: None,
+            checkout_ref: None,
+            seed_parent_id: None,
+            seed_label: None,
+        };
+        db.insert_conversation_creation_job(&crate::db::InsertConversationCreationJob {
+            id: "job-creation-file".to_string(),
+            conversation_id: "conv-creation-file".to_string(),
+            message_id: Some("msg-creation-file".to_string()),
+            intent,
+        })
+        .await
+        .expect("insert job");
+
+        let referenced = referenced_attachment_paths(&db).await.expect("references");
+        assert!(
+            referenced.contains(&PathBuf::from(stored_path)),
+            "creation job intent files must be protected from TTL cleanup"
+        );
     }
 
     #[test]
