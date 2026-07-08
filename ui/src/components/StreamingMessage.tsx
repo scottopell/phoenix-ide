@@ -7,7 +7,7 @@ import type { StreamingBuffer } from '../conversation/atom';
 import { useStreamingBuffer } from '../conversation/useConversationAtom';
 import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
-import { resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
+import { CONVERSATION_MARKDOWN_URL_TRANSFORM, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { formatMessageTime } from './MessageComponents';
 
@@ -188,7 +188,7 @@ const StreamingBlock = memo(function StreamingBlock({ block, syntaxStyle, markdo
   if (block.type === 'markdown') {
     return (
       <div className="agent-text-block">
-        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents}>
+        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
           {block.content}
         </ReactMarkdown>
       </div>

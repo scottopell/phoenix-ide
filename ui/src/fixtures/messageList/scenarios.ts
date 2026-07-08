@@ -135,7 +135,7 @@ const markdownImageMessages: Message[] = [
       text: [
         'Here is the Markdown screenshot preview using the same syntax agents paste into conversations:',
         '',
-        '![file-tree-dark-single-slot](qa/message-list/markdown-image-fixture.svg)',
+        '![file-tree-dark-single-slot](http://127.0.0.1:61123/qa/message-list/markdown-image-fixture.svg)',
         '',
         'The image is constrained to the message column and keeps its aspect ratio.',
       ].join('\n'),

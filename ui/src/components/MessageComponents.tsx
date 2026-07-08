@@ -39,7 +39,7 @@ import { PillStrip, type PillItem } from './PillStrip';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
-import { CONVERSATION_MARKDOWN_COMPONENTS, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
+import { CONVERSATION_MARKDOWN_COMPONENTS, CONVERSATION_MARKDOWN_URL_TRANSFORM, createConversationMarkdownComponents, resolveConversationMarkdownImageSrc } from './conversationMarkdownImages';
 import { MermaidDiagram } from './MermaidDiagram';
 import { StreamingBlocks } from './StreamingMessage';
 
@@ -757,7 +757,7 @@ const AgentTextBlock = memo(function AgentTextBlock({
 }) {
   return (
     <div className="agent-text-block">
-      <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+      <ReactMarkdown remarkPlugins={remarkPlugins} components={components} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
         {text}
       </ReactMarkdown>
     </div>
@@ -786,7 +786,7 @@ function CollapsibleTextImpl({
   if (expanded) {
     return (
       <div className="agent-text-block">
-        <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+        <ReactMarkdown remarkPlugins={remarkPlugins} components={components} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>
           {text}
         </ReactMarkdown>
       </div>
@@ -2125,7 +2125,7 @@ const ChildAgentActivity = memo(function ChildAgentActivity({ message, toolResul
           if (!text) return null;
           return (
             <div key={`${message.message_id}-text-${idx}`} className="subagent-activity-event agent-text">
-              <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</ReactMarkdown>
             </div>
           );
         }
@@ -2205,7 +2205,7 @@ export function SubAgentTranscript({ inline, running, full = false, finalResult 
       {finalResult?.text && (
         <div className={`subagent-final-result ${finalResult.statusClass}`}>
           <div className="subagent-final-result-label">final outcome</div>
-          <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents}>{finalResult.text}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={markdownComponents} urlTransform={CONVERSATION_MARKDOWN_URL_TRANSFORM}>{finalResult.text}</ReactMarkdown>
         </div>
       )}
     </div>

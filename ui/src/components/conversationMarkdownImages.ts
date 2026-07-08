@@ -1,5 +1,5 @@
 import { createElement } from 'react';
-import type { Components } from 'react-markdown';
+import { defaultUrlTransform, type Components } from 'react-markdown';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 
 const SAFE_DATA_IMAGE = /^data:image\/(?:png|jpe?g|gif|webp|bmp|avif);base64,/i;
@@ -20,6 +20,14 @@ function encodedPreviewUrlForAbsolutePath(path: string): string {
   return `/preview${path.split('/').map(encodePathSegment).join('/')}`;
 }
 
+function conversationMarkdownUrlTransform(url: string, key: string): string | null | undefined {
+  const trimmed = url.trim();
+  if (key === 'src' && (/^blob:/i.test(trimmed) || SAFE_DATA_IMAGE.test(trimmed))) {
+    return trimmed;
+  }
+  return defaultUrlTransform(url);
+}
+
 export function resolveConversationMarkdownImageSrc(src: string | undefined, rootDir?: string | undefined): string | undefined {
   if (!src) return src;
   const trimmed = src.trim();
@@ -38,10 +46,10 @@ export function resolveConversationMarkdownImageSrc(src: string | undefined, roo
   }
 
   if (trimmed.startsWith('/')) {
-    return encodedPreviewUrlForAbsolutePath(trimmed);
+    return rootDir ? encodedPreviewUrlForAbsolutePath(trimmed) : undefined;
   }
 
-  if (!rootDir) return trimmed;
+  if (!rootDir) return undefined;
   const relative = trimmed.replace(/^\.\//, '');
   return encodedPreviewUrlForAbsolutePath(`${trimTrailingSlash(rootDir)}/${relative}`);
 }
@@ -61,3 +69,5 @@ export function createConversationMarkdownComponents(ctx: ConversationMarkdownCo
 }
 
 export const CONVERSATION_MARKDOWN_COMPONENTS: Components = createConversationMarkdownComponents();
+
+export const CONVERSATION_MARKDOWN_URL_TRANSFORM = conversationMarkdownUrlTransform;

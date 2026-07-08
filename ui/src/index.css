@@ -969,8 +969,8 @@ body {
   margin: 16px 0;
 }
 
-/* Images in agent messages */
-.agent-text-block .conversation-markdown-image {
+/* Images in rendered conversation Markdown */
+.conversation-markdown-image {
   display: block;
   max-width: 100%;
   height: auto;

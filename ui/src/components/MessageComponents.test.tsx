@@ -841,6 +841,58 @@ describe('conversation markdown links', () => {
     );
   });
 
+  it('keeps safe data image URLs through ReactMarkdown sanitization', () => {
+    const dataUrl = 'data:image/png;base64,iVBORw0KGgo=';
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-data-image', [{
+            type: 'text',
+            text: `![data screenshot](${dataUrl})`,
+          }])}
+          toolResults={new Map()}
+          filePathRootDir="/repo/project"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('img', { name: 'data screenshot' })).toHaveAttribute('src', dataUrl);
+  });
+
+  it('keeps blob image URLs through ReactMarkdown sanitization', () => {
+    const blobUrl = 'blob:http://localhost/screenshot-id';
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-blob-image', [{
+            type: 'text',
+            text: `![blob screenshot](${blobUrl})`,
+          }])}
+          toolResults={new Map()}
+          filePathRootDir="/repo/project"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('img', { name: 'blob screenshot' })).toHaveAttribute('src', blobUrl);
+  });
+
+  it('does not leave no-root local Markdown image paths as browser-relative URLs', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-no-root-image', [{
+            type: 'text',
+            text: '![shared screenshot](ui/qa-artifacts/shared.png)',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('img', { name: 'shared screenshot' })).not.toHaveAttribute('src');
+  });
+
   it('opens streaming agent Markdown links in a new tab with safe rel attributes', async () => {
     render(
       <MemoryRouter>
