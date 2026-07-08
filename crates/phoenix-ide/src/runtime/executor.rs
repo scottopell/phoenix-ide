@@ -5726,6 +5726,7 @@ struct TaskmdApprovalFilenameInput<'a> {
     priority: taskmd_core::constants::Priority,
     status: taskmd_core::constants::Status,
     slug: &'a str,
+    allow_promoted_retry_recovery: bool,
 }
 
 fn resolve_taskmd_approval_filename(
@@ -5742,7 +5743,8 @@ fn resolve_taskmd_approval_filename(
         taskmd_core::constants::Status::InProgress,
         input.slug,
     );
-    if input.status != taskmd_core::constants::Status::InProgress
+    if input.allow_promoted_retry_recovery
+        && input.status != taskmd_core::constants::Status::InProgress
         && input
             .cwd
             .join(input.tasks_dir_name)
@@ -5859,6 +5861,23 @@ fn branch_ref_exists(repo_root: &std::path::Path, git_ref: &str) -> bool {
     run_git(repo_root, &["show-ref", "--verify", "--quiet", git_ref]).is_ok()
 }
 
+fn branch_ref_has_children(repo_root: &std::path::Path, namespace_ref: &str) -> bool {
+    run_git(
+        repo_root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("{namespace_ref}/"),
+        ],
+    )
+    .map(|stdout| {
+        stdout
+            .lines()
+            .any(|line| line.starts_with(&format!("{namespace_ref}/")))
+    })
+    .unwrap_or(false)
+}
+
 enum TaskApprovalBranchNameStatus {
     Free,
     Occupied,
@@ -5885,18 +5904,47 @@ fn task_approval_remote_head_exists(repo_root: &std::path::Path, branch_name: &s
     .unwrap_or(false)
 }
 
+fn task_approval_remote_head_has_children(repo_root: &std::path::Path, branch_name: &str) -> bool {
+    let expected_prefix = format!("refs/heads/{branch_name}/");
+    run_git(
+        repo_root,
+        &[
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &format!("{expected_prefix}*"),
+        ],
+    )
+    .map(|stdout| {
+        stdout.lines().any(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|git_ref| git_ref.starts_with(&expected_prefix))
+        })
+    })
+    .unwrap_or(false)
+}
+
 fn task_approval_branch_name_status(
     repo_root: &std::path::Path,
     branch_name: &str,
 ) -> TaskApprovalBranchNameStatus {
-    if branch_ref_exists(repo_root, &format!("refs/heads/{branch_name}")) {
+    let local_ref = format!("refs/heads/{branch_name}");
+    if branch_ref_exists(repo_root, &local_ref) {
         if find_branch_in_worktree_list(repo_root, branch_name).is_some() {
             return TaskApprovalBranchNameStatus::ActiveWorktree;
         }
         return TaskApprovalBranchNameStatus::Occupied;
     }
-    if branch_ref_exists(repo_root, &format!("refs/remotes/origin/{branch_name}"))
+    if branch_ref_has_children(repo_root, &local_ref) {
+        return TaskApprovalBranchNameStatus::Occupied;
+    }
+    let origin_ref = format!("refs/remotes/origin/{branch_name}");
+    if branch_ref_exists(repo_root, &origin_ref)
+        || branch_ref_has_children(repo_root, &origin_ref)
         || task_approval_remote_head_exists(repo_root, branch_name)
+        || task_approval_remote_head_has_children(repo_root, branch_name)
     {
         return TaskApprovalBranchNameStatus::Occupied;
     }
@@ -5921,6 +5969,16 @@ fn task_approval_branch_is_retry_match(
     )
     .map(|recorded| recorded.trim() == desired_branch)
     .unwrap_or(false)
+}
+
+fn task_approval_worktree_is_retry(
+    repo_root: &std::path::Path,
+    cwd: &std::path::Path,
+    desired_branch: &str,
+) -> bool {
+    run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map(|branch| task_approval_branch_is_retry_match(repo_root, desired_branch, branch.trim()))
+        .unwrap_or(false)
 }
 
 fn unique_task_approval_branch(
@@ -5967,6 +6025,14 @@ fn unique_task_approval_branch(
     fallback
 }
 
+fn detect_plain_markdown_task_stem(task_file: &str) -> Option<String> {
+    let filename = std::path::Path::new(task_file).file_name()?.to_str()?;
+    match crate::task_source::TaskSource::detect(filename)? {
+        crate::task_source::TaskSource::PlainMarkdown { stem } => Some(stem),
+        crate::task_source::TaskSource::Taskmd { .. } => None,
+    }
+}
+
 /// Blocking implementation of taskmd task approval (REQ-PROJ-028).
 /// Runs on a blocking thread via `spawn_blocking`.
 ///
@@ -5994,33 +6060,18 @@ fn execute_approve_task_blocking(
     title: &str,
     desired_base_branch: Option<&str>,
 ) -> Result<TaskApprovalResult, String> {
-    // task 13009: a plain-markdown task file (a `.md` file whose name doesn't
-    // match the taskmd pattern) takes a separate, simpler approval path — no
-    // taskmd id/status/slug, no status-rename, branch uniquified by conversation
-    // id. The empty-string legacy shim and all taskmd handling fall through to
-    // the code below (a non-`.md`, non-taskmd path produces the taskmd-pattern
-    // error there).
-    if let Some(filename) = std::path::Path::new(task_file)
-        .file_name()
-        .and_then(|f| f.to_str())
-    {
-        if let Some(crate::task_source::TaskSource::PlainMarkdown { stem }) =
-            crate::task_source::TaskSource::detect(filename)
-        {
-            return execute_approve_plain_markdown_blocking(
-                cwd,
-                repo_root,
-                conv_id,
-                task_file,
-                &stem,
-                title,
-                desired_base_branch,
-            );
-        }
+    if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
+        return execute_approve_plain_markdown_blocking(
+            cwd,
+            repo_root,
+            conv_id,
+            task_file,
+            &stem,
+            title,
+            desired_base_branch,
+        );
     }
 
-    // Serialize approvals so concurrent attempts can't race on the same
-    // branch/worktree name.
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6037,8 +6088,6 @@ fn execute_approve_task_blocking(
 
     let base_branch = resolve_approval_base_branch(cwd, repo_root, desired_base_branch)?;
 
-    // Parse the on-disk task filename — in taskmd 1.0 the filename is the sole
-    // source of id/priority/status/slug; Phoenix allocates no ID.
     let rel_path = std::path::Path::new(task_file);
     let original_filename = rel_path
         .file_name()
@@ -6055,6 +6104,9 @@ fn execute_approve_task_blocking(
     let slug = parsed.slug.clone();
     let branch_name = format!("task-{task_id}-{slug}");
 
+    let allow_promoted_retry_recovery =
+        task_approval_worktree_is_retry(repo_root, cwd, &branch_name);
+
     let taskmd_filename_input = TaskmdApprovalFilenameInput {
         cwd,
         tasks_dir_name,
@@ -6064,14 +6116,11 @@ fn execute_approve_task_blocking(
         priority: parsed.priority,
         status: parsed.status,
         slug: &slug,
+        allow_promoted_retry_recovery,
     };
     let (approval_filename, approval_status) =
         resolve_taskmd_approval_filename(&taskmd_filename_input)?;
 
-    // REQ-PROJ-028: `cwd` IS the early Explore worktree, on a `task-pending-…`
-    // temp branch, with the task file already under `{tasks_dir}/`. Rename the
-    // temp branch, promote the file's status to `in-progress` if needed, then
-    // commit it on the task branch.
     let (worktree_path, branch_name) =
         open_early_worktree_and_rename_branch(repo_root, conv_id, &branch_name)?;
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
@@ -6084,9 +6133,6 @@ fn execute_approve_task_blocking(
     )?;
 
     ensure_gitignore_has_phoenix(&worktree_path)?;
-    // If `update_task` renamed the file, the old name is now a deletion — stage
-    // it so the commit captures the rename rather than a duplicate task ID.
-    // `git add` on an untracked-and-missing path errors harmlessly.
     if final_filename != original_filename {
         let _ = run_git(
             &worktree_path,
@@ -6102,8 +6148,6 @@ fn execute_approve_task_blocking(
         &["add", "--", &format!("{tasks_dir_name}/{final_filename}")],
     )?;
     let commit_msg = format!("task {task_id}: {title}");
-    // Nothing staged — e.g. reusing an existing already-`in-progress` task file
-    // that wasn't modified: it's already on the branch, skip the commit.
     if run_git(&worktree_path, &["diff", "--cached", "--quiet"]).is_err() {
         if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
             return Err(format!("Failed to commit task file in worktree: {e}"));
@@ -7029,6 +7073,57 @@ mod approve_task_branch_collision_tests {
     }
 
     #[test]
+    fn local_child_ref_namespace_collision_uses_fallback() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "namespace-local";
+        add_explore_worktree(&repo_root, conv_id, "main");
+        let desired_branch = "task-12345-fix-the-login-bug";
+        run_git(&repo_root, &["branch", &format!("{desired_branch}/foo")]).unwrap();
+
+        let (_worktree, branch_name) =
+            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+                .expect("approval should avoid branch namespace prefix collisions");
+
+        assert_ne!(branch_name, desired_branch);
+        assert!(branch_name.starts_with("task-12345-fix-the-login-bug-"));
+        assert!(branch_exists(&repo_root, &branch_name));
+    }
+
+    #[test]
+    fn remote_child_ref_namespace_collision_uses_fallback() {
+        let (_tmp, repo_root) = init_repo();
+        let origin = tempfile::TempDir::new().unwrap();
+        run_git(origin.path(), &["init", "--bare", "-q"]).unwrap();
+        run_git(
+            &repo_root,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        )
+        .unwrap();
+        run_git(&repo_root, &["push", "-u", "origin", "main"]).unwrap();
+        let desired_branch = "task-12345-fix-the-login-bug";
+        let head = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
+        run_git(
+            origin.path(),
+            &[
+                "update-ref",
+                &format!("refs/heads/{desired_branch}/foo"),
+                &head,
+            ],
+        )
+        .unwrap();
+
+        let conv_id = "namespace-remote";
+        add_explore_worktree(&repo_root, conv_id, "main");
+        let (_worktree, branch_name) =
+            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+                .expect("approval should avoid remote branch namespace prefix collisions");
+
+        assert_ne!(branch_name, desired_branch);
+        assert!(branch_name.starts_with("task-12345-fix-the-login-bug-"));
+        assert!(branch_exists(&repo_root, &branch_name));
+    }
+
+    #[test]
     fn approval_retry_accepts_recorded_fallback_branch() {
         let (_tmp, repo_root) = init_repo();
         let conv_id = "fallback-retry";
@@ -7385,6 +7480,36 @@ mod approve_task_promoted_filename_tests {
         assert_eq!(result.branch_name, target_branch);
         assert_eq!(result.task_file, format!("tasks/{in_progress_filename}"));
         assert!(explore_wt.join("tasks").join(in_progress_filename).exists());
+    }
+
+    #[test]
+    fn first_approval_does_not_adopt_promoted_filename_when_ready_file_is_missing() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "not-retry";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let ready_filename = "12345-p2-ready--fix-the-login-bug.md";
+        let in_progress_filename = "12345-p2-in-progress--fix-the-login-bug.md";
+        std::fs::write(tasks_dir.join(in_progress_filename), "# Fix\n").unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            &format!("tasks/{ready_filename}"),
+            "Fix the login bug",
+            Some("main"),
+        );
+        let Err(error) = result else {
+            panic!("first approval must not silently adopt a different task file path");
+        };
+
+        assert!(
+            error.contains("does not exist"),
+            "unexpected error: {error}"
+        );
     }
 }
 
