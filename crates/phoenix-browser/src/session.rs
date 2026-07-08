@@ -1172,6 +1172,23 @@ impl BrowserSessionManager {
                 session_guard.terminate().await;
             }
 
+            let Some(user_data_key) = ({
+                let sessions = manager.sessions.read().await;
+                sessions
+                    .iter()
+                    .find(|(_, entry)| Arc::ptr_eq(&entry.session, &session))
+                    .map(|(_, entry)| entry.user_data_key.clone())
+            }) else {
+                tracing::debug!(work_scope = %requested_scope, "browser kill completed after session was already removed");
+                kill_done.notify_waiters();
+                return;
+            };
+
+            let user_data_dir = user_data_dir_for_key(&user_data_key);
+            if let Err(e) = tokio::fs::remove_dir_all(&user_data_dir).await {
+                tracing::warn!(path = %user_data_dir, error = %e, "Failed to clean up browser data dir");
+            }
+
             let removed = {
                 let mut sessions = manager.sessions.write().await;
                 let removed_key = sessions
@@ -1182,18 +1199,12 @@ impl BrowserSessionManager {
             };
 
             let Some(entry) = removed else {
-                tracing::debug!(work_scope = %requested_scope, "browser kill completed after session was already removed");
+                tracing::debug!(work_scope = %requested_scope, "browser kill cleaned profile after session was already removed");
                 kill_done.notify_waiters();
                 return;
             };
             let removed_scope = entry.scope.clone();
-            let user_data_key = entry.user_data_key.clone();
             drop(entry);
-
-            let user_data_dir = user_data_dir_for_key(&user_data_key);
-            if let Err(e) = tokio::fs::remove_dir_all(&user_data_dir).await {
-                tracing::warn!(path = %user_data_dir, error = %e, "Failed to clean up browser data dir");
-            }
 
             manager.emit_lifecycle(&removed_scope, false);
             kill_done.notify_waiters();
