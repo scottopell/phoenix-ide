@@ -15,7 +15,7 @@ mod git_handlers;
 pub(crate) mod handlers;
 mod lifecycle_handlers;
 mod local_reveal;
-mod pr_monitoring;
+pub(crate) mod pr_monitoring;
 mod process_sample;
 mod spa_routes;
 mod sse;
@@ -117,6 +117,7 @@ impl AppState {
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
+        tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
         handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
         // Conversation-retrieval index: bring it in line with `messages` once

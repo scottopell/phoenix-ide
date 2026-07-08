@@ -274,6 +274,38 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     expect(primaryCount()).toBe(1);
   });
 
+  it('cached open PR seed keeps address-feedback primary while fresh status loads', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-cached-open"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 120,
+          url: 'https://gh/pr/120',
+          display_state: 'open',
+          check_state: 'passing',
+          refresh: {
+            state: 'unavailable',
+            reason: 'command_failed',
+            last_attempted_at: '2026-01-01T00:00:00Z',
+            stale: true,
+          },
+          unavailable_reason: 'command_failed',
+        })}
+      />,
+    );
+
+    const address = screen.getByTestId('address-feedback-button');
+    expect(address).toHaveClass('work-actions-btn--primary');
+    expect(screen.getByTestId('open-pr-link')).not.toHaveClass('work-actions-btn--primary');
+    expect(screen.queryByTestId('merge-pr-link')).not.toBeInTheDocument();
+    expect(primaryCount()).toBe(1);
+  });
+
   it('open PR, fresh feedback + onSendMessage → address-feedback present + primary', () => {
     renderWithProviders(
       <WorkControlBar
@@ -328,7 +360,7 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
     expect(primaryCount()).toBe(1);
   });
 
-  it('open PR, pending checks → address-feedback primary, no PR link-out (pending ≠ green)', () => {
+  it('open PR, pending checks → address-feedback primary, Open PR secondary', () => {
     renderWithProviders(
       <WorkControlBar
         conversationId="conv-pending"
@@ -350,7 +382,7 @@ describe('WorkControlBar — idle disposition cases (REQ-WAB-004)', () => {
       'work-actions-btn--primary',
     );
     expect(screen.queryByTestId('merge-pr-link')).not.toBeInTheDocument();
-    expect(screen.queryByTestId('open-pr-link')).not.toBeInTheDocument();
+    expect(screen.getByTestId('open-pr-link')).not.toHaveClass('work-actions-btn--primary');
   });
 
   it('draft PR → open-pr-link ("Open PR #N ↗")', () => {

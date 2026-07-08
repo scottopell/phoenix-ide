@@ -117,7 +117,7 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 |---|---|---|---|---|
 | 1 | `continued_in_conv_id` set | `continued` | none | RESOLVE + FINISH suppressed; muted note |
 | 2 | phase ∈ {error, context_exhausted} | `stuck` | `Clean up` or `Abandon` per FINISH sub-table | RESOLVE suppressed |
-| 3 | idle, PR open, affordance enabled | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed; `Merge on GitHub #N ↗` secondary link when `check_state = passing` |
+| 3 | idle, PR open, message channel available | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed; `Merge on GitHub #N ↗` secondary when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
 | 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
 | 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
 | 6 | idle, PR merged | `clean_up_merged` | **Clean up** (FINISH) | — |
@@ -127,9 +127,11 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 | 8c | idle, no PR found, refresh ≠ unavailable, work-change state dirty-needs-review / loading / unavailable | `no_pr_review` | **View Diff** (REVIEW) | Clean up suppressed; note |
 | 9 | idle, gh unavailable (no PR identity, refresh = unavailable) | `gh_unavailable` | **Clean up** (FINISH) | warning note; single click |
 
-The **affordance** is enabled when Phoenix can post an auto-fix message to the conversation:
-the conversation has a live message channel and the PR refresh is not `unavailable`
-(`PrAutoFixAffordance`, `pr-association`). A draft PR is never addressable.
+The **Address feedback** affordance is enabled when Phoenix can post an auto-fix message to
+the conversation: the conversation has a live message channel and the PR is open
+(`PrAutoFixAffordance`, `pr-association`). A draft PR is never addressable. A degraded or
+stale refresh changes the secondary link-out from `Merge on GitHub` to `Open PR`; it does not
+replace the primary with a link under the user's pointer.
 
 The **FINISH sub-table** is a single shared selector (used by `stuck` and by the idle FINISH
 rows), total over PR state:
@@ -143,16 +145,19 @@ rows), total over PR state:
 | gh unavailable | `Clean up` | "gh unavailable — manual cleanup." |
 
 Rows 3–5 together cover **every** idle open-or-draft PR. Address feedback is the primary on
-every reachable open PR — not gated on failing checks or a prior feedback-freshness signal —
-because review comments may need addressing whether checks pass or fail and whether or not a
-freshness baseline has yet been seeded; the freshness and coverage signals ride as markers on
-the button rather than gating its presence. When checks are confirmed passing, the honest
-`Merge on GitHub #N ↗` link rides alongside as the non-glowing secondary. The Merge link is the
-primary only when the PR cannot be addressed (no message channel). The honest-label rule
-applies: rows 4 and 5 both open GitHub, but only a passing PR is labelled "Merge on GitHub"; a
-non-passing open PR (or any draft) is labelled "Open PR" so the bar never promises a merge the
-checks do not support. Both labels carry the ↗ external-navigation glyph and open GitHub in a
-new tab — neither performs the merge in Phoenix (REQ-WAB-010).
+every reachable open PR — not gated on failing checks, refresh availability, or a prior
+feedback-freshness signal — because review comments may need addressing whether checks pass or
+fail and whether or not a freshness baseline has yet been seeded; the freshness and coverage
+signals ride as markers on the button rather than gating its presence. Keeping Address feedback
+primary for stale cached open-PR snapshots prevents the primary action from changing under the
+pointer when the async fresh-status request completes. When checks are confirmed passing on a
+fresh refresh, the honest `Merge on GitHub #N ↗` link rides alongside as the non-glowing
+secondary; when mergeability is not freshly confirmed, `Open PR #N ↗` is the non-glowing
+secondary. The Merge link is the primary only when the PR cannot be addressed (no message
+channel). The honest-label rule applies: rows 4 and 5 both open GitHub, but only a passing PR is
+labelled "Merge on GitHub"; a non-passing open PR (or any draft) is labelled "Open PR" so the
+bar never promises a merge the checks do not support. Both labels carry the ↗ external-navigation
+glyph and open GitHub in a new tab — neither performs the merge in Phoenix (REQ-WAB-010).
 
 Rows 8a–8c split no-PR work by the typed work-change summary. Clean no-PR work is terminal and may clean up. Dirty no-PR work is not terminal: if the local committed work is pushed to a matching GitHub remote branch, the bar may offer an honest `Create PR on GitHub ↗` link; otherwise `View Diff` is the safe primary. Uncommitted changes, unpushed commits, remote divergence, unknown remote state, and non-GitHub remotes all route to `View Diff`. The bar never makes commit, push, merge, or terminal automation the hero.
 

@@ -197,26 +197,19 @@ export function deriveWorkDisposition(input: WorkDispositionInput): WorkDisposit
     const hasLink = url != null && number != null;
     const passing = prStatus?.check_state === 'passing';
 
-    // Addressable: any open PR Phoenix can post an auto-fix message to. Review
-    // comments may need addressing whether or not checks fail and whether or
-    // not the freshness baseline has been seeded, so Address feedback is the
-    // primary on every reachable open PR — not gated on failing checks or a
-    // pre-existing freshness signal. Freshness/coverage ride as markers on the
-    // button. When checks are confirmed passing on a fresh status, the honest
-    // Merge link rides alongside as a non-glowing secondary so the bar offers
-    // both "address the feedback" and "go merge it" without a second primary.
-    const addressable = ds === 'open' && canSendMessage && !refreshUnavailable;
+    // Addressable open PRs keep Address feedback primary even when refresh is
+    // unavailable; refresh only changes the secondary link-out.
+    const addressable = ds === 'open' && canSendMessage;
 
     if (addressable) {
       const secondary: ResolveVerb | null =
-        passing && hasLink ? { kind: 'merge_pr', url, number } : null;
+        passing && !refreshUnavailable && hasLink ? { kind: 'merge_pr', url, number } :
+          hasLink ? { kind: 'open_pr', url, number } : null;
       return resolveVerb({ kind: 'address_feedback' }, secondary);
     }
 
-    // Not addressable (draft, no message channel, or unavailable refresh):
-    // "Merge" only when checks are confirmed passing on a fresh status. A stale
-    // or unavailable refresh cannot assert mergeability, so it routes to the
-    // honest "Open PR" link (verify on GitHub) — never a one-click cleanup.
+    // Non-addressable open PRs only get Merge when a fresh status confirms
+    // passing checks; otherwise the link-out is labelled Open PR.
     if (ds === 'open' && !refreshUnavailable && passing && hasLink) {
       return resolveVerb({ kind: 'merge_pr', url, number });
     }

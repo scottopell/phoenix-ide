@@ -204,13 +204,13 @@ describe('stuck — RESOLVE always suppressed (REQ-WAB-005)', () => {
 describe('idle open/draft — RESOLVE', () => {
   const fresh: PrFeedbackFreshness = { state: 'new', count: 2 };
 
-  it('address_feedback when open + failing checks + canSendMessage; no secondary link (not green)', () => {
+  it('address_feedback when open + failing checks + canSendMessage; Open PR rides secondary', () => {
     const d = deriveWorkDisposition(
       input({ prStatus: foundPr('open', { check_state: 'failing' as PrCheckState }) }),
     );
     expect(d.primary).toBe('resolve');
     expect(d.resolve).toEqual({ kind: 'address_feedback' });
-    expect(d.secondaryResolve).toBeNull();
+    expect(d.secondaryResolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
     expect(d.showCleanUp).toBe(false);
     expect(d.showAbandon).toBe(true);
   });
@@ -243,7 +243,7 @@ describe('idle open/draft — RESOLVE', () => {
     expect(d.secondaryResolve).toEqual({ kind: 'merge_pr', url: PR_URL, number: PR_NUMBER });
   });
 
-  it('stale/unavailable refresh on a persisted open PR → Open PR link, no one-click cleanup (codex #E)', () => {
+  it('stale/unavailable refresh on an addressable open PR keeps Address feedback primary', () => {
     const d = deriveWorkDisposition(
       input({
         prStatus: foundPr('open', {
@@ -253,10 +253,12 @@ describe('idle open/draft — RESOLVE', () => {
         }),
       }),
     );
-    // Refresh failure must not make Clean up the primary (would delete a worktree
-    // for a still-open PR). Route to Open PR (verify on GitHub); Abandon still disposes.
+    // A cached/open PR should not first render Open PR and then flip to Address
+    // feedback when the async refresh completes. The safe link-out still rides as
+    // secondary while mergeability is unconfirmed.
     expect(d.primary).toBe('resolve');
-    expect(d.resolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
+    expect(d.resolve).toEqual({ kind: 'address_feedback' });
+    expect(d.secondaryResolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
     expect(d.showCleanUp).toBe(false);
     expect(d.showAbandon).toBe(true);
   });
@@ -275,7 +277,7 @@ describe('idle open/draft — RESOLVE', () => {
     expect(d.resolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
   });
 
-  it('NOT addressable when refresh unavailable on a found open PR → open_pr', () => {
+  it('refresh unavailable on a found open PR still addressable when a message channel exists', () => {
     const d = deriveWorkDisposition(
       input({
         prStatus: foundPr('open', {
@@ -284,7 +286,8 @@ describe('idle open/draft — RESOLVE', () => {
         }),
       }),
     );
-    expect(d.resolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
+    expect(d.resolve).toEqual({ kind: 'address_feedback' });
+    expect(d.secondaryResolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
   });
 
   it('merge_pr as primary when open + passing but no message channel (canSendMessage false)', () => {
@@ -298,12 +301,12 @@ describe('idle open/draft — RESOLVE', () => {
     expect(d.secondaryResolve).toBeNull();
   });
 
-  it('open + pending checks → Address feedback primary, no secondary (pending ≠ green)', () => {
+  it('open + pending checks → Address feedback primary, Open PR secondary (pending ≠ green)', () => {
     const d = deriveWorkDisposition(
       input({ prStatus: foundPr('open', { check_state: 'pending' as PrCheckState }) }),
     );
     expect(d.resolve).toEqual({ kind: 'address_feedback' });
-    expect(d.secondaryResolve).toBeNull();
+    expect(d.secondaryResolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
   });
 
   it('open_pr (never merge) for a draft even with passing checks', () => {

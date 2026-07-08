@@ -12,6 +12,7 @@
 pub mod deny_gate;
 pub(crate) mod executor;
 pub(crate) mod fork_resolve;
+pub mod pr_status_poll;
 mod recovery;
 pub mod traits;
 pub mod usage_limit_sweep;

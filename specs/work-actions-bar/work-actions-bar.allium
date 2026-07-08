@@ -235,13 +235,13 @@ entity WorkActionsBar {
 --       True when Phoenix can post an auto-fix message for this PR:
 --         status.pr != null
 --         AND status.pr.display_state = open   (drafts are never addressable)
---         AND status.auto_fix is enabled (the affordance passed alongside).
---       Does NOT gate on check_state or feedback_freshness: review comments may
---       need addressing whether checks pass or fail, and a freshness baseline is
---       seeded only after the first address, so gating on freshness would make
---       the first address unreachable. The freshness and coverage signals ride
---       as on-button markers instead. In derive_* below the affordance.enabled
---       term is supplied from BarInputs.
+--         AND status.auto_fix is enabled (the message-channel affordance passed alongside).
+--       Does NOT gate on check_state, feedback_freshness, or refresh freshness:
+--       review comments may need addressing whether checks pass or fail, and a
+--       freshness baseline is seeded only after the first address, so gating on
+--       freshness would make the first address unreachable. The freshness and
+--       coverage signals ride as on-button markers instead. In derive_* below
+--       the affordance.enabled term is supplied from BarInputs.
 --
 --   pr_merge_ready(status: pra/PrStatusView) -> Boolean
 --       True when status.pr != null AND status.pr.display_state = open AND
@@ -252,8 +252,10 @@ entity WorkActionsBar {
 --
 --   address_secondary_for(status: pra/PrStatusView) -> ResolveVerb?
 --       The non-glowing secondary link that rides beside an address_feedback
---       primary: merge_link when pr_merge_ready(status), else null. Only ever
---       merge_link or null — never a second address_feedback or open_pr_link.
+--       primary: merge_link when pr_merge_ready(status) and the refresh is fresh;
+--       otherwise open_pr_link when the PR has a URL; otherwise null. Never a
+--       second address_feedback. Stale cached open-PR snapshots keep the same
+--       primary and degrade only the secondary label.
 --
 --   derive_disposition(inputs: BarInputs) -> WorkDisposition
 --       Evaluates the REQ-WAB-004 table top-to-bottom and returns the first
@@ -357,8 +359,9 @@ rule DispositionStuck {
 }
 
 -- Row 3. Address feedback: idle, PR open, auto-fix affordance enabled — any
--- check state. RESOLVE is primary. When the PR's checks pass, an honest
--- "Merge on GitHub #N ↗" link rides alongside as the non-glowing secondary.
+-- check or refresh state. RESOLVE is primary. When the PR's checks pass on a
+-- fresh refresh, an honest "Merge on GitHub #N ↗" link rides alongside as the
+-- non-glowing secondary; stale/unavailable refresh uses "Open PR #N ↗" instead.
 rule DispositionAddressFeedback {
     when: WorkActionsBarRendered(bar)
 
