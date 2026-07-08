@@ -512,22 +512,38 @@ function ConversationPageContent() {
             try {
               const maxSequenceId = await cacheDB.getMaxMessageSequenceId(cachedConversationId);
               if (maxSequenceId !== null) {
-                const catchUp = await api.getConversationMessagesAfter(cachedConversationId, maxSequenceId, 200);
+                let nextAfterSequence = maxSequenceId;
+                let mergedMessages = cachedMessages;
+                let latestServerTail: number | null = null;
+                let latestTranscriptGeneration = cached?.transcript_generation ?? 1;
+
+                while (!cancelled) {
+                  const catchUp = await api.getConversationMessagesAfter(cachedConversationId, nextAfterSequence, 200);
+                  latestServerTail = catchUp.server_message_tail;
+                  latestTranscriptGeneration = catchUp.transcript_generation;
+                  if (catchUp.messages.length > 0) {
+                    mergedMessages = mergeConversationMessages(mergedMessages, catchUp.messages);
+                    await cacheDB.putMessages(catchUp.messages);
+                  }
+                  const mergedLatestSequenceId = latestMessageSequenceId(mergedMessages);
+                  if (
+                    catchUp.messages.length === 0 ||
+                    latestServerTail === null ||
+                    mergedLatestSequenceId === null ||
+                    mergedLatestSequenceId >= latestServerTail
+                  ) {
+                    break;
+                  }
+                  nextAfterSequence = mergedLatestSequenceId;
+                }
                 if (cancelled) return;
 
-                const mergedMessages = catchUp.messages.length > 0
-                  ? mergeConversationMessages(cachedMessages, catchUp.messages)
-                  : cachedMessages;
                 const mergedLatestSequenceId = latestMessageSequenceId(mergedMessages);
-
-                if (catchUp.messages.length > 0) {
-                  await cacheDB.putMessages(catchUp.messages);
-                }
                 await cacheDB.putReplicaMeta({
                   conversationId: cachedConversationId,
-                  latestMessageSequenceId: catchUp.server_message_tail ?? mergedLatestSequenceId,
+                  latestMessageSequenceId: latestServerTail ?? mergedLatestSequenceId,
                   latestEventSequenceId: null,
-                  transcriptGeneration: catchUp.transcript_generation,
+                  transcriptGeneration: latestTranscriptGeneration,
                   lastHydratedAt: new Date().toISOString(),
                 });
 
@@ -547,7 +563,7 @@ function ConversationPageContent() {
                       ? parseConversationState(authoritativeConversation.state)
                       : { type: 'idle' },
                     contextWindow: { used: metadata.context_window_size || 0 },
-                    transcriptGeneration: authoritativeConversation.transcript_generation ?? catchUp.transcript_generation,
+                    transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
                   });
                 }
                 return;

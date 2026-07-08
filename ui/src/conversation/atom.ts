@@ -1106,8 +1106,11 @@ export function conversationReducer(
     case 'sse_message': {
       const knownMessage = atom.messages.some((m) => m.message_id === action.message.message_id);
       const applied = applyWireActionBody(atom, action);
-      if (knownMessage && action.sequenceId === atom.lastAppliedEventSeq + 1) {
+      if (action.sequenceId === atom.lastAppliedEventSeq + 1) {
         return drainBufferedEventEnvelopes({ ...applied, lastAppliedEventSeq: action.sequenceId, eventGap: null });
+      }
+      if (knownMessage) {
+        return applied;
       }
       return applied;
     }

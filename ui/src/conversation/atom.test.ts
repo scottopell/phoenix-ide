@@ -248,7 +248,7 @@ describe('conversationReducer', () => {
 
       expect(atom.messages).toHaveLength(6);
       expect(atom.messages.map((m) => m.sequence_id)).toEqual([95, 96, 97, 98, 99, 100]);
-      expect(atom.lastAppliedEventSeq).toBe(95);
+      expect(atom.lastAppliedEventSeq).toBe(100);
     });
   });
 
@@ -468,7 +468,7 @@ describe('conversationReducer', () => {
         message: { ...makeMessage(2), message_id: 'late-msg', display_data: { existing: true } as Record<string, unknown> },
       });
 
-      expect(delivered.lastAppliedEventSeq).toBe(13);
+      expect(delivered.lastAppliedEventSeq).toBe(14);
       expect(delivered.messages[0]!.message_id).toBe('late-msg');
       expect(delivered.messages[0]!.display_data).toEqual({ existing: true, type: 'patched-from-ring' });
       expect(delivered.pendingMessagePatches['late-msg']).toEqual({
@@ -665,14 +665,14 @@ describe('conversationReducer', () => {
   });
 
   describe('sse_message', () => {
-    it('appends new message without advancing the event cursor', () => {
+    it('appends new message and advances the event cursor', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 9 };
       const msg = makeMessage(10);
 
       const next = dispatch(atom, { type: 'sse_message', message: msg, sequenceId: 10 });
 
       expect(next.messages).toHaveLength(1);
-      expect(next.lastAppliedEventSeq).toBe(9);
+      expect(next.lastAppliedEventSeq).toBe(10);
     });
 
     it('consumes duplicate known message creates without replacing message content', () => {

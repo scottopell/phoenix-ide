@@ -2155,6 +2155,7 @@ struct AroundMessagesQuery {
 }
 
 const MAX_EXACT_MESSAGE_RANGE_SPAN: i64 = 10_000;
+const MAX_MESSAGE_HISTORY_LIMIT: i64 = 500;
 
 async fn get_conversation(
     State(state): State<AppState>,
@@ -2195,14 +2196,18 @@ async fn get_conversation(
     }))
 }
 
-fn validate_positive_limit(name: &str, value: Option<i64>, default: i64) -> Result<i64, AppError> {
+fn validate_message_history_limit(
+    name: &str,
+    value: Option<i64>,
+    default: i64,
+) -> Result<i64, AppError> {
     let value = value.unwrap_or(default);
     if value <= 0 {
         return Err(AppError::BadRequest(format!(
             "{name} must be greater than 0"
         )));
     }
-    Ok(value)
+    Ok(value.min(MAX_MESSAGE_HISTORY_LIMIT))
 }
 
 fn build_message_slice_response(
@@ -2287,7 +2292,7 @@ async fn get_conversation_messages_latest(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
-    let limit = validate_positive_limit("limit", query.limit, 100)?;
+    let limit = validate_message_history_limit("limit", query.limit, 100)?;
     let db = state.runtime.db();
     let messages = db
         .get_latest_messages(&id, limit)
@@ -2312,7 +2317,7 @@ async fn get_conversation_messages(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
-    let limit = validate_positive_limit("limit", query.limit, 100)?;
+    let limit = validate_message_history_limit("limit", query.limit, 100)?;
     match (query.before_message_sequence, query.after_message_sequence) {
         (Some(_), Some(_)) => Err(AppError::BadRequest(
             "Specify exactly one of before_message_sequence or after_message_sequence".to_string(),
@@ -2406,8 +2411,8 @@ async fn get_conversation_messages_around(
         .get_conversation(&id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
-    let before = validate_positive_limit("before", query.before, 50)?;
-    let after = validate_positive_limit("after", query.after, 50)?;
+    let before = validate_message_history_limit("before", query.before, 50)?;
+    let after = validate_message_history_limit("after", query.after, 50)?;
     let db = state.runtime.db();
     let (before_messages, after_messages) = db
         .get_messages_around(&id, sequence, before, after)
@@ -4166,16 +4171,13 @@ async fn get_by_slug_meta(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let latest_messages = state
+    let context_window_size = state
         .runtime
         .db()
-        .get_latest_messages(&conversation.id, 1)
+        .get_latest_usage_data(&conversation.id)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let context_window_size = latest_messages
-        .iter()
-        .filter_map(|m| m.usage_data.as_ref())
-        .next_back()
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .as_ref()
         .map_or(0, crate::db::UsageData::context_window_used);
 
     Ok(Json(ConversationMetaResponse {

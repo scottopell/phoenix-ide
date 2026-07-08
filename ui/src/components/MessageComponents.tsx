@@ -915,6 +915,10 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
     () => deriveToolStripItems(message, toolResults),
     [message, toolResults],
   );
+  const knownResultIds = useMemo(
+    () => (import.meta.env.DEV ? Array.from(toolResults.keys()) : undefined),
+    [toolResults],
+  );
 
   const handleExpandTools = useCallback((toolId: string) => {
     pendingScrollToolIdRef.current = toolId || null;
@@ -1146,7 +1150,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
                   result={result}
                   onOpenFile={onOpenFile}
                   workScopeKey={workScopeKey}
-                  knownResultIds={Array.from(toolResults.keys())}
+                  knownResultIds={knownResultIds}
                   toolStartedAtMs={toolStartedAtMs}
                   showMissingResult={showMissingResult}
                 />

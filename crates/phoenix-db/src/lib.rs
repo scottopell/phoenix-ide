@@ -4045,6 +4045,35 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get the newest usage payload for a conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn get_latest_usage_data(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Option<UsageData>> {
+        let row = sqlx::query(
+            "SELECT usage_data
+             FROM messages
+             WHERE conversation_id = ?1 AND usage_data IS NOT NULL
+             ORDER BY sequence_id DESC
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row
+            .and_then(|row| {
+                row.try_get::<Option<String>, _>("usage_data")
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|usage| serde_json::from_str(&usage).ok()))
+    }
+
     /// Get messages before a sequence ID, capped by `limit`.
     ///
     /// Returns the newest `limit` messages with `sequence_id < before_sequence`,
