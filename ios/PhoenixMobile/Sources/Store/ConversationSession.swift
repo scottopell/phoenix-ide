@@ -73,6 +73,10 @@ final class ConversationSession {
             lastSequenceId = snap.lastSequenceId
             typedState = ConversationState.parse(snap.conversation?.state)
             presentationMode = snap.conversation?.presentation_mode
+            // Busy flag follows the cached mode the same way live
+            // state_change events derive it — a snapshot taken mid-turn
+            // must not open looking idle.
+            agentWorking = presentationMode == "working"
             rebuildToolUseIndex()
         }
     }
