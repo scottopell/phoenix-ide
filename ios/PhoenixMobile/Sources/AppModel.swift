@@ -56,6 +56,9 @@ final class AppModel {
         password = Keychain.password(account: Self.passwordAccount) ?? ""
         trustSelfSigned = UserDefaults.standard.object(forKey: Self.trustSelfSignedKey) as? Bool ?? true
         rebuildAPI()
+        _ = connectivity.addRestoreObserver { [weak self] in
+            self?.drainPersistedOutboxes()
+        }
     }
 
     private func rebuildAPI() {
@@ -92,7 +95,29 @@ final class AppModel {
         for session in sessions.values {
             session.resyncAfterForeground()
         }
+        drainPersistedOutboxes()
         Task { await refreshList() }
+    }
+
+    /// Deliver queued messages for conversations the user hasn't reopened.
+    /// After a cold restart `sessions` is empty, so without this sweep an
+    /// outbox persisted under `outbox-<id>.json` would sit on disk until
+    /// its conversation was opened manually — breaking the restart-survival
+    /// half of the offline queue. Sessions created here don't start an SSE
+    /// stream; they exist to drain (their outbox reconciles on next open).
+    private func drainPersistedOutboxes() {
+        guard api != nil else { return }
+        for name in DiskStore.names(withPrefix: "outbox-") {
+            let conversationId = String(name.dropFirst("outbox-".count))
+            guard !conversationId.isEmpty, sessions[conversationId] == nil else {
+                // Open sessions already drain via their own triggers.
+                continue
+            }
+            guard let entries = DiskStore.load([OutboxEntry].self, name: name),
+                  entries.contains(where: { $0.status == .pending && !$0.acceptedByServer })
+            else { continue }
+            session(for: conversationId)?.drainOutbox()
+        }
     }
 
     func backgrounded() {

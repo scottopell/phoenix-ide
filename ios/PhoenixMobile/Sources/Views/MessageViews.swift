@@ -12,6 +12,17 @@ struct MessageView: View {
     var toolIndex: [String: ToolUseRef] = [:]
 
     var body: some View {
+        // Recovery markers (dismissed errors, answered questions) persist
+        // with display_data.hidden — the web renderer skips them; so do we.
+        if message.display_data?["hidden"]?.boolValue == true {
+            EmptyView()
+        } else {
+            typedBody
+        }
+    }
+
+    @ViewBuilder
+    private var typedBody: some View {
         switch message.message_type {
         case "user":
             UserMessageView(content: message.content)

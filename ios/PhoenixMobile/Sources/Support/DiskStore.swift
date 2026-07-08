@@ -39,6 +39,19 @@ enum DiskStore {
         try? FileManager.default.removeItem(at: url(for: name))
     }
 
+    /// Names (without extension) of stored files matching a prefix. Used to
+    /// discover persisted per-conversation outboxes independently of which
+    /// sessions are currently open.
+    static func names(withPrefix prefix: String) -> [String] {
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil)) ?? []
+        return urls.compactMap { url in
+            guard url.pathExtension == "json" else { return nil }
+            let name = url.deletingPathExtension().lastPathComponent
+            return name.hasPrefix(prefix) ? name : nil
+        }
+    }
+
     static func removeAll() {
         try? FileManager.default.removeItem(at: directory)
     }

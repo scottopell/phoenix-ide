@@ -287,9 +287,13 @@ final class ConversationSession {
             }
             lastSequenceId = max(lastSequenceId, snap.lastSequenceId)
             rebuildToolUseIndex()
+            // Persist the authoritative snapshot BEFORE reconciling: the
+            // outbox prune must never become durable while the message
+            // snapshot that justifies it is still memory-only — a crash
+            // between the two writes would lose the user's text from both.
+            persistSnapshot()
             reconcileOutbox()
             drainOutbox()
-            persistSnapshot()
 
         default:
             applyLive(event)
@@ -311,8 +315,9 @@ final class ConversationSession {
                 streamingRequestId = nil
                 rebuildToolUseIndex()
             }
-            reconcileOutbox()
+            // Snapshot before outbox prune — see the init branch.
             persistSnapshot()
+            reconcileOutbox()
 
         case .messageUpdated(let seq, let messageId, let content, let displayData):
             // Stale guard applies here too: a replayed update from before
@@ -362,9 +367,10 @@ final class ConversationSession {
             agentWorking = false
             // Turn boundary: steering-queued entries should now be in
             // history; also a natural moment to send anything pending.
+            // Snapshot first — same ordering rule as the message branch.
+            persistSnapshot()
             reconcileOutbox()
             drainOutbox()
-            persistSnapshot()
 
         case .conversationUpdate(let seq, let update):
             guard applyIfNewer(seq) else { return }
