@@ -280,6 +280,7 @@ export type SSEAction =
   // toast the user already dismissed; client-synthesized errors are not part
   // of the server's total order and apply unconditionally.
   | { type: 'sse_error'; error: UIError; sequenceId?: number; epoch?: number }
+  | { type: 'sse_sequence_consumed'; sequenceId: number; epoch?: number }
   | { type: 'clear_error' }
   // Synthesized by `useConnection` when an `OPEN_SSE` effect fires.
   // Carries the connection generation that just opened, so the atom can
@@ -527,15 +528,13 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
   switch (action.type) {
     case 'sse_message': {
       const idx = atom.messages.findIndex((m) => m.message_id === action.message.message_id);
+      if (idx >= 0) {
+        return atom;
+      }
       let nextAtom: ConversationAtom = { ...atom, streamingBuffer: null };
       let nextMessage = action.message;
       ({ atom: nextAtom, message: nextMessage } = applyPendingMessagePatchesToMessage(nextAtom, nextMessage));
-      if (idx < 0) {
-        return withDerivedMessageSyncState(nextAtom, [...nextAtom.messages, nextMessage]);
-      }
-      const newMessages = [...nextAtom.messages];
-      newMessages[idx] = nextMessage;
-      return withDerivedMessageSyncState(nextAtom, newMessages);
+      return withDerivedMessageSyncState(nextAtom, [...nextAtom.messages, nextMessage]);
     }
     case 'sse_message_updated': {
       const patch: PendingMessagePatch = {
@@ -598,6 +597,8 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
           resetsAt: action.resetsAt,
         },
       };
+    case 'sse_sequence_consumed':
+      return atom;
     case 'sse_token': {
       if (atom.phase.type !== 'llm_requesting') return atom;
       const sameRequest = atom.streamingBuffer?.requestId === action.requestId;
@@ -665,10 +666,6 @@ function applyContiguousWireAction(
   if (sequenceId === undefined) return applyWireActionBody(atom, action as SSEAction);
   const mutatesOnlyIfConversationPresent = action.type === 'sse_browser_session_state';
   if (mutatesOnlyIfConversationPresent && !atom.conversation) {
-    return atom;
-  }
-  const phaseGuardDropsToken = action.type === 'sse_token' && atom.phase.type !== 'llm_requesting';
-  if (phaseGuardDropsToken) {
     return atom;
   }
   const expectedNext = atom.lastAppliedEventSeq + 1;
@@ -1090,18 +1087,24 @@ export function conversationReducer(
       if (p.pendingTruncated) {
         next = {
           ...next,
-          eventGap: p.lastAppliedEventSeq > next.lastAppliedEventSeq
-            ? {
-                expectedNextEventSeq: next.lastAppliedEventSeq + 1,
-                firstBufferedEventSeq: p.lastAppliedEventSeq,
-              }
-            : next.eventGap,
+          lastAppliedEventSeq: p.lastAppliedEventSeq,
+          bufferedEventEnvelopes: {},
+          eventGap: null,
+          pendingMessagePatches: {},
         };
       }
       return next;
     }
 
-    case 'sse_message':
+    case 'sse_message': {
+      const knownMessage = atom.messages.some((m) => m.message_id === action.message.message_id);
+      const applied = applyWireActionBody(atom, action);
+      if (knownMessage && action.sequenceId === atom.lastAppliedEventSeq + 1) {
+        return drainBufferedEventEnvelopes({ ...applied, lastAppliedEventSeq: action.sequenceId, eventGap: null });
+      }
+      return applied;
+    }
+
     case 'sse_message_updated':
     case 'sse_state_change':
     case 'sse_agent_done':
@@ -1111,6 +1114,9 @@ export function conversationReducer(
     case 'sse_conversation_update':
     case 'sse_browser_session_state':
     case 'sse_work_scope_update':
+      return applyContiguousWireAction(atom, action);
+
+    case 'sse_sequence_consumed':
       return applyContiguousWireAction(atom, action);
 
     case 'sse_error':

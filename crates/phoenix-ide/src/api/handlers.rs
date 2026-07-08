@@ -2149,6 +2149,8 @@ struct AroundMessagesQuery {
     after: Option<i64>,
 }
 
+const MAX_EXACT_MESSAGE_RANGE_SPAN: i64 = 10_000;
+
 async fn get_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2362,6 +2364,12 @@ async fn get_conversation_message_range(
         return Err(AppError::BadRequest(
             "start_message_sequence must be less than or equal to end_message_sequence".to_string(),
         ));
+    }
+    let range_span = query.end_message_sequence - query.start_message_sequence + 1;
+    if range_span > MAX_EXACT_MESSAGE_RANGE_SPAN {
+        return Err(AppError::BadRequest(format!(
+            "message range span must be at most {MAX_EXACT_MESSAGE_RANGE_SPAN}"
+        )));
     }
     let db = state.runtime.db();
     let messages = db
@@ -2620,7 +2628,10 @@ fn snapshot_pending_for_stream(
     if let Some(after_event_sequence) = query.after_event_sequence {
         broadcast_tx
             .snapshot_pending_after(after_event_sequence)
-            .unwrap_or_else(|| broadcast_tx.snapshot_pending())
+            .unwrap_or_else(|| {
+                broadcast_tx.observe_seq(after_event_sequence);
+                broadcast_tx.snapshot_pending()
+            })
     } else {
         broadcast_tx.snapshot_pending()
     }
@@ -6306,7 +6317,7 @@ pub(crate) mod hard_delete_cascade_tests {
         );
         assert!(latest.tombstones.is_empty());
         assert_eq!(latest.server_message_tail, Some(5));
-        assert_eq!(latest.transcript_generation, None);
+        assert_eq!(latest.transcript_generation, Some(1));
 
         let Json(range) = get_conversation_message_range(
             State(state),

@@ -127,7 +127,7 @@ mod tests {
                 pending_anchor_sequence_id,
                 pending_events,
                 pending_truncated,
-                transcript_generation: _,
+                transcript_generation,
             } => {
                 let enriched_msgs: Vec<Value> =
                     messages.iter().map(enrich_message_for_api).collect();
@@ -143,6 +143,7 @@ mod tests {
                     "type": "init",
                     "sequence_id": sequence_id,
                     "conversation": conversation,
+                    "transcript_generation": transcript_generation,
                     "messages": enriched_msgs,
                     "agent_working": agent_working,
                     "presentation_mode": presentation_mode,

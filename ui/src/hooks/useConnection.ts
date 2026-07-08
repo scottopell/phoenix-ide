@@ -397,7 +397,7 @@ export function useConnection({
               'conversation_became_terminal',
               stampedDispatch,
             );
-            // no-op until terminal PTY teardown is implemented
+            if (res.ok) stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
           });
 
           on('conversation_update', (e) => {
@@ -529,6 +529,7 @@ export function useConnection({
               stampedDispatch,
             );
             if (!res.ok) return;
+            stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
             window.dispatchEvent(
               new CustomEvent('phoenix:conversation-hard-deleted', {
                 detail: { conversationId: res.data.conversation_id },
@@ -542,13 +543,13 @@ export function useConnection({
           // tsc error) and is otherwise a no-op. The bubble auto-clears when
           // the server echoes the delivered message as a `message` event.
           on('steer_message_queued', (e) => {
-            parseEvent(
+            const res = parseEvent(
               SseSteerMessageQueuedDataSchema,
               e,
               'steer_message_queued',
               stampedDispatch,
             );
-            // no-op: bubble state driven by POST response + message echo
+            if (res.ok) stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
           });
 
           // Codex quota snapshot (task 67003). Account-global, not
@@ -564,6 +565,7 @@ export function useConnection({
             );
             if (!res.ok) return;
             setCodexQuota(res.data.snapshot);
+            stampedDispatch({ type: 'sse_sequence_consumed', sequenceId: res.data.sequence_id });
           });
 
           on('error', (e) => {

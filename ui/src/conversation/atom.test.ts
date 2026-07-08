@@ -248,7 +248,7 @@ describe('conversationReducer', () => {
 
       expect(atom.messages).toHaveLength(6);
       expect(atom.messages.map((m) => m.sequence_id)).toEqual([95, 96, 97, 98, 99, 100]);
-      expect(atom.lastAppliedEventSeq).toBe(100);
+      expect(atom.lastAppliedEventSeq).toBe(95);
     });
   });
 
@@ -414,10 +414,9 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
-      expect(next.messages).toHaveLength(1);
-      expect(next.messages[0]!.message_id).toBe('msg-3');
+      expect(next.messages.map((m) => m.message_id)).toEqual(['msg-3', 'eager-1']);
       expect(next.lastAppliedEventSeq).toBe(5);
-      expect(next.eventGap).toEqual({ expectedNextEventSeq: 6, firstBufferedEventSeq: 7 });
+      expect(next.eventGap).toBeNull();
     });
     it('pending patch survives event buffering/drain until the message arrives', () => {
       const seeded: ConversationAtom = {
@@ -469,7 +468,7 @@ describe('conversationReducer', () => {
         message: { ...makeMessage(2), message_id: 'late-msg', display_data: { existing: true } as Record<string, unknown> },
       });
 
-      expect(delivered.lastAppliedEventSeq).toBe(14);
+      expect(delivered.lastAppliedEventSeq).toBe(13);
       expect(delivered.messages[0]!.message_id).toBe('late-msg');
       expect(delivered.messages[0]!.display_data).toEqual({ existing: true, type: 'patched-from-ring' });
       expect(delivered.pendingMessagePatches['late-msg']).toEqual({
@@ -489,12 +488,12 @@ describe('conversationReducer', () => {
 
       const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
 
-      expect(next.lastAppliedEventSeq).toBe(50);
+      expect(next.lastAppliedEventSeq).toBe(100);
       expect(next.messages).toHaveLength(1);
       expect(next.messages[0]!.sequence_id).toBe(50);
       expect(next.uiError).toBeNull();
       expect(next.streamingBuffer).toBeNull();
-      expect(next.eventGap).toEqual({ expectedNextEventSeq: 51, firstBufferedEventSeq: 100 });
+      expect(next.eventGap).toBeNull();
     });
 
     // Reconnect floor stays at the atom's live tip. Pending entries whose
@@ -521,8 +520,7 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
-      expect(next.messages).toHaveLength(1);
-      expect(next.messages[0]!.message_id).toBe('msg-10');
+      expect(next.messages.map((m) => m.message_id)).toEqual(['msg-10', 'replay-id']);
       expect(next.lastAppliedEventSeq).toBe(10);
     });
 
@@ -635,8 +633,8 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.streamingBuffer).toBeNull();
-      expect(next.lastAppliedEventSeq).toBe(7);
-      expect(next.eventGap).toEqual({ expectedNextEventSeq: 8, firstBufferedEventSeq: 50 });
+      expect(next.lastAppliedEventSeq).toBe(50);
+      expect(next.eventGap).toBeNull();
     });
 
     // Turn ended while disconnected: snapshot phase is no longer
@@ -667,17 +665,30 @@ describe('conversationReducer', () => {
   });
 
   describe('sse_message', () => {
-    it('appends new message and advances lastAppliedEventSeq', () => {
+    it('appends new message without advancing the event cursor', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 9 };
       const msg = makeMessage(10);
 
       const next = dispatch(atom, { type: 'sse_message', message: msg, sequenceId: 10 });
 
       expect(next.messages).toHaveLength(1);
+      expect(next.lastAppliedEventSeq).toBe(9);
+    });
+
+    it('consumes duplicate known message creates without replacing message content', () => {
+      const existing = makeMessage(10, { content: [{ type: 'text', text: 'persisted' }] });
+      const atom: ConversationAtom = { ...createInitialAtom(), messages: [existing], lastAppliedEventSeq: 9 };
+      const next = dispatch(atom, {
+        type: 'sse_message',
+        sequenceId: 10,
+        message: { ...existing, content: [{ type: 'text', text: 'replayed duplicate' }] },
+      });
+
+      expect(next.messages).toEqual([existing]);
       expect(next.lastAppliedEventSeq).toBe(10);
     });
 
-    it('is a no-op for duplicate sequenceId', () => {
+    it('still accepts an unknown message whose message sequence is at the event cursor', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         lastAppliedEventSeq: 10,
@@ -689,10 +700,11 @@ describe('conversationReducer', () => {
         sequenceId: 10,
       });
 
-      expect(next).toBe(atom); // Same reference — no update
+      expect(next.messages.map((m) => m.message_id)).toEqual(['msg-10']);
+      expect(next.lastAppliedEventSeq).toBe(10);
     });
 
-    it('is a no-op for sequenceId below lastAppliedEventSeq', () => {
+    it('accepts a missing lower message sequence without regressing the event cursor', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 20 };
 
       const next = dispatch(atom, {
@@ -701,7 +713,8 @@ describe('conversationReducer', () => {
         sequenceId: 15,
       });
 
-      expect(next).toBe(atom);
+      expect(next.messages.map((m) => m.message_id)).toEqual(['msg-15']);
+      expect(next.lastAppliedEventSeq).toBe(20);
     });
 
     // Task 02675: defense-in-depth id dedup. Even if the server assigns a
@@ -986,7 +999,7 @@ describe('conversationReducer', () => {
         },
       });
 
-      expect(replayedCreate.messages[0]!.display_data).toEqual({ base: true });
+      expect(replayedCreate.messages[0]!.display_data).toEqual({ base: true, type: 'newer' });
       expect(replayedCreate.pendingMessagePatches['msg-stale']).toEqual({
         lastAppliedPatchEventSeq: 35,
         patches: [],
@@ -1397,8 +1410,8 @@ describe('conversationReducer', () => {
         delta: 'ghost',
         requestId: 'test-req-id',
       });
-      expect(next).toBe(atom);
       expect(next.streamingBuffer).toBeNull();
+      expect(next.lastAppliedEventSeq).toBe(1);
     });
 
     it('drops tokens when phase is tool_executing', () => {
@@ -1416,7 +1429,8 @@ describe('conversationReducer', () => {
         delta: 'ghost',
         requestId: 'test-req-id',
       });
-      expect(next).toBe(atom);
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.lastAppliedEventSeq).toBe(1);
     });
 
     // Task 02675 acceptance: simulated reconnect mid-stream with server

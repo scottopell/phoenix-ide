@@ -5,6 +5,8 @@ import {
   SseAgentDoneDataSchema,
   SseErrorDataSchema,
   SseInitDataSchema,
+  SseLlmAttemptDataSchema,
+  SseLlmFirstByteDataSchema,
   SseMessageDataSchema,
   SseMessageUpdatedDataSchema,
   SseStateChangeDataSchema,
@@ -197,14 +199,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             sequenceId: res.output.sequence_id,
             phase,
             // REQ-WPV-001: thread the server-authoritative entry time
-            // (RFC3339 → ms) onto the atom. NOTE: this inline sub-agent
-            // stream does NOT register the llm_first_byte / llm_attempt /
-            // ping listeners (nor dispatch sse_event_observed) that
-            // useConnection has — the sub-agent message view renders none
-            // of the first-byte / retry-suffix / heartbeat-watchdog
-            // indicators, so those are intentionally omitted here. If this
-            // view ever grows a StateBar-style indicator, those listeners
-            // must be added too.
+            // (RFC3339 → ms) onto the atom.
             stateUpdatedAt: Date.parse(res.output.state_updated_at),
           },
         });
@@ -215,6 +210,40 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         if (!isAgentWorking(phase)) {
           closeSource();
         }
+      });
+
+      source.addEventListener('llm_first_byte', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseLlmFirstByteDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_llm_first_byte',
+            sequenceId: res.output.sequence_id,
+            requestId: res.output.request_id,
+          },
+        });
+      });
+
+      source.addEventListener('llm_attempt', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseLlmAttemptDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_llm_attempt',
+            sequenceId: res.output.sequence_id,
+            attempt: res.output.attempt,
+            maxAttempts: res.output.max_attempts,
+            reason: res.output.reason,
+            backingOffMs: res.output.backing_off_ms,
+            resetsAt: res.output.resets_at ? Date.parse(res.output.resets_at) : null,
+          },
+        });
       });
 
       source.addEventListener('token', (event) => {
