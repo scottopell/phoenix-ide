@@ -136,7 +136,7 @@ pub struct ResolveGlobalReferenceResponse {
 pub async fn open_work(
     State(state): State<AppState>,
 ) -> Result<Json<GlobalOpenWorkResponse>, AppError> {
-    Ok(Json(build_open_work(&state).await?))
+    Ok(Json(build_open_work(&state, Some(OPEN_WORK_LIMIT)).await?))
 }
 
 pub async fn list_sessions(
@@ -220,7 +220,10 @@ pub async fn resolve_reference(
     Ok(Json(resolve_reference_impl(&state, &req.reference).await?))
 }
 
-async fn build_open_work(state: &AppState) -> Result<GlobalOpenWorkResponse, AppError> {
+async fn build_open_work(
+    state: &AppState,
+    limit: Option<usize>,
+) -> Result<GlobalOpenWorkResponse, AppError> {
     let conversations = state
         .db
         .list_conversations()
@@ -274,7 +277,9 @@ async fn build_open_work(state: &AppState) -> Result<GlobalOpenWorkResponse, App
     }
 
     items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    items.truncate(OPEN_WORK_LIMIT);
+    if let Some(limit) = limit {
+        items.truncate(limit);
+    }
 
     let mut grouped: HashMap<Option<String>, Vec<GlobalOpenWorkItem>> = HashMap::new();
     for item in items {
@@ -715,15 +720,18 @@ async fn execute_global_tool(
             }
         }
         "read_conversation" => {
-            let conv_id = input
+            let conv_ref = input
                 .get("conversation_id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
-                .trim()
-                .trim_start_matches('#');
-            if conv_id.is_empty() {
+                .trim();
+            if conv_ref.is_empty() {
                 return ("error: conversation_id is required".to_string(), true);
             }
+            let conv_id = match resolve_conversation_reference_to_id(state, conv_ref).await {
+                Ok(id) => id,
+                Err(e) => return (format!("error: {e}"), true),
+            };
             let cursor = usize::try_from(
                 input
                     .get("cursor")
@@ -731,15 +739,15 @@ async fn execute_global_tool(
                     .unwrap_or(0),
             )
             .unwrap_or(0);
-            match state.db.get_conversation(conv_id).await {
-                Ok(conv) => match state.db.get_messages(conv_id).await {
+            match state.db.get_conversation(&conv_id).await {
+                Ok(conv) => match state.db.get_messages(&conv_id).await {
                     Ok(messages) => (read_conversation_page(&conv, &messages, cursor), false),
                     Err(e) => (format!("error: read failed: {e}"), true),
                 },
                 Err(e) => (format!("error: conversation not found: {e}"), true),
             }
         }
-        "list_open_work" => match build_open_work(state).await {
+        "list_open_work" => match build_open_work(state, Some(OPEN_WORK_LIMIT)).await {
             Ok(view) => (format_open_work_for_agent(&view), false),
             Err(e) => (format!("error: open work projection failed: {e:?}"), true),
         },
@@ -757,6 +765,45 @@ async fn execute_global_tool(
             }
         }
         other => (format!("error: unknown tool {other}"), true),
+    }
+}
+
+async fn resolve_conversation_reference_to_id(
+    state: &AppState,
+    raw: &str,
+) -> Result<String, String> {
+    let reference = raw.trim().trim_start_matches('#');
+    if let Some(rest) = reference.strip_prefix("@conv:") {
+        let id = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or(rest)
+            .split('#')
+            .next()
+            .unwrap_or(rest);
+        if id.is_empty() {
+            return Err("conversation reference is missing an id".to_string());
+        }
+        return Ok(id.to_string());
+    }
+    if let Some(rest) = reference.strip_prefix("/c/") {
+        let slug = rest.split('#').next().unwrap_or(rest);
+        let conv = load_conversation_by_slug_or_id(state, slug)
+            .await
+            .map_err(|e| format!("conversation reference not found: {e:?}"))?;
+        return Ok(conv.id);
+    }
+    let id = reference
+        .split_whitespace()
+        .next()
+        .unwrap_or(reference)
+        .split('#')
+        .next()
+        .unwrap_or(reference);
+    if id.is_empty() {
+        Err("conversation reference is missing an id".to_string())
+    } else {
+        Ok(id.to_string())
     }
 }
 
@@ -780,9 +827,13 @@ async fn format_global_search_hits(state: &AppState, hits: &[crate::db::Retrieve
                     .title
                     .or(conv.slug.clone())
                     .unwrap_or_else(|| conv.id.clone());
-                let href = conv
-                    .slug
-                    .map(|s| format!("/c/{s}#message-{}", hit.message_id));
+                let href = conv.slug.map(|s| {
+                    if message_type_has_rendered_anchor(hit.message_type) {
+                        format!("/c/{s}#message-{}", hit.message_id)
+                    } else {
+                        format!("/c/{s}")
+                    }
+                });
                 (title, href)
             }
             Err(_) => (hit.conversation_id.clone(), None),
@@ -870,6 +921,13 @@ fn message_is_hidden(message: &crate::db::Message) -> bool {
         .unwrap_or(false)
 }
 
+fn message_type_has_rendered_anchor(message_type: MessageType) -> bool {
+    matches!(
+        message_type,
+        MessageType::User | MessageType::Agent | MessageType::Skill
+    )
+}
+
 fn render_global_message_line(conv: &Conversation, message: &crate::db::Message) -> String {
     let role = match message.message_type {
         MessageType::User => "User",
@@ -882,7 +940,13 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
     };
     let href = conv.slug.as_ref().map_or_else(
         || format!("@conv:{} msg:{}", conv.id, message.message_id),
-        |s| format!("/c/{s}#message-{}", message.message_id),
+        |s| {
+            if message_type_has_rendered_anchor(message.message_type) {
+                format!("/c/{s}#message-{}", message.message_id)
+            } else {
+                format!("/c/{s}")
+            }
+        },
     );
     format!(
         "[{} · {} · {}]({}) @conv:{} msg:{}\n{}\n\n",
@@ -987,46 +1051,89 @@ async fn resolve_reference_impl(
     raw: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
     let reference = raw.trim();
-    let normalized = reference
-        .strip_prefix("/c/")
-        .map(|s| ("conv_slug", s.split('#').next().unwrap_or(s)))
-        .or_else(|| {
-            reference
-                .strip_prefix("/chains/")
-                .map(|s| ("chain", s.split('#').next().unwrap_or(s)))
-        })
-        .or_else(|| reference.strip_prefix("@conv:").map(|s| ("conv", s)))
-        .or_else(|| reference.strip_prefix("@chain:").map(|s| ("chain", s)))
-        .or_else(|| reference.strip_prefix("@work:").map(|s| ("work", s)))
-        .ok_or_else(|| AppError::BadRequest("unsupported reference syntax".to_string()))?;
-    match normalized {
-        ("conv", id) => resolve_conversation_id(state, id).await,
-        ("conv_slug", slug) => {
-            let conv = state
-                .db
-                .get_conversation_by_slug(slug)
-                .await
-                .map_err(map_db_not_found)?;
-            Ok(resolve_conversation(conv))
+    if let Some(rest) = reference.strip_prefix("/c/") {
+        let (slug, fragment) = split_fragment(rest);
+        let conv = load_conversation_by_slug_or_id(state, slug).await?;
+        if let Some(message_id) = fragment.and_then(message_id_fragment) {
+            return resolve_message(state, conv, message_id).await;
         }
-        ("chain", id) => resolve_chain(state, id).await,
-        ("work", id) => resolve_work(state, id).await,
-        _ => Err(AppError::BadRequest(
-            "unsupported reference syntax".to_string(),
-        )),
+        return Ok(resolve_conversation(conv));
     }
+    if let Some(rest) = reference.strip_prefix("/chains/") {
+        let (id, _) = split_fragment(rest);
+        return resolve_chain(state, id).await;
+    }
+    if let Some(rest) = reference.strip_prefix("@conv:") {
+        let (id, message_id) = parse_conv_handle(rest);
+        let conv = state
+            .db
+            .get_conversation(id)
+            .await
+            .map_err(map_db_not_found)?;
+        if let Some(message_id) = message_id {
+            return resolve_message(state, conv, message_id).await;
+        }
+        return Ok(resolve_conversation(conv));
+    }
+    if let Some(rest) = reference.strip_prefix("@chain:") {
+        let (id, _) = split_fragment(rest);
+        return resolve_chain(state, first_token(id)).await;
+    }
+    if let Some(rest) = reference.strip_prefix("@work:") {
+        let (id, _) = split_fragment(rest);
+        return resolve_work(state, first_token(id)).await;
+    }
+    Err(AppError::BadRequest(
+        "unsupported reference syntax".to_string(),
+    ))
 }
 
-async fn resolve_conversation_id(
+fn split_fragment(s: &str) -> (&str, Option<&str>) {
+    s.split_once('#')
+        .map_or((s, None), |(base, fragment)| (base, Some(fragment)))
+}
+
+fn first_token(s: &str) -> &str {
+    s.split_whitespace().next().unwrap_or(s)
+}
+
+fn message_id_fragment(fragment: &str) -> Option<&str> {
+    fragment
+        .strip_prefix("message-")
+        .filter(|id| !id.is_empty())
+}
+
+fn parse_conv_handle(rest: &str) -> (&str, Option<&str>) {
+    let (id_part, fragment) = split_fragment(rest);
+    let mut parts = id_part.split_whitespace();
+    let id = parts.next().unwrap_or(id_part);
+    if id.is_empty() {
+        return (id, None);
+    }
+    let message_id = parts
+        .next()
+        .and_then(|part| {
+            part.strip_prefix("msg:")
+                .filter(|id| !id.is_empty())
+                .or_else(|| (part == "msg:").then(|| parts.next()).flatten())
+        })
+        .or_else(|| fragment.and_then(message_id_fragment));
+    (id, message_id)
+}
+
+async fn load_conversation_by_slug_or_id(
     state: &AppState,
-    id: &str,
-) -> Result<ResolveGlobalReferenceResponse, AppError> {
-    let conv = state
-        .db
-        .get_conversation(id)
-        .await
-        .map_err(map_db_not_found)?;
-    Ok(resolve_conversation(conv))
+    slug_or_id: &str,
+) -> Result<Conversation, AppError> {
+    match state.db.get_conversation_by_slug(slug_or_id).await {
+        Ok(conv) => Ok(conv),
+        Err(DbError::ConversationNotFound(_)) => state
+            .db
+            .get_conversation(slug_or_id)
+            .await
+            .map_err(map_db_not_found),
+        Err(e) => Err(map_db_not_found(e)),
+    }
 }
 
 fn resolve_conversation(conv: Conversation) -> ResolveGlobalReferenceResponse {
@@ -1044,6 +1151,49 @@ fn resolve_conversation(conv: Conversation) -> ResolveGlobalReferenceResponse {
             conv.state.variant_name()
         ),
     }
+}
+
+async fn resolve_message(
+    state: &AppState,
+    conv: Conversation,
+    message_id: &str,
+) -> Result<ResolveGlobalReferenceResponse, AppError> {
+    let messages = state
+        .db
+        .get_messages(&conv.id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let message = messages
+        .into_iter()
+        .find(|m| m.message_id == message_id)
+        .ok_or_else(|| AppError::NotFound("message reference target not found".to_string()))?;
+    if message_is_hidden(&message) {
+        return Err(AppError::NotFound(
+            "message reference target not found".to_string(),
+        ));
+    }
+    let href = conv.slug.as_ref().map(|s| {
+        if message_type_has_rendered_anchor(message.message_type) {
+            format!("/c/{s}#message-{}", message.message_id)
+        } else {
+            format!("/c/{s}")
+        }
+    });
+    let title = conv.title.clone().or(conv.slug.clone());
+    Ok(ResolveGlobalReferenceResponse {
+        kind: "message".to_string(),
+        id: message.message_id.clone(),
+        href,
+        title,
+        summary: format!(
+            "{} message {} in @conv:{} at {}: {}",
+            message.message_type,
+            message.message_id,
+            conv.id,
+            message.created_at,
+            trim_chars(render_full_message_text(&message).trim(), 240)
+        ),
+    })
 }
 
 async fn resolve_chain(
@@ -1090,7 +1240,7 @@ async fn resolve_work(
     state: &AppState,
     id: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
-    let view = build_open_work(state).await?;
+    let view = build_open_work(state, None).await?;
     for group in view.groups {
         for item in group.items {
             if item.id == id || item.reference == format!("@work:{id}") {
