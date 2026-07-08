@@ -7620,13 +7620,25 @@ html * {
   pointer-events: none;
 }
 
-/* --- Project Tabs --- */
+/* --- Project Scope + Lifecycle Tabs --- */
+.sidebar-project-scope {
+  flex-shrink: 0;
+  padding: 4px 12px 8px;
+}
+
+.sidebar-section-label {
+  margin-bottom: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .project-tabs {
   display: flex;
   gap: 4px;
-  padding: 4px 12px 8px;
   overflow-x: auto;
-  flex-shrink: 0;
   scrollbar-width: none;
   /* stylelint-disable-next-line property-no-vendor-prefix -- Safari < 17.2 needs the prefixed property for CSS masks */
   -webkit-mask-image: linear-gradient(to right, black 85%, transparent 100%);
@@ -7639,8 +7651,11 @@ html * {
 
 .project-tab {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 11px;
-  padding: 3px 10px;
+  padding: 3px 8px 3px 10px;
   border-radius: 12px;
   border: 1px solid var(--border-color);
   background: transparent;
@@ -7658,6 +7673,59 @@ html * {
 .project-tab.active {
   background: var(--accent-blue, #3b82f6);
   color: #fff;
+  border-color: var(--accent-blue, #3b82f6);
+}
+
+.project-tab-count,
+.sidebar-lifecycle-count {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.76;
+}
+
+.project-tab-count {
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+}
+
+.project-tab.active .project-tab-count {
+  background: rgb(255 255 255 / 18%);
+  opacity: 0.92;
+}
+
+.sidebar-lifecycle-tabs {
+  flex-shrink: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 4px;
+  padding: 0 12px 8px;
+}
+
+.sidebar-lifecycle-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.sidebar-lifecycle-tab:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.sidebar-lifecycle-tab.active {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
   border-color: var(--accent-blue, #3b82f6);
 }
 
@@ -7861,15 +7929,6 @@ html * {
 }
 
 
-.sidebar-archive-toggle {
-  padding: 4px 12px;
-}
-
-.sidebar-archive-toggle .archive-toggle {
-  font-size: 11px;
-  padding: 2px 8px;
-}
-
 .sidebar-toggle-expanded {
   flex-shrink: 0;
   display: flex;
@@ -7975,6 +8034,24 @@ html * {
 
 .sidebar-dot-btn.active {
   background: var(--bg-tertiary);
+}
+
+.sidebar-dot-overflow {
+  min-width: 30px;
+  height: 22px;
+  padding: 0 5px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sidebar-dot-overflow:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
 }
 
 .sidebar-toggle {

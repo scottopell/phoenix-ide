@@ -36,6 +36,7 @@ interface ConversationListProps {
   listDensity?: 'full' | 'mobile' | 'sidebar';
   authChip?: ReactNode;
   utilityActions?: ReactNode;
+  emptyScopeLabel?: string | null;
 }
 
 interface ConversationRowProps {
@@ -592,6 +593,7 @@ export function ConversationList({
   listDensity,
   authChip,
   utilityActions,
+  emptyScopeLabel,
 }: ConversationListProps) {
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -798,22 +800,11 @@ export function ConversationList({
           </div>
         </div>
       )}
-      {isSidebarLayout && (archivedConversations.length > 0 || showArchived) && (
-        <div className="sidebar-archive-toggle">
-          <button
-            className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
-            onClick={onToggleArchived}
-            title={showArchived ? 'Show active conversations' : 'Show archived conversations'}
-          >
-            {showArchived ? 'Active' : `Archived (${archivedConversations.length})`}
-          </button>
-        </div>
-      )}
 
       <ul id="conv-list">
         {isEmpty ? (
           <li className="empty-state">
-            <p>{showArchived ? 'No archived conversations' : 'No conversations yet'}</p>
+            <p>{`No ${showArchived ? 'archived' : 'active'} conversations${emptyScopeLabel ? ` in ${emptyScopeLabel}` : ''}`}</p>
           </li>
         ) : (
           groupedItems.map((item) => {

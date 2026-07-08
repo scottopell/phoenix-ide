@@ -14,6 +14,26 @@ import { subscribeModels } from '../modelsPoller';
 import { ConversationContext } from '../conversation/ConversationContext';
 
 const PROJECT_FILTER_KEY = 'phoenix:sidebar-project-filter';
+const COLLAPSED_DOT_LIMIT = 9;
+
+function projectLabel(project: Project): string {
+  return project.canonical_path.split('/').filter(Boolean).pop() || project.canonical_path;
+}
+
+function countForProject(conversations: readonly Conversation[], projectId: string | null): number {
+  if (projectId === null) return conversations.length;
+  return conversations.filter((c) => c.project_id === projectId).length;
+}
+
+function collapsedDotConversations(conversations: readonly Conversation[], activeSlug: string | null): readonly Conversation[] {
+  if (conversations.length <= COLLAPSED_DOT_LIMIT) return conversations;
+  const visible = conversations.slice(0, COLLAPSED_DOT_LIMIT);
+  if (!activeSlug || visible.some((c) => c.slug === activeSlug)) return visible;
+
+  const active = conversations.find((c) => c.slug === activeSlug);
+  if (!active) return visible;
+  return [...conversations.slice(0, COLLAPSED_DOT_LIMIT - 1), active];
+}
 
 const ChevronLeft = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -149,6 +169,11 @@ export function Sidebar({
     if (!activeProjectId) return archivedConversations;
     return archivedConversations.filter(c => c.project_id === activeProjectId);
   }, [archivedConversations, activeProjectId]);
+
+  const activeProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) ?? null : null;
+  const activeProjectLabel = activeProject ? projectLabel(activeProject) : null;
+  const scopedActiveCount = filteredConversations.length;
+  const scopedArchivedCount = filteredArchivedConversations.length;
 
   useEffect(() => {
     if (!activeSlug) {
@@ -298,6 +323,8 @@ export function Sidebar({
 
   const isOnNewPage = location.pathname === '/' || location.pathname === '/new';
   const isOnTerminalPage = location.pathname === '/terminal';
+  const collapsedConversations = collapsedDotConversations(conversations, activeSlug);
+  const collapsedOverflowCount = Math.max(0, conversations.length - collapsedConversations.length);
 
   if (collapsed) {
     return (
@@ -330,7 +357,7 @@ export function Sidebar({
           compact
         />
         <div className="sidebar-collapsed-dots">
-          {conversations.map(conv => {
+          {collapsedConversations.map(conv => {
             const displayState = getConvDisplayState(conv);
             const isActive = conv.slug === activeSlug;
             return (
@@ -344,6 +371,16 @@ export function Sidebar({
               </button>
             );
           })}
+          {collapsedOverflowCount > 0 && (
+            <button
+              className="sidebar-dot-overflow"
+              onClick={onToggle}
+              title={`${collapsedOverflowCount} more conversations — expand sidebar`}
+              aria-label={`${collapsedOverflowCount} more conversations — expand sidebar`}
+            >
+              +{collapsedOverflowCount}
+            </button>
+          )}
         </div>
       </aside>
     );
@@ -388,25 +425,55 @@ export function Sidebar({
         />
       </div>
       {projects.length > 0 && (
-        <div className="project-tabs">
-          <button
-            className={`project-tab ${activeProjectId === null ? 'active' : ''}`}
-            onClick={() => setActiveProjectId(null)}
-          >
-            All
-          </button>
-          {projects.map(p => (
+        <div className="sidebar-project-scope" aria-label="Project scope">
+          <div className="sidebar-section-label">Projects</div>
+          <div className="project-tabs">
             <button
-              key={p.id}
-              className={`project-tab ${activeProjectId === p.id ? 'active' : ''}`}
-              onClick={() => setActiveProjectId(p.id)}
-              title={p.canonical_path}
+              className={`project-tab ${activeProjectId === null ? 'active' : ''}`}
+              onClick={() => setActiveProjectId(null)}
+              aria-pressed={activeProjectId === null}
             >
-              {p.canonical_path.split('/').filter(Boolean).pop() || p.canonical_path}
+              <span>All</span>
+              <span className="project-tab-count">{conversations.length}</span>
             </button>
-          ))}
+            {projects.map(p => {
+              const label = projectLabel(p);
+              return (
+                <button
+                  key={p.id}
+                  className={`project-tab ${activeProjectId === p.id ? 'active' : ''}`}
+                  onClick={() => setActiveProjectId(p.id)}
+                  title={p.canonical_path}
+                  aria-pressed={activeProjectId === p.id}
+                >
+                  <span>{label}</span>
+                  <span className="project-tab-count">{countForProject(conversations, p.id)}</span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       )}
+      <div className="sidebar-lifecycle-tabs" aria-label="Conversation lifecycle">
+        <button
+          type="button"
+          className={`sidebar-lifecycle-tab ${!showArchived ? 'active' : ''}`}
+          onClick={() => { if (showArchived) handleToggleArchived(); }}
+          aria-pressed={!showArchived}
+        >
+          <span>Active</span>
+          <span className="sidebar-lifecycle-count">{scopedActiveCount}</span>
+        </button>
+        <button
+          type="button"
+          className={`sidebar-lifecycle-tab ${showArchived ? 'active' : ''}`}
+          onClick={() => { if (!showArchived) handleToggleArchived(); }}
+          aria-pressed={showArchived}
+        >
+          <span>Archived</span>
+          <span className="sidebar-lifecycle-count">{scopedArchivedCount}</span>
+        </button>
+      </div>
       <LocalServicesPanel />
       <div className="sidebar-list">
         <ConversationList
@@ -423,6 +490,7 @@ export function Sidebar({
           onConversationClick={handleConversationClick}
           activeSlug={activeSlug}
           sidebarMode
+          emptyScopeLabel={activeProjectLabel}
         />
       </div>
       <ConfirmDialog
