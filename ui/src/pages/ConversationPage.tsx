@@ -538,6 +538,15 @@ function ConversationPageContent() {
                 }
                 if (cancelled) return;
 
+                const latestWindow = await api.getConversationMessagesLatest(cachedConversationId, 50);
+                latestServerTail = latestWindow.server_message_tail;
+                latestTranscriptGeneration = latestWindow.transcript_generation;
+                if (latestWindow.messages.length > 0) {
+                  mergedMessages = mergeConversationMessages(mergedMessages, latestWindow.messages);
+                  await cacheDB.putMessages(latestWindow.messages);
+                }
+                if (cancelled) return;
+
                 const mergedLatestSequenceId = latestMessageSequenceId(mergedMessages);
                 await cacheDB.putReplicaMeta({
                   conversationId: cachedConversationId,
