@@ -65,4 +65,13 @@ final class ConversationListStore {
         conversations.removeAll { $0.id == id }
         DiskStore.save(conversations, name: Self.cacheName)
     }
+
+    /// Drop in-memory state after the disk cache is cleared (or the user
+    /// signs out). Without this the long-lived store keeps showing
+    /// supposedly-deleted rows until a successful refresh.
+    func reset() {
+        conversations = []
+        lastRefreshed = nil
+        lastError = nil
+    }
 }

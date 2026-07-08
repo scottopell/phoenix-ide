@@ -30,10 +30,12 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("Storage") {
+                Section {
                     Button("Clear offline cache", role: .destructive) {
                         confirmClearCache = true
                     }
+                } header: {
+                    Text("Storage")
                 } footer: {
                     Text(
                         "Removes cached conversations and message history from this "

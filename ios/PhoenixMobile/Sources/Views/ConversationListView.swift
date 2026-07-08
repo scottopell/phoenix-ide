@@ -101,7 +101,10 @@ struct ConversationRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
-                StateDot(stateType: conversation.stateType)
+                StateDot(
+                    presentationMode: conversation.presentation_mode,
+                    requiresAction: conversation.requires_action ?? false,
+                    stateType: conversation.stateType)
                 Text(conversation.displayTitle)
                     .font(.body)
                     .lineLimit(1)
@@ -130,9 +133,15 @@ struct ConversationRow: View {
 }
 
 /// Inline state indicator per the Phoenix feedback pattern: green = idle/ok,
-/// orange = working, red = error, gray = unknown.
+/// orange = working, blue = needs the user, red = error, gray = done/unknown.
+/// The server's `presentation_mode`/`requires_action` are authoritative when
+/// present (they encode judgments the raw state type can't, e.g. whether a
+/// context_exhausted conversation was already continued); the state-type
+/// switch is the fallback for cached rows from older snapshots.
 struct StateDot: View {
-    let stateType: String?
+    var presentationMode: String?
+    var requiresAction = false
+    var stateType: String?
 
     var body: some View {
         Circle()
@@ -141,12 +150,21 @@ struct StateDot: View {
     }
 
     private var color: Color {
+        if requiresAction { return .blue }
+        switch presentationMode {
+        case "idle": return .green
+        case "working": return .orange
+        case "needs_action": return .blue
+        case "error": return .red
+        case "done": return .gray
+        default: break  // absent — fall back to the state type
+        }
         switch stateType {
         case "idle": return .green
         case "error": return .red
         case "awaiting_user_response", "awaiting_task_approval",
              "awaiting_commission_review_approval", "awaiting_recovery":
-            return .blue  // needs the user
+            return .blue
         case "terminal", "context_exhausted", "handed_off": return .gray
         case nil: return .gray
         default: return .orange  // any in-flight state

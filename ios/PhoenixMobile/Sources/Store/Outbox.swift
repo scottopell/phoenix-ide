@@ -31,6 +31,13 @@ struct OutboxEntry: Codable, Identifiable, Equatable {
     var status: Status
     var acceptedByServer: Bool
     var createdAt: Date
+    /// When the server accepted the POST. The staleness window for the
+    /// recoverable-inconsistency surface runs from here, not createdAt — a
+    /// message composed offline an hour ago and accepted just now deserves
+    /// the full window before being flagged. Optional: pre-acceptance
+    /// entries (and rows persisted before this field existed) have none;
+    /// absent-with-accepted falls back to createdAt.
+    var acceptedAt: Date?
     var lastError: String?
     var attemptCount: Int
 
@@ -95,6 +102,7 @@ final class Outbox {
             status: .pending,
             acceptedByServer: false,
             createdAt: Date(),
+            acceptedAt: nil,
             lastError: nil,
             attemptCount: 0)
         entries.append(entry)
@@ -110,6 +118,7 @@ final class Outbox {
     func markAccepted(_ localId: String, steering: Bool) {
         update(localId) {
             $0.acceptedByServer = true
+            $0.acceptedAt = Date()
             $0.lastError = nil
             if steering {
                 $0.status = .steeringQueued
@@ -141,6 +150,7 @@ final class Outbox {
             }
             entry.status = .pending
             entry.acceptedByServer = false
+            entry.acceptedAt = nil
             entry.lastError = nil
         }
     }
@@ -171,8 +181,9 @@ final class Outbox {
     /// AcceptedButCausallyProvenMissingBecomesRecoverable, approximated by
     /// time: a non-steering entry the server accepted that still hasn't
     /// appeared in history after `window` seconds is surfaced with a retry
-    /// affordance rather than left spinning forever. Steering-queued entries
-    /// are exempt — they legitimately wait for the current turn to finish.
+    /// affordance rather than left spinning forever. The window runs from
+    /// acceptance, not composition. Steering-queued entries are exempt —
+    /// they legitimately wait for the current turn to finish.
     func surfaceStaleAcceptedEntries(window: TimeInterval = 60) {
         var changed = false
         let cutoff = Date().addingTimeInterval(-window)
@@ -180,7 +191,7 @@ final class Outbox {
             let entry = entries[idx]
             if entry.acceptedByServer,
                entry.status == .pending,
-               entry.createdAt < cutoff {
+               (entry.acceptedAt ?? entry.createdAt) < cutoff {
                 entries[idx].status = .recoverableInconsistency
                 changed = true
             }
