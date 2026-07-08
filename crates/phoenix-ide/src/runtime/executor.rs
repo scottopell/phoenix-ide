@@ -5818,7 +5818,7 @@ fn open_early_worktree_and_rename_branch(
         .trim()
         .to_string();
     tracing::info!(temp_branch = %temp_branch, task_branch, "REQ-PROJ-028: renaming temp branch");
-    if task_approval_branch_is_retry_match(task_branch, &temp_branch) {
+    if task_approval_branch_is_retry_match(repo_root, task_branch, &temp_branch) {
         tracing::info!(
             current_branch = %temp_branch,
             task_branch = %task_branch,
@@ -5837,6 +5837,21 @@ fn open_early_worktree_and_rename_branch(
         &["branch", "-m", &temp_branch, &target_branch],
     )
     .map_err(|e| format!("Failed to rename branch '{temp_branch}' to '{target_branch}': {e}"))?;
+    if target_branch != task_branch {
+        run_git(
+            repo_root,
+            &[
+                "config",
+                &format!("branch.{target_branch}.phoenix-approval-desired"),
+                task_branch,
+            ],
+        )
+        .map_err(|e| {
+            format!(
+                "Failed to record approval fallback branch '{target_branch}' for '{task_branch}': {e}"
+            )
+        })?;
+    }
     Ok((worktree_path, target_branch))
 }
 
@@ -5888,8 +5903,24 @@ fn task_approval_branch_name_status(
     TaskApprovalBranchNameStatus::Free
 }
 
-fn task_approval_branch_is_retry_match(desired_branch: &str, current_branch: &str) -> bool {
-    current_branch == desired_branch
+fn task_approval_branch_is_retry_match(
+    repo_root: &std::path::Path,
+    desired_branch: &str,
+    current_branch: &str,
+) -> bool {
+    if current_branch == desired_branch {
+        return true;
+    }
+    run_git(
+        repo_root,
+        &[
+            "config",
+            "--get",
+            &format!("branch.{current_branch}.phoenix-approval-desired"),
+        ],
+    )
+    .map(|recorded| recorded.trim() == desired_branch)
+    .unwrap_or(false)
 }
 
 fn is_phoenix_managed_worktree(repo_root: &std::path::Path, worktree_path: &str) -> bool {
@@ -7013,6 +7044,29 @@ mod approve_task_branch_collision_tests {
             branch_exists(&repo_root, &result.branch_name),
             "fallback execution branch must exist"
         );
+    }
+
+    #[test]
+    fn approval_retry_accepts_recorded_fallback_branch() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "fallback-retry";
+        let base_branch = "main";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        let desired_branch = "task-12345-fix-the-login-bug";
+        run_git(&repo_root, &["branch", desired_branch]).unwrap();
+
+        let (first_worktree, fallback_branch) =
+            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+                .expect("first approval should select and record a fallback branch");
+        assert_eq!(first_worktree, explore_wt);
+        assert_ne!(fallback_branch, desired_branch);
+
+        let (retry_worktree, retry_branch) =
+            open_early_worktree_and_rename_branch(&repo_root, conv_id, desired_branch)
+                .expect("retry should accept the recorded fallback branch");
+
+        assert_eq!(retry_worktree, explore_wt);
+        assert_eq!(retry_branch, fallback_branch);
     }
 
     #[test]

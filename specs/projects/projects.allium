@@ -640,7 +640,8 @@ rule TaskApprovalExecuted {
         --   3. Choose the execution branch: normally `task-<id>-<slug>`; if that
         --      name exists locally or at origin, append a random suffix and leave
         --      the existing ref untouched. If retrying after the worktree is already
-        --      on the exact deterministic approval branch, skip the rename and continue.
+        --      on the exact deterministic approval branch, or on a suffixed fallback
+        --      branch recorded for that deterministic branch, skip the rename and continue.
         --   4. Rename branch in place: `git branch -m <temp-name> <execution-branch>`.
         --   5. Rename the task file to ...-in-progress--<slug>.md if needed
         --      (staging the old name's deletion too, so the commit is a rename).
