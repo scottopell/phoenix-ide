@@ -26,9 +26,6 @@ export function useCreateConversationWithStore() {
       const prompt = typeof args[1] === 'string' && args[1].trim().length > 0 ? args[1] : null;
       rememberCreateIntent(conv.id, prompt);
       store.upsertSnapshot(conv.slug, conv);
-      if (conv.slug !== conv.id) {
-        store.upsertSnapshot(conv.id, conv);
-      }
       return conv;
     },
     [store],

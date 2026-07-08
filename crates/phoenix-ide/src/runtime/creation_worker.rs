@@ -96,11 +96,6 @@ async fn process_job(
             Ok(())
         }
         Err((message, kind)) => {
-            manager
-                .db()
-                .mark_conversation_creation_job_failed(&job.id, &message)
-                .await
-                .map_err(|e| e.to_string())?;
             let failed = ConvState::CreationFailed {
                 job_id: job.id.clone(),
                 error: message.clone(),
@@ -109,6 +104,11 @@ async fn process_job(
             manager
                 .db()
                 .update_conversation_state(&conv_id, &failed)
+                .await
+                .map_err(|e| e.to_string())?;
+            manager
+                .db()
+                .mark_conversation_creation_job_failed(&job.id, &message)
                 .await
                 .map_err(|e| e.to_string())?;
             if let Some(broadcast_tx) = {
@@ -190,6 +190,7 @@ async fn provision_conversation(
             validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
             let info = if existing_path.exists() {
+                validate_existing_worktree(&existing_path)?;
                 let worktree_path = existing_path.to_string_lossy().to_string();
                 let default_branch = crate::git_ops::run_git(
                     Path::new(&repo_root),
@@ -279,6 +280,7 @@ async fn provision_conversation(
             }
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
             let worktree = if existing_path.exists() {
+                validate_existing_worktree(&existing_path)?;
                 Ok(existing_path.to_string_lossy().to_string())
             } else {
                 let conv_id = job.conversation_id.clone();
@@ -470,6 +472,39 @@ async fn provision_conversation(
         .await
         .map_err(|e| (e, ErrorKind::ServerError))?;
     Ok(ProvisionOutcome::InitialMessageSubmitted)
+}
+
+fn validate_existing_worktree(path: &Path) -> Result<(), (String, ErrorKind)> {
+    let detected = phoenix_core::git::detect_git_repo_root(path).ok_or_else(|| {
+        (
+            format!(
+                "Existing worktree path is not a git worktree: {}",
+                path.display()
+            ),
+            ErrorKind::InvalidRequest,
+        )
+    })?;
+    let expected = path.canonicalize().map_err(|e| {
+        (
+            format!(
+                "Could not canonicalize existing worktree {}: {e}",
+                path.display()
+            ),
+            ErrorKind::ServerError,
+        )
+    })?;
+    let expected = expected.to_string_lossy().to_string();
+    if detected != expected {
+        return Err((
+            format!(
+                "Existing worktree path {} resolves to unexpected git root {}",
+                path.display(),
+                detected
+            ),
+            ErrorKind::InvalidRequest,
+        ));
+    }
+    Ok(())
 }
 
 fn deterministic_worktree_path(repo_root: &str, conv_id: &str) -> std::path::PathBuf {

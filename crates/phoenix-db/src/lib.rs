@@ -1533,6 +1533,12 @@ impl Database {
 
             match result {
                 Ok(_) => break,
+                Err(sqlx::Error::Database(ref e))
+                    if e.code().as_deref() == Some("2067")
+                        && e.message().contains("conversations.id") =>
+                {
+                    return Err(DbError::Serialization(e.message().to_string()));
+                }
                 Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
                     attempts += 1;
                     if attempts >= 10 {
@@ -2007,8 +2013,36 @@ impl Database {
     ///
     /// Returns [`DbError`] if the update fails or `job_id` does not exist.
     pub async fn mark_conversation_creation_job_complete(&self, job_id: &str) -> DbResult<()> {
-        self.mark_conversation_creation_job_phase(job_id, ConversationCreationPhase::Ready)
-            .await
+        let job = self.get_conversation_creation_job(job_id).await?;
+        let cleared_intent = serde_json::json!({
+            "cwd": "",
+            "model": null,
+            "text": "",
+            "message_id": job.message_id,
+            "images": [],
+            "files": [],
+            "mode": null,
+            "base_branch": null,
+            "checkout_ref": null,
+            "seed_parent_id": null,
+            "seed_label": null
+        })
+        .to_string();
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET phase = 'ready', intent_json = ?1, updated_at = ?2, completed_at = ?2
+             WHERE id = ?3",
+        )
+        .bind(cleared_intent)
+        .bind(now)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        }
+        Ok(())
     }
 
     /// Update conversation state, stamping `state_updated_at = now()`.

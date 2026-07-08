@@ -871,10 +871,36 @@ async fn inject_creation_job_state_fields(
     let Some(Value::Object(state_obj)) = map.get_mut("state") else {
         return;
     };
-    state_obj.insert("prompt".to_string(), Value::String(job.intent.text));
+    state_obj.insert(
+        "prompt".to_string(),
+        Value::String(creation_intent_display_text(&job.intent)),
+    );
     if let Some(error) = job.error {
         state_obj.insert("message".to_string(), Value::String(error));
     }
+}
+
+fn creation_intent_display_text(intent: &crate::db::ConversationCreationIntent) -> String {
+    let mut parts = Vec::new();
+    let text = intent.text.trim();
+    if !text.is_empty() {
+        parts.push(text.to_string());
+    }
+    if !intent.images.is_empty() {
+        parts.push(format!(
+            "{} image attachment{}",
+            intent.images.len(),
+            if intent.images.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if !intent.files.is_empty() {
+        parts.push(format!(
+            "{} file attachment{}",
+            intent.files.len(),
+            if intent.files.len() == 1 { "" } else { "s" }
+        ));
+    }
+    parts.join("\n")
 }
 
 /// Like [`conversation_to_json`] but also resolves `seed_parent_slug` via the
