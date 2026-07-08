@@ -128,6 +128,7 @@ describe('useConversationView perf isolation (Finding B)', () => {
         messages: [],
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
+        transcriptGeneration: 1,
       });
       store!.dispatch(SLUG, { type: 'connection_opened', epoch: 1 });
       store!.dispatch(SLUG, {
@@ -231,6 +232,7 @@ describe('useLastSseEventAtRef (heartbeat clock — ref, no host re-render)', ()
         messages: [],
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
+        transcriptGeneration: 1,
       });
       store!.dispatch(SLUG, { type: 'connection_opened', epoch: 1 });
     });

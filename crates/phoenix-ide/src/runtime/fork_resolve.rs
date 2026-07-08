@@ -1515,6 +1515,7 @@ fn build_child_conversation(
         created_at: now,
         updated_at: now,
         archived: false,
+        transcript_generation: 1,
         model: None,
         project_id: Some(project_id.to_string()),
         conv_mode,

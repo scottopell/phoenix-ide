@@ -1039,6 +1039,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             archived: false,
+            transcript_generation: 1,
             model: None,
             project_id: None,
             conv_mode,

@@ -145,6 +145,8 @@ interface UseConnectionOptions {
   conversationId: string | undefined;
   /** Dispatch SSE events directly to the conversation atom. */
   dispatch: Dispatch<SSEAction>;
+  /** Latest event-sequence cursor already applied by the atom, if any. */
+  getLastAppliedEventSeq?: () => number;
 }
 
 function transformInitData(raw: SseInitData): InitPayload {
@@ -161,6 +163,7 @@ function transformInitData(raw: SseInitData): InitPayload {
     contextWindow: {
       used: raw.context_window_size ?? 0,
     },
+    transcriptGeneration: raw.transcript_generation,
     lastAppliedEventSeq: raw.last_sequence_id ?? 0,
     pendingAnchorSequenceId: raw.pending_anchor_sequence_id,
     pendingEvents: raw.pending_events,
@@ -181,6 +184,7 @@ function transformInitData(raw: SseInitData): InitPayload {
 export function useConnection({
   conversationId,
   dispatch,
+  getLastAppliedEventSeq,
 }: UseConnectionOptions): ConnectionInfo {
   const [machineState, setMachineState] = useState<ConnectionMachineState>(initialState);
   const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
@@ -203,6 +207,7 @@ export function useConnection({
   machineStateRef.current = machineState;
   const latestConversationRef = useRef<import('../api').Conversation | null>(null);
   const latestPhaseRef = useRef<import('../api').ConversationState | null>(null);
+  const getLastAppliedEventSeqRef = useRef(getLastAppliedEventSeq);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -211,6 +216,10 @@ export function useConnection({
   useEffect(() => {
     conversationIdRef.current = conversationId;
   }, [conversationId]);
+
+  useEffect(() => {
+    getLastAppliedEventSeqRef.current = getLastAppliedEventSeq;
+  }, [getLastAppliedEventSeq]);
 
   const getContext = useCallback((): TransitionContext => ({
     browserOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
@@ -251,7 +260,10 @@ export function useConnection({
 
           dispatchRef.current({ type: 'connection_opened', epoch });
 
-          const url = `/api/conversations/${convId}/stream`;
+          const lastAppliedEventSeq = getLastAppliedEventSeqRef.current?.() ?? 0;
+          const url = lastAppliedEventSeq > 0
+            ? `/api/conversations/${convId}/stream?after_event_sequence=${lastAppliedEventSeq}`
+            : `/api/conversations/${convId}/stream`;
           const es = new EventSource(url);
           eventSourceRef.current = es;
           const isCurrentOwner = () =>

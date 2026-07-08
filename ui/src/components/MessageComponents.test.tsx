@@ -144,6 +144,7 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
   source.emit('init', {
     type: 'init',
     sequence_id: 100,
+    transcript_generation: 1,
     conversation,
     messages,
     agent_working: false,

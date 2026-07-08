@@ -116,6 +116,7 @@ describe('parseEvent', () => {
     // compile if these were still marked optional.
     const validInit = {
       sequence_id: 0,
+      transcript_generation: 1,
       conversation: { id: 'conv-1' },
       messages: [],
       agent_working: false,
@@ -167,6 +168,7 @@ describe('parseEvent', () => {
           SseInitDataSchema,
           makeEvent({
             sequence_id: 0,
+            transcript_generation: 1,
             conversation: { id: 'conv-1' },
             messages: [],
             agent_working: false,
@@ -208,6 +210,7 @@ describe('parseEvent', () => {
           SseInitDataSchema,
           makeEvent({
             sequence_id: 0,
+            transcript_generation: 1,
             conversation: { id: 'conv-1' },
             messages: [],
             agent_working: false,

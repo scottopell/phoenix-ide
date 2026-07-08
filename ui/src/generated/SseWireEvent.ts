@@ -15,7 +15,7 @@ import type { WorkScopeInventory } from "./WorkScopeInventory";
  * the TS schemas + `EventSource.addEventListener(eventType, ...)` calls
  * consume.
  */
-export type SseWireEvent = { "type": "init", sequence_id: number, 
+export type SseWireEvent = { "type": "init", sequence_id: number,
 /**
  * Hand-authored TS type `Conversation` in `ui/src/api.ts` is the
  * consumer; we pass `unknown` through codegen so the generated file
@@ -23,7 +23,7 @@ export type SseWireEvent = { "type": "init", sequence_id: number,
  * `SseWireEvent`'s enum discriminant small (matches the upstream
  * `SseEvent::Init.conversation: Box<_>` indirection).
  */
-conversation: unknown, 
+conversation: unknown,
 /**
  * `EnrichedMessage` is exported as its own generated type for
  * callers that want the Rust-derived shape, but the init payload
@@ -33,14 +33,14 @@ conversation: unknown,
  * valibot schema validates each element against `MessageSchema`
  * and transforms to `Message` at that boundary.
  */
-messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, project_name: string | null, 
+messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, project_name: string | null, transcript_generation: number,
 /**
  * `ReplayRing` anchor: the seq of the last persisted Message at
  * subscribe time. Every entry in `pending_events` has
  * `sequence_id > pending_anchor_sequence_id`. See
  * `sse_wire.allium` `InitSnapshot`.
  */
-pending_anchor_sequence_id: number, 
+pending_anchor_sequence_id: number,
 /**
  * `ReplayRing` contents at subscribe time. Each entry is a full
  * `SseWireEvent` (already converted from the runtime `SseEvent`),
@@ -56,25 +56,25 @@ pending_anchor_sequence_id: number,
  * `SseWireEvent` schema. Phase 3 (`tasks/62002`) wires that
  * validation into the reducer's init path.
  */
-pending_events: Array<unknown>, 
+pending_events: Array<unknown>,
 /**
  * True iff the ring overflowed since the last anchor; clients
  * should fall back to DB-only state and wait for the next live
  * event. Q3 resolution in `sse_wire.allium`.
  */
-pending_truncated: boolean, } | { "type": "message", sequence_id: number, 
+pending_truncated: boolean, } | { "type": "message", sequence_id: number,
 /**
  * See the note on `Init.messages` — the message payload is
  * validated against `MessageSchema` and transformed to the UI's
  * `Message` type at the valibot boundary.
  */
-message: unknown, } | { "type": "message_updated", sequence_id: number, message_id: string, display_data: unknown | null, content: unknown | null, 
+message: unknown, } | { "type": "message_updated", sequence_id: number, message_id: string, display_data: unknown | null, content: unknown | null,
 /**
  * Tool-execution duration in milliseconds. Present only when the
  * `MessageUpdated` event is emitted for a tool-result message;
  * absent (`undefined` on the TS side) for all other update paths.
  */
-duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: unknown, presentation_mode: string, 
+duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: unknown, presentation_mode: string,
 /**
  * Server clock at which the conversation entered this state — the
  * same `Conversation.state_updated_at: DateTime<Utc>` value the
@@ -85,13 +85,13 @@ duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: 
  *
  * Specs: `specs/working-phase-visibility/` REQ-WPV-001.
  */
-state_updated_at: string, error?: ErrorPresentation, } | { "type": "llm_first_byte", sequence_id: number, request_id: string, } | { "type": "llm_attempt", sequence_id: number, attempt: number, max_attempts: number, reason: LlmAttemptReason, backing_off_ms: number, resets_at?: string, } | { "type": "token", sequence_id: number, text: string, request_id: string, } | { "type": "agent_done", sequence_id: number, } | { "type": "conversation_became_terminal", sequence_id: number, } | { "type": "conversation_update", sequence_id: number, conversation: unknown, } | { "type": "error", sequence_id: number, message: string, 
+state_updated_at: string, error?: ErrorPresentation, } | { "type": "llm_first_byte", sequence_id: number, request_id: string, } | { "type": "llm_attempt", sequence_id: number, attempt: number, max_attempts: number, reason: LlmAttemptReason, backing_off_ms: number, resets_at?: string, } | { "type": "token", sequence_id: number, text: string, request_id: string, } | { "type": "agent_done", sequence_id: number, } | { "type": "conversation_became_terminal", sequence_id: number, } | { "type": "conversation_update", sequence_id: number, conversation: unknown, } | { "type": "error", sequence_id: number, message: string,
 /**
  * Generated as `unknown` — the existing UI reads only the flat
  * `message` field. Kind-aware consumers can narrow against
  * `UserFacingError` (also exported by ts-rs for future use).
  */
-error: unknown, } | { "type": "conversation_hard_deleted", sequence_id: number, conversation_id: string, } | { "type": "browser_session_state", sequence_id: number, active: boolean, } | { "type": "steer_message_queued", sequence_id: number, message_id: string, 
+error: unknown, } | { "type": "conversation_hard_deleted", sequence_id: number, conversation_id: string, } | { "type": "browser_session_state", sequence_id: number, active: boolean, } | { "type": "steer_message_queued", sequence_id: number, message_id: string,
 /**
  * Zero-based position in the steering queue.
  */

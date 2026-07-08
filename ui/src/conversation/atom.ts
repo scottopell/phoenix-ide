@@ -77,6 +77,7 @@ export interface ConversationAtom {
   eventGap: EventGap | null;
   contiguousMessageHighWater: number;
   messageRanges: MessageRange[];
+  transcriptGeneration: number | null;
   pendingMessagePatches: Record<string, PendingMessagePatchState>;
   streamingBuffer: StreamingBuffer | null;
   uiError: UIError | null;
@@ -163,6 +164,7 @@ export interface InitPayload {
   messages: Message[];
   phase: ConversationState;
   contextWindow: { used: number };
+  transcriptGeneration: number;
   /** Legacy wire `last_sequence_id` converted at the UI boundary. This is an
    *  event-sequence cursor, not transcript message availability. */
   lastAppliedEventSeq: number;
@@ -327,6 +329,7 @@ export type SSEAction =
       messages: Message[];
       phase: ConversationState;
       contextWindow: { used: number };
+      transcriptGeneration: number;
     }
   | {
       type: 'set_system_prompt';
@@ -347,6 +350,7 @@ export function createInitialAtom(): ConversationAtom {
     eventGap: null,
     contiguousMessageHighWater: 0,
     messageRanges: [],
+    transcriptGeneration: null,
     pendingMessagePatches: {},
     streamingBuffer: null,
     uiError: null,
@@ -987,7 +991,8 @@ export function conversationReducer(
       // append genuinely new); fresh-connect replaces entirely. See
       // `SseInitReconnectMerge` / `SseInitFreshConnect` in
       // `specs/conversation_atom/conversation_atom.allium`.
-      const isFreshConnect = atom.lastAppliedEventSeq === 0;
+      const generationChanged = atom.transcriptGeneration !== null && atom.transcriptGeneration !== p.transcriptGeneration;
+      const isFreshConnect = atom.lastAppliedEventSeq === 0 || generationChanged;
       let mergedMessages: Message[];
       if (!isFreshConnect) {
         const incomingById = new Map(p.messages.map((m) => [m.message_id, m]));
@@ -1028,6 +1033,7 @@ export function conversationReducer(
         lastAppliedEventSeq: phase1Floor,
         bufferedEventEnvelopes: {},
         eventGap: null,
+        transcriptGeneration: p.transcriptGeneration,
         pendingMessagePatches: isFreshConnect ? {} : atom.pendingMessagePatches,
         ...deriveMessageSyncState(mergedMessages),
         messages: mergedMessages,
@@ -1180,6 +1186,7 @@ export function conversationReducer(
         messages: action.messages,
         phase: action.phase,
         contextWindow: action.contextWindow,
+        transcriptGeneration: action.transcriptGeneration,
       };
 
     case 'set_system_prompt':

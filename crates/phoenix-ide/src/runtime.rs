@@ -429,6 +429,34 @@ impl ReplayRing {
         (self.anchor_seq, self.truncated, highest_seq, events)
     }
 
+    /// Replay-only snapshot for a reconnect cursor. Returns `None` when the
+    /// requested cursor cannot be served safely from the current ring:
+    /// truncated ring, cursor older than the current anchor, or cursor ahead of
+    /// the highest event presently covered by the ring. When `Some`, the
+    /// returned events all have `sequence_id > after_sequence_id` and the
+    /// `highest_seq` is the max of the replayed entries and the requested
+    /// cursor, so callers can seed `Init.last_sequence_id` without regressing to
+    /// the anchor on an empty-but-current replay.
+    fn snapshot_after(&self, after_sequence_id: i64) -> Option<(i64, bool, i64, Vec<SseEvent>)> {
+        if self.truncated || after_sequence_id < self.anchor_seq {
+            return None;
+        }
+
+        let mut entries: Vec<&ReplayRingEntry> = self.entries.iter().collect();
+        entries.sort_by_key(|e| e.sequence_id);
+        let highest_present = entries.last().map_or(self.anchor_seq, |e| e.sequence_id);
+        if after_sequence_id > highest_present {
+            return None;
+        }
+
+        let replayed: Vec<SseEvent> = entries
+            .into_iter()
+            .filter(|e| e.sequence_id > after_sequence_id)
+            .map(|e| e.event.clone())
+            .collect();
+        Some((self.anchor_seq, false, highest_present, replayed))
+    }
+
     /// Aggregate serialised JSON byte length across current ring entries.
     /// Lazy / on-demand — iterates and serialises each entry via the
     /// `SseWireEvent` conversion (matching the production wire path).
@@ -750,6 +778,19 @@ impl SseBroadcaster {
         self.ring.lock().expect("ReplayRing mutex").snapshot()
     }
 
+    /// Replay-only snapshot starting strictly after `after_sequence_id`.
+    /// Returns `None` when the ring cannot safely serve that cursor, signalling
+    /// callers to fall back to the existing full-init / DB-backed resync path.
+    pub fn snapshot_pending_after(
+        &self,
+        after_sequence_id: i64,
+    ) -> Option<(i64, bool, i64, Vec<SseEvent>)> {
+        self.ring
+            .lock()
+            .expect("ReplayRing mutex")
+            .snapshot_after(after_sequence_id)
+    }
+
     /// Aggregate serialised byte size of `ReplayRing` entries, computed
     /// on demand. Observability-only; exposed for callers that want to
     /// surface the metric (e.g. a future ops dashboard / Prometheus gauge).
@@ -882,6 +923,9 @@ pub enum SseEvent {
         context_window_size: u64,
         /// Human-readable project name derived from the repo root directory name.
         project_name: Option<String>,
+        /// Conversation-level transcript/replica generation for invalidating
+        /// stale incremental transcript state on reconnect.
+        transcript_generation: i64,
         /// `sequence_id` of the most recent persisted Message at subscribe
         /// time. Every entry in `pending_events` has `sequence_id` strictly
         /// greater than this. Equals `initial_last_seq` for a fresh
@@ -3272,6 +3316,60 @@ mod broadcaster_tests {
         let (_, truncated2, _, events2) = b.snapshot_pending();
         assert!(truncated2);
         assert!(events2.is_empty());
+    }
+
+    #[test]
+    fn snapshot_after_replays_only_entries_strictly_after_cursor() {
+        let b = SseBroadcaster::new(16, 0);
+        let _rx = b.subscribe();
+
+        let _ = b.send_persisted_message(test_message(1, "anchor"));
+        let _ = b.send_seq(|seq| token_event(seq, "a"));
+        let _ = b.send_seq(|seq| token_event(seq, "b"));
+
+        let (anchor, truncated, highest, events) = b
+            .snapshot_pending_after(2)
+            .expect("cursor should be replayable");
+        assert_eq!(anchor, 1);
+        assert!(!truncated);
+        assert_eq!(highest, 3);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SseEvent::Token {
+                sequence_id, text, ..
+            } => {
+                assert_eq!(*sequence_id, 3);
+                assert_eq!(text, "b");
+            }
+            other => panic!("expected Token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_after_rejects_unreplayable_cursors() {
+        let b = SseBroadcaster::new(REPLAY_RING_CAPACITY * 2, 0);
+        let _rx = b.subscribe();
+
+        let _ = b.send_persisted_message(test_message(5, "anchor"));
+        let _ = b.send_seq(|seq| token_event(seq, "a"));
+        let _ = b.send_seq(|seq| token_event(seq, "b"));
+
+        assert!(
+            b.snapshot_pending_after(4).is_none(),
+            "cursor older than the anchor must fall back to full init"
+        );
+        assert!(
+            b.snapshot_pending_after(8).is_none(),
+            "cursor ahead of the covered replay tip must fall back to full init"
+        );
+
+        for i in 0..=REPLAY_RING_CAPACITY {
+            let _ = b.send_seq(|seq| token_event(seq, &format!("overflow-{i}")));
+        }
+        assert!(
+            b.snapshot_pending_after(7).is_none(),
+            "truncated ring cannot safely serve replay cursors"
+        );
     }
 
     /// Persisted Message after truncation clears the truncated flag.

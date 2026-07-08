@@ -2,10 +2,10 @@
 // Simplified: Pure get/put storage, no TTL or staleness logic
 
 import { generateUUID } from './utils/uuid';
-import type { Conversation, FileAttachment, ImageData, Message } from './api';
+import type { Conversation, ConversationReplicaMeta, FileAttachment, ImageData, Message } from './api';
 
 const DB_NAME = 'phoenix-ide-cache';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 export interface PendingOperationPayload {
   text?: string;
@@ -31,6 +31,8 @@ export interface PendingOperation {
   retryCount: number;
   status: 'pending' | 'processing' | 'failed';
 }
+
+export type ReplicaMeta = ConversationReplicaMeta;
 
 export class CacheDB {
   private db: IDBDatabase | null = null;
@@ -106,6 +108,10 @@ export class CacheDB {
           const opsStore = db.createObjectStore('pendingOps', { keyPath: 'id' });
           opsStore.createIndex('by-created', 'createdAt');
           opsStore.createIndex('by-conversation', 'conversationId');
+        }
+
+        if (!db.objectStoreNames.contains('replicaMeta')) {
+          db.createObjectStore('replicaMeta', { keyPath: 'conversationId' });
         }
       };
     });
@@ -209,7 +215,7 @@ export class CacheDB {
 
   async deleteConversation(id: string): Promise<void> {
     await this.init();
-    const tx = this.db!.transaction(['conversations', 'messages'], 'readwrite');
+    const tx = this.db!.transaction(['conversations', 'messages', 'replicaMeta'], 'readwrite');
     
     // Delete conversation
     tx.objectStore('conversations').delete(id);
@@ -227,6 +233,8 @@ export class CacheDB {
         cursor.continue();
       }
     };
+
+    tx.objectStore('replicaMeta').delete(id);
   }
 
   // Messages - simple get/put
@@ -264,6 +272,34 @@ export class CacheDB {
     for (const message of messages) {
       store.put(message);
     }
+  }
+
+  async getLatestCachedMessages(conversationId: string, limit: number): Promise<Message[]> {
+    const messages = await this.getMessages(conversationId);
+    return messages.toSorted((a, b) => b.sequence_id - a.sequence_id).slice(0, limit);
+  }
+
+  async getMaxMessageSequenceId(conversationId: string): Promise<number | null> {
+    const messages = await this.getLatestCachedMessages(conversationId, 1);
+    return messages[0]?.sequence_id ?? null;
+  }
+
+  async getReplicaMeta(conversationId: string): Promise<ReplicaMeta | null> {
+    await this.init();
+    const tx = this.db!.transaction(['replicaMeta'], 'readonly');
+    const store = tx.objectStore('replicaMeta');
+    return new Promise((resolve) => {
+      const request = store.get(conversationId);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => resolve(null);
+    });
+  }
+
+  async putReplicaMeta(meta: ReplicaMeta): Promise<void> {
+    await this.init();
+    const tx = this.db!.transaction(['replicaMeta'], 'readwrite');
+    const store = tx.objectStore('replicaMeta');
+    store.put(meta);
   }
 
   // Pending operations for offline support

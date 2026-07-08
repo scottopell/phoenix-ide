@@ -75,6 +75,7 @@ export interface Conversation {
   created_at: string;
   updated_at: string;
   message_count: number;
+  transcript_generation?: number;
   state?: ConversationState;
   /** RFC3339 server clock at which the conversation entered its current
    *  `state`. Bumped on every transition by the runtime (db.rs:676);
@@ -473,6 +474,41 @@ export interface Message {
   display_data?: ImageData | Record<string, unknown> | null; // For tool results with images (e.g., screenshots)
   usage_data?: UsageData;
   created_at: string;
+}
+
+export interface ConversationMessageTombstone {
+  [key: string]: unknown;
+}
+
+export interface ConversationMessageSliceResponse {
+  messages: Message[];
+  tombstones: ConversationMessageTombstone[];
+  transcript_generation: number;
+  server_message_tail: number | null;
+}
+
+export interface ConversationMessageRangeResponse {
+  messages: Message[];
+  missing_sequences: number[];
+  tombstones: ConversationMessageTombstone[];
+  transcript_generation: number;
+  server_message_tail: number | null;
+}
+
+export interface ConversationMessagesAroundResponse {
+  before: Message[];
+  after: Message[];
+  tombstones: ConversationMessageTombstone[];
+  transcript_generation: number;
+  server_message_tail: number | null;
+}
+
+export interface ConversationReplicaMeta {
+  conversationId: string;
+  latestMessageSequenceId: number | null;
+  latestEventSequenceId: number | null;
+  transcriptGeneration: number | null;
+  lastHydratedAt: string;
 }
 
 export type MessageContent = 
@@ -1273,6 +1309,83 @@ export const api = {
     if (resp.status === 404) return null;
     if (!resp.ok) throw new Error('Failed to resolve conversation slug');
     return (await resp.json()).slug as string;
+  },
+
+  async getConversationMessagesLatest(
+    id: string,
+    limit: number,
+  ): Promise<ConversationMessageSliceResponse> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(id)}/messages/latest?${params}`,
+    );
+    if (!resp.ok) throw new Error('Failed to fetch latest conversation messages');
+    return resp.json();
+  },
+
+  async getConversationMessagesBefore(
+    id: string,
+    beforeMessageSequence: number,
+    limit: number,
+  ): Promise<ConversationMessageSliceResponse> {
+    const params = new URLSearchParams({
+      before_message_sequence: String(beforeMessageSequence),
+      limit: String(limit),
+    });
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(id)}/messages?${params}`,
+    );
+    if (!resp.ok) throw new Error('Failed to fetch conversation messages before sequence');
+    return resp.json();
+  },
+
+  async getConversationMessagesAfter(
+    id: string,
+    afterMessageSequence: number,
+    limit: number,
+  ): Promise<ConversationMessageSliceResponse> {
+    const params = new URLSearchParams({
+      after_message_sequence: String(afterMessageSequence),
+      limit: String(limit),
+    });
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(id)}/messages?${params}`,
+    );
+    if (!resp.ok) throw new Error('Failed to fetch conversation messages after sequence');
+    return resp.json();
+  },
+
+  async getConversationMessageRange(
+    id: string,
+    start: number,
+    end: number,
+  ): Promise<ConversationMessageRangeResponse> {
+    const params = new URLSearchParams({
+      start_message_sequence: String(start),
+      end_message_sequence: String(end),
+    });
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(id)}/messages/range?${params}`,
+    );
+    if (!resp.ok) throw new Error('Failed to fetch conversation message range');
+    return resp.json();
+  },
+
+  async getConversationMessagesAround(
+    id: string,
+    sequence: number,
+    before: number,
+    after: number,
+  ): Promise<ConversationMessagesAroundResponse> {
+    const params = new URLSearchParams({
+      before: String(before),
+      after: String(after),
+    });
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(id)}/messages/around/${encodeURIComponent(sequence)}?${params}`,
+    );
+    if (!resp.ok) throw new Error('Failed to fetch conversation messages around sequence');
+    return resp.json();
   },
 
   /** Initial pull of a scope's work-affine resource inventory (REQ-WSUI-006).

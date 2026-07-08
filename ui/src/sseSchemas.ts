@@ -163,6 +163,7 @@ const MessageSchema = v.pipe(
 export const SseInitDataSchema = v.looseObject({
   sequence_id: v.number(),
   conversation: ConversationSchema,
+  transcript_generation: v.number(),
   messages: v.array(MessageSchema),
   agent_working: v.boolean(),
   last_sequence_id: v.number(),

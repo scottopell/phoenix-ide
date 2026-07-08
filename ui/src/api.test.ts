@@ -87,6 +87,104 @@ describe('api.continueConversation', () => {
   });
 });
 
+describe('conversation message history clients', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('GETs latest messages with limit query', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        messages: [],
+        tombstones: [],
+        transcript_generation: null,
+        server_message_tail: 42,
+      }),
+    } as unknown as Response);
+
+    await api.getConversationMessagesLatest('conv/id', 25);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/conversations/conv%2Fid/messages/latest?limit=25',
+    );
+  });
+
+  it('GETs messages before a sequence using before_message_sequence', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        messages: [], tombstones: [], transcript_generation: null, server_message_tail: 9,
+      }),
+    } as unknown as Response);
+
+    await api.getConversationMessagesBefore('conv-1', 77, 10);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/conversations/conv-1/messages?before_message_sequence=77&limit=10',
+    );
+  });
+
+  it('GETs messages after a sequence using after_message_sequence', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        messages: [], tombstones: [], transcript_generation: null, server_message_tail: 9,
+      }),
+    } as unknown as Response);
+
+    await api.getConversationMessagesAfter('conv-1', 88, 11);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/conversations/conv-1/messages?after_message_sequence=88&limit=11',
+    );
+  });
+
+  it('GETs an exact range with explicit start/end_message_sequence params', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        messages: [], missing_sequences: [], tombstones: [], transcript_generation: 3, server_message_tail: 12,
+      }),
+    } as unknown as Response);
+
+    await api.getConversationMessageRange('conv-1', 5, 12);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/conversations/conv-1/messages/range?start_message_sequence=5&end_message_sequence=12',
+    );
+  });
+
+  it('GETs messages around a pivot sequence with before/after query params', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        before: [], after: [], tombstones: [], transcript_generation: null, server_message_tail: 12,
+      }),
+    } as unknown as Response);
+
+    await api.getConversationMessagesAround('conv-1', 17, 4, 6);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/conversations/conv-1/messages/around/17?before=4&after=6',
+    );
+  });
+});
+
 describe('api.regenerateConversationName', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());

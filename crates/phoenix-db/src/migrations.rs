@@ -176,6 +176,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_pr_feedback_status_cache",
         sql: MIGRATION_032,
     },
+    Migration {
+        version: 33,
+        name: "add_transcript_generation_to_conversations",
+        sql: MIGRATION_033,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -1043,6 +1048,11 @@ const MIGRATION_031: &str = r"
 ALTER TABLE turn_usage ADD COLUMN first_byte_at TEXT;
 ";
 
+/// Add conversation-level transcript/replica generation with a durable default.
+const MIGRATION_033: &str = r"
+ALTER TABLE conversations ADD COLUMN transcript_generation INTEGER NOT NULL DEFAULT 1;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,7 +1116,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 32);
+        assert_eq!(first, 33);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -1143,9 +1153,9 @@ mod tests {
             .unwrap();
 
         // Every version except the stamped 29 must run: 1–28 below the stamp
-        // and 30–32 above it.
+        // and 30–33 above it.
         let applied = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(applied, 31);
+        assert_eq!(applied, 32);
 
         // Migration 005's effects must be present.
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")

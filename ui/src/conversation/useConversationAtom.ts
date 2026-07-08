@@ -146,6 +146,20 @@ export function useConversationView(
  * The value is a primitive, so `Object.is` makes the snapshot trivially
  * stable between equal observations.
  */
+export function useConversationEventCursorRef(slug: string): MutableRefObject<number> {
+  const store = useConversationStore();
+  const ref = useRef(store.getSnapshot(slug).lastAppliedEventSeq);
+
+  useEffect(() => {
+    ref.current = store.getSnapshot(slug).lastAppliedEventSeq;
+    return store.subscribe(slug, () => {
+      ref.current = store.getSnapshot(slug).lastAppliedEventSeq;
+    });
+  }, [store, slug]);
+
+  return ref;
+}
+
 export function useLastSseEventAt(slug: string): number {
   const store = useConversationStore();
 

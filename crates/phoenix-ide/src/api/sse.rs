@@ -127,6 +127,7 @@ mod tests {
                 pending_anchor_sequence_id,
                 pending_events,
                 pending_truncated,
+                transcript_generation: _,
             } => {
                 let enriched_msgs: Vec<Value> =
                     messages.iter().map(enrich_message_for_api).collect();
@@ -353,6 +354,7 @@ mod tests {
             created_at: ts(),
             updated_at: ts(),
             archived: false,
+            transcript_generation: 1,
             model: Some("claude-sonnet-4-5".to_string()),
             project_id: None,
             conv_mode: ConvMode::Explore {
@@ -442,6 +444,7 @@ mod tests {
         let event = SseEvent::Init {
             sequence_id: 42,
             conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
             messages: vec![fixture_user_message(), fixture_agent_message_with_bash()],
             agent_working: false,
             presentation_mode: "idle".to_string(),
@@ -489,6 +492,7 @@ mod tests {
         let event = SseEvent::Init {
             sequence_id: 45,
             conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
             messages: vec![fixture_user_message()],
             agent_working: true,
             presentation_mode: "working".to_string(),
@@ -533,6 +537,7 @@ mod tests {
         let event = SseEvent::Init {
             sequence_id: 99,
             conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
             messages: vec![fixture_user_message()],
             agent_working: false,
             presentation_mode: "idle".to_string(),
@@ -902,6 +907,7 @@ mod tests {
         let init = SseEvent::Init {
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
             messages: Vec::new(),
             agent_working: true,
             presentation_mode: "working".to_string(),
@@ -998,6 +1004,7 @@ mod tests {
         let init = SseEvent::Init {
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
             messages: Vec::new(),
             agent_working: false,
             presentation_mode: "idle".to_string(),

@@ -88,6 +88,7 @@ afterEach(() => {
 function makeInitPayload(convId: string, slug: string) {
   return {
     sequence_id: 0,
+    transcript_generation: 1,
     conversation: {
       id: convId,
       slug,
@@ -96,6 +97,7 @@ function makeInitPayload(convId: string, slug: string) {
       created_at: '2024-01-01T00:00:00Z',
       updated_at: '2024-01-01T00:00:00Z',
       message_count: 0,
+      transcript_generation: 1,
     },
     messages: [],
     agent_working: false,
@@ -114,6 +116,30 @@ function makeInitPayload(convId: string, slug: string) {
 // ---------------------------------------------------------------------------
 
 describe('useConnection epoch stamping (task 08683)', () => {
+  it('opens the legacy stream URL when no replay cursor is available', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+
+    renderHook(() => useConnection({ conversationId: 'conv-A', dispatch }));
+
+    expect(FakeEventSource.instances).toHaveLength(1);
+    expect(FakeEventSource.instances[0]!.url).toBe('/api/conversations/conv-A/stream');
+  });
+
+  it('uses after_event_sequence when the atom already has a replay cursor', () => {
+    const dispatch = vi.fn<(a: SSEAction) => void>();
+
+    renderHook(() => useConnection({
+      conversationId: 'conv-A',
+      dispatch,
+      getLastAppliedEventSeq: () => 42,
+    }));
+
+    expect(FakeEventSource.instances).toHaveLength(1);
+    expect(FakeEventSource.instances[0]!.url).toBe(
+      '/api/conversations/conv-A/stream?after_event_sequence=42',
+    );
+  });
+
   it('stamps every wire-derived dispatch with the connection epoch', () => {
     const captured: SSEAction[] = [];
     const dispatch = (a: SSEAction) => {

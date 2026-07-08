@@ -621,6 +621,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             archived: false,
+            transcript_generation: 1,
             model: Some("mock".to_string()),
             project_id: None,
             conv_mode: ConvMode::Direct,

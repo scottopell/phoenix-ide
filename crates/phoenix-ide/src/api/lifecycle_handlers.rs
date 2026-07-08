@@ -780,6 +780,7 @@ mod tests {
             created_at: ts,
             updated_at: ts,
             archived: false,
+            transcript_generation: 1,
             model: None,
             project_id: Some("proj-1".to_string()),
             conv_mode: ConvMode::Work {

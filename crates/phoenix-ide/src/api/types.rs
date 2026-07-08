@@ -157,6 +157,46 @@ pub struct ConversationWithMessagesResponse {
     pub context_window_size: u64,
 }
 
+/// Response for message history slice endpoints.
+#[derive(Debug, Serialize)]
+pub struct ConversationMessageSliceResponse {
+    pub messages: Vec<crate::api::wire::EnrichedMessage>,
+    /// Current server does not persist message tombstones yet, so slice
+    /// endpoints return an empty list until that model exists.
+    pub tombstones: Vec<serde_json::Value>,
+    pub transcript_generation: Option<i64>,
+    pub server_message_tail: Option<i64>,
+}
+
+/// Response for exact inclusive range fetches.
+#[derive(Debug, Serialize)]
+pub struct ConversationMessageRangeResponse {
+    pub messages: Vec<crate::api::wire::EnrichedMessage>,
+    /// Sequence ids in the requested inclusive range that are absent from the DB.
+    /// The server currently has no persisted tombstone model, so holes are
+    /// surfaced explicitly instead of being silently omitted.
+    pub missing_sequences: Vec<i64>,
+    pub tombstones: Vec<serde_json::Value>,
+    pub transcript_generation: Option<i64>,
+    pub server_message_tail: Option<i64>,
+}
+
+/// Response for around-a-sequence fetches.
+///
+/// The `before` and `after` slices exclude the pivot sequence from the route
+/// (`/around/:sequence`). Clients that need the pivot message should fetch it
+/// from already-loaded transcript state or an exact range that includes it.
+#[derive(Debug, Serialize)]
+pub struct ConversationMessagesAroundResponse {
+    pub before: Vec<crate::api::wire::EnrichedMessage>,
+    pub after: Vec<crate::api::wire::EnrichedMessage>,
+    /// Current server does not persist message tombstones yet, so slice
+    /// endpoints return an empty list until that model exists.
+    pub tombstones: Vec<serde_json::Value>,
+    pub transcript_generation: Option<i64>,
+    pub server_message_tail: Option<i64>,
+}
+
 /// Response for chat action
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {

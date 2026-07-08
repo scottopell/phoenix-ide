@@ -1487,8 +1487,8 @@ impl Database {
         loop {
             let title_str = schema::title_from_slug(&actual_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8, 0, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             )
             .bind(id)
             .bind(&actual_slug)
@@ -1548,6 +1548,7 @@ impl Database {
             conv_mode: conv_mode.clone(),
             desired_base_branch: desired_base_branch.map(String::from),
             message_count: 0,
+            transcript_generation: 1,
             seed_parent_id: seed_parent_id.map(String::from),
             seed_label: seed_label.map(String::from),
             // REQ-BED-030: fresh conversations have not been continued.
@@ -1567,7 +1568,7 @@ impl Database {
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
@@ -1595,7 +1596,7 @@ impl Database {
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
@@ -1623,7 +1624,7 @@ impl Database {
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
@@ -1756,7 +1757,7 @@ impl Database {
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
@@ -2069,7 +2070,7 @@ impl Database {
     ) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language,
@@ -2243,8 +2244,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
-                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, NULL, NULL, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, NULL, NULL, NULL, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -2383,6 +2384,7 @@ impl Database {
             created_at: now,
             updated_at: now,
             archived: false,
+            transcript_generation: 1,
             model: parent.model,
             project_id: parent.project_id,
             conv_mode: work_mode,
@@ -2487,8 +2489,8 @@ impl Database {
         let actual_slug = loop {
             let title_for_insert = schema::title_from_slug(&candidate_slug);
             let result = sqlx::query(
-                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
-                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id, llm_language, cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch, cm_task_id, cm_task_title, cm_next_taskmd_id_hint)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, 1, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             )
             .bind(&new_id)
             .bind(&candidate_slug)
@@ -2578,6 +2580,7 @@ impl Database {
             created_at: now,
             updated_at: now,
             archived: false,
+            transcript_generation: 1,
             model: parent.model,
             project_id: parent.project_id,
             conv_mode: parent.conv_mode,
@@ -2656,7 +2659,7 @@ impl Database {
                 JOIN chain ON c.id = chain.next_id
             )
             SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                   c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                   c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                    c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
@@ -3331,7 +3334,7 @@ impl Database {
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
-                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.transcript_generation, c.model,
                     c.project_id, c.desired_base_branch,
                     c.cm_kind, c.cm_branch_name, c.cm_worktree_path, c.cm_base_branch, c.cm_task_id, c.cm_task_title, c.cm_next_taskmd_id_hint,
                     c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.llm_language, c.spawned_from_conversation_id,
@@ -4011,6 +4014,175 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get the latest messages for a conversation, capped by `limit`.
+    ///
+    /// Returns messages in ascending `sequence_id` order so callers can append
+    /// them directly to an in-memory transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message query or attachment hydration fails.
+    pub async fn get_latest_messages(
+        &self,
+        conversation_id: &str,
+        limit: i64,
+    ) -> DbResult<Vec<Message>> {
+        let mut rows = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1
+             ORDER BY sequence_id DESC
+             LIMIT ?2",
+        )
+        .bind(conversation_id)
+        .bind(limit)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.reverse();
+        hydrate_attachments(&self.pool, &mut rows).await?;
+        Ok(rows)
+    }
+
+    /// Get messages before a sequence ID, capped by `limit`.
+    ///
+    /// Returns the newest `limit` messages with `sequence_id < before_sequence`,
+    /// re-sorted ascending before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message query or attachment hydration fails.
+    pub async fn get_messages_before(
+        &self,
+        conversation_id: &str,
+        before_sequence: i64,
+        limit: i64,
+    ) -> DbResult<Vec<Message>> {
+        let mut rows = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1 AND sequence_id < ?2
+             ORDER BY sequence_id DESC
+             LIMIT ?3",
+        )
+        .bind(conversation_id)
+        .bind(before_sequence)
+        .bind(limit)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.reverse();
+        hydrate_attachments(&self.pool, &mut rows).await?;
+        Ok(rows)
+    }
+
+    /// Get messages after a sequence ID, capped by `limit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message query or attachment hydration fails.
+    pub async fn get_messages_after_limited(
+        &self,
+        conversation_id: &str,
+        after_sequence: i64,
+        limit: i64,
+    ) -> DbResult<Vec<Message>> {
+        let mut rows = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1 AND sequence_id > ?2
+             ORDER BY sequence_id ASC
+             LIMIT ?3",
+        )
+        .bind(conversation_id)
+        .bind(after_sequence)
+        .bind(limit)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
+
+        hydrate_attachments(&self.pool, &mut rows).await?;
+        Ok(rows)
+    }
+
+    /// Get the inclusive message range `[start_sequence, end_sequence]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message query or attachment hydration fails.
+    pub async fn get_message_range(
+        &self,
+        conversation_id: &str,
+        start_sequence: i64,
+        end_sequence: i64,
+    ) -> DbResult<Vec<Message>> {
+        let mut rows = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1 AND sequence_id >= ?2 AND sequence_id <= ?3
+             ORDER BY sequence_id ASC",
+        )
+        .bind(conversation_id)
+        .bind(start_sequence)
+        .bind(end_sequence)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
+
+        hydrate_attachments(&self.pool, &mut rows).await?;
+        Ok(rows)
+    }
+
+    /// Get a window of messages around `pivot_sequence`, excluding the pivot.
+    ///
+    /// Returns `(before, after)` with both slices in ascending order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either message query or attachment hydration fails.
+    pub async fn get_messages_around(
+        &self,
+        conversation_id: &str,
+        pivot_sequence: i64,
+        before_limit: i64,
+        after_limit: i64,
+    ) -> DbResult<(Vec<Message>, Vec<Message>)> {
+        let mut before = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1 AND sequence_id < ?2
+             ORDER BY sequence_id DESC
+             LIMIT ?3",
+        )
+        .bind(conversation_id)
+        .bind(pivot_sequence)
+        .bind(before_limit)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
+        before.reverse();
+
+        let mut after = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages
+             WHERE conversation_id = ?1 AND sequence_id > ?2
+             ORDER BY sequence_id ASC
+             LIMIT ?3",
+        )
+        .bind(conversation_id)
+        .bind(pivot_sequence)
+        .bind(after_limit)
+        .try_map(parse_message_row)
+        .fetch_all(&self.pool)
+        .await?;
+
+        hydrate_attachments(&self.pool, &mut before).await?;
+        hydrate_attachments(&self.pool, &mut after).await?;
+        Ok((before, after))
+    }
+
     /// Get a message by its `message_id`
     ///
     /// # Errors
@@ -4669,6 +4841,10 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         conv_mode,
         desired_base_branch,
         message_count: row.try_get("message_count")?,
+        transcript_generation: row
+            .try_get::<Option<i64>, _>("transcript_generation")
+            .unwrap_or(Some(1))
+            .unwrap_or(1),
         seed_parent_id,
         seed_label,
         continued_in_conv_id,
@@ -4832,13 +5008,13 @@ async fn insert_conversation_tx(
     sqlx::query(
         "INSERT INTO conversations (
             id, slug, title, cwd, parent_conversation_id, user_initiated, state,
-            state_updated_at, created_at, updated_at, archived, model, project_id,
+            state_updated_at, created_at, updated_at, archived, transcript_generation, model, project_id,
             desired_base_branch, seed_parent_id, seed_label,
             continued_in_conv_id, chain_name, llm_language,
             spawned_from_conversation_id,
             cm_kind, cm_branch_name, cm_worktree_path, cm_base_branch,
             cm_task_id, cm_task_title, cm_next_taskmd_id_hint
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
         ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
@@ -4852,6 +5028,7 @@ async fn insert_conversation_tx(
     .bind(conv.created_at.to_rfc3339())
     .bind(conv.updated_at.to_rfc3339())
     .bind(conv.archived)
+    .bind(conv.transcript_generation)
     .bind(&conv.model)
     .bind(&conv.project_id)
     .bind(&conv.desired_base_branch)
@@ -6179,6 +6356,73 @@ mod tests {
         let after = db.get_messages_after("conv-1", 1).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].message_id, "msg-2");
+    }
+
+    #[tokio::test]
+    async fn message_slice_helpers_return_expected_windows() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        db.create_conversation("conv-slices", "slug-slices", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        for idx in 1..=5 {
+            db.add_message(
+                &format!("msg-{idx}"),
+                "conv-slices",
+                &MessageContent::user(format!("m{idx}")),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let latest = db.get_latest_messages("conv-slices", 2).await.unwrap();
+        assert_eq!(
+            latest.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+
+        let before = db.get_messages_before("conv-slices", 4, 2).await.unwrap();
+        assert_eq!(
+            before.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        let after = db
+            .get_messages_after_limited("conv-slices", 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+
+        let range = db.get_message_range("conv-slices", 2, 4).await.unwrap();
+        assert_eq!(
+            range.iter().map(|m| m.sequence_id).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+
+        let (around_before, around_after) = db
+            .get_messages_around("conv-slices", 3, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            around_before
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            around_after
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
     }
 
     /// A freshly-migrated DB (base SCHEMA + all versioned migrations, the path

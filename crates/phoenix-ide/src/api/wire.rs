@@ -228,6 +228,7 @@ pub enum SseWireEvent {
         last_sequence_id: i64,
         context_window_size: u64,
         project_name: Option<String>,
+        transcript_generation: i64,
         /// `ReplayRing` anchor: the seq of the last persisted Message at
         /// subscribe time. Every entry in `pending_events` has
         /// `sequence_id > pending_anchor_sequence_id`. See
@@ -431,6 +432,7 @@ impl From<SseEvent> for SseWireEvent {
                 last_sequence_id,
                 context_window_size,
                 project_name,
+                transcript_generation,
                 pending_anchor_sequence_id,
                 pending_events,
                 pending_truncated,
@@ -443,6 +445,7 @@ impl From<SseEvent> for SseWireEvent {
                 last_sequence_id,
                 context_window_size,
                 project_name,
+                transcript_generation,
                 pending_anchor_sequence_id,
                 pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),
                 pending_truncated,

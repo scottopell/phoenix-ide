@@ -324,6 +324,10 @@ pub struct Project {
     pub conversation_count: i64,
 }
 
+fn default_transcript_generation() -> i64 {
+    1
+}
+
 /// Conversation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
@@ -354,6 +358,12 @@ pub struct Conversation {
     pub desired_base_branch: Option<String>,
     #[serde(default)]
     pub message_count: i64,
+    /// Conversation-level transcript/replica generation. Bumped when the
+    /// server invalidates previously cached incremental transcript state so
+    /// clients can discard stale ranges/patches and rebuild from a fresh
+    /// snapshot.
+    #[serde(default = "default_transcript_generation")]
+    pub transcript_generation: i64,
     /// Seed parent for decorative UI breadcrumb (REQ-SEED-003). Distinct from
     /// `parent_conversation_id` above (which is sub-agent parentage); this one
     /// is set when a user-initiated conversation was spawned from another via
@@ -1830,6 +1840,7 @@ mod conversation_serde_tests {
             created_at: fixture_ts(),
             updated_at: fixture_ts(),
             archived: false,
+            transcript_generation: 1,
             model: None,
             project_id: None,
             conv_mode: ConvMode::Explore {

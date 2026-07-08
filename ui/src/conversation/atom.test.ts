@@ -18,6 +18,7 @@ const testConversation: Conversation = {
   created_at: '2024-01-01T00:00:00Z',
   updated_at: '2024-01-01T00:00:00Z',
   message_count: 0,
+  transcript_generation: 1,
   browser_session_active: false,
   terminal_uses_tmux: false,
   work_scope_key: 'conversation:conv-1',
@@ -41,6 +42,7 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
     messages: [],
     phase: { type: 'idle' },
     contextWindow: { used: 1000 },
+    transcriptGeneration: 1,
     lastAppliedEventSeq,
     // Default to "no pending replay": anchor matches the tip and the ring
     // is empty. Tests exercising ReplayRing behaviour override these.
@@ -1822,6 +1824,7 @@ describe('conversationReducer', () => {
         messages: [makeMessage(3)],
         phase: { type: 'idle' },
         contextWindow: { used: 500 },
+        transcriptGeneration: 1,
       });
 
       expect(next.conversationId).toBe('conv-1');
@@ -1839,6 +1842,7 @@ describe('conversationReducer', () => {
         messages: [],
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
+        transcriptGeneration: 1,
       });
 
       expect(next).toBe(atom);

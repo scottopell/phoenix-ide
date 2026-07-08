@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ConversationPage } from './ConversationPage';
 import { DesktopLayout } from '../components/DesktopLayout';
@@ -9,6 +9,7 @@ import { ConversationStore } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
 import { api, type Conversation, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
+import { cacheDB } from '../cache';
 
 const viewportFlags = vi.hoisted(() => ({ isDesktop: true, isWideDesktop: true }));
 
@@ -19,6 +20,7 @@ vi.mock('../api', async () => {
     api: {
       ...actual.api,
       getConversationBySlug: vi.fn(),
+      getConversationMessagesAfter: vi.fn(),
       listConversations: vi.fn(() => Promise.resolve([])),
       listArchivedConversations: vi.fn(() => Promise.resolve([])),
       getModels: vi.fn(() => Promise.resolve([])),
@@ -37,10 +39,12 @@ vi.mock('../cache', () => ({
   cacheDB: {
     getConversationBySlug: vi.fn(() => Promise.resolve(null)),
     getMessages: vi.fn(() => Promise.resolve([])),
+    getMaxMessageSequenceId: vi.fn(() => Promise.resolve(null)),
     getAllConversations: vi.fn(() => Promise.resolve([])),
     syncConversations: vi.fn(() => Promise.resolve()),
     putConversation: vi.fn(() => Promise.resolve()),
     putMessages: vi.fn(() => Promise.resolve()),
+    putReplicaMeta: vi.fn(() => Promise.resolve()),
   },
 }));
 
@@ -58,8 +62,11 @@ vi.mock('../components/ConversationNavStack', () => ({
   ConversationNavStack: ({ messages }: { messages: Message[] }) => (
     <div data-testid="message-history">
       {messages.map((message) => {
-        const content = message.content as { text?: string };
-        return <div key={message.message_id}>{content.text}</div>;
+        const content = message.content as { text?: string } | { type?: string; text?: string }[];
+        const rendered = Array.isArray(content)
+          ? content.find((block) => block.type === 'text')?.text
+          : content?.text;
+        return <div key={message.message_id}>{rendered}</div>;
       })}
     </div>
   ),
@@ -109,15 +116,25 @@ const historyMessage: Message = {
   created_at: '2024-01-01T00:00:01Z',
 };
 
+const catchUpMessage: Message = {
+  message_id: 'm2',
+  sequence_id: 2,
+  conversation_id: conversationId,
+  message_type: 'agent',
+  content: [{ type: 'text', text: 'incremental catch-up arrived' }],
+  created_at: '2024-01-01T00:00:02Z',
+};
+
 function renderPage(conversation: Conversation) {
   const store = new ConversationStore();
   store.dispatch(conversation.slug, {
-      type: 'set_initial_data',
-      conversationId: conversation.id,
-      conversation,
-      messages: [historyMessage],
-      phase: { type: 'idle' },
-      contextWindow: { used: 0 },
+    type: 'set_initial_data',
+    conversationId: conversation.id,
+    conversation,
+    messages: [historyMessage],
+    phase: { type: 'idle' },
+    contextWindow: { used: 0 },
+    transcriptGeneration: conversation.transcript_generation ?? 1,
   });
 
   vi.mocked(api.getConversationBySlug).mockResolvedValue({
@@ -188,5 +205,48 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(await screen.findByTestId('terminal-panel')).toBeInTheDocument();
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('[data-testid="terminal-panel"]'));
     expect(document.querySelector('.conversation-column')).toContainElement(document.querySelector('#state-bar'));
+  });
+
+  it('renders cached messages immediately and incrementally catches up newer messages without a full fetch', async () => {
+    const cachedConversation = makeConversation();
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
+    vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
+      messages: [catchUpMessage],
+      tombstones: [],
+      transcript_generation: 7,
+      server_message_tail: 2,
+    });
+
+    render(
+      <ConversationContext.Provider value={new ConversationStore()}>
+        <DraftContext.Provider value={new DraftStore()}>
+          <ConversationReadinessProvider>
+            <MemoryRouter initialEntries={[`/c/${cachedConversation.slug}`]}>
+              <Routes>
+                <Route path="/c/:slug" element={<DesktopLayout><ConversationPage /></DesktopLayout>} />
+              </Routes>
+            </MemoryRouter>
+          </ConversationReadinessProvider>
+        </DraftContext.Provider>
+      </ConversationContext.Provider>,
+    );
+
+    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(await screen.findByText('incremental catch-up arrived')).toBeInTheDocument();
+    expect(api.getConversationMessagesAfter).toHaveBeenCalledWith(conversationId, 1, 200);
+    expect(cacheDB.putMessages).toHaveBeenCalledWith([catchUpMessage]);
+    await waitFor(() => {
+      expect(cacheDB.putReplicaMeta).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conversationId,
+          latestMessageSequenceId: 2,
+          latestEventSequenceId: null,
+          transcriptGeneration: 7,
+          lastHydratedAt: expect.any(String),
+        }),
+      );
+    });
   });
 });

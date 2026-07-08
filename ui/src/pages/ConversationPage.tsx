@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -32,7 +32,7 @@ import { OPEN_MESSAGE_VIEWER_EVENT } from '../components/MessageContextMenu';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
-import { useConversationView, useCreateConversationWithStore } from '../conversation';
+import { useConversationEventCursorRef, useConversationView, useCreateConversationWithStore } from '../conversation';
 import {
   useResizablePane,
   useIsDesktop,
@@ -140,6 +140,37 @@ function RecoveryBanner({ message, recoveryKind }: { message: string; recoveryKi
       </div>
     </div>
   );
+}
+
+function latestMessageSequenceId(messages: { sequence_id: number }[]): number | null {
+  return messages.length > 0 ? messages[messages.length - 1]?.sequence_id ?? null : null;
+}
+
+function mergeConversationMessages<T extends { message_id: string; sequence_id: number }>(existing: T[], incoming: T[]): T[] {
+  const byMessageId = new Map<string, T>();
+  const bySequenceId = new Map<number, T>();
+
+  const upsert = (message: T) => {
+    const priorByMessageId = byMessageId.get(message.message_id);
+    if (priorByMessageId && priorByMessageId.sequence_id <= message.sequence_id) {
+      bySequenceId.delete(priorByMessageId.sequence_id);
+    }
+
+    const priorBySequenceId = bySequenceId.get(message.sequence_id);
+    if (priorBySequenceId && priorBySequenceId.message_id !== message.message_id) {
+      byMessageId.delete(priorBySequenceId.message_id);
+    }
+
+    if (!priorByMessageId || priorByMessageId.sequence_id <= message.sequence_id) {
+      byMessageId.set(message.message_id, message);
+      bySequenceId.set(message.sequence_id, message);
+    }
+  };
+
+  existing.forEach(upsert);
+  incoming.forEach(upsert);
+
+  return Array.from(bySequenceId.values()).toSorted((a, b) => a.sequence_id - b.sequence_id);
 }
 
 function ConversationPageContent() {
@@ -420,9 +451,15 @@ function ConversationPageContent() {
     [queuedMessages],
   );
 
+  const atomRef = useRef(atom);
+  atomRef.current = atom;
+
+  const eventCursorRef = useConversationEventCursorRef(slug!);
+
   const connectionInfo = useConnection({
     conversationId,
     dispatch,
+    getLastAppliedEventSeq: () => eventCursorRef.current,
   });
 
   const isOffline =
@@ -430,9 +467,6 @@ function ConversationPageContent() {
   const isConnected =
     connectionInfo.state === 'connected' || connectionInfo.state === 'reconnected';
 
-  // Ref to read atom state inside effects without adding it to deps
-  const atomRef = useRef(atom);
-  atomRef.current = atom;
 
   // Load conversation by slug — skip if atom already has data from a previous visit
   useEffect(() => {
@@ -450,23 +484,76 @@ function ConversationPageContent() {
     const loadConversation = async () => {
       try {
         let cached = atomRef.current.conversation;
+        let cachedMessages: Message[] = hadAtomData ? atomRef.current.messages : [];
         if (!hadAtomData) {
           cached = await cacheDB.getConversationBySlug(slug);
-          if (cached && !cancelled) {
-            const cachedMessages = await cacheDB.getMessages(cached.id);
-            dispatch({
-              type: 'set_initial_data',
-              conversationId: cached.id,
-              conversation: cached,
-              messages: cachedMessages,
-              phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
-              contextWindow: { used: 0 },
-            });
+          if (cached) {
+            cachedMessages = await cacheDB.getMessages(cached.id);
+            if (!cancelled) {
+              dispatch({
+                type: 'set_initial_data',
+                conversationId: cached.id,
+                conversation: cached,
+                messages: cachedMessages,
+                phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
+                contextWindow: { used: 0 },
+                transcriptGeneration: cached.transcript_generation ?? 1,
+              });
+            }
           }
         }
 
         // Step 2: Fetch authoritative data from network
         if (navigator.onLine && !cancelled) {
+          const cachedConversationId = cached?.id ?? null;
+          const hasCachedMessages = cachedConversationId !== null && cachedMessages.length > 0;
+
+          if (hasCachedMessages && cachedConversationId) {
+            try {
+              const maxSequenceId = await cacheDB.getMaxMessageSequenceId(cachedConversationId);
+              if (maxSequenceId !== null) {
+                const catchUp = await api.getConversationMessagesAfter(cachedConversationId, maxSequenceId, 200);
+                if (cancelled) return;
+
+                if (catchUp.messages.length > 0) {
+                  const mergedMessages = mergeConversationMessages(cachedMessages, catchUp.messages);
+                  const mergedLatestSequenceId = latestMessageSequenceId(mergedMessages);
+
+                  await cacheDB.putMessages(catchUp.messages);
+                  await cacheDB.putReplicaMeta({
+                    conversationId: cachedConversationId,
+                    latestMessageSequenceId: catchUp.server_message_tail ?? mergedLatestSequenceId,
+                    latestEventSequenceId: null,
+                    transcriptGeneration: catchUp.transcript_generation,
+                    lastHydratedAt: new Date().toISOString(),
+                  });
+
+                  const cachedForDispatch = cached;
+                  if (
+                    cachedForDispatch &&
+                    !cancelled &&
+                    (!atomRef.current.conversation || atomRef.current.conversation.slug === slug)
+                  ) {
+                    dispatch({
+                      type: 'set_initial_data',
+                      conversationId: cachedConversationId,
+                      conversation: cachedForDispatch,
+                      messages: mergedMessages,
+                      phase: cachedForDispatch.state ? parseConversationState(cachedForDispatch.state) : { type: 'idle' },
+                      contextWindow: { used: 0 },
+                      transcriptGeneration: cachedForDispatch.transcript_generation ?? 1,
+                    });
+                  }
+                }
+                return;
+              }
+            } catch (err) {
+              if (!cancelled) {
+                console.warn('Incremental conversation catch-up failed; falling back to full fetch:', err);
+              }
+            }
+          }
+
           try {
             const result = await api.getConversationBySlug(slug);
             if (!cancelled) {
@@ -483,10 +570,18 @@ function ConversationPageContent() {
                 contextWindow: {
                   used: result.context_window_size || 0,
                 },
+                transcriptGeneration: result.conversation.transcript_generation ?? 1,
               });
               setArchiveStatusConfirmedConversationId(result.conversation.id);
               await cacheDB.putConversation(result.conversation);
               await cacheDB.putMessages(result.messages);
+              await cacheDB.putReplicaMeta({
+                conversationId: result.conversation.id,
+                latestMessageSequenceId: latestMessageSequenceId(result.messages),
+                latestEventSequenceId: null,
+                transcriptGeneration: null,
+                lastHydratedAt: new Date().toISOString(),
+              });
             }
           } catch (err) {
             if (!cancelled) {
@@ -536,6 +631,7 @@ function ConversationPageContent() {
           contextWindow: {
             used: result.context_window_size || 0,
           },
+          transcriptGeneration: result.conversation.transcript_generation ?? 1,
         });
         setArchiveStatusConfirmedConversationId(result.conversation.id);
         await cacheDB.putConversation(result.conversation);
