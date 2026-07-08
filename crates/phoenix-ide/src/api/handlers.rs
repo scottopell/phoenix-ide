@@ -1600,11 +1600,25 @@ async fn create_conversation_with_id(
         }
     }
 
-    if let Ok(conv) = state.runtime.db().get_conversation(&id).await {
-        tracing::info!(conversation_id = %id, "Create request hit existing conversation id");
-        return Ok(Json(ConversationResponse {
-            conversation: conversation_to_json(&state, &conv, None),
-        }));
+    let mode_for_preflight = req.mode.as_deref().unwrap_or("direct");
+    let repo_root_for_preflight = detect_git_repo_root(valid_cwd.as_path());
+    if matches!(mode_for_preflight, "managed" | "branch") && repo_root_for_preflight.is_none() {
+        return Err(AppError::BadRequest(
+            "Worktree mode requires a git repository".to_string(),
+        ));
+    }
+    let worktree_backed = matches!(mode_for_preflight, "managed" | "branch")
+        || (mode_for_preflight == "auto" && repo_root_for_preflight.is_some());
+    if !worktree_backed && !req.text.trim().is_empty() {
+        let resolution_root =
+            crate::resolution_root::ResolutionRoot::working_dir(valid_cwd.path_buf());
+        crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
+            AppError::UnprocessableEntity(ExpansionErrorResponse {
+                error: e.to_string(),
+                error_type: e.error_type().to_string(),
+                reference: e.reference(),
+            })
+        })?;
     }
 
     if mode_for_preflight == "branch" {
@@ -1613,9 +1627,9 @@ async fn create_conversation_with_id(
             .as_deref()
             .ok_or_else(|| AppError::BadRequest("Branch mode requires base_branch".to_string()))?;
         validate_user_ref(branch_name)?;
-        if let Some(repo_root) = detect_git_repo_root(valid_cwd.as_path()) {
+        if let Some(repo_root) = repo_root_for_preflight.as_deref() {
             match check_branch_conflict(
-                std::path::Path::new(&repo_root),
+                std::path::Path::new(repo_root),
                 state.runtime.db(),
                 branch_name,
             ) {
@@ -1623,16 +1637,16 @@ async fn create_conversation_with_id(
                 Err(BranchConflict::PhoenixConversation { slug }) => {
                     return Err(AppError::Conflict(Box::new(
                         ConflictErrorResponse::new(
-                            "branch_in_use",
                             "Branch is already checked out by another Phoenix conversation",
+                            "branch_in_use",
                         )
                         .with_conflict_slug(slug),
                     )));
                 }
                 Err(BranchConflict::ExternalCheckout { branch, location }) => {
                     return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        "branch_checked_out",
                         format!("Branch '{branch}' is already checked out in {location}"),
+                        "branch_checked_out",
                     ))));
                 }
             }
@@ -1775,7 +1789,7 @@ async fn create_conversation_with_id(
     }
 
     let intent = crate::db::ConversationCreationIntent {
-        cwd: req.cwd.clone(),
+        cwd: effective_cwd.clone(),
         model: req.model.clone(),
         text: req.text.clone(),
         message_id: req.message_id.clone(),
@@ -4042,27 +4056,21 @@ async fn regenerate_conversation_name(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    let messages = state
+    let first_text = state
         .runtime
         .db()
-        .get_messages(&id)
+        .first_opening_message_text(&id)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let first_text = messages
-        .iter()
-        .find_map(|m| match &m.content {
-            crate::db::MessageContent::User(content) => Some(content.text.as_str()),
-            _ => None,
-        })
+        .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| {
-            AppError::BadRequest("No user message available to summarize".to_string())
+            AppError::BadRequest("No opening message available to summarize".to_string())
         })?;
     let title = if let Some(cheap_model) = state.llm_registry.get_cheap_model() {
-        crate::title_generator::generate_title(first_text, cheap_model)
+        crate::title_generator::generate_title(&first_text, cheap_model)
             .await
-            .unwrap_or_else(|| title_from_text(first_text))
+            .unwrap_or_else(|| title_from_text(&first_text))
     } else {
-        title_from_text(first_text)
+        title_from_text(&first_text)
     };
     let slug = slugify_label(&title);
     state
@@ -6089,6 +6097,59 @@ mod conversation_cwd_validation_tests {
             response.conversation["state"]["type"].as_str(),
             Some("provisioning")
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_worktree_mode_outside_git_rejects_before_shell_creation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let mut req = create_request(tmp.path().to_string_lossy().to_string());
+        req.mode = Some("managed".to_string());
+
+        let err = create_conversation_with_id(state.clone(), req, Vec::new())
+            .await
+            .expect_err("explicit managed mode outside git must be synchronous 400");
+
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("git repository"), "got: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        assert!(
+            state
+                .db
+                .list_conversations()
+                .await
+                .expect("list")
+                .is_empty(),
+            "rejected explicit worktree create must not leave a failed shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_intent_stores_canonical_cwd() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let raw_cwd = project.join("..").join("project");
+        let canonical = project.canonicalize().expect("canonical project");
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let mut req = create_request(raw_cwd.to_string_lossy().to_string());
+        req.conversation_id = Some(uuid::Uuid::new_v4().to_string());
+        let conv_id = req.conversation_id.clone().expect("id");
+
+        let _ = create_conversation_with_id(state.clone(), req, Vec::new())
+            .await
+            .expect("create shell");
+
+        let job = state
+            .db
+            .get_conversation_creation_job_for_conversation(&conv_id)
+            .await
+            .expect("load job")
+            .expect("job exists");
+        assert_eq!(job.intent.cwd, canonical.to_string_lossy());
     }
 
     #[tokio::test]
