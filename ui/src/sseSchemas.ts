@@ -7,7 +7,7 @@
 // payload (missing field, wrong type, null where a string was expected) would
 // reach the conversation reducer unchanged and silently corrupt state — most
 // dangerously by letting a string `sequence_id` through, which breaks the
-// `atom.lastSequenceId >= action.sequenceId` dedup guard via string compare.
+// atom's numeric event-sequence dedupe/contiguity guards via string compare.
 //
 // As of task 02677 the schemas are typed with `v.GenericSchema<T>` where `T`
 // is the Rust-generated wire type from `./generated/sse`. That closes the

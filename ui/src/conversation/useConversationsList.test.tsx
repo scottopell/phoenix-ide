@@ -121,7 +121,7 @@ describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
       store!.dispatch('beta', {
         type: 'sse_conversation_update',
         epoch: 1,
-        sequenceId: 5,
+        sequenceId: 1,
         updates: { cwd: '/repo/feature-x', updated_at: '2024-06-02T00:00:00Z' },
       });
     });

@@ -29,7 +29,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     // Snapshot-only: no SSE-driven fields populated yet.
     expect(atom.messages).toEqual([]);
     expect(atom.connectionEpoch).toBeNull();
-    expect(atom.lastSequenceId).toBe(0);
+    expect(atom.lastAppliedEventSeq).toBe(0);
   });
 
   it('is a no-op when the row is identical to the held one', () => {
@@ -154,7 +154,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
 
   it('preserves SSE-driven fields when upserting a newer snapshot', () => {
     // The cardinal invariant: a polling tick that arrives mid-stream
-    // must not throw away `messages`, `lastSequenceId`,
+    // must not throw away `messages`, `lastAppliedEventSeq`,
     // `connectionEpoch`, etc. The upsert path mutates only
     // `atom.conversation`.
     const store = new ConversationStore();
@@ -164,10 +164,10 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     store.dispatch('alpha', {
       type: 'sse_message',
       epoch: 1,
-      sequenceId: 5,
+      sequenceId: 1,
       message: {
         message_id: 'msg-1',
-        sequence_id: 5,
+        sequence_id: 1,
         conversation_id: 'conv-alpha',
         message_type: 'agent',
         content: { text: 'hello' },
@@ -184,7 +184,7 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     // SSE-derived fields untouched.
     expect(after.messages).toHaveLength(1);
     expect(after.connectionEpoch).toBe(1);
-    expect(after.lastSequenceId).toBe(5);
+    expect(after.lastAppliedEventSeq).toBe(1);
   });
 
   it('upsertSnapshots returns the slugs that actually changed', () => {

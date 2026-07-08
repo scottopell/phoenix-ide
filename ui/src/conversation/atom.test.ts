@@ -35,16 +35,16 @@ function makeMessage(sequenceId: number, messageType: 'user' | 'agent' = 'agent'
 }
 
 function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
-  const lastSequenceId = overrides.lastSequenceId ?? 5;
+  const lastAppliedEventSeq = overrides.lastAppliedEventSeq ?? 5;
   return {
     conversation: testConversation,
     messages: [],
     phase: { type: 'idle' },
     contextWindow: { used: 1000 },
-    lastSequenceId,
+    lastAppliedEventSeq,
     // Default to "no pending replay": anchor matches the tip and the ring
     // is empty. Tests exercising ReplayRing behaviour override these.
-    pendingAnchorSequenceId: lastSequenceId,
+    pendingAnchorSequenceId: lastAppliedEventSeq,
     pendingEvents: [],
     pendingTruncated: false,
     ...overrides,
@@ -61,26 +61,26 @@ describe('conversationReducer', () => {
       const atom = createInitialAtom();
       const payload = makeInitPayload({
         messages: [makeMessage(1), makeMessage(2)],
-        lastSequenceId: 5,
+        lastAppliedEventSeq: 5,
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.conversationId).toBe('conv-1');
       expect(next.messages).toHaveLength(2);
-      expect(next.lastSequenceId).toBe(5);
+      expect(next.lastAppliedEventSeq).toBe(5);
       expect(next.streamingBuffer).toBeNull();
     });
 
-    it('merges delta messages on reconnect (lastSequenceId > 0)', () => {
+    it('merges delta messages on reconnect (lastAppliedEventSeq > 0)', () => {
       const existing = makeMessage(3);
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 3,
+        lastAppliedEventSeq: 3,
         messages: [existing],
       };
       const newMsg = makeMessage(4);
-      const payload = makeInitPayload({ messages: [newMsg], lastSequenceId: 4 });
+      const payload = makeInitPayload({ messages: [newMsg], lastAppliedEventSeq: 4 });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
@@ -89,7 +89,7 @@ describe('conversationReducer', () => {
       expect(next.messages[1]!.sequence_id).toBe(4);
     });
 
-    it('replaces messages on fresh connect (lastSequenceId = 0)', () => {
+    it('replaces messages on fresh connect (lastAppliedEventSeq = 0)', () => {
       const payload = makeInitPayload({ messages: [makeMessage(1), makeMessage(2)] });
       const atom = createInitialAtom();
 
@@ -117,14 +117,14 @@ describe('conversationReducer', () => {
       const existing = makeMessage(3);
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 3,
+        lastAppliedEventSeq: 3,
         messages: [existing],
       };
       // Server sends [3, 4] even though client already has 3 (off-by-one
       // or server bug). The client must keep exactly one copy of 3.
       const payload = makeInitPayload({
         messages: [makeMessage(3), makeMessage(4)],
-        lastSequenceId: 4,
+        lastAppliedEventSeq: 4,
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
@@ -139,13 +139,13 @@ describe('conversationReducer', () => {
       const existing: Message = { ...makeMessage(3), message_id: 'stable-id' };
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 3,
+        lastAppliedEventSeq: 3,
         messages: [existing],
       };
       const incoming: Message = { ...makeMessage(4), message_id: 'stable-id' };
       const payload = makeInitPayload({
         messages: [incoming],
-        lastSequenceId: 4,
+        lastAppliedEventSeq: 4,
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
@@ -165,7 +165,7 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         messages: [staleMsg],
-        lastSequenceId: 5,
+        lastAppliedEventSeq: 5,
       };
       const freshMsg: Message = {
         ...staleMsg,
@@ -173,7 +173,7 @@ describe('conversationReducer', () => {
       };
       const payload = makeInitPayload({
         messages: [freshMsg],
-        lastSequenceId: 5,
+        lastAppliedEventSeq: 5,
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
@@ -184,11 +184,11 @@ describe('conversationReducer', () => {
 
     // Task 02675 acceptance: replay the same init event twice → atom converges
     // to the same state. Re-applying init is idempotent; the reducer must not
-    // duplicate messages or regress lastSequenceId.
+    // duplicate messages or regress lastAppliedEventSeq.
     it('is idempotent: applying the same init twice yields equivalent state', () => {
       const payload = makeInitPayload({
         messages: [makeMessage(1), makeMessage(2), makeMessage(3)],
-        lastSequenceId: 3,
+        lastAppliedEventSeq: 3,
       });
 
       const once = dispatch(createInitialAtom(), { type: 'sse_init', payload });
@@ -196,46 +196,46 @@ describe('conversationReducer', () => {
 
       expect(twice.messages).toHaveLength(3);
       expect(twice.messages.map((m) => m.message_id)).toEqual(once.messages.map((m) => m.message_id));
-      expect(twice.lastSequenceId).toBe(once.lastSequenceId);
+      expect(twice.lastAppliedEventSeq).toBe(once.lastAppliedEventSeq);
       expect(twice.conversationId).toBe(once.conversationId);
     });
 
-    // Task 02675 acceptance: the lastSequenceId jump scenario. Init arrives
+    // Task 02675 acceptance: the lastAppliedEventSeq jump scenario. Init arrives
     // with lastSeq=100 but the client has already seen live events through
     // 105 (plausible when a reconnect snapshot is older than live events
-    // delivered in the gap). lastSequenceId must not regress to 100 —
+    // delivered in the gap). lastAppliedEventSeq must not regress to 100 —
     // otherwise the 101–105 events would be reapplied on the next delivery.
-    it('never regresses lastSequenceId when init lags live events', () => {
+    it('never regresses lastAppliedEventSeq when init lags live events', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 105,
+        lastAppliedEventSeq: 105,
       };
-      const stalePayload = makeInitPayload({ lastSequenceId: 100 });
+      const stalePayload = makeInitPayload({ lastAppliedEventSeq: 100 });
 
       const next = dispatch(atom, { type: 'sse_init', payload: stalePayload });
 
-      expect(next.lastSequenceId).toBe(105);
+      expect(next.lastAppliedEventSeq).toBe(105);
     });
 
     // Task 02675 acceptance: init lastSeq=100, messages only to 95. When
     // subsequent individual sse_message events for 96..100 arrive, all five
-    // must land. (Before the fix, the old atom leapfrogged lastSequenceId to
+    // must land. (Before the fix, the old atom leapfrogged lastAppliedEventSeq to
     // 100 on init and then rejected 96..100 as "already seen".)
     //
     // Today init merges by id so the 96..100 messages arrive through init's
-    // message list — but the property we need is that lastSequenceId after
+    // message list — but the property we need is that lastAppliedEventSeq after
     // init does not block future individual deliveries of those same ids.
     // The defensive id dedup in sse_message keeps this honest either way.
     it('messages 96..100 land when init lastSeq=100 but individual events follow', () => {
       // Scenario: init arrives first with messages only up to 95 (server
       // hasn't yet enriched the snapshot — 96..100 are in-flight). The
-      // client seeds lastSequenceId=100 from init. Then individual events
+      // client seeds lastAppliedEventSeq=100 from init. Then individual events
       // for 96..100 race in. With the old strict-greater guard, all five
       // would be rejected. With applyIfNewer + message_id dedup, they must
       // all land exactly once.
       const payload = makeInitPayload({
         messages: [makeMessage(95)],
-        lastSequenceId: 95, // Server correctly reports: highest is 95.
+        lastAppliedEventSeq: 95, // Server correctly reports: highest is 95.
       });
       let atom = dispatch(createInitialAtom(), { type: 'sse_init', payload });
       expect(atom.messages).toHaveLength(1);
@@ -246,7 +246,7 @@ describe('conversationReducer', () => {
 
       expect(atom.messages).toHaveLength(6);
       expect(atom.messages.map((m) => m.sequence_id)).toEqual([95, 96, 97, 98, 99, 100]);
-      expect(atom.lastSequenceId).toBe(100);
+      expect(atom.lastAppliedEventSeq).toBe(100);
     });
   });
 
@@ -264,7 +264,7 @@ describe('conversationReducer', () => {
       const payload = makeInitPayload({
         messages: [],
         phase: { type: 'llm_requesting', attempt: 1 },
-        lastSequenceId: 12,
+        lastAppliedEventSeq: 12,
         pendingAnchorSequenceId: 12,
         pendingEvents: [],
       });
@@ -272,7 +272,7 @@ describe('conversationReducer', () => {
       const atom = dispatch(createInitialAtom(), { type: 'sse_init', payload });
       const pending = derivePendingMessages([queued], atom.messages.map((m) => m.message_id));
 
-      expect(atom.lastSequenceId).toBe(12);
+      expect(atom.lastAppliedEventSeq).toBe(12);
       expect(pending.map((m) => m.localId)).toEqual(['local-user-1']);
     });
 
@@ -284,7 +284,7 @@ describe('conversationReducer', () => {
       };
       const payload = makeInitPayload({
         messages: [reflected],
-        lastSequenceId: 12,
+        lastAppliedEventSeq: 12,
         pendingAnchorSequenceId: 12,
       });
 
@@ -325,11 +325,10 @@ describe('conversationReducer', () => {
     function messageEntry(seq: number, msg: Message): unknown {
       return { type: 'message', sequence_id: seq, message: msg };
     }
-
     it('fresh connect with pending tokens rebuilds streamingBuffer', () => {
       const payload = makeInitPayload({
         phase: { type: 'llm_requesting', attempt: 1 },
-        lastSequenceId: 7,
+        lastAppliedEventSeq: 7,
         pendingAnchorSequenceId: 5,
         pendingEvents: [
           tokenEntry(6, 'Hel'),
@@ -342,19 +341,19 @@ describe('conversationReducer', () => {
       expect(next.streamingBuffer).not.toBeNull();
       expect(next.streamingBuffer!.text).toBe('Hello ');
       expect(next.streamingBuffer!.lastSequence).toBe(7);
-      expect(next.lastSequenceId).toBe(7);
+      expect(next.lastAppliedEventSeq).toBe(7);
     });
 
     // Load-bearing test for the SseInitFreshConnect rule: fresh-connect must
-    // seed lastSequenceId from `pendingAnchorSequenceId`, NOT from
-    // `lastSequenceId`. If it seeded from `lastSequenceId` (the server's
+    // seed lastAppliedEventSeq from `pendingAnchorSequenceId`, NOT from
+    // `lastAppliedEventSeq`. If it seeded from `lastAppliedEventSeq` (the server's
     // tip), every pending entry would be dropped as a replay because each
     // entry's seq ≤ tip. With the anchor as the floor, applyIfNewer(5, 6)
     // → 6 > 5 → accept.
     it('fresh-connect anchor: token at seq=anchor+1 is accepted, not dropped', () => {
       const payload = makeInitPayload({
         phase: { type: 'llm_requesting', attempt: 1 },
-        lastSequenceId: 6,
+        lastAppliedEventSeq: 6,
         pendingAnchorSequenceId: 5,
         pendingEvents: [tokenEntry(6, 'X')],
       });
@@ -362,13 +361,13 @@ describe('conversationReducer', () => {
       const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
 
       expect(next.streamingBuffer?.text).toBe('X');
-      expect(next.lastSequenceId).toBe(6);
+      expect(next.lastAppliedEventSeq).toBe(6);
     });
 
     it('fresh connect with pending state_change updates phase to latest pending state', () => {
       const payload = makeInitPayload({
         phase: { type: 'awaiting_llm' },
-        lastSequenceId: 7,
+        lastAppliedEventSeq: 7,
         pendingAnchorSequenceId: 5,
         pendingEvents: [
           stateChangeEntry(6, { type: 'llm_requesting', attempt: 1 }),
@@ -383,14 +382,14 @@ describe('conversationReducer', () => {
       const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
 
       expect(next.phase.type).toBe('tool_executing');
-      expect(next.lastSequenceId).toBe(7);
+      expect(next.lastAppliedEventSeq).toBe(7);
     });
 
     it('reconnect with pending eager Message adds the tool_use message', () => {
       const existing = makeMessage(3, 'user');
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 5,
+        lastAppliedEventSeq: 5,
         messages: [existing],
         conversationId: 'conv-1',
       };
@@ -406,25 +405,81 @@ describe('conversationReducer', () => {
       };
       const payload = makeInitPayload({
         messages: [existing], // DB snapshot — eager not yet persisted
-        lastSequenceId: 7,
+        lastAppliedEventSeq: 7,
         pendingAnchorSequenceId: 5,
         pendingEvents: [messageEntry(7, eagerMsg)],
       });
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
-      expect(next.messages).toHaveLength(2);
-      expect(next.messages[1]!.message_id).toBe('eager-1');
-      expect(next.messages[1]!.content).toEqual([
-        { type: 'tool_use', id: 'tool-1', name: 'bash', input: { command: 'ls' } },
-      ]);
-      expect(next.lastSequenceId).toBe(7);
+      expect(next.messages).toHaveLength(1);
+      expect(next.messages[0]!.message_id).toBe('msg-3');
+      expect(next.lastAppliedEventSeq).toBe(5);
+      expect(next.eventGap).toEqual({ expectedNextEventSeq: 6, firstBufferedEventSeq: 7 });
+    });
+    it('pending patch survives event buffering/drain until the message arrives', () => {
+      const seeded: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 10,
+      };
+
+      const pending = dispatch(seeded, {
+        type: 'sse_message_updated',
+        sequenceId: 11,
+        messageId: 'late-msg',
+        displayData: { type: 'patched-from-ring' },
+      });
+      expect(pending.lastAppliedEventSeq).toBe(11);
+      expect(pending.pendingMessagePatches['late-msg']).toEqual({
+        lastAppliedPatchEventSeq: 0,
+        patches: [{ eventSeq: 11, displayData: { type: 'patched-from-ring' } }],
+      });
+
+      const buffered = dispatch(pending, {
+        type: 'sse_state_change',
+        sequenceId: 13,
+        phase: { type: 'awaiting_llm' },
+        stateUpdatedAt: 13,
+      });
+      expect(buffered.lastAppliedEventSeq).toBe(11);
+      expect(buffered.eventGap).toEqual({ expectedNextEventSeq: 12, firstBufferedEventSeq: 13 });
+      expect(buffered.pendingMessagePatches['late-msg']).toEqual({
+        lastAppliedPatchEventSeq: 0,
+        patches: [{ eventSeq: 11, displayData: { type: 'patched-from-ring' } }],
+      });
+
+      const drained = dispatch(buffered, {
+        type: 'sse_state_change',
+        sequenceId: 12,
+        phase: { type: 'idle' },
+        stateUpdatedAt: 12,
+      });
+      expect(drained.lastAppliedEventSeq).toBe(13);
+      expect(drained.phase.type).toBe('awaiting_llm');
+      expect(drained.pendingMessagePatches['late-msg']).toEqual({
+        lastAppliedPatchEventSeq: 0,
+        patches: [{ eventSeq: 11, displayData: { type: 'patched-from-ring' } }],
+      });
+
+      const delivered = dispatch(drained, {
+        type: 'sse_message',
+        sequenceId: 14,
+        message: { ...makeMessage(2), message_id: 'late-msg', display_data: { existing: true } as Record<string, unknown> },
+      });
+
+      expect(delivered.lastAppliedEventSeq).toBe(14);
+      expect(delivered.messages[0]!.message_id).toBe('late-msg');
+      expect(delivered.messages[0]!.display_data).toEqual({ existing: true, type: 'patched-from-ring' });
+      expect(delivered.pendingMessagePatches['late-msg']).toEqual({
+        lastAppliedPatchEventSeq: 11,
+        patches: [],
+      });
     });
 
-    it('pendingTruncated=true with empty pendingEvents yields DB-only render and advances lastSequenceId', () => {
+    it('pendingTruncated=true with empty pendingEvents yields DB-only render and advances lastAppliedEventSeq', () => {
       const payload = makeInitPayload({
         messages: [makeMessage(50)],
-        lastSequenceId: 100,
+        lastAppliedEventSeq: 100,
         pendingAnchorSequenceId: 50,
         pendingEvents: [],
         pendingTruncated: true,
@@ -432,21 +487,22 @@ describe('conversationReducer', () => {
 
       const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
 
-      expect(next.lastSequenceId).toBe(100);
+      expect(next.lastAppliedEventSeq).toBe(50);
       expect(next.messages).toHaveLength(1);
       expect(next.messages[0]!.sequence_id).toBe(50);
       expect(next.uiError).toBeNull();
       expect(next.streamingBuffer).toBeNull();
+      expect(next.eventGap).toEqual({ expectedNextEventSeq: 51, firstBufferedEventSeq: 100 });
     });
 
     // Reconnect floor stays at the atom's live tip. Pending entries whose
     // seq is at or below that floor are dropped by the per-event
     // applyIfNewer guard — exactly the dedup contract the spec relies on.
-    it('reconnect drops pending entries with seq <= atom.lastSequenceId as replays', () => {
+    it('reconnect drops pending entries with seq <= atom.lastAppliedEventSeq as replays', () => {
       const existing = makeMessage(10);
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 10,
+        lastAppliedEventSeq: 10,
         messages: [existing],
         conversationId: 'conv-1',
       };
@@ -456,7 +512,7 @@ describe('conversationReducer', () => {
       };
       const payload = makeInitPayload({
         messages: [existing],
-        lastSequenceId: 10,
+        lastAppliedEventSeq: 10,
         pendingAnchorSequenceId: 5,
         pendingEvents: [messageEntry(8, dupMsg)],
       });
@@ -465,7 +521,7 @@ describe('conversationReducer', () => {
 
       expect(next.messages).toHaveLength(1);
       expect(next.messages[0]!.message_id).toBe('msg-10');
-      expect(next.lastSequenceId).toBe(10);
+      expect(next.lastAppliedEventSeq).toBe(10);
     });
 
     // Malformed pending entries should not crash the init — the whole
@@ -473,7 +529,7 @@ describe('conversationReducer', () => {
     it('skips malformed pending entries without crashing', () => {
       const payload = makeInitPayload({
         phase: { type: 'llm_requesting', attempt: 1 },
-        lastSequenceId: 7,
+        lastAppliedEventSeq: 7,
         pendingAnchorSequenceId: 5,
         pendingEvents: [
           { type: 'token', sequence_id: 'not-a-number', text: 'oops', request_id: 'r' },
@@ -483,12 +539,13 @@ describe('conversationReducer', () => {
 
       const next = dispatch(createInitialAtom(), { type: 'sse_init', payload });
 
-      expect(next.streamingBuffer?.text).toBe('ok');
-      expect(next.lastSequenceId).toBe(7);
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.lastAppliedEventSeq).toBe(5);
+      expect(next.eventGap).toEqual({ expectedNextEventSeq: 6, firstBufferedEventSeq: 7 });
     });
 
     // In-page reconnect after a network blip: the atom has already
-    // accepted live tokens, so atom.lastSequenceId is at the live tip.
+    // accepted live tokens, so atom.lastAppliedEventSeq is at the live tip.
     // The init's pending tokens carry the same seqs and are dropped by
     // applyIfNewer as replays. If phase 1 cleared streamingBuffer, the
     // cleared buffer would have no way to rebuild (replays can't fill
@@ -498,14 +555,14 @@ describe('conversationReducer', () => {
     it('reconnect preserves streamingBuffer when snapshot phase is llm_requesting', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 7,
+        lastAppliedEventSeq: 7,
         phase: { type: 'llm_requesting', attempt: 1 },
         streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
         conversationId: 'conv-1',
       };
       const payload = makeInitPayload({
         phase: { type: 'llm_requesting', attempt: 1 },
-        lastSequenceId: 7,
+        lastAppliedEventSeq: 7,
         pendingAnchorSequenceId: 5,
         pendingEvents: [
           tokenEntry(6, 'Hel'),
@@ -518,7 +575,7 @@ describe('conversationReducer', () => {
       expect(next.streamingBuffer).not.toBeNull();
       expect(next.streamingBuffer!.text).toBe('Hello ');
       expect(next.streamingBuffer!.lastSequence).toBe(7);
-      expect(next.lastSequenceId).toBe(7);
+      expect(next.lastAppliedEventSeq).toBe(7);
     });
 
     // Companion to the above: if the gap is real (server emitted tokens
@@ -527,14 +584,14 @@ describe('conversationReducer', () => {
     it('reconnect extends preserved streamingBuffer with above-floor pending tokens', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 7,
+        lastAppliedEventSeq: 7,
         phase: { type: 'llm_requesting', attempt: 1 },
         streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
         conversationId: 'conv-1',
       };
       const payload = makeInitPayload({
         phase: { type: 'llm_requesting', attempt: 1 },
-        lastSequenceId: 9,
+        lastAppliedEventSeq: 9,
         pendingAnchorSequenceId: 5,
         pendingEvents: [
           tokenEntry(6, 'Hel'),  // replay, dropped
@@ -548,26 +605,26 @@ describe('conversationReducer', () => {
 
       expect(next.streamingBuffer!.text).toBe('Hello world');
       expect(next.streamingBuffer!.lastSequence).toBe(9);
-      expect(next.lastSequenceId).toBe(9);
+      expect(next.lastAppliedEventSeq).toBe(9);
     });
 
     // Codex P2 from PR #79: when pendingTruncated=true the ring
     // overflowed, so the server is intentionally NOT sending the tokens
-    // between anchor and tip. The safety belt advances lastSequenceId
+    // between anchor and tip. The safety belt advances lastAppliedEventSeq
     // past the gap. Preserving the buffer would leave a stale prefix
     // that future live tokens append onto, producing a gapped/corrupted
     // message. Truncated must force a clear regardless of phase.
     it('reconnect clears streamingBuffer when pendingTruncated even if phase is llm_requesting', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 7,
+        lastAppliedEventSeq: 7,
         phase: { type: 'llm_requesting', attempt: 1 },
         streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
         conversationId: 'conv-1',
       };
       const payload = makeInitPayload({
         phase: { type: 'llm_requesting', attempt: 1 },
-        lastSequenceId: 50,
+        lastAppliedEventSeq: 50,
         pendingAnchorSequenceId: 7,
         pendingEvents: [],
         pendingTruncated: true,
@@ -576,7 +633,8 @@ describe('conversationReducer', () => {
       const next = dispatch(atom, { type: 'sse_init', payload });
 
       expect(next.streamingBuffer).toBeNull();
-      expect(next.lastSequenceId).toBe(50);
+      expect(next.lastAppliedEventSeq).toBe(7);
+      expect(next.eventGap).toEqual({ expectedNextEventSeq: 8, firstBufferedEventSeq: 50 });
     });
 
     // Turn ended while disconnected: snapshot phase is no longer
@@ -585,14 +643,14 @@ describe('conversationReducer', () => {
     it('reconnect clears streamingBuffer when snapshot phase is not llm_requesting', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 7,
+        lastAppliedEventSeq: 7,
         phase: { type: 'llm_requesting', attempt: 1 },
         streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
         conversationId: 'conv-1',
       };
       const payload = makeInitPayload({
         phase: { type: 'idle' },
-        lastSequenceId: 10,
+        lastAppliedEventSeq: 10,
         pendingAnchorSequenceId: 7,
         pendingEvents: [],
       });
@@ -601,25 +659,26 @@ describe('conversationReducer', () => {
 
       expect(next.streamingBuffer).toBeNull();
       expect(next.phase.type).toBe('idle');
-      expect(next.lastSequenceId).toBe(10);
+      expect(next.lastAppliedEventSeq).toBe(7);
+      expect(next.eventGap).toBeNull();
     });
   });
 
   describe('sse_message', () => {
-    it('appends new message and advances lastSequenceId', () => {
-      const atom = createInitialAtom();
+    it('appends new message and advances lastAppliedEventSeq', () => {
+      const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 9 };
       const msg = makeMessage(10);
 
       const next = dispatch(atom, { type: 'sse_message', message: msg, sequenceId: 10 });
 
       expect(next.messages).toHaveLength(1);
-      expect(next.lastSequenceId).toBe(10);
+      expect(next.lastAppliedEventSeq).toBe(10);
     });
 
     it('is a no-op for duplicate sequenceId', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 10,
+        lastAppliedEventSeq: 10,
       };
 
       const next = dispatch(atom, {
@@ -631,8 +690,8 @@ describe('conversationReducer', () => {
       expect(next).toBe(atom); // Same reference — no update
     });
 
-    it('is a no-op for sequenceId below lastSequenceId', () => {
-      const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 20 };
+    it('is a no-op for sequenceId below lastAppliedEventSeq', () => {
+      const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 20 };
 
       const next = dispatch(atom, {
         type: 'sse_message',
@@ -651,26 +710,25 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         messages: [original],
-        lastSequenceId: 5,
+        lastAppliedEventSeq: 5,
       };
 
-      // Same message_id, but a brand-new (higher) sequenceId.
-      const duplicateWithFreshSeq: Message = { ...original, sequence_id: 42 };
+      // Same message_id, but only the next contiguous event is admissible.
+      const duplicateWithFreshSeq: Message = { ...original, sequence_id: 6 };
       const next = dispatch(atom, {
         type: 'sse_message',
         message: duplicateWithFreshSeq,
-        sequenceId: 42,
+        sequenceId: 6,
       });
 
       expect(next.messages).toHaveLength(1);
-      // applyIfNewer still bumped lastSequenceId — the fact was "seen" even
-      // though the id-level dedup prevented a duplicate message.
-      expect(next.lastSequenceId).toBe(42);
+      expect(next.lastAppliedEventSeq).toBe(6);
     });
 
     it('clears streamingBuffer atomically on message arrival', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
+        lastAppliedEventSeq: 8,
         streamingBuffer: { text: 'partial text', lastSequence: 8, startedAt: Date.now(), requestId: 'test-req-id' },
       };
 
@@ -702,7 +760,7 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         messages: [original],
-        lastSequenceId: 42,
+        lastAppliedEventSeq: 42,
       };
       const summaryDisplayData: Record<string, unknown> = {
         type: 'subagent_summary',
@@ -718,14 +776,14 @@ describe('conversationReducer', () => {
 
       expect(next.messages).toHaveLength(1);
       expect(next.messages[0]!.display_data).toEqual(summaryDisplayData);
-      expect(next.lastSequenceId).toBe(43);
+      expect(next.lastAppliedEventSeq).toBe(43);
     });
 
-    it('is a no-op when message_id is unknown', () => {
+    it('stores a pending patch when message_id is unknown', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         messages: [makeMessage(5)],
-        lastSequenceId: 10,
+        lastAppliedEventSeq: 10,
       };
 
       const next = dispatch(atom, {
@@ -735,11 +793,14 @@ describe('conversationReducer', () => {
         displayData: { type: 'whatever' },
       });
 
-      // applyIfNewer still bumps lastSequenceId (the fact was seen); only the
-      // in-reducer lookup decides whether to mutate messages. This keeps the
-      // contract consistent: applyIfNewer is the ONLY sequence_id gate.
-      expect(next.lastSequenceId).toBe(11);
+      // The event was applied to pending reducer state, so the event floor still
+      // advances even though no live message row existed yet.
+      expect(next.lastAppliedEventSeq).toBe(11);
       expect(next.messages).toEqual(atom.messages);
+      expect(next.pendingMessagePatches['nonexistent-id']).toEqual({
+        lastAppliedPatchEventSeq: 0,
+        patches: [{ eventSeq: 11, displayData: { type: 'whatever' } }],
+      });
     });
 
     it('merges content and display_data independently', () => {
@@ -751,7 +812,7 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         messages: [original],
-        lastSequenceId: 10,
+        lastAppliedEventSeq: 10,
       };
 
       // Update only display_data, not content
@@ -776,7 +837,35 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         messages: [original],
-        lastSequenceId: 10,
+        lastAppliedEventSeq: 10,
+      };
+
+      const once = dispatch(atom, {
+        type: 'sse_message_updated',
+        sequenceId: 11,
+        messageId: original.message_id,
+        displayData: { type: 'after' },
+      });
+      // Second delivery with the SAME sequenceId: the replay guard rejects it.
+      const twice = dispatch(once, {
+        type: 'sse_message_updated',
+        sequenceId: 11,
+        messageId: original.message_id,
+        displayData: { type: 'after' },
+      });
+
+      expect(twice).toBe(once); // applyIfNewer returned atom unchanged
+      expect((twice.messages[0]!.display_data as { type: string }).type).toBe('after');
+    });
+    it('is idempotent: duplicate message_updated events apply exactly once', () => {
+      const original: Message = {
+        ...makeMessage(5),
+        display_data: { type: 'before' } as Record<string, unknown>,
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [original],
+        lastAppliedEventSeq: 10,
       };
 
       const once = dispatch(atom, {
@@ -797,6 +886,111 @@ describe('conversationReducer', () => {
       expect((twice.messages[0]!.display_data as { type: string }).type).toBe('after');
     });
 
+    it('applies pending patch after a later create without advancing message availability early', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 20,
+      };
+      let patched = atom;
+      for (const seq of [21, 22, 23, 24]) {
+        patched = dispatch(patched, {
+          type: 'sse_state_change',
+          sequenceId: seq,
+          phase: { type: 'idle' },
+          stateUpdatedAt: seq,
+        });
+      }
+
+      patched = dispatch(patched, {
+        type: 'sse_message_updated',
+        sequenceId: 25,
+        messageId: 'late-msg',
+        displayData: { type: 'deferred' },
+        durationMs: 321,
+      });
+
+      expect(patched.lastAppliedEventSeq).toBe(25);
+      expect(patched.messageRanges).toEqual([]);
+      expect(patched.contiguousMessageHighWater).toBe(0);
+      expect(patched.pendingMessagePatches['late-msg']).toEqual({
+        lastAppliedPatchEventSeq: 0,
+        patches: [{ eventSeq: 25, displayData: { type: 'deferred' }, durationMs: 321 }],
+      });
+
+      const created = dispatch(patched, {
+        type: 'sse_message',
+        sequenceId: 26,
+        message: {
+          ...makeMessage(7),
+          message_id: 'late-msg',
+          display_data: { existing: 'yes' } as Record<string, unknown>,
+        },
+      });
+
+      expect(created.messages).toHaveLength(1);
+      expect(created.messages[0]!.display_data).toEqual({ existing: 'yes', type: 'deferred', duration_ms: 321 });
+      expect(created.messageRanges).toEqual([{ start: 7, end: 7 }]);
+      expect(created.contiguousMessageHighWater).toBe(7);
+      expect(created.pendingMessagePatches['late-msg']).toEqual({
+        lastAppliedPatchEventSeq: 25,
+        patches: [],
+      });
+    });
+
+    it('stale pending/live patches are no-ops once a newer patch has already applied', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastAppliedEventSeq: 30,
+      };
+      let withPending = atom;
+      for (const seq of [31, 32, 33, 34]) {
+        withPending = dispatch(withPending, {
+          type: 'sse_state_change',
+          sequenceId: seq,
+          phase: { type: 'idle' },
+          stateUpdatedAt: seq,
+        });
+      }
+
+      withPending = dispatch(withPending, {
+        type: 'sse_message_updated',
+        sequenceId: 35,
+        messageId: 'msg-stale',
+        displayData: { type: 'newer' },
+      });
+      const created = dispatch(withPending, {
+        type: 'sse_message',
+        sequenceId: 36,
+        message: {
+          ...makeMessage(8),
+          message_id: 'msg-stale',
+          display_data: { base: true } as Record<string, unknown>,
+        },
+      });
+
+      expect(created.messages[0]!.display_data).toEqual({ base: true, type: 'newer' });
+      expect(created.pendingMessagePatches['msg-stale']).toEqual({
+        lastAppliedPatchEventSeq: 35,
+        patches: [],
+      });
+
+      const replayedCreate = dispatch(created, {
+        type: 'sse_message',
+        sequenceId: 37,
+        message: {
+          ...makeMessage(8),
+          message_id: 'msg-stale',
+          display_data: { base: true } as Record<string, unknown>,
+        },
+      });
+
+      expect(replayedCreate.messages[0]!.display_data).toEqual({ base: true });
+      expect(replayedCreate.pendingMessagePatches['msg-stale']).toEqual({
+        lastAppliedPatchEventSeq: 35,
+        patches: [],
+      });
+    });
+
     it('merges durationMs into display_data, preserving existing keys', () => {
       const original: Message = {
         ...makeMessage(5),
@@ -807,7 +1001,7 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         messages: [original],
-        lastSequenceId: 20,
+        lastAppliedEventSeq: 20,
       };
 
       const next = dispatch(atom, {
@@ -822,7 +1016,7 @@ describe('conversationReducer', () => {
       expect(dd['duration_ms']).toBe(4567);
       // existing keys survive
       expect(dd['bash']).toEqual([{ tool_use_id: 'abc', display: 'ls' }]);
-      expect(next.lastSequenceId).toBe(21);
+      expect(next.lastAppliedEventSeq).toBe(21);
     });
 
     it('durationMs update is gated by sequenceId (replay guard)', () => {
@@ -835,7 +1029,7 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         messages: [original],
-        lastSequenceId: 30,
+        lastAppliedEventSeq: 30,
       };
 
       // Stale sequenceId — should be rejected
@@ -870,7 +1064,7 @@ describe('conversationReducer', () => {
         ...createInitialAtom(),
         conversationId: 'conv-1',
         phase: { type: 'idle' },
-        lastSequenceId: 12,
+        lastAppliedEventSeq: 12,
       };
 
       const next = dispatch(atom, {
@@ -882,11 +1076,11 @@ describe('conversationReducer', () => {
 
       expect(next.phase).toEqual({ type: 'awaiting_continuation', attempt: 1 });
       expect(next.phaseStateUpdatedAt).toBe(1_700_000_000_000);
-      expect(next.lastSequenceId).toBe(13);
+      expect(next.lastAppliedEventSeq).toBe(13);
     });
 
     it('is a no-op for sequenceId already seen', () => {
-      const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 10 };
+      const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 10 };
 
       const next = dispatch(atom, {
         type: 'sse_state_change',
@@ -898,17 +1092,42 @@ describe('conversationReducer', () => {
       expect(next).toBe(atom);
     });
 
-    it('advances lastSequenceId on acceptance', () => {
-      const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 5 };
+    it('advances lastAppliedEventSeq on acceptance', () => {
+      const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 5 };
 
       const next = dispatch(atom, {
         type: 'sse_state_change',
-        sequenceId: 7,
+        sequenceId: 6,
         phase: { type: 'awaiting_llm' },
         stateUpdatedAt: 0,
       });
 
-      expect(next.lastSequenceId).toBe(7);
+      expect(next.lastAppliedEventSeq).toBe(6);
+    });
+
+    it('buffers out-of-order state changes until the missing event arrives', () => {
+      const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 100 };
+
+      const buffered = dispatch(atom, {
+        type: 'sse_state_change',
+        sequenceId: 102,
+        phase: { type: 'awaiting_llm' },
+        stateUpdatedAt: 0,
+      });
+
+      expect(buffered.lastAppliedEventSeq).toBe(100);
+      expect(buffered.eventGap).toEqual({ expectedNextEventSeq: 101, firstBufferedEventSeq: 102 });
+
+      const drained = dispatch(buffered, {
+        type: 'sse_state_change',
+        sequenceId: 101,
+        phase: { type: 'awaiting_llm' },
+        stateUpdatedAt: 1,
+      });
+
+      expect(drained.lastAppliedEventSeq).toBe(102);
+      expect(drained.eventGap).toBeNull();
+      expect(drained.phase.type).toBe('awaiting_llm');
     });
   });
 
@@ -922,14 +1141,15 @@ describe('conversationReducer', () => {
         conversation: { ...testConversation, browser_session_active: false },
       };
 
-      const next = dispatch(atom, {
+      const atomWithFloor: ConversationAtom = { ...atom, lastAppliedEventSeq: 11 };
+      const next = dispatch(atomWithFloor, {
         type: 'sse_browser_session_state',
         sequenceId: 12,
         active: true,
       });
 
       expect(next.conversation?.browser_session_active).toBe(true);
-      expect(next.lastSequenceId).toBe(12);
+      expect(next.lastAppliedEventSeq).toBe(12);
     });
 
     it('updates conversation.browser_session_active from true to false', () => {
@@ -938,14 +1158,15 @@ describe('conversationReducer', () => {
         conversation: { ...testConversation, browser_session_active: true },
       };
 
-      const next = dispatch(atom, {
+      const atomWithFloor: ConversationAtom = { ...atom, lastAppliedEventSeq: 13 };
+      const next = dispatch(atomWithFloor, {
         type: 'sse_browser_session_state',
         sequenceId: 14,
         active: false,
       });
 
       expect(next.conversation?.browser_session_active).toBe(false);
-      expect(next.lastSequenceId).toBe(14);
+      expect(next.lastAppliedEventSeq).toBe(14);
     });
 
     it('does not patch a non-existent conversation', () => {
@@ -965,7 +1186,7 @@ describe('conversationReducer', () => {
     it('rejects a stale sequenceId', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 30,
+        lastAppliedEventSeq: 30,
         conversation: { ...testConversation, browser_session_active: false },
       };
 
@@ -1001,20 +1222,21 @@ describe('conversationReducer', () => {
       const atom = createInitialAtom();
       expect(atom.workScope).toBeNull();
 
-      const next = dispatch(atom, {
+      const seeded = { ...atom, lastAppliedEventSeq: 6 };
+      const next = dispatch(seeded, {
         type: 'sse_work_scope_update',
         sequenceId: 7,
         inventory: inventory('conversation:conv-1', ['b-1']),
       });
 
       expect(next.workScope?.bash.map((h) => h.handle_id)).toEqual(['b-1']);
-      expect(next.lastSequenceId).toBe(7);
+      expect(next.lastAppliedEventSeq).toBe(7);
     });
 
     it('replaces (not merges) the previous inventory wholesale', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 7,
+        lastAppliedEventSeq: 7,
         workScope: inventory('conversation:conv-1', ['b-1', 'b-2']),
       };
 
@@ -1027,14 +1249,14 @@ describe('conversationReducer', () => {
       });
 
       expect(next.workScope?.bash.map((h) => h.handle_id)).toEqual(['b-3']);
-      expect(next.lastSequenceId).toBe(8);
+      expect(next.lastAppliedEventSeq).toBe(8);
     });
 
     it('rejects a stale sequenceId (applyIfNewer)', () => {
       const held = inventory('conversation:conv-1', ['b-1']);
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 30,
+        lastAppliedEventSeq: 30,
         workScope: held,
       };
 
@@ -1053,18 +1275,20 @@ describe('conversationReducer', () => {
     it('resets phase to idle', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
+        lastAppliedEventSeq: 19,
         phase: { type: 'awaiting_llm' },
       };
 
       const next = dispatch(atom, { type: 'sse_agent_done', sequenceId: 20 });
 
       expect(next.phase.type).toBe('idle');
-      expect(next.lastSequenceId).toBe(20);
+      expect(next.lastAppliedEventSeq).toBe(20);
     });
 
     it('clears streaming buffer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
+        lastAppliedEventSeq: 15,
         streamingBuffer: { text: 'incomplete', lastSequence: 15, startedAt: Date.now(), requestId: 'test-req-id' },
       };
 
@@ -1076,7 +1300,7 @@ describe('conversationReducer', () => {
     it('is a no-op if sequenceId already seen', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 25,
+        lastAppliedEventSeq: 25,
         phase: { type: 'awaiting_llm' },
       };
 
@@ -1102,13 +1326,13 @@ describe('conversationReducer', () => {
       const s2 = dispatch(s1, { type: 'sse_token', sequenceId: 2, delta: ' world', requestId: 'test-req-id' });
 
       expect(s2.streamingBuffer?.text).toBe('Hello world');
-      expect(s2.lastSequenceId).toBe(2);
+      expect(s2.lastAppliedEventSeq).toBe(2);
     });
 
     it('is a no-op for duplicate or out-of-order sequence', () => {
       const atom: ConversationAtom = {
         ...llmRequestingAtom(),
-        lastSequenceId: 5,
+        lastAppliedEventSeq: 5,
         streamingBuffer: { text: 'Hello', lastSequence: 5, startedAt: Date.now(), requestId: 'test-req-id' },
       };
 
@@ -1121,7 +1345,7 @@ describe('conversationReducer', () => {
       const startedAt = Date.now() - 1000;
       const atom: ConversationAtom = {
         ...llmRequestingAtom(),
-        lastSequenceId: 1,
+        lastAppliedEventSeq: 1,
         streamingBuffer: { text: 'Hello', lastSequence: 1, startedAt, requestId: 'test-req-id' },
       };
 
@@ -1138,7 +1362,7 @@ describe('conversationReducer', () => {
       const startedAt = Date.now() - 5000;
       const atom: ConversationAtom = {
         ...llmRequestingAtom(),
-        lastSequenceId: 4,
+        lastAppliedEventSeq: 4,
         streamingBuffer: {
           text: 'partial from attempt 1',
           lastSequence: 4,
@@ -1205,11 +1429,11 @@ describe('conversationReducer', () => {
     // After the fix, tokens carry server-assigned global sequence_ids that
     // are strictly greater than anything the client has seen.
     it('accumulates tokens after simulated reconnect mid-stream', () => {
-      // Pre-reconnect state: atom has been streaming, lastSequenceId=50.
+      // Pre-reconnect state: atom has been streaming, lastAppliedEventSeq=50.
       const preReconnect: ConversationAtom = {
         ...createInitialAtom(),
         phase: { type: 'llm_requesting', attempt: 1 },
-        lastSequenceId: 50,
+        lastAppliedEventSeq: 50,
         streamingBuffer: { text: 'Before ', lastSequence: 50, startedAt: Date.now(), requestId: 'test-req-id' },
       };
 
@@ -1219,7 +1443,7 @@ describe('conversationReducer', () => {
       const a3 = dispatch(a2, { type: 'sse_token', sequenceId: 53, delta: 'correctly', requestId: 'test-req-id' });
 
       expect(a3.streamingBuffer?.text).toBe('Before reconnect works correctly');
-      expect(a3.lastSequenceId).toBe(53);
+      expect(a3.lastAppliedEventSeq).toBe(53);
     });
   });
 
@@ -1234,11 +1458,11 @@ describe('conversationReducer', () => {
 
       expect(next.uiError).toEqual({ type: 'BackendError', message: 'Something went wrong' });
       // Client-synthesized errors do not bump the total-order counter.
-      expect(next.lastSequenceId).toBe(0);
+      expect(next.lastAppliedEventSeq).toBe(0);
     });
 
     it('routes wire-originated errors through applyIfNewer', () => {
-      const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 42 };
+      const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 42 };
 
       const next = dispatch(atom, {
         type: 'sse_error',
@@ -1247,16 +1471,16 @@ describe('conversationReducer', () => {
       });
 
       expect(next.uiError).toEqual({ type: 'BackendError', message: 'server hiccup' });
-      expect(next.lastSequenceId).toBe(43);
+      expect(next.lastAppliedEventSeq).toBe(43);
     });
 
     it('drops replayed wire errors after the user has moved on', () => {
-      // Simulate: user dismissed the toast (uiError = null), lastSequenceId has
+      // Simulate: user dismissed the toast (uiError = null), lastAppliedEventSeq has
       // since advanced past the error's sequenceId, then a reconnect replays
       // the same error. Nothing should change.
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        lastSequenceId: 50,
+        lastAppliedEventSeq: 50,
         uiError: null,
       };
 
@@ -1267,11 +1491,11 @@ describe('conversationReducer', () => {
       });
 
       expect(next.uiError).toBeNull();
-      expect(next.lastSequenceId).toBe(50);
+      expect(next.lastAppliedEventSeq).toBe(50);
     });
 
     it('applies a wire error only once when dispatched twice with the same sequenceId', () => {
-      const atom = createInitialAtom();
+      const atom = { ...createInitialAtom(), lastAppliedEventSeq: 9 };
 
       const a1 = dispatch(atom, {
         type: 'sse_error',
@@ -1291,7 +1515,7 @@ describe('conversationReducer', () => {
       });
 
       expect(a3.uiError).toBeNull();
-      expect(a3.lastSequenceId).toBe(10);
+      expect(a3.lastAppliedEventSeq).toBe(10);
     });
   });
 
@@ -1400,7 +1624,7 @@ describe('conversationReducer', () => {
 
     it('rejects a stale-epoch sse_message even if its sequence_id is fresh', () => {
       // Defense in depth: the sequence-id guard would happily accept this
-      // message (lastSequenceId=0 < 100). The epoch guard sits *before*
+      // message (lastAppliedEventSeq=0 < 100). The epoch guard sits *before*
       // the reducer cases and rejects on identity, not freshness.
       const atom: ConversationAtom = {
         ...createInitialAtom(),
@@ -1422,7 +1646,7 @@ describe('conversationReducer', () => {
       });
       expect(next).toBe(atom);
       expect(next.messages).toHaveLength(0);
-      expect(next.lastSequenceId).toBe(0);
+      expect(next.lastAppliedEventSeq).toBe(0);
     });
 
     it('client-originated actions are gated by expectedConversationId, not epoch', () => {
@@ -1483,20 +1707,20 @@ describe('conversationReducer', () => {
       });
       expect(next).toBe(atom);
       expect(next.uiError).toBeNull();
-      expect(next.lastSequenceId).toBe(0);
+      expect(next.lastAppliedEventSeq).toBe(0);
     });
   });
 
   describe('local_phase_change', () => {
-    // Client-originated optimistic phase updates do NOT bump lastSequenceId
+    // Client-originated optimistic phase updates do NOT bump lastAppliedEventSeq
     // (they're not part of the server's total order). This test guards
     // against a future change that accidentally wires them through the
     // server-side dedup path.
-    it('updates phase without touching lastSequenceId', () => {
+    it('updates phase without touching lastAppliedEventSeq', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         conversationId: 'conv-1',
-        lastSequenceId: 42,
+        lastAppliedEventSeq: 42,
       };
 
       const next = dispatch(atom, {
@@ -1506,14 +1730,14 @@ describe('conversationReducer', () => {
       });
 
       expect(next.phase.type).toBe('awaiting_llm');
-      expect(next.lastSequenceId).toBe(42);
+      expect(next.lastAppliedEventSeq).toBe(42);
     });
 
     it('supports optimistic awaiting_continuation after manual trigger acceptance', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         conversationId: 'conv-1',
-        lastSequenceId: 42,
+        lastAppliedEventSeq: 42,
       };
 
       const next = dispatch(atom, {
@@ -1523,7 +1747,7 @@ describe('conversationReducer', () => {
       });
 
       expect(next.phase).toEqual({ type: 'awaiting_continuation', attempt: 1 });
-      expect(next.lastSequenceId).toBe(42);
+      expect(next.lastAppliedEventSeq).toBe(42);
       expect(next.phaseStateUpdatedAt).toBeNull();
     });
 
@@ -1606,7 +1830,7 @@ describe('conversationReducer', () => {
     });
 
     it('is a no-op if SSE data already present', () => {
-      const atom: ConversationAtom = { ...createInitialAtom(), lastSequenceId: 5 };
+      const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 5 };
 
       const next = dispatch(atom, {
         type: 'set_initial_data',

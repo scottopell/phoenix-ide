@@ -53,7 +53,7 @@ function transformInitData(raw: SseInitData): InitPayload {
     messages: raw.messages || [],
     phase: parseConversationState(conversation?.state),
     contextWindow: { used: raw.context_window_size ?? 0 },
-    lastSequenceId: raw.last_sequence_id ?? 0,
+    lastAppliedEventSeq: raw.last_sequence_id ?? 0,
     pendingAnchorSequenceId: raw.pending_anchor_sequence_id,
     pendingEvents: raw.pending_events,
     pendingTruncated: raw.pending_truncated,
@@ -84,14 +84,14 @@ function maxMessageSequence(messages: Message[]): number {
 }
 
 function snapshotPayload(conversation: Conversation, messages: Message[], contextWindowSize: number): InitPayload {
-  const lastSequenceId = maxMessageSequence(messages);
+  const lastAppliedEventSeq = maxMessageSequence(messages);
   return {
     conversation,
     messages,
     phase: conversation.state ? parseConversationState(conversation.state) : { type: 'idle' },
     contextWindow: { used: contextWindowSize },
-    lastSequenceId,
-    pendingAnchorSequenceId: lastSequenceId,
+    lastAppliedEventSeq,
+    pendingAnchorSequenceId: lastAppliedEventSeq,
     pendingEvents: [],
     pendingTruncated: false,
   };

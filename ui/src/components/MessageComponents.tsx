@@ -1146,6 +1146,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
                   result={result}
                   onOpenFile={onOpenFile}
                   workScopeKey={workScopeKey}
+                  knownResultIds={Array.from(toolResults.keys())}
                   toolStartedAtMs={toolStartedAtMs}
                   showMissingResult={showMissingResult}
                 />
@@ -1212,6 +1213,7 @@ interface ToolUseBlockProps {
   result: Message | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   workScopeKey?: string | undefined;
+  knownResultIds?: readonly string[] | undefined;
   /** Server-clock unix ms when the runtime began dispatching this
    *  tool — sourced from the parent assistant message's
    *  `display_data.tool_starts[block.id]` (REQ-WPV-002). When present
@@ -1219,6 +1221,124 @@ interface ToolUseBlockProps {
    *  elapsed counter that survives reconnect / reload / multi-tab. */
   toolStartedAtMs?: number | undefined;
   showMissingResult?: boolean | undefined;
+}
+
+type ToolCardState =
+  | { kind: 'declared' }
+  | { kind: 'running'; toolStartedAtMs: number }
+  | { kind: 'completed'; result: Message; resultContent: ToolResultContent; durationMs?: number }
+  | { kind: 'failed'; result: Message; resultContent: ToolResultContent; durationMs?: number }
+  | { kind: 'missing_result' };
+
+function getToolCardState({
+  toolId,
+  result,
+  toolStartedAtMs,
+}: {
+  toolId: string;
+  result: Message | undefined;
+  toolStartedAtMs?: number | undefined;
+}): ToolCardState {
+  if (result) {
+    const resultContent = result.content as ToolResultContent;
+    const dd = result.display_data as Record<string, unknown> | undefined;
+    const durationValue = dd?.['duration_ms'];
+    const durationMs = typeof durationValue === 'number' ? durationValue : undefined;
+    const isError = resultContent?.is_error || !!resultContent?.error;
+    const duration = durationMs !== undefined ? { durationMs } : {};
+    return isError
+      ? { kind: 'failed', result, resultContent, ...duration }
+      : { kind: 'completed', result, resultContent, ...duration };
+  }
+  if (toolStartedAtMs != null) {
+    return { kind: 'running', toolStartedAtMs };
+  }
+  if (toolId) {
+    return { kind: 'missing_result' };
+  }
+  return { kind: 'declared' };
+}
+
+function logMissingToolResult({
+  toolId,
+  name,
+  knownResultIds,
+  toolStartedAtMs,
+}: {
+  toolId: string;
+  name: string;
+  knownResultIds?: readonly string[] | undefined;
+  toolStartedAtMs?: number | undefined;
+}): void {
+  if (!import.meta.env.DEV) return;
+  console.debug('[MessageComponents] rendering missing tool result', {
+    tool_use_id: toolId || null,
+    tool_call_id: toolId || null,
+    tool_name: name,
+    tool_started_at_ms: toolStartedAtMs ?? null,
+    known_result_ids: knownResultIds ?? [],
+    known_result_count: knownResultIds?.length ?? 0,
+  });
+}
+
+function renderToolCardState(state: ToolCardState, inflightElapsedSeconds: number): React.ReactNode {
+  switch (state.kind) {
+    case 'declared':
+      return <span className="tool-block-status pending">Declared</span>;
+    case 'running':
+      return (
+        <span
+          className="tool-block-elapsed"
+          title={`Started ${new Date(state.toolStartedAtMs).toLocaleTimeString()}`}
+        >
+          &bull; {inflightElapsedSeconds}s
+        </span>
+      );
+    case 'completed':
+      return (
+        <span className="tool-block-status success">
+          <CheckIcon />
+          {state.durationMs !== undefined && (
+            <span className="tool-block-duration">&bull; {formatToolDuration(state.durationMs)}</span>
+          )}
+        </span>
+      );
+    case 'failed':
+      return (
+        <span className="tool-block-status error">
+          <XIcon />
+          {state.durationMs !== undefined && (
+            <span className="tool-block-duration">&bull; {formatToolDuration(state.durationMs)}</span>
+          )}
+        </span>
+      );
+    case 'missing_result':
+      return <span className="tool-block-status pending">Waiting for tool result</span>;
+    default:
+      state satisfies never;
+      return null;
+  }
+}
+
+function renderMissingToolResultBody(state: ToolCardState): React.ReactNode {
+  switch (state.kind) {
+    case 'declared':
+      return <div className="tool-block-output-content"><span className="tool-empty">Tool declared</span></div>;
+    case 'running':
+      return <div className="tool-block-output-content"><span className="tool-empty">Waiting for tool result</span></div>;
+    case 'missing_result':
+      return <div className="tool-block-output-content"><span className="tool-empty">Waiting for tool result</span></div>;
+    case 'completed':
+    case 'failed':
+      return null;
+    default:
+      state satisfies never;
+      return null;
+  }
+}
+
+function getToolResultTextFromContent(resultContent: ToolResultContent | null): string {
+  return resultContent?.content || resultContent?.result || resultContent?.error || '';
 }
 
 // Helper to parse image data from read_image tool result
@@ -1733,7 +1853,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -1746,18 +1866,17 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, toolStarted
     block.display
   );
 
-  // Get the paired result if available
-  let resultContent: ToolResultContent | null = null;
-  if (result) {
-    resultContent = result.content as ToolResultContent;
-  }
+  const toolCardState = getToolCardState({ toolId, result, toolStartedAtMs });
+  const resultContent =
+    toolCardState.kind === 'completed' || toolCardState.kind === 'failed'
+      ? toolCardState.resultContent
+      : null;
+  const durationMs =
+    toolCardState.kind === 'completed' || toolCardState.kind === 'failed'
+      ? toolCardState.durationMs
+      : undefined;
 
-  // Duration from display_data.duration_ms (set by Rust executor after tool completes)
-  const durationMs: number | undefined = (() => {
-    const dd = result?.display_data as Record<string, unknown> | undefined;
-    const v = dd?.['duration_ms'];
-    return typeof v === 'number' ? v : undefined;
-  })();
+  const runningStartedAtMs = toolCardState.kind === 'running' ? toolCardState.toolStartedAtMs : undefined;
 
   // REQ-WPV-002: live elapsed counter while the tool is in flight
   // (block exists, no result yet). Source is the server-authoritative
@@ -1767,19 +1886,26 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, toolStarted
   // result takes over).
   const [inflightElapsedSeconds, setInflightElapsedSeconds] = useState(0);
   useEffect(() => {
-    if (result != null || toolStartedAtMs == null) {
+    if (toolCardState.kind !== 'running' || runningStartedAtMs === undefined) {
       setInflightElapsedSeconds(0);
       return;
     }
+    const startedAtMs = runningStartedAtMs;
     const compute = () =>
-      setInflightElapsedSeconds(Math.max(0, Math.floor((Date.now() - toolStartedAtMs) / 1000)));
+      setInflightElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000)));
     compute();
     const interval = window.setInterval(compute, 1000);
     return () => window.clearInterval(interval);
-  }, [result, toolStartedAtMs]);
+  }, [toolCardState.kind, runningStartedAtMs]);
 
-  const rawResultText = resultContent?.content || resultContent?.result || resultContent?.error || '';
-  const isError = resultContent?.is_error || !!resultContent?.error;
+  useEffect(() => {
+    if (toolCardState.kind === 'missing_result') {
+      logMissingToolResult({ toolId, name, knownResultIds, toolStartedAtMs });
+    }
+  }, [knownResultIds, name, toolCardState.kind, toolId, toolStartedAtMs]);
+
+  const rawResultText = getToolResultTextFromContent(resultContent);
+  const isError = toolCardState.kind === 'failed';
 
   // For bash/tmux, the tool result is a structured JSON envelope (REQ-BASH-002 /
   // REQ-TMUX-012). Decode it once so the renderer below can branch on
@@ -1903,26 +2029,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, toolStarted
       {/* Tool header with name */}
       <div className="tool-block-header">
         <span className="tool-block-name">{name}</span>
-        {hasOutput && (
-          <span className={`tool-block-status ${isError ? 'error' : 'success'}`}>
-            {isError ? <XIcon /> : <CheckIcon />}
-            {durationMs !== undefined && (
-              <span className="tool-block-duration">&bull; {formatToolDuration(durationMs)}</span>
-            )}
-          </span>
-        )}
-        {/* REQ-WPV-002: live elapsed counter while the tool is in
-            flight. Hidden once the result lands (the static
-            duration above takes over). Server-clock sourced — the
-            counter ticks correctly across reconnect / reload. */}
-        {result == null && toolStartedAtMs != null && (
-          <span
-            className="tool-block-elapsed"
-            title={`Started ${new Date(toolStartedAtMs).toLocaleTimeString()}`}
-          >
-            &bull; {inflightElapsedSeconds}s
-          </span>
-        )}
+        {renderToolCardState(toolCardState, inflightElapsedSeconds)}
       </div>
 
       {/* Tool input - always visible */}
@@ -1932,13 +2039,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, toolStarted
       </div>
 
       {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}
-      {showMissingResult && !hasOutput && (
-        <div className="tool-block-output missing">
-          <div className="tool-block-output-content tool-missing-result">
-            result not received
-          </div>
-        </div>
-      )}
+      {showMissingResult && !hasOutput && renderMissingToolResultBody(toolCardState)}
       {hasOutput && !isSubAgentResult && (
         <div className={`tool-block-output ${isError ? 'error' : ''} ${outputExpanded ? 'expanded' : ''}`}>
           {imageResult ? (

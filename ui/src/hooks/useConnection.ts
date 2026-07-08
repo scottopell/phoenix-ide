@@ -161,7 +161,7 @@ function transformInitData(raw: SseInitData): InitPayload {
     contextWindow: {
       used: raw.context_window_size ?? 0,
     },
-    lastSequenceId: raw.last_sequence_id ?? 0,
+    lastAppliedEventSeq: raw.last_sequence_id ?? 0,
     pendingAnchorSequenceId: raw.pending_anchor_sequence_id,
     pendingEvents: raw.pending_events,
     pendingTruncated: raw.pending_truncated,
@@ -174,9 +174,9 @@ function transformInitData(raw: SseInitData): InitPayload {
  * Socket lifecycle manager only. Receives `dispatch` from the conversation
  * atom and calls it with SSEActions. The server always returns the full
  * message list on /stream init — update-in-place mutations arrive via the
- * typed `message_updated` SSE event — so this hook carries no sequence-id
- * state of its own. Reducer-side dedup by `lastSequenceId >= event.sequenceId`
- * still applies inside the atom.
+ * typed `message_updated` SSE event — so this hook carries no event-cursor
+ * state of its own. Ordering, replay drop, and gap buffering all live in the
+ * atom reducer.
  */
 export function useConnection({
   conversationId,

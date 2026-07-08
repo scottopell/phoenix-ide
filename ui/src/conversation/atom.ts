@@ -37,6 +37,34 @@ export type UIError =
   | { type: 'BackendError'; message: string }
   | { type: 'ConnectionFailed'; retriesExhausted: boolean };
 
+export interface MessageRange {
+  start: number;
+  end: number;
+}
+
+export interface EventGap {
+  expectedNextEventSeq: number;
+  firstBufferedEventSeq: number;
+}
+
+export interface PendingMessagePatch {
+  eventSeq: number;
+  displayData?: Record<string, unknown>;
+  content?: Message['content'];
+  durationMs?: number;
+}
+
+export interface PendingMessagePatchState {
+  /** Highest patch event seq already materialized onto this message id, whether
+   *  the patch landed live against an existing message or was replayed later
+   *  from pending state after the message row arrived. The current wire has no
+   *  per-message version, so event sequence is the patch freshness key. */
+  lastAppliedPatchEventSeq: number;
+  /** Deferred patches for a missing message target, kept in ascending event
+   *  order and replayed once a later `sse_message` creates/upserts the row. */
+  patches: PendingMessagePatch[];
+}
+
 export interface ConversationAtom {
   conversationId: string | null;
   conversation: Conversation | null;
@@ -44,7 +72,12 @@ export interface ConversationAtom {
   messages: Message[];
   contextWindow: { used: number };
   systemPrompt: string | null;
-  lastSequenceId: number;
+  lastAppliedEventSeq: number;
+  bufferedEventEnvelopes: Record<number, SSEAction>;
+  eventGap: EventGap | null;
+  contiguousMessageHighWater: number;
+  messageRanges: MessageRange[];
+  pendingMessagePatches: Record<string, PendingMessagePatchState>;
   streamingBuffer: StreamingBuffer | null;
   uiError: UIError | null;
   /** `Date.now()` when the current `tool_executing` phase began. Reset on
@@ -130,21 +163,25 @@ export interface InitPayload {
   messages: Message[];
   phase: ConversationState;
   contextWindow: { used: number };
-  lastSequenceId: number;
-  /** ReplayRing anchor: seq of the last persisted Message at subscribe time.
-   *  Every entry in `pendingEvents` has `sequence_id > pendingAnchorSequenceId`.
-   *  On fresh-connect the init reducer seeds `lastSequenceId` from this value
-   *  so the per-event applyIfNewer guards accept pending entries instead of
-   *  dropping them as replays against `payload.lastSequenceId`. */
+  /** Legacy wire `last_sequence_id` converted at the UI boundary. This is an
+   *  event-sequence cursor, not transcript message availability. */
+  lastAppliedEventSeq: number;
+  /** ReplayRing anchor: event seq of the last applied SSE event at subscribe
+   *  time. Every entry in `pendingEvents` has
+   *  `sequence_id > pendingAnchorSequenceId`. On fresh-connect the init
+   *  reducer seeds `lastAppliedEventSeq` from this value so the pending replay
+   *  helper accepts the next contiguous entry instead of treating the whole
+   *  ring as already applied. */
   pendingAnchorSequenceId: number;
   /** ReplayRing contents at subscribe time. Each entry is a wire-format
    *  `SseWireEvent` (snake_case fields, `type` discriminator). Validated
    *  per-entry at apply time via the existing per-event valibot schemas;
    *  malformed entries are skipped without crashing the whole init. */
   pendingEvents: unknown[];
-  /** True iff the server-side ring overflowed since the last anchor. Treated
-   *  as a soft hint: the DB snapshot is still authoritative and the safety
-   *  belt advances `lastSequenceId` to the server's witnessed tip. */
+   /** True iff the server-side ring overflowed since the last anchor. The DB
+    *  snapshot remains authoritative, but the client must not pretend it
+    *  applied unseen events contiguously across the missing gap. */
+
   pendingTruncated: boolean;
 }
 
@@ -267,9 +304,10 @@ export type SSEAction =
       state: 'connecting' | 'live' | 'reconnecting' | 'failed';
       epoch?: number;
     }
-  // Client-originated optimistic phase change. No sequence_id — not part of
-  // the server's total order. Mutates `phase` only; does not touch
-  // `lastSequenceId`. The authoritative server-side phase change arrives
+   // Client-originated optimistic phase change. No sequence_id — not part of
+   // the server's total order. Mutates `phase` only; does not touch
+   // `lastAppliedEventSeq`. The authoritative server-side phase change arrives
+
   // later via `sse_state_change` and overrides this if it differs.
   | {
       type: 'local_phase_change';
@@ -304,7 +342,12 @@ export function createInitialAtom(): ConversationAtom {
     messages: [],
     contextWindow: { used: 0 },
     systemPrompt: null,
-    lastSequenceId: 0,
+    lastAppliedEventSeq: 0,
+    bufferedEventEnvelopes: {},
+    eventGap: null,
+    contiguousMessageHighWater: 0,
+    messageRanges: [],
+    pendingMessagePatches: {},
     streamingBuffer: null,
     uiError: null,
     toolExecutingStartedAt: null,
@@ -334,44 +377,330 @@ function reasonText(reason: 'rate_limit' | 'server_error' | 'network'): string {
   }
 }
 
+function normalizeMessageSequences(messages: Message[]): number[] {
+  return [...new Set(messages.map((m) => m.sequence_id).filter((n) => Number.isFinite(n)))].sort((a, b) => a - b);
+}
+
+function buildMessageRangesFromSequences(sequences: number[]): MessageRange[] {
+  if (sequences.length === 0) return [];
+  const ranges: MessageRange[] = [];
+  let start = sequences[0]!;
+  let end = sequences[0]!;
+  for (const seq of sequences.slice(1)) {
+    if (seq === end + 1) {
+      end = seq;
+      continue;
+    }
+    ranges.push({ start, end });
+    start = seq;
+    end = seq;
+  }
+  ranges.push({ start, end });
+  return ranges;
+}
+
+function deriveMessageSyncState(messages: Message[]): Pick<ConversationAtom, 'messageRanges' | 'contiguousMessageHighWater'> {
+  const sequences = normalizeMessageSequences(messages);
+  return {
+    messageRanges: buildMessageRangesFromSequences(sequences),
+    contiguousMessageHighWater: sequences.length === 0 ? 0 : sequences[sequences.length - 1]!,
+  };
+}
+
+function withDerivedMessageSyncState(atom: ConversationAtom, messages: Message[]): ConversationAtom {
+  return { ...atom, messages, ...deriveMessageSyncState(messages) };
+}
+
+function sortPendingPatches(patches: PendingMessagePatch[]): PendingMessagePatch[] {
+  return [...patches].sort((a, b) => a.eventSeq - b.eventSeq);
+}
+
 /**
- * Single dedup guard for every wire-originated SSE action (task 02675).
+ * Centralized message-patch applicator for both live `sse_message_updated`
+ * events and deferred replays from `pendingMessagePatches`.
  *
- * Contract: `sequenceId` is the server-assigned monotonic id for the whole
- * conversation (tokens, state_change, message, message_updated, … all share
- * one total order). If the atom has already seen an id ≥ this one, the event
- * is a replay — skip the mutation and keep `lastSequenceId` as-is. Otherwise
- * run `apply` and bump `lastSequenceId` to match.
- *
- * Why this exists — replaces four bespoke per-event guards in the old
- * reducer that had silently diverged: `sse_message` only guarded by
- * sequence_id but never by message_id (so a reconnect replay with a fresh id
- * duplicated the message); `sse_message_updated` had no guard at all;
- * `sse_token` used a separate per-connection closure counter (stalled on
- * reconnect); `sse_state_change` guarded on an id the server never
- * populated. Consolidating into one helper also makes dev-mode drops
- * observable — you see which event was rejected and why.
+ * The current wire has no per-message version, so patch freshness is defined by
+ * the SSE event sequence that carried the patch. Any patch whose `eventSeq` is
+ * at or below the message id's `lastAppliedPatchEventSeq` is stale and becomes
+ * an idempotent no-op. Applying a patch mutates only the message payload; it
+ * must never advertise transcript availability by touching `messageRanges` or
+ * `contiguousMessageHighWater`.
  */
-function applyIfNewer(
+function applyMessagePatch(
+  message: Message,
+  patch: PendingMessagePatch,
+  lastAppliedPatchEventSeq: number,
+): { message: Message; applied: boolean; lastAppliedPatchEventSeq: number } {
+  if (patch.eventSeq <= lastAppliedPatchEventSeq) {
+    return { message, applied: false, lastAppliedPatchEventSeq };
+  }
+
+  const existingDisplay = (message.display_data ?? {}) as Record<string, unknown>;
+  let mergedDisplay = existingDisplay;
+  if (patch.displayData !== undefined) {
+    mergedDisplay = { ...existingDisplay, ...patch.displayData };
+    const prevStarts = existingDisplay['tool_starts'];
+    const nextStarts = patch.displayData['tool_starts'];
+    const isObj = (v: unknown): v is Record<string, unknown> =>
+      typeof v === 'object' && v !== null && !Array.isArray(v);
+    if (isObj(prevStarts) && isObj(nextStarts)) {
+      mergedDisplay = {
+        ...mergedDisplay,
+        tool_starts: { ...prevStarts, ...nextStarts },
+      };
+    }
+  }
+
+  const withDuration = patch.durationMs !== undefined ? { ...mergedDisplay, duration_ms: patch.durationMs } : mergedDisplay;
+  const nextMessage = {
+    ...message,
+    ...((patch.displayData !== undefined || patch.durationMs !== undefined) && {
+      display_data: withDuration,
+    }),
+    ...(patch.content !== undefined && { content: patch.content }),
+  };
+
+  return {
+    message: nextMessage,
+    applied: true,
+    lastAppliedPatchEventSeq: patch.eventSeq,
+  };
+}
+
+function storePendingMessagePatch(
   atom: ConversationAtom,
-  eventType: string,
-  sequenceId: number,
-  apply: (a: ConversationAtom) => ConversationAtom
+  messageId: string,
+  patch: PendingMessagePatch,
 ): ConversationAtom {
-  if (atom.lastSequenceId >= sequenceId) {
+  const existing = atom.pendingMessagePatches[messageId] ?? {
+    lastAppliedPatchEventSeq: 0,
+    patches: [],
+  };
+  const nextPatches = sortPendingPatches([...existing.patches, patch]);
+  return {
+    ...atom,
+    pendingMessagePatches: {
+      ...atom.pendingMessagePatches,
+      [messageId]: {
+        ...existing,
+        patches: nextPatches,
+      },
+    },
+  };
+}
+
+function applyPendingMessagePatchesToMessage(
+  atom: ConversationAtom,
+  message: Message,
+): { atom: ConversationAtom; message: Message } {
+  const pending = atom.pendingMessagePatches[message.message_id];
+  if (!pending) return { atom, message };
+
+  let nextMessage = message;
+  let lastAppliedPatchEventSeq = pending.lastAppliedPatchEventSeq;
+  for (const patch of pending.patches) {
+    const applied = applyMessagePatch(nextMessage, patch, lastAppliedPatchEventSeq);
+    nextMessage = applied.message;
+    lastAppliedPatchEventSeq = applied.lastAppliedPatchEventSeq;
+  }
+
+  return {
+    atom: {
+      ...atom,
+      pendingMessagePatches: {
+        ...atom.pendingMessagePatches,
+        [message.message_id]: {
+          lastAppliedPatchEventSeq,
+          patches: [],
+        },
+      },
+    },
+    message: nextMessage,
+  };
+}
+
+function applyWireActionBody(atom: ConversationAtom, action: SSEAction): ConversationAtom {
+  switch (action.type) {
+    case 'sse_message': {
+      const idx = atom.messages.findIndex((m) => m.message_id === action.message.message_id);
+      let nextAtom: ConversationAtom = { ...atom, streamingBuffer: null };
+      let nextMessage = action.message;
+      ({ atom: nextAtom, message: nextMessage } = applyPendingMessagePatchesToMessage(nextAtom, nextMessage));
+      if (idx < 0) {
+        return withDerivedMessageSyncState(nextAtom, [...nextAtom.messages, nextMessage]);
+      }
+      const newMessages = [...nextAtom.messages];
+      newMessages[idx] = nextMessage;
+      return withDerivedMessageSyncState(nextAtom, newMessages);
+    }
+    case 'sse_message_updated': {
+      const patch: PendingMessagePatch = {
+        eventSeq: action.sequenceId,
+        ...(action.displayData !== undefined && { displayData: action.displayData }),
+        ...(action.content !== undefined && { content: action.content }),
+        ...(action.durationMs !== undefined && { durationMs: action.durationMs }),
+      };
+      const idx = atom.messages.findIndex((m) => m.message_id === action.messageId);
+      if (idx < 0) return storePendingMessagePatch(atom, action.messageId, patch);
+      const existingPending = atom.pendingMessagePatches[action.messageId] ?? {
+        lastAppliedPatchEventSeq: 0,
+        patches: [],
+      };
+      const applied = applyMessagePatch(atom.messages[idx]!, patch, existingPending.lastAppliedPatchEventSeq);
+      const nextPendingMessagePatches = {
+        ...atom.pendingMessagePatches,
+        [action.messageId]: {
+          lastAppliedPatchEventSeq: applied.lastAppliedPatchEventSeq,
+          patches: existingPending.patches.filter((p) => p.eventSeq > applied.lastAppliedPatchEventSeq),
+        },
+      };
+      if (!applied.applied) {
+        return { ...atom, pendingMessagePatches: nextPendingMessagePatches };
+      }
+      const newMessages = [...atom.messages];
+      newMessages[idx] = applied.message;
+      return { ...atom, messages: newMessages, pendingMessagePatches: nextPendingMessagePatches };
+    }
+    case 'sse_state_change': {
+      const phase =
+        action.phase.type === 'error' && action.error ? { ...action.phase, error: action.error } : action.phase;
+      return {
+        ...atom,
+        phase,
+        phaseStateUpdatedAt: action.stateUpdatedAt,
+        firstByteRequestId: null,
+        toolExecutingStartedAt: action.phase.type === 'tool_executing' ? Date.now() : null,
+      };
+    }
+    case 'sse_agent_done':
+      return {
+        ...atom,
+        phase: { type: 'idle' },
+        streamingBuffer: null,
+        firstByteRequestId: null,
+        turnRetryContext: null,
+      };
+    case 'sse_llm_first_byte':
+      return { ...atom, firstByteRequestId: action.requestId };
+    case 'sse_llm_attempt':
+      return {
+        ...atom,
+        turnRetryContext: {
+          attempt: action.attempt,
+          maxAttempts: action.maxAttempts,
+          reason: action.reason,
+          reasonText: reasonText(action.reason),
+          backingOffMs: action.backingOffMs,
+          resetsAt: action.resetsAt,
+        },
+      };
+    case 'sse_token': {
+      if (atom.phase.type !== 'llm_requesting') return atom;
+      const sameRequest = atom.streamingBuffer?.requestId === action.requestId;
+      return {
+        ...atom,
+        streamingBuffer: {
+          text: (sameRequest ? (atom.streamingBuffer?.text ?? '') : '') + action.delta,
+          lastSequence: action.sequenceId,
+          startedAt: sameRequest ? (atom.streamingBuffer?.startedAt ?? Date.now()) : Date.now(),
+          requestId: action.requestId,
+        },
+      };
+    }
+    case 'sse_conversation_update':
+      if (!atom.conversation) return atom;
+      return { ...atom, conversation: { ...atom.conversation, ...action.updates } };
+    case 'sse_browser_session_state':
+      if (!atom.conversation) return atom;
+      return {
+        ...atom,
+        conversation: { ...atom.conversation, browser_session_active: action.active },
+      };
+    case 'sse_work_scope_update':
+      return { ...atom, workScope: action.inventory };
+    case 'sse_error':
+      return { ...atom, uiError: action.error, turnRetryContext: null };
+    default:
+      return atom;
+  }
+}
+
+function drainBufferedEventEnvelopes(atom: ConversationAtom): ConversationAtom {
+  let next = atom;
+  let expected = next.lastAppliedEventSeq + 1;
+  let buffered = next.bufferedEventEnvelopes[expected];
+  while (buffered) {
+    const rest = { ...next.bufferedEventEnvelopes };
+    delete rest[expected];
+    next = applyWireActionBody({ ...next, bufferedEventEnvelopes: rest }, buffered);
+    next = { ...next, lastAppliedEventSeq: expected };
+    expected = next.lastAppliedEventSeq + 1;
+    buffered = next.bufferedEventEnvelopes[expected];
+  }
+  const bufferedSeqs = Object.keys(next.bufferedEventEnvelopes)
+    .map(Number)
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b);
+  return {
+    ...next,
+    eventGap:
+      bufferedSeqs.length > 0
+        ? {
+            expectedNextEventSeq: next.lastAppliedEventSeq + 1,
+            firstBufferedEventSeq: bufferedSeqs[0]!,
+          }
+        : null,
+  };
+}
+
+function applyContiguousWireAction(
+  atom: ConversationAtom,
+  action: Extract<SSEAction, { sequenceId?: number }>,
+): ConversationAtom {
+  const sequenceId = action.sequenceId;
+  if (sequenceId === undefined) return applyWireActionBody(atom, action as SSEAction);
+  const mutatesOnlyIfConversationPresent = action.type === 'sse_browser_session_state';
+  if (mutatesOnlyIfConversationPresent && !atom.conversation) {
+    return atom;
+  }
+  const phaseGuardDropsToken = action.type === 'sse_token' && atom.phase.type !== 'llm_requesting';
+  if (phaseGuardDropsToken) {
+    return atom;
+  }
+  const expectedNext = atom.lastAppliedEventSeq + 1;
+  if (sequenceId <= atom.lastAppliedEventSeq) {
     if (import.meta.env.DEV) {
-      // Structured warning mirrors 02674's handleSchemaViolation: dropped
-      // dispatches in dev become visible without spamming prod logs.
-      console.warn('[sse] dropping replay', {
-        eventType,
-        incomingSeq: sequenceId,
-        atomLastSeq: atom.lastSequenceId,
+      console.debug('[sse] dropping replayed event', {
+        eventType: action.type,
+        incomingEventSeq: sequenceId,
+        lastAppliedEventSeq: atom.lastAppliedEventSeq,
       });
     }
     return atom;
   }
-  return { ...apply(atom), lastSequenceId: sequenceId };
+  if (sequenceId > expectedNext) {
+    if (import.meta.env.DEV) {
+      console.debug('[sse] buffering out-of-order event', {
+        eventType: action.type,
+        incomingEventSeq: sequenceId,
+        expectedNextEventSeq: expectedNext,
+      });
+    }
+    const bufferedEventEnvelopes = { ...atom.bufferedEventEnvelopes, [sequenceId]: action as SSEAction };
+    const bufferedSeqs = Object.keys(bufferedEventEnvelopes).map(Number).sort((a, b) => a - b);
+    return {
+      ...atom,
+      bufferedEventEnvelopes,
+      eventGap: {
+        expectedNextEventSeq: expectedNext,
+        firstBufferedEventSeq: bufferedSeqs[0]!,
+      },
+    };
+  }
+  const applied = applyWireActionBody(atom, action as SSEAction);
+  return drainBufferedEventEnvelopes({ ...applied, lastAppliedEventSeq: sequenceId, eventGap: null });
 }
+
 
 /**
  * Task 08683: cross-conversation contamination guard.
@@ -658,7 +987,7 @@ export function conversationReducer(
       // append genuinely new); fresh-connect replaces entirely. See
       // `SseInitReconnectMerge` / `SseInitFreshConnect` in
       // `specs/conversation_atom/conversation_atom.allium`.
-      const isFreshConnect = atom.lastSequenceId === 0;
+      const isFreshConnect = atom.lastAppliedEventSeq === 0;
       let mergedMessages: Message[];
       if (!isFreshConnect) {
         const incomingById = new Map(p.messages.map((m) => [m.message_id, m]));
@@ -670,7 +999,7 @@ export function conversationReducer(
         mergedMessages = p.messages;
       }
 
-      const phase1Floor = isFreshConnect ? p.pendingAnchorSequenceId : atom.lastSequenceId;
+      const phase1Floor = isFreshConnect ? p.pendingAnchorSequenceId : atom.lastAppliedEventSeq;
       // streamingBuffer policy: fresh-connect always clears (atom had no
       // buffer to preserve). Reconnect preserves the existing buffer when
       // the snapshot phase is still llm_requesting AND the ring did not
@@ -680,7 +1009,7 @@ export function conversationReducer(
       // window the pending replay cannot rebuild because applyIfNewer
       // drops the very tokens we'd need. When pendingTruncated is true
       // we MUST clear — the missing middle of the stream is unreplayable
-      // and the safety belt advances lastSequenceId past it, so any
+      // and the old event cursor could skip across the missing span, so any
       // preserved buffer would be a stale prefix that future live tokens
       // append onto (producing a gapped, corrupted message). When the
       // snapshot phase is anything else, the turn ended while
@@ -694,10 +1023,14 @@ export function conversationReducer(
         ...atom,
         conversationId: p.conversation.id,
         conversation: p.conversation,
-        messages: mergedMessages,
         phase: p.phase,
         contextWindow: p.contextWindow,
-        lastSequenceId: phase1Floor,
+        lastAppliedEventSeq: phase1Floor,
+        bufferedEventEnvelopes: {},
+        eventGap: null,
+        pendingMessagePatches: isFreshConnect ? {} : atom.pendingMessagePatches,
+        ...deriveMessageSyncState(mergedMessages),
+        messages: mergedMessages,
         streamingBuffer: phase1StreamingBuffer,
         uiError: null,
         toolExecutingStartedAt: p.phase.type === 'tool_executing' ? Date.now() : null,
@@ -735,7 +1068,7 @@ export function conversationReducer(
       if (p.pendingTruncated && import.meta.env.DEV) {
         console.debug('[sse] init pendingTruncated=true — server ring overflowed; DB-only render', {
           pendingAnchorSequenceId: p.pendingAnchorSequenceId,
-          lastSequenceId: p.lastSequenceId,
+          lastAppliedEventSeq: p.lastAppliedEventSeq,
           pendingCount: p.pendingEvents.length,
         });
       }
@@ -747,258 +1080,37 @@ export function conversationReducer(
       // truncated/empty but the server's witnessed tip is ahead of the
       // anchor: advance the floor so future live events with lower seqs are
       // correctly dropped. Also covers the original "stale-init lags live
-      // events" case (atom.lastSequenceId > payload.lastSequenceId).
-      const finalLastSeq = Math.max(next.lastSequenceId, p.lastSequenceId);
-      if (finalLastSeq !== next.lastSequenceId) {
-        next = { ...next, lastSequenceId: finalLastSeq };
+      // events" case where the reconnect snapshot lags the live cursor.
+      if (p.pendingTruncated) {
+        next = {
+          ...next,
+          eventGap: p.lastAppliedEventSeq > next.lastAppliedEventSeq
+            ? {
+                expectedNextEventSeq: next.lastAppliedEventSeq + 1,
+                firstBufferedEventSeq: p.lastAppliedEventSeq,
+              }
+            : next.eventGap,
+        };
       }
       return next;
     }
 
-    case 'sse_message': {
-      // Defense-in-depth: even if applyIfNewer lets a message through, skip
-      // if the message_id is already present. The task spec (§"sse_message
-      // also needs id dedup") flags this as removing a load-bearing assumption
-      // that the server never re-emits a known message with a fresh seq id.
-      return applyIfNewer(atom, 'sse_message', action.sequenceId, (a) => {
-        if (a.messages.some((m) => m.message_id === action.message.message_id)) {
-          return a;
-        }
-        const newMessages = [...a.messages, action.message];
-
-        return {
-          ...a,
-          messages: newMessages,
-          streamingBuffer: null,
-        };
-      });
-    }
-
-    case 'sse_message_updated': {
-      return applyIfNewer(atom, 'sse_message_updated', action.sequenceId, (a) => {
-        const idx = a.messages.findIndex((m) => m.message_id === action.messageId);
-        if (idx < 0) return a;
-        const existing = a.messages[idx]!;
-        const existingDisplay = (existing.display_data ?? {}) as Record<string, unknown>;
-        // REQ-WPV-002: shallow-merge `displayData` rather than replace
-        // wholesale. The runtime emits partial patches (e.g. just
-        // `{tool_starts: {...}}` from `dispatch_tool_execution`) and
-        // wholesale replacement would wipe existing keys (`bash`,
-        // `retry_count`, `duration_ms`, etc.) that earlier broadcasts
-        // or the persisted message set. Each emitter is responsible
-        // for sending only the keys it owns.
-        let mergedDisplay = existingDisplay;
-        if (action.displayData !== undefined) {
-          mergedDisplay = { ...existingDisplay, ...action.displayData };
-          // `tool_starts` is an accumulating map keyed by tool_use_id; each
-          // `dispatch_tool_execution` patch carries ONLY the newly-started
-          // tool. The shallow spread above would replace the whole map, so a
-          // second tool's start wipes the first tool's timestamp. Deep-merge
-          // the nested map so every in-flight tool keeps its start time
-          // (REQ-WPV-002).
-          const prevStarts = existingDisplay['tool_starts'];
-          const nextStarts = action.displayData['tool_starts'];
-          const isObj = (v: unknown): v is Record<string, unknown> =>
-            typeof v === 'object' && v !== null && !Array.isArray(v);
-          if (isObj(prevStarts) && isObj(nextStarts)) {
-            mergedDisplay = {
-              ...mergedDisplay,
-              tool_starts: { ...prevStarts, ...nextStarts },
-            };
-          }
-        }
-        // `durationMs` is a typed convenience field for tool-result
-        // updates — merge into the same display_data so consumers
-        // read from a single place regardless of source path.
-        const withDuration =
-          action.durationMs !== undefined
-            ? { ...mergedDisplay, duration_ms: action.durationMs }
-            : mergedDisplay;
-        const merged = {
-          ...existing,
-          // Only overwrite display_data when at least one of the
-          // contributing fields was present; otherwise preserve the
-          // existing reference for cheap downstream equality checks.
-          ...((action.displayData !== undefined || action.durationMs !== undefined) && {
-            display_data: withDuration,
-          }),
-          ...(action.content !== undefined && { content: action.content }),
-        };
-        const newMessages = [...a.messages];
-        newMessages[idx] = merged;
-        return { ...a, messages: newMessages };
-      });
-    }
-
-    case 'sse_state_change': {
-      return applyIfNewer(atom, 'sse_state_change', action.sequenceId, (a) => {
-        const phase =
-          action.phase.type === 'error' && action.error
-            ? { ...action.phase, error: action.error }
-            : action.phase;
-        // Track when we enter tool_executing — reset on each new tool so the
-        // live elapsed counter in StateBar always reflects the current tool.
-        const toolExecutingStartedAt =
-          action.phase.type === 'tool_executing' ? Date.now() : null;
-        return {
-          ...a,
-          // main (#175): `phase` is the error-enriched phase computed above.
-          phase,
-          // REQ-WPV-001: store the server-authoritative entry time.
-          phaseStateUpdatedAt: action.stateUpdatedAt,
-          // REQ-WPV-007: every phase transition resets the first-byte
-          // signal. The next llm_requesting attempt starts in pre-first-
-          // byte; non-llm phases (tool_executing, idle, …) don't have a
-          // first-byte concept and must clear it so a subsequent
-          // llm_requesting doesn't inherit a stale value.
-          firstByteRequestId: null,
-          toolExecutingStartedAt,
-        };
-      });
-    }
-
-    case 'sse_agent_done': {
-      return applyIfNewer(atom, 'sse_agent_done', action.sequenceId, (a) => ({
-        ...a,
-        phase: { type: 'idle' },
-        streamingBuffer: null,
-        // REQ-WPV-007: turn boundary clears the first-byte signal. The
-        // sse_state_change handler also clears it on phase transitions,
-        // but agent_done can fire without a preceding state_change in
-        // some terminal paths, so we clear here defensively.
-        firstByteRequestId: null,
-        // REQ-WPV-003 + REQ-LRV-003: clear the retry context on turn end.
-        // Surfacing "(retry 2/5)" on a turn that has finished or aborted
-        // is confusing (the user reads it as "still retrying").
-        turnRetryContext: null,
-      }));
-    }
-
-    case 'sse_llm_first_byte': {
-      return applyIfNewer(atom, 'sse_llm_first_byte', action.sequenceId, (a) => ({
-        ...a,
-        firstByteRequestId: action.requestId,
-      }));
-    }
-
-    case 'sse_llm_attempt': {
-      return applyIfNewer(atom, 'sse_llm_attempt', action.sequenceId, (a) => ({
-        ...a,
-        turnRetryContext: {
-          attempt: action.attempt,
-          maxAttempts: action.maxAttempts,
-          reason: action.reason,
-          reasonText: reasonText(action.reason),
-          backingOffMs: action.backingOffMs,
-          resetsAt: action.resetsAt,
-        },
-      }));
-    }
-
-    case 'sse_token': {
-      // Phase guard (task 24683): only accumulate a streaming buffer while
-      // the conversation is actually waiting on an LLM response. Tokens that
-      // arrive after the phase has left `llm_requesting` — because of a
-      // scheduler race, a reconnect replay, or late drainage from a prior
-      // turn — would otherwise spawn a "ghost" streaming message below the
-      // already-persisted assistant message, which is the client-facing
-      // half of the "message repeats itself" bug.
-      //
-      // `applyIfNewer` subsumes the old per-connection `tokenSequence`
-      // closure (task 02675 §"sse_token reconnect stall fix"). The server now
-      // allocates sequence_ids from the conversation's single counter, so
-      // tokens emitted after a reconnect start at ids strictly greater than
-      // anything the client has seen, and the stall goes away.
-      if (atom.phase.type !== 'llm_requesting') {
-        return atom;
-      }
-      return applyIfNewer(atom, 'sse_token', action.sequenceId, (a) => {
-        // Key the streaming buffer by request_id. A retry after a mid-stream
-        // failure (network / server_error / invalid_response) opens a fresh LLM
-        // dispatch with a new request_id; its tokens must start a clean buffer
-        // rather than concatenate onto the failed attempt's partial text. A
-        // matching request_id — the common case, including a reconnect-replay
-        // of the same attempt — appends as before.
-        const sameRequest = a.streamingBuffer?.requestId === action.requestId;
-        return {
-          ...a,
-          streamingBuffer: {
-            text: (sameRequest ? (a.streamingBuffer?.text ?? '') : '') + action.delta,
-            lastSequence: action.sequenceId,
-            startedAt: sameRequest ? (a.streamingBuffer?.startedAt ?? Date.now()) : Date.now(),
-            // The server's `request_id` is stable across every token of a
-            // streaming session and matches the eventual `AssistantMessage.
-            // message_id`. We capture it on every token (cheap; same value
-            // throughout) so the render unit's key is available immediately
-            // and survives a reconnect-replay that starts mid-stream.
-            requestId: action.requestId,
-          },
-        };
-      });
-    }
-
+    case 'sse_message':
+    case 'sse_message_updated':
+    case 'sse_state_change':
+    case 'sse_agent_done':
+    case 'sse_llm_first_byte':
+    case 'sse_llm_attempt':
+    case 'sse_token':
     case 'sse_conversation_update':
-      return applyIfNewer(atom, 'sse_conversation_update', action.sequenceId, (a) => {
-        // Merge updated fields into the existing conversation object. If no
-        // conversation exists yet (shouldn't happen — init always lands
-        // first) bail out rather than synthesising one.
-        if (!a.conversation) return a;
-        return {
-          ...a,
-          conversation: { ...a.conversation, ...action.updates },
-        };
-      });
-
     case 'sse_browser_session_state':
-      // REQ-BT-018: server-authoritative live-session edge. Update only if
-      // this id is newer than anything we've seen. If the atom has no
-      // conversation yet (init hasn't landed) we drop the event — there's
-      // no struct to mutate, and init will carry the current value.
-      return applyIfNewer(atom, 'sse_browser_session_state', action.sequenceId, (a) => {
-        if (!a.conversation) {
-          if (import.meta.env.DEV) {
-            console.debug('[sse] dropping browser_session_state — no conversation', {
-              sequenceId: action.sequenceId,
-              active: action.active,
-            });
-          }
-          return a;
-        }
-        return {
-          ...a,
-          conversation: { ...a.conversation, browser_session_active: action.active },
-        };
-      });
-
     case 'sse_work_scope_update':
-      // REQ-WSUI-007: the push carries a COMPLETE inventory snapshot, so we
-      // replace `workScope` wholesale — no delta application, no partial
-      // state to reconcile. Routed through `applyIfNewer` (the same total
-      // order as every other wire event) so a reconnect replay can't regress
-      // to a stale snapshot.
-      return applyIfNewer(atom, 'sse_work_scope_update', action.sequenceId, (a) => ({
-        ...a,
-        workScope: action.inventory,
-      }));
+      return applyContiguousWireAction(atom, action);
 
     case 'sse_error':
-      // Wire-originated errors carry a sequenceId and route through the
-      // standard dedup path, so a replay of the same error after reconnect
-      // can't re-pop a toast the user already dismissed. Client-synthesized
-      // errors (schema violations, malformed JSON) have no sequenceId and
-      // apply unconditionally — they're not on the server's total order.
-      //
-      // REQ-LRV-003: a turn-terminal `error` clears the retry context.
-      // Surfacing "(retry 2/5)" on a finalised error reads as "still
-      // retrying" when the turn has actually given up.
-      if (action.sequenceId !== undefined) {
-        return applyIfNewer(atom, 'sse_error', action.sequenceId, (a) => ({
-          ...a,
-          uiError: action.error,
-          turnRetryContext: null,
-        }));
-      }
-      return { ...atom, uiError: action.error, turnRetryContext: null };
+      return action.sequenceId !== undefined
+        ? applyContiguousWireAction(atom, action)
+        : { ...atom, uiError: action.error, turnRetryContext: null };
 
     case 'clear_error':
       return { ...atom, uiError: null };
@@ -1046,7 +1158,7 @@ export function conversationReducer(
 
     case 'local_phase_change':
       if (action.expectedConversationId !== atom.conversationId) return atom;
-      // Optimistic client-side phase update — does NOT bump lastSequenceId.
+      // Optimistic client-side phase update — does NOT bump lastAppliedEventSeq.
       // Clear `phaseStateUpdatedAt` so the StateBar / pending bubble do not
       // render an elapsed counter using the *previous* phase's server
       // timestamp. The next server `state_change` will install the
@@ -1060,7 +1172,7 @@ export function conversationReducer(
 
     case 'set_initial_data':
       // Don't overwrite if SSE has already provided authoritative data
-      if (atom.lastSequenceId > 0) return atom;
+      if (atom.lastAppliedEventSeq > 0) return atom;
       return {
         ...atom,
         conversationId: action.conversationId,
