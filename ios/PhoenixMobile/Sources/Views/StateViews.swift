@@ -60,11 +60,16 @@ struct StateDetailView: View {
             errorCard(message: message)
 
         case .contextExhausted:
-            needsActionCard(
-                icon: "arrow.triangle.2.circlepath",
-                title: "Context exhausted",
-                detail: nil,
-                footnote: "Continue this work from the web UI.")
+            // Gate on the server's mode, per this type's own rule: an
+            // already-continued conversation is presented as done and must
+            // not look blocked; only an uncontinued one needs action.
+            if session.presentationMode == "needs_action" {
+                needsActionCard(
+                    icon: "arrow.triangle.2.circlepath",
+                    title: "Context exhausted",
+                    detail: nil,
+                    footnote: "Continue this work from the web UI.")
+            }
 
         case .cancelling:
             workingRow {
