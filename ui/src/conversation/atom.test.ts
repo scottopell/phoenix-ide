@@ -686,10 +686,7 @@ describe('conversationReducer', () => {
   });
 
   describe('sse_message_updated', () => {
-    // Regression: spawn_agents tool_result gets display_data refreshed AFTER many
-    // later SSE events. Now gated by sequenceId: the update must carry an id
-    // higher than the previous high-water mark.
-    it('applies display_data update-in-place with a monotonic sequenceId', () => {
+    it('applies display_data update-in-place without advancing the message replay floor', () => {
       const original: Message = {
         ...makeMessage(5, 'agent'),
         message_type: 'tool',
@@ -718,7 +715,7 @@ describe('conversationReducer', () => {
 
       expect(next.messages).toHaveLength(1);
       expect(next.messages[0]!.display_data).toEqual(summaryDisplayData);
-      expect(next.lastSequenceId).toBe(43);
+      expect(next.lastSequenceId).toBe(42);
     });
 
     it('is a no-op when message_id is unknown', () => {
@@ -735,10 +732,7 @@ describe('conversationReducer', () => {
         displayData: { type: 'whatever' },
       });
 
-      // applyIfNewer still bumps lastSequenceId (the fact was seen); only the
-      // in-reducer lookup decides whether to mutate messages. This keeps the
-      // contract consistent: applyIfNewer is the ONLY sequence_id gate.
-      expect(next.lastSequenceId).toBe(11);
+      expect(next.lastSequenceId).toBe(10);
       expect(next.messages).toEqual(atom.messages);
     });
 
@@ -754,7 +748,6 @@ describe('conversationReducer', () => {
         lastSequenceId: 10,
       };
 
-      // Update only display_data, not content
       const next = dispatch(atom, {
         type: 'sse_message_updated',
         sequenceId: 11,
@@ -766,9 +759,7 @@ describe('conversationReducer', () => {
       expect((next.messages[0]!.content as { text: string }).text).toBe('original content');
     });
 
-    // Task 02675 acceptance: duplicate message_updated events → state reflects
-    // exactly one application.
-    it('is idempotent: duplicate message_updated events apply exactly once', () => {
+    it('duplicate message_updated events converge without advancing lastSequenceId', () => {
       const original: Message = {
         ...makeMessage(5),
         display_data: { type: 'before' } as Record<string, unknown>,
@@ -785,7 +776,6 @@ describe('conversationReducer', () => {
         messageId: original.message_id,
         displayData: { type: 'after' },
       });
-      // Second delivery with the SAME sequenceId: the replay guard rejects it.
       const twice = dispatch(once, {
         type: 'sse_message_updated',
         sequenceId: 11,
@@ -793,8 +783,8 @@ describe('conversationReducer', () => {
         displayData: { type: 'after' },
       });
 
-      expect(twice).toBe(once); // applyIfNewer returned atom unchanged
       expect((twice.messages[0]!.display_data as { type: string }).type).toBe('after');
+      expect(twice.lastSequenceId).toBe(10);
     });
 
     it('merges durationMs into display_data, preserving existing keys', () => {
@@ -818,14 +808,12 @@ describe('conversationReducer', () => {
       });
 
       const dd = next.messages[0]!.display_data as Record<string, unknown>;
-      // duration_ms was injected
       expect(dd['duration_ms']).toBe(4567);
-      // existing keys survive
       expect(dd['bash']).toEqual([{ tool_use_id: 'abc', display: 'ls' }]);
-      expect(next.lastSequenceId).toBe(21);
+      expect(next.lastSequenceId).toBe(20);
     });
 
-    it('durationMs update is gated by sequenceId (replay guard)', () => {
+    it('durationMs update does not advance the message replay floor', () => {
       const original: Message = {
         ...makeMessage(5),
         message_type: 'tool',
@@ -838,16 +826,52 @@ describe('conversationReducer', () => {
         lastSequenceId: 30,
       };
 
-      // Stale sequenceId — should be rejected
       const next = dispatch(atom, {
         type: 'sse_message_updated',
-        sequenceId: 29,
+        sequenceId: 99,
         messageId: original.message_id,
         durationMs: 9999,
       });
 
-      expect(next).toBe(atom); // applyIfNewer returned unchanged
-      expect(next.messages[0]!.display_data).toBeNull();
+      expect((next.messages[0]!.display_data as Record<string, unknown>)['duration_ms']).toBe(9999);
+      expect(next.lastSequenceId).toBe(30);
+    });
+
+    it('does not let a high-sequence message_updated drop later lower-sequence tool result messages', () => {
+      const assistant: Message = {
+        ...makeMessage(2810, 'agent'),
+        content: [
+          { type: 'text', text: 'Inspect files.' },
+          { type: 'tool_use', id: 'tool-1', name: 'read_file', input: { path: 'one' } },
+          { type: 'tool_use', id: 'tool-2', name: 'read_file', input: { path: 'two' } },
+          { type: 'tool_use', id: 'tool-3', name: 'read_file', input: { path: 'three' } },
+        ] as Message['content'],
+      };
+      const toolResult = (toolUseId: string, sequenceId: number): Message => ({
+        ...makeMessage(sequenceId),
+        message_id: `${toolUseId}-result`,
+        message_type: 'tool',
+        content: { tool_use_id: toolUseId, content: `result ${toolUseId}`, is_error: false } as Message['content'],
+      });
+
+      let atom = dispatch(createInitialAtom(), {
+        type: 'sse_init',
+        payload: makeInitPayload({ messages: [], lastSequenceId: 0, pendingAnchorSequenceId: 0 }),
+      });
+      atom = dispatch(atom, { type: 'sse_message', sequenceId: 2810, message: assistant });
+      atom = dispatch(atom, { type: 'sse_message', sequenceId: 2811, message: toolResult('tool-1', 2811) });
+      atom = dispatch(atom, {
+        type: 'sse_message_updated',
+        sequenceId: 2815,
+        messageId: 'tool-1-result',
+        durationMs: 4,
+      });
+      atom = dispatch(atom, { type: 'sse_message', sequenceId: 2812, message: toolResult('tool-2', 2812) });
+      atom = dispatch(atom, { type: 'sse_message', sequenceId: 2813, message: toolResult('tool-3', 2813) });
+
+      expect(atom.messages.map((m) => m.sequence_id)).toEqual([2810, 2811, 2812, 2813]);
+      expect(atom.lastSequenceId).toBe(2813);
+      expect((atom.messages[1]!.display_data as Record<string, unknown>)['duration_ms']).toBe(4);
     });
   });
 

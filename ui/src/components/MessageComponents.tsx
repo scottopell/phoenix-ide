@@ -880,11 +880,12 @@ interface AgentMessageProps {
    * renders in its full non-collapsed form.
    */
   forceExpandedText?: boolean;
+  isLatestAgentMessage?: boolean;
 }
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, workScopeKey, activeToolUseId, isFirstInTurn = true, forceExpandedText = false, isLatestAgentMessage = false }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
   const { theme } = useTheme();
@@ -1121,14 +1122,18 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
                   typeof toolStartsMap[toolUseId] === 'number'
                   ? (toolStartsMap[toolUseId] as number)
                   : undefined;
+              const result = toolResults.get(block.id || '');
+              const showMissingResult =
+                result === undefined && !(isLatestAgentMessage && activeToolUseId !== undefined);
               return (
                 <ToolUseBlock
                   key={block.id || i}
                   block={block}
-                  result={toolResults.get(block.id || '')}
+                  result={result}
                   onOpenFile={onOpenFile}
                   workScopeKey={workScopeKey}
                   toolStartedAtMs={toolStartedAtMs}
+                  showMissingResult={showMissingResult}
                 />
               );
             }
@@ -1199,6 +1204,7 @@ interface ToolUseBlockProps {
    *  and no `result` has landed yet, the tool widget renders a live
    *  elapsed counter that survives reconnect / reload / multi-tab. */
   toolStartedAtMs?: number | undefined;
+  showMissingResult?: boolean | undefined;
 }
 
 // Helper to parse image data from read_image tool result
@@ -1713,7 +1719,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, toolStartedAtMs }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -1912,6 +1918,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, toolStarted
       </div>
 
       {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}
+      {showMissingResult && !hasOutput && (
+        <div className="tool-block-output missing">
+          <div className="tool-block-output-content tool-missing-result">
+            result not received
+          </div>
+        </div>
+      )}
       {hasOutput && !isSubAgentResult && (
         <div className={`tool-block-output ${isError ? 'error' : ''} ${outputExpanded ? 'expanded' : ''}`}>
           {imageResult ? (

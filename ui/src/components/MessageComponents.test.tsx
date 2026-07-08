@@ -282,6 +282,46 @@ describe('inline tool timers', () => {
     expect(screen.queryByText('• 24s')).not.toBeInTheDocument();
   });
 
+  it('does not show missing-result warnings for queued tools in the latest active turn', () => {
+    const agent = agentMessage('agent-queued-tools', [
+      { type: 'tool_use', id: 'tool-read-a', name: 'read_file', input: { path: 'a.md' } },
+      { type: 'tool_use', id: 'tool-read-b', name: 'read_file', input: { path: 'b.md' } },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agent}
+          toolResults={new Map()}
+          onOpenFile={undefined}
+          activeToolUseId="tool-read-a"
+          isLatestAgentMessage={true}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByText('result not received')).not.toBeInTheDocument();
+  });
+
+  it('shows a diagnostic when a historical tool_use has no paired result', () => {
+    const agent = agentMessage('agent-missing-result', [
+      { type: 'tool_use', id: 'tool-read', name: 'read_file', input: { path: 'missing.md' } },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agent}
+          toolResults={new Map()}
+          onOpenFile={undefined}
+          isLatestAgentMessage={false}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('result not received')).toBeInTheDocument();
+  });
+
   it('does not leave any screenshot-style multi-tool cards in live elapsed state once their results are visible', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-01T00:00:24Z'));
