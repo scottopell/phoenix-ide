@@ -4038,8 +4038,13 @@ where
                 // (`Effect::BroadcastAssistantMessage`) already delivered for
                 // this `message_id`, so a reconnect that lands during persistence
                 // never sees a shifted timestamp on the message the UI displays.
+                let (reserved_broadcast_range, reserved_seqs) = self
+                    .broadcast_tx
+                    .reserve_next_persisted_message_range(1 + tool_results.len());
+                let _reserved_broadcast_range = reserved_broadcast_range;
+
                 let agent_content = MessageContent::agent(assistant_message.content);
-                let agent_seq = self.broadcast_tx.next_seq();
+                let agent_seq = reserved_seqs[0];
                 let agent_msg = crate::db::Message {
                     message_id: assistant_message.message_id.clone(),
                     conversation_id: conv_id.clone(),
@@ -4053,7 +4058,7 @@ where
 
                 // Build all tool-result rows.
                 let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
-                for result in &tool_results {
+                for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
                     let tool_content = MessageContent::tool_with_images(
                         &result.tool_use_id,
                         result.output(),
@@ -4062,11 +4067,10 @@ where
                     );
                     let merged_display =
                         merge_duration_into_display_data(result.display_data(), result.duration_ms);
-                    let tool_seq = self.broadcast_tx.next_seq();
                     tool_msgs.push(crate::db::Message {
                         message_id: tool_result_message_id(&result.tool_use_id),
                         conversation_id: conv_id.clone(),
-                        sequence_id: tool_seq,
+                        sequence_id: *tool_seq,
                         message_type: tool_content.message_type(),
                         content: tool_content,
                         display_data: merged_display,
@@ -4074,13 +4078,6 @@ where
                         created_at: Utc::now(),
                     });
                 }
-
-                let reserved_until = tool_msgs
-                    .last()
-                    .map_or(agent_msg.sequence_id, |msg| msg.sequence_id);
-                let _reserved_broadcast_range = self
-                    .broadcast_tx
-                    .reserve_persisted_message_range(reserved_until);
 
                 // Persist the assistant message and every tool result in one
                 // transaction: either the full round is durable or none of it
@@ -4136,8 +4133,13 @@ where
 
         // Build the assistant message row with a seq strictly greater than any
         // ephemeral event broadcast earlier (mirrors `persist_checkpoint`).
+        let (reserved_broadcast_range, reserved_seqs) = self
+            .broadcast_tx
+            .reserve_next_persisted_message_range(1 + tool_results.len());
+        let _reserved_broadcast_range = reserved_broadcast_range;
+
         let agent_content = MessageContent::agent(assistant_message.content);
-        let agent_seq = self.broadcast_tx.next_seq();
+        let agent_seq = reserved_seqs[0];
         let agent_msg = crate::db::Message {
             message_id: assistant_message.message_id.clone(),
             conversation_id: conv_id.clone(),
@@ -4153,7 +4155,7 @@ where
         // `fork_proposal_id` in its display_data (UI-only) per the interception
         // contract; `merge_duration_into_display_data` preserves it.
         let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
-        for result in &tool_results {
+        for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
             let tool_content = MessageContent::tool_with_images(
                 &result.tool_use_id,
                 result.output(),
@@ -4162,11 +4164,10 @@ where
             );
             let merged_display =
                 merge_duration_into_display_data(result.display_data(), result.duration_ms);
-            let tool_seq = self.broadcast_tx.next_seq();
             tool_msgs.push(crate::db::Message {
                 message_id: tool_result_message_id(&result.tool_use_id),
                 conversation_id: conv_id.clone(),
-                sequence_id: tool_seq,
+                sequence_id: *tool_seq,
                 message_type: tool_content.message_type(),
                 content: tool_content,
                 display_data: merged_display,
@@ -4174,13 +4175,6 @@ where
                 created_at: Utc::now(),
             });
         }
-
-        let reserved_until = tool_msgs
-            .last()
-            .map_or(agent_msg.sequence_id, |msg| msg.sequence_id);
-        let _reserved_broadcast_range = self
-            .broadcast_tx
-            .reserve_persisted_message_range(reserved_until);
 
         let proposal = crate::db::ForkProposal {
             id: proposal_id,

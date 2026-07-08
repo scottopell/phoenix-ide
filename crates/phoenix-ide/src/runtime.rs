@@ -567,6 +567,11 @@ impl SseBroadcaster {
 
     /// Atomically allocate the next `sequence_id` and return it.
     pub fn next_seq(&self) -> i64 {
+        let _gate = self.gate.lock().expect("BroadcastGate mutex");
+        self.next_seq_unlocked()
+    }
+
+    fn next_seq_unlocked(&self) -> i64 {
         self.last_seq.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -649,30 +654,41 @@ impl SseBroadcaster {
         self.send_with_ring_raw(event, seq, op)
     }
 
-    pub fn reserve_persisted_message_range(&self, reserved_until: i64) -> ReservedBroadcastRange {
+    pub fn reserve_next_persisted_message_range(
+        &self,
+        count: usize,
+    ) -> (ReservedBroadcastRange, Vec<i64>) {
+        assert!(
+            count > 0,
+            "persisted-message range must contain at least one row"
+        );
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         debug_assert!(
             gate.reserved_until.is_none(),
             "nested persisted-message broadcast ranges are not supported"
         );
-        gate.reserved_until = Some(reserved_until);
-        ReservedBroadcastRange {
-            broadcaster: self.clone(),
-            active: true,
+        let mut seqs = Vec::with_capacity(count);
+        for _ in 0..count {
+            seqs.push(self.next_seq_unlocked());
         }
+        gate.reserved_until = seqs.last().copied();
+        (
+            ReservedBroadcastRange {
+                broadcaster: self.clone(),
+                active: true,
+            },
+            seqs,
+        )
     }
 
     fn release_reserved_range(&self) {
-        let queued = {
-            let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-            gate.reserved_until = None;
-            let mut queued = std::mem::take(&mut gate.queued);
-            queued.sort_by_key(|entry| entry.seq);
-            queued
-        };
+        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
+        let mut queued = std::mem::take(&mut gate.queued);
+        queued.sort_by_key(|entry| entry.seq);
         for QueuedBroadcast { event, seq, op } in queued {
             let _ = self.send_with_ring_raw(event, seq, op);
         }
+        gate.reserved_until = None;
     }
 
     /// Allocate the next `sequence_id`, pass it to `build`, broadcast the
@@ -3000,9 +3016,9 @@ mod broadcaster_tests {
         let b = SseBroadcaster::new(16, 0);
         let mut rx = b.subscribe();
 
-        let first_seq = b.next_seq();
-        let second_seq = b.next_seq();
-        let guard = b.reserve_persisted_message_range(second_seq);
+        let (guard, reserved_seqs) = b.reserve_next_persisted_message_range(2);
+        let first_seq = reserved_seqs[0];
+        let second_seq = reserved_seqs[1];
 
         let _ = b.send_seq(|seq| token_event(seq, "queued"));
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
