@@ -1608,12 +1608,7 @@ async fn create_conversation_with_id(
         {
             let is_same_create =
                 existing_job.message_id.as_deref() == Some(req.message_id.as_str());
-            let is_pending = matches!(
-                existing_job.phase,
-                crate::db::ConversationCreationPhase::Accepted
-                    | crate::db::ConversationCreationPhase::Provisioning
-            );
-            if !is_same_create && !is_pending {
+            if !is_same_create {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     "conversation_id already belongs to an existing conversation",
                     "conversation_id_exists",
@@ -1663,6 +1658,7 @@ async fn create_conversation_with_id(
             "Worktree mode requires a git repository".to_string(),
         ));
     }
+    let mut resolved_base_branch_for_intent = req.base_branch.clone();
     if matches!(mode_for_preflight, "managed" | "auto")
         && (mode_for_preflight == "managed" || repo_root_for_preflight.is_some())
     {
@@ -1685,6 +1681,7 @@ async fn create_conversation_with_id(
             .or(inferred_base.as_deref())
             .ok_or_else(|| AppError::BadRequest("Managed mode requires base_branch".to_string()))?;
         validate_user_ref(base_branch)?;
+        resolved_base_branch_for_intent = Some(base_branch.to_string());
         if let Some(checkout_ref) = req.checkout_ref.as_deref() {
             validate_user_ref(checkout_ref)?;
         }
@@ -1718,7 +1715,17 @@ async fn create_conversation_with_id(
             .ok_or_else(|| AppError::BadRequest("Branch mode requires base_branch".to_string()))?;
         validate_user_ref(branch_name)?;
         if let Some(repo_root) = repo_root_for_preflight.as_deref() {
-            match materialize_branch(std::path::Path::new(repo_root), branch_name) {
+            let repo_root_for_materialize = repo_root.to_string();
+            let branch_for_materialize = branch_name.to_string();
+            match tokio::task::spawn_blocking(move || {
+                materialize_branch(
+                    std::path::Path::new(&repo_root_for_materialize),
+                    &branch_for_materialize,
+                )
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("branch materialization task failed: {e}")))?
+            {
                 Ok(()) => {}
                 Err(GitOpError::BranchNotFound(branch)) => {
                     return Err(AppError::BadRequest(format!(
@@ -1778,7 +1785,7 @@ async fn create_conversation_with_id(
     let slug = format!("conv-{short_id}");
     let conv_mode = crate::db::ConvMode::Direct;
     let effective_cwd = valid_cwd.into_raw();
-    let desired_base_branch = req.base_branch.as_deref();
+    let desired_base_branch = resolved_base_branch_for_intent.as_deref();
     let shell_model = req
         .model
         .clone()
@@ -1823,10 +1830,29 @@ async fn create_conversation_with_id(
             }
         }
     }
+    if !req.files.is_empty() {
+        match validate_submitted_attachments(&id, &req.files).await {
+            Ok(validated) => {
+                req.files = validated
+                    .into_iter()
+                    .map(|file| crate::api::types::FileAttachment {
+                        original_name: file.original_name,
+                        media_type: file.media_type,
+                        size_bytes: file.size_bytes,
+                        stored_path: file.stored_path,
+                    })
+                    .collect();
+            }
+            Err(e) => {
+                delete_files(&stored_file_paths).await;
+                return Err(e);
+            }
+        }
+    }
 
     let intent = crate::db::ConversationCreationIntent {
         cwd: effective_cwd.clone(),
-        model: req.model.clone(),
+        model: Some(shell_model.clone()),
         text: req.text.clone(),
         message_id: req.message_id.clone(),
         images: req
@@ -1840,7 +1866,8 @@ async fn create_conversation_with_id(
             .collect(),
         files: req.files.iter().cloned().map(Into::into).collect(),
         mode: req.mode.clone(),
-        base_branch: req.base_branch.clone(),
+        base_branch: resolved_base_branch_for_intent.clone(),
+        checkout_ref: req.checkout_ref.clone(),
         seed_parent_id: req.seed_parent_id.clone(),
         seed_label: req.seed_label.clone(),
     };
@@ -1852,7 +1879,7 @@ async fn create_conversation_with_id(
         intent,
     };
 
-    let mut conversation = match state
+    let conversation = match state
         .runtime
         .db()
         .create_conversation_with_creation_job(
@@ -1921,14 +1948,7 @@ async fn create_conversation_with_id(
                 .as_ref()
                 .and_then(|job| job.message_id.as_deref())
                 == Some(req.message_id.as_str());
-            let is_pending = existing_job.as_ref().is_some_and(|job| {
-                matches!(
-                    job.phase,
-                    crate::db::ConversationCreationPhase::Accepted
-                        | crate::db::ConversationCreationPhase::Provisioning
-                )
-            });
-            if is_same_create || is_pending {
+            if is_same_create {
                 let mut conversation_json =
                     conversation_to_json(&state, &existing_conversation, None);
                 inject_creation_job_state_fields(
@@ -1951,20 +1971,6 @@ async fn create_conversation_with_id(
             return Err(AppError::Internal(e.to_string()));
         }
     };
-
-    let provisioning_state = ConvState::Provisioning {
-        job_id: job_id.clone(),
-        phase: phoenix_core::domain::db_schema::ConversationCreationPhase::Accepted,
-    };
-    state
-        .runtime
-        .db()
-        .update_conversation_state(&id, &provisioning_state)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    conversation.state = provisioning_state;
-    conversation.state_updated_at = chrono::Utc::now();
-    conversation.updated_at = conversation.state_updated_at;
 
     state.runtime.kick_creation_worker();
 
@@ -2808,6 +2814,22 @@ async fn stream_conversation(
     } else {
         None
     };
+
+    let mut init_conversation = enrich_conversation_with_seed(&state, &conversation, true).await?;
+    if matches!(
+        conversation.state,
+        ConvState::Provisioning { .. } | ConvState::CreationFailed { .. }
+    ) {
+        if let Ok(Some(job)) = state
+            .runtime
+            .db()
+            .get_conversation_creation_job_for_conversation(&conversation.id)
+            .await
+        {
+            init_conversation.creation_prompt = Some(creation_intent_display_text(&job.intent));
+            init_conversation.creation_error = job.error;
+        }
+    }
 
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
@@ -6292,6 +6314,7 @@ mod conversation_cwd_validation_tests {
             .expect("creation job");
         let mut req = create_request(tmp.path().to_string_lossy().to_string());
         req.conversation_id = Some(conv_id.clone());
+        req.message_id = "msg-existing-shell".to_string();
         req.mode = Some("branch".to_string());
         req.base_branch = Some("does-not-exist".to_string());
 

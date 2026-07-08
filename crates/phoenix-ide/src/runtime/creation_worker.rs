@@ -380,6 +380,14 @@ async fn provision_conversation(
         .await
         .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
 
+    let persisted_conversation = manager
+        .db()
+        .get_conversation(&job.conversation_id)
+        .await
+        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
+    let persisted_slug = persisted_conversation.slug.unwrap_or_else(|| slug.clone());
+    let persisted_title = persisted_conversation.title.or_else(|| title.clone());
+
     if let Some(broadcast_tx) = {
         let runtimes = manager.runtimes.read().await;
         runtimes
@@ -389,8 +397,8 @@ async fn provision_conversation(
         let _ = broadcast_tx.send_seq(|seq| SseEvent::ConversationUpdate {
             sequence_id: seq,
             update: ConversationMetadataUpdate {
-                slug: Some(slug.clone()),
-                title: title.clone(),
+                slug: Some(persisted_slug.clone()),
+                title: persisted_title.clone(),
                 cwd: Some(effective_cwd.clone()),
                 branch_name: conv_mode.branch_name().map(ToString::to_string),
                 worktree_path: conv_mode.worktree_path().map(ToString::to_string),

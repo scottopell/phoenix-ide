@@ -33,6 +33,7 @@ export function useCreateConversationWithStore() {
       }
       rememberCreateIntent(conv.id, prompt);
       store.upsertSnapshot(conv.slug, conv);
+      store.upsertRouteSnapshot(conv.id, conv);
       return conv;
     },
     [store],

@@ -1891,7 +1891,7 @@ impl Database {
     ///
     /// # Panics
     ///
-    /// Panics if the idle state cannot be serialized.
+    /// Panics if the initial provisioning state cannot be serialized.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn create_conversation_with_creation_job(
         &self,
@@ -1908,7 +1908,11 @@ impl Database {
         job: &InsertConversationCreationJob,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
-        let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
+        let creation_state = ConvState::Provisioning {
+            job_id: job.id.clone(),
+            phase: ConversationCreationPhase::Accepted,
+        };
+        let creation_state_json = serde_json::to_string(&creation_state).unwrap();
         let cm = conv_mode_columns(conv_mode);
         let now_str = now.to_rfc3339();
         let intent_json = serde_json::to_string(&job.intent)
@@ -1928,7 +1932,7 @@ impl Database {
             .bind(&title_str)
             .bind(cwd)
             .bind(user_initiated)
-            .bind(&idle_state)
+            .bind(&creation_state_json)
             .bind(&now_str)
             .bind(model)
             .bind(desired_base_branch)
@@ -1992,7 +1996,7 @@ impl Database {
             cwd: cwd.to_string(),
             parent_conversation_id: None,
             user_initiated,
-            state: ConvState::Idle,
+            state: creation_state,
             state_updated_at: now,
             created_at: now,
             updated_at: now,

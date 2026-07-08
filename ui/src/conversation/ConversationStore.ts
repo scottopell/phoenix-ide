@@ -145,6 +145,15 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     return this.setConversationSnapshot(slug, conversation, destination);
   }
 
+  upsertRouteSnapshot(routeKey: string, conversation: Conversation): boolean {
+    const destination = this.getSnapshot(routeKey);
+    if (destination.conversation?.id === conversation.id && destination.conversation.updated_at >= conversation.updated_at) {
+      return false;
+    }
+    notifyConversationSnapshotChange(conversation);
+    return this.setAtom(routeKey, { ...destination, conversation });
+  }
+
   private setConversationSnapshot(
     slug: string,
     conversation: Conversation,
