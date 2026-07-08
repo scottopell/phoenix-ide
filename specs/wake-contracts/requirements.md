@@ -117,9 +117,12 @@ registered_at, fire_template_json, registering_tool_use_id, status,
 terminal_cause, forgotten_reason, terminal_payload, resolved_at)`
 
 THE `terminal_cause` and `forgotten_reason` columns SHALL be the queryable
-terminal discriminators used for metrics and operator views. The
-`terminal_payload` column SHALL hold only the cause-specific body and SHALL NOT
-repeat those discriminator values.
+terminal discriminators used for metrics and operator views. `forgotten_reason`
+SHALL be populated whenever `terminal_cause = Forgotten` and SHALL be drawn from a
+finite set: `phoenix_restart`, `cascade_destroyed_handle`,
+`subagent_handle_missing`, or `tmux_handle_missing`. The `terminal_payload` column
+SHALL hold only the cause-specific body and SHALL NOT repeat those discriminator
+values.
 
 THE SYSTEM SHALL update `status`, `terminal_cause`, `forgotten_reason`,
 `terminal_payload`, and `resolved_at` atomically when a contract resolves
@@ -536,7 +539,9 @@ partial assistant text when available and the child conversation / agent id.
 WHEN the child reaches another bedrock terminal failure cause, including context
 exhaustion or non-retryable runtime failure
 THE SYSTEM SHALL preserve that cause as the child's durable terminal cause and
-deliver the corresponding tagged terminal outcome.
+deliver the corresponding tagged terminal outcome. Runtime-failure outcomes SHALL
+include the same typed `ErrorKind` taxonomy used by normal sub-agent failure,
+including `invalid_response`.
 
 WHEN bedrock admits text-only implicit completion as a child terminal state
 THE SYSTEM SHALL preserve that cause as the child's durable terminal cause and
