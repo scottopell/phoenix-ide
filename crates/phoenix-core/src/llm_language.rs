@@ -373,10 +373,16 @@ pub fn mode_branch(
 
 /// System prompt for conversation title generation. The trailing `Request:`
 /// label is the cue the caller appends the user's first message under.
-pub const TITLE_PROMPT: &str = r#"Generate a very short (3-6 words) title summarizing this request. Output only the title, no quotes or punctuation. Examples:
+pub const TITLE_PROMPT: &str = r#"Generate a very short (3-6 words) title summarizing this request. Output only the title, no quotes or punctuation.
+
+Prefer specific action and subject words. Do not start with generic labels like Review, Reviewing, Discuss, or Analyze when a more specific verb or noun from the request is available. Especially avoid titles that would become review-* slugs.
+
+Examples:
 - "Fix login page CSS bug" -> Fix Login Page CSS
 - "Help me write a Python script to parse CSV files" -> Python CSV Parser Script
 - "What's the best way to implement caching?" -> Implementing Caching Strategy
+- "Review and update the title generation prompt" -> Update Title Generation Prompt
+- "Can you review this PR feedback workflow?" -> PR Feedback Workflow
 
 Request:"#;
 
