@@ -366,6 +366,12 @@ pub struct ConversationCreationIntent {
     #[serde(default)]
     pub model: Option<String>,
     pub text: String,
+    // owned: pre-feature rows had no accepted expansion snapshot; None correctly re-expands.
+    #[serde(default)]
+    pub llm_text: Option<String>,
+    // owned: pre-feature rows had no accepted skill invocation snapshot; None correctly re-expands.
+    #[serde(default)]
+    pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
     pub message_id: String,
     #[serde(default)]
     pub images: Vec<ImageData>,

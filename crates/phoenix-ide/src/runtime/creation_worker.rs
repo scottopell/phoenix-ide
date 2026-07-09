@@ -447,25 +447,36 @@ async fn provision_conversation(
         return Ok(ProvisionOutcome::SeededEmpty);
     }
 
-    let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
-    let expanded =
-        crate::message_expander::expand(&intent.text, &resolution_root).map_err(|e| {
-            (
-                format!("{} ({})", e, e.error_type()),
-                ErrorKind::InvalidRequest,
-            )
-        })?;
+    let (display_text, llm_text, skill_invocation) = if intent.llm_text.is_some()
+        || intent.skill_invocation.is_some()
+    {
+        (
+            intent.text.clone(),
+            intent.llm_text.clone(),
+            intent.skill_invocation.clone(),
+        )
+    } else {
+        let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
+        let expanded =
+            crate::message_expander::expand(&intent.text, &resolution_root).map_err(|e| {
+                (
+                    format!("{} ({})", e, e.error_type()),
+                    ErrorKind::InvalidRequest,
+                )
+            })?;
+        let llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+        (expanded.display_text, llm_text, expanded.skill_invocation)
+    };
     let images: Vec<ImageData> = intent.images.clone();
     let files = intent.files.clone();
-    let llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
     let event = Event::UserMessage {
-        text: expanded.display_text,
+        text: display_text,
         llm_text,
         images,
         files,
         message_id: intent.message_id.clone(),
         user_agent: None,
-        skill_invocation: expanded.skill_invocation,
+        skill_invocation,
     };
     manager
         .db()

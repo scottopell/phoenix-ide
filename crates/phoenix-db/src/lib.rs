@@ -2181,6 +2181,8 @@ impl Database {
             "cwd": "",
             "model": null,
             "text": "",
+            "llm_text": null,
+            "skill_invocation": null,
             "message_id": job.message_id,
             "images": [],
             "files": [],

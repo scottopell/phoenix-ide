@@ -2,7 +2,7 @@
 //! LLM Skill tool so both produce identical output.
 
 /// The result of invoking a skill.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SkillInvocation {
     /// The skill name (e.g., "build")
     pub name: String,

@@ -1659,53 +1659,69 @@ async fn create_conversation_with_id(
         ));
     }
     let mut resolved_base_branch_for_intent = req.base_branch.clone();
-    if matches!(mode_for_preflight, "managed" | "auto")
-        && (mode_for_preflight == "managed" || repo_root_for_preflight.is_some())
-    {
-        let inferred_base = if mode_for_preflight == "auto" && req.base_branch.is_none() {
-            repo_root_for_preflight.as_deref().and_then(|repo_root| {
-                crate::git_ops::run_git(
+    let managed_like_preflight = matches!(mode_for_preflight, "managed" | "auto")
+        && (mode_for_preflight == "managed" || repo_root_for_preflight.is_some());
+    if managed_like_preflight {
+        let repo_root_for_blocking = repo_root_for_preflight.clone();
+        let requested_base = req.base_branch.clone();
+        let checkout_ref = req.checkout_ref.clone();
+        let infer_base = mode_for_preflight == "auto" && requested_base.is_none();
+        resolved_base_branch_for_intent = tokio::task::spawn_blocking(move || {
+            let inferred_base = if infer_base {
+                repo_root_for_blocking.as_deref().and_then(|repo_root| {
+                    crate::git_ops::run_git(
+                        std::path::Path::new(repo_root),
+                        &["rev-parse", "--abbrev-ref", "HEAD"],
+                    )
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && s != "HEAD")
+                })
+            } else {
+                None
+            };
+            let base_branch = requested_base
+                .as_deref()
+                .or(inferred_base.as_deref())
+                .ok_or_else(|| {
+                    AppError::BadRequest("Managed mode requires base_branch".to_string())
+                })?;
+            validate_user_ref(base_branch)?;
+            if let Some(checkout_ref) = checkout_ref.as_deref() {
+                validate_user_ref(checkout_ref)?;
+            }
+            if let Some(repo_root) = repo_root_for_blocking.as_deref() {
+                GitStartPoint::for_create_request(
                     std::path::Path::new(repo_root),
-                    &["rev-parse", "--abbrev-ref", "HEAD"],
+                    base_branch,
+                    checkout_ref.as_deref(),
                 )
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty() && s != "HEAD")
-            })
-        } else {
-            None
-        };
-        let base_branch = req
-            .base_branch
-            .as_deref()
-            .or(inferred_base.as_deref())
-            .ok_or_else(|| AppError::BadRequest("Managed mode requires base_branch".to_string()))?;
-        validate_user_ref(base_branch)?;
-        resolved_base_branch_for_intent = Some(base_branch.to_string());
-        if let Some(checkout_ref) = req.checkout_ref.as_deref() {
-            validate_user_ref(checkout_ref)?;
-        }
-        if let Some(repo_root) = repo_root_for_preflight.as_deref() {
-            GitStartPoint::for_create_request(
-                std::path::Path::new(repo_root),
-                base_branch,
-                req.checkout_ref.as_deref(),
-            )
-            .map_err(|e| AppError::BadRequest(e.to_string()))?;
-        }
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
+            }
+            Ok::<Option<String>, AppError>(Some(base_branch.to_string()))
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("managed ref preflight task failed: {e}")))??;
     }
     let worktree_backed = matches!(mode_for_preflight, "managed" | "branch")
         || (mode_for_preflight == "auto" && repo_root_for_preflight.is_some());
+    let persisted_prompt_text = req.text.clone();
+    let mut persisted_llm_text = None;
+    let mut persisted_skill_invocation = None;
     if !worktree_backed && !req.text.trim().is_empty() {
         let resolution_root =
             crate::resolution_root::ResolutionRoot::working_dir(valid_cwd.path_buf());
-        crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
-            AppError::UnprocessableEntity(ExpansionErrorResponse {
-                error: e.to_string(),
-                error_type: e.error_type().to_string(),
-                reference: e.reference(),
-            })
-        })?;
+        let expanded =
+            crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
+                AppError::UnprocessableEntity(ExpansionErrorResponse {
+                    error: e.to_string(),
+                    error_type: e.error_type().to_string(),
+                    reference: e.reference(),
+                })
+            })?;
+        persisted_llm_text =
+            (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+        persisted_skill_invocation = expanded.skill_invocation;
     }
 
     if mode_for_preflight == "branch" {
@@ -1786,10 +1802,26 @@ async fn create_conversation_with_id(
     let conv_mode = crate::db::ConvMode::Direct;
     let effective_cwd = valid_cwd.into_raw();
     let desired_base_branch = resolved_base_branch_for_intent.as_deref();
+    let registry_default_model = state.llm_registry.default_model_id().to_string();
     let shell_model = req
         .model
         .clone()
-        .unwrap_or_else(|| state.llm_registry.default_model_id().to_string());
+        .unwrap_or_else(|| registry_default_model.clone());
+    let intent_model = req.model.clone().unwrap_or_else(|| {
+        if managed_like_preflight {
+            state
+                .llm_registry
+                .cheap_model_id_for_provider(&registry_default_model)
+        } else {
+            registry_default_model.clone()
+        }
+    });
+    let resolved_mode_for_intent = match mode_for_preflight {
+        "auto" if repo_root_for_preflight.is_some() => Some("managed".to_string()),
+        "auto" => Some("direct".to_string()),
+        "direct" => None,
+        other => Some(other.to_string()),
+    };
     // New conversations are pinned to the current global default LLM language.
     // Once set, this conversation (and all its chain continuations / sub-agents)
     // stays in that language even if the global default later changes.
@@ -1852,8 +1884,10 @@ async fn create_conversation_with_id(
 
     let intent = crate::db::ConversationCreationIntent {
         cwd: effective_cwd.clone(),
-        model: Some(shell_model.clone()),
-        text: req.text.clone(),
+        model: Some(intent_model),
+        text: persisted_prompt_text,
+        llm_text: persisted_llm_text,
+        skill_invocation: persisted_skill_invocation,
         message_id: req.message_id.clone(),
         images: req
             .images
@@ -1865,7 +1899,7 @@ async fn create_conversation_with_id(
             })
             .collect(),
         files: req.files.iter().cloned().map(Into::into).collect(),
-        mode: req.mode.clone(),
+        mode: resolved_mode_for_intent,
         base_branch: resolved_base_branch_for_intent.clone(),
         checkout_ref: req.checkout_ref.clone(),
         seed_parent_id: req.seed_parent_id.clone(),
@@ -6300,6 +6334,8 @@ mod conversation_cwd_validation_tests {
                     cwd: tmp.path().to_string_lossy().to_string(),
                     model: None,
                     text: "retry".to_string(),
+                    llm_text: None,
+                    skill_invocation: None,
                     message_id: "msg-existing-shell".to_string(),
                     images: vec![],
                     files: vec![],
@@ -6404,6 +6440,8 @@ mod conversation_cwd_validation_tests {
                     cwd: "/tmp".to_string(),
                     model: None,
                     text: "original".to_string(),
+                    llm_text: None,
+                    skill_invocation: None,
                     message_id: "msg-original".to_string(),
                     images: vec![],
                     files: vec![],
@@ -10168,6 +10206,8 @@ mod attachment_storage_tests {
             cwd: "/tmp".to_string(),
             model: None,
             text: "with attachment".to_string(),
+            llm_text: None,
+            skill_invocation: None,
             message_id: "msg-creation-file".to_string(),
             images: vec![],
             files: vec![crate::db::FileAttachment {
