@@ -118,7 +118,7 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 |---|---|---|---|---|
 | 1 | `continued_in_conv_id` set | `continued` | none | RESOLVE + FINISH suppressed; muted note |
 | 2 | phase ∈ {error, context_exhausted} | `stuck` | `Clean up` or `Abandon` per FINISH sub-table | RESOLVE suppressed |
-| 3 | idle, PR open, message channel available | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed; `Merge on GitHub #N ↗` secondary when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
+| 3 | idle, PR open, backend message submission available | `address_feedback` | **Address feedback** (RESOLVE) | Clean up suppressed; `Merge on GitHub #N ↗` secondary when `check_state = passing` and refresh is fresh; otherwise `Open PR #N ↗` secondary when a PR URL is available |
 | 4 | idle, PR open, `check_state = passing`, affordance disabled | `merge_ready` | **Merge on GitHub #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
 | 5 | idle, PR open/draft, no other RESOLVE matched (draft, or affordance-disabled and not passing) | `pr_open_other` | **Open PR #N ↗** (RESOLVE, GitHub link) | Clean up suppressed |
 | 6 | idle, PR merged | `clean_up_merged` | **Clean up** (FINISH) | — |
@@ -129,7 +129,7 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 | 9 | idle, gh unavailable (no PR identity, refresh = unavailable) | `gh_unavailable` | **Clean up** (FINISH) | warning note; single click |
 
 The **Address feedback** affordance is enabled when Phoenix can post an auto-fix message to
-the conversation: the conversation has a live message channel and the PR is open
+the conversation through the backend-owned message submission path and the PR is open
 (`PrAutoFixAffordance`, `pr-association`). A draft PR is never addressable. A degraded or
 stale refresh changes the secondary link-out from `Merge on GitHub` to `Open PR`; it does not
 replace the primary with a link under the user's pointer.

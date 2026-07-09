@@ -311,7 +311,7 @@ entity PrStatusResult {
     refresh: PrRefreshMetadata
 }
 
--- Observable result of /pr-auto-fix-context.
+-- Observable result of the backend-owned Address feedback operation.
 entity PrAutoFixContextResult {
     conversation: bedrock/Conversation
     scope: WorkScope

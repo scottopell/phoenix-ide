@@ -75,7 +75,7 @@ export interface WorkDispositionInput {
   prLoading: boolean;
   /** Worktree/branch change state, structurally supplied by the backend. */
   workChange: PrStatusResponse['work_change'] | null;
-  /** onSendMessage available — false for stuck bars, gates Address feedback. */
+  /** Backend message submission available — false only when callers deliberately suppress Address feedback. */
   canSendMessage: boolean;
 }
 

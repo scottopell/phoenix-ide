@@ -20,6 +20,5 @@ export interface WorkActionsScenario {
   convModeLabel: string;
   phaseType: string;
   continuedInConvId: string | null;
-  canSendMessage: boolean;
   prState: ConversationPrStatusState;
 }

@@ -280,12 +280,6 @@ export interface PrFeedbackSummary {
   coverage: PrFeedbackCoverage[];
 }
 
-export interface PrAutoFixContextResponse {
-  artifact_path: string;
-  pr_number: number;
-  message: string;
-}
-
 export type PrRefreshState = 'fresh' | 'unavailable' | 'not_found';
 
 export interface PrIdentity {
@@ -372,6 +366,13 @@ export interface PrStatusResponse {
   associated_prs?: AssociatedPrSummaryResponse[];
   active_pr?: ActivePrSelectionResponse;
   latest_observed_branch?: ObservedBranchSummaryResponse;
+}
+
+export interface AddressPrFeedbackResponse {
+  queued: boolean;
+  steering?: boolean;
+  artifact_path: string;
+  pr_number: number;
 }
 
 export interface Project {
@@ -2005,9 +2006,13 @@ export const api = {
     return resp.json();
   },
 
-  async createPrAutoFixContext(conversationId: string): Promise<PrAutoFixContextResponse> {
-    const resp = await fetch(`/api/conversations/${conversationId}/pr-auto-fix-context`, { method: 'POST' });
-    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to capture PR context'); }
+  async addressPrFeedback(conversationId: string, messageId: string): Promise<AddressPrFeedbackResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/address-pr-feedback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message_id: messageId, user_agent: navigator.userAgent }),
+    });
+    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to address PR feedback'); }
     return resp.json();
   },
 

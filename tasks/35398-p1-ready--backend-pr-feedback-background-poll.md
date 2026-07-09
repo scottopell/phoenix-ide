@@ -13,7 +13,7 @@ Today PR association/freshness data is still primarily refreshed by open-time `G
 - Conversation list and conversation payloads expose enough of that persisted snapshot to seed Work Actions and PR badges without waiting for an open-time fetch.
 - Poll failures persist explicit freshness/availability metadata and never block conversation loading.
 - Connected clients are nudged/refreshed when a poll changes a scope's PR snapshot.
-- `create_pr_auto_fix_context` remains the final fresh capture path before sending an auto-fix message.
+- The backend-owned Address feedback operation remains the final fresh capture path before sending an auto-fix message.
 
 ## Implementation notes
 

@@ -277,7 +277,7 @@ describe('idle open/draft — RESOLVE', () => {
     expect(d.resolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
   });
 
-  it('refresh unavailable on a found open PR still addressable when a message channel exists', () => {
+  it('refresh unavailable on a found open PR still addressable when backend message submission exists', () => {
     const d = deriveWorkDisposition(
       input({
         prStatus: foundPr('open', {
@@ -290,11 +290,11 @@ describe('idle open/draft — RESOLVE', () => {
     expect(d.secondaryResolve).toEqual({ kind: 'open_pr', url: PR_URL, number: PR_NUMBER });
   });
 
-  it('merge_pr as primary when open + passing but no message channel (canSendMessage false)', () => {
+  it('merge_pr as primary when open + passing but message submission disabled', () => {
     const d = deriveWorkDisposition(
       input({ canSendMessage: false, prStatus: foundPr('open', { check_state: 'passing' as PrCheckState }) }),
     );
-    // No channel to post an auto-fix message → Address feedback unreachable, so
+    // No backend path to post an auto-fix message → Address feedback unreachable, so
     // the green PR routes to Merge as the primary (no secondary).
     expect(d.primary).toBe('resolve');
     expect(d.resolve).toEqual({ kind: 'merge_pr', url: PR_URL, number: PR_NUMBER });
@@ -331,7 +331,7 @@ describe('idle open/draft — RESOLVE', () => {
     expect(d.secondaryResolve).toBeNull();
   });
 
-  it('open PR missing url/number AND no message channel → safe abandon fallback', () => {
+  it('open PR missing url/number AND message submission disabled → safe abandon fallback', () => {
     const pr = foundPr('open', { check_state: 'passing' as PrCheckState });
     delete pr.url;
     delete pr.number;

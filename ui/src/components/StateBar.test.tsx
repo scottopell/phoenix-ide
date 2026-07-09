@@ -12,7 +12,7 @@ vi.mock('../api', async (importOriginal) => {
     api: {
       ...actual.api,
       getPrStatus: vi.fn(),
-      createPrAutoFixContext: vi.fn(),
+      addressPrFeedback: vi.fn(),
       getConversationUsage: vi.fn(),
     },
   };
@@ -40,10 +40,10 @@ beforeAll(() => {
   vi.clearAllMocks();
   setMobileViewport(false);
   (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue(mockPrStatus({ found: false }));
-  (api.createPrAutoFixContext as ReturnType<typeof vi.fn>).mockResolvedValue({
+  (api.addressPrFeedback as ReturnType<typeof vi.fn>).mockResolvedValue({
+    queued: true,
     artifact_path: '.phoenix/pr-context/pr-12.json',
     pr_number: 12,
-    message: 'Address `.phoenix/pr-context/pr-12.json`',
   });
   (api.getConversationUsage as ReturnType<typeof vi.fn>).mockResolvedValue({
     own: { input_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, output_tokens: 0, turns: 0 },
@@ -310,7 +310,7 @@ describe('StateBar PR badge', () => {
     expect(badge.getAttribute('title')).toContain('Fix CI');
     expect(screen.queryByRole('dialog', { name: /PR CI monitoring/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Auto-fix CI & address comments/i })).not.toBeInTheDocument();
-    expect(api.createPrAutoFixContext).not.toHaveBeenCalled();
+    expect(api.addressPrFeedback).not.toHaveBeenCalled();
   });
   it('shows pinned selector choice and can resume automatic inference', async () => {
     const selection = makeSelection({ active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 12 }, provenance: 'pinned' } });

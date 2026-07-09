@@ -1253,7 +1253,7 @@ pub(crate) async fn create_pr_auto_fix_context(
     let conv = state
         .runtime
         .db()
-        .get_conversation(&id)
+        .get_conversation(id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
@@ -1271,7 +1271,7 @@ pub(crate) async fn create_pr_auto_fix_context(
             branch_name.to_string(),
             worktree_path.to_string(),
             crate::work_scope::WorkScope::resolve(
-                &id,
+                id,
                 Some(std::path::Path::new(worktree_path.as_str())),
             ),
         ),
@@ -1373,7 +1373,7 @@ pub(crate) async fn create_pr_auto_fix_context(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
-    Ok(Json(response?))
+    response
 }
 
 fn validate_pr_auto_fix_artifact_path(artifact_path: &str) -> Result<(), AppError> {

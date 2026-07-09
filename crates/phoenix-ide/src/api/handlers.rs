@@ -3272,41 +3272,101 @@ async fn upload_conversation_attachments(
     Ok(Json(AttachmentUploadResponse { files }))
 }
 
+async fn address_pr_feedback(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AddressPrFeedbackRequest>,
+) -> Result<Json<AddressPrFeedbackResponse>, AppError> {
+    let context = capture_pr_auto_fix_context_for_conversation(&state, &id).await?;
+    let chat = submit_user_message(
+        &state,
+        &id,
+        SubmitUserMessageInput {
+            text: context.message,
+            message_id: req
+                .message_id
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            images: Vec::new(),
+            files: Vec::new(),
+            user_agent: req
+                .user_agent
+                .or_else(|| Some("Phoenix internal Address feedback".to_string())),
+        },
+    )
+    .await?;
+
+    Ok(Json(AddressPrFeedbackResponse {
+        queued: chat.queued,
+        steering: chat.steering,
+        artifact_path: context.artifact_path,
+        pr_number: context.pr_number,
+    }))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn send_chat(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, AppError> {
+    submit_user_message(
+        &state,
+        &id,
+        SubmitUserMessageInput {
+            text: req.text,
+            message_id: req.message_id,
+            images: req.images,
+            files: req.files,
+            user_agent: req.user_agent,
+        },
+    )
+    .await
+    .map(Json)
+}
+
+struct SubmitUserMessageInput {
+    text: String,
+    message_id: String,
+    images: Vec<crate::api::types::ImageAttachment>,
+    files: Vec<crate::api::types::FileAttachment>,
+    user_agent: Option<String>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn submit_user_message(
+    state: &AppState,
+    conversation_id: &str,
+    input: SubmitUserMessageInput,
+) -> Result<ChatResponse, AppError> {
     // Idempotency check: if message_id already exists, return success without creating duplicate
     if state
         .db
-        .message_exists(&req.message_id)
+        .message_exists(&input.message_id)
         .await
         .unwrap_or(false)
     {
         tracing::info!(
-            conversation_id = %id,
-            message_id = %req.message_id,
+            conversation_id = %conversation_id,
+            message_id = %input.message_id,
             "Duplicate message detected, returning success (idempotent)"
         );
-        return Ok(Json(ChatResponse {
+        return Ok(ChatResponse {
             queued: true,
             steering: false,
-        }));
+        });
     }
 
     // Expand `@file` inline references before sending to the LLM (REQ-IR-001, REQ-IR-007)
     let conversation = state
         .runtime
         .db()
-        .get_conversation(&id)
+        .get_conversation(conversation_id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let steering_queue = state
         .runtime
         .db()
-        .get_steering_queue(&id)
+        .get_steering_queue(conversation_id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
@@ -3314,21 +3374,23 @@ async fn send_chat(
     // retry returns the same accepted response without double-enqueuing.
     if steering_queue
         .iter()
-        .any(|e| e.message_id == req.message_id)
+        .any(|e| e.message_id == input.message_id)
     {
-        return Ok(Json(ChatResponse {
+        return Ok(ChatResponse {
             queued: true,
             steering: true,
-        }));
+        });
     }
 
-    let validated_files = validate_submitted_attachments(&id, &req.files).await?;
+    let validated_files = validate_submitted_attachments(conversation_id, &input.files).await?;
 
     // Route using live runtime state when a handle is present; fall back to
     // the DB row for stable rejection states when no handle is active.
     // See specs/bedrock/design.md FM-7 for the full authority rule.
-    let effective_state = if let Some(live_state) =
-        state.runtime.effective_conversation_state(&id).await
+    let effective_state = if let Some(live_state) = state
+        .runtime
+        .effective_conversation_state(conversation_id)
+        .await
     {
         // Live handle present — its state_rx is authoritative.
         live_state
@@ -3358,12 +3420,12 @@ async fn send_chat(
         // runtime so determine_resume_state derives the true initial state.
         let _handle = state
             .runtime
-            .get_or_create(&id)
+            .get_or_create(conversation_id)
             .await
             .map_err(AppError::BadRequest)?;
         state
             .runtime
-            .effective_conversation_state(&id)
+            .effective_conversation_state(conversation_id)
             .await
             .unwrap_or_else(|| conversation.state.clone())
     };
@@ -3390,14 +3452,14 @@ async fn send_chat(
             let resolution_root =
                 crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
             let expanded =
-                crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
+                crate::message_expander::expand(&input.text, &resolution_root).map_err(|e| {
                     AppError::UnprocessableEntity(ExpansionErrorResponse {
                         error: e.to_string(),
                         error_type: e.error_type().to_string(),
                         reference: e.reference(),
                     })
                 })?;
-            let images: Vec<ImageData> = req
+            let images: Vec<ImageData> = input
                 .images
                 .into_iter()
                 .map(|img| ImageData {
@@ -3414,25 +3476,26 @@ async fn send_chat(
                 llm_text: chat_llm_text,
                 images,
                 files,
-                message_id: req.message_id,
-                user_agent: req.user_agent,
+                message_id: input.message_id,
+                user_agent: input.user_agent,
                 skill_invocation: expanded.skill_invocation,
             };
             tracing::info!(
-                conv_id = %id,
+                conv_id = %conversation_id,
                 state = effective_state.variant_name(),
                 "Chat queued as steering message (conversation busy)"
             );
             state
                 .runtime
-                .enqueue_steer_message(&id, steer_event)
+                .enqueue_steer_message(conversation_id, steer_event)
                 .await
                 .map_err(AppError::BadRequest)?;
-            record_pr_auto_fix_context_baseline(state.runtime.db(), &id, &display_text).await?;
-            return Ok(Json(ChatResponse {
+            record_pr_auto_fix_context_baseline(state.runtime.db(), conversation_id, &display_text)
+                .await?;
+            return Ok(ChatResponse {
                 queued: true,
                 steering: true,
-            }));
+            });
         }
 
         let error_type = match err {
@@ -3445,7 +3508,7 @@ async fn send_chat(
             TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
         };
         tracing::info!(
-            conv_id = %id,
+            conv_id = %conversation_id,
             state = effective_state.variant_name(),
             error_type,
             "Chat rejected: conversation state cannot accept UserMessage"
@@ -3457,7 +3520,7 @@ async fn send_chat(
     }
 
     let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
-    let expanded = crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
+    let expanded = crate::message_expander::expand(&input.text, &resolution_root).map_err(|e| {
         AppError::UnprocessableEntity(ExpansionErrorResponse {
             error: e.to_string(),
             error_type: e.error_type().to_string(),
@@ -3466,7 +3529,7 @@ async fn send_chat(
     })?;
 
     // Convert images
-    let images: Vec<ImageData> = req
+    let images: Vec<ImageData> = input
         .images
         .into_iter()
         .map(|img| ImageData {
@@ -3489,22 +3552,22 @@ async fn send_chat(
         llm_text: chat_llm_text,
         images,
         files,
-        message_id: req.message_id,
-        user_agent: req.user_agent,
+        message_id: input.message_id,
+        user_agent: input.user_agent,
         skill_invocation: expanded.skill_invocation,
     };
 
     state
         .runtime
-        .send_event(&id, event)
+        .send_event(conversation_id, event)
         .await
         .map_err(AppError::BadRequest)?;
-    record_pr_auto_fix_context_baseline(state.runtime.db(), &id, &display_text).await?;
+    record_pr_auto_fix_context_baseline(state.runtime.db(), conversation_id, &display_text).await?;
 
-    Ok(Json(ChatResponse {
+    Ok(ChatResponse {
         queued: true,
         steering: false,
-    }))
+    })
 }
 
 async fn cancel_conversation(

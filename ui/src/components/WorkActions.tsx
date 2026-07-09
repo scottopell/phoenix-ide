@@ -5,13 +5,13 @@ import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatu
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
 import { prFeedbackFreshnessLabel, prFeedbackCoverageMarker } from './prBadge';
 import { deriveWorkDisposition } from './workDisposition';
+import { generateUUID } from '../utils/uuid';
 
 interface WorkControlBarProps {
   conversationId: string;
   convModeLabel: string | undefined;
   phaseType: string;
   continuedInConvId: string | null | undefined;
-  onSendMessage?: (text: string) => Promise<void> | void;
   showError?: (message: string) => void;
   prStatusHandle: ConversationPrStatusHandle;
 }
@@ -106,7 +106,6 @@ export function WorkControlBar({
   convModeLabel,
   phaseType,
   continuedInConvId,
-  onSendMessage,
   showError,
   prStatusHandle,
 }: WorkControlBarProps) {
@@ -150,7 +149,7 @@ export function WorkControlBar({
     continuedInConvId,
     prStatus,
     prLoading,
-    canSendMessage: !!onSendMessage,
+    canSendMessage: true,
     workChange: prStatus?.work_change ?? null,
   });
 
@@ -162,14 +161,12 @@ export function WorkControlBar({
   const coverageMarker = prStatus ? prFeedbackCoverageMarker(prStatus) : null;
 
   const handleAddressFeedback = async () => {
-    if (!onSendMessage) return;
     setCapturing(true);
     try {
-      const ctx = await api.createPrAutoFixContext(conversationId);
-      await onSendMessage(ctx.message);
+      await api.addressPrFeedback(conversationId, generateUUID());
       await prStatusHandle.refresh();
     } catch (err) {
-      showError?.(err instanceof Error ? err.message : 'Failed to capture PR context');
+      showError?.(err instanceof Error ? err.message : 'Failed to address PR feedback');
     } finally {
       setCapturing(false);
     }

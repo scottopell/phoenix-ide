@@ -220,6 +220,26 @@ pub struct ChatResponse {
     pub steering: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AddressPrFeedbackRequest {
+    /// Optional caller-provided idempotency key. Browser callers should provide
+    /// one so a retried one-shot Address feedback request cannot double-submit.
+    #[serde(default)]
+    pub message_id: Option<String>,
+    /// Browser user agent for display when the request originated from the UI.
+    #[serde(default)]
+    pub user_agent: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddressPrFeedbackResponse {
+    pub queued: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub steering: bool,
+    pub artifact_path: String,
+    pub pr_number: u64,
+}
+
 /// Response for cancel action.
 ///
 /// `ok` is always true; `no_op` is `true` when the conversation was already

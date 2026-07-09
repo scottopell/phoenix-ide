@@ -64,10 +64,10 @@ cover it:
   (`UnavailableProviderIsNotActionable`).
 - no primary, or a non-open primary → **disabled** with the non-open rejection message.
 
-The auto-fix *context* (`create_context`) refreshes the persisted primary by number
-independently of branch discovery, so branch/HEAD drift does not strand a user who has an
-associated primary. Branch-based discovery is a fallback only when no associated primary
-exists.
+The Address feedback operation refreshes the persisted primary by number independently of branch
+discovery before submitting the generated remediation instruction, so branch/HEAD drift does not
+strand a user who has an associated primary. Branch-based discovery is a fallback only when no
+associated primary exists.
 
 ## PR Feedback Freshness and Baseline (REQ-PRA-001..004)
 
