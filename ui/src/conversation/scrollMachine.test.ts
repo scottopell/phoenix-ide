@@ -171,6 +171,17 @@ describe('scrollMachine', () => {
     expect(result.effects.map((e) => e.type)).not.toContain('snapToLastIndex');
   });
 
+  it('keeps auto-follow for tap-only touches while pinned', () => {
+    let result = reduce(initialScrollMachineState(), measured({ totalHeight: 500, snapshot: snap(500, 100, 400), nowMs: 1000 }));
+    result = reduce(result.state, { type: 'touchStart', nowMs: 1050 });
+    result = reduce(result.state, { type: 'touchEnd', remainingTouches: 0, nowMs: 1060 });
+
+    result = reduce(result.state, measured({ totalHeight: 600, snapshot: snap(600, 100, 400), tailActivity: 'active', nowMs: 1100 }));
+
+    expect(result.effects).toContainEqual({ type: 'snapToLastIndex' });
+    expect(result.effects.map((e) => e.type)).not.toContain('showUnread');
+  });
+
   it('clears unread on at-bottom and jump-to-newest events', () => {
     let result = reduce(initialScrollMachineState(), { type: 'atBottomChanged', atBottom: true });
     expect(result.effects).toEqual([{ type: 'clearUnread' }]);

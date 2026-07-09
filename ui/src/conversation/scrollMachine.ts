@@ -67,6 +67,12 @@ export function initialScrollMachineState(): ScrollMachineState {
   };
 }
 
+function touchGestureTimestamp(state: ScrollMachineState, nowMs: number): number {
+  return state.lastUpwardScrollAt > 0 && nowMs - state.lastUpwardScrollAt < TOUCH_GESTURE_SUPPRESS_MS
+    ? nowMs
+    : state.lastTouchGestureAt;
+}
+
 export function reduceScrollMachine(
   state: ScrollMachineState,
   event: ScrollEvent,
@@ -95,7 +101,7 @@ export function reduceScrollMachine(
           ...state,
           hasUserEngaged: true,
           touchActive: true,
-          lastTouchGestureAt: event.nowMs,
+          lastTouchGestureAt: touchGestureTimestamp(state, event.nowMs),
         },
         effects: [],
       };
@@ -104,7 +110,7 @@ export function reduceScrollMachine(
         state: {
           ...state,
           touchActive: event.remainingTouches > 0,
-          lastTouchGestureAt: event.nowMs,
+          lastTouchGestureAt: touchGestureTimestamp(state, event.nowMs),
         },
         effects: [],
       };
