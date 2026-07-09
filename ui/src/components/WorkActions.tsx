@@ -114,8 +114,17 @@ export function WorkControlBar({
   const [abandoning, setAbandoning] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
+  const [addressMessageId, setAddressMessageId] = useState<string | null>(null);
+  const [addressSubmitted, setAddressSubmitted] = useState(false);
   const isLoading = markingMerged || abandoning;
   const { openDiffFullscreen } = useViewerSlotCommands();
+
+  useEffect(() => {
+    if (addressSubmitted && phaseType !== 'idle') {
+      setAddressSubmitted(false);
+      setAddressMessageId(null);
+    }
+  }, [addressSubmitted, phaseType]);
 
   const prLoading = prStatusHandle.state.status === 'loading';
   const prStatus = prStatusHandle.state.status === 'ready' ? prStatusHandle.state.prStatus : null;
@@ -160,11 +169,16 @@ export function WorkControlBar({
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
   const coverageMarker = prStatus ? prFeedbackCoverageMarker(prStatus) : null;
 
+  const addressLocked = capturing || addressSubmitted;
   const handleAddressFeedback = async () => {
+    if (addressLocked) return;
+    const messageId = addressMessageId ?? generateUUID();
+    if (!addressMessageId) setAddressMessageId(messageId);
     setCapturing(true);
     try {
-      await api.addressPrFeedback(conversationId, generateUUID());
+      await api.addressPrFeedback(conversationId, messageId);
       await prStatusHandle.refresh();
+      setAddressSubmitted(true);
     } catch (err) {
       showError?.(err instanceof Error ? err.message : 'Failed to address PR feedback');
     } finally {
@@ -201,7 +215,12 @@ export function WorkControlBar({
   };
 
   const note = disposition.note;
-  const addressFeedbackLabel = capturing ? `Capturing ${activePrLabel}…` : `Address ${activePrLabel} feedback`;
+  const addressLocked = capturing || addressSubmitted;
+  const addressFeedbackLabel = capturing
+    ? `Capturing ${activePrLabel}…`
+    : addressSubmitted
+      ? `Addressing ${activePrLabel}…`
+      : `Address ${activePrLabel} feedback`;
   const addressFeedbackAriaLabel = canShowPrDiff
     ? `${addressFeedbackLabel}. Review ${activePrLabel} diff separately if needed.`
     : addressFeedbackLabel;
@@ -240,7 +259,7 @@ export function WorkControlBar({
               className={`work-actions-btn work-actions-address${primaryClass('resolve')}`}
               data-testid="address-feedback-button"
               aria-label={addressFeedbackAriaLabel}
-              disabled={capturing}
+              disabled={addressLocked}
               onClick={handleAddressFeedback}
             >
               <span className="work-actions-address-copy">{addressFeedbackLabel}</span>

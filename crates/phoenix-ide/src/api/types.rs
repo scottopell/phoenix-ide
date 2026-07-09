@@ -236,8 +236,10 @@ pub struct AddressPrFeedbackResponse {
     pub queued: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub steering: bool,
-    pub artifact_path: String,
-    pub pr_number: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
 }
 
 /// Response for cancel action.

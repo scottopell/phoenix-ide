@@ -371,8 +371,8 @@ export interface PrStatusResponse {
 export interface AddressPrFeedbackResponse {
   queued: boolean;
   steering?: boolean;
-  artifact_path: string;
-  pr_number: number;
+  artifact_path?: string;
+  pr_number?: number;
 }
 
 export interface Project {

@@ -3277,15 +3277,25 @@ async fn address_pr_feedback(
     Path(id): Path<String>,
     Json(req): Json<AddressPrFeedbackRequest>,
 ) -> Result<Json<AddressPrFeedbackResponse>, AppError> {
+    let message_id = req
+        .message_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if let Some(chat) = preflight_user_message_submission(&state, &id, &message_id).await? {
+        return Ok(Json(AddressPrFeedbackResponse {
+            queued: chat.queued,
+            steering: chat.steering,
+            artifact_path: None,
+            pr_number: None,
+        }));
+    }
+
     let context = capture_pr_auto_fix_context_for_conversation(&state, &id).await?;
     let chat = submit_user_message(
         &state,
         &id,
         SubmitUserMessageInput {
             text: context.message,
-            message_id: req
-                .message_id
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            message_id,
             images: Vec::new(),
             files: Vec::new(),
             user_agent: req
@@ -3298,9 +3308,90 @@ async fn address_pr_feedback(
     Ok(Json(AddressPrFeedbackResponse {
         queued: chat.queued,
         steering: chat.steering,
-        artifact_path: context.artifact_path,
-        pr_number: context.pr_number,
+        artifact_path: Some(context.artifact_path),
+        pr_number: Some(context.pr_number),
     }))
+}
+
+fn transition_error_type(err: &TransitionError) -> &'static str {
+    match err {
+        TransitionError::ContextExhausted => "context_exhausted",
+        TransitionError::ConversationTerminal => "conversation_terminal",
+        TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
+        TransitionError::AwaitingUserResponse => "awaiting_user_response",
+        TransitionError::AgentBusy => "agent_busy",
+        TransitionError::CancellationInProgress => "cancellation_in_progress",
+        TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
+    }
+}
+
+async fn preflight_user_message_submission(
+    state: &AppState,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<Option<ChatResponse>, AppError> {
+    if state.db.message_exists(message_id).await.unwrap_or(false) {
+        return Ok(Some(ChatResponse {
+            queued: true,
+            steering: false,
+        }));
+    }
+
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let steering_queue = state
+        .runtime
+        .db()
+        .get_steering_queue(conversation_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if steering_queue.iter().any(|e| e.message_id == message_id) {
+        return Ok(Some(ChatResponse {
+            queued: true,
+            steering: true,
+        }));
+    }
+
+    let effective_state = if let Some(live_state) = state
+        .runtime
+        .effective_conversation_state(conversation_id)
+        .await
+    {
+        live_state
+    } else {
+        conversation.state.clone()
+    };
+
+    if let Err(err) = check_user_message_acceptable(&effective_state) {
+        let steer = matches!(
+            err,
+            TransitionError::AgentBusy | TransitionError::CancellationInProgress
+        );
+        if steer {
+            const MAX_STEER_QUEUE_DEPTH: usize = 5;
+            if steering_queue.len() >= MAX_STEER_QUEUE_DEPTH {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Steering queue is full; try again once a queued message has been delivered."
+                        .to_string(),
+                    "steering_queue_full",
+                ))));
+            }
+            return Ok(None);
+        }
+
+        let error_type = transition_error_type(&err);
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            err.to_string(),
+            error_type,
+        ))));
+    }
+
+    Ok(None)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3404,15 +3495,7 @@ async fn submit_user_message(
             ) {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     stable_err.to_string(),
-                    match stable_err {
-                        TransitionError::ContextExhausted => "context_exhausted",
-                        TransitionError::ConversationTerminal => "conversation_terminal",
-                        TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
-                        TransitionError::AwaitingUserResponse => "awaiting_user_response",
-                        TransitionError::AgentBusy => "agent_busy",
-                        TransitionError::CancellationInProgress => "cancellation_in_progress",
-                        TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
-                    },
+                    transition_error_type(&stable_err),
                 ))));
             }
         }
@@ -3498,15 +3581,7 @@ async fn submit_user_message(
             });
         }
 
-        let error_type = match err {
-            TransitionError::ContextExhausted => "context_exhausted",
-            TransitionError::ConversationTerminal => "conversation_terminal",
-            TransitionError::AwaitingTaskApproval => "awaiting_task_approval",
-            TransitionError::AwaitingUserResponse => "awaiting_user_response",
-            TransitionError::AgentBusy => "agent_busy",
-            TransitionError::CancellationInProgress => "cancellation_in_progress",
-            TransitionError::InvalidTransition { .. } => "invalid_state_for_message",
-        };
+        let error_type = transition_error_type(&err);
         tracing::info!(
             conv_id = %conversation_id,
             state = effective_state.variant_name(),
