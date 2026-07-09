@@ -1316,8 +1316,11 @@ function ConversationPageContent() {
   const creationFailedPrompt = convStateForChildren.type === 'creation_failed'
     ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
     : null;
+  const creationFailedDraft = convStateForChildren.type === 'creation_failed'
+    ? (localCreateIntent?.prompt ?? null)
+    : null;
   const handleStartOverFromFailedCreation = useCallback(() => {
-    const prompt = creationFailedPrompt;
+    const prompt = creationFailedDraft;
     if (prompt) {
       try {
         localStorage.setItem('phoenix-new-conversation-draft', prompt);
@@ -1326,7 +1329,7 @@ function ConversationPageContent() {
       }
     }
     navigate('/new');
-  }, [creationFailedPrompt, navigate]);
+  }, [creationFailedDraft, navigate]);
 
   useEffect(() => {
     if (convStateForChildren.type === 'provisioning') return;

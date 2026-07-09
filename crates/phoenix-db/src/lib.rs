@@ -2191,14 +2191,17 @@ impl Database {
     pub async fn list_pending_conversation_creation_jobs(
         &self,
     ) -> DbResult<Vec<ConversationCreationJob>> {
+        let stale_cutoff = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
         sqlx::query(
             "SELECT id, conversation_id, message_id, phase, intent_json, error,
                     accepted_at, provisioning_started_at, completed_at, failed_at,
                     created_at, updated_at
              FROM conversation_creation_jobs
-             WHERE phase IN ('accepted', 'provisioning')
+             WHERE phase = 'accepted'
+                OR (phase = 'provisioning' AND updated_at < ?1)
              ORDER BY updated_at ASC",
         )
+        .bind(stale_cutoff)
         .try_map(parse_conversation_creation_job_row)
         .fetch_all(&self.pool)
         .await
