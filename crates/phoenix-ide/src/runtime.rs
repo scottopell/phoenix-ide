@@ -821,6 +821,12 @@ pub struct ConversationMetadataUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,

@@ -149,6 +149,14 @@ CREATE TABLE IF NOT EXISTS conversation_creation_job_files (
 CREATE INDEX IF NOT EXISTS idx_creation_job_files_stored_path
     ON conversation_creation_job_files(stored_path);
 
+CREATE TABLE IF NOT EXISTS conversation_creation_job_images (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS turn_usage (
     id INTEGER PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

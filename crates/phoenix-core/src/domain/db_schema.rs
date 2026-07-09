@@ -377,7 +377,7 @@ pub struct ConversationCreationIntent {
     pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
     #[serde(skip)]
     pub message_id: String,
-    #[serde(default)]
+    #[serde(skip)]
     pub images: Vec<ImageData>,
     #[serde(skip)]
     pub files: Vec<FileAttachment>,

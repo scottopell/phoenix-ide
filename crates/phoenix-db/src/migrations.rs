@@ -196,6 +196,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_conversation_creation_job_files",
         sql: MIGRATION_036,
     },
+    Migration {
+        version: 37,
+        name: "create_conversation_creation_job_images",
+        sql: MIGRATION_037,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -1038,6 +1043,28 @@ WHERE json_type(j.intent_json, '$.files') = 'array'
   AND json_extract(file.value, '$.media_type') IS NOT NULL
   AND json_extract(file.value, '$.size_bytes') IS NOT NULL
   AND json_extract(file.value, '$.stored_path') IS NOT NULL;
+";
+
+const MIGRATION_037: &str = r"
+CREATE TABLE IF NOT EXISTS conversation_creation_job_images (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+
+INSERT OR IGNORE INTO conversation_creation_job_images (
+    job_id, ordinal, media_type, data
+)
+SELECT j.id,
+       image.key,
+       json_extract(image.value, '$.media_type'),
+       json_extract(image.value, '$.data')
+FROM conversation_creation_jobs j, json_each(j.intent_json, '$.images') AS image
+WHERE json_type(j.intent_json, '$.images') = 'array'
+  AND json_extract(image.value, '$.media_type') IS NOT NULL
+  AND json_extract(image.value, '$.data') IS NOT NULL;
 ";
 
 /// Run all pending migrations against the database.
@@ -1907,6 +1934,27 @@ mod tests {
         assert!(
             columns.iter().any(|c| c == "stored_path"),
             "Expected conversation_creation_job_files table to exist after migration 36; got {columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_037_creates_creation_job_images_table() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> =
+            sqlx::query("PRAGMA table_info(conversation_creation_job_images)")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<String, _>("name"))
+                .collect();
+        assert!(
+            columns.iter().any(|c| c == "data"),
+            "Expected conversation_creation_job_images table to exist after migration 37; got {columns:?}"
         );
     }
 

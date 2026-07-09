@@ -381,6 +381,28 @@ async fn insert_creation_job_files_tx(
     Ok(())
 }
 
+async fn insert_creation_job_images_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    job: &InsertConversationCreationJob,
+) -> DbResult<()> {
+    for (ordinal, image) in job.intent.images.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| DbError::Serialization("image ordinal exceeds i64".to_string()))?;
+        sqlx::query(
+            "INSERT INTO conversation_creation_job_images (
+                job_id, ordinal, media_type, data
+             ) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&job.id)
+        .bind(ordinal)
+        .bind(&image.media_type)
+        .bind(&image.data)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
@@ -1892,6 +1914,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         insert_creation_job_files_tx(&mut tx, job).await?;
+        insert_creation_job_images_tx(&mut tx, job).await?;
         tx.commit().await?;
         self.get_conversation_creation_job(&job.id).await
     }
@@ -2000,6 +2023,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         insert_creation_job_files_tx(&mut tx, job).await?;
+        insert_creation_job_images_tx(&mut tx, job).await?;
 
         tx.commit().await?;
         let title = schema::title_from_slug(&actual_slug);
@@ -2126,6 +2150,34 @@ impl Database {
                     media_type: row.get("media_type"),
                     size_bytes,
                     stored_path: row.get("stored_path"),
+                })
+            })
+            .collect()
+    }
+
+    /// Load normalized image attachments for a creation job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the query fails.
+    pub async fn get_conversation_creation_job_images(
+        &self,
+        job_id: &str,
+    ) -> DbResult<Vec<ImageData>> {
+        let rows = sqlx::query(
+            "SELECT media_type, data
+             FROM conversation_creation_job_images
+             WHERE job_id = ?1
+             ORDER BY ordinal ASC",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ImageData {
+                    media_type: row.get("media_type"),
+                    data: row.get("data"),
                 })
             })
             .collect()

@@ -4,11 +4,12 @@ use crate::api::handlers::{
     ManagedWorktreeError,
 };
 use crate::db::{
-    ConvMode, ConversationCreationMetadataUpdate, ConversationCreationPhase, ErrorKind, ImageData,
+    ConvMode, ConversationCreationMetadataUpdate, ConversationCreationPhase, ErrorKind,
     NonEmptyString,
 };
 use crate::runtime::{ConversationMetadataUpdate, EvictionReason, RuntimeManager, SseEvent};
 use crate::state_machine::{ConvState, Event};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -343,10 +344,44 @@ async fn provision_conversation(
         }
     }
 
+    let files = manager
+        .db()
+        .get_conversation_creation_job_files(&job.id)
+        .await
+        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
+    let images = manager
+        .db()
+        .get_conversation_creation_job_images(&job.id)
+        .await
+        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
+
     let seed_title = intent.seed_label.clone().filter(|s| !s.trim().is_empty());
-    let generated_title = if seed_title.is_none() && !intent.text.trim().is_empty() {
+    let mut title_source = intent.text.trim().to_string();
+    if !images.is_empty() {
+        if !title_source.is_empty() {
+            title_source.push('\n');
+        }
+        let _ = write!(
+            title_source,
+            "{} image attachment{}",
+            images.len(),
+            if images.len() == 1 { "" } else { "s" }
+        );
+    }
+    if !files.is_empty() {
+        if !title_source.is_empty() {
+            title_source.push('\n');
+        }
+        let _ = write!(
+            title_source,
+            "{} file attachment{}",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        );
+    }
+    let generated_title = if seed_title.is_none() && !title_source.is_empty() {
         if let Some(cheap_model) = manager.model_registry().get_cheap_model() {
-            crate::title_generator::generate_title(&intent.text, cheap_model).await
+            crate::title_generator::generate_title(&title_source, cheap_model).await
         } else {
             None
         }
@@ -404,6 +439,9 @@ async fn provision_conversation(
                 slug: Some(persisted_slug.clone()),
                 title: persisted_title.clone(),
                 cwd: Some(effective_cwd.clone()),
+                project_id: persisted_conversation.project_id.clone(),
+                project_name: None,
+                updated_at: Some(persisted_conversation.updated_at.to_rfc3339()),
                 branch_name: conv_mode.branch_name().map(ToString::to_string),
                 worktree_path: conv_mode.worktree_path().map(ToString::to_string),
                 conv_mode_label: Some(conv_mode.label().to_string()),
@@ -421,14 +459,9 @@ async fn provision_conversation(
         });
     }
 
-    let files = manager
-        .db()
-        .get_conversation_creation_job_files(&job.id)
-        .await
-        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
     let seeded_empty = (intent.seed_parent_id.is_some() || intent.seed_label.is_some())
         && intent.text.trim().is_empty()
-        && intent.images.is_empty()
+        && images.is_empty()
         && files.is_empty();
 
     if seeded_empty {
@@ -475,7 +508,6 @@ async fn provision_conversation(
         let llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
         (expanded.display_text, llm_text, expanded.skill_invocation)
     };
-    let images: Vec<ImageData> = intent.images.clone();
     let message_id = job.message_id.clone().ok_or_else(|| {
         (
             "creation job missing initial message_id".to_string(),

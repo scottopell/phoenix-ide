@@ -858,9 +858,20 @@ async fn inject_creation_job_state_fields(
         .await
         .map(|files| files.len())
         .unwrap_or(0);
+    let image_count = state
+        .runtime
+        .db()
+        .get_conversation_creation_job_images(&job.id)
+        .await
+        .map(|images| images.len())
+        .unwrap_or(0);
     state_obj.insert(
         "prompt".to_string(),
-        Value::String(creation_intent_display_text(&job.intent, file_count)),
+        Value::String(creation_intent_display_text(
+            &job.intent,
+            image_count,
+            file_count,
+        )),
     );
     if let Some(error) = job.error {
         state_obj.insert("message".to_string(), Value::String(error));
@@ -869,6 +880,7 @@ async fn inject_creation_job_state_fields(
 
 fn creation_intent_display_text(
     intent: &crate::db::ConversationCreationIntent,
+    image_count: usize,
     file_count: usize,
 ) -> String {
     let mut parts = Vec::new();
@@ -876,11 +888,11 @@ fn creation_intent_display_text(
     if !text.is_empty() {
         parts.push(text.to_string());
     }
-    if !intent.images.is_empty() {
+    if image_count > 0 {
         parts.push(format!(
             "{} image attachment{}",
-            intent.images.len(),
-            if intent.images.len() == 1 { "" } else { "s" }
+            image_count,
+            if image_count == 1 { "" } else { "s" }
         ));
     }
     if file_count > 0 {
@@ -2901,8 +2913,18 @@ async fn stream_conversation(
                 .await
                 .map(|files| files.len())
                 .unwrap_or(0);
-            init_conversation.creation_prompt =
-                Some(creation_intent_display_text(&job.intent, file_count));
+            let image_count = state
+                .runtime
+                .db()
+                .get_conversation_creation_job_images(&job.id)
+                .await
+                .map(|images| images.len())
+                .unwrap_or(0);
+            init_conversation.creation_prompt = Some(creation_intent_display_text(
+                &job.intent,
+                image_count,
+                file_count,
+            ));
             init_conversation.creation_error = job.error;
         }
     }
