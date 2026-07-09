@@ -2634,17 +2634,21 @@ async fn get_system_prompt(
 fn snapshot_pending_for_stream(
     broadcast_tx: &crate::runtime::SseBroadcaster,
     query: &StreamConversationQuery,
-) -> (i64, bool, i64, Vec<SseEvent>) {
+) -> (i64, bool, i64, Vec<SseEvent>, bool) {
     if let Some(after_event_sequence) = query.after_event_sequence {
-        broadcast_tx
-            .snapshot_pending_after(after_event_sequence)
-            .unwrap_or_else(|| {
-                let server_tip = broadcast_tx.current_seq();
-                broadcast_tx.observe_seq(after_event_sequence.min(server_tip));
-                broadcast_tx.snapshot_pending()
-            })
+        if let Some((anchor, truncated, highest, events)) =
+            broadcast_tx.snapshot_pending_after(after_event_sequence)
+        {
+            (anchor, truncated, highest, events, true)
+        } else {
+            let server_tip = broadcast_tx.current_seq();
+            broadcast_tx.observe_seq(after_event_sequence.min(server_tip));
+            let (anchor, truncated, highest, events) = broadcast_tx.snapshot_pending();
+            (anchor, truncated, highest, events, false)
+        }
     } else {
-        broadcast_tx.snapshot_pending()
+        let (anchor, truncated, highest, events) = broadcast_tx.snapshot_pending();
+        (anchor, truncated, highest, events, false)
     }
 }
 
@@ -2700,10 +2704,15 @@ async fn stream_conversation(
     // Snapshot the ReplayRing before the DB message read. The later DB read is
     // the durable catch-up for any persisted Message that commits before init is
     // constructed; live SSE covers events that commit after that read.
-    let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
-        snapshot_pending_for_stream(&broadcast_tx, &query);
+    let (
+        pending_anchor_sequence_id,
+        pending_truncated,
+        highest_pending_seq,
+        pending_events,
+        cursor_replay_served,
+    ) = snapshot_pending_for_stream(&broadcast_tx, &query);
 
-    let messages = if query.after_event_sequence.is_some() {
+    let messages = if cursor_replay_served {
         Vec::new()
     } else {
         state
@@ -2713,7 +2722,7 @@ async fn stream_conversation(
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?
     };
-    let highest_message_seq = if query.after_event_sequence.is_some() {
+    let highest_message_seq = if cursor_replay_served {
         last_sequence_id
     } else {
         messages.iter().map(|m| m.sequence_id).max().unwrap_or(0)
@@ -2724,7 +2733,7 @@ async fn stream_conversation(
     );
     broadcast_tx.observe_seq(init_seq);
 
-    let context_window_size = if query.after_event_sequence.is_some() {
+    let context_window_size = if cursor_replay_served {
         state
             .runtime
             .db()
@@ -6588,16 +6597,22 @@ pub(crate) mod hard_delete_cascade_tests {
             })
             .expect("token-b");
 
-        let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
-            snapshot_pending_for_stream(
-                &handle.broadcast_tx,
-                &StreamConversationQuery {
-                    after_event_sequence: Some(persisted.sequence_id + 1),
-                    after_sequence: Some(999_999),
-                },
-            );
+        let (
+            pending_anchor_sequence_id,
+            pending_truncated,
+            highest_pending_seq,
+            pending_events,
+            cursor_replay_served,
+        ) = snapshot_pending_for_stream(
+            &handle.broadcast_tx,
+            &StreamConversationQuery {
+                after_event_sequence: Some(persisted.sequence_id + 1),
+                after_sequence: Some(999_999),
+            },
+        );
 
         assert!(!pending_truncated);
+        assert!(cursor_replay_served);
         assert_eq!(highest_pending_seq, persisted.sequence_id + 2);
         assert_eq!(pending_anchor_sequence_id, persisted.sequence_id);
         assert_eq!(

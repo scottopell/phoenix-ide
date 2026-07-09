@@ -24,14 +24,21 @@ const testConversation: Conversation = {
   work_scope_key: 'conversation:conv-1',
 };
 
-function makeMessage(sequenceId: number, messageType: 'user' | 'agent' = 'agent'): Message {
+function makeMessage(
+  sequenceId: number,
+  messageTypeOrOverrides: 'user' | 'agent' | Partial<Message> = 'agent',
+): Message {
+  const overrides = typeof messageTypeOrOverrides === 'string'
+    ? { message_type: messageTypeOrOverrides }
+    : messageTypeOrOverrides;
   return {
     message_id: `msg-${sequenceId}`,
     sequence_id: sequenceId,
     conversation_id: 'conv-1',
-    message_type: messageType,
+    message_type: 'agent',
     content: { text: `message ${sequenceId}` } as Message['content'],
     created_at: '2024-01-01T00:00:00Z',
+    ...overrides,
   };
 }
 
@@ -1919,6 +1926,7 @@ describe('conversationReducer', () => {
         conversation: testConversation,
         messages: [makeMessage(1)],
         phase: { type: 'llm_requesting', attempt: 1 },
+        phaseLastAppliedEventSeq: 9,
         lastAppliedEventSeq: 10,
       };
       const next = dispatch(atom, {
@@ -1932,6 +1940,52 @@ describe('conversationReducer', () => {
       });
 
       expect(next.phase).toEqual({ type: 'llm_requesting', attempt: 1 });
+    });
+
+    it('merge_conversation_data accepts authoritative phase when only a cached cursor was seeded', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        phase: { type: 'idle' },
+        lastAppliedEventSeq: 10,
+      };
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(2)],
+        phase: { type: 'llm_requesting', attempt: 1 },
+        contextWindow: { used: 0 },
+        eventCursorFloor: 10,
+      });
+
+      expect(next.phase).toEqual({ type: 'llm_requesting', attempt: 1 });
+    });
+
+    it('merge_conversation_data preserves live-patched messages over stale REST rows', () => {
+      const liveMessage = makeMessage(1, { display_data: { duration_ms: 123 } });
+      const staleRestMessage = makeMessage(1);
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [liveMessage],
+        pendingMessagePatches: {
+          [liveMessage.message_id]: { lastAppliedPatchEventSeq: 7, patches: [] },
+        },
+      };
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [staleRestMessage],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+      });
+
+      expect(next.messages[0]).toEqual(liveMessage);
     });
 
     it('is a no-op if SSE data already present', () => {

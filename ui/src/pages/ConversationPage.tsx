@@ -593,7 +593,7 @@ function ConversationPageContent() {
             const result = await api.getConversationBySlug(slug);
             if (!cancelled) {
               dispatch({
-                type: atomRef.current.lastAppliedEventSeq > 0 ? 'merge_conversation_data' : 'set_initial_data',
+                type: eventCursorRef.current > 0 ? 'merge_conversation_data' : 'set_initial_data',
                 conversationId: result.conversation.id,
                 conversation: result.conversation,
                 messages: result.messages,
@@ -644,7 +644,7 @@ function ConversationPageContent() {
     return () => {
       cancelled = true;
     };
-  }, [slug, navigate, dispatch]);
+  }, [slug, navigate, dispatch, eventCursorRef]);
 
   useEffect(() => {
     if (!slug || !conversationId || archiveStatusConfirmed || !isConnected) return;
@@ -655,7 +655,7 @@ function ConversationPageContent() {
         const result = await api.getConversationBySlug(slug);
         if (cancelled) return;
         dispatch({
-          type: atomRef.current.lastAppliedEventSeq > 0 ? 'merge_conversation_data' : 'set_initial_data',
+          type: eventCursorRef.current > 0 ? 'merge_conversation_data' : 'set_initial_data',
           conversationId: result.conversation.id,
           conversation: result.conversation,
           messages: result.messages,
@@ -682,7 +682,7 @@ function ConversationPageContent() {
     return () => {
       cancelled = true;
     };
-  }, [slug, conversationId, archiveStatusConfirmed, isConnected, dispatch]);
+  }, [slug, conversationId, archiveStatusConfirmed, isConnected, dispatch, eventCursorRef]);
 
   // Fetch system prompt once when conversationId is known
   useEffect(() => {

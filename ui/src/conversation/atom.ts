@@ -70,6 +70,7 @@ export interface ConversationAtom {
   conversationId: string | null;
   conversation: Conversation | null;
   phase: ConversationState;
+  phaseLastAppliedEventSeq: number;
   messages: Message[];
   contextWindow: { used: number };
   systemPrompt: string | null;
@@ -355,6 +356,7 @@ export function createInitialAtom(): ConversationAtom {
     conversationId: null,
     conversation: null,
     phase: { type: 'idle' },
+    phaseLastAppliedEventSeq: 0,
     messages: [],
     contextWindow: { used: 0 },
     systemPrompt: null,
@@ -428,11 +430,12 @@ function withDerivedMessageSyncState(atom: ConversationAtom, messages: Message[]
   return { ...atom, messages, ...deriveMessageSyncState(messages) };
 }
 
-function mergeMessagesByIdentity(existing: Message[], incoming: Message[]): Message[] {
+function mergeMessagesByIdentity(existing: Message[], incoming: Message[], preserveExistingMessageIds = new Set<string>()): Message[] {
   const byMessageId = new Map<string, Message>();
   const bySequenceId = new Map<number, Message>();
 
   const upsert = (message: Message) => {
+    if (preserveExistingMessageIds.has(message.message_id) && byMessageId.has(message.message_id)) return;
     const priorByMessageId = byMessageId.get(message.message_id);
     if (priorByMessageId) bySequenceId.delete(priorByMessageId.sequence_id);
     const priorBySequenceId = bySequenceId.get(message.sequence_id);
@@ -600,6 +603,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       return {
         ...atom,
         phase,
+        phaseLastAppliedEventSeq: action.sequenceId,
         phaseStateUpdatedAt: action.stateUpdatedAt,
         firstByteRequestId: null,
         toolExecutingStartedAt: action.phase.type === 'tool_executing' ? Date.now() : null,
@@ -609,6 +613,7 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
       return {
         ...atom,
         phase: { type: 'idle' },
+        phaseLastAppliedEventSeq: action.sequenceId,
         streamingBuffer: null,
         firstByteRequestId: null,
         turnRetryContext: null,
@@ -1082,6 +1087,7 @@ export function conversationReducer(
         conversationId: p.conversation.id,
         conversation: p.conversation,
         phase: p.phase,
+        phaseLastAppliedEventSeq: 0,
         contextWindow: p.contextWindow,
         lastAppliedEventSeq: phase1Floor,
         bufferedEventEnvelopes: {},
@@ -1250,27 +1256,35 @@ export function conversationReducer(
         conversation: action.conversation,
         messages: action.messages,
         phase: action.phase,
+        phaseLastAppliedEventSeq: 0,
         contextWindow: action.contextWindow,
         transcriptGeneration: action.transcriptGeneration ?? action.conversation.transcript_generation ?? 1,
         lastAppliedEventSeq: Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0),
       };
 
-    case 'merge_conversation_data':
+    case 'merge_conversation_data': {
       if (atom.conversationId !== null && atom.conversationId !== action.conversationId) return atom;
-      const messages = mergeMessagesByIdentity(atom.messages, action.messages);
+      const livePatchedMessageIds = new Set(
+        Object.entries(atom.pendingMessagePatches)
+          .filter(([, pending]) => pending.lastAppliedPatchEventSeq > 0)
+          .map(([messageId]) => messageId),
+      );
+      const messages = mergeMessagesByIdentity(atom.messages, action.messages, livePatchedMessageIds);
       const lastAppliedEventSeq = Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0);
       const merged: ConversationAtom = {
         ...atom,
         conversationId: action.conversationId,
         conversation: action.conversation,
         messages,
-        phase: atom.lastAppliedEventSeq > 0 ? atom.phase : action.phase,
+        phase: atom.phaseLastAppliedEventSeq > 0 ? atom.phase : action.phase,
+        phaseLastAppliedEventSeq: atom.phaseLastAppliedEventSeq,
         contextWindow: action.contextWindow,
         transcriptGeneration: action.transcriptGeneration ?? action.conversation.transcript_generation ?? atom.transcriptGeneration ?? 1,
         lastAppliedEventSeq,
         ...deriveMessageSyncState(messages),
       };
       return lastAppliedEventSeq > atom.lastAppliedEventSeq ? drainBufferedEventEnvelopes(merged) : merged;
+    }
 
     case 'set_system_prompt':
       if (action.expectedConversationId !== atom.conversationId) return atom;
