@@ -326,6 +326,31 @@ struct PhoenixAPI: Sendable {
             as: SuccessResponse.self)
     }
 
+    // Task approval (awaiting_task_approval): the server 400s when the
+    // conversation isn't in that state — e.g. another client decided first.
+
+    func approveTask(conversationId: String) async throws {
+        struct ApprovalResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/approve-task", body: [:],
+            as: ApprovalResponse.self)
+    }
+
+    func rejectTask(conversationId: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/reject-task", body: [:],
+            as: SuccessResponse.self)
+    }
+
+    func sendTaskFeedback(conversationId: String, annotations: String) async throws {
+        struct SuccessResponse: Codable { var success: Bool? }
+        _ = try await post(
+            "api/conversations/\(conversationId)/task-feedback",
+            body: ["annotations": annotations],
+            as: SuccessResponse.self)
+    }
+
     func validateCwd(path: String) async throws -> ValidateCwdResponse {
         try await get(
             "api/validate-cwd",

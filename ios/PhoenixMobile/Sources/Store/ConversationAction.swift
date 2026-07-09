@@ -28,6 +28,14 @@ enum ConversationAction: Equatable {
     /// Clear a user-resumable error state so the conversation accepts
     /// input again. The server 409s for non-resumable errors.
     case dismissError
+    /// Approve the proposed task plan (awaiting_task_approval only; the
+    /// server 400s otherwise, e.g. when another client already decided).
+    case approveTask
+    /// Reject the proposed task plan.
+    case rejectTask
+    /// Send the plan back with free-text change requests; the agent
+    /// revises and re-proposes.
+    case provideTaskFeedback(annotations: String)
 
     enum DeliveryPolicy {
         case onlineOnly
@@ -37,6 +45,11 @@ enum ConversationAction: Equatable {
     var policy: DeliveryPolicy {
         switch self {
         case .cancel, .dismissError:
+            return .onlineOnly
+        case .approveTask, .rejectTask, .provideTaskFeedback:
+            // Approval decides live server state; a queued stale decision
+            // replayed later (possibly after someone decided differently
+            // from the web UI) must never fire.
             return .onlineOnly
         }
     }

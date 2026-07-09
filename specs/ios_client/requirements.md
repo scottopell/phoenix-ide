@@ -325,3 +325,30 @@ THE SYSTEM SHALL surface the server's explanation
 stale intent — an archive or cancel replayed minutes later can destroy
 work the user did in between. Only idempotency-keyed sends are safe to
 defer; the type forces each new action to make that choice explicitly.
+
+---
+
+### REQ-IOS-013: Task Approval
+
+WHEN a conversation is awaiting task approval
+THE SYSTEM SHALL render the proposed task's title, priority, and plan
+(plan collapsed with an expand affordance)
+AND offer approve, reject (with confirmation), and free-text
+request-changes resolutions
+
+WHEN a resolution is submitted
+THE SYSTEM SHALL send it as an online-only action (REQ-IOS-012)
+AND rely on the server's resulting state change to clear the card rather
+than optimistic local state
+SO THAT a decision made concurrently from another client wins cleanly and
+this client simply observes the state move on
+
+WHEN the device is offline or a resolution is in flight
+THE SYSTEM SHALL disable the resolution controls
+AND, when offline, state that approval is never queued
+
+**Rationale:** Plan approval is the highest-value blocking decision to
+make away from the desk. The no-optimistic-state rule matters because
+approval is multi-client: the server 400s a decision on an
+already-decided plan, which surfaces as an explanatory error instead of a
+silent double-apply.

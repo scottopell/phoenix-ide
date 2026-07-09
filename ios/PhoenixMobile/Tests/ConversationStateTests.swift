@@ -65,10 +65,10 @@ final class ConversationStateTests: XCTestCase {
             .awaitingUserResponse(questionCount: 2, firstQuestion: "Which db?"))
     }
 
-    func testAwaitingTaskApprovalCarriesTitle() {
+    func testAwaitingTaskApprovalCarriesTitlePriorityPlan() {
         XCTAssertEqual(
-            parse("{\"type\":\"awaiting_task_approval\",\"title\":\"Fix login\",\"priority\":\"p1\",\"plan\":\"...\"}"),
-            .awaitingTaskApproval(title: "Fix login"))
+            parse("{\"type\":\"awaiting_task_approval\",\"title\":\"Fix login\",\"priority\":\"p1\",\"plan\":\"1. do it\"}"),
+            .awaitingTaskApproval(title: "Fix login", priority: "p1", plan: "1. do it"))
     }
 
     func testErrorCarriesMessage() {

@@ -27,7 +27,7 @@ enum ConversationState: Equatable {
     case toolExecuting(toolName: String, remainingCount: Int, completedCount: Int)
     case awaitingSubAgents(pendingCount: Int, completedCount: Int)
     case awaitingUserResponse(questionCount: Int, firstQuestion: String?)
-    case awaitingTaskApproval(title: String)
+    case awaitingTaskApproval(title: String, priority: String, plan: String)
     case error(message: String)
     case contextExhausted
     /// Covers `cancelling`, `cancelling_tool`, `cancelling_sub_agents`.
@@ -68,7 +68,10 @@ enum ConversationState: Equatable {
                 questionCount: questions.count,
                 firstQuestion: questions.first?["question"]?.stringValue)
         case "awaiting_task_approval":
-            return .awaitingTaskApproval(title: json["title"]?.stringValue ?? "")
+            return .awaitingTaskApproval(
+                title: json["title"]?.stringValue ?? "",
+                priority: json["priority"]?.stringValue ?? "",
+                plan: json["plan"]?.stringValue ?? "")
         case "error":
             return .error(message: json["message"]?.stringValue ?? "Unknown error")
         case "context_exhausted":
