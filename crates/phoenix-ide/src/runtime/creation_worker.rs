@@ -31,12 +31,16 @@ async fn process_job(
     job: crate::db::ConversationCreationJob,
 ) -> Result<(), String> {
     let conv_id = job.conversation_id.clone();
-    if manager
-        .db()
-        .message_exists(&job.intent.message_id)
-        .await
-        .map_err(|e| e.to_string())?
-    {
+    let message_already_exists = if let Some(message_id) = job.message_id.as_deref() {
+        manager
+            .db()
+            .message_exists(message_id)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        false
+    };
+    if message_already_exists {
         manager
             .db()
             .mark_conversation_creation_job_complete(&job.id)
@@ -417,10 +421,16 @@ async fn provision_conversation(
         });
     }
 
+    let files = manager
+        .db()
+        .get_conversation_creation_job_files(&job.id)
+        .await
+        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
     let seeded_empty = (intent.seed_parent_id.is_some() || intent.seed_label.is_some())
         && intent.text.trim().is_empty()
         && intent.images.is_empty()
-        && intent.files.is_empty();
+        && files.is_empty();
+
     if seeded_empty {
         manager
             .db()
@@ -447,9 +457,7 @@ async fn provision_conversation(
         return Ok(ProvisionOutcome::SeededEmpty);
     }
 
-    let (display_text, llm_text, skill_invocation) = if intent.llm_text.is_some()
-        || intent.skill_invocation.is_some()
-    {
+    let (display_text, llm_text, skill_invocation) = if intent.expansion_preflighted {
         (
             intent.text.clone(),
             intent.llm_text.clone(),
@@ -468,21 +476,21 @@ async fn provision_conversation(
         (expanded.display_text, llm_text, expanded.skill_invocation)
     };
     let images: Vec<ImageData> = intent.images.clone();
-    let files = intent.files.clone();
+    let message_id = job.message_id.clone().ok_or_else(|| {
+        (
+            "creation job missing initial message_id".to_string(),
+            ErrorKind::ServerError,
+        )
+    })?;
     let event = Event::UserMessage {
         text: display_text,
         llm_text,
         images,
         files,
-        message_id: intent.message_id.clone(),
+        message_id,
         user_agent: None,
         skill_invocation,
     };
-    manager
-        .db()
-        .update_conversation_state(&job.conversation_id, &ConvState::Idle)
-        .await
-        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
     manager
         .evict_runtime(&job.conversation_id, EvictionReason::CreationProvisioned)
         .await;

@@ -3766,9 +3766,13 @@ where
                         message_id = %message_id,
                         "Skipping PersistMessage; message already exists"
                     );
-                    self.storage
+                    if let Err(e) = self
+                        .storage
                         .mark_creation_job_complete_for_message(&message_id)
-                        .await?;
+                        .await
+                    {
+                        tracing::warn!(message_id = %message_id, error = %e, "failed to mark creation job complete after duplicate message persist");
+                    }
                     return Ok(None);
                 }
 
@@ -3786,9 +3790,13 @@ where
                     .await?;
 
                 // Broadcast to clients (display_data already computed at effect creation)
-                self.storage
+                if let Err(e) = self
+                    .storage
                     .mark_creation_job_complete_for_message(&message_id)
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(message_id = %message_id, error = %e, "failed to mark creation job complete after durable message persist");
+                }
 
                 let _ = self.broadcast_tx.send_message(msg);
                 Ok(None)

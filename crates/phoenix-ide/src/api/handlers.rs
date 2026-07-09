@@ -1706,6 +1706,7 @@ async fn create_conversation_with_id(
     let worktree_backed = matches!(mode_for_preflight, "managed" | "branch")
         || (mode_for_preflight == "auto" && repo_root_for_preflight.is_some());
     let persisted_prompt_text = req.text.clone();
+    let mut expansion_preflighted = false;
     let mut persisted_llm_text = None;
     let mut persisted_skill_invocation = None;
     if !worktree_backed && !req.text.trim().is_empty() {
@@ -1719,6 +1720,7 @@ async fn create_conversation_with_id(
                     reference: e.reference(),
                 })
             })?;
+        expansion_preflighted = true;
         persisted_llm_text =
             (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
         persisted_skill_invocation = expanded.skill_invocation;
@@ -1886,6 +1888,7 @@ async fn create_conversation_with_id(
         cwd: effective_cwd.clone(),
         model: Some(intent_model),
         text: persisted_prompt_text,
+        expansion_preflighted,
         llm_text: persisted_llm_text,
         skill_invocation: persisted_skill_invocation,
         message_id: req.message_id.clone(),
@@ -6334,6 +6337,7 @@ mod conversation_cwd_validation_tests {
                     cwd: tmp.path().to_string_lossy().to_string(),
                     model: None,
                     text: "retry".to_string(),
+                    expansion_preflighted: false,
                     llm_text: None,
                     skill_invocation: None,
                     message_id: "msg-existing-shell".to_string(),
@@ -6440,6 +6444,7 @@ mod conversation_cwd_validation_tests {
                     cwd: "/tmp".to_string(),
                     model: None,
                     text: "original".to_string(),
+                    expansion_preflighted: false,
                     llm_text: None,
                     skill_invocation: None,
                     message_id: "msg-original".to_string(),
@@ -10206,6 +10211,7 @@ mod attachment_storage_tests {
             cwd: "/tmp".to_string(),
             model: None,
             text: "with attachment".to_string(),
+            expansion_preflighted: false,
             llm_text: None,
             skill_invocation: None,
             message_id: "msg-creation-file".to_string(),

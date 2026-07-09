@@ -2095,6 +2095,42 @@ impl Database {
         .map_err(DbError::Sqlx)
     }
 
+    /// Load normalized file attachments for a creation job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the query fails or a stored size is invalid.
+    pub async fn get_conversation_creation_job_files(
+        &self,
+        job_id: &str,
+    ) -> DbResult<Vec<FileAttachment>> {
+        let rows = sqlx::query(
+            "SELECT original_name, media_type, size_bytes, stored_path
+             FROM conversation_creation_job_files
+             WHERE job_id = ?1
+             ORDER BY ordinal ASC",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let size = row.get::<i64, _>("size_bytes");
+                let size_bytes = u64::try_from(size).map_err(|_| {
+                    DbError::Serialization(
+                        "negative attachment size in creation job file".to_string(),
+                    )
+                })?;
+                Ok(FileAttachment {
+                    original_name: row.get("original_name"),
+                    media_type: row.get("media_type"),
+                    size_bytes,
+                    stored_path: row.get("stored_path"),
+                })
+            })
+            .collect()
+    }
+
     /// List accepted/provisioning creation jobs in processing order.
     ///
     /// # Errors
@@ -2190,16 +2226,14 @@ impl Database {
     ///
     /// Returns [`DbError`] if the update fails or `job_id` does not exist.
     pub async fn mark_conversation_creation_job_complete(&self, job_id: &str) -> DbResult<()> {
-        let job = self.get_conversation_creation_job(job_id).await?;
         let cleared_intent = serde_json::json!({
             "cwd": "",
             "model": null,
             "text": "",
+            "expansion_preflighted": false,
             "llm_text": null,
             "skill_invocation": null,
-            "message_id": job.message_id,
             "images": [],
-            "files": [],
             "mode": null,
             "base_branch": null,
             "checkout_ref": null,
