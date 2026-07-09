@@ -49,12 +49,9 @@ struct StateDetailView: View {
                 detail: firstQuestion,
                 footnote: "Answer from the web UI — responding here isn't supported yet.")
 
-        case .awaitingTaskApproval(let title):
-            needsActionCard(
-                icon: "checklist",
-                title: "Task plan awaiting approval",
-                detail: title.isEmpty ? nil : title,
-                footnote: "Review and approve from the web UI.")
+        case .awaitingTaskApproval(let title, let priority, let plan):
+            TaskApprovalCard(
+                session: session, title: title, priority: priority, plan: plan)
 
         case .error(let message):
             errorCard(message: message)
@@ -180,5 +177,134 @@ struct StateDetailView: View {
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+}
+
+/// Task plan approval — the first fully in-app blocking decision
+/// (REQ-IOS-013). Reviews the proposed title/priority/plan and resolves it
+/// with approve, reject, or free-text change requests. All three routes
+/// are online-only ConversationActions: the card never queues a decision,
+/// and the server's SSE state_change (not optimistic local state) clears
+/// it — so a decision made concurrently from the web UI wins cleanly and
+/// this client just sees the state move on.
+struct TaskApprovalCard: View {
+    @Environment(AppModel.self) private var model
+    let session: ConversationSession
+    let title: String
+    let priority: String
+    let plan: String
+
+    @State private var planExpanded = false
+    @State private var showFeedbackField = false
+    @State private var feedbackText = ""
+    @State private var confirmReject = false
+
+    private var busy: Bool { session.actionInFlight != nil }
+    private var actionable: Bool { model.connectivity.isOnline && !busy }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Label("Task plan awaiting approval", systemImage: "checklist")
+                    .font(.callout.bold())
+                Spacer()
+                if busy {
+                    ProgressView().controlSize(.small)
+                }
+            }
+
+            HStack(spacing: 6) {
+                Text(title.isEmpty ? "(untitled task)" : title)
+                    .font(.callout)
+                    .lineLimit(2)
+                if !priority.isEmpty {
+                    Text(priority)
+                        .font(.caption2.monospaced().bold())
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.blue.opacity(0.15))
+                        .clipShape(Capsule())
+                }
+            }
+
+            if !plan.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(plan)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(planExpanded ? nil : 4)
+                        .textSelection(.enabled)
+                    Button(planExpanded ? "Show less" : "Show full plan") {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            planExpanded.toggle()
+                        }
+                    }
+                    .font(.caption.bold())
+                }
+            }
+
+            if showFeedbackField {
+                TextField("What should change?", text: $feedbackText, axis: .vertical)
+                    .lineLimit(2...5)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout)
+            }
+
+            HStack(spacing: 10) {
+                Button("Reject", role: .destructive) {
+                    confirmReject = true
+                }
+                .disabled(!actionable)
+
+                Button(showFeedbackField ? "Send changes" : "Request changes") {
+                    if showFeedbackField {
+                        let text = feedbackText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !text.isEmpty else { return }
+                        session.perform(.provideTaskFeedback(annotations: text))
+                        feedbackText = ""
+                        showFeedbackField = false
+                    } else {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            showFeedbackField = true
+                        }
+                    }
+                }
+                .disabled(!actionable
+                    || (showFeedbackField
+                        && feedbackText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+
+                Spacer()
+
+                Button("Approve") {
+                    session.perform(.approveTask)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!actionable)
+            }
+            .font(.callout)
+
+            if !model.connectivity.isOnline {
+                Text("Offline — approval needs a connection and is never queued.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.blue.opacity(0.1))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.blue.opacity(0.35), lineWidth: 0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .confirmationDialog(
+            "Reject this task plan?",
+            isPresented: $confirmReject, titleVisibility: .visible
+        ) {
+            Button("Reject plan", role: .destructive) {
+                session.perform(.rejectTask)
+            }
+        }
     }
 }

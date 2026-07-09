@@ -203,10 +203,16 @@ final class ConversationSession {
         }
     }
 
+    /// The action currently being executed, or nil. Views use this to
+    /// disable controls and show progress — approval buttons especially
+    /// must not double-fire.
+    private(set) var actionInFlight: ConversationAction?
+
     /// Execute a session-scoped action per its declared delivery policy
     /// (ConversationAction). Online-only actions fail fast with a toast
     /// when offline — deliberately not queued, see the policy doc.
     func perform(_ action: ConversationAction) {
+        guard actionInFlight == nil else { return }
         switch action.policy {
         case .onlineOnly:
             guard connectivity.isOnline else {
@@ -216,14 +222,25 @@ final class ConversationSession {
         case .outboxed:
             break  // never blocked on connectivity by definition
         }
+        actionInFlight = action
         Task {
+            defer { actionInFlight = nil }
             do {
                 switch action {
                 case .cancel:
                     _ = try await api.cancel(conversationId: conversationId)
                 case .dismissError:
                     try await api.dismissError(conversationId: conversationId)
+                case .approveTask:
+                    try await api.approveTask(conversationId: conversationId)
+                case .rejectTask:
+                    try await api.rejectTask(conversationId: conversationId)
+                case .provideTaskFeedback(let annotations):
+                    try await api.sendTaskFeedback(
+                        conversationId: conversationId, annotations: annotations)
                 }
+                // Success needs no local state change: the server emits the
+                // resulting state_change over SSE and the reducer applies it.
             } catch {
                 lastErrorToast = (error as? APIError)?.errorDescription
                     ?? error.localizedDescription
