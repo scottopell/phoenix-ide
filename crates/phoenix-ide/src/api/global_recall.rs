@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use super::handlers::AppError;
 
@@ -23,6 +24,10 @@ const SEARCH_TOP_K: usize = 10;
 const READ_PAGE_CHARS: usize = 7000;
 const MAX_RECALL_TURNS: usize = 6;
 const ANSWER_MAX_TOKENS: u32 = 3072;
+const READ_MESSAGE_BATCH: i64 = 64;
+
+static RECALL_SESSION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Serialize)]
 pub struct GlobalOpenWorkResponse {
@@ -203,6 +208,8 @@ pub async fn ask_session(
         return Err(AppError::BadRequest("question is required".to_string()));
     }
     let _session = load_session(&state, &id).await?;
+    let session_lock = recall_session_lock(&id)?;
+    let _guard = session_lock.lock().await;
     let answer = run_global_recall_agent(&state, &id, question).await?;
     let (user_message, assistant_message) =
         insert_recall_turn(&state, &id, question, &answer).await?;
@@ -217,6 +224,16 @@ pub async fn resolve_reference(
     Json(req): Json<ResolveGlobalReferenceRequest>,
 ) -> Result<Json<ResolveGlobalReferenceResponse>, AppError> {
     Ok(Json(resolve_reference_impl(&state, &req.reference).await?))
+}
+
+fn recall_session_lock(session_id: &str) -> Result<Arc<tokio::sync::Mutex<()>>, AppError> {
+    let mut locks = RECALL_SESSION_LOCKS.lock().map_err(|_| {
+        AppError::Internal("Global Recall session lock registry is poisoned".to_string())
+    })?;
+    Ok(locks
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone())
 }
 
 async fn build_open_work(state: &AppState) -> Result<GlobalOpenWorkResponse, AppError> {
@@ -724,15 +741,11 @@ async fn execute_global_tool(
             if query.is_empty() {
                 return ("error: query is required".to_string(), true);
             }
-            match global_index_is_fresh(state).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return (
-                        "search unavailable: the global message index is still warming; try again after startup reconciliation completes".to_string(),
-                        true,
-                    );
-                }
-                Err(e) => return (format!("error: index freshness check failed: {e}"), true),
+            if !global_index_is_fresh(state) {
+                return (
+                    "search unavailable: the global message index is still warming; try again after startup reconciliation completes".to_string(),
+                    true,
+                );
             }
             match state
                 .message_retriever
@@ -765,8 +778,8 @@ async fn execute_global_tool(
             )
             .unwrap_or(0);
             match state.db.get_conversation(&conv_id).await {
-                Ok(conv) => match state.db.get_messages(&conv_id).await {
-                    Ok(messages) => (read_conversation_page(&conv, &messages, cursor), false),
+                Ok(conv) => match read_conversation_page(&state.db, &conv, cursor).await {
+                    Ok(page) => (page, false),
                     Err(e) => (format!("error: read failed: {e}"), true),
                 },
                 Err(e) => (format!("error: conversation not found: {e}"), true),
@@ -832,15 +845,8 @@ async fn resolve_conversation_reference_to_id(
     }
 }
 
-async fn global_index_is_fresh(state: &AppState) -> Result<bool, crate::db::RetrievalError> {
-    if !state.message_retriever.index_reconciled() {
-        return Ok(false);
-    }
-    let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM conversations")
-        .fetch_all(state.db.pool())
-        .await
-        .map_err(crate::db::RetrievalError::Db)?;
-    state.message_retriever.is_fresh_for(&ids).await
+fn global_index_is_fresh(state: &AppState) -> bool {
+    state.message_retriever.index_reconciled()
 }
 
 async fn format_global_search_hits(state: &AppState, hits: &[crate::db::RetrievedChunk]) -> String {
@@ -878,11 +884,11 @@ async fn format_global_search_hits(state: &AppState, hits: &[crate::db::Retrieve
     out
 }
 
-fn read_conversation_page(
+async fn read_conversation_page(
+    db: &crate::db::Database,
     conv: &Conversation,
-    messages: &[crate::db::Message],
     cursor: usize,
-) -> String {
+) -> Result<String, DbError> {
     let mut header = format!(
         "Conversation @conv:{} — {}\nlink: {}\nupdated: {}\n---\n",
         conv.id,
@@ -893,43 +899,61 @@ fn read_conversation_page(
         conversation_href(conv),
         conv.updated_at
     );
-    let body = render_message_page(conv, messages, cursor);
+    let body = render_message_page(db, conv, cursor).await?;
     header.push_str(&body);
-    header
+    Ok(header)
 }
 
-fn render_message_page(
+async fn render_message_page(
+    db: &crate::db::Database,
     conv: &Conversation,
-    messages: &[crate::db::Message],
     cursor: usize,
-) -> String {
+) -> Result<String, DbError> {
     let end = cursor.saturating_add(READ_PAGE_CHARS);
     let mut out = String::new();
     let mut pos = 0usize;
     let mut has_more = false;
-    'outer: for message in messages {
-        if message_is_hidden(message) {
-            continue;
+    let mut after_sequence = 0;
+    loop {
+        let messages = db
+            .get_messages_after_limited(&conv.id, after_sequence, READ_MESSAGE_BATCH)
+            .await?;
+        if messages.is_empty() {
+            break;
         }
-        let line = render_global_message_line(conv, message);
-        for ch in line.chars() {
-            if pos >= end {
-                has_more = true;
-                break 'outer;
+        for message in messages {
+            after_sequence = message.sequence_id;
+            if message_is_hidden(&message) {
+                continue;
             }
-            if pos >= cursor {
-                out.push(ch);
+            let line = render_global_message_line(conv, &message);
+            for ch in line.chars() {
+                if pos >= end {
+                    has_more = true;
+                    break;
+                }
+                if pos >= cursor {
+                    out.push(ch);
+                }
+                pos += 1;
             }
-            pos += 1;
+            if has_more {
+                break;
+            }
+        }
+        if has_more {
+            break;
         }
     }
     if out.is_empty() && !has_more {
-        return "(end of conversation)".to_string();
+        return Ok("(end of conversation)".to_string());
     }
     if has_more {
-        format!("{out}\n[… more content; call read_conversation again with cursor={end}]")
+        Ok(format!(
+            "{out}\n[… more content; call read_conversation again with cursor={end}]"
+        ))
     } else {
-        out
+        Ok(out)
     }
 }
 
@@ -1193,15 +1217,16 @@ async fn resolve_message(
     conv: Conversation,
     message_id: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
-    let messages = state
+    let message = state
         .db
-        .get_messages(&conv.id)
+        .get_message_by_id(message_id)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let message = messages
-        .into_iter()
-        .find(|m| m.message_id == message_id)
-        .ok_or_else(|| AppError::NotFound("message reference target not found".to_string()))?;
+        .map_err(|_| AppError::NotFound("message reference target not found".to_string()))?;
+    if message.conversation_id != conv.id {
+        return Err(AppError::NotFound(
+            "message reference target not found".to_string(),
+        ));
+    }
     if message_is_hidden(&message) {
         return Err(AppError::NotFound(
             "message reference target not found".to_string(),
