@@ -2930,6 +2930,15 @@ where
                 self.state_updated_at,
             )
             .await?;
+        if !matches!(self.state, ConvState::Provisioning { .. }) {
+            if let Err(e) = self
+                .storage
+                .mark_creation_job_complete_for_conversation(&self.context.conversation_id)
+                .await
+            {
+                tracing::warn!(conv_id = %self.context.conversation_id, error = %e, "failed to mark creation job complete after state persistence");
+            }
+        }
 
         if broadcast {
             let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
@@ -3766,13 +3775,6 @@ where
                         message_id = %message_id,
                         "Skipping PersistMessage; message already exists"
                     );
-                    if let Err(e) = self
-                        .storage
-                        .mark_creation_job_complete_for_message(&message_id)
-                        .await
-                    {
-                        tracing::warn!(message_id = %message_id, error = %e, "failed to mark creation job complete after duplicate message persist");
-                    }
                     return Ok(None);
                 }
 
@@ -3790,14 +3792,6 @@ where
                     .await?;
 
                 // Broadcast to clients (display_data already computed at effect creation)
-                if let Err(e) = self
-                    .storage
-                    .mark_creation_job_complete_for_message(&message_id)
-                    .await
-                {
-                    tracing::warn!(message_id = %message_id, error = %e, "failed to mark creation job complete after durable message persist");
-                }
-
                 let _ = self.broadcast_tx.send_message(msg);
                 Ok(None)
             }

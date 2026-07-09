@@ -2258,17 +2258,17 @@ impl Database {
         Ok(())
     }
 
-    /// Mark the creation job for an initial message complete after that message is durable.
+    /// Mark the creation job for a conversation complete after state leaves provisioning.
     ///
     /// # Errors
     ///
     /// Returns [`DbError`] if the lookup or completion update fails.
-    pub async fn mark_conversation_creation_job_complete_for_message(
+    pub async fn mark_conversation_creation_job_complete_for_conversation(
         &self,
-        message_id: &str,
+        conversation_id: &str,
     ) -> DbResult<()> {
         if let Some(job) = self
-            .get_conversation_creation_job_for_message(message_id)
+            .get_conversation_creation_job_for_conversation(conversation_id)
             .await?
         {
             if matches!(

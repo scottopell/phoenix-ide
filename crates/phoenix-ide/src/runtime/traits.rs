@@ -82,10 +82,10 @@ pub trait MessageStore: Send + Sync {
     /// recovery (re-drain after partial steering-queue drain).
     async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
 
-    /// Mark a pending async creation job complete after its initial message is durable.
-    async fn mark_creation_job_complete_for_message(
+    /// Mark a pending async creation job complete after the conversation state leaves provisioning.
+    async fn mark_creation_job_complete_for_conversation(
         &self,
-        _message_id: &str,
+        _conversation_id: &str,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -362,9 +362,12 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).message_exists(message_id).await
     }
 
-    async fn mark_creation_job_complete_for_message(&self, message_id: &str) -> Result<(), String> {
+    async fn mark_creation_job_complete_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), String> {
         (**self)
-            .mark_creation_job_complete_for_message(message_id)
+            .mark_creation_job_complete_for_conversation(conversation_id)
             .await
     }
 
@@ -659,9 +662,12 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
-    async fn mark_creation_job_complete_for_message(&self, message_id: &str) -> Result<(), String> {
+    async fn mark_creation_job_complete_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), String> {
         self.db
-            .mark_conversation_creation_job_complete_for_message(message_id)
+            .mark_conversation_creation_job_complete_for_conversation(conversation_id)
             .await
             .map_err(|e| e.to_string())
     }

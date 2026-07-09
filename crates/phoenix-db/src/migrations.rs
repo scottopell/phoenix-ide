@@ -1205,7 +1205,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 34);
+        assert_eq!(first as usize, MIGRATIONS.len());
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
