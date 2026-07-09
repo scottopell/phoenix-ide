@@ -152,6 +152,20 @@ describe('scrollMachine', () => {
     expect(result.effects).toContainEqual({ type: 'showUnread' });
   });
 
+  it('keeps moved-touch suppression when at-bottom fires before touch end', () => {
+    let result = reduce(initialScrollMachineState(), measured({ totalHeight: 500, snapshot: snap(500, 100, 400), nowMs: 1000 }));
+    result = reduce(result.state, { type: 'scroll', snapshot: snap(500, 100, 400), nowMs: 1000 });
+
+    result = reduce(result.state, { type: 'touchStart' });
+    result = reduce(result.state, { type: 'touchMove', nowMs: 1050 });
+    result = reduce(result.state, { type: 'atBottomChanged', atBottom: true });
+    result = reduce(result.state, { type: 'touchEnd', remainingTouches: 0, nowMs: 1060 });
+    result = reduce(result.state, measured({ totalHeight: 600, snapshot: snap(600, 95, 400), tailActivity: 'active', nowMs: 1100 }));
+
+    expect(result.effects.map((e) => e.type)).not.toContain('snapToLastIndex');
+    expect(result.effects).toContainEqual({ type: 'showUnread' });
+  });
+
   it('does not suppress on downward scroll', () => {
     let result = reduce(initialScrollMachineState(), measured({ totalHeight: 500, snapshot: snap(500, 50, 400), nowMs: 1000 }));
     result = reduce(result.state, { type: 'wheel', deltaY: 50, nowMs: 1100 });

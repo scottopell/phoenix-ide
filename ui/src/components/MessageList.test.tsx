@@ -1302,6 +1302,53 @@ describe('handleTotalListHeightChanged', () => {
     }
   });
 
+  it('does NOT re-snap when at-bottom fires during a moved touch before touch end', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const subAgentsState: ConversationState = {
+        type: 'awaiting_sub_agents',
+        pending: [],
+        completed_results: [],
+      };
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={subAgentsState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-atbottom-during-touchmove"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      vi.setSystemTime(1000);
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      fireEvent.scroll(scroller);
+      act(() => virtuosoMock.totalListHeightChanged?.(500));
+      virtuosoMock.scrollToIndex.mockClear();
+
+      vi.setSystemTime(1050);
+      fireEvent.touchStart(scroller, { touches: [{}] });
+      vi.setSystemTime(1060);
+      fireEvent.touchMove(scroller, { touches: [{}] });
+      act(() => virtuosoMock.atBottomStateChange?.(true));
+      vi.setSystemTime(1070);
+      fireEvent.touchEnd(scroller, { touches: [] });
+      vi.setSystemTime(1100);
+      setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(600));
+
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+
   it('downward scroll does not suppress the pinned re-snap', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const { container } = render(

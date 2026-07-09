@@ -129,9 +129,18 @@ rule ScrollerAttachmentResetsGestureTracking {
             policy.phase = unmeasured
 }
 
-rule AtBottomClearsUnreadAndSuppression {
+rule AtBottomDuringActiveTouchPreservesTouchSuppression {
     when: AtBottomChanged(policy, at_bottom)
     requires: at_bottom = true
+    requires: policy.touch_active = true
+    ensures: policy.last_upward_scroll_at = 0
+    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
+}
+
+rule AtBottomAfterTouchClearsUnreadAndSuppression {
+    when: AtBottomChanged(policy, at_bottom)
+    requires: at_bottom = true
+    requires: policy.touch_active = false
     ensures: policy.touch_moved_after_start = false
     ensures: policy.last_upward_scroll_at = 0
     ensures: policy.last_touch_gesture_at = 0

@@ -91,7 +91,12 @@ export function reduceScrollMachine(
     case 'atBottomChanged':
       return event.atBottom
         ? {
-          state: { ...state, lastUpwardScrollAt: 0, lastTouchGestureAt: 0, touchMovedAfterStart: false },
+          state: {
+            ...state,
+            lastUpwardScrollAt: 0,
+            lastTouchGestureAt: state.touchActive ? state.lastTouchGestureAt : 0,
+            touchMovedAfterStart: state.touchActive ? state.touchMovedAfterStart : false,
+          },
           effects: [{ type: 'clearUnread' }],
         }
         : { state, effects: [] };
