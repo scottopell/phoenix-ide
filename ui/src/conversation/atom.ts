@@ -13,6 +13,7 @@ import {
   SseConversationUpdateDataSchema,
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
+  SseRateLimitSnapshotDataSchema,
   SseWorkScopeUpdateDataSchema,
   SseErrorDataSchema,
 } from '../sseSchemas';
@@ -341,6 +342,7 @@ export type SSEAction =
       phase: ConversationState;
       contextWindow: { used: number };
       transcriptGeneration: number;
+      eventCursorFloor?: number;
     }
   | {
       type: 'set_system_prompt';
@@ -956,10 +958,29 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
       // useConnection.ts; no reducer action needed (no-op). Schema drift
       // still warns in DEV so a Rust-side wire change surfaces here.
       const res = v.safeParse(SseSteerMessageQueuedDataSchema, entry);
-      if (!res.success && import.meta.env.DEV) {
-        console.warn('[sse] dropping malformed pending steer_message_queued entry', { issues: res.issues });
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending steer_message_queued entry', { issues: res.issues });
+        }
+        return atom;
       }
-      return atom;
+      return conversationReducer(atom, {
+        type: 'sse_sequence_consumed',
+        sequenceId: res.output.sequence_id,
+      });
+    }
+    case 'rate_limit_snapshot': {
+      const res = v.safeParse(SseRateLimitSnapshotDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending rate_limit_snapshot entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_sequence_consumed',
+        sequenceId: res.output.sequence_id,
+      });
     }
     case 'error': {
       const res = v.safeParse(SseErrorDataSchema, entry);
@@ -1245,6 +1266,7 @@ export function conversationReducer(
         phase: action.phase,
         contextWindow: action.contextWindow,
         transcriptGeneration: action.transcriptGeneration,
+        lastAppliedEventSeq: Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0),
         ...deriveMessageSyncState(messages),
       };
 

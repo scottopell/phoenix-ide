@@ -511,9 +511,9 @@ function ConversationPageContent() {
 
           if (hasCachedMessages && cachedConversationId) {
             try {
-              const maxSequenceId = await cacheDB.getMaxMessageSequenceId(cachedConversationId);
-              if (maxSequenceId !== null) {
-                let nextAfterSequence = maxSequenceId;
+              const mergedTranscriptTail = latestMessageSequenceId(cachedMessages);
+              if (mergedTranscriptTail !== null) {
+                let nextAfterSequence = mergedTranscriptTail;
                 let mergedMessages = cachedMessages;
                 let latestServerTail: number | null = null;
                 let latestTranscriptGeneration = cached?.transcript_generation ?? 1;
@@ -577,6 +577,7 @@ function ConversationPageContent() {
                       : { type: 'idle' },
                     contextWindow: { used: metadata.context_window_size || 0 },
                     transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
+                    eventCursorFloor: latestServerTail ?? mergedLatestSequenceId ?? 0,
                   });
                 }
                 return;
