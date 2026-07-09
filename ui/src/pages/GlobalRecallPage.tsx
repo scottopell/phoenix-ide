@@ -45,8 +45,8 @@ export function GlobalRecallPage() {
     Promise.all([api.getGlobalOpenWork(), api.listGlobalRecallSessions()])
       .then(([work, rows]) => {
         setOpenWork(work);
-        setSessions(rows);
-        setActiveSessionId(rows[0]?.id ?? null);
+        setSessions((prev) => (prev.length > 0 ? prev : rows));
+        setActiveSessionId((prev) => prev ?? rows[0]?.id ?? null);
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
