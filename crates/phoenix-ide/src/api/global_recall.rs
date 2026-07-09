@@ -355,6 +355,9 @@ async fn project_item_from_members(
     };
     let mut signals = item_signals(current, members.len(), now);
     let task_status = task_status_for(current).await?;
+    if task_status.as_deref().is_some_and(is_closed_task_status) {
+        return Ok(None);
+    }
     if let Some(status) = &task_status {
         if matches!(status.as_str(), "in-progress" | "ready" | "blocked") {
             signals.push(format!("task {status}"));
@@ -436,8 +439,20 @@ fn item_signals(conv: &Conversation, member_count: usize, now: DateTime<Utc>) ->
     signals
 }
 
+fn is_closed_task_status(status: &str) -> bool {
+    matches!(status, "done" | "wont-do")
+}
+
 fn should_suppress_item(conv: &Conversation, member_count: usize, now: DateTime<Utc>) -> bool {
     if conv.archived || !conv.user_initiated {
+        return true;
+    }
+    if matches!(conv.state, ConvState::Terminal)
+        && matches!(
+            conv.conv_mode,
+            ConvMode::Work { .. } | ConvMode::Branch { .. }
+        )
+    {
         return true;
     }
     let old = now.signed_duration_since(conv.updated_at).num_days() > RECENT_DAYS;
@@ -1069,7 +1084,13 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
 fn format_open_work_for_agent(view: &GlobalOpenWorkResponse) -> String {
     let mut out = String::new();
     for group in &view.groups {
-        let _ = writeln!(out, "Project: {}", group.project_name);
+        let _ = writeln!(
+            out,
+            "Project: {} id {} path {}",
+            group.project_name,
+            group.project_id.as_deref().unwrap_or("none"),
+            group.canonical_path.as_deref().unwrap_or("none")
+        );
         for item in &group.items {
             let _ = writeln!(
                 out,
@@ -1277,6 +1298,15 @@ async fn resolve_chain(
             "chain reference target not found".to_string(),
         ));
     }
+    let member_refs = members
+        .iter()
+        .map(|member| format!("@conv:{member}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let current = members.last().map_or_else(
+        || format!("@conv:{root_id}"),
+        |member| format!("@conv:{member}"),
+    );
     Ok(ResolveGlobalReferenceResponse {
         kind: "chain".to_string(),
         id: root_id.to_string(),
@@ -1287,8 +1317,10 @@ async fn resolve_chain(
             .or(root.title.clone())
             .or(root.slug.clone()),
         summary: format!(
-            "chain rooted at @conv:{root_id} with {} member(s)",
-            members.len()
+            "chain rooted at @conv:{root_id} with {} member(s); current/latest {}; ordered members: {}",
+            members.len(),
+            current,
+            member_refs
         ),
     })
 }
