@@ -253,12 +253,16 @@ impl MessageRetriever for Fts5Retriever {
         };
 
         let mut sql = String::from(
-            "SELECT message_id, chunk_ordinal, conversation_id, message_type, created_at, \
+            "SELECT message_fts.message_id, message_fts.chunk_ordinal, message_fts.conversation_id, \
+             message_fts.message_type, message_fts.created_at, \
              snippet(message_fts, 0, '', '', '…', 24) AS snippet, bm25(message_fts) AS score \
-             FROM message_fts WHERE message_fts MATCH ?",
+             FROM message_fts \
+             JOIN messages source ON source.message_id = message_fts.message_id \
+             WHERE message_fts MATCH ? \
+               AND COALESCE(json_extract(source.display_data, '$.hidden'), 0) != 1",
         );
         if !scope_ids.is_empty() {
-            sql.push_str(" AND conversation_id IN (");
+            sql.push_str(" AND message_fts.conversation_id IN (");
             for i in 0..scope_ids.len() {
                 if i > 0 {
                     sql.push(',');
@@ -682,6 +686,40 @@ mod tests {
             .unwrap();
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].message_id, "m2");
+    }
+
+    #[tokio::test]
+    async fn hidden_messages_are_excluded_even_when_already_indexed() {
+        let db = seed().await;
+        db.add_message(
+            "hidden-1",
+            "c-a",
+            &MessageContent::user("confidential recovery artifact"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let retriever = Fts5Retriever::new(db.pool().clone());
+        assert_eq!(
+            retriever
+                .retrieve("confidential recovery", RetrievalScope::Global, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        db.update_message_display_data("hidden-1", &serde_json::json!({ "hidden": true }))
+            .await
+            .unwrap();
+
+        assert!(retriever
+            .retrieve("confidential recovery", RetrievalScope::Global, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

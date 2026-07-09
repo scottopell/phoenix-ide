@@ -66,6 +66,10 @@ THE SYSTEM SHALL expose the current/latest conversation for the chain
 THE SYSTEM SHALL NOT show non-leaf chain members as separate open work items
 when they are already represented by the chain item
 
+WHEN historical chain members are archived
+THE SYSTEM SHALL preserve the original chain root as the work-item identity if
+the latest conversation still has positive open-work evidence
+
 **Rationale:** A continuation chain is the user's unit of work. Listing every
 member separately creates clutter and makes old chain members look like
 independent active work.
@@ -82,8 +86,18 @@ THE signals SHALL cover the item source, recent activity, work or branch mode,
 active or attention-needing runtime state, task status when available, and
 multi-member chain membership when applicable
 
-THE SYSTEM SHALL suppress archived conversations and conversations that were
-not initiated by the user
+THE SYSTEM SHALL include a Work-mode item only when its task status is
+`in-progress`, `ready`, or `blocked`, or when its runtime state is active,
+recovery-like, or attention-needing
+
+THE SYSTEM SHALL include an otherwise-idle Direct, Explore, or Branch item only
+when it was updated within 14 days
+
+THE SYSTEM SHALL suppress completed, failed, handed-off, terminal, archived,
+and non-user-initiated current conversations
+
+IF a Work-mode task status is unavailable
+THE SYSTEM SHALL NOT treat recency alone as evidence that the work remains open
 
 **Rationale:** The user needs confidence that the global list is not magic.
 Explicit signals turn the projection into an auditable triage view.
@@ -114,6 +128,11 @@ handle that can be copied or cited
 
 THE reference syntax SHALL distinguish chains, conversations, and open work
 items
+
+WHEN an open work item later closes or becomes archived
+THE SYSTEM SHALL continue to resolve its previously issued work-item reference
+to the durable source identity and SHALL report its current open, closed, or
+archived status
 
 THE navigation targets SHALL be app-relative so deployment hostnames and
 browser gateways do not determine reference validity

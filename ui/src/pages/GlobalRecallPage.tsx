@@ -10,14 +10,18 @@ const MARKDOWN_COMPONENTS = { a: ConversationMarkdownAnchor };
 
 export function GlobalRecallPage() {
   const [openWork, setOpenWork] = useState<GlobalOpenWorkResponse | null>(null);
+  const [openWorkLoadingMore, setOpenWorkLoadingMore] = useState(false);
   const [sessions, setSessions] = useState<GlobalRecallSession[]>([]);
+  const [sessionsHaveMore, setSessionsHaveMore] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<GlobalRecallMessage[]>([]);
+  const [olderMessageCursor, setOlderMessageCursor] = useState<number | null>(null);
   const [question, setQuestion] = useState('');
   const [loading, setLoading] = useState(true);
   const [asking, setAsking] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [copiedReference, setCopiedReference] = useState<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -25,16 +29,21 @@ export function GlobalRecallPage() {
   }, [activeSessionId]);
 
   const refreshOpenWork = useCallback(() => {
+    setError(null);
     api.getGlobalOpenWork()
-      .then(setOpenWork)
+      .then((work) => {
+        setOpenWork(work);
+        setError(null);
+      })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, []);
 
   const refreshSessions = useCallback(async () => {
     try {
-      const rows = await api.listGlobalRecallSessions();
-      setSessions(rows);
-      setActiveSessionId((prev) => prev ?? rows[0]?.id ?? null);
+      const page = await api.listGlobalRecallSessions();
+      setSessions(page.sessions);
+      setSessionsHaveMore(page.has_more);
+      setActiveSessionId((prev) => prev ?? page.sessions[0]?.id ?? null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -43,10 +52,12 @@ export function GlobalRecallPage() {
   useEffect(() => {
     setLoading(true);
     Promise.all([api.getGlobalOpenWork(), api.listGlobalRecallSessions()])
-      .then(([work, rows]) => {
+      .then(([work, page]) => {
         setOpenWork(work);
-        setSessions((prev) => (prev.length > 0 ? prev : rows));
-        setActiveSessionId((prev) => prev ?? rows[0]?.id ?? null);
+        setSessions((prev) => (prev.length > 0 ? prev : page.sessions));
+        setSessionsHaveMore(page.has_more);
+        setActiveSessionId((prev) => prev ?? page.sessions[0]?.id ?? null);
+        setError(null);
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
@@ -54,6 +65,7 @@ export function GlobalRecallPage() {
 
   useEffect(() => {
     setMessages([]);
+    setOlderMessageCursor(null);
     if (!activeSessionId) {
       setSessionLoading(false);
       return;
@@ -65,6 +77,8 @@ export function GlobalRecallPage() {
       .then((res) => {
         if (!cancelled && requestedSessionId === activeSessionId) {
           setMessages(res.messages);
+          setOlderMessageCursor(res.older_cursor);
+          setError(null);
           setSessionLoading(false);
         }
       })
@@ -84,6 +98,47 @@ export function GlobalRecallPage() {
     [openWork],
   );
 
+  const loadMoreOpenWork = async () => {
+    if (!openWork || !openWork.has_more || openWorkLoadingMore) return;
+    setOpenWorkLoadingMore(true);
+    setError(null);
+    try {
+      const page = await api.getGlobalOpenWork(itemCount);
+      setOpenWork((prev) => prev ? {
+        generated_at: page.generated_at,
+        has_more: page.has_more,
+        groups: mergeOpenWorkGroups(prev.groups, page.groups),
+      } : page);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setOpenWorkLoadingMore(false);
+    }
+  };
+
+  const loadMoreSessions = async () => {
+    setError(null);
+    try {
+      const page = await api.listGlobalRecallSessions(sessions.length);
+      setSessions((prev) => [...prev, ...page.sessions.filter((row) => !prev.some((p) => p.id === row.id))]);
+      setSessionsHaveMore(page.has_more);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const loadOlderMessages = async () => {
+    if (!activeSessionId || olderMessageCursor === null) return;
+    setError(null);
+    try {
+      const page = await api.getGlobalRecallSession(activeSessionId, olderMessageCursor);
+      setMessages((prev) => [...page.messages, ...prev]);
+      setOlderMessageCursor(page.older_cursor);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   const createSession = async () => {
     setError(null);
     try {
@@ -97,8 +152,10 @@ export function GlobalRecallPage() {
 
   const copyReference = async (reference: string) => {
     setError(null);
+    setCopiedReference(null);
     try {
       await navigator.clipboard.writeText(reference);
+      setCopiedReference(reference);
     } catch (e) {
       setError(e instanceof Error ? `Failed to copy reference: ${e.message}` : 'Failed to copy reference');
     }
@@ -139,6 +196,9 @@ export function GlobalRecallPage() {
       </header>
 
       {error && <div className="global-recall-error">{error}</div>}
+      <div className="global-recall-sr-only" aria-live="polite">
+        {copiedReference ? `Copied ${copiedReference}` : ''}
+      </div>
       {loading ? <div className="global-recall-muted">Loading…</div> : null}
 
       <section className="global-recall-open-work">
@@ -182,6 +242,11 @@ export function GlobalRecallPage() {
             </div>
           </div>
         ))}
+        {openWork?.has_more && (
+          <button type="button" onClick={() => { void loadMoreOpenWork(); }} disabled={openWorkLoadingMore}>
+            {openWorkLoadingMore ? 'Loading…' : 'Load more open work'}
+          </button>
+        )}
       </section>
 
       <section className="global-recall-session-pane">
@@ -194,14 +259,25 @@ export function GlobalRecallPage() {
               key={session.id}
               className={session.id === activeSessionId ? 'active' : ''}
               onClick={() => setActiveSessionId(session.id)}
+              aria-pressed={session.id === activeSessionId}
             >
               <strong>{session.title}</strong>
               <span>{new Date(session.updated_at).toLocaleString()}</span>
             </button>
           ))}
+          {sessionsHaveMore && (
+            <button type="button" onClick={() => { void loadMoreSessions(); }}>
+              Load more sessions
+            </button>
+          )}
         </aside>
         <div className="global-recall-chat">
-          <div className="global-recall-messages">
+          <div className="global-recall-messages" aria-live="polite">
+            {olderMessageCursor !== null && !sessionLoading && (
+              <button type="button" onClick={() => { void loadOlderMessages(); }}>
+                Load older messages
+              </button>
+            )}
             {activeSessionId === null ? (
               <p className="global-recall-muted">No recall session selected.</p>
             ) : sessionLoading ? (
@@ -220,7 +296,9 @@ export function GlobalRecallPage() {
             ))}
           </div>
           <form className="global-recall-composer" onSubmit={(e) => { e.preventDefault(); void ask(); }}>
+            <label className="global-recall-sr-only" htmlFor="global-recall-question">Global Recall question</label>
             <textarea
+              id="global-recall-question"
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               placeholder="Ask Global Recall to synthesize Phoenix history…"
@@ -238,4 +316,20 @@ export function GlobalRecallPage() {
 
 function shortId(id: string): string {
   return id.slice(0, 8);
+}
+
+function mergeOpenWorkGroups(
+  current: GlobalOpenWorkResponse['groups'],
+  incoming: GlobalOpenWorkResponse['groups'],
+): GlobalOpenWorkResponse['groups'] {
+  const groups = current.map((group) => ({ ...group, items: [...group.items] }));
+  for (const incomingGroup of incoming) {
+    const existing = groups.find((group) => group.project_id === incomingGroup.project_id);
+    if (existing) {
+      existing.items.push(...incomingGroup.items.filter((item) => !existing.items.some((currentItem) => currentItem.reference === item.reference)));
+    } else {
+      groups.push(incomingGroup);
+    }
+  }
+  return groups;
 }

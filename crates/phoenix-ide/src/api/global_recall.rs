@@ -3,7 +3,7 @@ use crate::db::MessageContent;
 use crate::db::{ConvMode, Conversation, DbError, MessageType, RetrievalScope};
 use crate::state_machine::ConvState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use chrono::{DateTime, Utc};
@@ -19,12 +19,15 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use super::handlers::AppError;
 
-const RECENT_DAYS: i64 = 45;
+const RECENT_DAYS: i64 = 14;
 const SEARCH_TOP_K: usize = 10;
 const READ_PAGE_CHARS: usize = 7000;
 const MAX_RECALL_TURNS: usize = 6;
 const ANSWER_MAX_TOKENS: u32 = 3072;
 const READ_MESSAGE_BATCH: i64 = 64;
+const RECALL_SESSION_PAGE: i64 = 50;
+const RECALL_MESSAGE_PAGE: i64 = 100;
+const OPEN_WORK_PAGE: usize = 100;
 
 static RECALL_SESSION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -33,9 +36,10 @@ static RECALL_SESSION_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mut
 pub struct GlobalOpenWorkResponse {
     pub generated_at: DateTime<Utc>,
     pub groups: Vec<GlobalOpenWorkProject>,
+    pub has_more: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct GlobalOpenWorkProject {
     pub project_id: Option<String>,
     pub project_name: String,
@@ -78,12 +82,14 @@ pub struct GlobalOpenWorkItem {
 #[derive(Debug, Serialize)]
 pub struct GlobalRecallSessionsResponse {
     pub sessions: Vec<GlobalRecallSession>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct GlobalRecallSessionResponse {
     pub session: GlobalRecallSession,
     pub messages: Vec<GlobalRecallMessage>,
+    pub older_cursor: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,23 +143,48 @@ pub struct ResolveGlobalReferenceResponse {
     pub summary: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct OpenWorkPageQuery {
+    #[serde(default)]
+    pub offset: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionPageQuery {
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MessagePageQuery {
+    pub before: Option<i64>,
+}
+
 pub async fn open_work(
     State(state): State<AppState>,
+    Query(page): Query<OpenWorkPageQuery>,
 ) -> Result<Json<GlobalOpenWorkResponse>, AppError> {
-    Ok(Json(build_open_work(&state).await?))
+    let view = build_open_work(&state).await?;
+    Ok(Json(paginate_open_work(view, page.offset, OPEN_WORK_PAGE)))
 }
 
 pub async fn list_sessions(
     State(state): State<AppState>,
+    Query(page): Query<SessionPageQuery>,
 ) -> Result<Json<GlobalRecallSessionsResponse>, AppError> {
-    let sessions = sqlx::query(
-        "SELECT id, title, created_at, updated_at FROM global_recall_sessions ORDER BY updated_at DESC",
+    let mut sessions = sqlx::query(
+        "SELECT id, title, created_at, updated_at FROM global_recall_sessions
+         ORDER BY updated_at DESC LIMIT ?1 OFFSET ?2",
     )
+    .bind(RECALL_SESSION_PAGE + 1)
+    .bind(page.offset.max(0))
     .try_map(parse_session_row)
     .fetch_all(state.db.pool())
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Json(GlobalRecallSessionsResponse { sessions }))
+    let has_more = sessions.len() > usize::try_from(RECALL_SESSION_PAGE).unwrap_or(50);
+    sessions.truncate(usize::try_from(RECALL_SESSION_PAGE).unwrap_or(50));
+    Ok(Json(GlobalRecallSessionsResponse { sessions, has_more }))
 }
 
 pub async fn create_session(
@@ -192,10 +223,15 @@ pub async fn create_session(
 pub async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(page): Query<MessagePageQuery>,
 ) -> Result<Json<GlobalRecallSessionResponse>, AppError> {
     let session = load_session(&state, &id).await?;
-    let messages = load_session_messages(&state, &id).await?;
-    Ok(Json(GlobalRecallSessionResponse { session, messages }))
+    let (messages, older_cursor) = load_session_message_page(&state, &id, page.before).await?;
+    Ok(Json(GlobalRecallSessionResponse {
+        session,
+        messages,
+        older_cursor,
+    }))
 }
 
 pub async fn ask_session(
@@ -212,7 +248,7 @@ pub async fn ask_session(
     let _guard = session_lock.lock().await;
     let answer = run_global_recall_agent(&state, &id, question).await?;
     let (user_message, assistant_message) =
-        insert_recall_turn(&state, &id, question, &answer).await?;
+        insert_recall_turn(&state.db, &id, question, &answer).await?;
     Ok(Json(AskGlobalRecallResponse {
         user_message,
         assistant_message,
@@ -240,7 +276,7 @@ async fn build_open_work(state: &AppState) -> Result<GlobalOpenWorkResponse, App
     let now = Utc::now();
     let conversations = state
         .db
-        .list_conversations()
+        .list_all_conversations()
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let projects = state
@@ -250,41 +286,9 @@ async fn build_open_work(state: &AppState) -> Result<GlobalOpenWorkResponse, App
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let project_by_id: HashMap<String, _> =
         projects.into_iter().map(|p| (p.id.clone(), p)).collect();
-    let by_id: HashMap<String, Conversation> = conversations
-        .iter()
-        .cloned()
-        .map(|c| (c.id.clone(), c))
-        .collect();
-    let active_ids: HashSet<String> = by_id.keys().cloned().collect();
-    let mut predecessor_by_child: HashMap<String, String> = HashMap::new();
-    for conv in &conversations {
-        if let Some(child) = &conv.continued_in_conv_id {
-            predecessor_by_child.insert(child.clone(), conv.id.clone());
-        }
-    }
-
-    let mut visited = HashSet::new();
+    let chains = group_conversation_chains(&conversations);
     let mut items = Vec::new();
-    for conv in &conversations {
-        if visited.contains(&conv.id) || predecessor_by_child.contains_key(&conv.id) {
-            continue;
-        }
-        let mut member_ids = vec![conv.id.clone()];
-        let mut cursor = conv;
-        while let Some(next_id) = cursor.continued_in_conv_id.as_deref() {
-            if !active_ids.contains(next_id) || member_ids.iter().any(|id| id == next_id) {
-                break;
-            }
-            member_ids.push(next_id.to_string());
-            cursor = &by_id[next_id];
-        }
-        for id in &member_ids {
-            visited.insert(id.clone());
-        }
-        let members: Vec<Conversation> = member_ids
-            .iter()
-            .filter_map(|id| by_id.get(id).cloned())
-            .collect();
+    for members in chains {
         if let Some(item) = project_item_from_members(&members, now).await? {
             items.push(item);
         }
@@ -333,7 +337,96 @@ async fn build_open_work(state: &AppState) -> Result<GlobalOpenWorkResponse, App
     Ok(GlobalOpenWorkResponse {
         generated_at: now,
         groups,
+        has_more: false,
     })
+}
+
+fn paginate_open_work(
+    view: GlobalOpenWorkResponse,
+    offset: usize,
+    limit: usize,
+) -> GlobalOpenWorkResponse {
+    let mut flattened = Vec::new();
+    for group in view.groups {
+        for item in group.items {
+            flattened.push((
+                group.project_id.clone(),
+                group.project_name.clone(),
+                group.canonical_path.clone(),
+                item,
+            ));
+        }
+    }
+    let has_more = offset.saturating_add(limit) < flattened.len();
+    let mut groups: Vec<GlobalOpenWorkProject> = Vec::new();
+    for (project_id, project_name, canonical_path, item) in
+        flattened.into_iter().skip(offset).take(limit)
+    {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.project_id == project_id)
+        {
+            group.items.push(item);
+        } else {
+            groups.push(GlobalOpenWorkProject {
+                project_id,
+                project_name,
+                canonical_path,
+                items: vec![item],
+            });
+        }
+    }
+    GlobalOpenWorkResponse {
+        generated_at: view.generated_at,
+        groups,
+        has_more,
+    }
+}
+
+fn group_conversation_chains(conversations: &[Conversation]) -> Vec<Vec<Conversation>> {
+    let by_id: HashMap<String, Conversation> = conversations
+        .iter()
+        .cloned()
+        .map(|c| (c.id.clone(), c))
+        .collect();
+    let all_ids: HashSet<&str> = by_id.keys().map(String::as_str).collect();
+    let predecessor_ids: HashSet<&str> = conversations
+        .iter()
+        .filter_map(|c| c.continued_in_conv_id.as_deref())
+        .filter(|id| all_ids.contains(id))
+        .collect();
+    let mut visited = HashSet::new();
+    let mut chains = Vec::new();
+
+    for conversation in conversations {
+        if visited.contains(&conversation.id) || predecessor_ids.contains(conversation.id.as_str())
+        {
+            continue;
+        }
+        let mut members = Vec::new();
+        let mut cursor = conversation;
+        loop {
+            if !visited.insert(cursor.id.clone()) {
+                break;
+            }
+            members.push(cursor.clone());
+            let Some(next_id) = cursor.continued_in_conv_id.as_deref() else {
+                break;
+            };
+            let Some(next) = by_id.get(next_id) else {
+                break;
+            };
+            cursor = next;
+        }
+        chains.push(members);
+    }
+
+    for conversation in conversations {
+        if visited.insert(conversation.id.clone()) {
+            chains.push(vec![conversation.clone()]);
+        }
+    }
+    chains
 }
 
 async fn project_item_from_members(
@@ -345,7 +438,8 @@ async fn project_item_from_members(
     }
     let root = &members[0];
     let current = members.last().expect("non-empty members");
-    if should_suppress_item(current, members.len(), now) {
+    let task_status = task_status_for(current).await?;
+    if !is_open_work_candidate(current, task_status.as_deref(), now) {
         return Ok(None);
     }
     let source = if members.len() >= 2 {
@@ -354,10 +448,6 @@ async fn project_item_from_members(
         GlobalOpenWorkSource::Conversation
     };
     let mut signals = item_signals(current, members.len(), now);
-    let task_status = task_status_for(current).await?;
-    if task_status.as_deref().is_some_and(is_closed_task_status) {
-        return Ok(None);
-    }
     if let Some(status) = &task_status {
         if matches!(status.as_str(), "in-progress" | "ready" | "blocked") {
             signals.push(format!("task {status}"));
@@ -421,10 +511,10 @@ fn item_signals(conv: &Conversation, member_count: usize, now: DateTime<Utc>) ->
         ConvState::AwaitingTaskApproval { .. } => signals.push("task approval pending".to_string()),
         ConvState::AwaitingUserResponse { .. }
         | ConvState::AwaitingCommissionReviewApproval { .. }
+        | ConvState::AwaitingContinuation { .. }
         | ConvState::ContextExhausted { .. } => signals.push("needs action".to_string()),
         ConvState::Error { .. } => signals.push("error".to_string()),
         ConvState::Idle
-        | ConvState::AwaitingContinuation { .. }
         | ConvState::Completed { .. }
         | ConvState::Failed { .. }
         | ConvState::HandedOff { .. }
@@ -433,38 +523,69 @@ fn item_signals(conv: &Conversation, member_count: usize, now: DateTime<Utc>) ->
     if member_count >= 2 {
         signals.push(format!("{member_count}-conversation chain"));
     }
-    if signals.is_empty() {
-        signals.push("user-initiated open conversation".to_string());
-    }
     signals
+}
+
+fn is_open_task_status(status: &str) -> bool {
+    matches!(status, "in-progress" | "ready" | "blocked")
 }
 
 fn is_closed_task_status(status: &str) -> bool {
     matches!(status, "done" | "wont-do")
 }
 
-fn should_suppress_item(conv: &Conversation, member_count: usize, now: DateTime<Utc>) -> bool {
-    if conv.archived || !conv.user_initiated {
-        return true;
-    }
-    if matches!(conv.state, ConvState::Terminal)
-        && matches!(
-            conv.conv_mode,
-            ConvMode::Work { .. } | ConvMode::Branch { .. }
-        )
-    {
-        return true;
-    }
-    let old = now.signed_duration_since(conv.updated_at).num_days() > RECENT_DAYS;
-    let low_value_mode = matches!(conv.conv_mode, ConvMode::Explore { .. } | ConvMode::Direct);
-    let quiet_state = matches!(
-        conv.state,
-        ConvState::Terminal
-            | ConvState::Completed { .. }
+fn has_runtime_open_evidence(state: &ConvState) -> bool {
+    matches!(
+        state,
+        ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+            | ConvState::AwaitingCommissionReviewApproval { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::ContextExhausted { .. }
+            | ConvState::Error { .. }
+    )
+}
+
+fn is_closed_runtime_state(state: &ConvState) -> bool {
+    matches!(
+        state,
+        ConvState::Completed { .. }
             | ConvState::Failed { .. }
             | ConvState::HandedOff { .. }
-    );
-    old && low_value_mode && quiet_state && member_count == 1
+            | ConvState::Terminal
+    )
+}
+
+fn is_open_work_candidate(
+    conversation: &Conversation,
+    task_status: Option<&str>,
+    now: DateTime<Utc>,
+) -> bool {
+    if conversation.archived
+        || !conversation.user_initiated
+        || is_closed_runtime_state(&conversation.state)
+        || task_status.is_some_and(is_closed_task_status)
+    {
+        return false;
+    }
+    if has_runtime_open_evidence(&conversation.state) {
+        return true;
+    }
+    match conversation.conv_mode {
+        ConvMode::Work { .. } => task_status.is_some_and(is_open_task_status),
+        ConvMode::Branch { .. } | ConvMode::Explore { .. } | ConvMode::Direct => {
+            now.signed_duration_since(conversation.updated_at)
+                .num_days()
+                <= RECENT_DAYS
+        }
+    }
 }
 
 fn item_title(root: &Conversation, current: &Conversation, member_count: usize) -> String {
@@ -539,18 +660,51 @@ async fn load_session_messages(
     state: &AppState,
     id: &str,
 ) -> Result<Vec<GlobalRecallMessage>, AppError> {
-    sqlx::query(
-        "SELECT id, role, content, created_at FROM global_recall_messages WHERE session_id = ?1 ORDER BY ordinal ASC",
+    let mut messages = sqlx::query(
+        "SELECT id, role, content, created_at FROM global_recall_messages
+         WHERE session_id = ?1 ORDER BY ordinal DESC LIMIT 8",
     )
     .bind(id)
     .try_map(parse_message_row)
     .fetch_all(state.db.pool())
     .await
-    .map_err(|e| AppError::Internal(e.to_string()))
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    messages.reverse();
+    Ok(messages)
+}
+
+async fn load_session_message_page(
+    state: &AppState,
+    id: &str,
+    before: Option<i64>,
+) -> Result<(Vec<GlobalRecallMessage>, Option<i64>), AppError> {
+    let mut rows = sqlx::query(
+        "SELECT ordinal, id, role, content, created_at FROM global_recall_messages
+         WHERE session_id = ?1 AND (?2 IS NULL OR ordinal < ?2)
+         ORDER BY ordinal DESC LIMIT ?3",
+    )
+    .bind(id)
+    .bind(before)
+    .bind(RECALL_MESSAGE_PAGE + 1)
+    .try_map(parse_message_with_ordinal_row)
+    .fetch_all(state.db.pool())
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    let page_size = usize::try_from(RECALL_MESSAGE_PAGE).unwrap_or(100);
+    let has_more = rows.len() > page_size;
+    rows.truncate(page_size);
+    rows.reverse();
+    let older_cursor = has_more
+        .then(|| rows.first().map(|(ordinal, _)| *ordinal))
+        .flatten();
+    Ok((
+        rows.into_iter().map(|(_, message)| message).collect(),
+        older_cursor,
+    ))
 }
 
 async fn insert_recall_turn(
-    state: &AppState,
+    db: &crate::db::Database,
     session_id: &str,
     question: &str,
     answer: &str,
@@ -568,7 +722,7 @@ async fn insert_recall_turn(
         created_at: Utc::now(),
     };
     for attempt in 0..3 {
-        match insert_recall_turn_once(state, session_id, &user, &assistant).await {
+        match insert_recall_turn_once(db, session_id, &user, &assistant).await {
             Ok(()) => return Ok((user, assistant)),
             Err(e) if attempt < 2 && is_recall_ordinal_conflict(&e) => (),
             Err(e) => return Err(e),
@@ -580,13 +734,12 @@ async fn insert_recall_turn(
 }
 
 async fn insert_recall_turn_once(
-    state: &AppState,
+    db: &crate::db::Database,
     session_id: &str,
     user: &GlobalRecallMessage,
     assistant: &GlobalRecallMessage,
 ) -> Result<(), AppError> {
-    let mut tx = state
-        .db
+    let mut tx = db
         .pool()
         .begin()
         .await
@@ -651,7 +804,7 @@ async fn run_global_recall_agent(
     let mut orientation = String::from(
         "You are a read-only Phoenix Global Recall analyst. You may search and read Phoenix conversation history, inspect deterministic open-work projections, and resolve Phoenix references. Do not claim to have edited files or changed tasks. Cite sources using markdown links when tool results provide them; otherwise cite @conv:<id>, @chain:<id>, or message ids.\n\nRecent saved session context:\n",
     );
-    for m in history.iter().rev().take(8).rev() {
+    for m in &history {
         let _ = writeln!(orientation, "{}: {}", m.role, trim_chars(&m.content, 1200));
     }
     let _ = writeln!(orientation, "\nCurrent question: {question}");
@@ -1329,25 +1482,90 @@ async fn resolve_work(
     state: &AppState,
     id: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
-    let view = build_open_work(state).await?;
-    for group in view.groups {
-        for item in group.items {
-            if item.id == id || item.reference == format!("@work:{id}") {
-                return Ok(ResolveGlobalReferenceResponse {
-                    kind: "work".to_string(),
-                    id: item.id,
-                    href: Some(item.href),
-                    title: Some(item.title),
-                    summary: format!(
-                        "open work item in {}: {}",
-                        group.project_name,
-                        item.signals.join(", ")
-                    ),
-                });
-            }
-        }
+    let root = state
+        .db
+        .get_conversation(id)
+        .await
+        .map_err(map_db_not_found)?;
+    let chain_root = state
+        .db
+        .chain_root_of(id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if chain_root.as_deref().is_some_and(|root_id| root_id != id) {
+        return Err(AppError::NotFound(
+            "work reference target not found".to_string(),
+        ));
     }
-    Err(AppError::NotFound("open work item not found".to_string()))
+    let member_ids = state
+        .db
+        .chain_members_forward(id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let mut members = Vec::with_capacity(member_ids.len().max(1));
+    if member_ids.len() >= 2 {
+        for member_id in member_ids {
+            members.push(
+                state
+                    .db
+                    .get_conversation(&member_id)
+                    .await
+                    .map_err(map_db_not_found)?,
+            );
+        }
+    } else {
+        members.push(root.clone());
+    }
+    let current = members.last().unwrap_or(&root);
+    let task_status = task_status_for(current).await?;
+    let status = if current.archived {
+        "archived"
+    } else if is_open_work_candidate(current, task_status.as_deref(), Utc::now()) {
+        "open"
+    } else {
+        "closed"
+    };
+    let projects = state
+        .db
+        .list_projects()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let project = current
+        .project_id
+        .as_ref()
+        .or(root.project_id.as_ref())
+        .and_then(|project_id| projects.iter().find(|project| &project.id == project_id));
+    let project_label = project.map_or_else(
+        || "no project".to_string(),
+        |project| {
+            format!(
+                "{} ({})",
+                display_project_name(&project.canonical_path),
+                project.canonical_path
+            )
+        },
+    );
+    let is_chain = members.len() >= 2;
+    let href = if is_chain {
+        format!("/chains/{}", root.id)
+    } else {
+        conversation_href(current)
+    };
+    let title = item_title(&root, current, members.len());
+    let task = task_status.as_ref().map_or_else(
+        || "no readable task status".to_string(),
+        |task_status| format!("task {task_status}"),
+    );
+    Ok(ResolveGlobalReferenceResponse {
+        kind: "work".to_string(),
+        id: id.to_string(),
+        href: Some(href),
+        title: Some(title),
+        summary: format!(
+            "{status} work item in {project_label}; root @conv:{}; current/latest @conv:{}; {task}",
+            root.id, current.id
+        ),
+    })
 }
 
 fn map_db_not_found(e: DbError) -> AppError {
@@ -1371,6 +1589,14 @@ fn parse_session_row(row: sqlx::sqlite::SqliteRow) -> Result<GlobalRecallSession
         created_at: parse_datetime(&row.try_get::<String, _>("created_at")?, "created_at")?,
         updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
     })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn parse_message_with_ordinal_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<(i64, GlobalRecallMessage), sqlx::Error> {
+    let ordinal = row.try_get("ordinal")?;
+    Ok((ordinal, parse_message_row(row)?))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1406,7 +1632,199 @@ fn trim_chars(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{message_id_fragment, parse_conv_handle, split_fragment};
+    use super::{
+        group_conversation_chains, is_open_work_candidate, message_id_fragment, paginate_open_work,
+        parse_conv_handle, split_fragment, GlobalOpenWorkItem, GlobalOpenWorkProject,
+        GlobalOpenWorkResponse, GlobalOpenWorkSource,
+    };
+    use crate::db::{ConvMode, Conversation, NonEmptyString};
+    use crate::state_machine::ConvState;
+    use chrono::{Duration, Utc};
+    use phoenix_core::llm_language::LlmLanguage;
+    use sqlx::Row;
+
+    fn conversation(id: &str) -> Conversation {
+        let now = Utc::now();
+        Conversation {
+            id: id.to_string(),
+            slug: Some(id.to_string()),
+            title: Some(id.to_string()),
+            cwd: "/tmp/project".to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Idle,
+            state_updated_at: now,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            model: None,
+            project_id: Some("project-1".to_string()),
+            conv_mode: ConvMode::Direct,
+            desired_base_branch: None,
+            message_count: 0,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            chain_name: None,
+            llm_language: LlmLanguage::default(),
+            spawned_from_conversation_id: None,
+        }
+    }
+
+    fn work_mode() -> ConvMode {
+        ConvMode::Work {
+            branch_name: NonEmptyString::new("task-1").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/worktree").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("1").unwrap(),
+            task_title: NonEmptyString::new("Test task").unwrap(),
+        }
+    }
+
+    #[test]
+    fn open_work_pages_preserve_project_groups() {
+        let now = Utc::now();
+        let item = |id: &str| GlobalOpenWorkItem {
+            id: id.to_string(),
+            source: GlobalOpenWorkSource::Conversation,
+            title: id.to_string(),
+            project_id: Some("project-1".to_string()),
+            current_conversation_id: id.to_string(),
+            current_conversation_slug: Some(id.to_string()),
+            root_conversation_id: id.to_string(),
+            root_conversation_slug: Some(id.to_string()),
+            updated_at: now,
+            mode: "Direct".to_string(),
+            state: "Idle".to_string(),
+            task_id: None,
+            task_title: None,
+            task_status: None,
+            branch_name: None,
+            base_branch: None,
+            worktree_path: None,
+            member_count: 1,
+            signals: vec!["recent activity".to_string()],
+            href: format!("/c/{id}"),
+            reference: format!("@work:{id}"),
+        };
+        let view = GlobalOpenWorkResponse {
+            generated_at: now,
+            groups: vec![GlobalOpenWorkProject {
+                project_id: Some("project-1".to_string()),
+                project_name: "project".to_string(),
+                canonical_path: Some("/tmp/project".to_string()),
+                items: vec![item("a"), item("b"), item("c")],
+            }],
+            has_more: false,
+        };
+
+        let first = paginate_open_work(view, 0, 2);
+        assert!(first.has_more);
+        assert_eq!(first.groups[0].items.len(), 2);
+        assert_eq!(first.groups[0].items[0].id, "a");
+    }
+
+    #[tokio::test]
+    async fn multiple_sessions_keep_ordered_independent_turns() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let now = Utc::now().to_rfc3339();
+        for id in ["session-a", "session-b"] {
+            sqlx::query(
+                "INSERT INTO global_recall_sessions (id, title, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)",
+            )
+            .bind(id)
+            .bind(id)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        super::insert_recall_turn(&db, "session-a", "question 1", "answer 1")
+            .await
+            .unwrap();
+        super::insert_recall_turn(&db, "session-b", "question b", "answer b")
+            .await
+            .unwrap();
+        super::insert_recall_turn(&db, "session-a", "question 2", "answer 2")
+            .await
+            .unwrap();
+
+        let rows = sqlx::query(
+            "SELECT ordinal, role, content FROM global_recall_messages
+             WHERE session_id = 'session-a' ORDER BY ordinal",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let values: Vec<(i64, String, String)> = rows
+            .iter()
+            .map(|row| (row.get("ordinal"), row.get("role"), row.get("content")))
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                (0, "user".to_string(), "question 1".to_string()),
+                (1, "assistant".to_string(), "answer 1".to_string()),
+                (2, "user".to_string(), "question 2".to_string()),
+                (3, "assistant".to_string(), "answer 2".to_string()),
+            ]
+        );
+        let other_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM global_recall_messages WHERE session_id = 'session-b'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(other_count, 2);
+    }
+
+    #[test]
+    fn open_work_requires_positive_evidence() {
+        let now = Utc::now();
+        let mut direct = conversation("direct");
+        assert!(is_open_work_candidate(&direct, None, now));
+        direct.updated_at = now - Duration::days(15);
+        assert!(!is_open_work_candidate(&direct, None, now));
+
+        let mut work = conversation("work");
+        work.conv_mode = work_mode();
+        assert!(!is_open_work_candidate(&work, None, now));
+        assert!(is_open_work_candidate(&work, Some("ready"), now));
+        assert!(is_open_work_candidate(&work, Some("in-progress"), now));
+        assert!(is_open_work_candidate(&work, Some("blocked"), now));
+        assert!(!is_open_work_candidate(&work, Some("done"), now));
+
+        work.state = ConvState::AwaitingContinuation {
+            rejected_tool_calls: vec![],
+            attempt: 0,
+        };
+        assert!(is_open_work_candidate(&work, None, now));
+        assert!(!is_open_work_candidate(&work, Some("wont-do"), now));
+
+        direct.state = ConvState::Completed {
+            result: "done".to_string(),
+        };
+        direct.updated_at = now;
+        assert!(!is_open_work_candidate(&direct, None, now));
+    }
+
+    #[test]
+    fn archived_historical_members_do_not_break_chain_identity() {
+        let mut root = conversation("root");
+        root.archived = true;
+        root.continued_in_conv_id = Some("middle".to_string());
+        let mut middle = conversation("middle");
+        middle.archived = true;
+        middle.continued_in_conv_id = Some("current".to_string());
+        let current = conversation("current");
+
+        let chains = group_conversation_chains(&[current, middle, root]);
+        assert_eq!(chains.len(), 1);
+        let ids: Vec<&str> = chains[0].iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["root", "middle", "current"]);
+    }
 
     #[test]
     fn parse_conv_handle_accepts_message_handle_syntax() {

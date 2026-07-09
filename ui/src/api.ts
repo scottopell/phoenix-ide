@@ -851,6 +851,7 @@ export interface GlobalOpenWorkProject {
 export interface GlobalOpenWorkResponse {
   generated_at: string;
   groups: GlobalOpenWorkProject[];
+  has_more: boolean;
 }
 
 export interface GlobalRecallSession {
@@ -870,6 +871,12 @@ export interface GlobalRecallMessage {
 export interface GlobalRecallSessionResponse {
   session: GlobalRecallSession;
   messages: GlobalRecallMessage[];
+  older_cursor: number | null;
+}
+
+export interface GlobalRecallSessionsResponse {
+  sessions: GlobalRecallSession[];
+  has_more: boolean;
 }
 
 export interface GlobalRecallAskResponse {
@@ -1171,16 +1178,16 @@ export const api = {
     return resp.json();
   },
 
-  async getGlobalOpenWork(): Promise<GlobalOpenWorkResponse> {
-    const resp = await fetch('/api/global/open-work');
+  async getGlobalOpenWork(offset = 0): Promise<GlobalOpenWorkResponse> {
+    const resp = await fetch(`/api/global/open-work?offset=${offset}`);
     if (!resp.ok) throw new Error('Failed to load Global Open Work');
     return resp.json();
   },
 
-  async listGlobalRecallSessions(): Promise<GlobalRecallSession[]> {
-    const resp = await fetch('/api/global/recall/sessions');
+  async listGlobalRecallSessions(offset = 0): Promise<GlobalRecallSessionsResponse> {
+    const resp = await fetch(`/api/global/recall/sessions?offset=${offset}`);
     if (!resp.ok) throw new Error('Failed to load Global Recall sessions');
-    return (await resp.json()).sessions;
+    return resp.json();
   },
 
   async createGlobalRecallSession(title?: string): Promise<GlobalRecallSession> {
@@ -1193,8 +1200,9 @@ export const api = {
     return (await resp.json()).session;
   },
 
-  async getGlobalRecallSession(id: string): Promise<GlobalRecallSessionResponse> {
-    const resp = await fetch(`/api/global/recall/sessions/${encodeURIComponent(id)}`);
+  async getGlobalRecallSession(id: string, before?: number): Promise<GlobalRecallSessionResponse> {
+    const query = before === undefined ? '' : `?before=${before}`;
+    const resp = await fetch(`/api/global/recall/sessions/${encodeURIComponent(id)}${query}`);
     if (!resp.ok) throw new Error('Failed to load Global Recall session');
     return resp.json();
   },
