@@ -1733,14 +1733,6 @@ async fn create_conversation_with_id(
             if let Some(checkout_ref) = checkout_ref.as_deref() {
                 validate_user_ref(checkout_ref)?;
             }
-            if let Some(repo_root) = repo_root_for_blocking.as_deref() {
-                GitStartPoint::for_create_request(
-                    std::path::Path::new(repo_root),
-                    base_branch,
-                    checkout_ref.as_deref(),
-                )
-                .map_err(|e| AppError::BadRequest(e.to_string()))?;
-            }
             Ok::<Option<String>, AppError>(Some(base_branch.to_string()))
         })
         .await
@@ -2906,25 +2898,7 @@ async fn stream_conversation(
             .get_conversation_creation_job_for_conversation(&conversation.id)
             .await
         {
-            let file_count = state
-                .runtime
-                .db()
-                .get_conversation_creation_job_files(&job.id)
-                .await
-                .map(|files| files.len())
-                .unwrap_or(0);
-            let image_count = state
-                .runtime
-                .db()
-                .get_conversation_creation_job_images(&job.id)
-                .await
-                .map(|images| images.len())
-                .unwrap_or(0);
-            init_conversation.creation_prompt = Some(creation_intent_display_text(
-                &job.intent,
-                image_count,
-                file_count,
-            ));
+            init_conversation.creation_prompt = Some(job.intent.text.clone());
             init_conversation.creation_error = job.error;
         }
     }
@@ -6427,7 +6401,7 @@ mod conversation_cwd_validation_tests {
     }
 
     #[tokio::test]
-    async fn auto_mode_stale_checkout_ref_rejects_before_shell_creation() {
+    async fn auto_mode_stale_checkout_ref_is_deferred_to_worker() {
         let tmp = tempfile::tempdir().expect("tempdir");
         init_git_repo(tmp.path());
         let state = hard_delete_cascade_tests::make_test_state().await;
@@ -6435,29 +6409,26 @@ mod conversation_cwd_validation_tests {
         req.mode = Some("auto".to_string());
         req.checkout_ref = Some("does-not-exist".to_string());
 
-        let err = create_conversation_with_id(state.clone(), req, Vec::new())
+        let Json(response) = create_conversation_with_id(state.clone(), req, Vec::new())
             .await
-            .expect_err("auto mode must validate inferred managed start ref before shell creation");
+            .expect("auto create accepts shell before worker ref validation");
 
-        match err {
-            AppError::BadRequest(msg) => {
-                assert!(msg.contains("not found"), "got: {msg}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-        assert!(
-            state
-                .db
-                .list_conversations()
-                .await
-                .expect("list")
-                .is_empty(),
-            "rejected auto create must not leave a failed shell"
+        assert_eq!(
+            response.conversation["state"]["type"].as_str(),
+            Some("provisioning")
         );
+        let conv_id = response.conversation["id"].as_str().expect("id");
+        let job = state
+            .db
+            .get_conversation_creation_job_for_conversation(conv_id)
+            .await
+            .expect("load job")
+            .expect("job");
+        assert_eq!(job.intent.checkout_ref.as_deref(), Some("does-not-exist"));
     }
 
     #[tokio::test]
-    async fn managed_mode_nonexistent_base_branch_rejects_before_shell_creation() {
+    async fn managed_mode_nonexistent_base_branch_is_deferred_to_worker() {
         let tmp = tempfile::tempdir().expect("tempdir");
         init_git_repo(tmp.path());
         let state = hard_delete_cascade_tests::make_test_state().await;
@@ -6465,25 +6436,22 @@ mod conversation_cwd_validation_tests {
         req.mode = Some("managed".to_string());
         req.base_branch = Some("does-not-exist".to_string());
 
-        let err = create_conversation_with_id(state.clone(), req, Vec::new())
+        let Json(response) = create_conversation_with_id(state.clone(), req, Vec::new())
             .await
-            .expect_err("managed start ref must be validated before shell creation");
+            .expect("managed create accepts shell before worker ref validation");
 
-        match err {
-            AppError::BadRequest(msg) => {
-                assert!(msg.contains("not found"), "got: {msg}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-        assert!(
-            state
-                .db
-                .list_conversations()
-                .await
-                .expect("list")
-                .is_empty(),
-            "rejected managed create must not leave a failed shell"
+        assert_eq!(
+            response.conversation["state"]["type"].as_str(),
+            Some("provisioning")
         );
+        let conv_id = response.conversation["id"].as_str().expect("id");
+        let job = state
+            .db
+            .get_conversation_creation_job_for_conversation(conv_id)
+            .await
+            .expect("load job")
+            .expect("job");
+        assert_eq!(job.intent.base_branch.as_deref(), Some("does-not-exist"));
     }
 
     #[tokio::test]

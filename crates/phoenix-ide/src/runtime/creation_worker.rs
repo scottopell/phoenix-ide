@@ -421,11 +421,14 @@ async fn provision_conversation(
         cleanup_unpersisted_worktree(repo_root.as_deref(), &job.conversation_id, &conv_mode);
         return Err((e.to_string(), ErrorKind::ServerError));
     }
-    manager
+    if let Err(e) = manager
         .db()
         .update_conversation_model(&job.conversation_id, &resolved_model)
         .await
-        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
+    {
+        cleanup_unpersisted_worktree(repo_root.as_deref(), &job.conversation_id, &conv_mode);
+        return Err((e.to_string(), ErrorKind::ServerError));
+    }
 
     let persisted_conversation = manager
         .db()
