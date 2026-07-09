@@ -123,7 +123,7 @@ fn model_pricing(model: &str) -> Option<ModelPricing> {
             cache_write: 18.75,
             cache_read: 1.50,
         }),
-        "claude-sonnet-4-6" => Some(ModelPricing {
+        "claude-sonnet-5" | "claude-sonnet-4-6" => Some(ModelPricing {
             input: 3.00,
             output: 15.00,
             cache_write: 3.75,
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn totals_sum_tokens_and_turns() {
         let mut t = Totals::default();
-        let known = calculate_turn_cost("claude-sonnet-4-6", 1_000_000, 0, 0, 0);
+        let known = calculate_turn_cost("claude-sonnet-5", 1_000_000, 0, 0, 0);
         let unknown = calculate_turn_cost("unpriced-model", 0, 500_000, 250_000, 1_000_000);
         t.add(1_000_000, 0, 0, 0, 1, known);
         t.add(0, 500_000, 250_000, 1_000_000, 1, unknown);
@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn cost_calculation_prices_each_token_category() {
         let cost = calculate_turn_cost(
-            "claude-sonnet-4-6",
+            "claude-sonnet-5",
             1_000_000,
             2_000_000,
             3_000_000,
@@ -695,7 +695,7 @@ mod tests {
             0,
             0,
             1,
-            calculate_turn_cost("claude-sonnet-4-6", 1_000_000, 0, 0, 0),
+            calculate_turn_cost("claude-sonnet-5", 1_000_000, 0, 0, 0),
         );
         totals.add(
             0,

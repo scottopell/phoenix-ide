@@ -309,8 +309,8 @@ mod tests {
     ) -> LlmServiceImpl {
         let spec = all_models()
             .into_iter()
-            .find(|s| s.id == "claude-sonnet-4-6")
-            .expect("claude-sonnet-4-6 must be in the model registry");
+            .find(|s| s.id == "claude-sonnet-5")
+            .expect("claude-sonnet-5 must be in the model registry");
         let auth = LlmAuth::new(Arc::new(StaticCredential::new("k")), AuthStyle::ApiKey);
         LlmServiceImpl::new(
             spec,

@@ -25,7 +25,7 @@ const MAX_TERM_RESULTS: usize = 64 * 1024; // 64KB per term
 const MAX_COMBINED_RESULTS: usize = 128 * 1024; // 128KB combined
 
 /// Preferred models for filtering (fast and cheap)
-const PREFERRED_MODELS: &[&str] = &["claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-6"];
+const PREFERRED_MODELS: &[&str] = &["claude-haiku-4-5", "claude-sonnet-5", "claude-sonnet-4-6"];
 
 use phoenix_core::llm_language::KEYWORD_SEARCH_FILTER_SYSTEM as FILTER_SYSTEM_PROMPT;
 

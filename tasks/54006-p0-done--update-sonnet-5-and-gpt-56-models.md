@@ -30,13 +30,13 @@ Primary code surfaces identified:
 
 ## Acceptance Criteria
 
-- [ ] Phoenix's registry default is Sonnet 5 when Anthropic auth is available and no `DEFAULT_MODEL` override is set.
-- [ ] `claude-sonnet-4-6` remains usable for existing conversations but is no longer the preferred default/recommended Sonnet.
-- [ ] `/api/models` reports Sonnet 5 as available when Anthropic auth/credential-helper routing is available.
-- [ ] GPT-5.6 is added only if a live availability check confirms the model ID; otherwise the final implementation notes that GPT-5.6 was not yet accessible.
-- [ ] Usage pricing is updated for new models when public pricing is known; otherwise unknown pricing is explicit rather than guessed.
-- [ ] Tests and generated expectations are updated without rewriting migration/history tests that intentionally cover legacy IDs.
-- [ ] `./dev.py check` passes.
+- [x] Phoenix's registry default is Sonnet 5 when Anthropic auth is available and no `DEFAULT_MODEL` override is set.
+- [x] `claude-sonnet-4-6` remains usable for existing conversations but is no longer the preferred default/recommended Sonnet.
+- [x] `/api/models` reports Sonnet 5 as available when Anthropic auth/credential-helper routing is available.
+- [x] GPT-5.6 is added only if a live availability check confirms the model ID; otherwise the final implementation notes that GPT-5.6 was not yet accessible.
+- [x] Usage pricing is updated for new models when public pricing is known; otherwise unknown pricing is explicit rather than guessed.
+- [x] Tests and generated expectations are updated without rewriting migration/history tests that intentionally cover legacy IDs.
+- [x] `./dev.py check` passes.
 
 ## Notes
 

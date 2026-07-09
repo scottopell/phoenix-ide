@@ -145,14 +145,12 @@ function formatContextWindow(n: number): string {
   return n.toString();
 }
 
-/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-5.5" -> "gpt-5.5" */
+/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "claude-sonnet-5" -> "sonnet-5". */
 function abbreviateModel(model: string): string {
   if (!model.startsWith("claude-")) return model;
   const inner = model.slice(7); // strip "claude-"
-  const lastHyphen = inner.lastIndexOf("-");
-  if (lastHyphen > 0 && /^\d+$/.test(inner.slice(lastHyphen + 1))) {
-    return inner.slice(0, lastHyphen) + "." + inner.slice(lastHyphen + 1);
-  }
+  const versionMatch = inner.match(/^(.*-\d+)-(\d+)$/);
+  if (versionMatch) return `${versionMatch[1]}.${versionMatch[2]}`;
   return inner;
 }
 

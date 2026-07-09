@@ -551,12 +551,13 @@ impl ModelRegistry {
     }
 
     /// Pick the default model from available services.
-    /// Prefers claude-sonnet-4-6 > claude-sonnet-4-5 > any available > hardcoded fallback.
+    /// Prefers claude-sonnet-5 > claude-sonnet-4-6 > any available > hardcoded fallback.
     fn pick_default_model(
         services: &HashMap<String, Arc<dyn LlmService>>,
         config: &LlmConfig,
     ) -> String {
         const PREFERRED: &[&str] = &[
+            "claude-sonnet-5",
             "claude-sonnet-4-6",
             "claude-sonnet-4-5",
             "gpt-5.5",
@@ -583,7 +584,7 @@ impl ModelRegistry {
             .find(|id| services.contains_key(**id))
             .map(|id| (*id).to_string())
             .or_else(|| services.keys().next().cloned())
-            .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
+            .unwrap_or_else(|| "claude-sonnet-5".to_string())
     }
 
     /// Create registry with model discovery using credential-helper auth and base URL overrides.
@@ -947,18 +948,18 @@ impl ModelRegistry {
             .and_then(|g| g.clone())
     }
 
-    /// Build a registry with a single `claude-sonnet-4-6` slot wired to
+    /// Build a registry with a single `claude-sonnet-5` slot wired to
     /// `service`. Test-only: bypasses `LlmConfig` and credential plumbing so
     /// integration-flavoured tests in non-llm modules (chain Q&A) can drive
     /// the public registry surface against a mock service.
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test_with_sonnet(service: Arc<dyn LlmService>) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
-        services.insert("claude-sonnet-4-6".to_string(), service);
+        services.insert("claude-sonnet-5".to_string(), service);
         Self {
             services: std::sync::RwLock::new(services),
             specs: std::sync::RwLock::new(HashMap::new()),
-            default_model: "claude-sonnet-4-6".to_string(),
+            default_model: "claude-sonnet-5".to_string(),
             codex_bridge_loaded_at_startup: false,
             current_codex_loaded_path: std::sync::RwLock::new(None),
             config: Arc::new(LlmConfig::default()),
@@ -972,10 +973,10 @@ impl ModelRegistry {
     /// don't drift. Returns the (`model_id`, service) pair so the caller
     /// can persist the identifier into `chain_qa.model`.
     ///
-    /// Preference order: claude-sonnet-4-6 → gpt-5.5 → registry default.
+    /// Preference order: claude-sonnet-5 → claude-sonnet-4-6 → gpt-5.5 → registry default.
     /// Returns None only when the registry has no models at all.
     pub fn get_mid_tier_model(&self) -> Option<(String, Arc<dyn LlmService>)> {
-        const PREFERRED: &[&str] = &["claude-sonnet-4-6", "gpt-5.5"];
+        const PREFERRED: &[&str] = &["claude-sonnet-5", "claude-sonnet-4-6", "gpt-5.5"];
         for id in PREFERRED {
             if let Some(service) = self.get(id) {
                 return Some(((*id).to_string(), service));
@@ -1438,8 +1439,7 @@ mod tests {
         };
         let registry = ModelRegistry::new(&config);
 
-        // Should default to claude-sonnet-4-6
-        assert_eq!(registry.default_model_id(), "claude-sonnet-4-6");
+        assert_eq!(registry.default_model_id(), "claude-sonnet-5");
     }
 
     #[test]
@@ -1632,6 +1632,7 @@ mod tests {
         };
         let registry = ModelRegistry::new(&config);
         assert!(!registry.available_models().is_empty());
+        assert!(registry.get("claude-sonnet-5").is_some());
         assert!(registry.get("claude-sonnet-4-6").is_some());
         assert!(registry.get("gpt-5.5").is_some());
     }
@@ -1972,6 +1973,21 @@ mod tests {
         assert_eq!(opus.provider, "Anthropic");
         assert!(opus.description.contains("most capable"));
         assert_eq!(opus.context_window, 1_000_000);
+
+        let sonnet_5 = model_infos
+            .iter()
+            .find(|m| m.id == "claude-sonnet-5")
+            .unwrap();
+        assert_eq!(sonnet_5.provider, "Anthropic");
+        assert!(sonnet_5.recommended);
+        assert_eq!(sonnet_5.context_window, 1_000_000);
+
+        let sonnet_4_6 = model_infos
+            .iter()
+            .find(|m| m.id == "claude-sonnet-4-6")
+            .unwrap();
+        assert!(!sonnet_4_6.recommended);
+        assert!(sonnet_4_6.description.contains("legacy"));
     }
 
     #[test]

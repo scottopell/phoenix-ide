@@ -55,7 +55,7 @@ function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
   return {
     id: 'conv-1',
     slug: 'track-pr-status',
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     cwd: '/repo/.phoenix/worktrees/conv-1',
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
@@ -167,8 +167,9 @@ function setMobileViewport(matches = true) {
 }
 
 const pickerModels: ModelInfo[] = [
-  { id: 'claude-sonnet-4-6', provider: 'anthropic', description: '', context_window: 200_000, recommended: true },
-  { id: 'claude-opus-4-7', provider: 'anthropic', description: '', context_window: 200_000, recommended: true },
+  { id: 'claude-sonnet-5', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: true },
+  { id: 'claude-sonnet-4-6', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: false },
+  { id: 'claude-opus-4-7', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: true },
 ];
 
 function mockPrStatus(status: Partial<PrStatusResponse>): PrStatusResponse {
@@ -274,8 +275,9 @@ describe('StateBar PR badge', () => {
 
 describe('StateBar model picker enablement (task 02713)', () => {
   const models: ModelInfo[] = [
-    { id: 'claude-sonnet-4-6', provider: 'anthropic', description: '', context_window: 200_000, recommended: true },
-    { id: 'claude-opus-4-7', provider: 'anthropic', description: '', context_window: 200_000, recommended: true },
+    { id: 'claude-sonnet-5', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: true },
+    { id: 'claude-sonnet-4-6', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: false },
+    { id: 'claude-opus-4-7', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: true },
   ];
 
   function renderWithState(convState: ConversationState) {
@@ -668,7 +670,7 @@ describe('StateBar mobile layout', () => {
 
     expect(screen.getByTitle(/Explore mode/i)).toHaveTextContent('Explore');
     expect(screen.getByText(/Read-only git project/i)).toBeInTheDocument();
-    expect(screen.getByText('claude-sonnet-4-6')).toBeInTheDocument();
+    expect(screen.getByText('claude-sonnet-5')).toBeInTheDocument();
     expect(screen.getByText('…/projects/phoenix-ide')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /copy full working directory .*phoenix-ide/i })).toBeInTheDocument();
     expect(screen.queryByText('Phoenix IDE')).not.toBeInTheDocument();
@@ -707,7 +709,7 @@ describe('StateBar mobile layout', () => {
     expect(screen.getByText('task-123-pr-status')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /#12 checks ✓/i })).toBeInTheDocument();
     expect(screen.getByText('170k')).toBeInTheDocument();
-    expect(screen.getByText('claude-sonnet-4-6')).toBeInTheDocument();
+    expect(screen.getByText('claude-sonnet-5')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /copy full working directory/i })).toBeInTheDocument();
     expect(screen.queryByText('main')).not.toBeInTheDocument();
   });
@@ -767,9 +769,9 @@ describe('StateBar mobile layout', () => {
     expect(onOpenFiles).toHaveBeenCalledTimes(1);
 
     fireEvent.keyDown(screen.getAllByRole('button', { name: /expand status bar/i })[0]!, { key: 'Enter' });
-    expect(screen.getByTitle(/Model: claude-sonnet-4-6/i)).toBeInTheDocument();
+    expect(screen.getByTitle(/Model: claude-sonnet-5/i)).toBeInTheDocument();
 
-    fireEvent.click(screen.getByTitle(/Model: claude-sonnet-4-6/i));
+    fireEvent.click(screen.getByTitle(/Model: claude-sonnet-5/i));
     expect(screen.getByRole('listbox', { name: /select model/i })).toBeInTheDocument();
   });
 });

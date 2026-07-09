@@ -159,7 +159,7 @@ async fn submit_question_persists_and_completes() {
     assert_eq!(row.answer.as_deref(), Some("THE ANSWER"));
     assert_eq!(row.chain_members_at_answer, 3);
     assert!(row.completed_at.is_some());
-    assert_eq!(row.model, "claude-sonnet-4-6");
+    assert_eq!(row.model, "claude-sonnet-5");
     assert_eq!(
         llm.call_count(),
         2,

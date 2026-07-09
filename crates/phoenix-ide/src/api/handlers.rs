@@ -8220,7 +8220,7 @@ mod regenerate_conversation_name_tests {
 
         #[allow(clippy::unnecessary_literal_bound)]
         fn model_id(&self) -> &str {
-            "claude-sonnet-4-6"
+            "claude-sonnet-5"
         }
     }
 
@@ -8424,7 +8424,7 @@ mod upgrade_model_state_guard_tests {
         }
         #[allow(clippy::unnecessary_literal_bound)]
         fn model_id(&self) -> &str {
-            "claude-sonnet-4-6"
+            "claude-sonnet-5"
         }
     }
 
@@ -8514,14 +8514,14 @@ mod upgrade_model_state_guard_tests {
             .await
             .expect("set error");
 
-        upgrade(&state, "c-err", "claude-sonnet-4-6")
+        upgrade(&state, "c-err", "claude-sonnet-5")
             .await
             .expect("model switch must be allowed from Error");
 
         let conv = state.db.get_conversation("c-err").await.expect("reload");
         assert_eq!(
             conv.model.as_deref(),
-            Some("claude-sonnet-4-6"),
+            Some("claude-sonnet-5"),
             "new model must be persisted so the next retry picks it up"
         );
     }
@@ -8531,11 +8531,11 @@ mod upgrade_model_state_guard_tests {
         let state = make_test_state().await;
         seed(&state, "c-idle").await;
         // create_conversation leaves the row Idle by default.
-        upgrade(&state, "c-idle", "claude-sonnet-4-6")
+        upgrade(&state, "c-idle", "claude-sonnet-5")
             .await
             .expect("model switch must be allowed from Idle");
         let conv = state.db.get_conversation("c-idle").await.expect("reload");
-        assert_eq!(conv.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(conv.model.as_deref(), Some("claude-sonnet-5"));
     }
 
     #[tokio::test]
@@ -8548,7 +8548,7 @@ mod upgrade_model_state_guard_tests {
             .await
             .expect("set busy");
 
-        let err = upgrade(&state, "c-busy", "claude-sonnet-4-6")
+        let err = upgrade(&state, "c-busy", "claude-sonnet-5")
             .await
             .expect_err("must reject while an LLM request is in flight");
         match err {
