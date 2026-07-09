@@ -152,7 +152,7 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     presentation_mode: 'idle',
     context_window_size: 0,
     project_name: null,
-    pending_anchor_sequence_id: messages.reduce((max, m) => Math.max(max, m.sequence_id), 0),
+    pending_anchor_sequence_id: 100,
     pending_events: pendingEvents,
     pending_truncated: false,
   });

@@ -234,9 +234,8 @@ rule SseInitFreshConnect {
         -- starts at pending_anchor_sequence_id and rises as each
         -- accepted entry advances it).
         --
-        -- The phase 1 lastSequenceId = pending_anchor_sequence_id
-        -- is the key change from the prior version of this rule:
-        -- previously it was payload.last_sequence_id, which would
+        -- Phase 1 uses pending_anchor_sequence_id rather than
+        -- payload.last_sequence_id; seeding from the witnessed tip would
         -- cause every pending entry to be dropped as a replay.
 }
 
@@ -338,7 +337,7 @@ rule SseInitReconnectMerge {
 rule SseMessageAppended {
     when: SseMessageDispatched(atom, message, seq)
 
-    requires: seq > atom.lastSequenceId
+    requires: seq = atom.lastSequenceId + 1
     requires: not message_in_list(atom.messages, message.message_id)
 
     ensures: atom.messages = append(atom.messages, message)
@@ -349,9 +348,10 @@ rule SseMessageAppended {
         -- Each of the three ensures clauses above MUST hold jointly. A
         -- partial apply (e.g. streamingBuffer cleared but the message
         -- not appended) is exactly the "streaming-finalizes-then-
-        -- disappears" shape we see in production. The React reducer's
-        -- single return statement gives us atomicity by construction as
-        -- long as all three fields are set in that return.
+        -- disappears" shape we see in production. Message follows the
+        -- shared sequenced-event ordering boundary: a future message is
+        -- deferred until its missing prefix has applied, then this atomic
+        -- transition runs.
 }
 
 -- `message` when the message_id is already present (defense-in-depth
@@ -361,7 +361,7 @@ rule SseMessageAppended {
 rule SseMessageDedupReplay {
     when: SseMessageDispatched(atom, message, seq)
 
-    requires: seq > atom.lastSequenceId
+    requires: seq = atom.lastSequenceId + 1
     requires: message_in_list(atom.messages, message.message_id)
 
     ensures: atom.messages = atom.messages
@@ -373,6 +373,19 @@ rule SseMessageDedupReplay {
         -- the buffer at the time. If buffer is non-null now, it is
         -- from a later turn, not the replayed message's turn — so
         -- leaving it untouched is correct.
+}
+
+-- A message ahead of the next contiguous sequence is not observable until
+-- the missing prefix has been applied. This is the same ordering boundary
+-- used by every other sequenced SSE event; Message has no bypass.
+rule SseMessageAheadDeferred {
+    when: SseMessageDispatched(atom, message, seq)
+
+    requires: seq > atom.lastSequenceId + 1
+
+    ensures: atom.messages = atom.messages
+    ensures: atom.streamingBuffer = atom.streamingBuffer
+    ensures: atom.lastSequenceId = atom.lastSequenceId
 }
 
 -- Replays below the current watermark are dropped entirely.
@@ -489,8 +502,8 @@ rule SseConversationUpdateApplied {
 
     @guidance
         -- Shallow merge into atom.conversation. If atom.conversation is
-        -- null (init hasn't landed), the rule applies lastSequenceId
-        -- but leaves the merge as a no-op.
+        -- null (before init), the rule applies lastSequenceId but leaves
+        -- the merge as a no-op.
 }
 
 -- `sse_error` with a sequence_id (wire-originated) routes through
@@ -813,12 +826,9 @@ invariant LastSseEventAtPositive {
 -- Render Subscription Isolation
 ------------------------------------------------------------
 -- This section is the authoritative home for the page-view render
--- isolation contract. It previously lived as a prose comment on the
--- ConversationPageView type in ui/src/conversation/useConversationAtom.ts;
--- per AGENTS.md ("comments are local facts, not distributed
--- specifications") a cross-component contract belongs here, where the
--- perf-isolation test (useConversationView.perf-isolation.test.tsx) can
--- be read against it.
+-- isolation contract. The perf-isolation test
+-- (useConversationView.perf-isolation.test.tsx) verifies this
+-- cross-component contract.
 --
 -- THE CONTRACT. The atom has two highest-frequency fields:
 --

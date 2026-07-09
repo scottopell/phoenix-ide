@@ -394,7 +394,7 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(7);
     });
 
-    it('reconnect with pending eager Message adds the tool_use message', () => {
+    it('reconnect buffers a pending eager Message when an earlier event is missing', () => {
       const existing = makeMessage(3, 'user');
       const atom: ConversationAtom = {
         ...createInitialAtom(),
@@ -421,9 +421,10 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
-      expect(next.messages.map((m) => m.message_id)).toEqual(['msg-3', 'eager-1']);
+      expect(next.messages.map((m) => m.message_id)).toEqual(['msg-3']);
       expect(next.lastAppliedEventSeq).toBe(5);
-      expect(next.eventGap).toBeNull();
+      expect(next.eventGap).toEqual({ expectedNextEventSeq: 6, firstBufferedEventSeq: 7 });
+      expect(next.bufferedEventEnvelopes[7]).toMatchObject({ type: 'sse_message' });
     });
     it('pending patch survives event buffering/drain until the message arrives', () => {
       const seeded: ConversationAtom = {
@@ -527,7 +528,7 @@ describe('conversationReducer', () => {
 
       const next = dispatch(atom, { type: 'sse_init', payload });
 
-      expect(next.messages.map((m) => m.message_id)).toEqual(['msg-10', 'replay-id']);
+      expect(next.messages.map((m) => m.message_id)).toEqual(['msg-10']);
       expect(next.lastAppliedEventSeq).toBe(10);
     });
 
@@ -695,7 +696,7 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(10);
     });
 
-    it('still accepts an unknown message whose message sequence is at the event cursor', () => {
+    it('drops a message at or below the applied event cursor', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         lastAppliedEventSeq: 10,
@@ -707,21 +708,36 @@ describe('conversationReducer', () => {
         sequenceId: 10,
       });
 
-      expect(next.messages.map((m) => m.message_id)).toEqual(['msg-10']);
-      expect(next.lastAppliedEventSeq).toBe(10);
+      expect(next).toBe(atom);
     });
 
-    it('accepts a missing lower message sequence without regressing the event cursor', () => {
-      const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 20 };
+    it('buffers an ahead-of-cursor message and drains it when REST reaches the preceding floor', () => {
+      const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 100 };
 
-      const next = dispatch(atom, {
+      const buffered = dispatch(atom, {
         type: 'sse_message',
-        message: makeMessage(15),
-        sequenceId: 15,
+        message: makeMessage(501),
+        sequenceId: 501,
       });
 
-      expect(next.messages.map((m) => m.message_id)).toEqual(['msg-15']);
-      expect(next.lastAppliedEventSeq).toBe(20);
+      expect(buffered.messages).toEqual([]);
+      expect(buffered.lastAppliedEventSeq).toBe(100);
+      expect(buffered.bufferedEventEnvelopes[501]).toMatchObject({ type: 'sse_message' });
+
+      const drained = dispatch(buffered, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(500)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        eventCursorFloor: 500,
+        snapshotStartedAtEventSeq: 100,
+      });
+
+      expect(drained.messages.map((message) => message.sequence_id)).toEqual([500, 501]);
+      expect(drained.lastAppliedEventSeq).toBe(501);
+      expect(drained.bufferedEventEnvelopes).toEqual({});
     });
 
     // Task 02675: defense-in-depth id dedup. Even if the server assigns a
@@ -1595,12 +1611,7 @@ describe('conversationReducer', () => {
       expect(a2.connectionState).toBe('live');
     });
 
-    it('first stamped action passes when atom epoch is null (bootstrap)', () => {
-      // Before connection_opened lands, atom.connectionEpoch is null.
-      // Stamped actions must still be accepted in this window or the
-      // connection never bootstraps. In practice useConnection always
-      // dispatches connection_opened before any stamped wire action, so
-      // this branch only covers the malformed-init edge case.
+    it('rejects stamped actions until connection_opened establishes their epoch', () => {
       const atom = createInitialAtom();
       const next = dispatch(atom, {
         type: 'sse_message',
@@ -1608,7 +1619,7 @@ describe('conversationReducer', () => {
         sequenceId: 1,
         epoch: 1,
       });
-      expect(next.messages).toHaveLength(1);
+      expect(next).toBe(atom);
     });
 
     it('rejects stamped action when epoch does not match (cross-conv contamination)', () => {
@@ -1885,6 +1896,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         transcriptGeneration: 1,
+        snapshotStartedAtEventSeq: 10,
       });
 
       expect(next.lastAppliedEventSeq).toBe(10);
@@ -1912,6 +1924,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         eventCursorFloor: 2,
+        snapshotStartedAtEventSeq: 1,
       });
 
       expect(next.lastAppliedEventSeq).toBe(3);
@@ -1937,6 +1950,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         eventCursorFloor: 2,
+        snapshotStartedAtEventSeq: 1,
       });
 
       expect(next.phase).toEqual({ type: 'llm_requesting', attempt: 1 });
@@ -1959,6 +1973,7 @@ describe('conversationReducer', () => {
         phase: { type: 'llm_requesting', attempt: 1 },
         contextWindow: { used: 0 },
         eventCursorFloor: 10,
+        snapshotStartedAtEventSeq: 10,
       });
 
       expect(next.phase).toEqual({ type: 'llm_requesting', attempt: 1 });
@@ -1982,6 +1997,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         eventCursorFloor: 12,
+        snapshotStartedAtEventSeq: 11,
       });
 
       expect(next.phase).toEqual({ type: 'llm_requesting', attempt: 1 });
@@ -2006,9 +2022,37 @@ describe('conversationReducer', () => {
         messages: [staleRestMessage],
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
+        snapshotStartedAtEventSeq: 6,
       });
 
       expect(next.messages[0]).toEqual(liveMessage);
+    });
+
+    it('merge_conversation_data accepts REST rows when their patch predates the request', () => {
+      const liveMessage = makeMessage(1, { display_data: { duration_ms: 123 } });
+      const restMessage = makeMessage(1, { display_data: { duration_ms: 456 } });
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [liveMessage],
+        pendingMessagePatches: {
+          [liveMessage.message_id]: { lastAppliedPatchEventSeq: 7, patches: [] },
+        },
+      };
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [restMessage],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        snapshotStartedAtEventSeq: 8,
+      });
+
+      expect(next.messages[0]).toEqual(restMessage);
+      expect(next.pendingMessagePatches).toEqual({});
     });
 
     it('merge_conversation_data preserves live conversation metadata over older REST rows', () => {
@@ -2035,6 +2079,7 @@ describe('conversationReducer', () => {
         phase: { type: 'idle' },
         contextWindow: { used: 0 },
         eventCursorFloor: 6,
+        snapshotStartedAtEventSeq: 6,
       });
 
       expect(next.conversation?.cwd).toBe('/newer/live/cwd');
@@ -2056,6 +2101,13 @@ describe('conversationReducer', () => {
         pendingMessagePatches: {
           'msg-1': { lastAppliedPatchEventSeq: 9, patches: [] },
         },
+        streamingBuffer: { text: 'stale', lastSequence: 9, startedAt: 1, requestId: 'old' },
+        phase: { type: 'llm_requesting', attempt: 1 },
+        phaseLastAppliedEventSeq: 8,
+        conversationLastAppliedEventSeq: 7,
+        connectionEpoch: 4,
+        connectionState: 'live',
+        systemPrompt: 'old prompt',
       };
 
       const next = dispatch(atom, {
@@ -2074,6 +2126,12 @@ describe('conversationReducer', () => {
       expect(next.lastAppliedEventSeq).toBe(1);
       expect(next.bufferedEventEnvelopes).toEqual({});
       expect(next.pendingMessagePatches).toEqual({});
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.phaseLastAppliedEventSeq).toBe(0);
+      expect(next.conversationLastAppliedEventSeq).toBe(0);
+      expect(next.connectionEpoch).toBeNull();
+      expect(next.connectionState).toBe('connecting');
+      expect(next.systemPrompt).toBeNull();
     });
 
     it('is a no-op if SSE data already present', () => {

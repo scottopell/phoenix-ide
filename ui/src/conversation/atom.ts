@@ -138,9 +138,9 @@ export interface ConversationAtom {
     resetsAt: number | null;
   } | null;
   /** Per-connection generation that produced the events this atom has accepted.
-   *  `null` until `connection_opened` lands. Wire-originated actions tagged
-   *  with a non-matching `epoch` are dropped at the reducer boundary — the
-   *  cross-conversation contamination guard from task 08683.
+   *  `null` until `connection_opened` lands. Stamped wire actions are accepted
+   *  only when their epoch matches this field, so neither an unestablished nor
+   *  a stale connection can mutate the atom.
    *
    *  Strictly monotonic within a single useConnection mount lifetime:
    *  a stale OPEN_SSE executor closure that fires after a newer one cannot
@@ -346,7 +346,7 @@ export type SSEAction =
       contextWindow: { used: number };
       transcriptGeneration?: number;
       eventCursorFloor?: number;
-      reset?: boolean;
+      snapshotStartedAtEventSeq: number;
     }
   | {
       type: 'set_system_prompt';
@@ -432,6 +432,13 @@ function deriveMessageSyncState(messages: Message[]): Pick<ConversationAtom, 'me
 
 function withDerivedMessageSyncState(atom: ConversationAtom, messages: Message[]): ConversationAtom {
   return { ...atom, messages, ...deriveMessageSyncState(messages) };
+}
+
+function latestMessagePatchEventSeq(state: PendingMessagePatchState): number {
+  return Math.max(
+    state.lastAppliedPatchEventSeq,
+    ...state.patches.map((patch) => patch.eventSeq),
+  );
 }
 
 function mergeMessagesByIdentity(existing: Message[], incoming: Message[], preserveExistingMessageIds = new Set<string>()): Message[] {
@@ -748,8 +755,6 @@ function applyContiguousWireAction(
 
 
 /**
- * Task 08683: cross-conversation contamination guard.
- *
  * Wire-originated actions carry the `epoch` of the `useConnection` `OPEN_SSE`
  * generation that produced them. When that epoch doesn't match the atom's
  * current `connectionEpoch`, the action is from a stale connection — typically
@@ -758,7 +763,8 @@ function applyContiguousWireAction(
  *
  * Returns true when the action should be dropped. Logs in dev so silent
  * drops are observable. Always returns false for actions without an
- * `epoch` field (client-originated, or the bootstrap `connection_opened`).
+ * `epoch` field (client-originated) and for `connection_opened`, which
+ * establishes the accepted epoch through its own monotonic transition.
  */
 function isStaleEpoch(atom: ConversationAtom, action: SSEAction): boolean {
   // `connection_opened` carries the new epoch as data; it must not be
@@ -766,13 +772,7 @@ function isStaleEpoch(atom: ConversationAtom, action: SSEAction): boolean {
   // monotonic check.
   if (action.type === 'connection_opened') return false;
   if (!('epoch' in action) || action.epoch === undefined) return false;
-  // First connection on a fresh atom: connectionEpoch is null. Accepting
-  // the first stamped action is what brings the atom online; rejecting
-  // here would deadlock the bootstrap. The `connection_opened` event
-  // dispatched alongside `OPEN_SSE` lifts `connectionEpoch` to a real
-  // value before any other stamped action arrives.
-  if (atom.connectionEpoch === null) return false;
-  if (action.epoch === atom.connectionEpoch) return false;
+  if (atom.connectionEpoch !== null && action.epoch === atom.connectionEpoch) return false;
   if (import.meta.env.DEV) {
     console.debug('[sse] dropping stale-epoch action', {
       actionType: action.type,
@@ -1169,18 +1169,7 @@ export function conversationReducer(
       return next;
     }
 
-    case 'sse_message': {
-      const knownMessage = atom.messages.some((m) => m.message_id === action.message.message_id);
-      const applied = applyWireActionBody(atom, action);
-      if (action.sequenceId === atom.lastAppliedEventSeq + 1) {
-        return drainBufferedEventEnvelopes({ ...applied, lastAppliedEventSeq: action.sequenceId, eventGap: null });
-      }
-      if (knownMessage) {
-        return applied;
-      }
-      return applied;
-    }
-
+    case 'sse_message':
     case 'sse_message_updated':
     case 'sse_state_change':
     case 'sse_agent_done':
@@ -1258,11 +1247,12 @@ export function conversationReducer(
       if (!atom.conversation) return atom;
       return { ...atom, conversation: { ...atom.conversation, ...action.updates } };
 
-    case 'set_initial_data':
+    case 'set_initial_data': {
       // Don't overwrite if SSE has already provided authoritative data
       if (atom.lastAppliedEventSeq > 0 && !action.reset) return atom;
+      const base = action.reset ? createInitialAtom() : atom;
       return {
-        ...atom,
+        ...base,
         conversationId: action.conversationId,
         conversation: action.conversation,
         messages: action.messages,
@@ -1278,18 +1268,19 @@ export function conversationReducer(
         eventGap: null,
         pendingMessagePatches: {},
       };
+    }
 
     case 'merge_conversation_data': {
       if (atom.conversationId !== null && atom.conversationId !== action.conversationId) return atom;
       const livePatchedMessageIds = new Set(
         Object.entries(atom.pendingMessagePatches)
-          .filter(([, pending]) => pending.lastAppliedPatchEventSeq > 0)
+          .filter(([, pending]) => latestMessagePatchEventSeq(pending) > action.snapshotStartedAtEventSeq)
           .map(([messageId]) => messageId),
       );
       const messages = mergeMessagesByIdentity(atom.messages, action.messages, livePatchedMessageIds);
       const incomingFloor = action.eventCursorFloor ?? 0;
       const lastAppliedEventSeq = Math.max(atom.lastAppliedEventSeq, incomingFloor);
-      const conversation = atom.conversationLastAppliedEventSeq > incomingFloor && atom.conversation
+      const conversation = atom.conversationLastAppliedEventSeq > action.snapshotStartedAtEventSeq && atom.conversation
         ? atom.conversation
         : action.conversation;
       const merged: ConversationAtom = {
@@ -1297,8 +1288,13 @@ export function conversationReducer(
         conversationId: action.conversationId,
         conversation,
         messages,
-        phase: atom.phaseLastAppliedEventSeq > 0 ? atom.phase : action.phase,
+        phase: atom.phaseLastAppliedEventSeq > action.snapshotStartedAtEventSeq ? atom.phase : action.phase,
         phaseLastAppliedEventSeq: atom.phaseLastAppliedEventSeq,
+        pendingMessagePatches: Object.fromEntries(
+          Object.entries(atom.pendingMessagePatches).filter(
+            ([, pending]) => latestMessagePatchEventSeq(pending) > action.snapshotStartedAtEventSeq,
+          ),
+        ),
         contextWindow: action.contextWindow,
         transcriptGeneration: action.transcriptGeneration ?? action.conversation.transcript_generation ?? atom.transcriptGeneration ?? 1,
         lastAppliedEventSeq,

@@ -511,31 +511,34 @@ function ConversationPageContent() {
 
           if (hasCachedMessages && cachedConversationId) {
             try {
+              const snapshotStartedAtEventSeq = eventCursorRef.current;
               const mergedTranscriptTail = latestMessageSequenceId(cachedMessages);
               if (mergedTranscriptTail !== null) {
-                let nextAfterSequence = mergedTranscriptTail;
+                let contiguousTranscriptTail = mergedTranscriptTail;
                 let mergedMessages = cachedMessages;
                 let latestServerTail: number | null = null;
                 let latestTranscriptGeneration = cached?.transcript_generation ?? 1;
 
                 while (!cancelled) {
-                  const catchUp = await api.getConversationMessagesAfter(cachedConversationId, nextAfterSequence, 200);
+                  const catchUp = await api.getConversationMessagesAfter(cachedConversationId, contiguousTranscriptTail, 200);
                   latestServerTail = catchUp.server_message_tail;
                   latestTranscriptGeneration = catchUp.transcript_generation;
                   if (catchUp.messages.length > 0) {
                     mergedMessages = mergeConversationMessages(mergedMessages, catchUp.messages);
                     await cacheDB.putMessages(catchUp.messages);
                   }
-                  const mergedLatestSequenceId = latestMessageSequenceId(mergedMessages);
+                  if (catchUp.messages.length > 0) {
+                    const nextContiguousTail = catchUp.messages.at(-1)!.sequence_id;
+                    if (nextContiguousTail <= contiguousTranscriptTail) break;
+                    contiguousTranscriptTail = nextContiguousTail;
+                  }
                   if (
                     catchUp.messages.length === 0 ||
                     latestServerTail === null ||
-                    mergedLatestSequenceId === null ||
-                    mergedLatestSequenceId >= latestServerTail
+                    contiguousTranscriptTail >= latestServerTail
                   ) {
                     break;
                   }
-                  nextAfterSequence = mergedLatestSequenceId;
                 }
                 if (cancelled) return;
 
@@ -548,10 +551,26 @@ function ConversationPageContent() {
                 }
                 if (cancelled) return;
 
-                const mergedLatestSequenceId = latestMessageSequenceId(mergedMessages);
+                while (!cancelled && latestServerTail !== null && contiguousTranscriptTail < latestServerTail) {
+                  const catchUp = await api.getConversationMessagesAfter(
+                    cachedConversationId,
+                    contiguousTranscriptTail,
+                    200,
+                  );
+                  latestServerTail = catchUp.server_message_tail;
+                  latestTranscriptGeneration = catchUp.transcript_generation;
+                  if (catchUp.messages.length === 0) break;
+                  const nextContiguousTail = catchUp.messages.at(-1)!.sequence_id;
+                  if (nextContiguousTail <= contiguousTranscriptTail) break;
+                  mergedMessages = mergeConversationMessages(mergedMessages, catchUp.messages);
+                  await cacheDB.putMessages(catchUp.messages);
+                  contiguousTranscriptTail = nextContiguousTail;
+                }
+                if (cancelled) return;
+
                 await cacheDB.putReplicaMeta({
                   conversationId: cachedConversationId,
-                  latestMessageSequenceId: latestServerTail ?? mergedLatestSequenceId,
+                  latestMessageSequenceId: contiguousTranscriptTail,
                   latestEventSequenceId: null,
                   transcriptGeneration: latestTranscriptGeneration,
                   lastHydratedAt: new Date().toISOString(),
@@ -577,7 +596,8 @@ function ConversationPageContent() {
                       : { type: 'idle' },
                     contextWindow: { used: metadata.context_window_size || 0 },
                     transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
-                    eventCursorFloor: latestServerTail ?? mergedLatestSequenceId ?? 0,
+                    eventCursorFloor: contiguousTranscriptTail,
+                    snapshotStartedAtEventSeq,
                   });
                 }
                 return;
@@ -590,6 +610,7 @@ function ConversationPageContent() {
           }
 
           try {
+            const snapshotStartedAtEventSeq = eventCursorRef.current;
             const result = await api.getConversationBySlug(slug);
             if (!cancelled) {
               const replacesDifferentConversation = atomRef.current.conversationId !== null
@@ -610,6 +631,7 @@ function ConversationPageContent() {
                 },
                 transcriptGeneration: result.conversation.transcript_generation ?? 1,
                 eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
+                snapshotStartedAtEventSeq,
               });
               setArchiveStatusConfirmedConversationId(result.conversation.id);
               await cacheDB.putConversation(result.conversation);
@@ -655,6 +677,7 @@ function ConversationPageContent() {
 
     const confirmArchiveStatus = async () => {
       try {
+        const snapshotStartedAtEventSeq = eventCursorRef.current;
         const result = await api.getConversationBySlug(slug);
         if (cancelled) return;
         const replacesDifferentConversation = atomRef.current.conversationId !== null
@@ -675,6 +698,7 @@ function ConversationPageContent() {
           },
           transcriptGeneration: result.conversation.transcript_generation ?? 1,
           eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
+          snapshotStartedAtEventSeq,
         });
         setArchiveStatusConfirmedConversationId(result.conversation.id);
         await cacheDB.putConversation(result.conversation);

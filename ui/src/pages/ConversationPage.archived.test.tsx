@@ -266,6 +266,54 @@ describe('ConversationPage archived read-only rendering', () => {
     });
   });
 
+  it('fills a tail that grows during latest-window refresh before advancing replica coverage', async () => {
+    const cachedConversation = makeConversation();
+    const message3 = { ...catchUpMessage, message_id: 'm3', sequence_id: 3, content: [{ type: 'text', text: 'middle message' }] } as Message;
+    const message4 = { ...catchUpMessage, message_id: 'm4', sequence_id: 4, content: [{ type: 'text', text: 'new tail message' }] } as Message;
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getMaxMessageSequenceId).mockResolvedValue(1);
+    vi.mocked(api.getConversationMessagesAfter).mockImplementation(async (_id, afterSequence) => (
+      afterSequence < 2
+        ? {
+            messages: [catchUpMessage],
+            tombstones: [],
+            transcript_generation: 7,
+            server_message_tail: 2,
+          }
+        : {
+            messages: [message3, message4],
+            tombstones: [],
+            transcript_generation: 7,
+            server_message_tail: 4,
+          }
+    ));
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [message4],
+      tombstones: [],
+      transcript_generation: 7,
+      server_message_tail: 4,
+    });
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+
+    renderPage(cachedConversation);
+
+    expect(await screen.findByText('middle message')).toBeInTheDocument();
+    expect(await screen.findByText('new tail message')).toBeInTheDocument();
+    expect(api.getConversationMessagesAfter).toHaveBeenCalledWith(conversationId, 1, 200);
+    expect(api.getConversationMessagesAfter).toHaveBeenCalledWith(conversationId, 2, 200);
+    await waitFor(() => {
+      expect(cacheDB.putReplicaMeta).toHaveBeenCalledWith(
+        expect.objectContaining({ latestMessageSequenceId: 4 }),
+      );
+    });
+  });
+
   it('renders cached messages immediately and incrementally catches up newer messages without a full fetch', async () => {
     const cachedConversation = makeConversation();
     vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
