@@ -90,7 +90,7 @@ describe('scrollMachine', () => {
     result = reduce(result.state, { type: 'settleTick', snapshot: snap(1000, 100, 400), nowMs: 1200 });
     expect(result.effects).toContainEqual({ type: 'writeDomBottom' });
 
-    result = reduce(result.state, { type: 'touchStart', nowMs: 1250 });
+    result = reduce(result.state, { type: 'touchStart' });
     result = reduce(result.state, { type: 'settleTick', snapshot: snap(1000, 100, 400), nowMs: 1300 });
     expect(result.effects).toContainEqual({ type: 'stopSettleWatch' });
   });
@@ -106,7 +106,7 @@ describe('scrollMachine', () => {
 
   it('suppresses re-snap during touch and upward momentum, then resumes', () => {
     let result = reduce(initialScrollMachineState(), measured({ totalHeight: 500, snapshot: snap(500, 100, 400), nowMs: 1000 }));
-    result = reduce(result.state, { type: 'touchStart', nowMs: 1050 });
+    result = reduce(result.state, { type: 'touchStart' });
     result = reduce(result.state, measured({ totalHeight: 600, snapshot: snap(600, 80, 400), nowMs: 1100 }));
     expect(result.effects.map((e) => e.type)).not.toContain('snapToLastIndex');
 
@@ -123,11 +123,13 @@ describe('scrollMachine', () => {
     let result = reduce(initialScrollMachineState(), measured({ totalHeight: 500, snapshot: snap(500, 100, 400), nowMs: 1000 }));
     result = reduce(result.state, { type: 'scroll', snapshot: snap(500, 100, 400), nowMs: 1000 });
 
-    result = reduce(result.state, { type: 'touchStart', nowMs: 1050 });
+    result = reduce(result.state, { type: 'touchStart' });
+    result = reduce(result.state, { type: 'touchMove', nowMs: 1070 });
     result = reduce(result.state, { type: 'touchEnd', remainingTouches: 0, nowMs: 1080 });
     result = reduce(result.state, { type: 'scroll', snapshot: snap(500, 80, 400), nowMs: 1100 });
 
-    result = reduce(result.state, { type: 'touchStart', nowMs: 1800 });
+    result = reduce(result.state, { type: 'touchStart' });
+    result = reduce(result.state, { type: 'touchMove', nowMs: 1820 });
     result = reduce(result.state, { type: 'touchEnd', remainingTouches: 0, nowMs: 1830 });
     result = reduce(result.state, measured({ totalHeight: 600, snapshot: snap(600, 80, 400), tailActivity: 'active', nowMs: 1900 }));
     expect(result.effects.map((e) => e.type)).not.toContain('snapToLastIndex');
@@ -135,6 +137,19 @@ describe('scrollMachine', () => {
 
     result = reduce(result.state, measured({ totalHeight: 700, snapshot: snap(700, 200, 400), tailActivity: 'active', nowMs: 1830 + TOUCH_GESTURE_SUPPRESS_MS + 1 }));
     expect(result.effects).toContainEqual({ type: 'snapToLastIndex' });
+  });
+
+  it('suppresses moved touch gestures even when no upward scroll event has arrived', () => {
+    let result = reduce(initialScrollMachineState(), measured({ totalHeight: 500, snapshot: snap(500, 100, 400), nowMs: 1000 }));
+    result = reduce(result.state, { type: 'scroll', snapshot: snap(500, 100, 400), nowMs: 1000 });
+
+    result = reduce(result.state, { type: 'touchStart' });
+    result = reduce(result.state, { type: 'touchMove', nowMs: 1050 });
+    result = reduce(result.state, { type: 'touchEnd', remainingTouches: 0, nowMs: 1060 });
+    result = reduce(result.state, measured({ totalHeight: 600, snapshot: snap(600, 95, 400), tailActivity: 'active', nowMs: 1100 }));
+
+    expect(result.effects.map((e) => e.type)).not.toContain('snapToLastIndex');
+    expect(result.effects).toContainEqual({ type: 'showUnread' });
   });
 
   it('does not suppress on downward scroll', () => {
@@ -164,7 +179,7 @@ describe('scrollMachine', () => {
 
   it('marks unread when gesture suppression swallows a genuine tail-growth snap', () => {
     let result = reduce(initialScrollMachineState(), measured({ totalHeight: 500, snapshot: snap(500, 100, 400), nowMs: 1000 }));
-    result = reduce(result.state, { type: 'touchStart', nowMs: 1050 });
+    result = reduce(result.state, { type: 'touchStart' });
     result = reduce(result.state, measured({ totalHeight: 600, snapshot: snap(600, 100, 400), tailActivity: 'active', nowMs: 1100 }));
 
     expect(result.effects).toContainEqual({ type: 'showUnread' });
@@ -173,7 +188,7 @@ describe('scrollMachine', () => {
 
   it('keeps auto-follow for tap-only touches while pinned', () => {
     let result = reduce(initialScrollMachineState(), measured({ totalHeight: 500, snapshot: snap(500, 100, 400), nowMs: 1000 }));
-    result = reduce(result.state, { type: 'touchStart', nowMs: 1050 });
+    result = reduce(result.state, { type: 'touchStart' });
     result = reduce(result.state, { type: 'touchEnd', remainingTouches: 0, nowMs: 1060 });
 
     result = reduce(result.state, measured({ totalHeight: 600, snapshot: snap(600, 100, 400), tailActivity: 'active', nowMs: 1100 }));
@@ -186,7 +201,7 @@ describe('scrollMachine', () => {
     let result = reduce(initialScrollMachineState(), measured({ totalHeight: 500, snapshot: snap(500, 100, 400), nowMs: 1000 }));
     result = reduce(result.state, { type: 'scroll', snapshot: snap(500, 80, 400), nowMs: 1050 });
     result = reduce(result.state, { type: 'atBottomChanged', atBottom: true });
-    result = reduce(result.state, { type: 'touchStart', nowMs: 1100 });
+    result = reduce(result.state, { type: 'touchStart' });
     result = reduce(result.state, { type: 'touchEnd', remainingTouches: 0, nowMs: 1110 });
 
     result = reduce(result.state, measured({ totalHeight: 600, snapshot: snap(600, 100, 400), tailActivity: 'active', nowMs: 1150 }));
@@ -233,6 +248,7 @@ const stateArb: fc.Arbitrary<ScrollMachineState> = fc.record({
   hasSeenContent: fc.boolean(),
   hasUserEngaged: fc.boolean(),
   touchActive: fc.boolean(),
+  touchMovedAfterStart: fc.boolean(),
   lastUpwardScrollAt: finiteNumber,
   lastTouchGestureAt: finiteNumber,
   lastScrollTop: finiteNumber,
@@ -243,7 +259,8 @@ const eventArb: fc.Arbitrary<ScrollEvent> = fc.oneof(
   fc.record({ type: fc.constant('scrollerAttached' as const), snapshot: snapshotArb }),
   fc.record({ type: fc.constant('atBottomChanged' as const), atBottom: fc.boolean() }),
   fc.constant({ type: 'pointerDown' } as const),
-  fc.record({ type: fc.constant('touchStart' as const), nowMs: finiteNumber }),
+  fc.constant({ type: 'touchStart' } as const),
+  fc.record({ type: fc.constant('touchMove' as const), nowMs: finiteNumber }),
   fc.record({ type: fc.constant('touchEnd' as const), remainingTouches: fc.integer({ min: 0, max: 5 }), nowMs: finiteNumber }),
   fc.record({ type: fc.constant('wheel' as const), deltaY: fc.integer({ min: -2_000, max: 2_000 }), nowMs: finiteNumber }),
   fc.record({ type: fc.constant('scroll' as const), snapshot: snapshotArb, nowMs: finiteNumber }),
@@ -270,6 +287,7 @@ const measuredEngagedState = (overrides: Partial<ScrollMachineState> = {}): Scro
   hasSeenContent: true,
   hasUserEngaged: true,
   touchActive: false,
+  touchMovedAfterStart: false,
   lastUpwardScrollAt: 0,
   lastTouchGestureAt: 0,
   lastScrollTop: 600,
@@ -289,6 +307,7 @@ describe('scrollMachine fast-check properties', () => {
         expect(Number.isFinite(result.state.prevScrollHeight)).toBe(true);
         expect(Number.isFinite(result.state.prevClientHeight)).toBe(true);
         expect(Number.isFinite(result.state.lastTouchGestureAt)).toBe(true);
+        expect(typeof result.state.touchMovedAfterStart).toBe('boolean');
         expect(!(types.includes('snapToLastIndex') && types.includes('writeDomBottom'))).toBe(true);
         expect(!(types.includes('showUnread') && types.includes('clearUnread'))).toBe(true);
         expect(visibleScrollEffects(result.effects).length).toBeLessThanOrEqual(1);
@@ -437,7 +456,7 @@ describe('scrollMachine fast-check properties', () => {
     fc.assert(
       fc.property(stateArb, snapshotArb, fc.integer({ min: 0, max: 200 }), finiteNumber, (state, snapshot, unitCount, nowMs) => {
         const result = reduceScrollMachine(
-          { ...state, conversationId: 'old', hasMeasuredConversation: true, hasUserEngaged: true, touchActive: true, lastUpwardScrollAt: nowMs, lastTouchGestureAt: nowMs },
+          { ...state, conversationId: 'old', hasMeasuredConversation: true, hasUserEngaged: true, touchActive: true, touchMovedAfterStart: true, lastUpwardScrollAt: nowMs, lastTouchGestureAt: nowMs },
           {
             type: 'totalHeightChanged',
             conversationId: 'new',
@@ -455,6 +474,7 @@ describe('scrollMachine fast-check properties', () => {
         expect(result.state.prevTotalHeight).toBe(snapshot.scrollHeight);
         expect(result.state.hasUserEngaged).toBe(false);
         expect(result.state.touchActive).toBe(false);
+        expect(result.state.touchMovedAfterStart).toBe(false);
         expect(result.state.lastUpwardScrollAt).toBe(0);
         expect(result.state.lastTouchGestureAt).toBe(0);
       }),

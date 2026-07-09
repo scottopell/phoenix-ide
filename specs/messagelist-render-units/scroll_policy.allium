@@ -23,6 +23,7 @@
 config {
     pin_threshold_px: Integer = 100
     gesture_suppression_ms: Integer = 400
+    touch_gesture_suppression_ms: Integer = 1200
     settle_window_ms: Integer = 3000
 }
 
@@ -55,7 +56,9 @@ entity ScrollPolicy {
     prev_client_height: Integer
     has_seen_content: Boolean
     touch_active: Boolean
+    touch_moved_after_start: Boolean
     last_upward_scroll_at: Integer
+    last_touch_gesture_at: Integer
     last_scroll_top: Integer
     settle_deadline: Integer
 
@@ -83,6 +86,7 @@ surface ScrollPolicyAdapter {
         policy.phase
         policy.has_seen_content
         policy.touch_active
+        policy.touch_moved_after_start
 
     provides:
         ScrollerAttached(policy, snapshot)
@@ -90,7 +94,8 @@ surface ScrollPolicyAdapter {
         PointerDown(policy)
         NavigationJump(policy)
         TouchStart(policy)
-        TouchEnd(policy, remaining_touches)
+        TouchMove(policy, now_ms)
+        TouchEnd(policy, remaining_touches, now_ms)
         Wheel(policy, delta_y, now_ms)
         ScrollMoved(policy, snapshot, now_ms)
         TotalHeightChanged(policy, conversation_id, total_height, unit_count, snapshot, tail_activity, now_ms)
@@ -113,7 +118,9 @@ surface ScrollPolicyEffectSink {
 rule ScrollerAttachmentResetsGestureTracking {
     when: ScrollerAttached(policy, snapshot)
     ensures: policy.touch_active = false
+    ensures: policy.touch_moved_after_start = false
     ensures: policy.last_upward_scroll_at = 0
+    ensures: policy.last_touch_gesture_at = 0
     ensures: policy.last_scroll_top = snapshot.scroll_top
     ensures:
         if policy.has_seen_content:
@@ -122,9 +129,12 @@ rule ScrollerAttachmentResetsGestureTracking {
             policy.phase = unmeasured
 }
 
-rule AtBottomClearsUnread {
+rule AtBottomClearsUnreadAndSuppression {
     when: AtBottomChanged(policy, at_bottom)
     requires: at_bottom = true
+    ensures: policy.touch_moved_after_start = false
+    ensures: policy.last_upward_scroll_at = 0
+    ensures: policy.last_touch_gesture_at = 0
     ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
 }
 
@@ -138,15 +148,33 @@ rule NavigationJumpEngagesViewport {
     ensures: policy.phase = engaged
 }
 
-rule TouchStartEngagesAndSuppresses {
+rule TouchStartEngagesActiveGesture {
     when: TouchStart(policy)
     ensures: policy.phase = engaged
     ensures: policy.touch_active = true
+    ensures: policy.touch_moved_after_start = false
 }
 
-rule TouchEndReleasesWhenNoTouchesRemain {
-    when: TouchEnd(policy, remaining_touches)
+rule TouchMoveCreatesPostTouchSuppression {
+    when: TouchMove(policy, now_ms)
+    ensures: policy.phase = engaged
+    ensures: policy.touch_moved_after_start = true
+    ensures: policy.last_touch_gesture_at = now_ms
+}
+
+rule TouchEndReleasesMovedGestureWhenNoTouchesRemain {
+    when: TouchEnd(policy, remaining_touches, now_ms)
     requires: remaining_touches = 0
+    requires: policy.touch_moved_after_start = true
+    ensures: policy.touch_active = false
+    ensures: policy.touch_moved_after_start = false
+    ensures: policy.last_touch_gesture_at = now_ms
+}
+
+rule TouchEndReleasesTapWithoutPostTouchSuppression {
+    when: TouchEnd(policy, remaining_touches, _)
+    requires: remaining_touches = 0
+    requires: policy.touch_moved_after_start = false
     ensures: policy.touch_active = false
 }
 
@@ -211,7 +239,9 @@ rule ConversationChangeSeedsFreshBaseline {
     ensures: policy.prev_client_height = snapshot.client_height
     ensures: policy.last_scroll_top = snapshot.scroll_top
     ensures: policy.touch_active = false
+    ensures: policy.touch_moved_after_start = false
     ensures: policy.last_upward_scroll_at = 0
+    ensures: policy.last_touch_gesture_at = 0
     ensures: policy.has_seen_content = unit_count > 0
     ensures:
         if unit_count > 0:
@@ -260,6 +290,7 @@ rule PinnedHeightChangeSnapsToNewest {
     requires: old_from_bottom <= config.pin_threshold_px
     requires: policy.touch_active = false
     requires: now_ms - policy.last_upward_scroll_at >= config.gesture_suppression_ms
+    requires: now_ms - policy.last_touch_gesture_at >= config.touch_gesture_suppression_ms
     ensures: policy.prev_total_height = total_height
     ensures: policy.prev_scroll_height = snapshot.scroll_height
     ensures: policy.prev_client_height = snapshot.client_height
@@ -275,7 +306,7 @@ rule GestureSuppressedTailGrowthShowsUnread {
     let client_height_for_pin = policy.prev_client_height
     let old_from_bottom = policy.prev_scroll_height - snapshot.scroll_top - client_height_for_pin
     requires: old_from_bottom <= config.pin_threshold_px
-    requires: policy.touch_active = true or now_ms - policy.last_upward_scroll_at < config.gesture_suppression_ms
+    requires: policy.touch_active = true or now_ms - policy.last_upward_scroll_at < config.gesture_suppression_ms or now_ms - policy.last_touch_gesture_at < config.touch_gesture_suppression_ms
     ensures: policy.prev_total_height = total_height
     ensures: policy.prev_scroll_height = snapshot.scroll_height
     ensures: policy.prev_client_height = snapshot.client_height

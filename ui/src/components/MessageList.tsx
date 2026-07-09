@@ -480,7 +480,8 @@ function MessageListImpl({
         snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
       });
       const onPointerDown = () => dispatchScrollEvent({ type: 'pointerDown' });
-      const onTouchStart = () => dispatchScrollEvent({ type: 'touchStart', nowMs: Date.now() });
+      const onTouchStart = () => dispatchScrollEvent({ type: 'touchStart' });
+      const onTouchMove = () => dispatchScrollEvent({ type: 'touchMove', nowMs: Date.now() });
       const onTouchEnd = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchEnd', remainingTouches: e.touches.length, nowMs: Date.now() });
       const onWheel = (e: WheelEvent) => dispatchScrollEvent({ type: 'wheel', deltaY: e.deltaY, nowMs: Date.now() });
       const onScroll = () => dispatchScrollEvent({
@@ -490,6 +491,7 @@ function MessageListImpl({
       });
       ref.addEventListener('pointerdown', onPointerDown, { passive: true });
       ref.addEventListener('touchstart', onTouchStart, { passive: true });
+      ref.addEventListener('touchmove', onTouchMove, { passive: true });
       ref.addEventListener('touchend', onTouchEnd, { passive: true });
       ref.addEventListener('touchcancel', onTouchEnd, { passive: true });
       ref.addEventListener('wheel', onWheel, { passive: true });
@@ -497,6 +499,7 @@ function MessageListImpl({
       detachGestureListenersRef.current = () => {
         ref.removeEventListener('pointerdown', onPointerDown);
         ref.removeEventListener('touchstart', onTouchStart);
+        ref.removeEventListener('touchmove', onTouchMove);
         ref.removeEventListener('touchend', onTouchEnd);
         ref.removeEventListener('touchcancel', onTouchEnd);
         ref.removeEventListener('wheel', onWheel);
