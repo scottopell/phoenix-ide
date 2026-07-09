@@ -343,6 +343,18 @@ pub struct Database {
     path: String,
 }
 
+fn sqlite_constraint_code_is(code: Option<&str>, expected: &str) -> bool {
+    code == Some(expected)
+}
+
+fn is_sqlite_unique_constraint(error: &dyn sqlx::error::DatabaseError) -> bool {
+    sqlite_constraint_code_is(error.code().as_deref(), "2067")
+}
+
+fn is_sqlite_primary_key_constraint(error: &dyn sqlx::error::DatabaseError) -> bool {
+    sqlite_constraint_code_is(error.code().as_deref(), "1555")
+}
+
 async fn insert_creation_job_files_tx(
     tx: &mut Transaction<'_, Sqlite>,
     job: &InsertConversationCreationJob,
@@ -1562,12 +1574,13 @@ impl Database {
             match result {
                 Ok(_) => break,
                 Err(sqlx::Error::Database(ref e))
-                    if e.code().as_deref() == Some("2067")
+                    if (is_sqlite_unique_constraint(e.as_ref())
+                        || is_sqlite_primary_key_constraint(e.as_ref()))
                         && e.message().contains("conversations.id") =>
                 {
                     return Err(DbError::ConversationAlreadyExists(id.to_string()));
                 }
-                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
+                Err(sqlx::Error::Database(ref e)) if is_sqlite_unique_constraint(e.as_ref()) => {
                     attempts += 1;
                     if attempts >= 10 {
                         // Last resort: full UUID fragment (UUIDs are ASCII, first 8 bytes always valid)
@@ -1952,12 +1965,13 @@ impl Database {
             match result {
                 Ok(_) => break,
                 Err(sqlx::Error::Database(ref e))
-                    if e.code().as_deref() == Some("2067")
+                    if (is_sqlite_unique_constraint(e.as_ref())
+                        || is_sqlite_primary_key_constraint(e.as_ref()))
                         && e.message().contains("conversations.id") =>
                 {
                     return Err(DbError::ConversationAlreadyExists(id.to_string()));
                 }
-                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
+                Err(sqlx::Error::Database(ref e)) if is_sqlite_unique_constraint(e.as_ref()) => {
                     attempts += 1;
                     if attempts >= 10 {
                         let uuid_str = uuid::Uuid::new_v4().to_string();
@@ -2730,7 +2744,7 @@ impl Database {
 
             match result {
                 Ok(_) => break candidate_slug,
-                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
+                Err(sqlx::Error::Database(ref e)) if is_sqlite_unique_constraint(e.as_ref()) => {
                     slug_offset += 1;
                     candidate_slug = if slug_offset <= 20 {
                         format!("{base_slug}-{}", slug_offset + 1)
@@ -2979,7 +2993,7 @@ impl Database {
 
             match result {
                 Ok(_) => break candidate_slug,
-                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
+                Err(sqlx::Error::Database(ref e)) if is_sqlite_unique_constraint(e.as_ref()) => {
                     slug_offset += 1;
                     candidate_slug = if slug_offset <= 20 {
                         format!("{root_slug}-{}", base_n + slug_offset)
@@ -3850,7 +3864,7 @@ impl Database {
                     return Ok(());
                 }
                 Err(sqlx::Error::Database(ref e))
-                    if e.code().as_deref() == Some("2067") && base_slug.is_some() =>
+                    if is_sqlite_unique_constraint(e.as_ref()) && base_slug.is_some() =>
                 {
                     attempts += 1;
                     let slug = base_slug.as_deref().unwrap_or_default();
@@ -3944,7 +3958,7 @@ impl Database {
                     return Ok(());
                 }
                 Err(sqlx::Error::Database(ref e))
-                    if e.code().as_deref() == Some("2067") && base_slug.is_some() =>
+                    if is_sqlite_unique_constraint(e.as_ref()) && base_slug.is_some() =>
                 {
                     attempts += 1;
                     let slug = base_slug.as_deref().unwrap_or_default();

@@ -3,6 +3,7 @@ import type { ConversationAtom, SSEAction } from './atom';
 import type { CachedPrSummary, Conversation } from '../api';
 import { RoutedStore } from './RoutedStore';
 import { notifyConversationSnapshotChange } from '../notifications';
+import { parseConversationState } from '../utils';
 
 function cachedPrEqual(a: CachedPrSummary | null | undefined, b: CachedPrSummary | null | undefined): boolean {
   if (a === b) return true;
@@ -151,7 +152,12 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       return false;
     }
     notifyConversationSnapshotChange(conversation);
-    return this.setAtom(routeKey, { ...destination, conversation });
+    return this.setAtom(routeKey, {
+      ...destination,
+      conversationId: conversation.id,
+      conversation,
+      phase: parseConversationState(conversation.state),
+    });
   }
 
   private setConversationSnapshot(

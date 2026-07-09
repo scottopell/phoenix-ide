@@ -119,6 +119,8 @@ const ChevronRightSmall = () => (
   </svg>
 );
 const routeForConversation = (conv: { id: string; slug?: string | null }) => `/c/${conv.id}`;
+const UUID_ROUTE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuidRouteSegment = (segment: string) => UUID_ROUTE_RE.test(segment);
 
 
 export function ConversationPage() {
@@ -500,7 +502,9 @@ function ConversationPageContent() {
         let cached = atomRef.current.conversation;
         let cachedMessages: Message[] = hadAtomData ? atomRef.current.messages : [];
         if (!hadAtomData) {
-          cached = await cacheDB.getConversationBySlug(slug) ?? await cacheDB.getConversation(slug);
+          cached = isUuidRouteSegment(slug)
+            ? await cacheDB.getConversation(slug) ?? await cacheDB.getConversationBySlug(slug)
+            : await cacheDB.getConversationBySlug(slug) ?? await cacheDB.getConversation(slug);
           if (cached) {
             cachedMessages = await cacheDB.getMessages(cached.id);
             if (!cancelled) {
@@ -626,6 +630,14 @@ function ConversationPageContent() {
           try {
             const snapshotStartedAtEventSeq = eventCursorRef.current;
             const result = await (async () => {
+              if (isUuidRouteSegment(slug)) {
+                try {
+                  return await api.getConversation(slug);
+                } catch (err) {
+                  if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+                  return api.getConversationBySlug(slug);
+                }
+              }
               try {
                 return await api.getConversationBySlug(slug);
               } catch (err) {
@@ -700,6 +712,14 @@ function ConversationPageContent() {
       try {
         const snapshotStartedAtEventSeq = eventCursorRef.current;
         const result = await (async () => {
+          if (isUuidRouteSegment(slug)) {
+            try {
+              return await api.getConversation(slug);
+            } catch (err) {
+              if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
+              return api.getConversationBySlug(slug);
+            }
+          }
           try {
             return await api.getConversationBySlug(slug);
           } catch (err) {
@@ -1472,6 +1492,7 @@ function ConversationPageContent() {
     convStateForChildren.type !== 'terminal' &&
     convStateForChildren.type !== 'handed_off' &&
     convStateForChildren.type !== 'provisioning' &&
+    convStateForChildren.type !== 'creation_failed' &&
     convStateForChildren.type !== 'context_exhausted';
 
   // Derived: model context window is a pure function of the current model's
