@@ -24,13 +24,14 @@ export function GlobalRecallPage() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, []);
 
-  const refreshSessions = useCallback(() => {
-    api.listGlobalRecallSessions()
-      .then((rows) => {
-        setSessions(rows);
-        setActiveSessionId((prev) => prev ?? rows[0]?.id ?? null);
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  const refreshSessions = useCallback(async () => {
+    try {
+      const rows = await api.listGlobalRecallSessions();
+      setSessions(rows);
+      setActiveSessionId((prev) => prev ?? rows[0]?.id ?? null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   }, []);
 
   useEffect(() => {
@@ -75,9 +76,22 @@ export function GlobalRecallPage() {
 
   const createSession = async () => {
     setError(null);
-    const session = await api.createGlobalRecallSession(`Global Recall ${new Date().toLocaleString()}`);
-    refreshSessions();
-    setActiveSessionId(session.id);
+    try {
+      const session = await api.createGlobalRecallSession(`Global Recall ${new Date().toLocaleString()}`);
+      await refreshSessions();
+      setActiveSessionId(session.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const copyReference = async (reference: string) => {
+    setError(null);
+    try {
+      await navigator.clipboard.writeText(reference);
+    } catch (e) {
+      setError(e instanceof Error ? `Failed to copy reference: ${e.message}` : 'Failed to copy reference');
+    }
   };
 
   const ask = async () => {
@@ -95,7 +109,7 @@ export function GlobalRecallPage() {
         }
         return current;
       });
-      refreshSessions();
+      void refreshSessions();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setQuestion(text);
@@ -153,7 +167,7 @@ export function GlobalRecallPage() {
                       {item.branch_name && <span>BRANCH {item.branch_name}{item.base_branch ? ` ← ${item.base_branch}` : ''}</span>}
                     </div>
                   </div>
-                  <button type="button" onClick={() => navigator.clipboard.writeText(item.reference)}>
+                  <button type="button" onClick={() => { void copyReference(item.reference); }}>
                     Copy {item.reference}
                   </button>
                 </article>

@@ -35,7 +35,9 @@ use super::types::{
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
-use crate::db::{ConvMode, Conversation, ConversationUsage, ImageData, NotificationSettings};
+use crate::db::{
+    ConvMode, Conversation, ConversationUsage, DbError, ImageData, NotificationSettings,
+};
 use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
     GitOpError, PhoenixIgnoreStrategy,
@@ -4251,12 +4253,16 @@ async fn get_by_slug(
     State(state): State<AppState>,
     Path(slug): Path<String>,
 ) -> Result<Json<ConversationWithMessagesResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation_by_slug(&slug)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let conversation = match state.runtime.db().get_conversation_by_slug(&slug).await {
+        Ok(conversation) => conversation,
+        Err(DbError::ConversationNotFound(_)) => state
+            .runtime
+            .db()
+            .get_conversation(&slug)
+            .await
+            .map_err(|e| AppError::NotFound(e.to_string()))?,
+        Err(e) => return Err(AppError::NotFound(e.to_string())),
+    };
 
     let messages = state
         .runtime

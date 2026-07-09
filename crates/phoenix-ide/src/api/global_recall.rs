@@ -18,7 +18,6 @@ use std::fmt::Write as _;
 
 use super::handlers::AppError;
 
-const OPEN_WORK_LIMIT: usize = 80;
 const RECENT_DAYS: i64 = 45;
 const SEARCH_TOP_K: usize = 10;
 const READ_PAGE_CHARS: usize = 7000;
@@ -136,7 +135,7 @@ pub struct ResolveGlobalReferenceResponse {
 pub async fn open_work(
     State(state): State<AppState>,
 ) -> Result<Json<GlobalOpenWorkResponse>, AppError> {
-    Ok(Json(build_open_work(&state, Some(OPEN_WORK_LIMIT)).await?))
+    Ok(Json(build_open_work(&state).await?))
 }
 
 pub async fn list_sessions(
@@ -220,10 +219,8 @@ pub async fn resolve_reference(
     Ok(Json(resolve_reference_impl(&state, &req.reference).await?))
 }
 
-async fn build_open_work(
-    state: &AppState,
-    limit: Option<usize>,
-) -> Result<GlobalOpenWorkResponse, AppError> {
+async fn build_open_work(state: &AppState) -> Result<GlobalOpenWorkResponse, AppError> {
+    let now = Utc::now();
     let conversations = state
         .db
         .list_conversations()
@@ -271,15 +268,12 @@ async fn build_open_work(
             .iter()
             .filter_map(|id| by_id.get(id).cloned())
             .collect();
-        if let Some(item) = project_item_from_members(&members) {
+        if let Some(item) = project_item_from_members(&members, now).await? {
             items.push(item);
         }
     }
 
     items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    if let Some(limit) = limit {
-        items.truncate(limit);
-    }
 
     let mut grouped: HashMap<Option<String>, Vec<GlobalOpenWorkItem>> = HashMap::new();
     for item in items {
@@ -320,27 +314,30 @@ async fn build_open_work(
     });
 
     Ok(GlobalOpenWorkResponse {
-        generated_at: Utc::now(),
+        generated_at: now,
         groups,
     })
 }
 
-fn project_item_from_members(members: &[Conversation]) -> Option<GlobalOpenWorkItem> {
+async fn project_item_from_members(
+    members: &[Conversation],
+    now: DateTime<Utc>,
+) -> Result<Option<GlobalOpenWorkItem>, AppError> {
     if members.is_empty() {
-        return None;
+        return Ok(None);
     }
     let root = &members[0];
     let current = members.last().expect("non-empty members");
-    if should_suppress_item(current, members.len()) {
-        return None;
+    if should_suppress_item(current, members.len(), now) {
+        return Ok(None);
     }
     let source = if members.len() >= 2 {
         GlobalOpenWorkSource::Chain
     } else {
         GlobalOpenWorkSource::Conversation
     };
-    let mut signals = item_signals(current, members.len());
-    let task_status = task_status_for(current);
+    let mut signals = item_signals(current, members.len(), now);
+    let task_status = task_status_for(current).await?;
     if let Some(status) = &task_status {
         if matches!(status.as_str(), "in-progress" | "ready" | "blocked") {
             signals.push(format!("task {status}"));
@@ -352,13 +349,10 @@ fn project_item_from_members(members: &[Conversation]) -> Option<GlobalOpenWorkI
     };
     let href = match source {
         GlobalOpenWorkSource::Chain => format!("/chains/{}", root.id),
-        GlobalOpenWorkSource::Conversation => current
-            .slug
-            .as_ref()
-            .map_or_else(|| format!("/c/{}", current.id), |s| format!("/c/{s}")),
+        GlobalOpenWorkSource::Conversation => conversation_href(current),
     };
     let reference = format!("@work:{id}");
-    Some(GlobalOpenWorkItem {
+    Ok(Some(GlobalOpenWorkItem {
         id,
         source,
         title: item_title(root, current, members.len()),
@@ -383,12 +377,12 @@ fn project_item_from_members(members: &[Conversation]) -> Option<GlobalOpenWorkI
         signals,
         href,
         reference,
-    })
+    }))
 }
 
-fn item_signals(conv: &Conversation, member_count: usize) -> Vec<String> {
+fn item_signals(conv: &Conversation, member_count: usize, now: DateTime<Utc>) -> Vec<String> {
     let mut signals = Vec::new();
-    if Utc::now().signed_duration_since(conv.updated_at).num_days() <= RECENT_DAYS {
+    if now.signed_duration_since(conv.updated_at).num_days() <= RECENT_DAYS {
         signals.push("recent activity".to_string());
     }
     match conv.conv_mode {
@@ -425,11 +419,11 @@ fn item_signals(conv: &Conversation, member_count: usize) -> Vec<String> {
     signals
 }
 
-fn should_suppress_item(conv: &Conversation, member_count: usize) -> bool {
+fn should_suppress_item(conv: &Conversation, member_count: usize, now: DateTime<Utc>) -> bool {
     if conv.archived || !conv.user_initiated {
         return true;
     }
-    let old = Utc::now().signed_duration_since(conv.updated_at).num_days() > RECENT_DAYS;
+    let old = now.signed_duration_since(conv.updated_at).num_days() > RECENT_DAYS;
     let low_value_mode = matches!(conv.conv_mode, ConvMode::Explore { .. } | ConvMode::Direct);
     let quiet_state = matches!(
         conv.state,
@@ -468,9 +462,19 @@ fn display_project_name(path: &str) -> String {
         .to_string()
 }
 
-fn task_status_for(conv: &Conversation) -> Option<String> {
-    let task_id = conv.conv_mode.task_id()?;
-    let worktree = conv.conv_mode.worktree_path()?;
+async fn task_status_for(conv: &Conversation) -> Result<Option<String>, AppError> {
+    let Some(task_id) = conv.conv_mode.task_id().map(str::to_string) else {
+        return Ok(None);
+    };
+    let Some(worktree) = conv.conv_mode.worktree_path().map(str::to_string) else {
+        return Ok(None);
+    };
+    tokio::task::spawn_blocking(move || task_status_from_disk(&worktree, &task_id))
+        .await
+        .map_err(|e| AppError::Internal(format!("task status worker failed: {e}")))
+}
+
+fn task_status_from_disk(worktree: &str, task_id: &str) -> Option<String> {
     let tasks_dir_name = taskmd_core::discover::discover_or_default(std::path::Path::new(worktree));
     let tasks_dir = std::path::Path::new(worktree).join(tasks_dir_name);
     let entries = std::fs::read_dir(tasks_dir).ok()?;
@@ -531,14 +535,32 @@ async fn insert_recall_turn(
         content: answer.to_string(),
         created_at: Utc::now(),
     };
+    for attempt in 0..3 {
+        match insert_recall_turn_once(state, session_id, &user, &assistant).await {
+            Ok(()) => return Ok((user, assistant)),
+            Err(e) if attempt < 2 && is_recall_ordinal_conflict(&e) => (),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(AppError::Internal(
+        "failed to insert Global Recall turn".to_string(),
+    ))
+}
+
+async fn insert_recall_turn_once(
+    state: &AppState,
+    session_id: &str,
+    user: &GlobalRecallMessage,
+    assistant: &GlobalRecallMessage,
+) -> Result<(), AppError> {
     let mut tx = state
         .db
         .pool()
         .begin()
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    insert_recall_message_in_tx(&mut tx, session_id, &user).await?;
-    insert_recall_message_in_tx(&mut tx, session_id, &assistant).await?;
+    insert_recall_message_in_tx(&mut tx, session_id, user).await?;
+    insert_recall_message_in_tx(&mut tx, session_id, assistant).await?;
     sqlx::query("UPDATE global_recall_sessions SET updated_at = ?1 WHERE id = ?2")
         .bind(assistant.created_at.to_rfc3339())
         .bind(session_id)
@@ -547,8 +569,11 @@ async fn insert_recall_turn(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     tx.commit()
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok((user, assistant))
+        .map_err(|e| AppError::Internal(e.to_string()))
+}
+
+fn is_recall_ordinal_conflict(error: &AppError) -> bool {
+    matches!(error, AppError::Internal(message) if message.contains("global_recall_messages.session_id") || message.contains("UNIQUE constraint failed"))
 }
 
 async fn insert_recall_message_in_tx(
@@ -747,7 +772,7 @@ async fn execute_global_tool(
                 Err(e) => (format!("error: conversation not found: {e}"), true),
             }
         }
-        "list_open_work" => match build_open_work(state, Some(OPEN_WORK_LIMIT)).await {
+        "list_open_work" => match build_open_work(state).await {
             Ok(view) => (format_open_work_for_agent(&view), false),
             Err(e) => (format!("error: open work projection failed: {e:?}"), true),
         },
@@ -825,15 +850,13 @@ async fn format_global_search_hits(state: &AppState, hits: &[crate::db::Retrieve
             Ok(conv) => {
                 let title = conv
                     .title
+                    .clone()
                     .or(conv.slug.clone())
                     .unwrap_or_else(|| conv.id.clone());
-                let href = conv.slug.map(|s| {
-                    if message_type_has_rendered_anchor(hit.message_type) {
-                        format!("/c/{s}#message-{}", hit.message_id)
-                    } else {
-                        format!("/c/{s}")
-                    }
-                });
+                let href = Some(conversation_message_href(
+                    &conv,
+                    Some((&hit.message_id, hit.message_type)),
+                ));
                 (title, href)
             }
             Err(_) => (hit.conversation_id.clone(), None),
@@ -867,9 +890,7 @@ fn read_conversation_page(
             .as_deref()
             .or(conv.slug.as_deref())
             .unwrap_or(&conv.id),
-        conv.slug
-            .as_ref()
-            .map_or_else(|| format!("/c/{}", conv.id), |s| format!("/c/{s}")),
+        conversation_href(conv),
         conv.updated_at
     );
     let body = render_message_page(conv, messages, cursor);
@@ -921,6 +942,20 @@ fn message_is_hidden(message: &crate::db::Message) -> bool {
         .unwrap_or(false)
 }
 
+fn conversation_href(conv: &Conversation) -> String {
+    format!("/c/{}", conv.slug.as_deref().unwrap_or(&conv.id))
+}
+
+fn conversation_message_href(conv: &Conversation, message: Option<(&str, MessageType)>) -> String {
+    let base = conversation_href(conv);
+    match message {
+        Some((message_id, message_type)) if message_type_has_rendered_anchor(message_type) => {
+            format!("{base}#message-{message_id}")
+        }
+        _ => base,
+    }
+}
+
 fn message_type_has_rendered_anchor(message_type: MessageType) -> bool {
     matches!(
         message_type,
@@ -938,16 +973,7 @@ fn render_global_message_line(conv: &Conversation, message: &crate::db::Message)
         MessageType::Continuation => "Continuation",
         MessageType::Skill => "Skill",
     };
-    let href = conv.slug.as_ref().map_or_else(
-        || format!("@conv:{} msg:{}", conv.id, message.message_id),
-        |s| {
-            if message_type_has_rendered_anchor(message.message_type) {
-                format!("/c/{s}#message-{}", message.message_id)
-            } else {
-                format!("/c/{s}")
-            }
-        },
-    );
+    let href = conversation_message_href(conv, Some((&message.message_id, message.message_type)));
     format!(
         "[{} · {} · {}]({}) @conv:{} msg:{}\n{}\n\n",
         role,
@@ -1137,7 +1163,7 @@ async fn load_conversation_by_slug_or_id(
 }
 
 fn resolve_conversation(conv: Conversation) -> ResolveGlobalReferenceResponse {
-    let href = conv.slug.as_ref().map(|s| format!("/c/{s}"));
+    let href = Some(conversation_href(&conv));
     let title = conv.title.clone().or(conv.slug.clone());
     ResolveGlobalReferenceResponse {
         kind: "conversation".to_string(),
@@ -1172,13 +1198,10 @@ async fn resolve_message(
             "message reference target not found".to_string(),
         ));
     }
-    let href = conv.slug.as_ref().map(|s| {
-        if message_type_has_rendered_anchor(message.message_type) {
-            format!("/c/{s}#message-{}", message.message_id)
-        } else {
-            format!("/c/{s}")
-        }
-    });
+    let href = Some(conversation_message_href(
+        &conv,
+        Some((&message.message_id, message.message_type)),
+    ));
     let title = conv.title.clone().or(conv.slug.clone());
     Ok(ResolveGlobalReferenceResponse {
         kind: "message".to_string(),
@@ -1240,7 +1263,7 @@ async fn resolve_work(
     state: &AppState,
     id: &str,
 ) -> Result<ResolveGlobalReferenceResponse, AppError> {
-    let view = build_open_work(state, None).await?;
+    let view = build_open_work(state).await?;
     for group in view.groups {
         for item in group.items {
             if item.id == id || item.reference == format!("@work:{id}") {
@@ -1279,8 +1302,8 @@ fn parse_session_row(row: sqlx::sqlite::SqliteRow) -> Result<GlobalRecallSession
     Ok(GlobalRecallSession {
         id: row.try_get("id")?,
         title: row.try_get("title")?,
-        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
-        updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?),
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?, "created_at")?,
+        updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?, "updated_at")?,
     })
 }
 
@@ -1290,12 +1313,17 @@ fn parse_message_row(row: sqlx::sqlite::SqliteRow) -> Result<GlobalRecallMessage
         id: row.try_get("id")?,
         role: row.try_get("role")?,
         content: row.try_get("content")?,
-        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?, "created_at")?,
     })
 }
 
-fn parse_datetime(s: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc))
+fn parse_datetime(s: &str, column: &'static str) -> Result<DateTime<Utc>, sqlx::Error> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| sqlx::Error::ColumnDecode {
+            index: column.to_string(),
+            source: Box::new(e),
+        })
 }
 
 fn trim_chars(s: &str, max: usize) -> String {
@@ -1308,4 +1336,39 @@ fn trim_chars(s: &str, max: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{message_id_fragment, parse_conv_handle, split_fragment};
+
+    #[test]
+    fn parse_conv_handle_accepts_message_handle_syntax() {
+        assert_eq!(
+            parse_conv_handle("conv-1 msg:message-9"),
+            ("conv-1", Some("message-9"))
+        );
+        assert_eq!(
+            parse_conv_handle("conv-1 msg: message-9"),
+            ("conv-1", Some("message-9"))
+        );
+    }
+
+    #[test]
+    fn parse_conv_handle_preserves_message_fragment() {
+        assert_eq!(
+            parse_conv_handle("conv-1#message-message-9"),
+            ("conv-1", Some("message-9"))
+        );
+    }
+
+    #[test]
+    fn split_fragment_keeps_base_and_message_id() {
+        assert_eq!(
+            split_fragment("slug#message-m1"),
+            ("slug", Some("message-m1"))
+        );
+        assert_eq!(message_id_fragment("message-m1"), Some("m1"));
+        assert_eq!(message_id_fragment("section-m1"), None);
+    }
 }

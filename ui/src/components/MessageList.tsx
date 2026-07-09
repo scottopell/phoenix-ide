@@ -76,6 +76,7 @@ interface MessageListProps {
    *  `unitIndex` values are guaranteed to be in virtuoso's coordinate space —
    *  no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
+  targetMessageId?: string | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
@@ -85,6 +86,7 @@ export interface MessageListHandle {
   /** Scroll the render unit at `unitIndex` (a `historicalUnits` index, which
    *  equals its virtuoso item index) into view and pulse it once mounted. */
   scrollToUnitIndex: (unitIndex: number) => void;
+  scrollToMessageId: (messageId: string) => void;
 }
 
 
@@ -313,6 +315,7 @@ function MessageListImpl({
   enableMessageSidepanel = true,
   onVisibleRangeChange,
   onChaptersChange,
+  targetMessageId,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
@@ -685,7 +688,24 @@ function MessageListImpl({
     });
   }, [historicalUnits, clearJumpRetryTimers, correctPendingJumpOffset, applyPendingPulse, dispatchScrollEvent]);
 
-  useImperativeHandle(ref, () => ({ scrollToUnitIndex }), [scrollToUnitIndex]);
+  const findUnitIndexByMessageId = useCallback((messageId: string) => {
+    return historicalUnits.findIndex((unit) => {
+      if (unit.kind === 'agent_turn') return unit.agent.message_id === messageId;
+      if ('message' in unit && 'message_id' in unit.message) return unit.message.message_id === messageId;
+      return false;
+    });
+  }, [historicalUnits]);
+
+  const scrollToMessageId = useCallback((messageId: string) => {
+    const index = findUnitIndexByMessageId(messageId);
+    if (index >= 0) scrollToUnitIndex(index);
+  }, [findUnitIndexByMessageId, scrollToUnitIndex]);
+
+  useEffect(() => {
+    if (targetMessageId) scrollToMessageId(targetMessageId);
+  }, [scrollToMessageId, targetMessageId]);
+
+  useImperativeHandle(ref, () => ({ scrollToUnitIndex, scrollToMessageId }), [scrollToMessageId, scrollToUnitIndex]);
 
   const handleRangeChanged = useCallback((range: ListRange) => {
     onVisibleRangeChange?.(range);

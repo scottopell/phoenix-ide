@@ -1,5 +1,5 @@
 import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
@@ -177,6 +177,11 @@ function ConversationPageContent() {
   const { slug } = useParams<{ slug: string }>();
   const { setConversationReadiness } = useConversationReadiness();
   const navigate = useNavigate();
+  const location = useLocation();
+  const targetMessageId = useMemo(() => {
+    const hash = location.hash.startsWith('#message-') ? location.hash.slice('#message-'.length) : '';
+    return hash || undefined;
+  }, [location.hash]);
   const createConversationWithStore = useCreateConversationWithStore();
 
   // Atom-backed conversation state (survives navigation via ConversationProvider).
@@ -1546,6 +1551,7 @@ function ConversationPageContent() {
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}
+        targetMessageId={targetMessageId}
       />
       </RenderProfiler>
       {atom.uiError && (
