@@ -1,5 +1,6 @@
 export const PIN_TO_BOTTOM_THRESHOLD = 100;
 export const USER_SCROLL_SUPPRESS_MS = 400;
+export const TOUCH_GESTURE_SUPPRESS_MS = 1200;
 export const SETTLE_WATCH_MS = 3000;
 export const SETTLE_WATCH_INTERVAL_MS = 150;
 
@@ -31,6 +32,7 @@ export interface ScrollMachineState {
   hasUserEngaged: boolean;
   touchActive: boolean;
   lastUpwardScrollAt: number;
+  lastTouchGestureAt: number;
   lastScrollTop: number;
   settleDeadline: number;
 }
@@ -39,8 +41,8 @@ export type ScrollEvent =
   | { type: 'scrollerAttached'; snapshot: ScrollSnapshot }
   | { type: 'atBottomChanged'; atBottom: boolean }
   | { type: 'pointerDown' }
-  | { type: 'touchStart' }
-  | { type: 'touchEnd'; remainingTouches: number }
+  | { type: 'touchStart'; nowMs: number }
+  | { type: 'touchEnd'; remainingTouches: number; nowMs: number }
   | { type: 'wheel'; deltaY: number; nowMs: number }
   | { type: 'scroll'; snapshot: ScrollSnapshot; nowMs: number }
   | { type: 'totalHeightChanged'; conversationId: string | undefined; totalHeight: number; unitCount: number; snapshot: ScrollSnapshot | null; tailActivity: TailActivity; nowMs: number }
@@ -59,6 +61,7 @@ export function initialScrollMachineState(): ScrollMachineState {
     hasUserEngaged: false,
     touchActive: false,
     lastUpwardScrollAt: 0,
+    lastTouchGestureAt: 0,
     lastScrollTop: 0,
     settleDeadline: 0,
   };
@@ -75,6 +78,7 @@ export function reduceScrollMachine(
           ...state,
           touchActive: false,
           lastUpwardScrollAt: 0,
+          lastTouchGestureAt: 0,
           lastScrollTop: event.snapshot.scrollTop,
           hasUserEngaged: false,
         },
@@ -86,9 +90,24 @@ export function reduceScrollMachine(
     case 'navJump':
       return { state: { ...state, hasUserEngaged: true }, effects: [] };
     case 'touchStart':
-      return { state: { ...state, hasUserEngaged: true, touchActive: true }, effects: [] };
+      return {
+        state: {
+          ...state,
+          hasUserEngaged: true,
+          touchActive: true,
+          lastTouchGestureAt: event.nowMs,
+        },
+        effects: [],
+      };
     case 'touchEnd':
-      return { state: { ...state, touchActive: event.remainingTouches > 0 }, effects: [] };
+      return {
+        state: {
+          ...state,
+          touchActive: event.remainingTouches > 0,
+          lastTouchGestureAt: event.nowMs,
+        },
+        effects: [],
+      };
     case 'wheel':
       return {
         state: {
@@ -129,6 +148,7 @@ export function reduceScrollMachine(
             hasUserEngaged: false,
             touchActive: false,
             lastUpwardScrollAt: 0,
+            lastTouchGestureAt: 0,
             lastScrollTop: event.snapshot?.scrollTop ?? 0,
             settleDeadline: hasSeenContent ? event.nowMs + SETTLE_WATCH_MS : state.settleDeadline,
           },
@@ -179,7 +199,8 @@ export function reduceScrollMachine(
       if (oldFromBottom <= PIN_TO_BOTTOM_THRESHOLD) {
         const userOwnsViewport =
           nextState.touchActive ||
-          event.nowMs - nextState.lastUpwardScrollAt < USER_SCROLL_SUPPRESS_MS;
+          event.nowMs - nextState.lastUpwardScrollAt < USER_SCROLL_SUPPRESS_MS ||
+          (nextState.lastTouchGestureAt > 0 && event.nowMs - nextState.lastTouchGestureAt < TOUCH_GESTURE_SUPPRESS_MS);
         if (!userOwnsViewport) return { state: nextState, effects: [{ type: 'snapToLastIndex' }] };
         if (grewWithTailActivity) return { state: nextState, effects: [{ type: 'showUnread' }] };
         return { state: nextState, effects: [] };
