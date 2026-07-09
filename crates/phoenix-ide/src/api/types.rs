@@ -236,6 +236,8 @@ pub struct AddressPrFeedbackResponse {
     pub queued: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub steering: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_op: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

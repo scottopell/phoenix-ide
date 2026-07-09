@@ -13,6 +13,7 @@ interface WorkControlBarProps {
   phaseType: string;
   continuedInConvId: string | null | undefined;
   showError?: (message: string) => void;
+  onAddressFeedbackAccepted?: () => void;
   prStatusHandle: ConversationPrStatusHandle;
 }
 
@@ -107,6 +108,7 @@ export function WorkControlBar({
   phaseType,
   continuedInConvId,
   showError,
+  onAddressFeedbackAccepted,
   prStatusHandle,
 }: WorkControlBarProps) {
   const [error, setError] = useState<string | null>(null);
@@ -190,9 +192,14 @@ export function WorkControlBar({
     addressRequestRef.current = request;
     setCapturing(true);
     try {
-      await api.addressPrFeedback(conversationId, messageId);
+      const response = await api.addressPrFeedback(conversationId, messageId);
       if (!isCurrentRequest()) return;
+      if (response.no_op) {
+        setAddressMessageId(null);
+        return;
+      }
       setAddressSubmitted(true);
+      onAddressFeedbackAccepted?.();
       prStatusHandle.refresh().catch((err) => {
         if (isCurrentRequest()) {
           console.warn('[WorkActions] failed to refresh PR status after addressing feedback', err);

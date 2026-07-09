@@ -1651,6 +1651,10 @@ function ConversationPageContent() {
   }, [convStateForChildren.type, conversationId]);
   const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
   const fileRootPath = isArchived || !conversation ? null : (conversation.worktree_path ?? conversation.cwd);
+  const markAwaitingLlm = useCallback(() => {
+    if (!conversationId) return;
+    dispatch({ type: 'local_phase_change', phase: { type: 'awaiting_llm' }, expectedConversationId: conversationId });
+  }, [conversationId, dispatch]);
   const handleOpenFiles = useCallback(() => {
     if (fileRootPath) setShowFileBrowser(true);
   }, [fileRootPath]);
@@ -2283,6 +2287,7 @@ function ConversationPageContent() {
             continuedInConvId={conversation.continued_in_conv_id}
             onSendMessage={handleSendTextOnly}
             showError={showError}
+            onAddressFeedbackAccepted={markAwaitingLlm}
             prStatusHandle={prStatusHandle}
           />
         )}

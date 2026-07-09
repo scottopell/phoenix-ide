@@ -3284,6 +3284,7 @@ async fn address_pr_feedback(
         return Ok(Json(AddressPrFeedbackResponse {
             queued: chat.queued,
             steering: chat.steering,
+            no_op: true,
             artifact_path: None,
             pr_number: None,
         }));
@@ -3308,6 +3309,7 @@ async fn address_pr_feedback(
     Ok(Json(AddressPrFeedbackResponse {
         queued: chat.queued,
         steering: chat.steering,
+        no_op: false,
         artifact_path: Some(context.artifact_path),
         pr_number: Some(context.pr_number),
     }))
@@ -3366,6 +3368,13 @@ async fn preflight_user_message_submission(
     } else {
         conversation.state.clone()
     };
+
+    if !matches!(effective_state, ConvState::Idle) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Address feedback can only be submitted while the conversation is idle.".to_string(),
+            "address_feedback_not_idle",
+        ))));
+    }
 
     if let Err(err) = check_user_message_acceptable(&effective_state) {
         let steer = matches!(
