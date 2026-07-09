@@ -16,6 +16,7 @@ export function GlobalRecallPage() {
   const [question, setQuestion] = useState('');
   const [loading, setLoading] = useState(true);
   const [asking, setAsking] = useState(false);
+  const [sessionLoading, setSessionLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
 
@@ -52,21 +53,25 @@ export function GlobalRecallPage() {
   }, []);
 
   useEffect(() => {
+    setMessages([]);
     if (!activeSessionId) {
-      setMessages([]);
+      setSessionLoading(false);
       return;
     }
     const requestedSessionId = activeSessionId;
     let cancelled = false;
+    setSessionLoading(true);
     api.getGlobalRecallSession(requestedSessionId)
       .then((res) => {
         if (!cancelled && requestedSessionId === activeSessionId) {
           setMessages(res.messages);
+          setSessionLoading(false);
         }
       })
       .catch((e) => {
         if (!cancelled) {
           setError(e instanceof Error ? e.message : String(e));
+          setSessionLoading(false);
         }
       });
     return () => {
@@ -100,7 +105,7 @@ export function GlobalRecallPage() {
   };
 
   const ask = async () => {
-    if (!activeSessionId || !question.trim() || asking) return;
+    if (!activeSessionId || !question.trim() || asking || sessionLoading) return;
     const text = question.trim();
     setQuestion('');
     setAsking(true);
@@ -199,6 +204,8 @@ export function GlobalRecallPage() {
           <div className="global-recall-messages">
             {activeSessionId === null ? (
               <p className="global-recall-muted">No recall session selected.</p>
+            ) : sessionLoading ? (
+              <p className="global-recall-muted">Loading recall session…</p>
             ) : messages.length === 0 ? (
               <p className="global-recall-muted">Ask about strategy, handoffs, or history. Answers can search/read source conversations and cite links.</p>
             ) : messages.map((message) => (
@@ -217,9 +224,9 @@ export function GlobalRecallPage() {
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               placeholder="Ask Global Recall to synthesize Phoenix history…"
-              disabled={!activeSessionId || asking}
+              disabled={!activeSessionId || asking || sessionLoading}
             />
-            <button type="submit" disabled={!activeSessionId || !question.trim() || asking}>
+            <button type="submit" disabled={!activeSessionId || !question.trim() || asking || sessionLoading}>
               {asking ? 'Thinking…' : 'Ask'}
             </button>
           </form>
