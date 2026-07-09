@@ -261,8 +261,11 @@ struct TaskApprovalCard: View {
                         let text = feedbackText.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !text.isEmpty else { return }
                         session.perform(.provideTaskFeedback(annotations: text))
-                        feedbackText = ""
-                        showFeedbackField = false
+                        // Deliberately NOT cleared here: on success the
+                        // state change unmounts this card (draft discarded
+                        // with it); on failure the user's typed annotations
+                        // must survive for retry — these actions don't
+                        // queue, so the draft is the only copy.
                     } else {
                         withAnimation(.easeInOut(duration: 0.15)) {
                             showFeedbackField = true

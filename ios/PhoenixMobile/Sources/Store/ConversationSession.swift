@@ -58,7 +58,14 @@ final class ConversationSession {
         var conversation: Conversation?
         var messages: [Message]
         var lastSequenceId: Int64
+        // Additive-optional: snapshots persisted before this field decode
+        // as nil (age simply unknown — no note shown).
+        var savedAt: Date?
     }
+
+    /// When the cached snapshot was last written; drives the offline
+    /// cache-age note (REQ-IOS-001).
+    private(set) var snapshotSavedAt: Date?
 
     init(conversationId: String, api: PhoenixAPI, connectivity: ConnectivityMonitor) {
         self.conversationId = conversationId
@@ -77,7 +84,12 @@ final class ConversationSession {
             // state_change events derive it — a snapshot taken mid-turn
             // must not open looking idle.
             agentWorking = presentationMode == "working"
+            snapshotSavedAt = snap.savedAt
             rebuildToolUseIndex()
+            // A crash between persistSnapshot and the outbox prune leaves
+            // both files claiming the same message — reconciling here keeps
+            // the union-without-duplicates rule on cold offline opens.
+            reconcileOutbox()
         }
     }
 
@@ -128,10 +140,12 @@ final class ConversationSession {
     }
 
     private func persistSnapshot() {
+        let now = Date()
+        snapshotSavedAt = now
         DiskStore.save(
             Snapshot(
                 conversation: conversation, messages: messages,
-                lastSequenceId: lastSequenceId),
+                lastSequenceId: lastSequenceId, savedAt: now),
             name: snapshotName)
     }
 
@@ -437,6 +451,11 @@ final class ConversationSession {
                 typedState = .idle
                 convState = .string("idle")
                 conversation?.state = .string("idle")
+                // The mode must move with the state, or the snapshot
+                // persists idle-with-working-mode and a cold reopen seeds
+                // the spinner back for a turn that already ended.
+                presentationMode = "idle"
+                conversation?.presentation_mode = "idle"
             default:
                 break
             }
