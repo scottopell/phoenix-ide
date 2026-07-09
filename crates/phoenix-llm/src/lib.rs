@@ -95,6 +95,42 @@ pub enum TokenChunk {
     RateLimitSnapshot(QuotaDetails),
 }
 
+/// Provider request-shape limits that apply to continuation summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationRequestLimits {
+    /// The route has no known request-shape limit beyond its token window.
+    TokenWindowOnly,
+    /// The route accepts at most this many total provider input items, including
+    /// the final continuation prompt.
+    MaxInputItems(std::num::NonZeroUsize),
+}
+
+impl ContinuationRequestLimits {
+    /// Conservative Codex bridge bound. The backend's exact ceiling is not
+    /// documented; this reserves one item beyond 900 history messages for the
+    /// appended continuation prompt.
+    #[must_use]
+    pub const fn codex_bridge() -> Self {
+        Self::MaxInputItems(std::num::NonZeroUsize::MIN.saturating_add(900))
+    }
+
+    #[must_use]
+    pub const fn max_input_items(self) -> Option<usize> {
+        match self {
+            Self::TokenWindowOnly => None,
+            Self::MaxInputItems(max) => Some(max.get()),
+        }
+    }
+
+    #[must_use]
+    pub const fn max_history_messages(self, reserved_input_items: usize) -> Option<usize> {
+        match self.max_input_items() {
+            Some(max) => Some(max.saturating_sub(reserved_input_items)),
+            None => None,
+        }
+    }
+}
+
 /// Common interface for LLM providers
 #[async_trait]
 pub trait LlmService: Send + Sync {
@@ -123,6 +159,11 @@ pub trait LlmService: Send + Sync {
     /// Default `false` covers Anthropic, mock, and direct `OpenAI`.
     fn uses_codex_bridge(&self) -> bool {
         false
+    }
+
+    /// Request-shape limits for tool-less continuation-summary requests.
+    fn continuation_request_limits(&self) -> ContinuationRequestLimits {
+        ContinuationRequestLimits::TokenWindowOnly
     }
 }
 
@@ -294,5 +335,9 @@ impl LlmService for LoggingService {
 
     fn uses_codex_bridge(&self) -> bool {
         self.inner.uses_codex_bridge()
+    }
+
+    fn continuation_request_limits(&self) -> ContinuationRequestLimits {
+        self.inner.continuation_request_limits()
     }
 }

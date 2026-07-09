@@ -1172,6 +1172,34 @@ mod tests {
     }
 
     #[test]
+    fn codex_continuation_input_including_prompt_fits_typed_item_limit() {
+        use crate::types::{ContentBlock, LlmMessage, MessageRole};
+
+        let limits = crate::ContinuationRequestLimits::codex_bridge();
+        let history_cap = limits
+            .max_history_messages(1)
+            .expect("Codex continuation item cap");
+        let mut req = empty_request();
+        req.messages = (0..history_cap)
+            .map(|i| LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text(format!("history {i}"))],
+            })
+            .collect();
+        req.messages.push(LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::text("prepare continuation handoff")],
+        });
+
+        let translated = translate_to_responses_request("gpt-5.5", &req, true);
+        assert_eq!(translated.input.len(), history_cap + 1);
+        assert!(
+            translated.input.len() <= limits.max_input_items().unwrap(),
+            "translated history plus continuation prompt exceeds route limit"
+        );
+    }
+
+    #[test]
     fn test_request_tags_omitted_when_none() {
         let req = translate_to_responses_request("gpt-5.5", &empty_request(), false);
         let json = serde_json::to_value(&req).unwrap();

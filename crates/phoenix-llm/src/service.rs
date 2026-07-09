@@ -159,6 +159,14 @@ impl LlmService for LlmServiceImpl {
     fn uses_codex_bridge(&self) -> bool {
         self.use_codex_backend
     }
+
+    fn continuation_request_limits(&self) -> super::ContinuationRequestLimits {
+        if self.use_codex_backend {
+            super::ContinuationRequestLimits::codex_bridge()
+        } else {
+            super::ContinuationRequestLimits::TokenWindowOnly
+        }
+    }
 }
 
 impl LlmServiceImpl {

@@ -404,7 +404,8 @@ AND the request SHALL NOT include any tool capabilities
 AND the request SHALL frame the summary as an operational handoff to a fresh agent that resumes in the same working directory with no memory of the session
 AND the request SHALL describe any tools that were requested but not executed, including their intended arguments
 AND the request SHALL preserve the prior tool history as text rather than discarding it
-AND the request SHALL be bounded to fit the context window so it cannot itself exceed the limit
+AND the request SHALL be bounded to fit the context window and any request-shape limits declared by the selected provider route
+AND bounded history SHALL retain a contiguous newest suffix and begin with a user-role message when non-empty
 
 WHEN continuation summary is received
 THE SYSTEM SHALL store it as a continuation message

@@ -5089,6 +5089,7 @@ where
         let event_tx = self.event_tx.clone();
         let conv_id = self.context.conversation_id.clone();
         let context_window = self.context.context_window;
+        let continuation_limits = self.llm_client.continuation_request_limits();
 
         // Build continuation prompt
         let continuation_prompt = build_continuation_prompt(&rejected_tool_calls);
@@ -5103,6 +5104,8 @@ where
                     return;
                 }
             };
+
+            let rendered_count = messages.len();
 
             // The continuation request declares no tools, so any tool_use /
             // tool_result / server-handled block left in history would make the
@@ -5130,26 +5133,26 @@ where
                 + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT)
                 + CONTINUATION_OUTPUT_RESERVE_TOKENS
                 + CONTINUATION_SAFETY_MARGIN_TOKENS;
-            let budget = plan_continuation_history(messages, context_window, fixed_tokens);
+            let history_item_cap = continuation_limits.max_history_messages(1);
+            let budget =
+                plan_continuation_history(messages, context_window, fixed_tokens, history_item_cap);
+            tracing::debug!(
+                rendered_count,
+                retained_count = budget.messages.len(),
+                history_item_cap,
+                dropped_for_item_cap = budget.dropped_for_item_cap,
+                dropped_by_budget = budget.dropped_by_budget,
+                trimmed_for_user_first = budget.trimmed_for_user_first,
+                dropped_for_headroom = budget.dropped_for_headroom,
+                context_window,
+                input_budget = budget.input_budget,
+                estimated_history_tokens = budget.estimated_history_tokens,
+                headroom_tokens = budget.headroom_tokens,
+                minimum_headroom_tokens = CONTINUATION_MIN_HEADROOM_TOKENS,
+                minimum_headroom_satisfied = budget.minimum_headroom_satisfied,
+                "continuation: planned bounded history"
+            );
             let mut messages = budget.messages;
-            if budget.dropped_by_budget > 0
-                || budget.trimmed_for_user_first > 0
-                || budget.dropped_for_headroom > 0
-                || !budget.minimum_headroom_satisfied
-            {
-                tracing::debug!(
-                    dropped_by_budget = budget.dropped_by_budget,
-                    trimmed_for_user_first = budget.trimmed_for_user_first,
-                    dropped_for_headroom = budget.dropped_for_headroom,
-                    context_window,
-                    input_budget = budget.input_budget,
-                    estimated_history_tokens = budget.estimated_history_tokens,
-                    headroom_tokens = budget.headroom_tokens,
-                    minimum_headroom_tokens = CONTINUATION_MIN_HEADROOM_TOKENS,
-                    minimum_headroom_satisfied = budget.minimum_headroom_satisfied,
-                    "continuation: trimmed history to fit budget, start user-first, and preserve headroom"
-                );
-            }
 
             // Add the continuation request as a user message
             messages.push(LlmMessage {
@@ -5832,6 +5835,7 @@ struct ContinuationBudgetResult {
     messages: Vec<LlmMessage>,
     input_budget: usize,
     dropped_by_budget: usize,
+    dropped_for_item_cap: usize,
     trimmed_for_user_first: usize,
     dropped_for_headroom: usize,
     estimated_history_tokens: usize,
@@ -5843,9 +5847,11 @@ fn plan_continuation_history(
     messages: Vec<LlmMessage>,
     context_window: usize,
     fixed_tokens: usize,
+    history_item_cap: Option<usize>,
 ) -> ContinuationBudgetResult {
     let input_budget = context_window.saturating_sub(fixed_tokens);
     let (messages, dropped_by_budget) = cap_messages_to_token_budget(messages, input_budget);
+    let (messages, dropped_for_item_cap) = cap_messages_to_count(messages, history_item_cap);
     let (mut messages, trimmed_for_user_first) = drop_leading_non_user(messages);
 
     let target_history_budget = input_budget.saturating_sub(CONTINUATION_MIN_HEADROOM_TOKENS);
@@ -5865,6 +5871,7 @@ fn plan_continuation_history(
         messages,
         input_budget,
         dropped_by_budget,
+        dropped_for_item_cap,
         trimmed_for_user_first,
         dropped_for_headroom,
         estimated_history_tokens,
@@ -5977,7 +5984,7 @@ fn summarize_continuation_pipeline(
     let (user_first, trimmed_for_user_first) = drop_leading_non_user(budget_capped);
     stages.push(summarize_continuation_stage("user_first", &user_first));
 
-    let budget = plan_continuation_history(images_capped, context_window, fixed_tokens);
+    let budget = plan_continuation_history(images_capped, context_window, fixed_tokens, None);
     stages.push(summarize_continuation_stage("headroom", &budget.messages));
 
     ContinuationPipelineSummary {
@@ -6021,6 +6028,17 @@ fn cap_messages_to_token_budget(
     let dropped = keep_from;
     let kept = messages.into_iter().skip(keep_from).collect();
     (kept, dropped)
+}
+
+fn cap_messages_to_count(
+    messages: Vec<LlmMessage>,
+    history_item_cap: Option<usize>,
+) -> (Vec<LlmMessage>, usize) {
+    let Some(cap) = history_item_cap else {
+        return (messages, 0);
+    };
+    let dropped = messages.len().saturating_sub(cap);
+    (messages.into_iter().skip(dropped).collect(), dropped)
 }
 
 /// Drop leading non-user messages so the list starts with a user message (or is
@@ -6587,6 +6605,95 @@ mod strip_tool_blocks_tests {
     }
 
     #[test]
+    fn codex_continuation_planner_caps_tool_heavy_history_and_preserves_suffix() {
+        let mut rendered = vec![user_text("initial task")];
+        for i in 0..400 {
+            rendered.push(assistant(vec![ContentBlock::ToolUse {
+                id: format!("tool-{i}"),
+                name: "bash".to_string(),
+                input: serde_json::json!({ "cmd": format!("echo {i}") }),
+            }]));
+            rendered.push(user(vec![ContentBlock::ToolResult {
+                tool_use_id: format!("tool-{i}"),
+                content: format!("result {i}"),
+                images: vec![],
+                is_error: false,
+            }]));
+            rendered.push(assistant(vec![ContentBlock::text(format!("observed {i}"))]));
+        }
+
+        let flattened = flatten_tool_blocks(rendered);
+        assert!(flattened.len() > 1_100);
+        let limits = phoenix_llm::ContinuationRequestLimits::codex_bridge();
+        let history_item_cap = limits.max_history_messages(1).expect("Codex item cap");
+        let context_window = 272_000;
+        let fixed_tokens = CONTINUATION_OUTPUT_RESERVE_TOKENS
+            + CONTINUATION_SAFETY_MARGIN_TOKENS
+            + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT);
+        assert!(
+            estimate_messages_tokens(&flattened)
+                < context_window - fixed_tokens - CONTINUATION_MIN_HEADROOM_TOKENS,
+            "fixture must isolate the item-count boundary rather than token trimming"
+        );
+
+        let budget = plan_continuation_history(
+            flattened.clone(),
+            context_window,
+            fixed_tokens,
+            Some(history_item_cap),
+        );
+        let (expected, _) = drop_leading_non_user(
+            flattened
+                .into_iter()
+                .rev()
+                .take(history_item_cap)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+        );
+
+        let planned_text: Vec<_> = budget
+            .messages
+            .iter()
+            .map(|message| message.content[0].render_text())
+            .collect();
+        let expected_text: Vec<_> = expected
+            .iter()
+            .map(|message| message.content[0].render_text())
+            .collect();
+        assert_eq!(
+            planned_text, expected_text,
+            "newest contiguous suffix changed"
+        );
+        assert!(budget.messages.len() <= history_item_cap);
+        assert_eq!(budget.messages.first().unwrap().role, MessageRole::User);
+        assert!(budget.dropped_for_item_cap > 0);
+        assert_eq!(budget.dropped_by_budget, 0);
+        assert_eq!(budget.dropped_for_headroom, 0);
+        assert!(budget.minimum_headroom_satisfied);
+        assert!(budget.headroom_tokens >= CONTINUATION_MIN_HEADROOM_TOKENS);
+    }
+
+    #[test]
+    fn continuation_route_without_item_cap_is_token_governed_only() {
+        let messages: Vec<_> = (0..1_150)
+            .map(|i| user_text(&format!("small history message {i}")))
+            .collect();
+        let context_window = 272_000;
+        let fixed_tokens = CONTINUATION_OUTPUT_RESERVE_TOKENS
+            + CONTINUATION_SAFETY_MARGIN_TOKENS
+            + estimate_text_tokens(CONTINUATION_SYSTEM_PROMPT);
+        let budget = plan_continuation_history(messages, context_window, fixed_tokens, None);
+
+        assert_eq!(budget.messages.len(), 1_150);
+        assert_eq!(budget.dropped_for_item_cap, 0);
+        assert_eq!(budget.dropped_by_budget, 0);
+        assert_eq!(budget.dropped_for_headroom, 0);
+        assert!(budget.minimum_headroom_satisfied);
+    }
+
+    #[test]
     fn continuation_planner_reports_unsatisfied_headroom_when_fixed_tokens_leave_no_room() {
         let fixed_tokens = 1_000;
         let context_window = fixed_tokens + CONTINUATION_MIN_HEADROOM_TOKENS - 1;
@@ -6596,6 +6703,7 @@ mod strip_tool_blocks_tests {
             )],
             context_window,
             fixed_tokens,
+            None,
         );
 
         assert!(budget.messages.is_empty());

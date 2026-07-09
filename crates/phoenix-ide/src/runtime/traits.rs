@@ -228,6 +228,11 @@ pub trait LlmClient: Send + Sync {
     /// Get the model ID
     #[allow(dead_code)] // API completeness
     fn model_id(&self) -> &str;
+
+    /// Typed provider/route limits for continuation-summary requests.
+    fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
+        phoenix_llm::ContinuationRequestLimits::TokenWindowOnly
+    }
 }
 
 use crate::runtime::deny_gate::CheckedToolCall;
@@ -497,6 +502,10 @@ impl<T: LlmClient + ?Sized> LlmClient for Arc<T> {
 
     fn model_id(&self) -> &str {
         (**self).model_id()
+    }
+
+    fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
+        (**self).continuation_request_limits()
     }
 }
 
@@ -843,6 +852,13 @@ impl LlmClient for RegistryLlmClient {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn continuation_request_limits(&self) -> phoenix_llm::ContinuationRequestLimits {
+        self.registry.get(&self.model_id).map_or(
+            phoenix_llm::ContinuationRequestLimits::TokenWindowOnly,
+            |llm| llm.continuation_request_limits(),
+        )
     }
 }
 
