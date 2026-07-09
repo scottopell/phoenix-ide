@@ -18,6 +18,14 @@ struct ConversationView: View {
                     systemImage: "trash",
                     description: Text("This conversation was deleted on the server."))
             } else {
+                if let staleness = cacheAgeNote {
+                    Text(staleness)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 2)
+                        .background(.thinMaterial)
+                }
                 if !session.outbox.persistenceHealthy {
                     Label(
                         "Storage write failed — queued messages may not survive a restart",
@@ -56,6 +64,20 @@ struct ConversationView: View {
         }
         .onAppear { session.start() }
         .onDisappear { session.closeView() }
+    }
+
+    /// Cache-age note while disconnected (REQ-IOS-001): only shown when
+    /// the snapshot is meaningfully stale, mirroring the list's threshold.
+    private var cacheAgeNote: String? {
+        guard !model.connectivity.isOnline,
+              session.connection != .live,
+              let savedAt = session.snapshotSavedAt,
+              Date().timeIntervalSince(savedAt) > 120
+        else { return nil }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        let rel = formatter.localizedString(for: savedAt, relativeTo: Date())
+        return "Cached \(rel)"
     }
 
     /// Offline with nothing cached and nothing queued: an empty transcript

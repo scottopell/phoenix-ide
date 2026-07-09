@@ -25,14 +25,25 @@ struct MessageView: View {
     private var typedBody: some View {
         switch message.message_type {
         case "user":
-            UserMessageView(content: message.content)
+            // Meta user-role records (approval seeds, branch markers) are
+            // Phoenix-authored — rendering them as the user's own bubble
+            // misattributes them.
+            if message.content["is_meta"]?.boolValue == true {
+                SystemNote(text: noteText, style: .secondary)
+            } else {
+                UserMessageView(content: message.content)
+            }
         case "agent":
             AgentMessageView(content: message.content)
         case "tool":
             ToolResultMessageView(content: message.content, toolUse: invokingToolUse)
         case "error":
             SystemNote(text: noteText, style: .red)
-        case "system", "continuation", "skill":
+        case "skill":
+            // Payload is {trigger, name, body} where body is the expanded
+            // prompt — show what the user typed, not the expansion.
+            SkillRow(content: message.content)
+        case "system", "continuation":
             SystemNote(text: noteText, style: .secondary)
         default:
             SystemNote(text: noteText, style: .secondary)
@@ -67,6 +78,30 @@ struct MessageView: View {
     }
 }
 
+/// A skill invocation, shown as the user's command (`/verify …`), with the
+/// expanded prompt body deliberately hidden.
+struct SkillRow: View {
+    let content: JSONValue
+
+    var body: some View {
+        HStack {
+            Spacer(minLength: 40)
+            Label(trigger, systemImage: "wand.and.stars")
+                .font(.callout.monospaced())
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.accentColor.opacity(0.15))
+                .clipShape(Capsule())
+        }
+    }
+
+    private var trigger: String {
+        content["trigger"]?.stringValue
+            ?? content["name"]?.stringValue.map { "/\($0)" }
+            ?? "skill"
+    }
+}
+
 struct UserMessageView: View {
     let content: JSONValue
 
@@ -85,6 +120,19 @@ struct UserMessageView: View {
                           systemImage: "photo")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                }
+                // File attachments exist on the record even though this
+                // client can't open them — hiding them would silently
+                // misrepresent the cached message.
+                if let files = content["files"]?.arrayValue, !files.isEmpty {
+                    ForEach(Array(files.enumerated()), id: \.offset) { _, file in
+                        Label(
+                            file["original_name"]?.stringValue ?? "attachment",
+                            systemImage: "doc")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
             }
         }

@@ -71,10 +71,17 @@ final class ConversationSession {
         /// were part of the iOS cache; nil forces replacement on next init.
         var transcriptGeneration: Int64?
         var syncedAt: Date?
+        // Additive-optional: snapshots persisted before this field decode
+        // as nil (age simply unknown — no note shown).
+        var savedAt: Date?
     }
 
     private var transcriptGeneration: Int64?
     private(set) var snapshotSyncedAt: Date?
+
+    /// Time of the latest authoritative server data stored in the snapshot.
+    /// Local lifecycle flushes preserve it so old cache cannot appear fresh.
+    private(set) var snapshotSavedAt: Date?
 
     init(
         conversationId: String,
@@ -105,6 +112,7 @@ final class ConversationSession {
             // state_change events derive it — a snapshot taken mid-turn
             // must not open looking idle.
             agentWorking = presentationMode == "working"
+            snapshotSavedAt = snap.savedAt
             rebuildToolUseIndex()
             // A prior crash can leave the authoritative snapshot durable but
             // the matching outbox row not yet pruned. Reconcile at load so the
@@ -212,17 +220,23 @@ final class ConversationSession {
     }
 
     @discardableResult
-    private func persistSnapshot() -> Bool {
+    private func persistSnapshot(authoritative: Bool = false) -> Bool {
         guard !isHardDeleted else { return false }
-        return DiskStore.save(
+        let savedAt = authoritative ? Date() : snapshotSavedAt
+        let didSave = DiskStore.save(
             Snapshot(
                 conversation: conversation,
                 messages: Self.durableMessages(
                     messages, through: durableMessageSequenceCeiling),
                 lastSequenceId: lastSequenceId,
                 transcriptGeneration: transcriptGeneration,
-                syncedAt: snapshotSyncedAt),
+                syncedAt: snapshotSyncedAt,
+                savedAt: savedAt),
             name: snapshotName)
+        if didSave, authoritative {
+            snapshotSavedAt = savedAt
+        }
+        return didSave
     }
 
     // MARK: - Sending
@@ -640,6 +654,11 @@ final class ConversationSession {
                 typedState = .idle
                 convState = .string("idle")
                 conversation?.state = .string("idle")
+                // The mode must move with the state, or the snapshot
+                // persists idle-with-working-mode and a cold reopen seeds
+                // the spinner back for a turn that already ended.
+                presentationMode = "idle"
+                conversation?.presentation_mode = "idle"
             default:
                 break
             }
