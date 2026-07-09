@@ -467,8 +467,8 @@ export function ConversationListPage() {
                   compact
                 />
               )}
+              footer={<StorageStatus conversationCount={totalConversations} />}
             />
-            <StorageStatus conversationCount={totalConversations} />
           </>
         )}
       </main>

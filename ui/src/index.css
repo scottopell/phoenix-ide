@@ -13566,6 +13566,22 @@ button.keyword-search-filepath:hover {
   padding-inline: 2px;
 }
 
+#conversation-list.mobile-list-density {
+  display: flex;
+  min-height: 100%;
+  box-sizing: border-box;
+  flex-direction: column;
+}
+
+#conversation-list.mobile-list-density #conv-list {
+  flex: 0 0 auto;
+}
+
+#conversation-list.mobile-list-density .conversation-list-footer {
+  margin: auto -16px -16px;
+  flex: 0 0 auto;
+}
+
 .mobile-list-density .conversation-list-header {
   margin-bottom: 10px;
 }

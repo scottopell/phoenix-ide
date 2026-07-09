@@ -284,6 +284,34 @@ const defaultProps = {
   onRename: vi.fn(),
 };
 
+describe('ConversationList — footer slot', () => {
+  it('renders the footer inside the conversation list after the row list', () => {
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          conversations={[makeConv('c1', 'first')]}
+          listDensity="mobile"
+          footer={<footer data-testid="storage-footer">1 conversation</footer>}
+        />
+      </MemoryRouter>,
+    );
+
+    const listRoot = container.querySelector('#conversation-list');
+    const rowList = container.querySelector('#conv-list');
+    const footerSlot = container.querySelector('.conversation-list-footer');
+    const footer = container.querySelector('[data-testid="storage-footer"]');
+
+    expect(listRoot).not.toBeNull();
+    expect(rowList).not.toBeNull();
+    expect(footerSlot).not.toBeNull();
+    expect(footer).not.toBeNull();
+    expect(listRoot).toContainElement(footerSlot as HTMLElement);
+    expect(footerSlot).toContainElement(footer as HTMLElement);
+    expect(rowList?.nextElementSibling).toBe(footerSlot);
+  });
+});
+
 // SIDE-02: "All" tab has no project labels
 //
 // When viewing the "All" tab with conversations from multiple projects,

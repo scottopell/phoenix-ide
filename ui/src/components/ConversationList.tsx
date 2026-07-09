@@ -37,6 +37,7 @@ interface ConversationListProps {
   authChip?: ReactNode;
   utilityActions?: ReactNode;
   emptyScopeLabel?: string | null;
+  footer?: ReactNode;
 }
 
 interface ConversationRowProps {
@@ -623,6 +624,7 @@ export function ConversationList({
   authChip,
   utilityActions,
   emptyScopeLabel,
+  footer,
 }: ConversationListProps) {
   const navigate = useNavigate();
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -903,6 +905,7 @@ export function ConversationList({
           })
         )}
       </ul>
+      {footer && <div className="conversation-list-footer">{footer}</div>}
     </section>
   );
 }

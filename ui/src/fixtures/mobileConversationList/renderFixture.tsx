@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { ConversationList } from '../../components/ConversationList';
+import { StorageStatus } from '../../components/StorageStatus';
 import { SettingsDropdown } from '../../components/SettingsDropdown';
 import '../../index.css';
 import { getMobileConversationListFixtureData } from './scenarios';
@@ -13,6 +14,7 @@ interface Props {
 export function MobileConversationListFixtureBody({ scenario }: Props) {
   const [showArchived, setShowArchived] = useState(scenario.kind === 'archived');
   const fixtureData = getMobileConversationListFixtureData(scenario);
+  const totalConversations = fixtureData.conversations.length + fixtureData.archivedConversations.length;
 
   useEffect(() => {
     delete document.documentElement.dataset['mobileConversationListFixtureReady'];
@@ -53,6 +55,7 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
               compact
             />
           )}
+          footer={<StorageStatus conversationCount={totalConversations} />}
         />
       </main>
     </div>
