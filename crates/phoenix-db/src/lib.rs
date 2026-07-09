@@ -2294,6 +2294,7 @@ impl Database {
         })
         .to_string();
         let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE conversation_creation_jobs
              SET phase = 'ready', intent_json = ?1, updated_at = ?2, completed_at = ?2
@@ -2302,11 +2303,20 @@ impl Database {
         .bind(cleared_intent)
         .bind(now)
         .bind(job_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
         }
+        sqlx::query("DELETE FROM conversation_creation_job_files WHERE job_id = ?1")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM conversation_creation_job_images WHERE job_id = ?1")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 

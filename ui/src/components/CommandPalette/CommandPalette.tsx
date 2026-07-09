@@ -99,7 +99,8 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
         currentSlug,
         archiveCurrent: currentSlug
           ? () => {
-              const conv = conversations.find(c => c.slug === currentSlug);
+              const activeRoute = activeConvId ?? currentSlug;
+              const conv = conversations.find(c => c.id === activeRoute || c.slug === activeRoute);
               if (!conv) return;
               // Chain members must archive at the chain level — per-conv
               // archive returns 409 chain_member. Walk to the chain root and
@@ -115,7 +116,7 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
             }
           : undefined,
       }),
-    [navigate, currentSlug, conversations],
+    [navigate, currentSlug, activeConvId, conversations],
   );
 
   // Dispatch helper — state machine only needs actions now (sources are async)

@@ -1,7 +1,7 @@
 use crate::api::handlers::{
     create_branch_worktree_blocking, create_managed_explore_worktree_blocking, generate_slug,
-    slugify_label, validate_user_ref, AppError, BranchWorktreeError, BranchWorktreeInfo,
-    ManagedWorktreeError,
+    slugify_label, title_from_text, validate_user_ref, AppError, BranchWorktreeError,
+    BranchWorktreeInfo, ManagedWorktreeError,
 };
 use crate::db::{
     ConvMode, ConversationCreationMetadataUpdate, ConversationCreationPhase, ErrorKind,
@@ -9,6 +9,7 @@ use crate::db::{
 };
 use crate::runtime::{ConversationMetadataUpdate, EvictionReason, RuntimeManager, SseEvent};
 use crate::state_machine::{ConvState, Event};
+use futures::future::join_all;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,8 +20,13 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         .list_pending_conversation_creation_jobs()
         .await
         .map_err(|e| e.to_string())?;
-    for job in jobs {
-        if let Err(error) = process_job(manager, job).await {
+    let results = join_all(jobs.into_iter().map(|job| {
+        let manager = Arc::clone(manager);
+        async move { process_job(&manager, job).await }
+    }))
+    .await;
+    for result in results {
+        if let Err(error) = result {
             tracing::error!(error = %error, "conversation creation job processing failed");
         }
     }
@@ -388,7 +394,9 @@ async fn provision_conversation(
     } else {
         None
     };
-    let title = seed_title.or(generated_title);
+    let title = seed_title
+        .or(generated_title)
+        .or_else(|| (!title_source.is_empty()).then_some(title_from_text(&title_source)));
     let slug = title
         .as_deref()
         .map(slugify_label)

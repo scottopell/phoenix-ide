@@ -4308,7 +4308,7 @@ async fn regenerate_conversation_name(
     }))
 }
 
-fn title_from_text(text: &str) -> String {
+pub(crate) fn title_from_text(text: &str) -> String {
     text.split_whitespace()
         .take(8)
         .collect::<Vec<_>>()
