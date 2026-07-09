@@ -865,7 +865,7 @@ async fn format_global_search_hits(state: &AppState, hits: &[crate::db::Retrieve
             href.unwrap_or_else(|| format!("@conv:{} msg:{}", hit.conversation_id, hit.message_id));
         let _ = writeln!(
             out,
-            "- [{} · {} · {}]({}) @conv:{} msg:{}: {}",
+            "- [{} · {} · {}]({}) @conv:{} msg:{} — {}",
             title,
             hit.message_type,
             hit.created_at.format("%Y-%m-%d"),
@@ -1129,6 +1129,10 @@ fn message_id_fragment(fragment: &str) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
+fn handle_token(s: &str) -> &str {
+    s.trim_end_matches([':', ',', ';', '.', ')', ']', '}'])
+}
+
 fn parse_conv_handle(rest: &str) -> (&str, Option<&str>) {
     let (id_part, fragment) = split_fragment(rest);
     let mut parts = id_part.split_whitespace();
@@ -1140,8 +1144,13 @@ fn parse_conv_handle(rest: &str) -> (&str, Option<&str>) {
         .next()
         .and_then(|part| {
             part.strip_prefix("msg:")
+                .map(handle_token)
                 .filter(|id| !id.is_empty())
-                .or_else(|| (part == "msg:").then(|| parts.next()).flatten())
+                .or_else(|| {
+                    (part == "msg:")
+                        .then(|| parts.next().map(handle_token))
+                        .flatten()
+                })
         })
         .or_else(|| fragment.and_then(message_id_fragment));
     (id, message_id)
@@ -1346,6 +1355,10 @@ mod tests {
     fn parse_conv_handle_accepts_message_handle_syntax() {
         assert_eq!(
             parse_conv_handle("conv-1 msg:message-9"),
+            ("conv-1", Some("message-9"))
+        );
+        assert_eq!(
+            parse_conv_handle("conv-1 msg:message-9:"),
             ("conv-1", Some("message-9"))
         );
         assert_eq!(

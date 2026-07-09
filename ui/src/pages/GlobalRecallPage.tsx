@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Link } from 'react-router-dom';
 import { api } from '../api';
@@ -17,6 +17,11 @@ export function GlobalRecallPage() {
   const [loading, setLoading] = useState(true);
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
 
   const refreshOpenWork = useCallback(() => {
     api.getGlobalOpenWork()
@@ -103,12 +108,9 @@ export function GlobalRecallPage() {
     try {
       const submittedSessionId = activeSessionId;
       const res = await api.askGlobalRecallSession(submittedSessionId, text);
-      setActiveSessionId((current) => {
-        if (current === submittedSessionId) {
-          setMessages((prev) => [...prev, res.user_message, res.assistant_message]);
-        }
-        return current;
-      });
+      if (activeSessionIdRef.current === submittedSessionId) {
+        setMessages((prev) => [...prev, res.user_message, res.assistant_message]);
+      }
       void refreshSessions();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

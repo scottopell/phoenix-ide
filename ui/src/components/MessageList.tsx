@@ -86,7 +86,7 @@ export interface MessageListHandle {
   /** Scroll the render unit at `unitIndex` (a `historicalUnits` index, which
    *  equals its virtuoso item index) into view and pulse it once mounted. */
   scrollToUnitIndex: (unitIndex: number) => void;
-  scrollToMessageId: (messageId: string) => void;
+  scrollToMessageId: (messageId: string) => boolean;
 }
 
 
@@ -605,6 +605,7 @@ function MessageListImpl({
   // every virtuoso row wrapper (see `itemContent`).
   const pendingPulseKeyRef = useRef<string | null>(null);
   const activeJumpKeyRef = useRef<string | null>(null);
+  const jumpedTargetMessageIdRef = useRef<string | null>(null);
   const jumpRetryTimersRef = useRef<number[]>([]);
   const pulseTimersRef = useRef<number[]>([]);
 
@@ -698,11 +699,20 @@ function MessageListImpl({
 
   const scrollToMessageId = useCallback((messageId: string) => {
     const index = findUnitIndexByMessageId(messageId);
-    if (index >= 0) scrollToUnitIndex(index);
+    if (index < 0) return false;
+    scrollToUnitIndex(index);
+    return true;
   }, [findUnitIndexByMessageId, scrollToUnitIndex]);
 
   useEffect(() => {
-    if (targetMessageId) scrollToMessageId(targetMessageId);
+    if (!targetMessageId) {
+      jumpedTargetMessageIdRef.current = null;
+      return;
+    }
+    if (jumpedTargetMessageIdRef.current === targetMessageId) return;
+    if (scrollToMessageId(targetMessageId)) {
+      jumpedTargetMessageIdRef.current = targetMessageId;
+    }
   }, [scrollToMessageId, targetMessageId]);
 
   useImperativeHandle(ref, () => ({ scrollToUnitIndex, scrollToMessageId }), [scrollToMessageId, scrollToUnitIndex]);
