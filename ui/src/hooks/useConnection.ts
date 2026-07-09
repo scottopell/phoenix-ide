@@ -165,7 +165,7 @@ function transformInitData(raw: SseInitData): InitPayload {
     },
     transcriptGeneration: raw.transcript_generation,
     lastAppliedEventSeq: raw.last_sequence_id ?? 0,
-    pendingAnchorSequenceId: raw.pending_anchor_sequence_id,
+    pendingAnchorSequenceId: raw.pending_anchor_sequence_id ?? raw.last_sequence_id ?? 0,
     pendingEvents: raw.pending_events,
     pendingTruncated: raw.pending_truncated,
   };

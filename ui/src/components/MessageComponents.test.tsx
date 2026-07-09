@@ -177,7 +177,8 @@ describe('inline tool timers', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getAllByText('Waiting for tool result')).toHaveLength(2);
+    expect(screen.getByText('Waiting for tool result')).toBeInTheDocument();
+    expect(screen.getByText('result not received')).toBeInTheDocument();
     expect(debugSpy).toHaveBeenCalledWith(
       '[MessageComponents] rendering missing tool result',
       expect.objectContaining({
@@ -1667,10 +1668,16 @@ describe('SubAgentStatus inline activity', () => {
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
     act(() => {
       emitInit(FakeEventSource.instances[0]!, [], [], childConversation);
-      FakeEventSource.instances[0]!.emit('token', {
+      FakeEventSource.instances[0]!.emit('message', {
         sequence_id: 101,
-        request_id: 'child-req-1',
-        text: '![live-shot](ui/qa-artifacts/live.png)',
+        message: {
+          message_id: 'child-live-message',
+          conversation_id: childConversation.id,
+          sequence_id: 101,
+          message_type: 'agent',
+          content: [{ type: 'text', text: '![live-shot](ui/qa-artifacts/live.png)' }],
+          created_at: '2024-01-01T00:00:01Z',
+        },
       });
     });
 

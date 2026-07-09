@@ -1329,9 +1329,9 @@ function renderMissingToolResultBody(state: ToolCardState): React.ReactNode {
     case 'declared':
       return <div className="tool-block-output-content"><span className="tool-empty">Tool declared</span></div>;
     case 'running':
-      return <div className="tool-block-output-content"><span className="tool-empty">Waiting for tool result</span></div>;
+      return <div className="tool-block-output-content tool-missing-result">result not received</div>;
     case 'missing_result':
-      return <div className="tool-block-output-content"><span className="tool-empty">Waiting for tool result</span></div>;
+      return <div className="tool-block-output-content tool-missing-result">result not received</div>;
     case 'completed':
     case 'failed':
       return null;
