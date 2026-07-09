@@ -135,6 +135,24 @@ fn model_pricing(model: &str) -> Option<ModelPricing> {
             cache_write: 1.00,
             cache_read: 0.08,
         }),
+        "gpt-5.6-sol" => Some(ModelPricing {
+            input: 5.00,
+            output: 30.00,
+            cache_write: 6.25,
+            cache_read: 0.50,
+        }),
+        "gpt-5.6-terra" => Some(ModelPricing {
+            input: 2.50,
+            output: 15.00,
+            cache_write: 3.125,
+            cache_read: 0.25,
+        }),
+        "gpt-5.6-luna" => Some(ModelPricing {
+            input: 1.00,
+            output: 6.00,
+            cache_write: 1.25,
+            cache_read: 0.10,
+        }),
         "gpt-5.5" => Some(ModelPricing {
             input: 5.00,
             output: 30.00,
@@ -670,6 +688,34 @@ mod tests {
         assert_eq!(cost.cache_write_usd, Some(11.25));
         assert_eq!(cost.cache_read_usd, Some(1.2));
         assert_eq!(cost.total_usd, Some(45.45));
+    }
+
+    #[test]
+    fn gpt_56_variant_pricing_uses_announcement_cache_multipliers() {
+        let sol = calculate_turn_cost("gpt-5.6-sol", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!(sol.pricing_known);
+        assert_eq!(sol.input_usd, Some(5.0));
+        assert_eq!(sol.output_usd, Some(30.0));
+        assert_eq!(sol.cache_write_usd, Some(6.25));
+        assert_eq!(sol.cache_read_usd, Some(0.5));
+        assert_eq!(sol.total_usd, Some(41.75));
+
+        let terra =
+            calculate_turn_cost("gpt-5.6-terra", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!(terra.pricing_known);
+        assert_eq!(terra.input_usd, Some(2.5));
+        assert_eq!(terra.output_usd, Some(15.0));
+        assert_eq!(terra.cache_write_usd, Some(3.125));
+        assert_eq!(terra.cache_read_usd, Some(0.25));
+        assert_eq!(terra.total_usd, Some(20.875));
+
+        let luna = calculate_turn_cost("gpt-5.6-luna", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!(luna.pricing_known);
+        assert_eq!(luna.input_usd, Some(1.0));
+        assert_eq!(luna.output_usd, Some(6.0));
+        assert_eq!(luna.cache_write_usd, Some(1.25));
+        assert_eq!(luna.cache_read_usd, Some(0.1));
+        assert_eq!(luna.total_usd, Some(8.35));
     }
 
     #[test]

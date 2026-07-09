@@ -2,7 +2,7 @@
 
 ## Context
 
-The built-in Phoenix model registry currently defaults to `claude-sonnet-4-6` and includes OpenAI models through `gpt-5.5`. Sonnet 5 has shipped and should replace Sonnet 4.6 as the default. GPT-5.6 is expected soon; a local Codex models cache check in this workspace did not show `gpt-5.6`/`gpt-5-6`, only `gpt-5.5` and `gpt-5.4`, so it may not be accessible yet from the cached Codex model list. The cache checked was `~/.codex/models_cache.json` and was fetched at `2026-05-12T22:59:54.865455Z`, so implementation should refresh/verify against the live model list if possible before deciding whether to add GPT-5.6 now.
+The built-in Phoenix model registry previously defaulted to `claude-sonnet-4-6` and included OpenAI models through `gpt-5.5`. Sonnet 5 has shipped and should replace Sonnet 4.6 as the default. GPT-5.6 is available through the AI Gateway Responses endpoint as explicit `gpt-5.6-sol`, `gpt-5.6-luna`, and `gpt-5.6-terra` variants; the hyphenated `gpt-5-6` spelling is not available.
 
 ## Scope
 
@@ -23,8 +23,8 @@ Primary code surfaces identified:
 3. Demote `claude-sonnet-4-6` to legacy/recommended false once Sonnet 5 is present.
 4. Update default model selection to prefer Sonnet 5 before Sonnet 4.6 and update the no-service fallback from Sonnet 4.6 to Sonnet 5.
 5. Re-check GPT-5.6 availability.
-   - If live Codex/OpenAI discovery shows `gpt-5.6`, add it as a built-in OpenAI Responses model, make it recommended, place it before `gpt-5.5`, and add pricing if known.
-   - If it is still unavailable, leave GPT-5.5 as the latest OpenAI built-in and document the verification result in the final response.
+   - Live AI Gateway probing confirmed `gpt-5.6-sol`, `gpt-5.6-luna`, and `gpt-5.6-terra` work and `gpt-5-6` does not.
+   - Add explicit GPT-5.6 variant entries as built-in OpenAI Responses models, make them recommended, place them before `gpt-5.5`, and add pricing if known.
 6. Update tests/fixtures whose expected default or helper model should move to Sonnet 5. Preserve historical/migration tests that intentionally reference old model IDs.
 7. Run focused tests, then `./dev.py check`.
 

@@ -301,6 +301,36 @@ pub fn all_models() -> Vec<ModelSpec> {
         // bridge path is selected, so this spec's value reaches the runtime
         // only for direct/provider-compatible routes.
         ModelSpec {
+            id: "gpt-5.6-sol".into(),
+            api_name: "gpt-5.6-sol".into(),
+            backend: ModelBackend::OpenAIResponses,
+            description: "GPT-5.6 Sol (frontier, 1M context)".into(),
+            context_window: 1_000_000,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+        },
+        ModelSpec {
+            id: "gpt-5.6-luna".into(),
+            api_name: "gpt-5.6-luna".into(),
+            backend: ModelBackend::OpenAIResponses,
+            description: "GPT-5.6 Luna (frontier, 1M context)".into(),
+            context_window: 1_000_000,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+        },
+        ModelSpec {
+            id: "gpt-5.6-terra".into(),
+            api_name: "gpt-5.6-terra".into(),
+            backend: ModelBackend::OpenAIResponses,
+            description: "GPT-5.6 Terra (frontier, 1M context)".into(),
+            context_window: 1_000_000,
+            recommended: true,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+        },
+        ModelSpec {
             id: "gpt-5.5".into(),
             api_name: "gpt-5.5".into(),
             backend: ModelBackend::OpenAIResponses,

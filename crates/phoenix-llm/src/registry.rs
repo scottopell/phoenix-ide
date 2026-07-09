@@ -560,6 +560,9 @@ impl ModelRegistry {
             "claude-sonnet-5",
             "claude-sonnet-4-6",
             "claude-sonnet-4-5",
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
             "gpt-5.5",
             "gpt-5.3-codex",
             "gpt-5.4",
@@ -973,10 +976,15 @@ impl ModelRegistry {
     /// don't drift. Returns the (`model_id`, service) pair so the caller
     /// can persist the identifier into `chain_qa.model`.
     ///
-    /// Preference order: claude-sonnet-5 → claude-sonnet-4-6 → gpt-5.5 → registry default.
+    /// Preference order: claude-sonnet-5 → claude-sonnet-4-6 → gpt-5.6-sol → gpt-5.5 → registry default.
     /// Returns None only when the registry has no models at all.
     pub fn get_mid_tier_model(&self) -> Option<(String, Arc<dyn LlmService>)> {
-        const PREFERRED: &[&str] = &["claude-sonnet-5", "claude-sonnet-4-6", "gpt-5.5"];
+        const PREFERRED: &[&str] = &[
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "gpt-5.6-sol",
+            "gpt-5.5",
+        ];
         for id in PREFERRED {
             if let Some(service) = self.get(id) {
                 return Some(((*id).to_string(), service));
@@ -1362,6 +1370,25 @@ mod tests {
     }
 
     #[test]
+    fn discovery_matcher_allows_openai_prefixed_wire_name() {
+        let model = all_models()
+            .into_iter()
+            .find(|model| model.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol built-in model exists");
+        let discovered = DiscoveredModels {
+            anthropic_listed: false,
+            anthropic: HashSet::new(),
+            openai_responses_listed: true,
+            openai_responses: HashSet::from(["openai/gpt-5.6-sol".to_string()]),
+        };
+
+        assert!(ModelRegistry::spec_matches_discovered_model(
+            &model,
+            &discovered
+        ));
+    }
+
+    #[test]
     fn discovery_matcher_does_not_cross_backend_boundaries() {
         let model = external_baseten_model();
         let discovered = DiscoveredModels {
@@ -1634,6 +1661,9 @@ mod tests {
         assert!(!registry.available_models().is_empty());
         assert!(registry.get("claude-sonnet-5").is_some());
         assert!(registry.get("claude-sonnet-4-6").is_some());
+        assert!(registry.get("gpt-5.6-sol").is_some());
+        assert!(registry.get("gpt-5.6-luna").is_some());
+        assert!(registry.get("gpt-5.6-terra").is_some());
         assert!(registry.get("gpt-5.5").is_some());
     }
 
@@ -1926,7 +1956,7 @@ mod tests {
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
-        assert_eq!(registry.default_model_id(), "gpt-5.5");
+        assert_eq!(registry.default_model_id(), "gpt-5.6-sol");
     }
 
     /// `pick_default_model` must not pin to a configured `DEFAULT_MODEL` that
