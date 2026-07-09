@@ -492,8 +492,26 @@ async fn provision_conversation(
         skill_invocation,
     };
     manager
+        .db()
+        .update_conversation_state(&job.conversation_id, &ConvState::Idle)
+        .await
+        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
+    manager
         .evict_runtime(&job.conversation_id, EvictionReason::CreationProvisioned)
         .await;
+    let _handle = manager
+        .get_or_create(&job.conversation_id)
+        .await
+        .map_err(|e| (e, ErrorKind::ServerError))?;
+    let provisioning = ConvState::Provisioning {
+        job_id: job.id.clone(),
+        phase: ConversationCreationPhase::Provisioning,
+    };
+    manager
+        .db()
+        .update_conversation_state(&job.conversation_id, &provisioning)
+        .await
+        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
     manager
         .send_event(&job.conversation_id, event)
         .await

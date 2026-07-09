@@ -851,16 +851,26 @@ async fn inject_creation_job_state_fields(
     let Some(Value::Object(state_obj)) = map.get_mut("state") else {
         return;
     };
+    let file_count = state
+        .runtime
+        .db()
+        .get_conversation_creation_job_files(&job.id)
+        .await
+        .map(|files| files.len())
+        .unwrap_or(0);
     state_obj.insert(
         "prompt".to_string(),
-        Value::String(creation_intent_display_text(&job.intent)),
+        Value::String(creation_intent_display_text(&job.intent, file_count)),
     );
     if let Some(error) = job.error {
         state_obj.insert("message".to_string(), Value::String(error));
     }
 }
 
-fn creation_intent_display_text(intent: &crate::db::ConversationCreationIntent) -> String {
+fn creation_intent_display_text(
+    intent: &crate::db::ConversationCreationIntent,
+    file_count: usize,
+) -> String {
     let mut parts = Vec::new();
     let text = intent.text.trim();
     if !text.is_empty() {
@@ -873,11 +883,11 @@ fn creation_intent_display_text(intent: &crate::db::ConversationCreationIntent) 
             if intent.images.len() == 1 { "" } else { "s" }
         ));
     }
-    if !intent.files.is_empty() {
+    if file_count > 0 {
         parts.push(format!(
             "{} file attachment{}",
-            intent.files.len(),
-            if intent.files.len() == 1 { "" } else { "s" }
+            file_count,
+            if file_count == 1 { "" } else { "s" }
         ));
     }
     parts.join("\n")
@@ -1625,6 +1635,27 @@ async fn create_conversation_with_id(
             "conversation_id already belongs to an existing conversation",
             "conversation_id_exists",
         ))));
+    }
+
+    if let Ok(Some(existing_job)) = state
+        .runtime
+        .db()
+        .get_conversation_creation_job_for_message(&req.message_id)
+        .await
+    {
+        if let Ok(conv) = state
+            .runtime
+            .db()
+            .get_conversation(&existing_job.conversation_id)
+            .await
+        {
+            tracing::info!(message_id = %req.message_id, "Create request hit existing creation job message id");
+            let mut conversation_json = conversation_to_json(&state, &conv, None);
+            inject_creation_job_state_fields(&state, &conv, &mut conversation_json).await;
+            return Ok(Json(ConversationResponse {
+                conversation: conversation_json,
+            }));
+        }
     }
 
     if state
@@ -2863,7 +2894,15 @@ async fn stream_conversation(
             .get_conversation_creation_job_for_conversation(&conversation.id)
             .await
         {
-            init_conversation.creation_prompt = Some(creation_intent_display_text(&job.intent));
+            let file_count = state
+                .runtime
+                .db()
+                .get_conversation_creation_job_files(&job.id)
+                .await
+                .map(|files| files.len())
+                .unwrap_or(0);
+            init_conversation.creation_prompt =
+                Some(creation_intent_display_text(&job.intent, file_count));
             init_conversation.creation_error = job.error;
         }
     }
