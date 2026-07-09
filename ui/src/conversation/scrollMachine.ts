@@ -1,6 +1,4 @@
 export const PIN_TO_BOTTOM_THRESHOLD = 100;
-export const USER_SCROLL_SUPPRESS_MS = 400;
-export const TOUCH_GESTURE_SUPPRESS_MS = 1200;
 export const SETTLE_WATCH_MS = 3000;
 export const SETTLE_WATCH_INTERVAL_MS = 150;
 
@@ -12,252 +10,439 @@ export interface ScrollSnapshot {
 
 export type TailActivity = 'none' | 'active';
 
+export type FollowMode =
+  | { kind: 'following' }
+  | { kind: 'reading' }
+  | { kind: 'returning-to-tail' };
+
+export type Gesture =
+  | { kind: 'idle' }
+  | {
+      kind: 'touch';
+      moved: boolean;
+      departedBottom: boolean;
+      modeBeforeGesture: FollowMode;
+    };
+
+export interface ScrollGeometry {
+  atBottom: boolean;
+  lastSnapshot: ScrollSnapshot | null;
+  previousTotalHeight: number;
+  previousScrollHeight: number;
+  previousClientHeight: number;
+}
+
+interface MeasuredSession {
+  conversationId: string | undefined;
+  geometry: ScrollGeometry;
+  gesture: Gesture;
+  unread: boolean;
+}
+
+export type ScrollMachineState =
+  | { kind: 'unmeasured'; conversationId: string | undefined; measuredEmpty: boolean }
+  | (MeasuredSession & { kind: 'mount-rescue'; deadlineMs: number })
+  | (MeasuredSession & { kind: 'live'; follow: FollowMode });
+
 export type ScrollEffect =
   | { type: 'snapToLastIndex' }
+  | { type: 'scheduleTailFollow' }
   | { type: 'scheduleDomBottomWrite' }
   | { type: 'writeDomBottom' }
   | { type: 'startSettleWatch'; deadlineMs: number }
   | { type: 'stopSettleWatch' }
   | { type: 'showUnread' }
-  | { type: 'clearUnread' }
-  | { type: 'debugIgnoredGrowth'; oldFromBottom: number; heightDelta: number };
-
-export interface ScrollMachineState {
-  conversationId: string | undefined;
-  hasMeasuredConversation: boolean;
-  prevTotalHeight: number;
-  prevScrollHeight: number;
-  prevClientHeight: number;
-  hasSeenContent: boolean;
-  hasUserEngaged: boolean;
-  touchActive: boolean;
-  touchMovedAfterStart: boolean;
-  lastUpwardScrollAt: number;
-  lastTouchGestureAt: number;
-  lastScrollTop: number;
-  settleDeadline: number;
-}
+  | { type: 'clearUnread' };
 
 export type ScrollEvent =
+  | { type: 'conversationChanged'; conversationId: string | undefined }
+  | {
+      type: 'conversationMeasured';
+      conversationId: string | undefined;
+      totalHeight: number;
+      unitCount: number;
+      snapshot: ScrollSnapshot | null;
+      nowMs: number;
+    }
   | { type: 'scrollerAttached'; snapshot: ScrollSnapshot }
-  | { type: 'atBottomChanged'; atBottom: boolean }
-  | { type: 'pointerDown' }
-  | { type: 'touchStart' }
-  | { type: 'touchMove'; nowMs: number }
-  | { type: 'touchEnd'; remainingTouches: number; nowMs: number }
-  | { type: 'wheel'; deltaY: number; nowMs: number }
-  | { type: 'scroll'; snapshot: ScrollSnapshot; nowMs: number }
-  | { type: 'totalHeightChanged'; conversationId: string | undefined; totalHeight: number; unitCount: number; snapshot: ScrollSnapshot | null; tailActivity: TailActivity; nowMs: number }
-  | { type: 'settleTick'; snapshot: ScrollSnapshot | null; nowMs: number }
-  | { type: 'navJump' }
-  | { type: 'jumpToNewestClicked'; unitCount: number };
+  | { type: 'viewportPinnedChanged'; atBottom: boolean }
+  | { type: 'interactionStarted' }
+  | { type: 'touchStarted' }
+  | { type: 'touchMoved' }
+  | { type: 'touchEnded'; remainingTouches: number }
+  | { type: 'touchCancelled'; remainingTouches: number }
+  | { type: 'upwardIntent'; snapshot?: ScrollSnapshot }
+  | { type: 'downwardMovement'; snapshot: ScrollSnapshot }
+  | { type: 'navigationJumped' }
+  | { type: 'tailContentAdvanced' }
+  | {
+      type: 'heightChanged';
+      totalHeight: number;
+      unitCount: number;
+      snapshot: ScrollSnapshot | null;
+      tailActivity: TailActivity;
+    }
+  | { type: 'settleProbe'; snapshot: ScrollSnapshot | null; nowMs: number }
+  | { type: 'jumpToNewestRequested'; unitCount: number };
 
-export function initialScrollMachineState(): ScrollMachineState {
+interface Reduction {
+  state: ScrollMachineState;
+  effects: ScrollEffect[];
+}
+
+const IDLE: Gesture = { kind: 'idle' };
+const FOLLOWING: FollowMode = { kind: 'following' };
+const READING: FollowMode = { kind: 'reading' };
+const RETURNING: FollowMode = { kind: 'returning-to-tail' };
+
+function geometryFrom(snapshot: ScrollSnapshot | null, totalHeight: number): ScrollGeometry {
   return {
-    conversationId: undefined,
-    hasMeasuredConversation: false,
-    prevTotalHeight: 0,
-    prevScrollHeight: 0,
-    prevClientHeight: 0,
-    hasSeenContent: false,
-    hasUserEngaged: false,
-    touchActive: false,
-    touchMovedAfterStart: false,
-    lastUpwardScrollAt: 0,
-    lastTouchGestureAt: 0,
-    lastScrollTop: 0,
-    settleDeadline: 0,
+    atBottom: true,
+    lastSnapshot: snapshot,
+    previousTotalHeight: totalHeight,
+    previousScrollHeight: snapshot?.scrollHeight ?? 0,
+    previousClientHeight: snapshot?.clientHeight ?? 0,
   };
+}
+
+function updateGeometry(
+  geometry: ScrollGeometry,
+  snapshot: ScrollSnapshot | null,
+  totalHeight = geometry.previousTotalHeight,
+): ScrollGeometry {
+  return {
+    ...geometry,
+    lastSnapshot: snapshot ?? geometry.lastSnapshot,
+    previousTotalHeight: totalHeight,
+    previousScrollHeight: snapshot?.scrollHeight ?? geometry.previousScrollHeight,
+    previousClientHeight: snapshot?.clientHeight ?? geometry.previousClientHeight,
+  };
+}
+
+export function initialScrollMachineState(
+  conversationId?: string,
+): ScrollMachineState {
+  return { kind: 'unmeasured', conversationId, measuredEmpty: false };
+}
+
+function unreadEffects(wasUnread: boolean, unread: boolean): ScrollEffect[] {
+  if (wasUnread === unread) return [];
+  return [{ type: unread ? 'showUnread' : 'clearUnread' }];
+}
+
+function liveFrom(
+  session: MeasuredSession,
+  follow: FollowMode,
+): ScrollMachineState {
+  return { ...session, kind: 'live', follow };
+}
+
+function exitMountRescue(
+  state: Extract<ScrollMachineState, { kind: 'mount-rescue' }>,
+  follow: FollowMode,
+): Reduction {
+  return {
+    state: liveFrom(
+      {
+        conversationId: state.conversationId,
+        geometry: state.geometry,
+        gesture: state.gesture,
+        unread: state.unread,
+      },
+      follow,
+    ),
+    effects: [{ type: 'stopSettleWatch' }],
+  };
+}
+
+function takeUserOwnership(
+  state: Exclude<ScrollMachineState, { kind: 'unmeasured' }>,
+  snapshot?: ScrollSnapshot,
+): Reduction {
+  const session: MeasuredSession = {
+    conversationId: state.conversationId,
+    geometry: snapshot ? updateGeometry(state.geometry, snapshot) : state.geometry,
+    gesture: state.gesture,
+    unread: state.unread,
+  };
+  return {
+    state: liveFrom(session, READING),
+    effects: state.kind === 'mount-rescue' ? [{ type: 'stopSettleWatch' }] : [],
+  };
+}
+
+function requestTailReturn(
+  state: Extract<ScrollMachineState, { kind: 'live' }>,
+): Reduction {
+  const effects = unreadEffects(state.unread, false);
+  return {
+    state: { ...state, follow: RETURNING, unread: false },
+    effects: [...effects, { type: 'snapToLastIndex' }],
+  };
+}
+
+function confirmTailReturn(
+  state: Exclude<ScrollMachineState, { kind: 'unmeasured' }>,
+): Reduction {
+  const effects = unreadEffects(state.unread, false);
+  const session: MeasuredSession = {
+    conversationId: state.conversationId,
+    geometry: { ...state.geometry, atBottom: true },
+    gesture: state.gesture,
+    unread: false,
+  };
+  return {
+    state: liveFrom(session, FOLLOWING),
+    effects: state.kind === 'mount-rescue'
+      ? [{ type: 'stopSettleWatch' }, ...effects]
+      : effects,
+  };
+}
+
+function advanceTail(
+  state: Exclude<ScrollMachineState, { kind: 'unmeasured' }>,
+): Reduction {
+  const blocked =
+    (state.kind === 'live' && state.follow.kind === 'reading') ||
+    (state.gesture.kind === 'touch' && state.gesture.moved);
+  const unread = blocked;
+  if (state.kind === 'mount-rescue') {
+    return {
+      state: { ...state, unread },
+      effects: [
+        ...unreadEffects(state.unread, unread),
+        { type: 'scheduleDomBottomWrite' },
+      ],
+    };
+  }
+  return {
+    state: { ...state, unread },
+    effects: blocked
+      ? unreadEffects(state.unread, unread)
+      : [...unreadEffects(state.unread, unread), { type: 'scheduleTailFollow' }],
+  };
+}
+
+function resolveTouch(
+  state: Exclude<ScrollMachineState, { kind: 'unmeasured' }>,
+  remainingTouches: number,
+): Reduction {
+  if (state.gesture.kind !== 'touch' || remainingTouches > 0) {
+    return { state, effects: [] };
+  }
+  const follow = state.gesture.moved ? READING : state.gesture.modeBeforeGesture;
+  const session: MeasuredSession = {
+    conversationId: state.conversationId,
+    geometry: state.geometry,
+    gesture: IDLE,
+    unread: state.unread,
+  };
+  return { state: liveFrom(session, follow), effects: [] };
 }
 
 export function reduceScrollMachine(
   state: ScrollMachineState,
   event: ScrollEvent,
-): { state: ScrollMachineState; effects: ScrollEffect[] } {
+): Reduction {
   switch (event.type) {
-    case 'scrollerAttached':
+    case 'conversationChanged': {
+      if (state.conversationId === event.conversationId) return { state, effects: [] };
+      const effects: ScrollEffect[] = [];
+      if (state.kind === 'mount-rescue') effects.push({ type: 'stopSettleWatch' });
+      if (state.kind !== 'unmeasured' && state.unread) effects.push({ type: 'clearUnread' });
       return {
-        state: {
-          ...state,
-          touchActive: false,
-          touchMovedAfterStart: false,
-          lastUpwardScrollAt: 0,
-          lastTouchGestureAt: 0,
-          lastScrollTop: event.snapshot.scrollTop,
-          hasUserEngaged: false,
-        },
-        effects: [],
-      };
-    case 'atBottomChanged':
-      return event.atBottom
-        ? {
-          state: {
-            ...state,
-            lastUpwardScrollAt: 0,
-            lastTouchGestureAt: state.touchActive ? state.lastTouchGestureAt : 0,
-            touchMovedAfterStart: state.touchActive ? state.touchMovedAfterStart : false,
-          },
-          effects: [{ type: 'clearUnread' }],
-        }
-        : { state, effects: [] };
-    case 'pointerDown':
-    case 'navJump':
-      return { state: { ...state, hasUserEngaged: true }, effects: [] };
-    case 'touchStart':
-      return {
-        state: {
-          ...state,
-          hasUserEngaged: true,
-          touchActive: true,
-          touchMovedAfterStart: false,
-        },
-        effects: [],
-      };
-    case 'touchMove':
-      return {
-        state: {
-          ...state,
-          hasUserEngaged: true,
-          touchMovedAfterStart: true,
-          lastTouchGestureAt: event.nowMs,
-        },
-        effects: [],
-      };
-    case 'touchEnd': {
-      const touchActive = event.remainingTouches > 0;
-      return {
-        state: {
-          ...state,
-          touchActive,
-          touchMovedAfterStart: touchActive ? state.touchMovedAfterStart : false,
-          lastTouchGestureAt: state.touchMovedAfterStart ? event.nowMs : state.lastTouchGestureAt,
-        },
-        effects: [],
+        state: initialScrollMachineState(event.conversationId),
+        effects,
       };
     }
-    case 'wheel':
+
+    case 'conversationMeasured': {
+      if (state.conversationId !== event.conversationId) {
+        const reset = reduceScrollMachine(state, {
+          type: 'conversationChanged',
+          conversationId: event.conversationId,
+        });
+        return reduceScrollMachine(reset.state, event);
+      }
+      if (state.kind !== 'unmeasured') {
+        return reduceScrollMachine(state, {
+          type: 'heightChanged',
+          totalHeight: event.totalHeight,
+          unitCount: event.unitCount,
+          snapshot: event.snapshot,
+          tailActivity: 'none',
+        });
+      }
+      if (event.unitCount === 0 || event.snapshot === null) {
+        return {
+          state: event.unitCount === 0 ? { ...state, measuredEmpty: true } : state,
+          effects: [],
+        };
+      }
+      const firstContentAfterEmpty = state.measuredEmpty;
+      const deadlineMs = event.nowMs + SETTLE_WATCH_MS;
+      return {
+        state: {
+          kind: 'mount-rescue',
+          conversationId: event.conversationId,
+          deadlineMs,
+          geometry: geometryFrom(event.snapshot, event.totalHeight),
+          gesture: IDLE,
+          unread: false,
+        },
+        effects: [
+          ...(firstContentAfterEmpty ? [{ type: 'snapToLastIndex' } as const] : []),
+          { type: 'startSettleWatch', deadlineMs },
+          { type: 'scheduleDomBottomWrite' },
+        ],
+      };
+    }
+
+    case 'scrollerAttached':
+      if (state.kind === 'unmeasured') return { state, effects: [] };
+      return {
+        state: { ...state, geometry: updateGeometry(state.geometry, event.snapshot) },
+        effects: [],
+      };
+
+    case 'viewportPinnedChanged': {
+      if (state.kind === 'unmeasured') return { state, effects: [] };
+      const next = {
+        ...state,
+        geometry: { ...state.geometry, atBottom: event.atBottom },
+        gesture: state.gesture.kind === 'touch' && !event.atBottom
+          ? { ...state.gesture, departedBottom: true }
+          : state.gesture,
+      };
+      if (!event.atBottom) return { state: next, effects: [] };
+      if (next.gesture.kind === 'touch' && next.gesture.moved) {
+        return { state: next, effects: [] };
+      }
+      return confirmTailReturn(next);
+    }
+
+    case 'interactionStarted':
+      if (state.kind === 'mount-rescue') return exitMountRescue(state, FOLLOWING);
+      return { state, effects: [] };
+
+    case 'touchStarted': {
+      if (state.kind === 'unmeasured') return { state, effects: [] };
+      const follow = state.kind === 'live' ? state.follow : FOLLOWING;
+      const session: MeasuredSession = {
+        conversationId: state.conversationId,
+        geometry: state.geometry,
+        gesture: {
+          kind: 'touch',
+          moved: false,
+          departedBottom: !state.geometry.atBottom,
+          modeBeforeGesture: follow,
+        },
+        unread: state.unread,
+      };
+      return {
+        state: liveFrom(session, follow),
+        effects: state.kind === 'mount-rescue' ? [{ type: 'stopSettleWatch' }] : [],
+      };
+    }
+
+    case 'touchMoved': {
+      if (state.kind === 'unmeasured' || state.gesture.kind !== 'touch') {
+        return { state, effects: [] };
+      }
       return {
         state: {
           ...state,
-          hasUserEngaged: true,
-          lastUpwardScrollAt: event.deltaY < 0 ? event.nowMs : state.lastUpwardScrollAt,
+          kind: 'live',
+          follow: READING,
+          gesture: { ...state.gesture, moved: true },
         },
+        effects: state.kind === 'mount-rescue' ? [{ type: 'stopSettleWatch' }] : [],
+      };
+    }
+
+    case 'touchEnded':
+    case 'touchCancelled':
+      if (state.kind === 'unmeasured') return { state, effects: [] };
+      return resolveTouch(state, event.remainingTouches);
+
+    case 'upwardIntent':
+    case 'navigationJumped':
+      if (state.kind === 'unmeasured') return { state, effects: [] };
+      return takeUserOwnership(
+        state,
+        event.type === 'upwardIntent' ? event.snapshot : undefined,
+      );
+
+    case 'downwardMovement':
+      if (state.kind === 'unmeasured') return { state, effects: [] };
+      return {
+        state: { ...state, geometry: updateGeometry(state.geometry, event.snapshot) },
         effects: [],
       };
-    case 'scroll': {
-      const upward = event.snapshot.scrollTop < state.lastScrollTop;
+
+    case 'tailContentAdvanced':
+      if (state.kind === 'unmeasured') return { state, effects: [] };
+      return advanceTail(state);
+
+    case 'heightChanged': {
+      if (state.kind === 'unmeasured') return { state, effects: [] };
+      const previousTotalHeight = state.geometry.previousTotalHeight;
       const nextState = {
         ...state,
-        lastScrollTop: event.snapshot.scrollTop,
-        lastUpwardScrollAt: upward ? event.nowMs : state.lastUpwardScrollAt,
+        geometry: updateGeometry(state.geometry, event.snapshot, event.totalHeight),
       };
-      if (
-        !nextState.hasUserEngaged &&
-        event.nowMs <= nextState.settleDeadline &&
-        event.snapshot.scrollHeight - event.snapshot.scrollTop - event.snapshot.clientHeight > 1
-      ) {
+      if (event.unitCount === 0 || event.snapshot === null) {
+        return { state: nextState, effects: [] };
+      }
+      if (state.kind === 'mount-rescue') {
         return { state: nextState, effects: [{ type: 'scheduleDomBottomWrite' }] };
       }
-      return { state: nextState, effects: [] };
-    }
-    case 'totalHeightChanged': {
-      if (!state.hasMeasuredConversation || state.conversationId !== event.conversationId) {
-        const hasSeenContent = event.unitCount > 0;
+      if (state.follow.kind !== 'reading' && !(state.gesture.kind === 'touch' && state.gesture.moved)) {
         return {
-          state: {
-            ...state,
-            conversationId: event.conversationId,
-            hasMeasuredConversation: true,
-            prevTotalHeight: event.totalHeight,
-            prevClientHeight: event.snapshot?.clientHeight ?? 0,
-            prevScrollHeight: event.snapshot?.scrollHeight ?? 0,
-            hasSeenContent,
-            hasUserEngaged: false,
-            touchActive: false,
-            touchMovedAfterStart: false,
-            lastUpwardScrollAt: 0,
-            lastTouchGestureAt: 0,
-            lastScrollTop: event.snapshot?.scrollTop ?? 0,
-            settleDeadline: hasSeenContent ? event.nowMs + SETTLE_WATCH_MS : state.settleDeadline,
-          },
-          effects: hasSeenContent
-            ? [{ type: 'startSettleWatch', deadlineMs: event.nowMs + SETTLE_WATCH_MS }, { type: 'scheduleDomBottomWrite' }]
-            : [],
-        };
-      }
-
-      const prevHeight = state.prevTotalHeight;
-      let nextState = { ...state, prevTotalHeight: event.totalHeight };
-      if (event.unitCount === 0 || event.snapshot === null) return { state: nextState, effects: [] };
-
-      if (!nextState.hasSeenContent) {
-        nextState = {
-          ...nextState,
-          hasSeenContent: true,
-          prevClientHeight: event.snapshot.clientHeight,
-          prevScrollHeight: event.snapshot.scrollHeight,
-          settleDeadline: event.nowMs + SETTLE_WATCH_MS,
-        };
-        return {
-          state: nextState,
+          state: { ...nextState, unread: false },
           effects: [
+            ...unreadEffects(state.unread, false),
             { type: 'snapToLastIndex' },
-            { type: 'startSettleWatch', deadlineMs: event.nowMs + SETTLE_WATCH_MS },
-            { type: 'scheduleDomBottomWrite' },
           ],
         };
       }
-
-      const clientHeightForPinCheck =
-        event.snapshot.clientHeight < nextState.prevClientHeight
-          ? nextState.prevClientHeight
-          : event.snapshot.clientHeight;
-      const oldFromBottom = nextState.prevScrollHeight - event.snapshot.scrollTop - clientHeightForPinCheck;
-      nextState = {
-        ...nextState,
-        prevClientHeight: event.snapshot.clientHeight,
-        prevScrollHeight: event.snapshot.scrollHeight,
+      const tailGrew =
+        event.tailActivity === 'active' && event.totalHeight > previousTotalHeight;
+      if (!tailGrew || state.unread) return { state: nextState, effects: [] };
+      return {
+        state: { ...nextState, unread: true },
+        effects: [{ type: 'showUnread' }],
       };
-
-      if (!nextState.hasUserEngaged && event.nowMs <= nextState.settleDeadline) {
-        return { state: nextState, effects: [{ type: 'scheduleDomBottomWrite' }] };
-      }
-
-      const grewWithTailActivity = event.totalHeight > prevHeight && event.tailActivity === 'active';
-      if (oldFromBottom <= PIN_TO_BOTTOM_THRESHOLD) {
-        const userOwnsViewport =
-          nextState.touchActive ||
-          event.nowMs - nextState.lastUpwardScrollAt < USER_SCROLL_SUPPRESS_MS ||
-          (nextState.lastTouchGestureAt > 0 && event.nowMs - nextState.lastTouchGestureAt < TOUCH_GESTURE_SUPPRESS_MS);
-        if (!userOwnsViewport) return { state: nextState, effects: [{ type: 'snapToLastIndex' }] };
-        if (grewWithTailActivity) return { state: nextState, effects: [{ type: 'showUnread' }] };
-        return { state: nextState, effects: [] };
-      }
-
-      if (event.totalHeight > prevHeight) {
-        if (grewWithTailActivity) return { state: nextState, effects: [{ type: 'showUnread' }] };
-        return {
-          state: nextState,
-          effects: [{ type: 'debugIgnoredGrowth', oldFromBottom, heightDelta: event.totalHeight - prevHeight }],
-        };
-      }
-      return { state: nextState, effects: [] };
     }
-    case 'settleTick':
-      if (state.hasUserEngaged || event.nowMs > state.settleDeadline) {
-        return { state, effects: [{ type: 'stopSettleWatch' }] };
-      }
+
+    case 'settleProbe': {
+      if (state.kind !== 'mount-rescue') return { state, effects: [] };
+      if (event.nowMs > state.deadlineMs) return exitMountRescue(state, FOLLOWING);
       if (
         event.snapshot &&
         event.snapshot.scrollHeight - event.snapshot.scrollTop - event.snapshot.clientHeight > 1
       ) {
-        return { state, effects: [{ type: 'writeDomBottom' }] };
+        return {
+          state: {
+            ...state,
+            geometry: updateGeometry(state.geometry, event.snapshot),
+          },
+          effects: [{ type: 'writeDomBottom' }],
+        };
       }
       return { state, effects: [] };
-    case 'jumpToNewestClicked':
-      return {
-        state,
-        effects: event.unitCount === 0 ? [] : [{ type: 'clearUnread' }, { type: 'snapToLastIndex' }],
-      };
+    }
+
+    case 'jumpToNewestRequested':
+      if (state.kind === 'unmeasured' || event.unitCount === 0) {
+        return { state, effects: [] };
+      }
+      if (state.kind === 'mount-rescue') {
+        const exited = exitMountRescue(state, FOLLOWING);
+        const live = exited.state as Extract<ScrollMachineState, { kind: 'live' }>;
+        const requested = requestTailReturn(live);
+        return { state: requested.state, effects: [...exited.effects, ...requested.effects] };
+      }
+      return requestTailReturn(state);
   }
 }

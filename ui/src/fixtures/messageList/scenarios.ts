@@ -156,6 +156,26 @@ const toolStripMessages: Message[] = [
   },
 ];
 
+const scrollPolicyMessages: Message[] = Array.from({ length: 80 }, (_, index) => {
+  const sequenceId = index + 1;
+  const isUser = index % 2 === 0;
+  return {
+    message_id: `scroll-policy-${sequenceId}`,
+    conversation_id: 'fixture-message-list-scroll-policy',
+    sequence_id: sequenceId,
+    type: isUser ? 'user' : 'agent',
+    message_type: isUser ? 'user' : 'agent',
+    created_at: new Date(Date.UTC(2025, 0, 1, 10, index)).toISOString(),
+    content: isUser
+      ? { text: `Scroll policy checkpoint ${sequenceId}: keep this historical item stable.` }
+      : [{
+          type: 'text',
+          text: `Checkpoint ${sequenceId} is complete.\n\n${'Measured conversation output remains deterministic. '.repeat(6)}`,
+        }],
+    display_data: {},
+  } as Message;
+});
+
 const markdownImageMessages: Message[] = [
   {
     message_id: 'user-image-1',
@@ -203,6 +223,12 @@ export const messageListScenarios = [
     theme: 'dark',
   },
   {
+    id: 'scroll-policy-long',
+    title: 'Scroll policy long conversation',
+    description: 'Long deterministic conversation with controls for real Virtuoso tail-follow QA.',
+    theme: 'dark',
+  },
+  {
     id: 'markdown-image-dark',
     title: 'Markdown image',
     description: 'Assistant Markdown image syntax renders an inline screenshot preview.',
@@ -223,7 +249,9 @@ export function messageListFixtureData(scenario: MessageListScenario): MessageLi
     ? toolStripMessages
     : scenario.id === 'markdown-image-dark'
       ? markdownImageMessages
-      : baseMessages;
+      : scenario.id === 'scroll-policy-long'
+        ? scrollPolicyMessages
+        : baseMessages;
   return {
     conversationId: `fixture-message-list-${scenario.id}`,
     slug: `fixture-message-list-${scenario.id}`,

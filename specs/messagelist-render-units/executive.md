@@ -13,7 +13,7 @@ It is the structural follow-up to the bottom-anchored window introduced in task 
 - Virtuoso-owned virtualization (windowing, scroll-anchor compensation, item-height measurement, follow-output)
 - Streaming view as a `TailUnit` kind with leaf-level buffer subscription
 - Capability-gap logging on skipped messages
-- Pinned-to-bottom preservation without force-scroll override (REQ-MLRU-014)
+- Durable tail-follow ownership, unread policy, gesture handling, and bounded mount rescue (REQ-MLRU-014)
 
 **Out of scope (removed):**
 
@@ -37,7 +37,7 @@ A correct-by-construction rewrite of the message-list virtualization so the virt
 ## Technical Summary
 
 - `ui/src/conversation/renderUnits.ts` — pure `buildRenderUnits({ messages, pendingMessages, convState, streamingHandle })` returns `{ historicalUnits: HistoricalUnit[]; tailUnits: TailUnit[] }`. Two discriminated unions; `agent_turn` carries `toolResultsByUseId: ReadonlyMap<string, Message>` and `isFirstInTurn: boolean` as fields, both computed at construction. Pending user messages append to `historicalUnits` keyed by `localId`. `streamingHandle` is a tag (`{ key } | null`) — the buffer itself is subscribed inside the leaf.
-- `ui/src/conversation/scrollMachine.ts` — pure reducer for the scroll policy specified in `scroll_policy.allium`: pinned users follow the tail, non-pinned users are not yanked, upward gestures suppress auto-follow, pre-engagement mount settling is bounded, and policy state resets on conversation identity changes.
+- `ui/src/conversation/scrollMachine.ts` — pure reducer for `scroll_policy.allium`, using discriminated `unmeasured`, `mount-rescue`, and `live` sessions; durable `following`, `reading`, and `returning-to-tail` modes; explicit touch gesture variants; reducer-owned unread truth; and bounded mount recovery. Live ownership has no release timeout.
 - `ui/src/components/MessageList.tsx` — derives units, concatenates `[...historicalUnits, ...tailUnits]`, hands them to a single `<Virtuoso>` instance configured with `followOutput={false}`, `atBottomThreshold={100}`, `initialTopMostItemIndex={allUnits.length - 1}`, `alignToBottom`, `increaseViewportBy={{ top: 600, bottom: 600 }}`, and `key={conversationId}` to force a fresh instance per conversation. System prompt renders via `components.Header`. The component adapts Virtuoso, DOM, gesture, and timer events into scroll-policy events and interprets policy effects as Virtuoso or DOM scroll operations. Jump-to-newest is an absolute overlay outside Virtuoso, driven by at-bottom/unread state, dispatching a policy event that calls `virtuosoRef.current.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' })`. The `<StreamingMessage slug={slug} />` leaf subscribes to the buffer directly via `useStreamingBuffer(slug)`.
 
 ## Status Summary
@@ -57,7 +57,7 @@ A correct-by-construction rewrite of the message-list virtualization so the virt
 | **REQ-MLRU-011:** Capability-Gap Logging | Complete | `console.debug` on every skip path; no warn-or-higher |
 | **REQ-MLRU-012:** Tool-Result-Heavy Tail Regression | Complete | Test exists in `MessageList.test.tsx` |
 | **REQ-MLRU-013:** SessionStorage Height Cache | **Deprecated** | In-memory only; persistence served only the removed saved-scroll restore |
-| **REQ-MLRU-014:** Pinned-to-Bottom Preservation | Complete | Reworded in task 60410 to forbid force-scroll override; `followOutput={false}` with deterministic manual auto-follow policy |
+| **REQ-MLRU-014:** Durable Tail-Follow Policy | Complete | Discriminated lifecycle/follow/gesture state; no live ownership timeout; centralized unread; bounded mount rescue |
 | **REQ-MLRU-015:** Virtuoso-Owned Virtualization | Complete | Single `<Virtuoso>` instance owns windowing, scroll anchoring, measurement |
 
 ## Lineage

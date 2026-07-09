@@ -14,5 +14,8 @@ CompactLatestExpanded.storyName = 'compact-latest-expanded';
 export const CompactToolStrip = storyFor('compact-tool-strip');
 CompactToolStrip.storyName = 'compact-tool-strip';
 
+export const ScrollPolicyLong = storyFor('scroll-policy-long');
+ScrollPolicyLong.storyName = 'scroll-policy-long';
+
 export const MarkdownImageDark = storyFor('markdown-image-dark');
 MarkdownImageDark.storyName = 'markdown-image-dark';

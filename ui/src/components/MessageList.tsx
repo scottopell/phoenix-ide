@@ -315,17 +315,10 @@ function MessageListImpl({
   onChaptersChange,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
-  const [isAtBottom, setIsAtBottom] = useState(true);
-  // Tail-content unread tracking: bumped when the visible-unit count grows
-  // while the user is NOT pinned at bottom. Cleared when isAtBottom flips
-  // true or the jump-to-newest button is clicked. This keeps the
-  // "↓ New messages" affordance honest: it only shows after new tail
-  // content arrived while the user was scrolled up, not on every
-  // scroll-up of a static conversation.
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
-  const scrollMachineRef = useRef(initialScrollMachineState());
+  const scrollMachineRef = useRef(initialScrollMachineState(conversationId));
 
   // The streaming buffer's `requestId` IS the eventual agent message_id
   // (server uses the same uuid for both — see `AssistantMessage::new` in
@@ -378,12 +371,12 @@ function MessageListImpl({
   const activeToolUseId = activeToolUseIdFromState(convState);
 
   const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
-    setIsAtBottom(atBottom);
-    dispatchScrollEventRef.current({ type: 'atBottomChanged', atBottom });
+    dispatchScrollEventRef.current({ type: 'viewportPinnedChanged', atBottom });
   }, []);
 
   const detachGestureListenersRef = useRef<(() => void) | null>(null);
   const settleSnapRafRef = useRef(0);
+  const tailFollowRafRef = useRef(0);
   const settleWatchTimerRef = useRef(0);
   const dispatchScrollEventRef = useRef<(event: ScrollEvent) => void>(() => {});
 
@@ -396,11 +389,27 @@ function MessageListImpl({
     if (settleSnapRafRef.current !== 0) return;
     settleSnapRafRef.current = requestAnimationFrame(() => {
       settleSnapRafRef.current = 0;
-      dispatchScrollEventRef.current({ type: 'settleTick', snapshot: readScrollSnapshot(), nowMs: Date.now() });
+      dispatchScrollEventRef.current({ type: 'settleProbe', snapshot: readScrollSnapshot(), nowMs: Date.now() });
     });
   }, [readScrollSnapshot]);
 
+  const scheduleTailFollow = useCallback(() => {
+    if (tailFollowRafRef.current !== 0) return;
+    tailFollowRafRef.current = requestAnimationFrame(() => {
+      tailFollowRafRef.current = 0;
+      virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+    });
+  }, []);
+
   const stopSettleWatch = useCallback(() => {
+    if (settleSnapRafRef.current !== 0) {
+      cancelAnimationFrame(settleSnapRafRef.current);
+      settleSnapRafRef.current = 0;
+    }
+    if (tailFollowRafRef.current !== 0) {
+      cancelAnimationFrame(tailFollowRafRef.current);
+      tailFollowRafRef.current = 0;
+    }
     if (settleWatchTimerRef.current !== 0) {
       clearInterval(settleWatchTimerRef.current);
       settleWatchTimerRef.current = 0;
@@ -411,7 +420,7 @@ function MessageListImpl({
     scheduleDomBottomWrite();
     if (settleWatchTimerRef.current !== 0) return;
     settleWatchTimerRef.current = window.setInterval(() => {
-      dispatchScrollEventRef.current({ type: 'settleTick', snapshot: readScrollSnapshot(), nowMs: Date.now() });
+      dispatchScrollEventRef.current({ type: 'settleProbe', snapshot: readScrollSnapshot(), nowMs: Date.now() });
     }, SETTLE_WATCH_INTERVAL_MS);
   }, [readScrollSnapshot, scheduleDomBottomWrite]);
 
@@ -420,6 +429,9 @@ function MessageListImpl({
       switch (effect.type) {
         case 'snapToLastIndex':
           virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+          break;
+        case 'scheduleTailFollow':
+          scheduleTailFollow();
           break;
         case 'scheduleDomBottomWrite':
           scheduleDomBottomWrite();
@@ -441,17 +453,9 @@ function MessageListImpl({
         case 'clearUnread':
           setHasUnreadTailContent(false);
           break;
-        case 'debugIgnoredGrowth':
-          if (import.meta.env.DEV) {
-            console.debug('[MessageList] height grew but not re-snapping (past threshold, no tail activity)', {
-              oldFromBottom: effect.oldFromBottom,
-              heightDelta: effect.heightDelta,
-            });
-          }
-          break;
       }
     }
-  }, [scheduleDomBottomWrite, startSettleWatch, stopSettleWatch]);
+  }, [scheduleDomBottomWrite, scheduleTailFollow, startSettleWatch, stopSettleWatch]);
 
   const dispatchScrollEvent = useCallback((event: ScrollEvent) => {
     const next = reduceScrollMachine(scrollMachineRef.current, event);
@@ -461,12 +465,7 @@ function MessageListImpl({
   dispatchScrollEventRef.current = dispatchScrollEvent;
 
   useEffect(() => {
-    return () => {
-      if (settleSnapRafRef.current !== 0) {
-        cancelAnimationFrame(settleSnapRafRef.current);
-      }
-      stopSettleWatch();
-    };
+    return stopSettleWatch;
   }, [stopSettleWatch]);
 
   const handleScrollerRef = useCallback((ref: HTMLElement | Window | null) => {
@@ -479,21 +478,31 @@ function MessageListImpl({
         type: 'scrollerAttached',
         snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
       });
-      const onPointerDown = () => dispatchScrollEvent({ type: 'pointerDown' });
-      const onTouchStart = () => dispatchScrollEvent({ type: 'touchStart' });
-      const onTouchMove = () => dispatchScrollEvent({ type: 'touchMove', nowMs: Date.now() });
-      const onTouchEnd = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchEnd', remainingTouches: e.touches.length, nowMs: Date.now() });
-      const onWheel = (e: WheelEvent) => dispatchScrollEvent({ type: 'wheel', deltaY: e.deltaY, nowMs: Date.now() });
-      const onScroll = () => dispatchScrollEvent({
-        type: 'scroll',
-        snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },
-        nowMs: Date.now(),
-      });
+      const onPointerDown = () => dispatchScrollEvent({ type: 'interactionStarted' });
+      const onTouchStart = () => dispatchScrollEvent({ type: 'touchStarted' });
+      const onTouchMove = () => dispatchScrollEvent({ type: 'touchMoved' });
+      const onTouchEnd = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchEnded', remainingTouches: e.touches.length });
+      const onTouchCancel = (e: TouchEvent) => dispatchScrollEvent({ type: 'touchCancelled', remainingTouches: e.touches.length });
+      const onWheel = (e: WheelEvent) => dispatchScrollEvent(
+        e.deltaY < 0 ? { type: 'upwardIntent' } : { type: 'interactionStarted' },
+      );
+      const onScroll = () => {
+        const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight };
+        const machine = scrollMachineRef.current;
+        const previousTop = machine.kind === 'unmeasured'
+          ? snapshot.scrollTop
+          : machine.geometry.lastSnapshot?.scrollTop ?? snapshot.scrollTop;
+        dispatchScrollEvent(
+          snapshot.scrollTop < previousTop
+            ? { type: 'upwardIntent', snapshot }
+            : { type: 'downwardMovement', snapshot },
+        );
+      };
       ref.addEventListener('pointerdown', onPointerDown, { passive: true });
       ref.addEventListener('touchstart', onTouchStart, { passive: true });
       ref.addEventListener('touchmove', onTouchMove, { passive: true });
       ref.addEventListener('touchend', onTouchEnd, { passive: true });
-      ref.addEventListener('touchcancel', onTouchEnd, { passive: true });
+      ref.addEventListener('touchcancel', onTouchCancel, { passive: true });
       ref.addEventListener('wheel', onWheel, { passive: true });
       ref.addEventListener('scroll', onScroll, { passive: true });
       detachGestureListenersRef.current = () => {
@@ -501,7 +510,7 @@ function MessageListImpl({
         ref.removeEventListener('touchstart', onTouchStart);
         ref.removeEventListener('touchmove', onTouchMove);
         ref.removeEventListener('touchend', onTouchEnd);
-        ref.removeEventListener('touchcancel', onTouchEnd);
+        ref.removeEventListener('touchcancel', onTouchCancel);
         ref.removeEventListener('wheel', onWheel);
         ref.removeEventListener('scroll', onScroll);
       };
@@ -515,32 +524,10 @@ function MessageListImpl({
   const allUnitsLengthRef = useRef(allUnits.length);
   allUnitsLengthRef.current = allUnits.length;
 
-  // Mark unread tail content when ANY tail signal fires while the user
-  // is not pinned at bottom. Three independent signals cover the cases:
-  //   1. `messages.length` grows — covers user/agent/system arrivals AND
-  //      tool messages (which collapse into an existing agent_turn unit
-  //      so `allUnits.length` would NOT change, but the visible tail
-  //      content does).
-  //   2. `streamingRequestId` transitions null → string — a new streaming
-  //      session started; subsequent token-by-token growth is implicit
-  //      while it stays non-null. We don't subscribe to per-token text
-  //      changes (would break REQ-MLRU-010 streaming isolation); the
-  //      session-start signal is the actionable trigger.
-  //   3. `pendingMessages.length` grows — local queue gained a queued
-  //      bubble (e.g. a steered message during agent activity).
-  // Reset on conversation switch so unread state cannot leak across
-  // navigation (MessageList stays mounted by ConversationPage and only
-  // sees a prop change for `conversationId`).
   const prevMessagesLengthRef = useRef(messages.length);
   const prevStreamingRequestIdRef = useRef(streamingRequestId);
   const prevPendingLengthRef = useRef(pendingMessages.length);
   const prevConversationIdRef = useRef(conversationId);
-  // Refs read by handleTotalListHeightChanged (bound via useCallback and
-  // cannot see live props directly):
-  //   - streamingRequestIdRef: gate height-driven unread on streaming
-  //     activity so unrelated height changes don't raise "↓ New messages".
-  //   - convStateRef: also let `awaiting_sub_agents` count as active tail
-  //     activity when existing tool output grows without a new message.
   const streamingRequestIdRef = useRef(streamingRequestId);
   const convStateRef = useRef(convState);
   streamingRequestIdRef.current = streamingRequestId;
@@ -548,50 +535,52 @@ function MessageListImpl({
 
   useEffect(() => {
     const conversationChanged = prevConversationIdRef.current !== conversationId;
-    const prevMsgs = prevMessagesLengthRef.current;
-    const prevStreamId = prevStreamingRequestIdRef.current;
-    const prevPending = prevPendingLengthRef.current;
+    const messagesGrew = messages.length > prevMessagesLengthRef.current;
+    const streamingStarted =
+      prevStreamingRequestIdRef.current === null && streamingRequestId !== null;
+    const pendingGrew = pendingMessages.length > prevPendingLengthRef.current;
+
     prevConversationIdRef.current = conversationId;
     prevMessagesLengthRef.current = messages.length;
     prevStreamingRequestIdRef.current = streamingRequestId;
     prevPendingLengthRef.current = pendingMessages.length;
+
     if (conversationChanged) {
-      setHasUnreadTailContent(false);
-      // The handleTotalListHeightChanged baseline is managed by the
-      // callback's own conversation-switch handler (lastSeenConvIdRef
-      // check), which fires synchronously during Virtuoso's measurement
-      // — before this passive useEffect runs. Resetting prevTotalHeightRef
-      // here would overwrite the seeded baseline and re-introduce a
-      // `prevHeight === 0` condition on the next async height delta.
+      dispatchScrollEvent({ type: 'conversationChanged', conversationId });
       return;
     }
-    if (isAtBottom) return;
-    const messagesGrew = messages.length > prevMsgs;
-    const streamingStarted = prevStreamId === null && streamingRequestId !== null;
-    const pendingGrew = pendingMessages.length > prevPending;
     if (messagesGrew || streamingStarted || pendingGrew) {
-      setHasUnreadTailContent(true);
+      dispatchScrollEvent({ type: 'tailContentAdvanced' });
     }
-  }, [conversationId, messages.length, pendingMessages.length, streamingRequestId, isAtBottom]);
+  }, [conversationId, dispatchScrollEvent, messages.length, pendingMessages.length, streamingRequestId]);
 
   const handleTotalListHeightChanged = useCallback((newHeight: number) => {
     const tailActivity: TailActivity =
       streamingRequestIdRef.current !== null || convStateRef.current.type === 'awaiting_sub_agents'
         ? 'active'
         : 'none';
-    dispatchScrollEvent({
-      type: 'totalHeightChanged',
-      conversationId,
+    const machine = scrollMachineRef.current;
+    const measurement = {
       totalHeight: newHeight,
       unitCount: allUnitsLengthRef.current,
       snapshot: readScrollSnapshot(),
-      tailActivity,
-      nowMs: Date.now(),
-    });
+    };
+    dispatchScrollEvent(machine.kind === 'unmeasured' || machine.conversationId !== conversationId
+      ? {
+          type: 'conversationMeasured',
+          conversationId,
+          ...measurement,
+          nowMs: Date.now(),
+        }
+      : {
+          type: 'heightChanged',
+          ...measurement,
+          tailActivity,
+        });
   }, [conversationId, dispatchScrollEvent, readScrollSnapshot]);
 
   const scrollToNewest = useCallback(() => {
-    dispatchScrollEvent({ type: 'jumpToNewestClicked', unitCount: allUnitsLengthRef.current });
+    dispatchScrollEvent({ type: 'jumpToNewestRequested', unitCount: allUnitsLengthRef.current });
   }, [dispatchScrollEvent]);
 
   // Conversation-nav jump + post-mount pulse. The target row is usually
@@ -663,7 +652,7 @@ function MessageListImpl({
     // A nav jump is user engagement even though it never touches the
     // scroller: without this, a pre-engagement height delta would snap the
     // viewport back to the bottom and clobber the jump.
-    dispatchScrollEvent({ type: 'navJump' });
+    dispatchScrollEvent({ type: 'navigationJumped' });
     clearJumpRetryTimers();
     activeJumpKeyRef.current = unit.key;
     pendingPulseKeyRef.current = unit.key;
@@ -756,7 +745,7 @@ function MessageListImpl({
           className="message-virtuoso"
         />
       </section>
-      {!isEmpty && !isAtBottom && hasUnreadTailContent && (
+      {!isEmpty && hasUnreadTailContent && (
         <button className="jump-to-newest" onClick={scrollToNewest}>
           ↓ New messages
         </button>

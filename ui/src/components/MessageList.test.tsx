@@ -928,6 +928,7 @@ describe('handleTotalListHeightChanged', () => {
     // virtuoso reports them off the bottom.
     act(() => virtuosoMock.atBottomStateChange?.(false));
     fireEvent.touchStart(scroller, { touches: [{}] });
+    fireEvent.touchMove(scroller, { touches: [{}] });
 
     // Genuine tail growth (sub-agents phase) lands while the gesture
     // suppresses the snap. oldFromBottom = 500 - 100 - 400 = 0 (pinned).
@@ -962,10 +963,11 @@ describe('handleTotalListHeightChanged', () => {
     fireEvent.pointerDown(scroller);
     virtuosoMock.scrollToIndex.mockClear();
 
-    // Scrolled-up user + height delta: no rescue, no snap.
+    // Pointer interaction exits mount rescue into normal durable follow.
+    // It does not claim reading ownership without upward movement.
     setupScroller(scroller, { scrollHeight: 1200, scrollTop: 0, clientHeight: 400 });
     act(() => virtuosoMock.totalListHeightChanged?.(1200));
-    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
   });
 
   it('follows a pinned user even when virtuoso model height disagrees with DOM scrollHeight', () => {
@@ -1030,18 +1032,17 @@ describe('handleTotalListHeightChanged', () => {
       // threshold (oldFromBottom = 500 - 80 - 400 = 20) when a
       // measurement-driven height delta lands.
       fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchMove(scroller, { touches: [{}] });
       setupScroller(scroller, { scrollHeight: 600, scrollTop: 80, clientHeight: 400 });
       act(() => virtuosoMock.totalListHeightChanged?.(600));
       expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
 
-      // Finger lifts; once the suppress window expires, a pinned user is
-      // followed again.
+      // Finger lift and elapsed time do not release durable reading ownership.
       fireEvent.touchEnd(scroller, { touches: [] });
       act(() => vi.advanceTimersByTime(1300));
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
-      // oldFromBottom = 600 - 200 - 400 = 0 (pinned)
       act(() => virtuosoMock.totalListHeightChanged?.(700));
-      expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -1087,13 +1088,11 @@ describe('handleTotalListHeightChanged', () => {
       act(() => virtuosoMock.totalListHeightChanged?.(600));
       expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
 
-      // After the window expires with no further upward movement, a pinned
-      // user is followed again.
+      // Elapsed time cannot reclaim the viewport from the user.
       act(() => vi.advanceTimersByTime(1300));
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
-      // oldFromBottom = 600 - 200 - 400 = 0 (pinned)
       act(() => virtuosoMock.totalListHeightChanged?.(700));
-      expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -1249,7 +1248,7 @@ describe('handleTotalListHeightChanged', () => {
       vi.setSystemTime(3101);
       setupScroller(scroller, { scrollHeight: 700, scrollTop: 200, clientHeight: 400 });
       act(() => virtuosoMock.totalListHeightChanged?.(700));
-      expect(virtuosoMock.scrollToIndex).toHaveBeenCalled();
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -1348,6 +1347,36 @@ describe('handleTotalListHeightChanged', () => {
     }
   });
 
+
+  it('maps touchcancel after movement to durable reading ownership', () => {
+    const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-touchcancel"
+        />,
+      ),
+    );
+
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+    act(() => virtuosoMock.totalListHeightChanged?.(500));
+    virtuosoMock.scrollToIndex.mockClear();
+
+    fireEvent.touchStart(scroller, { touches: [{}] });
+    fireEvent.touchMove(scroller, { touches: [{}] });
+    fireEvent.touchCancel(scroller, { touches: [] });
+    setupScroller(scroller, { scrollHeight: 600, scrollTop: 95, clientHeight: 400 });
+    act(() => virtuosoMock.totalListHeightChanged?.(600));
+
+    expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    expect(container.querySelector('.jump-to-newest')).not.toBeNull();
+  });
 
   it('downward scroll does not suppress the pinned re-snap', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));

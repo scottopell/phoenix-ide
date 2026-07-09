@@ -11,13 +11,13 @@ It supersedes the raw-message virtualization model that the
 `isRenderableHistoricalMessage` patch in `MessageList.tsx` mitigated but
 did not structurally replace.
 
-**Virtualization vendor:** As of task 60410, virtualization is delegated
-to `react-virtuoso` (REQ-MLRU-015). The hand-rolled bottom-anchored
-window, IntersectionObserver-driven boundary expansion, exact-scroll
+**Virtualization vendor:** Virtualization is delegated to
+`react-virtuoso` (REQ-MLRU-015). The hand-rolled bottom-anchored window,
+IntersectionObserver-driven boundary expansion, exact-scroll
 compensation, and measured-spacer-with-kind-fallback geometry layer
 (formerly REQ-MLRU-005, REQ-MLRU-006, REQ-MLRU-007, REQ-MLRU-008) are
-all deprecated. The library is now authoritative for windowing,
-scroll anchoring, and item-height measurement.
+deprecated. The library is authoritative for windowing, scroll
+anchoring, and item-height measurement.
 
 **No saved-scroll restore:** REQ-CONV-013 (per-conversation scroll
 memory) was deprecated. This spec accordingly does not specify, and
@@ -231,14 +231,10 @@ paint, RESTORE_OVERSCAN window widening, ack-time DOM snapshot) was
 deleted. There is no saved-scroll restore; mount always lands pinned
 to the bottom per REQ-MLRU-005.
 
-**Deprecation Reason:** Unit-anchor restore is structurally correct
-*in isolation*, but it interacted poorly with pending → sent
-acknowledgement: the unit whose key was anchored could change shape
-during the pending → sent swap, and the ack-time DOM-snapshot
-compensation introduced by PR #152 was a band-aid for that
-interaction. The decision was to remove the entire feature rather
-than continue patching. The pending → sent transition is now handled
-correctly-by-construction (REQ-MLRU-001 single-key invariant).
+**Deprecation Reason:** Unit-anchor restore interacted poorly with
+pending → sent acknowledgement because the anchored unit could change
+shape during the swap. The pending → sent transition is instead handled
+correctly by construction through the REQ-MLRU-001 single-key invariant.
 
 ---
 
@@ -320,134 +316,91 @@ regression of the unit model.
 **DEPRECATED:** Removed alongside REQ-CONV-013. Persisting measured
 heights to `sessionStorage` existed solely to make the first paint
 after navigation produce exact spacer geometry so that the
-unit-anchor restore (REQ-MLRU-009) landed precisely without a
-reflow. With saved-scroll restore gone, persistence is dead weight.
+unit-anchor restore (REQ-MLRU-009) could avoid reflow. Without saved-scroll restore, persistence has no consumer.
 
-The measured-height cache (REQ-MLRU-008) remains as an *in-memory*
-per-conversation Map for the lifetime of the conversation's mount;
-it is rebuilt on each mount as `ResizeObserver` callbacks fire. The
-first paint uses per-kind estimates; subsequent renders use measured
-values as they accumulate. The brief visual settle on first paint
-is acceptable.
+Virtuoso owns its in-memory measurement cache for the lifetime of the
+mounted conversation. Phoenix does not persist a parallel height cache.
 
 ---
 
-### REQ-MLRU-014: Pinned-to-Bottom Preservation
+### REQ-MLRU-014: Durable Tail-Follow Policy
 
-WHEN a new render unit appears at the tail and the user is currently
-pinned to the bottom of the list
-THE SYSTEM SHALL keep the bottom of the list visible after the unit is
-appended
-(implemented via the `totalListHeightChanged` callback, which re-snaps
-to the last item when the user's pre-growth distance from the bottom is
-within the pin threshold)
+WHEN a conversation with content opens or becomes active
+THE SYSTEM SHALL establish tail-follow intent and converge to the newest
+content through a bounded mount-rescue lifecycle
+UNLESS user interaction transfers viewport ownership before convergence
 
-THE SYSTEM SHALL compute the pre-growth distance from the bottom in DOM
-scroller units — the previously observed `scrollHeight` against the
-current `scrollTop` and viewport height — not against the virtualizer's
-reported total list height. The virtualizer's total is an
-estimate-corrected model value whose divergence from the DOM
-`scrollHeight` grows with the number of not-yet-measured rows; on long
-conversations that divergence exceeds the pin threshold, and a
-model-based check misclassifies a genuinely pinned user as scrolled-up,
-silently disabling auto-follow.
+WHILE tail-follow intent belongs to the system
+WHEN the total list height changes for any reason, including streaming
+growth, delayed measurement, late layout, or viewport shrink
+THE SYSTEM SHALL preserve the tail by issuing exactly one Virtuoso
+scroll-to-last command
+AND SHALL keep unread-tail state clear
 
-WHEN a new render unit appears and the user is NOT pinned to the bottom
-(scrolled up)
-THE SYSTEM SHALL show the "jump-to-newest" button
-AND SHALL NOT auto-scroll the viewport
+WHEN upward wheel or viewport movement, a moved touch, or a conversation-
+navigation jump indicates that the user is reading earlier content
+THE SYSTEM SHALL transfer viewport ownership to the user immediately
+AND SHALL retain that ownership without any time-based expiry
 
-WHEN the total list height changes while a user scroll gesture is in
-progress — an active touch drag (finger down), or an upward scroll
-(wheel, scrollbar, keyboard, or touch momentum) within a short rolling
-suppression window
-THE SYSTEM SHALL NOT auto-scroll the viewport, even if the pre-change
-scroll position is within the pin threshold
-SO THAT measurement-driven height deltas (rows mounting and being
-measured during the user's own scroll-up, late image loads, syntax
-highlighters) cannot clobber the gesture and trap the user at the
-bottom — a departing user's first pin-threshold's worth of travel is
-otherwise re-snapped on every height delta.
-The suppression window is refreshed by each upward scroll event, so it
-only needs to outlive the gap between momentum scroll events; downward
-scrolls never suppress (the auto-follow snap itself scrolls downward,
-and a user scrolling down is heading to the bottom).
+WHEN tail content advances while viewport ownership belongs to the user
+THE SYSTEM SHALL show the jump-to-newest unread affordance
+AND SHALL NOT move the viewport
 
-THE SYSTEM SHALL NOT force-scroll the viewport for any message type.
-No "force" override exists for system messages, approval prompts, or
-any other unit kind: a user who has scrolled up retains their scroll
-position regardless of incoming content type, and the jump-to-newest
-button is the sole mechanism for returning to the tail on demand.
+WHEN unrelated layout height changes while viewport ownership belongs
+to the user
+THE SYSTEM SHALL neither move the viewport nor create unread state
 
-THE SYSTEM SHALL determine "pinned to bottom" using Virtuoso's
-`atBottomStateChange` callback with `atBottomThreshold` configured to
-match the prior 100-pixel threshold.
+WHEN an idle viewport is confirmed at the bottom
+THE SYSTEM SHALL restore tail-follow intent and clear unread state
 
-THE SYSTEM SHALL disable Virtuoso's built-in auto-scroll mechanisms
-(`followOutput={false}`) and rely solely on the `totalListHeightChanged`
-callback for auto-follow. Virtuoso's built-in `followOutput="auto"`
-enables a size-increase handler that misclassifies user scroll-up as
-content growth during streaming (its `notAtBottomBecause` priority
-order checks `scrollHeight` growth before scroll direction), yanking
-the user back to the bottom. The manual `totalListHeightChanged`
-callback uses the pre-growth scroll position to distinguish "user was
-near the bottom" from "user scrolled up," which is correct during
-streaming where Virtuoso's built-in handler is not.
+WHEN the user requests jump-to-newest
+THE SYSTEM SHALL enter a returning-to-tail mode and issue exactly one
+Virtuoso scroll-to-last command
+AND SHALL remain in returning-to-tail mode until bottom geometry is
+confirmed
 
-WHILE the user has not yet interacted with the conversation's scroller
-(no touch, wheel, or pointer input, and no conversation-nav jump)
-AND the bounded settling window following the conversation's first
-measurement (or first content after an empty mount) has not elapsed
-THE SYSTEM SHALL keep the viewport pinned to the bottom regardless of
-the measured distance from it — correcting on every total-list-height
-change, on every scroll movement that leaves the viewport off the
-bottom, and by periodic verification (stranding can be silent: the
-virtualizer's placement churn does not always end with a height delta
-or scroll event to react to).
-The enforcement is bounded by the settling window, not merely the
-periodic check: stranding is a mount-churn phenomenon, and scroll-only
-user inputs — keyboard scrolling on a focused row, browser
-find-in-page — emit no touch/wheel/pointer event to mark engagement,
-so enforcement past the window would fight them. After the window the
-distance-based pin logic applies, whose upward-scroll suppression
-covers scroll-only inputs.
-SO THAT a stranded initial placement self-heals: the virtualizer's
-initial bottom placement is computed against pre-measurement estimates,
-and a large estimate correction landing right after mount can leave the
-viewport far from the bottom (even at the top of the conversation).
-Distance-based pinning cannot recover from stranding — it classifies
-the stranded viewport as a scrolled-up user. The mount contract is
-"open pinned to the newest message"; only a user interaction releases
-the viewport from it. The pre-engagement correction is a direct DOM
-scroll assignment, not a virtualizer scroll-to-index: the index seek
-navigates to the model's estimated offset via a seek loop that
-measurement churn can abort, while a DOM assignment to the current
-bottom cannot be aborted and converges as the tail measures.
+WHEN a touch begins
+THE SYSTEM SHALL remember the pre-gesture follow mode
+AND a touch that ends without movement SHALL restore that mode
 
-WHEN the Virtuoso instance mounts with empty data and the first
-messages arrive later (fresh conversation, or cached metadata before
-messages load)
-THE SYSTEM SHALL explicitly scroll to the bottom on the first
-non-empty height measurement, because `initialTopMostItemIndex` only
-controls the mount position and does not re-apply when data arrives
-after mount.
+WHEN a touch moves
+THE SYSTEM SHALL transfer viewport ownership to the user even if no
+scroll event is emitted
+AND a bottom callback received during that moved touch SHALL NOT release
+user ownership
+AND touch end or cancellation SHALL preserve user ownership
 
-WHEN the viewport height decreases (browser resize, terminal/panel
-expansion, composer growth) and the user was pinned to the bottom
-before the shrink
-THE SYSTEM SHALL re-snap to the bottom using the previous (pre-shrink)
-viewport height for the pin-distance calculation, so a pinned user is
-not misclassified as scrolled-up by the smaller viewport.
+THE SYSTEM SHALL use Virtuoso's `atBottomStateChange` callback only as
+bottom geometry and explicit return-to-tail confirmation
+AND SHALL use `totalListHeightChanged` only as notification that layout
+height changed and a follow action may be required
+AND SHALL NOT infer viewport ownership from height growth or proximity
 
-**Rationale:** Force-scroll-on-system-message (the prior implementation
-of this requirement) was an over-broad trigger that yanked the viewport
-on routine system messages (mode transitions, cancellations) as well as
-actionable ones (approval prompts). It is a hostile UX pattern not used
-by comparable chat-style products. Pinned-vs-scrolled-up is the only
-state that drives auto-scroll; the jump-to-newest button is the only
-escape hatch. Disabling `followOutput` eliminates the double-auto-scroll
-where Virtuoso's built-in handler and the manual `totalListHeightChanged`
-callback both fire and fight each other during streaming.
+WHILE bounded mount rescue is active
+THE SYSTEM SHALL periodically verify bottom placement and may assign the
+DOM scroller's `scrollTop` to its current `scrollHeight`
+SO THAT silent virtualizer placement stranding converges to the newest
+content
+
+WHEN any user interaction occurs or the mount-rescue deadline elapses
+THE SYSTEM SHALL stop mount rescue synchronously for that mounted
+conversation
+AND SHALL NOT restart it until conversation identity changes
+AND normal live follow SHALL NOT write the DOM scroll position directly
+
+WHEN the Virtuoso instance is first measured empty and content later
+arrives
+THE SYSTEM SHALL issue one Virtuoso scroll-to-last command and begin
+bounded mount rescue
+
+WHEN conversation identity changes
+THE SYSTEM SHALL atomically reset follow intent, geometry baselines,
+gesture state, unread state, and mount-rescue eligibility
+
+THE SYSTEM SHALL NOT force-scroll the viewport for any message type
+AND SHALL NOT model momentum duration or native scroll physics
+AND each policy transition SHALL emit at most one visible scroll command
+AND SHALL NOT both show and clear unread state.
 
 ---
 
@@ -461,24 +414,20 @@ AND render each item via `itemContent={(_, unit) => renderUnit(unit, ...)}`
 AND key each item via `computeItemKey={(_, unit) => unit.key}`
 
 THE SYSTEM SHALL configure the Virtuoso instance with:
-- `followOutput={false}` — disable ALL of Virtuoso's built-in auto-scroll
-  mechanisms (both the totalCount-based followOutput and the size-increase
-  handler). Auto-follow is handled solely by the `totalListHeightChanged`
-  callback (per REQ-MLRU-014), whose pre-growth `oldFromBottom` logic
-  correctly distinguishes "user was near the bottom" from "user scrolled
-  up" — unlike Virtuoso's built-in size-increase handler, which
-  misclassifies user scroll-up as content growth during streaming.
+- `followOutput={false}` — disable Virtuoso's built-in auto-scroll so
+  only the policy in REQ-MLRU-014 decides whether height changes preserve
+  the tail; running two follow mechanisms simultaneously is forbidden.
 - `initialTopMostItemIndex={allUnits.length - 1}` (or `0` when empty) —
   bottom-pinned mount (replaces REQ-MLRU-005)
 - `alignToBottom` — when total content height is less than viewport
   height, items pin to the bottom of the viewport rather than the top
 - `atBottomThreshold={100}` — match the prior pin-detection threshold
-- `atBottomStateChange={isAtBottom => …}` — wired to the
-  jump-to-newest button visibility state (fires independently of
-  `followOutput`)
-- `totalListHeightChanged={handleTotalListHeightChanged}` — the sole
-  auto-scroll mechanism; re-snaps to the last item when the user's
-  pre-growth distance from the bottom is within the pin threshold
+- `atBottomStateChange={isAtBottom => …}` — reports bottom geometry and
+  confirms an explicit return to tail; it does not independently grant
+  permission to move the viewport
+- `totalListHeightChanged={handleTotalListHeightChanged}` — reports list
+  height changes to the policy; durable follow mode, rather than a
+  proximity calculation, decides whether to scroll
 - `increaseViewportBy={{ top: 600, bottom: 600 }}` — overscan distance
   matching the prior 600-pixel sentinel rootMargin
 - `key={conversationId}` on the React element — force a fresh Virtuoso
@@ -501,30 +450,7 @@ scroll position, height cache, or measurement state outside Virtuoso's
 own internal cache. Cross-conversation visits are first-render-fresh by
 design (REQ-CONV-013 stays deprecated).
 
-**Rationale:** The hand-rolled spacer + IntersectionObserver-sentinel
-+ scroll-compensation stack (PR #161, #162, #163 hotfixes) repeatedly
-introduced new scroll-jump regressions because each layer made
-assumptions the others had to compensate for. Virtuoso encapsulates
-the entire windowing + anchor-compensation contract behind a stable,
-library-tested API, replacing four Phoenix requirements (REQ-MLRU-005,
-006, 007, 008) with one declarative configuration.
-
----
-
-## Acceptance Criteria Mapping
-
-The acceptance criteria in `tasks/60410-p1-ready--migrate-messagelist-to-react-virtuoso.md`
-map to requirements above:
-
-| Task criterion | Requirement |
-|----------------|-------------|
-| `MessageList` builds deterministic `RenderUnit[]` | REQ-MLRU-001 |
-| Pending and sent user messages share one render-unit key | REQ-MLRU-001 |
-| Single `<Virtuoso>` instance renders units | REQ-MLRU-015 |
-| Tool-result-heavy tail regression test | REQ-MLRU-012 |
-| Switch into large conversation lands pinned to bottom | REQ-MLRU-015 |
-| No visible scroll jump as older units come into view | REQ-MLRU-015 (Virtuoso-owned) |
-| No visible scroll jump on pending → sent acknowledgement | REQ-MLRU-001 (single-key timeline) |
-| Streaming token updates don't re-render historical list | REQ-MLRU-010 |
-| System message arrives while scrolled up — no force-scroll | REQ-MLRU-014 |
-| System prompt, pending, sub-agent, tool inline, jump-to-newest, context menu preserved | REQ-MLRU-004, REQ-MLRU-002, REQ-MLRU-014, REQ-MLRU-015 |
+**Rationale:** A single virtualization owner avoids scroll-jump bugs
+caused by independent windowing, spacer, measurement, and compensation
+layers making incompatible geometry assumptions. Virtuoso encapsulates
+the windowing and anchor-compensation contract behind one library API.
