@@ -182,6 +182,19 @@ describe('scrollMachine', () => {
     expect(result.effects.map((e) => e.type)).not.toContain('showUnread');
   });
 
+  it('clears stale upward intent when returning to bottom before a tap-only touch', () => {
+    let result = reduce(initialScrollMachineState(), measured({ totalHeight: 500, snapshot: snap(500, 100, 400), nowMs: 1000 }));
+    result = reduce(result.state, { type: 'scroll', snapshot: snap(500, 80, 400), nowMs: 1050 });
+    result = reduce(result.state, { type: 'atBottomChanged', atBottom: true });
+    result = reduce(result.state, { type: 'touchStart', nowMs: 1100 });
+    result = reduce(result.state, { type: 'touchEnd', remainingTouches: 0, nowMs: 1110 });
+
+    result = reduce(result.state, measured({ totalHeight: 600, snapshot: snap(600, 100, 400), tailActivity: 'active', nowMs: 1150 }));
+
+    expect(result.effects).toContainEqual({ type: 'snapToLastIndex' });
+    expect(result.effects.map((e) => e.type)).not.toContain('showUnread');
+  });
+
   it('clears unread on at-bottom and jump-to-newest events', () => {
     let result = reduce(initialScrollMachineState(), { type: 'atBottomChanged', atBottom: true });
     expect(result.effects).toEqual([{ type: 'clearUnread' }]);

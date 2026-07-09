@@ -91,7 +91,12 @@ export function reduceScrollMachine(
         effects: [],
       };
     case 'atBottomChanged':
-      return { state, effects: event.atBottom ? [{ type: 'clearUnread' }] : [] };
+      return event.atBottom
+        ? {
+          state: { ...state, lastUpwardScrollAt: 0, lastTouchGestureAt: 0 },
+          effects: [{ type: 'clearUnread' }],
+        }
+        : { state, effects: [] };
     case 'pointerDown':
     case 'navJump':
       return { state: { ...state, hasUserEngaged: true }, effects: [] };
