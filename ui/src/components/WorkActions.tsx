@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { requestActivePrSelectorOpen } from './activePrSelectorIntent';
 import { api } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
@@ -116,19 +116,23 @@ export function WorkControlBar({
   const [openSelectorAfterRefresh, setOpenSelectorAfterRefresh] = useState(false);
   const [addressMessageId, setAddressMessageId] = useState<string | null>(null);
   const [addressSubmitted, setAddressSubmitted] = useState(false);
-  const isLoading = markingMerged || abandoning;
+  const addressRequestRef = useRef<{ conversationId: string; messageId: string } | null>(null);
+  const addressLocked = capturing || addressSubmitted;
+  const isLoading = markingMerged || abandoning || addressLocked;
   const { openDiffFullscreen } = useViewerSlotCommands();
 
   useEffect(() => {
     setCapturing(false);
     setAddressSubmitted(false);
     setAddressMessageId(null);
+    addressRequestRef.current = null;
   }, [conversationId]);
 
   useEffect(() => {
     if (addressSubmitted && phaseType !== 'idle') {
       setAddressSubmitted(false);
       setAddressMessageId(null);
+      addressRequestRef.current = null;
     }
   }, [addressSubmitted, phaseType]);
 
@@ -175,22 +179,33 @@ export function WorkControlBar({
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
   const coverageMarker = prStatus ? prFeedbackCoverageMarker(prStatus) : null;
 
-  const addressLocked = capturing || addressSubmitted;
   const handleAddressFeedback = async () => {
     if (addressLocked) return;
     const messageId = addressMessageId ?? generateUUID();
+    const request = { conversationId, messageId };
+    const isCurrentRequest = () =>
+      addressRequestRef.current?.conversationId === request.conversationId &&
+      addressRequestRef.current?.messageId === request.messageId;
     if (!addressMessageId) setAddressMessageId(messageId);
+    addressRequestRef.current = request;
     setCapturing(true);
     try {
       await api.addressPrFeedback(conversationId, messageId);
+      if (!isCurrentRequest()) return;
       setAddressSubmitted(true);
       prStatusHandle.refresh().catch((err) => {
-        console.warn('[WorkActions] failed to refresh PR status after addressing feedback', err);
+        if (isCurrentRequest()) {
+          console.warn('[WorkActions] failed to refresh PR status after addressing feedback', err);
+        }
       });
     } catch (err) {
-      showError?.(err instanceof Error ? err.message : 'Failed to address PR feedback');
+      if (isCurrentRequest()) {
+        showError?.(err instanceof Error ? err.message : 'Failed to address PR feedback');
+      }
     } finally {
-      setCapturing(false);
+      if (isCurrentRequest()) {
+        setCapturing(false);
+      }
     }
   };
 
