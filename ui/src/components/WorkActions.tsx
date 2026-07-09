@@ -120,6 +120,12 @@ export function WorkControlBar({
   const { openDiffFullscreen } = useViewerSlotCommands();
 
   useEffect(() => {
+    setCapturing(false);
+    setAddressSubmitted(false);
+    setAddressMessageId(null);
+  }, [conversationId]);
+
+  useEffect(() => {
     if (addressSubmitted && phaseType !== 'idle') {
       setAddressSubmitted(false);
       setAddressMessageId(null);
@@ -177,8 +183,10 @@ export function WorkControlBar({
     setCapturing(true);
     try {
       await api.addressPrFeedback(conversationId, messageId);
-      await prStatusHandle.refresh();
       setAddressSubmitted(true);
+      prStatusHandle.refresh().catch((err) => {
+        console.warn('[WorkActions] failed to refresh PR status after addressing feedback', err);
+      });
     } catch (err) {
       showError?.(err instanceof Error ? err.message : 'Failed to address PR feedback');
     } finally {
