@@ -19,9 +19,11 @@ final class ConversationListStore {
         var lastRefreshed: Date
     }
 
-    /// Bumped by reset(); a refresh started under an older generation
-    /// discards its response, so an in-flight fetch from the previous
-    /// server cannot repopulate a just-cleared cache.
+    /// Bumped by every local mutation (reset, upsert, remove); a refresh
+    /// started under an older generation discards its response. This keeps
+    /// an in-flight fetch from repopulating a cleared cache, resurrecting a
+    /// just-archived row, or dropping a just-created one — the discarded
+    /// refresh's data is strictly older than the mutation it would clobber.
     private var generation = 0
 
     init() {
@@ -58,6 +60,7 @@ final class ConversationListStore {
     /// Merge a single updated conversation (e.g. after creation or an SSE
     /// update in an open session) without waiting for a full refresh.
     func upsert(_ conversation: Conversation) {
+        generation += 1
         if let idx = conversations.firstIndex(where: { $0.id == conversation.id }) {
             conversations[idx] = conversation
         } else {
@@ -70,6 +73,7 @@ final class ConversationListStore {
     }
 
     func remove(id: String) {
+        generation += 1
         conversations.removeAll { $0.id == id }
         DiskStore.save(conversations, name: Self.cacheName)
     }
