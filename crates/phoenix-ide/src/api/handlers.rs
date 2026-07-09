@@ -2652,6 +2652,17 @@ fn snapshot_pending_for_stream(
     }
 }
 
+fn can_omit_db_messages_for_stream(
+    cursor_replay_served: bool,
+    query: &StreamConversationQuery,
+    last_sequence_id: i64,
+) -> bool {
+    cursor_replay_served
+        && query
+            .after_event_sequence
+            .is_some_and(|after_event_sequence| after_event_sequence >= last_sequence_id)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn stream_conversation(
     State(state): State<AppState>,
@@ -2712,7 +2723,9 @@ async fn stream_conversation(
         cursor_replay_served,
     ) = snapshot_pending_for_stream(&broadcast_tx, &query);
 
-    let messages = if cursor_replay_served {
+    let can_omit_db_messages =
+        can_omit_db_messages_for_stream(cursor_replay_served, &query, last_sequence_id);
+    let messages = if can_omit_db_messages {
         Vec::new()
     } else {
         state
@@ -2722,7 +2735,7 @@ async fn stream_conversation(
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?
     };
-    let highest_message_seq = if cursor_replay_served {
+    let highest_message_seq = if can_omit_db_messages {
         last_sequence_id
     } else {
         messages.iter().map(|m| m.sequence_id).max().unwrap_or(0)
@@ -2733,7 +2746,7 @@ async fn stream_conversation(
     );
     broadcast_tx.observe_seq(init_seq);
 
-    let context_window_size = if cursor_replay_served {
+    let context_window_size = if can_omit_db_messages {
         state
             .runtime
             .db()
@@ -6624,6 +6637,34 @@ pub(crate) mod hard_delete_cascade_tests {
             SseEvent::Token { text, .. } => assert_eq!(text, "token-b"),
             other => panic!("expected token replay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cursored_stream_omits_db_messages_only_when_cursor_covers_db_tail() {
+        assert!(can_omit_db_messages_for_stream(
+            true,
+            &StreamConversationQuery {
+                after_event_sequence: Some(10),
+                after_sequence: None,
+            },
+            10,
+        ));
+        assert!(!can_omit_db_messages_for_stream(
+            true,
+            &StreamConversationQuery {
+                after_event_sequence: Some(9),
+                after_sequence: None,
+            },
+            10,
+        ));
+        assert!(!can_omit_db_messages_for_stream(
+            false,
+            &StreamConversationQuery {
+                after_event_sequence: Some(10),
+                after_sequence: None,
+            },
+            10,
+        ));
     }
 
     #[tokio::test]

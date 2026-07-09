@@ -592,8 +592,11 @@ function ConversationPageContent() {
           try {
             const result = await api.getConversationBySlug(slug);
             if (!cancelled) {
+              const replacesDifferentConversation = atomRef.current.conversationId !== null
+                && atomRef.current.conversationId !== result.conversation.id;
               dispatch({
-                type: eventCursorRef.current > 0 ? 'merge_conversation_data' : 'set_initial_data',
+                type: eventCursorRef.current > 0 && !replacesDifferentConversation ? 'merge_conversation_data' : 'set_initial_data',
+                reset: replacesDifferentConversation,
                 conversationId: result.conversation.id,
                 conversation: result.conversation,
                 messages: result.messages,
@@ -654,8 +657,11 @@ function ConversationPageContent() {
       try {
         const result = await api.getConversationBySlug(slug);
         if (cancelled) return;
+        const replacesDifferentConversation = atomRef.current.conversationId !== null
+          && atomRef.current.conversationId !== result.conversation.id;
         dispatch({
-          type: eventCursorRef.current > 0 ? 'merge_conversation_data' : 'set_initial_data',
+          type: eventCursorRef.current > 0 && !replacesDifferentConversation ? 'merge_conversation_data' : 'set_initial_data',
+          reset: replacesDifferentConversation,
           conversationId: result.conversation.id,
           conversation: result.conversation,
           messages: result.messages,

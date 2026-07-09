@@ -1964,6 +1964,29 @@ describe('conversationReducer', () => {
       expect(next.phase).toEqual({ type: 'llm_requesting', attempt: 1 });
     });
 
+    it('merge_conversation_data preserves phase from stream init over stale REST metadata', () => {
+      const atom = dispatch(createInitialAtom(), {
+        type: 'sse_init',
+        payload: makeInitPayload({
+          phase: { type: 'llm_requesting', attempt: 1 },
+          lastAppliedEventSeq: 12,
+          pendingAnchorSequenceId: 12,
+        }),
+      });
+
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        eventCursorFloor: 12,
+      });
+
+      expect(next.phase).toEqual({ type: 'llm_requesting', attempt: 1 });
+    });
+
     it('merge_conversation_data preserves live-patched messages over stale REST rows', () => {
       const liveMessage = makeMessage(1, { display_data: { duration_ms: 123 } });
       const staleRestMessage = makeMessage(1);
@@ -1986,6 +2009,71 @@ describe('conversationReducer', () => {
       });
 
       expect(next.messages[0]).toEqual(liveMessage);
+    });
+
+    it('merge_conversation_data preserves live conversation metadata over older REST rows', () => {
+      const atomAfterLiveUpdate = dispatch(
+        {
+          ...createInitialAtom(),
+          conversationId: 'conv-1',
+          conversation: testConversation,
+          messages: [makeMessage(1)],
+          lastAppliedEventSeq: 6,
+        },
+        {
+          type: 'sse_conversation_update',
+          sequenceId: 7,
+          updates: { cwd: '/newer/live/cwd' },
+        },
+      );
+
+      const next = dispatch(atomAfterLiveUpdate, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: { ...testConversation, cwd: '/older/rest/cwd' },
+        messages: [makeMessage(1)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        eventCursorFloor: 6,
+      });
+
+      expect(next.conversation?.cwd).toBe('/newer/live/cwd');
+    });
+
+    it('set_initial_data can reset a stale cached conversation to the fetched slug owner', () => {
+      const replacementConversation: Conversation = {
+        ...testConversation,
+        id: 'conv-2',
+        slug: 'test-slug',
+      };
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        lastAppliedEventSeq: 10,
+        bufferedEventEnvelopes: { 11: { type: 'sse_agent_done', sequenceId: 11 } },
+        pendingMessagePatches: {
+          'msg-1': { lastAppliedPatchEventSeq: 9, patches: [] },
+        },
+      };
+
+      const next = dispatch(atom, {
+        type: 'set_initial_data',
+        conversationId: 'conv-2',
+        conversation: replacementConversation,
+        messages: [makeMessage(1, { conversation_id: 'conv-2' })],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        eventCursorFloor: 1,
+        reset: true,
+      });
+
+      expect(next.conversationId).toBe('conv-2');
+      expect(next.conversation).toEqual(replacementConversation);
+      expect(next.lastAppliedEventSeq).toBe(1);
+      expect(next.bufferedEventEnvelopes).toEqual({});
+      expect(next.pendingMessagePatches).toEqual({});
     });
 
     it('is a no-op if SSE data already present', () => {

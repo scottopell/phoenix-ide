@@ -71,6 +71,7 @@ export interface ConversationAtom {
   conversation: Conversation | null;
   phase: ConversationState;
   phaseLastAppliedEventSeq: number;
+  conversationLastAppliedEventSeq: number;
   messages: Message[];
   contextWindow: { used: number };
   systemPrompt: string | null;
@@ -334,6 +335,7 @@ export type SSEAction =
       contextWindow: { used: number };
       transcriptGeneration?: number;
       eventCursorFloor?: number;
+      reset?: boolean;
     }
   | {
       type: 'merge_conversation_data';
@@ -344,6 +346,7 @@ export type SSEAction =
       contextWindow: { used: number };
       transcriptGeneration?: number;
       eventCursorFloor?: number;
+      reset?: boolean;
     }
   | {
       type: 'set_system_prompt';
@@ -357,6 +360,7 @@ export function createInitialAtom(): ConversationAtom {
     conversation: null,
     phase: { type: 'idle' },
     phaseLastAppliedEventSeq: 0,
+    conversationLastAppliedEventSeq: 0,
     messages: [],
     contextWindow: { used: 0 },
     systemPrompt: null,
@@ -649,12 +653,17 @@ function applyWireActionBody(atom: ConversationAtom, action: SSEAction): Convers
     }
     case 'sse_conversation_update':
       if (!atom.conversation) return atom;
-      return { ...atom, conversation: { ...atom.conversation, ...action.updates } };
+      return {
+        ...atom,
+        conversation: { ...atom.conversation, ...action.updates },
+        conversationLastAppliedEventSeq: action.sequenceId,
+      };
     case 'sse_browser_session_state':
       if (!atom.conversation) return atom;
       return {
         ...atom,
         conversation: { ...atom.conversation, browser_session_active: action.active },
+        conversationLastAppliedEventSeq: action.sequenceId,
       };
     case 'sse_work_scope_update':
       return { ...atom, workScope: action.inventory };
@@ -1063,6 +1072,7 @@ export function conversationReducer(
         isFreshConnect ? p.pendingAnchorSequenceId : atom.lastAppliedEventSeq,
         snapshotMessageAnchor,
       );
+      const initPhaseAuthoritySeq = Math.max(phase1Floor, p.lastAppliedEventSeq);
       // streamingBuffer policy: fresh-connect always clears (atom had no
       // buffer to preserve). Reconnect preserves the existing buffer when
       // the snapshot phase is still llm_requesting AND the ring did not
@@ -1087,7 +1097,8 @@ export function conversationReducer(
         conversationId: p.conversation.id,
         conversation: p.conversation,
         phase: p.phase,
-        phaseLastAppliedEventSeq: 0,
+        phaseLastAppliedEventSeq: initPhaseAuthoritySeq,
+        conversationLastAppliedEventSeq: 0,
         contextWindow: p.contextWindow,
         lastAppliedEventSeq: phase1Floor,
         bufferedEventEnvelopes: {},
@@ -1249,7 +1260,7 @@ export function conversationReducer(
 
     case 'set_initial_data':
       // Don't overwrite if SSE has already provided authoritative data
-      if (atom.lastAppliedEventSeq > 0) return atom;
+      if (atom.lastAppliedEventSeq > 0 && !action.reset) return atom;
       return {
         ...atom,
         conversationId: action.conversationId,
@@ -1257,9 +1268,15 @@ export function conversationReducer(
         messages: action.messages,
         phase: action.phase,
         phaseLastAppliedEventSeq: 0,
+        conversationLastAppliedEventSeq: 0,
         contextWindow: action.contextWindow,
         transcriptGeneration: action.transcriptGeneration ?? action.conversation.transcript_generation ?? 1,
-        lastAppliedEventSeq: Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0),
+        lastAppliedEventSeq: action.reset
+          ? (action.eventCursorFloor ?? 0)
+          : Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0),
+        bufferedEventEnvelopes: {},
+        eventGap: null,
+        pendingMessagePatches: {},
       };
 
     case 'merge_conversation_data': {
@@ -1270,11 +1287,15 @@ export function conversationReducer(
           .map(([messageId]) => messageId),
       );
       const messages = mergeMessagesByIdentity(atom.messages, action.messages, livePatchedMessageIds);
-      const lastAppliedEventSeq = Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0);
+      const incomingFloor = action.eventCursorFloor ?? 0;
+      const lastAppliedEventSeq = Math.max(atom.lastAppliedEventSeq, incomingFloor);
+      const conversation = atom.conversationLastAppliedEventSeq > incomingFloor && atom.conversation
+        ? atom.conversation
+        : action.conversation;
       const merged: ConversationAtom = {
         ...atom,
         conversationId: action.conversationId,
-        conversation: action.conversation,
+        conversation,
         messages,
         phase: atom.phaseLastAppliedEventSeq > 0 ? atom.phase : action.phase,
         phaseLastAppliedEventSeq: atom.phaseLastAppliedEventSeq,
