@@ -331,7 +331,7 @@ export type SSEAction =
       messages: Message[];
       phase: ConversationState;
       contextWindow: { used: number };
-      transcriptGeneration: number;
+      transcriptGeneration?: number;
       eventCursorFloor?: number;
     }
   | {
@@ -341,7 +341,7 @@ export type SSEAction =
       messages: Message[];
       phase: ConversationState;
       contextWindow: { used: number };
-      transcriptGeneration: number;
+      transcriptGeneration?: number;
       eventCursorFloor?: number;
     }
   | {
@@ -1251,24 +1251,26 @@ export function conversationReducer(
         messages: action.messages,
         phase: action.phase,
         contextWindow: action.contextWindow,
-        transcriptGeneration: action.transcriptGeneration,
+        transcriptGeneration: action.transcriptGeneration ?? action.conversation.transcript_generation ?? 1,
         lastAppliedEventSeq: Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0),
       };
 
     case 'merge_conversation_data':
       if (atom.conversationId !== null && atom.conversationId !== action.conversationId) return atom;
       const messages = mergeMessagesByIdentity(atom.messages, action.messages);
-      return {
+      const lastAppliedEventSeq = Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0);
+      const merged: ConversationAtom = {
         ...atom,
         conversationId: action.conversationId,
         conversation: action.conversation,
         messages,
-        phase: action.phase,
+        phase: atom.lastAppliedEventSeq > 0 ? atom.phase : action.phase,
         contextWindow: action.contextWindow,
-        transcriptGeneration: action.transcriptGeneration,
-        lastAppliedEventSeq: Math.max(atom.lastAppliedEventSeq, action.eventCursorFloor ?? 0),
+        transcriptGeneration: action.transcriptGeneration ?? action.conversation.transcript_generation ?? atom.transcriptGeneration ?? 1,
+        lastAppliedEventSeq,
         ...deriveMessageSyncState(messages),
       };
+      return lastAppliedEventSeq > atom.lastAppliedEventSeq ? drainBufferedEventEnvelopes(merged) : merged;
 
     case 'set_system_prompt':
       if (action.expectedConversationId !== atom.conversationId) return atom;

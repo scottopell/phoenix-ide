@@ -1884,6 +1884,56 @@ describe('conversationReducer', () => {
       expect(next.messages.map((m) => m.sequence_id)).toEqual([1, 2]);
     });
 
+    it('merge_conversation_data drains buffered events when the cursor floor reaches them', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        phase: { type: 'idle' },
+        lastAppliedEventSeq: 1,
+        bufferedEventEnvelopes: {
+          3: { type: 'sse_agent_done', sequenceId: 3 },
+        },
+        eventGap: { expectedNextEventSeq: 2, firstBufferedEventSeq: 3 },
+      };
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(2)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        eventCursorFloor: 2,
+      });
+
+      expect(next.lastAppliedEventSeq).toBe(3);
+      expect(next.bufferedEventEnvelopes).toEqual({});
+      expect(next.eventGap).toBeNull();
+    });
+
+    it('merge_conversation_data preserves live phase after SSE has started', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(1)],
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastAppliedEventSeq: 10,
+      };
+      const next = dispatch(atom, {
+        type: 'merge_conversation_data',
+        conversationId: 'conv-1',
+        conversation: testConversation,
+        messages: [makeMessage(2)],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+        eventCursorFloor: 2,
+      });
+
+      expect(next.phase).toEqual({ type: 'llm_requesting', attempt: 1 });
+    });
+
     it('is a no-op if SSE data already present', () => {
       const atom: ConversationAtom = { ...createInitialAtom(), lastAppliedEventSeq: 5 };
 

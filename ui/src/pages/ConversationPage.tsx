@@ -593,7 +593,7 @@ function ConversationPageContent() {
             const result = await api.getConversationBySlug(slug);
             if (!cancelled) {
               dispatch({
-                type: 'set_initial_data',
+                type: atomRef.current.lastAppliedEventSeq > 0 ? 'merge_conversation_data' : 'set_initial_data',
                 conversationId: result.conversation.id,
                 conversation: result.conversation,
                 messages: result.messages,
@@ -655,7 +655,7 @@ function ConversationPageContent() {
         const result = await api.getConversationBySlug(slug);
         if (cancelled) return;
         dispatch({
-          type: 'set_initial_data',
+          type: atomRef.current.lastAppliedEventSeq > 0 ? 'merge_conversation_data' : 'set_initial_data',
           conversationId: result.conversation.id,
           conversation: result.conversation,
           messages: result.messages,
