@@ -1984,7 +1984,7 @@ pub(crate) fn create_branch_worktree_blocking(
             return Err(BranchWorktreeError::Conflict { slug });
         }
         Err(BranchConflict::ExternalCheckout { branch, location }) => {
-            return Err(BranchWorktreeError::Git(format!(
+            return Err(BranchWorktreeError::BadRequest(format!(
                 "Branch '{branch}' is already checked out in {location}. \
                  Git doesn't allow a branch to be checked out in two places at once. \
                  Switch to a different branch there first, or use Direct mode."
@@ -2001,7 +2001,9 @@ pub(crate) fn create_branch_worktree_blocking(
     )
     .map_err(|e| match e {
         GitOpError::Io(msg) | GitOpError::Git(msg) => BranchWorktreeError::Git(msg),
-        other @ GitOpError::BranchNotFound(_) => BranchWorktreeError::Git(other.to_string()),
+        GitOpError::BranchNotFound(branch) => BranchWorktreeError::BadRequest(format!(
+            "Branch '{branch}' not found locally or at origin"
+        )),
     })?;
 
     tracing::info!(

@@ -133,9 +133,6 @@ CREATE TABLE IF NOT EXISTS conversation_creation_jobs (
     CHECK (phase IN ('accepted', 'provisioning', 'ready', 'failed'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_creation_jobs_phase_updated
-    ON conversation_creation_jobs(phase, updated_at);
-
 CREATE TABLE IF NOT EXISTS conversation_creation_job_files (
     job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL,

@@ -7904,6 +7904,37 @@ mod tests {
         assert_eq!(second_job.protocol.generation, 2);
     }
 
+    #[tokio::test]
+    async fn migrated_creation_database_reopens_with_rerunnable_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "phoenix-db-reopen-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_file = dir.join("reopen.db");
+        let db_path = db_file.to_string_lossy().to_string();
+
+        let db = Database::open(&db_path).await.unwrap();
+        run_pending_migrations(db.pool()).await.unwrap();
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(columns.iter().any(|column| column == "status"));
+        assert!(!columns.iter().any(|column| column == "phase"));
+        drop(db);
+
+        let reopened = Database::open(&db_path)
+            .await
+            .expect("post-migration database must reopen");
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn restrict_db_permissions_sets_owner_only_and_skips_missing_sidecars() {

@@ -62,6 +62,10 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
     }
 }
 
+fn creation_resource_is_absent(path: &Path) -> bool {
+    !path.exists()
+}
+
 async fn reconcile_creation_cleanup(
     manager: &Arc<RuntimeManager>,
     cleanup: &crate::db::CreationCleanupJob,
@@ -73,6 +77,17 @@ async fn reconcile_creation_cleanup(
         let repo = reservation.repository_identity.clone();
         let resource = reservation.resource_identity.clone();
         let reservation_id = reservation.id.clone();
+        if creation_resource_is_absent(Path::new(&resource)) {
+            let outcome = manager
+                .db()
+                .release_creation_resource(cleanup, &reservation.id, chrono::Utc::now())
+                .await
+                .map_err(|error| error.to_string())?;
+            if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+                return Ok(());
+            }
+            continue;
+        }
         let cleanup_for_blocking = cleanup.clone();
         let db = manager.db().clone();
         tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -910,9 +925,8 @@ fn branch_worktree_error_to_kind(error: BranchWorktreeError) -> (String, ErrorKi
             format!("Branch already owned by conversation {slug}"),
             ErrorKind::InvalidRequest,
         ),
-        BranchWorktreeError::Git(message) | BranchWorktreeError::BadRequest(message) => {
-            (message, ErrorKind::InvalidRequest)
-        }
+        BranchWorktreeError::BadRequest(message) => (message, ErrorKind::InvalidRequest),
+        BranchWorktreeError::Git(message) => (message, ErrorKind::ServerError),
     }
 }
 
@@ -920,6 +934,41 @@ fn managed_worktree_error_to_kind(error: ManagedWorktreeError) -> (String, Error
     match error {
         ManagedWorktreeError::BadRequest(message) => (message, ErrorKind::InvalidRequest),
         ManagedWorktreeError::Git(message) => (message, ErrorKind::ServerError),
+    }
+}
+
+#[cfg(test)]
+mod missing_resource_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn missing_resource_is_reconciled_before_repository_locking() {
+        let missing = std::env::temp_dir().join(format!(
+            "phoenix-missing-creation-resource-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(creation_resource_is_absent(&missing));
+    }
+}
+
+#[cfg(test)]
+mod branch_error_classification_tests {
+    use super::*;
+
+    #[test]
+    fn infrastructure_git_failure_is_retryable() {
+        let (_, kind) = branch_worktree_error_to_kind(BranchWorktreeError::Git(
+            "temporary git failure".to_string(),
+        ));
+        assert_eq!(kind, ErrorKind::ServerError);
+    }
+
+    #[test]
+    fn user_actionable_branch_failure_is_permanent() {
+        let (_, kind) = branch_worktree_error_to_kind(BranchWorktreeError::BadRequest(
+            "branch not found".to_string(),
+        ));
+        assert_eq!(kind, ErrorKind::InvalidRequest);
     }
 }
 
