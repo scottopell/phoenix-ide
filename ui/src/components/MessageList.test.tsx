@@ -362,15 +362,19 @@ describe('MessageList', () => {
   it('sizes wide markdown tables from the non-scrolling chat boundary', () => {
     const chatViewRule = appCss.match(/#chat-view\.view\.active\s*{[^}]*}/s)?.[0];
     const tableFallbackRule = appCss.match(/\.markdown-table-scroll\s*{[^}]*}/s)?.[0];
-    const tableBreakoutRule = appCss.match(/@supports\s*\(width:\s*1cqw\)\s*{\s*@container\s*\(width\s*>\s*800px\)\s*{\s*(\.markdown-table-scroll\s*{[^}]*})/s)?.[1];
+    const tableBreakoutRule = appCss.match(/(\.message\.agent\s*>\s*\.message-content\s*>\s*\.agent-text-block\s*>\s*\.markdown-table-scroll)\s*{([^}]*)}/s);
+    const tableBreakoutTableRule = appCss.match(/\.message\.agent\s*>\s*\.message-content\s*>\s*\.agent-text-block\s*>\s*\.markdown-table-scroll\s*>\s*table\s*{([^}]*)}/s)?.[1];
     const virtuosoRule = appCss.match(/\.message-virtuoso\s*{[^}]*}/s)?.[0];
 
     expect(chatViewRule).toMatch(/container-type:\s*inline-size/);
     expect(tableFallbackRule).toMatch(/max-width:\s*100%/);
     expect(tableFallbackRule).toMatch(/overflow-x:\s*auto/);
-    expect(tableBreakoutRule).toMatch(/width:\s*max-content/);
-    expect(tableBreakoutRule).toMatch(/min-width:\s*100%/);
-    expect(tableBreakoutRule).toMatch(/max-width:\s*calc\(100cqw\s*-\s*16px\)/);
+    expect(tableBreakoutRule?.[1]).toBe('.message.agent > .message-content > .agent-text-block > .markdown-table-scroll');
+    expect(tableBreakoutRule?.[2]).toMatch(/width:\s*calc\(100cqw\s*-\s*16px\)/);
+    expect(tableBreakoutRule?.[2]).toMatch(/margin-inline:\s*calc\(\(100%\s*-\s*\(100cqw\s*-\s*16px\)\)\s*\/\s*2\)/);
+    expect(tableBreakoutRule?.[2]).not.toMatch(/transform|position|left:/);
+    expect(tableBreakoutTableRule).toMatch(/min-width:\s*min\(100%,\s*784px\)/);
+    expect(tableBreakoutTableRule).toMatch(/margin-inline:\s*auto/);
     expect(virtuosoRule).not.toMatch(/container-type/);
     expect(virtuosoRule).not.toMatch(/overflow-x/);
   });

@@ -976,13 +976,15 @@ body {
 
 @supports (width: 1cqw) {
   @container (width > 800px) {
-    .markdown-table-scroll {
-      position: relative;
-      left: 50%;
-      width: max-content;
-      min-width: 100%;
-      max-width: calc(100cqw - 16px);
-      transform: translateX(-50%);
+    .message.agent > .message-content > .agent-text-block > .markdown-table-scroll {
+      width: calc(100cqw - 16px);
+      max-width: none;
+      margin-inline: calc((100% - (100cqw - 16px)) / 2);
+    }
+
+    .message.agent > .message-content > .agent-text-block > .markdown-table-scroll > table {
+      min-width: min(100%, 784px);
+      margin-inline: auto;
     }
   }
 }
