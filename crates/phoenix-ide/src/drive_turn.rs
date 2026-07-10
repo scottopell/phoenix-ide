@@ -1,0 +1,325 @@
+//! One-shot production conversation runtime driver.
+
+use crate::runtime::RuntimeManager;
+use crate::state_machine::{ConvState, Event};
+use phoenix_core::domain::db_schema::{ConvMode, Message, MessageType};
+use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
+use phoenix_db::Database;
+use phoenix_llm::{LlmConfig, ModelRegistry};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use thiserror::Error;
+
+/// `SQLite` storage for one driven turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatabaseMode {
+    /// A one-connection database that disappears when the process exits.
+    Memory,
+    /// A unique file in the operating system temp directory, retained for inspection.
+    TemporaryFile,
+    /// A caller-owned database file retained after the process exits.
+    File(PathBuf),
+}
+
+/// Input for one production conversation turn.
+#[derive(Debug, Clone)]
+pub struct DriveTurnRequest {
+    pub cwd: PathBuf,
+    pub model: String,
+    pub prompt: String,
+    pub database: DatabaseMode,
+    pub timeout: Duration,
+}
+
+/// Stable boundary reached after the driven user message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StableOutcome {
+    Idle,
+    Error {
+        message: String,
+        error_kind: phoenix_core::domain::db_schema::ErrorKind,
+    },
+    AwaitingTaskApproval,
+    AwaitingUserResponse,
+    AwaitingCommissionReviewApproval,
+    ContextExhausted,
+    HandedOff,
+    Terminal,
+}
+
+/// Raw evidence produced by one driven turn.
+#[derive(Debug, Serialize)]
+pub struct DriveTurnResult {
+    pub conversation_id: String,
+    pub git_sha: String,
+    pub model: String,
+    pub database: DatabaseResult,
+    pub outcome: StableOutcome,
+    pub elapsed_ms: u128,
+    pub messages: Vec<Message>,
+}
+
+/// Database lifetime recorded in the output without inventing a path for memory mode.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DatabaseResult {
+    Memory,
+    File { path: PathBuf },
+}
+
+#[derive(Debug, Error)]
+pub enum DriveTurnError {
+    #[error("working directory is invalid: {0}")]
+    InvalidWorkingDirectory(String),
+    #[error("model '{requested}' is unavailable; available models: {available}")]
+    UnknownModel {
+        requested: String,
+        available: String,
+    },
+    #[error("database initialization failed: {0}")]
+    Database(String),
+    #[error("runtime initialization failed: {0}")]
+    Runtime(String),
+    #[error("turn timed out after {0:?}")]
+    Timeout(Duration),
+}
+
+impl DriveTurnRequest {
+    /// Validate path, prompt, model, and timeout before any external request runs.
+    fn validate(&self) -> Result<PathBuf, DriveTurnError> {
+        if self.prompt.trim().is_empty() {
+            return Err(DriveTurnError::Runtime("prompt must not be empty".into()));
+        }
+        if self.timeout.is_zero() {
+            return Err(DriveTurnError::Runtime(
+                "timeout must be greater than zero".into(),
+            ));
+        }
+        crate::conversation_cwd::validate_conversation_cwd(
+            self.cwd
+                .to_str()
+                .ok_or_else(|| DriveTurnError::InvalidWorkingDirectory("not UTF-8".into()))?,
+        )
+        .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
+        .map(PathBuf::from)
+        .map_err(|error| DriveTurnError::InvalidWorkingDirectory(error.to_string()))
+    }
+}
+
+/// Drive one user turn through the same runtime, provider adapters, and tool
+/// registry used by the Phoenix server.
+///
+/// # Errors
+///
+/// Returns an error if validation/bootstrap fails or the runtime does not reach
+/// a stable state within the requested timeout.
+pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurnError> {
+    let cwd = request.validate()?;
+    install_crypto_provider();
+
+    let started = std::time::Instant::now();
+    let (db, database_result) = open_database(&request.database).await?;
+
+    let runtime_env = Arc::new(PhoenixRuntimeEnvironment::detect());
+    let llm_config = LlmConfig::from_env(runtime_env);
+    let credential_helper = llm_config.credential_helper.clone();
+    let llm_registry = Arc::new(ModelRegistry::new_with_discovery(&llm_config).await);
+    if llm_registry.get(&request.model).is_none() {
+        return Err(DriveTurnError::UnknownModel {
+            requested: request.model,
+            available: llm_registry.available_models().join(", "),
+        });
+    }
+
+    let conversation_id = uuid::Uuid::new_v4().to_string();
+    db.create_conversation_with_project(
+        &conversation_id,
+        "drive-turn",
+        cwd.to_string_lossy().as_ref(),
+        true,
+        None,
+        Some(&request.model),
+        None,
+        &ConvMode::Direct,
+        None,
+        None,
+        None,
+        phoenix_core::llm_language::LlmLanguage::default(),
+    )
+    .await
+    .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+
+    let manager = Arc::new(RuntimeManager::new(
+        db.clone(),
+        llm_registry,
+        crate::platform::PlatformCapability::detect(),
+        Arc::new(crate::tools::mcp::McpClientManager::new()),
+        credential_helper,
+    ));
+    manager.start_sub_agent_handler().await;
+
+    let mut state_rx = manager
+        .subscribe_state(&conversation_id)
+        .await
+        .map_err(DriveTurnError::Runtime)?;
+    let message_id = uuid::Uuid::new_v4().to_string();
+    manager
+        .send_event(
+            &conversation_id,
+            Event::UserMessage {
+                text: request.prompt,
+                llm_text: None,
+                images: Vec::new(),
+                files: Vec::new(),
+                message_id,
+                user_agent: Some("drive-turn".into()),
+                skill_invocation: None,
+            },
+        )
+        .await
+        .map_err(DriveTurnError::Runtime)?;
+
+    let outcome = tokio::time::timeout(
+        request.timeout,
+        wait_for_stable_turn(&db, &conversation_id, &mut state_rx),
+    )
+    .await
+    .map_err(|_| DriveTurnError::Timeout(request.timeout))??;
+    let messages = db
+        .get_messages(&conversation_id)
+        .await
+        .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+
+    Ok(DriveTurnResult {
+        conversation_id,
+        git_sha: option_env!("PHOENIX_GIT_SHA")
+            .unwrap_or("unknown")
+            .to_string(),
+        model: request.model,
+        database: database_result,
+        outcome,
+        elapsed_ms: started.elapsed().as_millis(),
+        messages,
+    })
+}
+
+async fn open_database(mode: &DatabaseMode) -> Result<(Database, DatabaseResult), DriveTurnError> {
+    match mode {
+        DatabaseMode::Memory => Database::open_in_memory()
+            .await
+            .map(|db| (db, DatabaseResult::Memory))
+            .map_err(|error| DriveTurnError::Database(error.to_string())),
+        DatabaseMode::TemporaryFile => {
+            let path = std::env::temp_dir()
+                .join(format!("phoenix-drive-turn-{}.db", uuid::Uuid::new_v4()));
+            open_file_database(path).await
+        }
+        DatabaseMode::File(path) => open_file_database(path.clone()).await,
+    }
+}
+
+async fn open_file_database(path: PathBuf) -> Result<(Database, DatabaseResult), DriveTurnError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+    }
+    let db = Database::open(path.to_string_lossy().as_ref())
+        .await
+        .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+    phoenix_db::run_pending_migrations(db.pool())
+        .await
+        .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+    db.restrict_file_permissions();
+    Ok((db, DatabaseResult::File { path }))
+}
+
+async fn wait_for_stable_turn(
+    db: &Database,
+    conversation_id: &str,
+    state_rx: &mut tokio::sync::watch::Receiver<ConvState>,
+) -> Result<StableOutcome, DriveTurnError> {
+    loop {
+        let state = state_rx.borrow().clone();
+        if let Some(outcome) = stable_outcome(&state) {
+            let messages = db
+                .get_messages(conversation_id)
+                .await
+                .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+            let has_agent_output = messages
+                .iter()
+                .any(|message| message.message_type == MessageType::Agent);
+            if has_agent_output || !matches!(outcome, StableOutcome::Idle) {
+                return Ok(outcome);
+            }
+        }
+        state_rx
+            .changed()
+            .await
+            .map_err(|_| DriveTurnError::Runtime("runtime state channel closed".into()))?;
+    }
+}
+
+fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
+    match state {
+        ConvState::Idle => Some(StableOutcome::Idle),
+        ConvState::Error {
+            message,
+            error_kind,
+            ..
+        } => Some(StableOutcome::Error {
+            message: message.clone(),
+            error_kind: error_kind.clone(),
+        }),
+        ConvState::AwaitingTaskApproval { .. } => Some(StableOutcome::AwaitingTaskApproval),
+        ConvState::AwaitingUserResponse { .. } => Some(StableOutcome::AwaitingUserResponse),
+        ConvState::AwaitingCommissionReviewApproval { .. } => {
+            Some(StableOutcome::AwaitingCommissionReviewApproval)
+        }
+        ConvState::ContextExhausted { .. } => Some(StableOutcome::ContextExhausted),
+        ConvState::HandedOff { .. } => Some(StableOutcome::HandedOff),
+        ConvState::Terminal => Some(StableOutcome::Terminal),
+        ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Completed { .. }
+        | ConvState::Failed { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingContinuation { .. } => None,
+    }
+}
+
+fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_states_are_not_stable() {
+        assert_eq!(
+            stable_outcome(&ConvState::LlmRequesting { attempt: 1 }),
+            None
+        );
+    }
+
+    #[test]
+    fn error_state_preserves_typed_failure() {
+        let state = ConvState::Error {
+            message: "failed".into(),
+            error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+            resets_at: None,
+        };
+        assert!(matches!(
+            stable_outcome(&state),
+            Some(StableOutcome::Error { message, .. }) if message == "failed"
+        ));
+    }
+}

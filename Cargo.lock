@@ -2945,6 +2945,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-drive-turn"
+version = "0.1.0"
+dependencies = [
+ "phoenix_ide",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "phoenix-llm"
 version = "0.1.0"
 dependencies = [

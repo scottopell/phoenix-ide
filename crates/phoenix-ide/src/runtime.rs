@@ -2711,6 +2711,18 @@ impl RuntimeManager {
         })
     }
 
+    /// Subscribe to the authoritative in-memory state for one conversation.
+    ///
+    /// This is the non-HTTP completion boundary used by one-shot runtime drivers.
+    /// It starts the same production runtime as [`RuntimeManager::send_event`]
+    /// and observes the same state channel used by API routing decisions.
+    pub(crate) async fn subscribe_state(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<watch::Receiver<ConvState>, String> {
+        Ok(self.get_or_create(conversation_id).await?.state_rx)
+    }
+
     /// Return the authoritative `ConvState` for routing decisions.
     ///
     /// If a live runtime exists for `conv_id`, its in-memory executor state is

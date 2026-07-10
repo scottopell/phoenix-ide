@@ -1,0 +1,19 @@
+[package]
+name = "phoenix-drive-turn"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+publish = false
+description = "One-shot production Phoenix conversation runtime driver"
+
+[[bin]]
+name = "drive-turn"
+path = "src/main.rs"
+
+[dependencies]
+phoenix_ide = { path = "../phoenix-ide" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
