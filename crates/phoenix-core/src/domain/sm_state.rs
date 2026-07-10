@@ -750,6 +750,7 @@ mod tests {
                 | ConvState::Completed { .. }
                 | ConvState::Failed { .. }
                 | ConvState::CreationFailed { .. }
+                | ConvState::CreationCancelled { .. }
                 | ConvState::AwaitingRecovery { .. }
                 | ConvState::AwaitingContinuation { .. }
                 | ConvState::AwaitingTaskApproval { .. }
@@ -937,6 +938,9 @@ pub enum ConvState {
         job_id: String,
         phase: ConversationCreationPhase,
     },
+
+    /// Creation was cancelled; original intent remains available for restart.
+    CreationCancelled { job_id: String },
 
     /// Executing tools serially.
     /// The assistant message is held here (NOT yet persisted) — persistence is atomic
@@ -1504,7 +1508,8 @@ impl TryFrom<ConvState> for ParentState {
             ConvState::Completed { .. }
             | ConvState::Failed { .. }
             | ConvState::Provisioning { .. }
-            | ConvState::CreationFailed { .. } => Err(StateConversionError {
+            | ConvState::CreationFailed { .. }
+            | ConvState::CreationCancelled { .. } => Err(StateConversionError {
                 from_variant: cs.variant_name(),
                 target_type: "ParentState",
             }),
@@ -1593,6 +1598,7 @@ impl TryFrom<ConvState> for SubAgentState {
             // Parent-only states are invalid for sub-agent
             ConvState::Provisioning { .. }
             | ConvState::CreationFailed { .. }
+            | ConvState::CreationCancelled { .. }
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
@@ -1761,6 +1767,7 @@ impl ConvState {
                 | ConvState::ContextExhausted { .. }
                 | ConvState::HandedOff { .. }
                 | ConvState::CreationFailed { .. }
+                | ConvState::CreationCancelled { .. }
                 | ConvState::Terminal
         )
     }
@@ -1823,6 +1830,7 @@ impl ConvState {
             | Self::LlmRequesting { .. }
             | Self::SeededLlmRequesting { .. }
             | Self::Provisioning { .. }
+            | Self::CreationCancelled { .. }
             | Self::ToolExecuting { .. }
             | Self::CancellingTool { .. }
             | Self::AwaitingSubAgents { .. }
@@ -1852,6 +1860,7 @@ impl ConvState {
             ConvState::SeededLlmRequesting { .. } => "SeededLlmRequesting",
             ConvState::Provisioning { .. } => "Provisioning",
             ConvState::CreationFailed { .. } => "CreationFailed",
+            ConvState::CreationCancelled { .. } => "CreationCancelled",
             ConvState::ToolExecuting { .. } => "ToolExecuting",
             ConvState::CancellingTool { .. } => "CancellingTool",
             ConvState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
@@ -1891,7 +1900,9 @@ impl ConvState {
                     summary: summary.clone(),
                 })
             }
-            ConvState::Terminal | ConvState::HandedOff { .. } => {
+            ConvState::Terminal
+            | ConvState::HandedOff { .. }
+            | ConvState::CreationCancelled { .. } => {
                 StepResult::Terminal(TerminalOutcome::TaskResolved)
             }
             ConvState::Idle
@@ -1926,7 +1937,8 @@ impl ConvState {
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
             | ConvState::ContextExhausted { .. } => "needs_action",
-            ConvState::HandedOff { .. }
+            ConvState::CreationCancelled { .. }
+            | ConvState::HandedOff { .. }
             | ConvState::Terminal
             | ConvState::Completed { .. }
             | ConvState::Failed { .. } => "done",
@@ -1952,7 +1964,8 @@ impl ConvState {
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. } => DisplayState::AwaitingApproval,
-            ConvState::ContextExhausted { .. }
+            ConvState::CreationCancelled { .. }
+            | ConvState::ContextExhausted { .. }
             | ConvState::HandedOff { .. }
             | ConvState::Completed { .. }
             | ConvState::Failed { .. }

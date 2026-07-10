@@ -3203,6 +3203,20 @@ async fn cancel_conversation(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    if matches!(conversation.state, ConvState::Provisioning { .. }) {
+        state
+            .runtime
+            .db()
+            .cancel_conversation_creation(&id, chrono::Utc::now())
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        state.runtime.kick_creation_worker();
+        return Ok(Json(CancelResponse {
+            ok: true,
+            no_op: false,
+        }));
+    }
+
     if matches!(conversation.state, ConvState::Idle) || conversation.state.is_terminal() {
         tracing::debug!(
             conv_id = %id,
@@ -3905,6 +3919,22 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         .get_conversation(id)
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if matches!(
+        conv.state,
+        ConvState::Provisioning { .. }
+            | ConvState::CreationCancelled { .. }
+            | ConvState::CreationFailed { .. }
+    ) {
+        state
+            .runtime
+            .db()
+            .request_conversation_creation_deletion(id, chrono::Utc::now())
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        state.runtime.kick_creation_worker();
+        return Ok(());
+    }
 
     if conv.state.is_busy() {
         return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(

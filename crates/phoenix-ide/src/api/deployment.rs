@@ -631,6 +631,7 @@ fn managed_worktree_scope_owner(conv: &Conversation, conversations: &[Conversati
         ConvState::Completed { .. }
         | ConvState::Failed { .. }
         | ConvState::CreationFailed { .. }
+        | ConvState::CreationCancelled { .. }
         | ConvState::Terminal => false,
         ConvState::Idle
         | ConvState::Provisioning { .. }
@@ -683,6 +684,7 @@ fn managed_worktree_single_node_owner(conv: &Conversation) -> bool {
         ConvState::Completed { .. }
         | ConvState::Failed { .. }
         | ConvState::CreationFailed { .. }
+        | ConvState::CreationCancelled { .. }
         | ConvState::Terminal => false,
         ConvState::Idle
         | ConvState::Provisioning { .. }
@@ -718,6 +720,7 @@ fn conv_state_name(state: &phoenix_core::domain::sm_state::ConvState) -> &'stati
         phoenix_core::domain::sm_state::ConvState::Completed { .. } => "Completed",
         phoenix_core::domain::sm_state::ConvState::Failed { .. } => "Failed",
         phoenix_core::domain::sm_state::ConvState::CreationFailed { .. } => "CreationFailed",
+        phoenix_core::domain::sm_state::ConvState::CreationCancelled { .. } => "CreationCancelled",
         phoenix_core::domain::sm_state::ConvState::Error { .. } => "Error",
         phoenix_core::domain::sm_state::ConvState::AwaitingRecovery { .. } => "AwaitingRecovery",
         phoenix_core::domain::sm_state::ConvState::AwaitingContinuation { .. } => {

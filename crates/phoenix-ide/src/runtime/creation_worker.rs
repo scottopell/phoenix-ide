@@ -19,6 +19,14 @@ use std::sync::Arc;
 
 pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
     let worker_id = CreationWorkerId(format!("creation-worker-{}", uuid::Uuid::new_v4()));
+    while let Some(cleanup) = manager
+        .db()
+        .next_conversation_creation_cleanup()
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        reconcile_creation_cleanup(manager, &cleanup).await?;
+    }
     loop {
         let token = CreationClaimToken(uuid::Uuid::new_v4().to_string());
         let outcome = manager
@@ -38,6 +46,43 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
             tracing::error!(error = %error, "conversation creation job processing failed");
         }
     }
+}
+
+async fn reconcile_creation_cleanup(
+    manager: &Arc<RuntimeManager>,
+    cleanup: &crate::db::CreationCleanupJob,
+) -> Result<(), String> {
+    for reservation in &cleanup.reservations {
+        if reservation.status == "released" {
+            continue;
+        }
+        let repo = reservation.repository_identity.clone();
+        let resource = reservation.resource_identity.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let _lock = RepositoryMutationLock::acquire(&repo).map_err(|(message, _)| message)?;
+            let path = Path::new(&resource);
+            if path.exists() {
+                crate::git_ops::run_git(
+                    Path::new(&repo),
+                    &["worktree", "remove", "--force", &resource],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        manager
+            .db()
+            .release_creation_resource(&reservation.id)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    manager
+        .db()
+        .finish_conversation_creation_cleanup(cleanup, chrono::Utc::now())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 async fn process_claimed_job(

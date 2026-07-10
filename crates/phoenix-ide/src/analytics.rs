@@ -425,6 +425,9 @@ fn terminal_status(conv: &Conversation) -> Option<String> {
         crate::state_machine::ConvState::CreationFailed { .. } => {
             Some("creation_failed".to_string())
         }
+        crate::state_machine::ConvState::CreationCancelled { .. } => {
+            Some("creation_cancelled".to_string())
+        }
         crate::state_machine::ConvState::Error { .. } => Some("error".to_string()),
         crate::state_machine::ConvState::ContextExhausted { .. } => {
             Some("context_exhausted".to_string())

@@ -157,6 +157,14 @@ pub struct CreationResourceReservation {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreationCleanupJob {
+    pub job_id: String,
+    pub conversation_id: String,
+    pub status: String,
+    pub reservations: Vec<CreationResourceReservation>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConversationCreationMetadataUpdate {
     pub slug: Option<String>,
@@ -2309,6 +2317,207 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
         Ok(deadline.as_deref().map(parse_datetime))
+    }
+
+    /// Revoke provisioning authority and preserve a visible cancelled record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the transaction fails or no creation job exists.
+    pub async fn cancel_conversation_creation(
+        &self,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let now = now.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let job: Option<(String, i64)> = sqlx::query_as(
+            "SELECT id, generation FROM conversation_creation_jobs
+             WHERE conversation_id = ?1
+               AND status IN ('accepted', 'claimed', 'retry_scheduled')",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((job_id, generation)) = job else {
+            tx.rollback().await?;
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        };
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'cancelling', generation = generation + 1,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL,
+                 next_attempt_at = NULL, updated_at = ?1
+             WHERE id = ?2 AND generation = ?3",
+        )
+        .bind(&now)
+        .bind(&job_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        let state = serde_json::to_string(&ConvState::CreationCancelled {
+            job_id: job_id.clone(),
+        })
+        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        sqlx::query(
+            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
+             WHERE id = ?3",
+        )
+        .bind(state)
+        .bind(&now)
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET status = 'cleanup_required', updated_at = ?1
+             WHERE job_id = ?2 AND status IN ('reserved', 'present')",
+        )
+        .bind(now)
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Revoke provisioning authority and hide a deletion tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the transaction fails or no creation job exists.
+    pub async fn request_conversation_creation_deletion(
+        &self,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let now = now.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let job: Option<(String, i64)> = sqlx::query_as(
+            "SELECT id, generation FROM conversation_creation_jobs
+             WHERE conversation_id = ?1
+               AND status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelled', 'failed')",
+        )
+        .bind(conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((job_id, generation)) = job else {
+            tx.rollback().await?;
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        };
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'deletion_pending', generation = generation + 1,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL,
+                 next_attempt_at = NULL, error = NULL, failed_at = NULL,
+                 cancelled_at = NULL, deletion_requested_at = ?1, updated_at = ?1
+             WHERE id = ?2 AND generation = ?3",
+        )
+        .bind(&now)
+        .bind(&job_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE conversations SET archived = 1, updated_at = ?1 WHERE id = ?2")
+            .bind(&now)
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET status = 'cleanup_required', updated_at = ?1
+             WHERE job_id = ?2 AND status IN ('reserved', 'present')",
+        )
+        .bind(now)
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Load one creation tombstone that requires resource reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the read fails.
+    pub async fn next_conversation_creation_cleanup(&self) -> DbResult<Option<CreationCleanupJob>> {
+        let row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT id, conversation_id, status FROM conversation_creation_jobs
+             WHERE status IN ('cancelling', 'deletion_pending')
+             ORDER BY updated_at, id LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((job_id, conversation_id, status)) = row else {
+            return Ok(None);
+        };
+        let reservations = self.get_creation_resource_reservations(&job_id).await?;
+        Ok(Some(CreationCleanupJob {
+            job_id,
+            conversation_id,
+            status,
+            reservations,
+        }))
+    }
+
+    /// Mark one reserved resource released after reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails.
+    pub async fn release_creation_resource(&self, reservation_id: &str) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET status = 'released', updated_at = ?1
+             WHERE id = ?2 AND status = 'cleanup_required'",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(reservation_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Finish cancellation or physically remove a reconciled deletion tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if cleanup is incomplete or the transaction fails.
+    pub async fn finish_conversation_creation_cleanup(
+        &self,
+        cleanup: &CreationCleanupJob,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_creation_resource_reservations
+             WHERE job_id = ?1 AND status != 'released'",
+        )
+        .bind(&cleanup.job_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if remaining != 0 {
+            return Err(DbError::Serialization(
+                "creation cleanup still has unreconciled resources".to_string(),
+            ));
+        }
+        if cleanup.status == "cancelling" {
+            sqlx::query(
+                "UPDATE conversation_creation_jobs
+                 SET status = 'cancelled', cancelled_at = ?1, updated_at = ?1
+                 WHERE id = ?2 AND status = 'cancelling'",
+            )
+            .bind(now.to_rfc3339())
+            .bind(&cleanup.job_id)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM conversations WHERE id = ?1")
+                .bind(&cleanup.conversation_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Reserve an external creation resource under the current claim.
@@ -6990,6 +7199,87 @@ mod tests {
                 .status,
             CreationStatus::Ready
         ));
+    }
+
+    #[tokio::test]
+    async fn creation_cancel_and_delete_revoke_claim_before_cleanup() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-cancel", "conv-cancel").await;
+        let now = Utc::now();
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected authority");
+        };
+        db.reserve_conversation_creation_resource(
+            "reservation-cancel",
+            "job-cancel",
+            &claim,
+            "/repo",
+            "/repo/worktree",
+            now,
+        )
+        .await
+        .unwrap();
+
+        db.cancel_conversation_creation("conv-cancel", now)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.fail_conversation_creation_job("job-cancel", &claim, "late", now)
+                .await
+                .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        let cleanup = db
+            .next_conversation_creation_cleanup()
+            .await
+            .unwrap()
+            .expect("cancel cleanup");
+        assert_eq!(cleanup.status, "cancelling");
+        assert!(matches!(
+            db.get_conversation("conv-cancel").await.unwrap().state,
+            ConvState::CreationCancelled { .. }
+        ));
+        db.release_creation_resource("reservation-cancel")
+            .await
+            .unwrap();
+        db.finish_conversation_creation_cleanup(&cleanup, now)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.get_conversation_creation_job("job-cancel")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Cancelled
+        ));
+
+        db.request_conversation_creation_deletion("conv-cancel", now)
+            .await
+            .unwrap();
+        assert!(db.get_conversation("conv-cancel").await.unwrap().archived);
+        let deletion = db
+            .next_conversation_creation_cleanup()
+            .await
+            .unwrap()
+            .expect("deletion cleanup");
+        assert_eq!(deletion.status, "deletion_pending");
+        db.finish_conversation_creation_cleanup(&deletion, now)
+            .await
+            .unwrap();
+        assert!(db.get_conversation("conv-cancel").await.is_err());
     }
 
     #[tokio::test]

@@ -389,6 +389,7 @@ export type ConversationState =
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string; resume: RecoveryResumeTarget }
   | { type: 'provisioning'; prompt?: string | null }
   | { type: 'creation_failed'; message?: string | null; prompt?: string | null }
+  | { type: 'creation_cancelled'; prompt?: string | null }
   | { type: 'terminal' };
 
 /** Mirror of the backend `ConvState::allows_model_change`. */
@@ -407,6 +408,8 @@ export function isTerminalConversationState(state: ConversationState): boolean {
     case 'context_exhausted':
     case 'handed_off':
     case 'creation_failed':
+      return true;
+    case 'creation_cancelled':
       return true;
     case 'idle':
     case 'awaiting_llm':
@@ -438,6 +441,7 @@ function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'e
     case 'idle': return 'idle';
     case 'terminal': return 'terminal';
     case 'handed_off': return 'terminal';
+    case 'creation_cancelled': return 'terminal';
     case 'error': return 'error';
     case 'context_exhausted': return 'idle';
     case 'awaiting_task_approval': return 'awaiting-approval';

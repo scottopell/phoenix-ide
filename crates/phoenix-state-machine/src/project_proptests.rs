@@ -842,7 +842,8 @@ mod random_walk {
             | ConvState::Provisioning { .. }
             | ConvState::Completed { .. }
             | ConvState::Failed { .. }
-            | ConvState::CreationFailed { .. } => Event::UserCancel {
+            | ConvState::CreationFailed { .. }
+            | ConvState::CreationCancelled { .. } => Event::UserCancel {
                 reason: None,
                 cause: CancelCause::UserRequested,
             },

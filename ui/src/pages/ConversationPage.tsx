@@ -1316,7 +1316,10 @@ function ConversationPageContent() {
   const creationFailedPrompt = convStateForChildren.type === 'creation_failed'
     ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
     : null;
-  const creationFailedDraft = convStateForChildren.type === 'creation_failed'
+  const creationCancelledPrompt = convStateForChildren.type === 'creation_cancelled'
+    ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
+    : null;
+  const creationFailedDraft = convStateForChildren.type === 'creation_failed' || convStateForChildren.type === 'creation_cancelled'
     ? (localCreateIntent?.prompt ?? conversation?.creation_prompt ?? null)
     : null;
   const handleStartOverFromFailedCreation = useCallback(() => {
@@ -1333,7 +1336,7 @@ function ConversationPageContent() {
 
   useEffect(() => {
     if (convStateForChildren.type === 'provisioning') return;
-    if (convStateForChildren.type !== 'creation_failed') {
+    if (convStateForChildren.type !== 'creation_failed' && convStateForChildren.type !== 'creation_cancelled') {
       clearCreateIntent(conversationId);
     }
   }, [convStateForChildren.type, conversationId]);
@@ -1657,10 +1660,17 @@ function ConversationPageContent() {
           <button
             type="button"
             className="context-exhausted-copy"
-            disabled
-            title="Delete is available after provisioning finishes."
+            onClick={() => void handleCancel()}
           >
-            Delete
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="context-exhausted-copy"
+            disabled={deletingConversation}
+            onClick={() => void handleDeleteProvisioningConversation()}
+          >
+            {deletingConversation ? 'Deleting…' : 'Delete'}
           </button>
         </div>
       )}
@@ -1698,6 +1708,29 @@ function ConversationPageContent() {
             </div>
             {creationFailedPrompt && (
               <pre className="context-exhausted-content">{creationFailedPrompt}</pre>
+            )}
+          </div>
+        </div>
+      )}
+      {convStateForChildren.type === 'creation_cancelled' && (
+        <div className="context-exhausted-banner context-exhausted-banner--expanded">
+          <div className="context-exhausted-summary">
+            <div className="error-body-title">Conversation creation cancelled</div>
+            <div className="context-exhausted-actions">
+              <button type="button" className="context-exhausted-continue" onClick={handleStartOverFromFailedCreation}>
+                Start over
+              </button>
+              <button
+                type="button"
+                className="context-exhausted-copy"
+                disabled={deletingConversation}
+                onClick={() => void handleDeleteProvisioningConversation()}
+              >
+                {deletingConversation ? 'Deleting…' : 'Delete'}
+              </button>
+            </div>
+            {creationCancelledPrompt && (
+              <pre className="context-exhausted-content">{creationCancelledPrompt}</pre>
             )}
           </div>
         </div>

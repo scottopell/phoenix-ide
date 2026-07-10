@@ -269,7 +269,7 @@ describe('canCancelConversationState', () => {
     [{ type: 'terminal' }, false],
     [{ type: 'handed_off', successor_conv_id: 'next' }, false],
     [{ type: 'seeded_llm_requesting', seed_message_id: 'seed', attempt: 1 }, true],
-    [{ type: 'provisioning', prompt: 'hello' }, false],
+    [{ type: 'provisioning', prompt: 'hello' }, true],
     [{ type: 'creation_failed', message: 'boom', prompt: 'hello' }, false],
   ];
 

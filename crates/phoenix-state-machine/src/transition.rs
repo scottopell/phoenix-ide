@@ -444,6 +444,7 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         | ConvState::AwaitingContinuation { .. }
         | ConvState::Provisioning { .. }
         | ConvState::CreationFailed { .. }
+        | ConvState::CreationCancelled { .. }
         | ConvState::Completed { .. }
         | ConvState::Failed { .. } => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
@@ -3461,6 +3462,7 @@ fn current_attempt(state: &ConvState) -> u32 {
         | ConvState::AwaitingCommissionReviewApproval { .. }
         | ConvState::Provisioning { .. }
         | ConvState::CreationFailed { .. }
+        | ConvState::CreationCancelled { .. }
         | ConvState::ContextExhausted { .. }
         | ConvState::HandedOff { .. }
         | ConvState::Terminal => 1,
@@ -3852,6 +3854,7 @@ mod tests {
             | ConvState::Failed { .. }
             | ConvState::CreationFailed { .. }
             | ConvState::Error { .. }
+            | ConvState::CreationCancelled { .. }
             | ConvState::AwaitingRecovery { .. }
             | ConvState::AwaitingContinuation { .. }
             | ConvState::AwaitingTaskApproval { .. }
