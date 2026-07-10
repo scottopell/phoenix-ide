@@ -147,6 +147,16 @@ pub enum CreationCasOutcome {
     ClaimLost,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreationResourceReservation {
+    pub id: String,
+    pub job_id: String,
+    pub generation: u64,
+    pub repository_identity: String,
+    pub resource_identity: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ConversationCreationMetadataUpdate {
     pub slug: Option<String>,
@@ -2299,6 +2309,137 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
         Ok(deadline.as_deref().map(parse_datetime))
+    }
+
+    /// Reserve an external creation resource under the current claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when authority was lost or the insert fails.
+    pub async fn reserve_conversation_creation_resource(
+        &self,
+        reservation_id: &str,
+        job_id: &str,
+        claim: &CreationClaim,
+        repository_identity: &str,
+        resource_identity: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let authoritative: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM conversation_creation_jobs
+             WHERE id = ?1 AND status = 'claimed' AND generation = ?2
+               AND claim_worker_id = ?3 AND claim_token = ?4 AND lease_until > ?5",
+        )
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .bind(now.to_rfc3339())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if authoritative.is_none() {
+            tx.rollback().await?;
+            return Ok(CreationCasOutcome::ClaimLost);
+        }
+        sqlx::query(
+            "INSERT INTO conversation_creation_resource_reservations (
+                id, job_id, generation, repository_identity, resource_identity,
+                status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved', ?6, ?6)
+             ON CONFLICT(job_id, resource_identity) DO UPDATE SET
+                generation = excluded.generation,
+                repository_identity = excluded.repository_identity,
+                status = CASE
+                    WHEN conversation_creation_resource_reservations.status = 'present'
+                        THEN 'present'
+                    ELSE 'reserved'
+                END,
+                updated_at = excluded.updated_at",
+        )
+        .bind(reservation_id)
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(repository_identity)
+        .bind(resource_identity)
+        .bind(now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(CreationCasOutcome::Applied)
+    }
+
+    /// Mark a reservation present while its generation remains current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the guarded update fails.
+    pub async fn mark_creation_resource_present(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        resource_identity: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let result = sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET status = 'present', updated_at = ?1
+             WHERE job_id = ?2 AND generation = ?3 AND resource_identity = ?4
+               AND EXISTS (
+                   SELECT 1 FROM conversation_creation_jobs j
+                   WHERE j.id = ?2 AND j.status = 'claimed' AND j.generation = ?3
+                     AND j.claim_worker_id = ?5 AND j.claim_token = ?6
+                     AND j.lease_until > ?1
+               )",
+        )
+        .bind(now.to_rfc3339())
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(resource_identity)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
+    }
+
+    /// Load durable resource reservations for one creation job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the read fails or a generation is invalid.
+    pub async fn get_creation_resource_reservations(
+        &self,
+        job_id: &str,
+    ) -> DbResult<Vec<CreationResourceReservation>> {
+        let rows: Vec<(String, String, i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, job_id, generation, repository_identity, resource_identity, status
+             FROM conversation_creation_resource_reservations
+             WHERE job_id = ?1 ORDER BY id",
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(id, job_id, generation, repository_identity, resource_identity, status)| {
+                    Ok(CreationResourceReservation {
+                        id,
+                        job_id,
+                        generation: u64::try_from(generation).map_err(|_| {
+                            DbError::Serialization("negative reservation generation".to_string())
+                        })?,
+                        repository_identity,
+                        resource_identity,
+                        status,
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Renew a creation lease only while the supplied claim remains current.
@@ -6849,6 +6990,98 @@ mod tests {
                 .status,
             CreationStatus::Ready
         ));
+    }
+
+    #[tokio::test]
+    async fn creation_resource_reservation_is_fenced_by_generation() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-resource", "conv-resource").await;
+        let now = Utc::now();
+        let first = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(first_job) = first else {
+            panic!("expected first claim");
+        };
+        let CreationStatus::Claimed(first_claim) = first_job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        assert_eq!(
+            db.reserve_conversation_creation_resource(
+                "reservation-1",
+                "job-resource",
+                &first_claim,
+                "/repo",
+                "/repo/.phoenix/worktrees/conv-resource",
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let takeover = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now + chrono::Duration::seconds(11),
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(second_job) = takeover else {
+            panic!("expected takeover");
+        };
+        let CreationStatus::Claimed(second_claim) = second_job.protocol.status else {
+            panic!("expected replacement authority");
+        };
+        assert_eq!(
+            db.mark_creation_resource_present(
+                "job-resource",
+                &first_claim,
+                "/repo/.phoenix/worktrees/conv-resource",
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        assert_eq!(
+            db.reserve_conversation_creation_resource(
+                "reservation-2",
+                "job-resource",
+                &second_claim,
+                "/repo",
+                "/repo/.phoenix/worktrees/conv-resource",
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert_eq!(
+            db.mark_creation_resource_present(
+                "job-resource",
+                &second_claim,
+                "/repo/.phoenix/worktrees/conv-resource",
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let reservations = db
+            .get_creation_resource_reservations("job-resource")
+            .await
+            .unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].generation, second_claim.generation);
+        assert_eq!(reservations[0].status, "present");
     }
 
     #[tokio::test]

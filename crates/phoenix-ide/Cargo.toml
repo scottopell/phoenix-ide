@@ -120,6 +120,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 base64 = "0.22"
 sha2 = "0.11"
 rand = "0.10"
+fs2 = "0.4"
 # Process management
 # Process management and PTY
 nix = { version = "0.31", features = ["signal", "process", "term", "fs"] }

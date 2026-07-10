@@ -9,6 +9,7 @@ use crate::db::{
 };
 use crate::runtime::{ConversationMetadataUpdate, EvictionReason, RuntimeManager, SseEvent};
 use crate::state_machine::{ConvState, Event};
+use fs2::FileExt;
 use phoenix_core::domain::creation_protocol::{
     CreationClaimToken, CreationStatus, CreationWorkerId,
 };
@@ -213,6 +214,12 @@ async fn provision_conversation(
     job: &crate::db::ConversationCreationJob,
 ) -> Result<ProvisionOutcome, (String, ErrorKind)> {
     let intent = &job.intent;
+    let CreationStatus::Claimed(claim) = &job.protocol.status else {
+        return Err((
+            "creation provisioning lacks claim authority".to_string(),
+            ErrorKind::ServerError,
+        ));
+    };
     let valid_cwd = crate::conversation_cwd::validate_conversation_cwd(&intent.cwd)
         .map_err(|e| (e.to_string(), ErrorKind::InvalidRequest))?;
     let initial_cwd = valid_cwd.into_raw();
@@ -266,59 +273,54 @@ async fn provision_conversation(
             })?;
             validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
-            let info = if existing_path.exists() {
-                validate_existing_worktree(&existing_path)?;
-                let worktree_path = existing_path.to_string_lossy().to_string();
-                let default_branch = crate::git_ops::run_git(
-                    Path::new(&repo_root),
-                    &["symbolic-ref", "refs/remotes/origin/HEAD"],
-                )
-                .ok()
-                .and_then(|s| {
-                    s.trim()
-                        .strip_prefix("refs/remotes/origin/")
-                        .map(String::from)
-                })
-                .or_else(|| {
-                    crate::git_ops::run_git(
-                        Path::new(&repo_root),
-                        &["rev-parse", "--abbrev-ref", "HEAD"],
+            reserve_worktree(manager, job, claim, &repo_root, &existing_path).await?;
+            let db = manager.db().clone();
+            let conv_id = job.conversation_id.clone();
+            let repo_for_blocking = repo_root.clone();
+            let path_for_blocking = existing_path.clone();
+            let info = tokio::task::spawn_blocking(move || {
+                let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
+                if path_for_blocking.exists() {
+                    validate_existing_worktree(&path_for_blocking)?;
+                    let worktree_path = path_for_blocking.to_string_lossy().to_string();
+                    let default_branch = crate::git_ops::run_git(
+                        Path::new(&repo_for_blocking),
+                        &["symbolic-ref", "refs/remotes/origin/HEAD"],
                     )
                     .ok()
-                    .map(|s| s.trim().to_string())
-                })
-                .unwrap_or_else(|| branch_name.clone());
-                Ok(BranchWorktreeInfo {
-                    branch_name: branch_name.clone(),
-                    worktree_path,
-                    base_branch: default_branch,
-                })
-            } else {
-                let db = manager.db().clone();
-                let conv_id = job.conversation_id.clone();
-                tokio::task::spawn_blocking(move || {
-                    create_branch_worktree_blocking(&repo_root, &conv_id, &branch_name, &db)
-                })
-                .await
-                .map_err(|e| {
-                    (
-                        format!("spawn_blocking failed: {e}"),
-                        ErrorKind::ServerError,
-                    )
-                })?
-            };
-            let info = match info {
-                Ok(info) => info,
-                Err(BranchWorktreeError::Conflict { slug }) => {
-                    return Err((
-                        format!("Branch already owned by conversation {slug}"),
-                        ErrorKind::InvalidRequest,
-                    ))
+                    .and_then(|s| {
+                        s.trim()
+                            .strip_prefix("refs/remotes/origin/")
+                            .map(String::from)
+                    })
+                    .or_else(|| {
+                        crate::git_ops::run_git(
+                            Path::new(&repo_for_blocking),
+                            &["rev-parse", "--abbrev-ref", "HEAD"],
+                        )
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                    })
+                    .unwrap_or_else(|| branch_name.clone());
+                    Ok(BranchWorktreeInfo {
+                        branch_name,
+                        worktree_path,
+                        base_branch: default_branch,
+                    })
+                } else {
+                    create_branch_worktree_blocking(&repo_for_blocking, &conv_id, &branch_name, &db)
+                        .map_err(branch_worktree_error_to_kind)
                 }
-                Err(BranchWorktreeError::Git(msg) | BranchWorktreeError::BadRequest(msg)) => {
-                    return Err((msg, ErrorKind::InvalidRequest))
-                }
-            };
+            })
+            .await
+            .map_err(|e| {
+                (
+                    format!("spawn_blocking failed: {e}"),
+                    ErrorKind::ServerError,
+                )
+            })?;
+            let info = info?;
+            mark_worktree_present(manager, job, claim, &existing_path).await?;
             effective_cwd.clone_from(&info.worktree_path);
             desired_base_branch = Some(info.base_branch.clone());
             conv_mode = ConvMode::Branch {
@@ -364,37 +366,36 @@ async fn provision_conversation(
                 validate_user_ref(checkout_ref).map_err(app_error_to_kind)?;
             }
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
-            let worktree = if existing_path.exists() {
-                validate_existing_worktree(&existing_path)?;
-                Ok(existing_path.to_string_lossy().to_string())
-            } else {
-                let conv_id = job.conversation_id.clone();
-                let repo_for_blocking = repo_root.clone();
-                let base_branch_for_blocking = base_branch.clone();
-                let checkout_ref = intent.checkout_ref.clone();
-                tokio::task::spawn_blocking(move || {
+            reserve_worktree(manager, job, claim, &repo_root, &existing_path).await?;
+            let conv_id = job.conversation_id.clone();
+            let repo_for_blocking = repo_root.clone();
+            let path_for_blocking = existing_path.clone();
+            let base_branch_for_blocking = base_branch.clone();
+            let checkout_ref = intent.checkout_ref.clone();
+            let worktree = tokio::task::spawn_blocking(move || {
+                let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
+                if path_for_blocking.exists() {
+                    validate_existing_worktree(&path_for_blocking)?;
+                    Ok(path_for_blocking.to_string_lossy().to_string())
+                } else {
                     create_managed_explore_worktree_blocking(
                         &repo_for_blocking,
                         &conv_id,
                         &base_branch_for_blocking,
                         checkout_ref.as_deref(),
                     )
-                })
-                .await
-                .map_err(|e| {
-                    (
-                        format!("spawn_blocking failed: {e}"),
-                        ErrorKind::ServerError,
-                    )
-                })?
-            };
-            let worktree = match worktree {
-                Ok(path) => path,
-                Err(ManagedWorktreeError::BadRequest(msg)) => {
-                    return Err((msg, ErrorKind::InvalidRequest))
+                    .map_err(managed_worktree_error_to_kind)
                 }
-                Err(ManagedWorktreeError::Git(msg)) => return Err((msg, ErrorKind::ServerError)),
-            };
+            })
+            .await
+            .map_err(|e| {
+                (
+                    format!("spawn_blocking failed: {e}"),
+                    ErrorKind::ServerError,
+                )
+            })?;
+            let worktree = worktree?;
+            mark_worktree_present(manager, job, claim, &existing_path).await?;
             effective_cwd.clone_from(&worktree);
             desired_base_branch = Some(base_branch.clone());
             let tasks_dir_name = taskmd_core::discover::discover_or_default(Path::new(&worktree));
@@ -612,6 +613,159 @@ async fn provision_conversation(
         .await
         .map_err(|e| (e, ErrorKind::ServerError))?;
     Ok(ProvisionOutcome::InitialMessageSubmitted)
+}
+
+struct RepositoryMutationLock {
+    file: std::fs::File,
+}
+
+impl RepositoryMutationLock {
+    fn acquire(repo_root: &str) -> Result<Self, (String, ErrorKind)> {
+        let common_dir = crate::git_ops::run_git(
+            Path::new(repo_root),
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .map_err(|error| (error, ErrorKind::ServerError))?;
+        let lock_path = PathBuf::from(common_dir.trim()).join("phoenix-creation.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                (
+                    format!(
+                        "could not open repository creation lock {}: {error}",
+                        lock_path.display()
+                    ),
+                    ErrorKind::ServerError,
+                )
+            })?;
+        file.lock_exclusive().map_err(|error| {
+            (
+                format!("could not lock repository {}: {error}", lock_path.display()),
+                ErrorKind::ServerError,
+            )
+        })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for RepositoryMutationLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            tracing::warn!(error = %error, "failed to unlock repository creation lock");
+        }
+    }
+}
+
+async fn reserve_worktree(
+    manager: &Arc<RuntimeManager>,
+    job: &crate::db::ConversationCreationJob,
+    claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+    repo_root: &str,
+    worktree_path: &Path,
+) -> Result<(), (String, ErrorKind)> {
+    let outcome = manager
+        .db()
+        .reserve_conversation_creation_resource(
+            &format!("{}:worktree", job.id),
+            &job.id,
+            claim,
+            repo_root,
+            &worktree_path.to_string_lossy(),
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
+    if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+        return Err((
+            "creation claim was lost before reserving worktree".to_string(),
+            ErrorKind::Cancelled,
+        ));
+    }
+    Ok(())
+}
+
+async fn mark_worktree_present(
+    manager: &Arc<RuntimeManager>,
+    job: &crate::db::ConversationCreationJob,
+    claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+    worktree_path: &Path,
+) -> Result<(), (String, ErrorKind)> {
+    let outcome = manager
+        .db()
+        .mark_creation_resource_present(
+            &job.id,
+            claim,
+            &worktree_path.to_string_lossy(),
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
+    if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+        return Err((
+            "creation claim was lost after materializing worktree".to_string(),
+            ErrorKind::Cancelled,
+        ));
+    }
+    Ok(())
+}
+
+fn branch_worktree_error_to_kind(error: BranchWorktreeError) -> (String, ErrorKind) {
+    match error {
+        BranchWorktreeError::Conflict { slug } => (
+            format!("Branch already owned by conversation {slug}"),
+            ErrorKind::InvalidRequest,
+        ),
+        BranchWorktreeError::Git(message) | BranchWorktreeError::BadRequest(message) => {
+            (message, ErrorKind::InvalidRequest)
+        }
+    }
+}
+
+fn managed_worktree_error_to_kind(error: ManagedWorktreeError) -> (String, ErrorKind) {
+    match error {
+        ManagedWorktreeError::BadRequest(message) => (message, ErrorKind::InvalidRequest),
+        ManagedWorktreeError::Git(message) => (message, ErrorKind::ServerError),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod repository_lock_tests {
+    use super::RepositoryMutationLock;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn repository_mutation_lock_serializes_live_holders() {
+        let repo = tempfile::tempdir().unwrap();
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let repo_path = repo.path().to_string_lossy().to_string();
+        let first = RepositoryMutationLock::acquire(&repo_path).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _second = RepositoryMutationLock::acquire(&repo_path).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(first);
+        acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread.join().unwrap();
+    }
 }
 
 fn validate_existing_worktree(path: &Path) -> Result<(), (String, ErrorKind)> {

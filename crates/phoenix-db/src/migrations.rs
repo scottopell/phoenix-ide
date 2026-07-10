@@ -191,6 +191,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_conversation_creation_jobs",
         sql: MIGRATION_035,
     },
+<<<<<<< HEAD
     Migration {
         version: 36,
         name: "create_conversation_creation_job_files",
@@ -206,6 +207,14 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_fenced_creation_protocol",
         sql: MIGRATION_038,
     },
+||||||| parent of 8ac6c360 (feat: fence creation worktree mutations)
+=======
+    Migration {
+        version: 36,
+        name: "add_creation_resource_reservations",
+        sql: MIGRATION_036,
+    },
+>>>>>>> 8ac6c360 (feat: fence creation worktree mutations)
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -1155,6 +1164,25 @@ CREATE INDEX idx_creation_job_files_stored_path
     ON conversation_creation_job_files(stored_path);
 ";
 
+const MIGRATION_036: &str = r"
+CREATE TABLE conversation_creation_resource_reservations (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL,
+    repository_identity TEXT NOT NULL,
+    resource_identity TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(job_id, resource_identity),
+    CHECK (generation > 0),
+    CHECK (status IN ('reserved', 'present', 'cleanup_required', 'released', 'conflict'))
+);
+
+CREATE INDEX idx_creation_resource_reservations_job
+    ON conversation_creation_resource_reservations(job_id, status);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -2082,6 +2110,31 @@ mod tests {
             invalid.is_err(),
             "claimed row without authority must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_036_adds_creation_resource_reservations() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> =
+            sqlx::query("PRAGMA table_info(conversation_creation_resource_reservations)")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<String, _>("name"))
+                .collect();
+        for expected in [
+            "job_id",
+            "generation",
+            "repository_identity",
+            "resource_identity",
+            "status",
+        ] {
+            assert!(columns.iter().any(|column| column == expected));
+        }
     }
 
     /// Migration 003 (REQ-BED-030): adds a nullable `continued_in_conv_id`
