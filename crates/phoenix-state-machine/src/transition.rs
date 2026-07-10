@@ -472,6 +472,16 @@ pub fn transition(
     context: &ConvContext,
     event: Event,
 ) -> Result<TransitionResult, TransitionError> {
+    if matches!(event, Event::CreationRequestResume) {
+        if !matches!(state, ConvState::LlmRequesting { .. }) || context.is_sub_agent {
+            return Err(TransitionError::InvalidTransition {
+                state: state.variant_name(),
+                event: "CreationRequestResume",
+            });
+        }
+        return Ok(TransitionResult::new(state.clone()).with_effect(Effect::RequestLlm));
+    }
+
     if let Event::CreationProvisioned { initial_message } = event {
         if !matches!(state, ConvState::Provisioning { .. }) || context.is_sub_agent {
             return Err(TransitionError::InvalidTransition {
@@ -4182,6 +4192,37 @@ mod tests {
             .map(|effect| format!("{effect:?}"))
             .collect();
         assert_eq!(provisioning_effects, idle_effects);
+    }
+
+    #[test]
+    fn creation_request_resume_dispatches_persisted_initial_request() {
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            Event::CreationRequestResume,
+        )
+        .expect("creation request resumes");
+        assert_eq!(result.new_state, ConvState::LlmRequesting { attempt: 1 });
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn creation_request_resume_is_rejected_outside_llm_requesting() {
+        let result = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::CreationRequestResume,
+        );
+        assert!(matches!(
+            result,
+            Err(TransitionError::InvalidTransition {
+                event: "CreationRequestResume",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -833,7 +833,9 @@ async fn inject_creation_job_state_fields(
 ) {
     if !matches!(
         conv.state,
-        ConvState::Provisioning { .. } | ConvState::CreationFailed { .. }
+        ConvState::Provisioning { .. }
+            | ConvState::CreationFailed { .. }
+            | ConvState::CreationCancelled { .. }
     ) {
         return;
     }
@@ -2736,7 +2738,9 @@ async fn stream_conversation(
     let mut init_conversation = enrich_conversation_with_seed(&state, &conversation, true).await?;
     if matches!(
         conversation.state,
-        ConvState::Provisioning { .. } | ConvState::CreationFailed { .. }
+        ConvState::Provisioning { .. }
+            | ConvState::CreationFailed { .. }
+            | ConvState::CreationCancelled { .. }
     ) {
         if let Ok(Some(job)) = state
             .runtime
@@ -3799,6 +3803,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
         delete_conversation_attachments(id).await;
+        broadcast_conversation_hard_deleted(state, id).await;
         state.runtime.kick_creation_worker();
         return Ok(());
     }
@@ -3849,11 +3854,12 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
 
     delete_conversation_attachments(id).await;
 
-    // Step 6: broadcast. The conversation broadcaster is per-conv today;
-    // task 02697 will route this to a sidebar-scoped channel on the UI
-    // side. Until then, broadcasting on the per-conv channel reaches any
-    // client currently subscribed to this conversation (so its tab can
-    // close gracefully).
+    broadcast_conversation_hard_deleted(state, id).await;
+
+    Ok(())
+}
+
+async fn broadcast_conversation_hard_deleted(state: &AppState, id: &str) {
     if let Some(handle) = state.runtime.try_get_handle(id).await {
         let conv_id = id.to_string();
         let _ = handle
@@ -3863,11 +3869,6 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
                 conversation_id: conv_id,
             });
     }
-
-    // Also reach SSE clients on any evicted-but-not-yet-replaced broadcaster.
-    // This covers the window between evict_runtime (model upgrade) and the next
-    // get_or_create: during that window try_get_handle returns None but clients
-    // are still subscribed to the stashed broadcaster.
     if let Some(tx) = state.runtime.take_evicted_broadcaster(id).await {
         let conv_id = id.to_string();
         let _ = tx.send_seq(|seq| SseEvent::ConversationHardDeleted {
@@ -3875,8 +3876,6 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
             conversation_id: conv_id,
         });
     }
-
-    Ok(())
 }
 
 /// Best-effort report from [`cascade_projects_on_delete`]. The orchestrator

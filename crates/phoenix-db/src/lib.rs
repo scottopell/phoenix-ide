@@ -2988,9 +2988,10 @@ impl Database {
         if result.rows_affected() == 1 {
             sqlx::query(
                 "UPDATE conversation_creation_resource_reservations
-                 SET status = 'cleanup_required', updated_at = ?1
-                 WHERE job_id = ?2 AND status IN ('reserved', 'present')",
+                 SET status = 'cleanup_required', generation = ?1, updated_at = ?2
+                 WHERE job_id = ?3 AND status IN ('reserved', 'present')",
             )
+            .bind(claim_generation_i64(claim)?)
             .bind(&now)
             .bind(job_id)
             .execute(&mut *tx)
@@ -4975,7 +4976,15 @@ impl Database {
         //   - terminal: task lifecycle ended (complete/abandon) — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')",
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')
+               AND NOT (
+                   json_extract(state, '$.type') = 'llm_requesting'
+                   AND EXISTS (
+                       SELECT 1 FROM conversation_creation_jobs j
+                       WHERE j.conversation_id = conversations.id
+                         AND j.status IN ('accepted', 'claimed', 'retry_scheduled')
+                   )
+               )",
         )
         .bind(&idle_state)
         .bind(now.to_rfc3339())
@@ -7541,10 +7550,27 @@ mod tests {
         )
         .await
         .unwrap();
+        let takeover_at = now + chrono::Duration::seconds(31);
+        let replacement = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                takeover_at,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(replacement_job) = replacement else {
+            panic!("expected replacement claim");
+        };
+        let CreationStatus::Claimed(replacement_claim) = replacement_job.protocol.status else {
+            panic!("expected replacement authority");
+        };
+        assert!(replacement_claim.generation > claim.generation);
         assert_eq!(
             db.fail_conversation_creation_job(
                 "job-failed-cleanup",
-                &claim,
+                &replacement_claim,
                 "permanent failure",
                 &ErrorKind::InvalidRequest,
                 now,
@@ -7564,6 +7590,13 @@ mod tests {
                 error_kind: ErrorKind::InvalidRequest,
             } if job_id == "job-failed-cleanup" && error == "permanent failure"
         ));
+        let reservation = db
+            .get_creation_resource_reservations("job-failed-cleanup")
+            .await
+            .unwrap()
+            .pop()
+            .expect("reservation");
+        assert_eq!(reservation.generation, replacement_claim.generation);
         let cleanup = claim_test_cleanup(&db).await;
         assert_eq!(cleanup.status, "failed");
         assert_eq!(
@@ -8933,6 +8966,23 @@ mod tests {
             pre_allocated_seq + 1,
             "DB-MAX+1 allocation must observe seqs planted by add_message_with_seq"
         );
+    }
+
+    #[tokio::test]
+    async fn reset_preserves_llm_requesting_for_unfinished_creation() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-bootstrap", "conv-bootstrap").await;
+        let requesting = ConvState::LlmRequesting { attempt: 1 };
+        db.update_conversation_state("conv-bootstrap", &requesting)
+            .await
+            .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        assert!(matches!(
+            db.get_conversation("conv-bootstrap").await.unwrap().state,
+            ConvState::LlmRequesting { .. }
+        ));
     }
 
     #[tokio::test]

@@ -2762,6 +2762,26 @@ impl RuntimeManager {
 
         let row_state_updated_at = conv.state_updated_at;
 
+        if matches!(conv.state, ConvState::LlmRequesting { .. })
+            && self
+                .db
+                .get_conversation_creation_job_for_conversation(conversation_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_some_and(|job| {
+                    matches!(
+                        job.protocol.status,
+                        phoenix_core::domain::creation_protocol::CreationStatus::Accepted
+                            | phoenix_core::domain::creation_protocol::CreationStatus::Claimed(_)
+                            | phoenix_core::domain::creation_protocol::CreationStatus::RetryScheduled {
+                                ..
+                            }
+                    )
+                })
+        {
+            return Ok((conv.state, row_state_updated_at, false));
+        }
+
         match &conv.state {
             ConvState::Provisioning { .. }
             | ConvState::CreationFailed { .. }

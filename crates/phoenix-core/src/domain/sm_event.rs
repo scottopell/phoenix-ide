@@ -49,6 +49,8 @@ pub enum Event {
     CreationProvisioned {
         initial_message: SteerEntry,
     },
+    /// Internal crash-recovery event for an initial request persisted before dispatch.
+    CreationRequestResume,
     UserCancel {
         /// Why the cancel was issued. `None` means user-initiated or parent-propagated.
         reason: Option<String>,
@@ -244,6 +246,7 @@ impl Event {
         match self {
             Event::UserMessage { .. } => "UserMessage",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
+            Event::CreationRequestResume => "CreationRequestResume",
             Event::UserCancel { .. } => "UserCancel",
             Event::LlmResponse { .. } => "LlmResponse",
             Event::LlmError { .. } => "LlmError",
@@ -460,6 +463,10 @@ impl TryFrom<Event> for ParentEvent {
                 event_variant: "CreationProvisioned",
                 target_type: "ParentEvent",
             }),
+            Event::CreationRequestResume => Err(EventConversionError {
+                event_variant: "CreationRequestResume",
+                target_type: "ParentEvent",
+            }),
             Event::UserCancel { reason, cause } => {
                 Ok(ParentEvent::Core(CoreEvent::UserCancel { reason, cause }))
             }
@@ -611,6 +618,10 @@ impl TryFrom<Event> for SubAgentEvent {
             })),
             Event::CreationProvisioned { .. } => Err(EventConversionError {
                 event_variant: "CreationProvisioned",
+                target_type: "SubAgentEvent",
+            }),
+            Event::CreationRequestResume => Err(EventConversionError {
+                event_variant: "CreationRequestResume",
                 target_type: "SubAgentEvent",
             }),
             Event::UserCancel { reason, cause } => {

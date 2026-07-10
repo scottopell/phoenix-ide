@@ -2930,16 +2930,6 @@ where
                 self.state_updated_at,
             )
             .await?;
-        if !matches!(self.state, ConvState::Provisioning { .. }) {
-            if let Err(e) = self
-                .storage
-                .mark_creation_job_complete_for_conversation(&self.context.conversation_id)
-                .await
-            {
-                tracing::warn!(conv_id = %self.context.conversation_id, error = %e, "failed to mark creation job complete after state persistence");
-            }
-        }
-
         if broadcast {
             let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
                 sequence_id: seq,
@@ -3798,7 +3788,17 @@ where
 
             Effect::PersistState => self.persist_state_effect(true).await,
 
-            Effect::RequestLlm => self.dispatch_llm_request().await,
+            Effect::RequestLlm => {
+                let generated_event = self.dispatch_llm_request().await?;
+                if let Err(error) = self
+                    .storage
+                    .mark_creation_job_complete_for_conversation(&self.context.conversation_id)
+                    .await
+                {
+                    tracing::warn!(conv_id = %self.context.conversation_id, %error, "failed to mark creation job complete after LLM dispatch");
+                }
+                Ok(generated_event)
+            }
 
             Effect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,
 

@@ -186,6 +186,16 @@ async fn process_job(
             }
             return Ok(());
         }
+        if matches!(conversation.state, ConvState::LlmRequesting { .. }) {
+            tracing::info!(job_id = %job.id, message_id = ?job.message_id, "resuming creation LLM request before completing job");
+            let handle = manager.get_or_create(&conv_id).await?;
+            handle
+                .event_tx
+                .send(Event::CreationRequestResume)
+                .await
+                .map_err(|error| format!("failed to resume creation request: {error}"))?;
+            return Ok(());
+        }
         tracing::info!(job_id = %job.id, message_id = ?job.message_id, "replaying creation bootstrap after message persisted without state advancement");
     }
 
@@ -269,7 +279,10 @@ async fn process_job(
 }
 
 fn creation_state_allows_existing_message_completion(state: &ConvState) -> bool {
-    !matches!(state, ConvState::Provisioning { .. })
+    !matches!(
+        state,
+        ConvState::Provisioning { .. } | ConvState::LlmRequesting { .. }
+    )
 }
 
 enum ProvisionOutcome {
@@ -920,6 +933,12 @@ mod existing_message_recovery_tests {
             job_id: "job".to_string(),
             phase: phoenix_core::domain::db_schema::ConversationCreationPhase::Provisioning,
         };
+        assert!(!creation_state_allows_existing_message_completion(&state));
+    }
+
+    #[test]
+    fn persisted_message_does_not_complete_job_before_llm_dispatch() {
+        let state = ConvState::LlmRequesting { attempt: 1 };
         assert!(!creation_state_allows_existing_message_completion(&state));
     }
 
