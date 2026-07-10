@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useState, type RefCallback } from 'react';
+import { useLayoutEffect } from 'react';
 
 export function isViewportOwnedRoute(pathname: string, desktop: boolean): boolean {
   return (desktop && /^\/$/.test(pathname))
@@ -18,29 +18,31 @@ export function useDocumentViewportOwnership(ownsViewport: boolean): void {
   }, [ownsViewport]);
 }
 
-function findScrollOwner(target: Element | null, boundary: HTMLElement): HTMLElement | null {
-  let element = target;
-  while (element && boundary.contains(element)) {
-    if (element instanceof HTMLElement) {
-      const overflowY = getComputedStyle(element).overflowY;
-      const isScrollable = element.scrollHeight > element.clientHeight
-        && (overflowY === 'auto' || overflowY === 'scroll');
-      if (element.matches('[data-app-scroll-owner], textarea') || isScrollable) return element;
-    }
-    if (element === boundary) break;
-    element = element.parentElement;
-  }
-  return null;
+function canScrollInDirection(element: HTMLElement, deltaY: number): boolean {
+  const maxScrollTop = element.scrollHeight - element.clientHeight;
+  if (maxScrollTop <= 0) return false;
+
+  const overflowY = getComputedStyle(element).overflowY;
+  const isScrollOwner = element.matches('[data-app-scroll-owner], textarea')
+    || overflowY === 'auto'
+    || overflowY === 'scroll';
+  if (!isScrollOwner) return false;
+
+  return deltaY > 0 ? element.scrollTop > 0 : element.scrollTop < maxScrollTop - 1;
 }
 
-export function useAppTouchContainment<T extends HTMLElement>(
-  ownsViewport: boolean,
-): RefCallback<T> {
-  const [owner, setOwner] = useState<T | null>(null);
-  const ownerRef = useCallback((element: T | null) => setOwner(element), []);
+function hasScrollableAncestor(target: Element | null, deltaY: number): boolean {
+  let element = target;
+  while (element) {
+    if (element instanceof HTMLElement && canScrollInDirection(element, deltaY)) return true;
+    element = element.parentElement;
+  }
+  return false;
+}
 
+export function useAppTouchContainment(ownsViewport: boolean): void {
   useLayoutEffect(() => {
-    if (!ownsViewport || !owner) return;
+    if (!ownsViewport) return;
 
     let lastX = 0;
     let lastY = 0;
@@ -62,25 +64,14 @@ export function useAppTouchContainment<T extends HTMLElement>(
       if (Math.abs(deltaY) <= Math.abs(deltaX)) return;
 
       const target = event.target instanceof Element ? event.target : null;
-      const scrollOwner = findScrollOwner(target, owner);
-      if (!scrollOwner) {
-        event.preventDefault();
-        return;
-      }
-
-      const maxScrollTop = scrollOwner.scrollHeight - scrollOwner.clientHeight;
-      const pullingPastTop = deltaY > 0 && scrollOwner.scrollTop <= 0;
-      const pushingPastBottom = deltaY < 0 && scrollOwner.scrollTop >= maxScrollTop - 1;
-      if (pullingPastTop || pushingPastBottom) event.preventDefault();
+      if (!hasScrollableAncestor(target, deltaY)) event.preventDefault();
     };
 
-    owner.addEventListener('touchstart', onTouchStart, { passive: true });
-    owner.addEventListener('touchmove', onTouchMove, { passive: false });
+    document.addEventListener('touchstart', onTouchStart, { passive: true });
+    document.addEventListener('touchmove', onTouchMove, { passive: false });
     return () => {
-      owner.removeEventListener('touchstart', onTouchStart);
-      owner.removeEventListener('touchmove', onTouchMove);
+      document.removeEventListener('touchstart', onTouchStart);
+      document.removeEventListener('touchmove', onTouchMove);
     };
-  }, [owner, ownsViewport]);
-
-  return ownerRef;
+  }, [ownsViewport]);
 }

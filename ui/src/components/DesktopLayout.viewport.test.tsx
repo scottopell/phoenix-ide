@@ -55,16 +55,15 @@ describe('app viewport ownership', () => {
 
   it('blocks vertical touch chaining while preserving owned inner scrolling', () => {
     function Harness() {
-      const ownerRef = useAppTouchContainment<HTMLDivElement>(true);
+      useAppTouchContainment(true);
       return (
         <div>
-          <div data-testid="outside-pane" />
-          <div ref={ownerRef}>
-            <div data-testid="chrome" />
-            <div data-testid="scroller" data-app-scroll-owner />
-            <div data-testid="overlay-scroller" style={{ overflowY: 'auto' }} />
-            <textarea data-testid="textarea" />
+          <div data-testid="chrome" />
+          <div data-testid="scroller" data-app-scroll-owner>
+            <div data-testid="nested-scroller" style={{ overflowY: 'auto' }} />
           </div>
+          <div data-testid="side-pane" style={{ overflowY: 'auto' }} />
+          <textarea data-testid="textarea" />
         </div>
       );
     }
@@ -83,17 +82,17 @@ describe('app viewport ownership', () => {
     };
 
     const { getByTestId } = render(<Harness />);
-    const outsidePane = getByTestId('outside-pane');
     const chrome = getByTestId('chrome');
     const scroller = getByTestId('scroller');
-    const overlayScroller = getByTestId('overlay-scroller');
+    const nestedScroller = getByTestId('nested-scroller');
+    const sidePane = getByTestId('side-pane');
     const textarea = getByTestId('textarea');
     Object.defineProperties(scroller, {
       clientHeight: { configurable: true, value: 400 },
       scrollHeight: { configurable: true, value: 800 },
       scrollTop: { configurable: true, writable: true, value: 100 },
     });
-    for (const element of [overlayScroller, textarea]) {
+    for (const element of [nestedScroller, sidePane, textarea]) {
       Object.defineProperties(element, {
         clientHeight: { configurable: true, value: 100 },
         scrollHeight: { configurable: true, value: 300 },
@@ -101,8 +100,8 @@ describe('app viewport ownership', () => {
       });
     }
 
-    start(outsidePane, 100);
-    expect(touch(outsidePane, 80)).toBe(true);
+    start(sidePane, 100);
+    expect(touch(sidePane, 80)).toBe(true);
 
     start(chrome, 100);
     expect(touch(chrome, 80, 120)).toBe(true);
@@ -113,8 +112,12 @@ describe('app viewport ownership', () => {
     start(scroller, 100);
     expect(touch(scroller, 80)).toBe(true);
 
-    start(overlayScroller, 100);
-    expect(touch(overlayScroller, 80)).toBe(true);
+    start(nestedScroller, 100);
+    expect(touch(nestedScroller, 80)).toBe(true);
+
+    nestedScroller.scrollTop = 200;
+    start(nestedScroller, 100);
+    expect(touch(nestedScroller, 80)).toBe(true);
 
     start(textarea, 100);
     expect(touch(textarea, 80)).toBe(true);
@@ -123,26 +126,35 @@ describe('app viewport ownership', () => {
     start(scroller, 100);
     expect(touch(scroller, 80)).toBe(false);
 
+    start(nestedScroller, 100);
+    expect(touch(nestedScroller, 80)).toBe(false);
+
     scroller.scrollTop = 0;
     start(scroller, 80);
     expect(touch(scroller, 100)).toBe(false);
   });
 
-  it('attaches containment when a cold-load shell mounts after the skeleton', () => {
-    function Harness({ loaded }: { loaded: boolean }) {
-      const ownerRef = useAppTouchContainment<HTMLDivElement>(true);
-      return loaded ? <div ref={ownerRef} data-testid="owner"><div data-testid="chrome" /></div> : null;
+  it('contains dynamically mounted body portals while viewport ownership is active', () => {
+    function Harness() {
+      useAppTouchContainment(true);
+      return null;
     }
 
-    const { getByTestId, rerender } = render(<Harness loaded={false} />);
-    rerender(<Harness loaded />);
-    const chrome = getByTestId('chrome');
+    const { unmount } = render(<Harness />);
+    const portal = document.createElement('div');
+    document.body.append(portal);
     const start = new Event('touchstart', { bubbles: true, cancelable: true });
     Object.defineProperty(start, 'touches', { value: [{ clientX: 10, clientY: 100 }] });
-    chrome.dispatchEvent(start);
+    portal.dispatchEvent(start);
     const move = new Event('touchmove', { bubbles: true, cancelable: true });
     Object.defineProperty(move, 'touches', { value: [{ clientX: 10, clientY: 80 }] });
-    expect(chrome.dispatchEvent(move)).toBe(false);
+    expect(portal.dispatchEvent(move)).toBe(false);
+
+    unmount();
+    const moveAfterUnmount = new Event('touchmove', { bubbles: true, cancelable: true });
+    Object.defineProperty(moveAfterUnmount, 'touches', { value: [{ clientX: 10, clientY: 80 }] });
+    expect(portal.dispatchEvent(moveAfterUnmount)).toBe(true);
+    portal.remove();
   });
 
   it('gives chat shells one dynamic viewport owner and contains the document', () => {

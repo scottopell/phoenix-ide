@@ -24,6 +24,7 @@ import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';
 import {
   isViewportOwnedRoute,
+  useAppTouchContainment,
   useDocumentViewportOwnership,
 } from './viewportRoutes';
 import {
@@ -121,6 +122,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const location = useLocation();
   const ownsViewport = isViewportOwnedRoute(location.pathname, isDesktop);
   useDocumentViewportOwnership(ownsViewport);
+  useAppTouchContainment(ownsViewport);
   const { toasts, dismissToast, showSuccess, showError, showInfo } = useToast();
   useNotificationClickNavigationBridge();
 
