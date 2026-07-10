@@ -2433,20 +2433,25 @@ impl Database {
             tx.rollback().await?;
             return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
         };
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE conversation_creation_jobs
              SET status = 'deletion_pending', generation = generation + 1,
                  claim_worker_id = NULL, claim_token = NULL, lease_until = NULL,
                  cleanup_worker_id = NULL, cleanup_token = NULL, cleanup_lease_until = NULL,
                  next_attempt_at = NULL, error = NULL, failed_at = NULL,
                  cancelled_at = NULL, deletion_requested_at = ?1, updated_at = ?1
-             WHERE id = ?2 AND generation = ?3",
+             WHERE id = ?2 AND generation = ?3
+               AND status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'failed')",
         )
         .bind(&now)
         .bind(&job_id)
         .bind(generation)
         .execute(&mut *tx)
         .await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        }
         sqlx::query("UPDATE conversations SET archived = 1, updated_at = ?1 WHERE id = ?2")
             .bind(&now)
             .bind(conversation_id)
@@ -2464,6 +2469,59 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Atomically transition a seeded-empty creation to Idle and ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if serialization or the transaction fails.
+    pub async fn complete_seeded_empty_conversation_creation(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let idle = serde_json::to_string(&ConvState::Idle)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let now = now.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'ready', stage = 'finalize', completed_at = ?1, updated_at = ?1,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
+             WHERE id = ?2 AND conversation_id = ?3 AND status = 'claimed'
+               AND generation = ?4 AND claim_worker_id = ?5 AND claim_token = ?6
+               AND lease_until > ?1",
+        )
+        .bind(&now)
+        .bind(job_id)
+        .bind(conversation_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(CreationCasOutcome::ClaimLost);
+        }
+        let state_updated = sqlx::query(
+            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
+             WHERE id = ?3",
+        )
+        .bind(idle)
+        .bind(&now)
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if state_updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+        }
+        tx.commit().await?;
+        Ok(CreationCasOutcome::Applied)
     }
 
     /// Load one creation tombstone that requires resource reconciliation.
@@ -7722,6 +7780,120 @@ mod tests {
             .await
             .unwrap();
         assert!(db.get_conversation("conv-cancel").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn creation_delete_rejects_ready_job_without_archiving() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-ready-delete", "conv-ready-delete").await;
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'ready', completed_at = ?1 WHERE id = ?2",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind("job-ready-delete")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let result = db
+            .request_conversation_creation_deletion("conv-ready-delete", Utc::now())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(DbError::Sqlx(sqlx::Error::RowNotFound))
+        ));
+        assert!(
+            !db.get_conversation("conv-ready-delete")
+                .await
+                .unwrap()
+                .archived
+        );
+    }
+
+    #[tokio::test]
+    async fn seeded_empty_completion_is_atomic_and_claim_fenced() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-seeded", "conv-seeded").await;
+        let now = Utc::now();
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected authority");
+        };
+
+        assert_eq!(
+            db.complete_seeded_empty_conversation_creation(
+                "job-seeded",
+                &claim,
+                "conv-seeded",
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert!(matches!(
+            db.get_conversation("conv-seeded").await.unwrap().state,
+            ConvState::Idle
+        ));
+        assert!(matches!(
+            db.get_conversation_creation_job("job-seeded")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Ready
+        ));
+
+        insert_test_creation_job(&db, "job-seeded-stale", "conv-seeded-stale").await;
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-stale".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected stale claim");
+        };
+        let CreationStatus::Claimed(stale_claim) = job.protocol.status else {
+            panic!("expected stale authority");
+        };
+        db.cancel_conversation_creation("conv-seeded-stale", now)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.complete_seeded_empty_conversation_creation(
+                "job-seeded-stale",
+                &stale_claim,
+                "conv-seeded-stale",
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        assert!(matches!(
+            db.get_conversation("conv-seeded-stale")
+                .await
+                .unwrap()
+                .state,
+            ConvState::CreationCancelled { .. }
+        ));
     }
 
     #[tokio::test]

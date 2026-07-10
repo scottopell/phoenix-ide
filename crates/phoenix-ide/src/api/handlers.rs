@@ -2655,13 +2655,7 @@ async fn stream_conversation(
         }
         Err(e) if is_invalid_runtime_cwd_error(&e) => {
             tracing::warn!(conv_id = %id, error = %e, "Serving static SSE transcript without starting runtime because persisted cwd is invalid");
-            let last_sequence_id = state
-                .runtime
-                .db()
-                .get_last_sequence_id(&id)
-                .await
-                .unwrap_or(0);
-            let broadcaster = crate::runtime::SseBroadcaster::new(1, last_sequence_id);
+            let broadcaster = state.runtime.conversation_broadcaster(&id).await;
             let broadcast_rx = broadcaster.subscribe();
             (broadcaster, broadcast_rx)
         }
@@ -3068,16 +3062,15 @@ async fn cancel_conversation(
             .get_conversation(&id)
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
-        if let Some(handle) = state.runtime.try_get_handle(&id).await {
-            let cancelled_state = cancelled.state.clone();
-            let state_updated_at = cancelled.state_updated_at;
-            let _ = handle.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                sequence_id: seq,
-                presentation_mode: cancelled_state.presentation_mode().to_string(),
-                state: cancelled_state.clone(),
-                state_updated_at,
-            });
-        }
+        let broadcast_tx = state.runtime.conversation_broadcaster(&id).await;
+        let cancelled_state = cancelled.state.clone();
+        let state_updated_at = cancelled.state_updated_at;
+        let _ = broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+            sequence_id: seq,
+            presentation_mode: cancelled_state.presentation_mode().to_string(),
+            state: cancelled_state.clone(),
+            state_updated_at,
+        });
         state
             .runtime
             .evict_runtime(&id, crate::runtime::EvictionReason::CreationProvisioned)
@@ -3804,6 +3797,10 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
             .request_conversation_creation_deletion(id, chrono::Utc::now())
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
+        state
+            .runtime
+            .evict_runtime(id, crate::runtime::EvictionReason::CreationProvisioned)
+            .await;
         delete_conversation_attachments(id).await;
         broadcast_conversation_hard_deleted(state, id).await;
         state.runtime.kick_creation_worker();

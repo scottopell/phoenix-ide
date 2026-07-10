@@ -212,18 +212,7 @@ async fn process_job(
     }
 
     match provision_conversation(manager, &mut job).await {
-        Ok(ProvisionOutcome::SeededEmpty) => {
-            let outcome = manager
-                .db()
-                .complete_conversation_creation_job(&job.id, &claim, chrono::Utc::now())
-                .await
-                .map_err(|e| e.to_string())?;
-            if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
-                tracing::debug!(job_id = %job.id, generation = claim.generation, "seeded creation completion rejected after claim loss");
-            }
-            Ok(())
-        }
-        Ok(ProvisionOutcome::InitialMessageSubmitted) => Ok(()),
+        Ok(ProvisionOutcome::SeededEmpty | ProvisionOutcome::InitialMessageSubmitted) => Ok(()),
         Err((message, kind)) => {
             if creation_error_is_retryable(&kind) && job.protocol.attempt < 4 {
                 let delay_ms = crate::state_machine::creation_protocol::creation_retry_delay_ms(
@@ -271,17 +260,13 @@ async fn process_job(
                 tracing::debug!(job_id = %job.id, generation = claim.generation, "creation failure rejected after claim loss");
                 return Ok(());
             }
-            if let Some(broadcast_tx) = {
-                let runtimes = manager.runtimes.read().await;
-                runtimes.get(&conv_id).map(|h| h.broadcast_tx.clone())
-            } {
-                let _ = broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                    sequence_id: seq,
-                    state: failed.clone(),
-                    presentation_mode: failed.presentation_mode().to_string(),
-                    state_updated_at: chrono::Utc::now(),
-                });
-            }
+            let broadcast_tx = manager.conversation_broadcaster(&conv_id).await;
+            let _ = broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                sequence_id: seq,
+                state: failed.clone(),
+                presentation_mode: failed.presentation_mode().to_string(),
+                state_updated_at: chrono::Utc::now(),
+            });
             manager
                 .evict_runtime(&conv_id, EvictionReason::CreationProvisioned)
                 .await;
@@ -395,8 +380,7 @@ async fn provision_conversation(
             let path_for_blocking = existing_path.clone();
             let info = tokio::task::spawn_blocking(move || {
                 let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
-                if path_for_blocking.exists() {
-                    validate_existing_worktree(&path_for_blocking)?;
+                if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                     let worktree_path = path_for_blocking.to_string_lossy().to_string();
                     let default_branch = crate::git_ops::run_git(
                         Path::new(&repo_for_blocking),
@@ -510,8 +494,7 @@ async fn provision_conversation(
             let checkout_ref = intent.checkout_ref.clone();
             let worktree = tokio::task::spawn_blocking(move || {
                 let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
-                if path_for_blocking.exists() {
-                    validate_existing_worktree(&path_for_blocking)?;
+                if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
                     Ok(path_for_blocking.to_string_lossy().to_string())
                 } else {
                     create_managed_explore_worktree_blocking(
@@ -699,11 +682,22 @@ async fn provision_conversation(
         && files.is_empty();
 
     if seeded_empty {
-        manager
+        let outcome = manager
             .db()
-            .update_conversation_state(&job.conversation_id, &ConvState::Idle)
+            .complete_seeded_empty_conversation_creation(
+                &job.id,
+                &claim,
+                &job.conversation_id,
+                chrono::Utc::now(),
+            )
             .await
             .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
+        if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+            return Err((
+                "creation claim was lost before seeded completion".to_string(),
+                ErrorKind::Cancelled,
+            ));
+        }
         if let Some(broadcast_tx) = {
             let runtimes = manager.runtimes.read().await;
             runtimes
@@ -944,6 +938,23 @@ fn managed_worktree_error_to_kind(error: ManagedWorktreeError) -> (String, Error
 }
 
 #[cfg(test)]
+mod partial_worktree_reconciliation_tests {
+    use super::*;
+
+    #[test]
+    fn owned_partial_directory_is_removed_for_rematerialization() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        let partial = repo.path().join(".phoenix/worktrees/conversation");
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join("partial"), b"incomplete").unwrap();
+
+        assert!(!reconcile_owned_worktree_path(&repo.path().to_string_lossy(), &partial).unwrap());
+        assert!(!partial.exists());
+    }
+}
+
+#[cfg(test)]
 mod missing_resource_cleanup_tests {
     use super::*;
 
@@ -1051,6 +1062,56 @@ mod repository_lock_tests {
         acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         thread.join().unwrap();
     }
+}
+
+fn reconcile_owned_worktree_path(
+    repo_root: &str,
+    path: &Path,
+) -> Result<bool, (String, ErrorKind)> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if let Some(detected) = phoenix_core::git::detect_git_repo_root(path) {
+        let owning_repo = Path::new(repo_root)
+            .canonicalize()
+            .map_err(|error| {
+                (
+                    format!("Could not canonicalize repository {repo_root}: {error}"),
+                    ErrorKind::ServerError,
+                )
+            })?
+            .to_string_lossy()
+            .to_string();
+        if detected != owning_repo {
+            validate_existing_worktree(path)?;
+            return Ok(true);
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        (
+            format!(
+                "Could not inspect partial worktree {}: {error}",
+                path.display()
+            ),
+            ErrorKind::ServerError,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        std::fs::remove_file(path)
+    } else {
+        std::fs::remove_dir_all(path)
+    }
+    .map_err(|error| {
+        (
+            format!(
+                "Could not remove partial worktree {}: {error}",
+                path.display()
+            ),
+            ErrorKind::ServerError,
+        )
+    })?;
+    let _ = crate::git_ops::run_git(Path::new(repo_root), &["worktree", "prune"]);
+    Ok(false)
 }
 
 fn validate_existing_worktree(path: &Path) -> Result<(), (String, ErrorKind)> {

@@ -2711,6 +2711,34 @@ impl RuntimeManager {
         runtimes.get(conv_id).map(|h| h.state_rx.borrow().clone())
     }
 
+    /// Return the durable live-update channel for a conversation without starting its runtime.
+    pub async fn conversation_broadcaster(&self, conversation_id: &str) -> SseBroadcaster {
+        if let Some(handle) = self.try_get_handle(conversation_id).await {
+            return handle.broadcast_tx;
+        }
+        if let Some(broadcaster) = self
+            .evicted_broadcasters
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
+        {
+            return broadcaster;
+        }
+        let initial_last_seq = self
+            .db
+            .get_last_sequence_id(conversation_id)
+            .await
+            .unwrap_or(0);
+        let candidate = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq);
+        self.evicted_broadcasters
+            .write()
+            .await
+            .entry(conversation_id.to_string())
+            .or_insert(candidate)
+            .clone()
+    }
+
     /// Remove and return the evicted broadcaster for `conversation_id`, if any.
     ///
     /// An evicted broadcaster exists in the window between `evict_runtime` (model
@@ -3746,6 +3774,31 @@ mod scope_liveness_tests {
             mgr.scope_has_live_conversation(&scope).await.unwrap(),
             "a non-terminal, unarchived owner with a live handle is live"
         );
+    }
+
+    #[tokio::test]
+    async fn handleless_conversation_reuses_manager_owned_broadcaster() {
+        let mgr = test_manager().await;
+        let first = mgr.conversation_broadcaster("invalid-cwd-shell").await;
+        let mut receiver = first.subscribe();
+        let second = mgr.conversation_broadcaster("invalid-cwd-shell").await;
+
+        let idle = ConvState::Idle;
+        second
+            .send_seq(|seq| SseEvent::StateChange {
+                sequence_id: seq,
+                presentation_mode: idle.presentation_mode().to_string(),
+                state: idle.clone(),
+                state_updated_at: Utc::now(),
+            })
+            .expect("shared channel has receiver");
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            SseEvent::StateChange {
+                state: ConvState::Idle,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
