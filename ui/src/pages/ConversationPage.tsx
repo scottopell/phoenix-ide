@@ -1499,6 +1499,7 @@ function ConversationPageContent() {
     convStateForChildren.type !== 'handed_off' &&
     convStateForChildren.type !== 'provisioning' &&
     convStateForChildren.type !== 'creation_failed' &&
+    convStateForChildren.type !== 'creation_cancelled' &&
     convStateForChildren.type !== 'context_exhausted';
 
   // Derived: model context window is a pure function of the current model's

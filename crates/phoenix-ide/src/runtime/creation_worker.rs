@@ -62,8 +62,8 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
     }
 }
 
-fn creation_resource_is_absent(path: &Path) -> bool {
-    !path.exists()
+fn missing_repository_and_resource(repo: &Path, resource: &Path) -> bool {
+    !repo.exists() && !resource.exists()
 }
 
 async fn reconcile_creation_cleanup(
@@ -77,21 +77,18 @@ async fn reconcile_creation_cleanup(
         let repo = reservation.repository_identity.clone();
         let resource = reservation.resource_identity.clone();
         let reservation_id = reservation.id.clone();
-        if creation_resource_is_absent(Path::new(&resource)) {
-            let outcome = manager
-                .db()
-                .release_creation_resource(cleanup, &reservation.id, chrono::Utc::now())
-                .await
-                .map_err(|error| error.to_string())?;
-            if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
-                return Ok(());
-            }
-            continue;
-        }
         let cleanup_for_blocking = cleanup.clone();
         let db = manager.db().clone();
         tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let _lock = RepositoryMutationLock::acquire(&repo).map_err(|(message, _)| message)?;
+            let _lock = match RepositoryMutationLock::acquire(&repo) {
+                Ok(lock) => Some(lock),
+                Err((_message, _))
+                    if missing_repository_and_resource(Path::new(&repo), Path::new(&resource)) =>
+                {
+                    None
+                }
+                Err((message, _)) => return Err(message),
+            };
             let runtime = tokio::runtime::Handle::current();
             let reservations = runtime
                 .block_on(db.get_creation_resource_reservations(&cleanup_for_blocking.job_id))
@@ -756,6 +753,9 @@ async fn provision_conversation(
             skill_invocation,
         },
     };
+    manager
+        .evict_runtime(&job.conversation_id, EvictionReason::CreationProvisioned)
+        .await;
     let handle = manager
         .get_or_create(&job.conversation_id)
         .await
@@ -942,12 +942,24 @@ mod missing_resource_cleanup_tests {
     use super::*;
 
     #[test]
-    fn missing_resource_is_reconciled_before_repository_locking() {
-        let missing = std::env::temp_dir().join(format!(
+    fn missing_repository_and_resource_are_already_reconciled() {
+        let root = std::env::temp_dir().join(format!(
             "phoenix-missing-creation-resource-{}",
             uuid::Uuid::new_v4()
         ));
-        assert!(creation_resource_is_absent(&missing));
+        assert!(missing_repository_and_resource(
+            &root.join("repo"),
+            &root.join("worktree")
+        ));
+    }
+
+    #[test]
+    fn absent_resource_with_live_repository_requires_locking() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(!missing_repository_and_resource(
+            repo.path(),
+            &repo.path().join("worktree")
+        ));
     }
 }
 
