@@ -322,7 +322,7 @@ describe('parseConversationState commission review approval', () => {
     }
   });
 
-  it('parses provisioning and creation_failed states', () => {
+  it('parses provisioning, failed, and cancelled creation states', () => {
     expect(parseConversationState({ type: 'provisioning', prompt: 'ship it' })).toEqual({
       type: 'provisioning',
       prompt: 'ship it',
@@ -330,6 +330,10 @@ describe('parseConversationState commission review approval', () => {
     expect(parseConversationState({ type: 'creation_failed', message: 'boom', prompt: 'ship it' })).toEqual({
       type: 'creation_failed',
       message: 'boom',
+      prompt: 'ship it',
+    });
+    expect(parseConversationState({ type: 'creation_cancelled', prompt: 'ship it' })).toEqual({
+      type: 'creation_cancelled',
       prompt: 'ship it',
     });
   });

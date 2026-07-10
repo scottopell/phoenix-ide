@@ -1304,6 +1304,14 @@ async fn validate_submitted_attachments(
     conversation_id: &str,
     files: &[crate::api::types::FileAttachment],
 ) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
+    validate_submitted_attachments_at_root(&attachment_root(), conversation_id, files).await
+}
+
+async fn validate_submitted_attachments_at_root(
+    root: &std::path::Path,
+    conversation_id: &str,
+    files: &[crate::api::types::FileAttachment],
+) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
@@ -1312,7 +1320,7 @@ async fn validate_submitted_attachments(
             "A message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} files"
         )));
     }
-    let expected_dir = attachment_root().join(conversation_id);
+    let expected_dir = root.join(conversation_id);
     let canonical_expected_dir = tokio::fs::canonicalize(&expected_dir)
         .await
         .map_err(|_| AppError::BadRequest("Attachment directory does not exist".to_string()))?;
@@ -1704,10 +1712,7 @@ async fn create_conversation_with_id(
         .model
         .clone()
         .unwrap_or_else(|| registry_default_model.clone());
-    let intent_model = req
-        .model
-        .clone()
-        .unwrap_or_else(|| registry_default_model.clone());
+    let intent_model = req.model.clone();
     let resolved_mode_for_intent = match requested_mode {
         "direct" => None,
         other => Some(other.to_string()),
@@ -1752,25 +1757,17 @@ async fn create_conversation_with_id(
             }
         }
     }
-    if !req.files.is_empty() {
-        let mut total_bytes = 0_u64;
-        for file in &req.files {
-            let size = usize::try_from(file.size_bytes)
-                .map_err(|_| AppError::BadRequest("Attachment size is invalid".to_string()))?;
-            validate_attachment_file(&file.original_name, &file.media_type, size)?;
-            total_bytes = total_bytes.saturating_add(file.size_bytes);
-        }
-        if total_bytes > u64::try_from(MAX_TOTAL_ATTACHMENT_BYTES).unwrap_or(u64::MAX) {
+    let validated_files = match validate_submitted_attachments(&id, &req.files).await {
+        Ok(files) => files,
+        Err(error) => {
             delete_files(&stored_file_paths).await;
-            return Err(AppError::BadRequest(
-                "Attachments exceed the 25 MB total limit".to_string(),
-            ));
+            return Err(error);
         }
-    }
+    };
 
     let intent = crate::db::ConversationCreationIntent {
         cwd: effective_cwd.clone(),
-        model: Some(intent_model),
+        model: intent_model,
         text: persisted_prompt_text,
         expansion_preflighted: false,
         llm_text: None,
@@ -1785,7 +1782,7 @@ async fn create_conversation_with_id(
                 media_type: img.media_type,
             })
             .collect(),
-        files: req.files.iter().cloned().map(Into::into).collect(),
+        files: validated_files,
         mode: resolved_mode_for_intent,
         base_branch: req.base_branch.clone(),
         checkout_ref: req.checkout_ref.clone(),
@@ -3059,6 +3056,26 @@ async fn cancel_conversation(
             .cancel_conversation_creation(&id, chrono::Utc::now())
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
+        let cancelled = state
+            .runtime
+            .db()
+            .get_conversation(&id)
+            .await
+            .map_err(|error| AppError::Internal(error.to_string()))?;
+        if let Some(handle) = state.runtime.try_get_handle(&id).await {
+            let cancelled_state = cancelled.state.clone();
+            let state_updated_at = cancelled.state_updated_at;
+            let _ = handle.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                sequence_id: seq,
+                presentation_mode: cancelled_state.presentation_mode().to_string(),
+                state: cancelled_state.clone(),
+                state_updated_at,
+            });
+        }
+        state
+            .runtime
+            .evict_runtime(&id, crate::runtime::EvictionReason::CreationProvisioned)
+            .await;
         state.runtime.kick_creation_worker();
         return Ok(Json(CancelResponse {
             ok: true,
@@ -3781,6 +3798,7 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
             .request_conversation_creation_deletion(id, chrono::Utc::now())
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
+        delete_conversation_attachments(id).await;
         state.runtime.kick_creation_worker();
         return Ok(());
     }
@@ -6120,6 +6138,58 @@ mod conversation_cwd_validation_tests {
             response.conversation["state"]["type"].as_str(),
             Some("provisioning")
         );
+    }
+
+    #[tokio::test]
+    async fn submitted_attachment_must_belong_to_creation_conversation() {
+        let root = tempfile::tempdir().expect("attachment root");
+        let other_dir = root.path().join("other-conversation");
+        tokio::fs::create_dir_all(&other_dir)
+            .await
+            .expect("other dir");
+        let stored_path = other_dir.join("file.txt");
+        tokio::fs::write(&stored_path, b"hello")
+            .await
+            .expect("file");
+        let file = crate::api::types::FileAttachment {
+            original_name: "file.txt".to_string(),
+            stored_path: stored_path.to_string_lossy().to_string(),
+            media_type: "text/plain".to_string(),
+            size_bytes: 5,
+        };
+        tokio::fs::create_dir_all(root.path().join("new-conversation"))
+            .await
+            .expect("expected dir");
+
+        let error =
+            validate_submitted_attachments_at_root(root.path(), "new-conversation", &[file])
+                .await
+                .expect_err("cross-conversation attachment must be rejected");
+        assert!(
+            matches!(error, AppError::BadRequest(message) if message.contains("does not belong"))
+        );
+    }
+
+    #[tokio::test]
+    async fn create_conversation_preserves_omitted_model_in_durable_intent() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        let mut request = create_request("/".to_string());
+        request.conversation_id = Some(conversation_id.clone());
+        request.mode = Some("managed".to_string());
+
+        let _response = create_conversation_with_id(state.clone(), request, Vec::new())
+            .await
+            .expect("creation shell accepted");
+        let job = state
+            .runtime
+            .db()
+            .get_conversation_creation_job_for_conversation(&conversation_id)
+            .await
+            .expect("job lookup")
+            .expect("creation job");
+
+        assert_eq!(job.intent.model, None);
     }
 
     #[tokio::test]

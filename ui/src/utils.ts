@@ -254,6 +254,11 @@ export function parseConversationState(raw: unknown): ConversationState {
             : null,
         prompt: typeof obj['prompt'] === 'string' ? obj['prompt'] : null,
       };
+    case 'creation_cancelled':
+      return {
+        type: 'creation_cancelled',
+        prompt: typeof obj['prompt'] === 'string' ? obj['prompt'] : null,
+      };
     case 'llm_requesting':
     case 'awaiting_continuation':
       return { type, attempt: (obj['attempt'] as number) ?? 1 };

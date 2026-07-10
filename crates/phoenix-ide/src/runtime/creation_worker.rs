@@ -728,6 +728,10 @@ async fn provision_conversation(
             skill_invocation,
         },
     };
+    let handle = manager
+        .get_or_create(&job.conversation_id)
+        .await
+        .map_err(|e| (e, ErrorKind::ServerError))?;
     let authority = manager
         .db()
         .renew_conversation_creation_claim(
@@ -740,18 +744,15 @@ async fn provision_conversation(
         .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
     if matches!(authority, crate::db::CreationCasOutcome::ClaimLost) {
         return Err((
-            "creation claim was lost before runtime bootstrap".to_string(),
+            "creation claim was lost before runtime bootstrap enqueue".to_string(),
             ErrorKind::Cancelled,
         ));
     }
-    let _handle = manager
-        .get_or_create(&job.conversation_id)
+    handle
+        .event_tx
+        .send(event)
         .await
-        .map_err(|e| (e, ErrorKind::ServerError))?;
-    manager
-        .send_event(&job.conversation_id, event)
-        .await
-        .map_err(|e| (e, ErrorKind::ServerError))?;
+        .map_err(|e| (format!("Failed to send event: {e}"), ErrorKind::ServerError))?;
     checkpoint_creation_stage(
         manager,
         job,

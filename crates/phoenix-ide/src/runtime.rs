@@ -2765,6 +2765,7 @@ impl RuntimeManager {
         match &conv.state {
             ConvState::Provisioning { .. }
             | ConvState::CreationFailed { .. }
+            | ConvState::CreationCancelled { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::AwaitingCommissionReviewApproval { .. }
@@ -3725,6 +3726,35 @@ mod scope_liveness_tests {
             mgr.scope_has_live_conversation(&scope).await.unwrap(),
             "a non-terminal, unarchived owner with a live handle is live"
         );
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_preserves_creation_cancelled() {
+        let mgr = test_manager().await;
+        mgr.db()
+            .create_conversation("cancelled", "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        mgr.db()
+            .update_conversation_state(
+                "cancelled",
+                &ConvState::CreationCancelled {
+                    job_id: "job".to_string(),
+                },
+            )
+            .await
+            .expect("set cancelled");
+
+        let (state, _ts, needs_auto_continue) = mgr
+            .determine_resume_state("cancelled")
+            .await
+            .expect("resume");
+
+        assert!(matches!(
+            state,
+            ConvState::CreationCancelled { ref job_id } if job_id == "job"
+        ));
+        assert!(!needs_auto_continue);
     }
 
     #[tokio::test]

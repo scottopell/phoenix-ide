@@ -2317,7 +2317,11 @@ impl Database {
                  FROM conversation_creation_jobs
                  WHERE status = 'claimed'
                  UNION ALL
-                 SELECT updated_at AS deadline
+                 SELECT CASE
+                            WHEN cleanup_lease_until IS NOT NULL
+                            THEN cleanup_lease_until
+                            ELSE updated_at
+                        END AS deadline
                  FROM conversation_creation_jobs
                  WHERE status IN ('cancelling', 'deletion_pending')
                     OR (status = 'failed' AND EXISTS (
@@ -4971,7 +4975,7 @@ impl Database {
         //   - terminal: task lifecycle ended (complete/abandon) — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'creation_failed', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')",
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'provisioning', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'awaiting_commission_review_approval', 'terminal')",
         )
         .bind(&idle_state)
         .bind(now.to_rfc3339())
@@ -7757,6 +7761,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creation_cleanup_deadline_waits_for_live_cleanup_lease() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-cleanup-deadline", "conv-cleanup-deadline").await;
+        let now = Utc::now();
+        db.cancel_conversation_creation("conv-cleanup-deadline", now)
+            .await
+            .unwrap();
+        let lease_duration = chrono::Duration::seconds(30);
+        let cleanup = db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-a",
+                "cleanup-token-a",
+                now,
+                lease_duration,
+            )
+            .await
+            .unwrap()
+            .expect("cleanup claim");
+
+        assert_eq!(cleanup.lease_until, now + lease_duration);
+        assert_eq!(
+            db.next_conversation_creation_deadline().await.unwrap(),
+            Some(cleanup.lease_until)
+        );
+        assert!(db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-b",
+                "cleanup-token-b",
+                now + chrono::Duration::seconds(1),
+                lease_duration,
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-b",
+                "cleanup-token-b",
+                cleanup.lease_until,
+                lease_duration,
+            )
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn creation_retry_is_durable_and_due_without_a_kick() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-retry", "conv-retry").await;
@@ -8882,6 +8933,29 @@ mod tests {
             pre_allocated_seq + 1,
             "DB-MAX+1 allocation must observe seqs planted by add_message_with_seq"
         );
+    }
+
+    #[tokio::test]
+    async fn reset_preserves_creation_cancelled_state() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("cancelled", "slug", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            "cancelled",
+            &ConvState::CreationCancelled {
+                job_id: "job".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        db.reset_all_to_idle().await.unwrap();
+
+        assert!(matches!(
+            db.get_conversation("cancelled").await.unwrap().state,
+            ConvState::CreationCancelled { ref job_id } if job_id == "job"
+        ));
     }
 
     #[tokio::test]
