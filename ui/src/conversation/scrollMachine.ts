@@ -334,7 +334,9 @@ export function reduceScrollMachine(
           ? { ...state.gesture, departedBottom: true }
           : state.gesture,
       };
-      if (!event.atBottom) return { state: next, effects: [] };
+      if (!event.atBottom || next.kind === 'mount-rescue') {
+        return { state: next, effects: [] };
+      }
       if (next.gesture.kind === 'touch' && next.gesture.moved) {
         return { state: next, effects: [] };
       }

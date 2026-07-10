@@ -109,6 +109,16 @@ describe('scrollMachine durable follow policy', () => {
 
     state = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 0 }).state;
     expectLiveMode(state, 'reading');
+
+    const tailGrowth = reduceScrollMachine(state, {
+      type: 'heightChanged',
+      totalHeight: 1_100,
+      unitCount: 5,
+      snapshot: snap(1_100, 700, 400),
+      tailActivity: 'active',
+    });
+    expectLiveMode(tailGrowth.state, 'reading');
+    expect(effectTypes(tailGrowth.effects)).not.toContain('snapToLastIndex');
   });
 
   it('tap-only touch restores the mode from before the gesture', () => {
@@ -160,6 +170,24 @@ describe('scrollMachine durable follow policy', () => {
     result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
     expectLiveMode(result.state, 'following');
     expect(result.effects).toEqual([]);
+  });
+
+  it('keeps mount rescue alive through an initial bottom confirmation', () => {
+    const mounted = measured();
+    const result = reduceScrollMachine(mounted.state, {
+      type: 'viewportPinnedChanged',
+      atBottom: true,
+    });
+
+    expect(result.state.kind).toBe('mount-rescue');
+    expect(result.effects).toEqual([]);
+
+    const stranded = reduceScrollMachine(result.state, {
+      type: 'settleProbe',
+      snapshot: snap(1_200, 500, 400),
+      nowMs: 1_100,
+    });
+    expect(stranded.effects).toEqual([{ type: 'writeDomBottom' }]);
   });
 
   it('navigation jumps take durable ownership and disable mount rescue', () => {

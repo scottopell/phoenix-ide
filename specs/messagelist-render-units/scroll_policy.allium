@@ -307,17 +307,12 @@ rule LiveIdleBottomConfirmationRestoresFollowing {
     ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
 }
 
-rule MountIdleBottomConfirmationExitsRescue {
+rule MountBottomConfirmationKeepsRescueActive {
     when: ViewportPinnedChanged(policy, at_bottom)
     requires: at_bottom = true
-    requires: policy.gesture_mode = idle
     requires: policy.lifecycle = mount_rescue
-    ensures: policy.lifecycle = live
+    ensures: policy.lifecycle = mount_rescue
     ensures: policy.at_bottom = true
-    ensures: policy.follow_mode = following
-    ensures: policy.unread = false
-    ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
-    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
 }
 
 rule TailAdvanceWhileReadingShowsUnread {
