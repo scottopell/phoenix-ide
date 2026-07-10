@@ -25,6 +25,7 @@ const READ_PAGE_CHARS: usize = 7000;
 const MAX_RECALL_TURNS: usize = 6;
 const ANSWER_MAX_TOKENS: u32 = 3072;
 const READ_MESSAGE_BATCH: i64 = 64;
+const READ_TARGET_SIDE_MESSAGES: i64 = 32;
 const RECALL_SESSION_PAGE: i64 = 50;
 const RECALL_MESSAGE_PAGE: i64 = 100;
 const OPEN_WORK_PAGE: usize = 100;
@@ -37,6 +38,12 @@ pub struct GlobalOpenWorkResponse {
     pub generated_at: DateTime<Utc>,
     pub groups: Vec<GlobalOpenWorkProject>,
     pub has_more: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConversationReadTarget {
+    conversation_id: String,
+    message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -438,6 +445,9 @@ async fn project_item_from_members(
     }
     let root = &members[0];
     let current = members.last().expect("non-empty members");
+    if is_intrinsically_closed(current) {
+        return Ok(None);
+    }
     let task_status = task_status_for(current).await?;
     if !is_open_work_candidate(current, task_status.as_deref(), now) {
         return Ok(None);
@@ -563,16 +573,18 @@ fn is_closed_runtime_state(state: &ConvState) -> bool {
     )
 }
 
+fn is_intrinsically_closed(conversation: &Conversation) -> bool {
+    conversation.archived
+        || !conversation.user_initiated
+        || is_closed_runtime_state(&conversation.state)
+}
+
 fn is_open_work_candidate(
     conversation: &Conversation,
     task_status: Option<&str>,
     now: DateTime<Utc>,
 ) -> bool {
-    if conversation.archived
-        || !conversation.user_initiated
-        || is_closed_runtime_state(&conversation.state)
-        || task_status.is_some_and(is_closed_task_status)
-    {
+    if is_intrinsically_closed(conversation) || task_status.is_some_and(is_closed_task_status) {
         return false;
     }
     if has_runtime_open_evidence(&conversation.state) {
@@ -882,7 +894,7 @@ fn global_recall_tools() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "list_open_work".to_string(),
             description: "Read the deterministic Global Open Work projection grouped by project, including item references and explainable signals.".to_string(),
-            input_schema: serde_json::json!({"type":"object","properties":{}}),
+            input_schema: serde_json::json!({"type":"object","properties":{"offset":{"type":"integer","minimum":0}}}),
             defer_loading: false,
         },
         ToolDefinition {
@@ -934,8 +946,8 @@ async fn execute_global_tool(
             if conv_ref.is_empty() {
                 return ("error: conversation_id is required".to_string(), true);
             }
-            let conv_id = match resolve_conversation_reference_to_id(state, conv_ref).await {
-                Ok(id) => id,
+            let target = match resolve_conversation_read_target(state, conv_ref).await {
+                Ok(target) => target,
                 Err(e) => return (format!("error: {e}"), true),
             };
             let cursor = usize::try_from(
@@ -945,18 +957,37 @@ async fn execute_global_tool(
                     .unwrap_or(0),
             )
             .unwrap_or(0);
-            match state.db.get_conversation(&conv_id).await {
-                Ok(conv) => match read_conversation_page(&state.db, &conv, cursor).await {
-                    Ok(page) => (page, false),
-                    Err(e) => (format!("error: read failed: {e}"), true),
-                },
+            match state.db.get_conversation(&target.conversation_id).await {
+                Ok(conv) => {
+                    let result = if let Some(message_id) = target.message_id.as_deref() {
+                        read_conversation_around_message(&state.db, &conv, message_id).await
+                    } else {
+                        read_conversation_page(&state.db, &conv, cursor).await
+                    };
+                    match result {
+                        Ok(page) => (page, false),
+                        Err(e) => (format!("error: read failed: {e}"), true),
+                    }
+                }
                 Err(e) => (format!("error: conversation not found: {e}"), true),
             }
         }
-        "list_open_work" => match build_open_work(state).await {
-            Ok(view) => (format_open_work_for_agent(&view), false),
-            Err(e) => (format!("error: open work projection failed: {e:?}"), true),
-        },
+        "list_open_work" => {
+            let offset = usize::try_from(
+                input
+                    .get("offset")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )
+            .unwrap_or(usize::MAX);
+            match build_open_work(state).await {
+                Ok(view) => {
+                    let page = paginate_open_work(view, offset, OPEN_WORK_PAGE);
+                    (format_open_work_for_agent(&page, offset), false)
+                }
+                Err(e) => (format!("error: open work projection failed: {e:?}"), true),
+            }
+        }
         "resolve_reference" => {
             let reference = input
                 .get("reference")
@@ -974,42 +1005,39 @@ async fn execute_global_tool(
     }
 }
 
-async fn resolve_conversation_reference_to_id(
+async fn resolve_conversation_read_target(
     state: &AppState,
     raw: &str,
-) -> Result<String, String> {
+) -> Result<ConversationReadTarget, String> {
     let reference = raw.trim().trim_start_matches('#');
     if let Some(rest) = reference.strip_prefix("@conv:") {
-        let id = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or(rest)
-            .split('#')
-            .next()
-            .unwrap_or(rest);
+        let (id, message_id) = parse_conv_handle(rest);
         if id.is_empty() {
             return Err("conversation reference is missing an id".to_string());
         }
-        return Ok(id.to_string());
+        return Ok(ConversationReadTarget {
+            conversation_id: id.to_string(),
+            message_id: message_id.map(str::to_string),
+        });
     }
     if let Some(rest) = reference.strip_prefix("/c/") {
-        let slug = rest.split('#').next().unwrap_or(rest);
+        let (slug, fragment) = split_fragment(rest);
         let conv = load_conversation_by_slug_or_id(state, slug)
             .await
             .map_err(|e| format!("conversation reference not found: {e:?}"))?;
-        return Ok(conv.id);
+        return Ok(ConversationReadTarget {
+            conversation_id: conv.id,
+            message_id: fragment.and_then(message_id_fragment).map(str::to_string),
+        });
     }
-    let id = reference
-        .split_whitespace()
-        .next()
-        .unwrap_or(reference)
-        .split('#')
-        .next()
-        .unwrap_or(reference);
+    let (id, message_id) = parse_conv_handle(reference);
     if id.is_empty() {
         Err("conversation reference is missing an id".to_string())
     } else {
-        Ok(id.to_string())
+        Ok(ConversationReadTarget {
+            conversation_id: id.to_string(),
+            message_id: message_id.map(str::to_string),
+        })
     }
 }
 
@@ -1070,6 +1098,51 @@ async fn read_conversation_page(
     let body = render_message_page(db, conv, cursor).await?;
     header.push_str(&body);
     Ok(header)
+}
+
+async fn read_conversation_around_message(
+    db: &crate::db::Database,
+    conv: &Conversation,
+    message_id: &str,
+) -> Result<String, DbError> {
+    let target = db.get_message_by_id(message_id).await?;
+    if target.conversation_id != conv.id {
+        return Err(DbError::MessageNotFound(message_id.to_string()));
+    }
+    let probe_limit = READ_TARGET_SIDE_MESSAGES.saturating_add(1);
+    let (mut before, mut after) = db
+        .get_messages_around(&conv.id, target.sequence_id, probe_limit, probe_limit)
+        .await?;
+    let side_limit = usize::try_from(READ_TARGET_SIDE_MESSAGES).unwrap_or(0);
+    let has_more_before = before.len() > side_limit;
+    let has_more_after = after.len() > side_limit;
+    if has_more_before {
+        before.remove(0);
+    }
+    after.truncate(side_limit);
+    let mut messages = before;
+    messages.push(target);
+    messages.extend(after);
+
+    let mut out = format!(
+        "Conversation @conv:{} — {}\nlink: {}\nupdated: {}\ntarget_message: {}\nhas_more_before: {}\nhas_more_after: {}\n---\n",
+        conv.id,
+        conv.title
+            .as_deref()
+            .or(conv.slug.as_deref())
+            .unwrap_or(&conv.id),
+        conversation_href(conv),
+        conv.updated_at,
+        message_id,
+        has_more_before,
+        has_more_after,
+    );
+    for message in messages {
+        if !message_is_hidden(&message) {
+            out.push_str(&render_global_message_line(conv, &message));
+        }
+    }
+    Ok(out)
 }
 
 async fn render_message_page(
@@ -1234,8 +1307,22 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
     }
 }
 
-fn format_open_work_for_agent(view: &GlobalOpenWorkResponse) -> String {
-    let mut out = String::new();
+fn format_open_work_for_agent(view: &GlobalOpenWorkResponse, offset: usize) -> String {
+    let item_count = view
+        .groups
+        .iter()
+        .map(|group| group.items.len())
+        .sum::<usize>();
+    let next_offset = view.has_more.then(|| offset.saturating_add(item_count));
+    let mut out = format!(
+        "Open work page offset {offset}\nhas_more: {}\nnext_offset: {}\n",
+        view.has_more,
+        next_offset.map_or_else(|| "none".to_string(), |value| value.to_string()),
+    );
+    if item_count == 0 {
+        out.push_str("No active work found.\n");
+        return out;
+    }
     for group in &view.groups {
         let _ = writeln!(
             out,
@@ -1633,9 +1720,10 @@ fn trim_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        group_conversation_chains, is_open_work_candidate, message_id_fragment, paginate_open_work,
-        parse_conv_handle, split_fragment, GlobalOpenWorkItem, GlobalOpenWorkProject,
-        GlobalOpenWorkResponse, GlobalOpenWorkSource,
+        format_open_work_for_agent, group_conversation_chains, is_intrinsically_closed,
+        is_open_work_candidate, message_id_fragment, paginate_open_work, parse_conv_handle,
+        split_fragment, GlobalOpenWorkItem, GlobalOpenWorkProject, GlobalOpenWorkResponse,
+        GlobalOpenWorkSource,
     };
     use crate::db::{ConvMode, Conversation, NonEmptyString};
     use crate::state_machine::ConvState;
@@ -1723,6 +1811,23 @@ mod tests {
         assert!(first.has_more);
         assert_eq!(first.groups[0].items.len(), 2);
         assert_eq!(first.groups[0].items[0].id, "a");
+        let output = format_open_work_for_agent(&first, 0);
+        assert!(output.contains("has_more: true"));
+        assert!(output.contains("next_offset: 2"));
+    }
+
+    #[test]
+    fn empty_open_work_tool_page_is_explicit() {
+        let page = GlobalOpenWorkResponse {
+            generated_at: Utc::now(),
+            groups: vec![],
+            has_more: false,
+        };
+
+        assert_eq!(
+            format_open_work_for_agent(&page, 100),
+            "Open work page offset 100\nhas_more: false\nnext_offset: none\nNo active work found.\n"
+        );
     }
 
     #[tokio::test]
@@ -1809,6 +1914,22 @@ mod tests {
         };
         direct.updated_at = now;
         assert!(!is_open_work_candidate(&direct, None, now));
+    }
+
+    #[test]
+    fn intrinsic_open_work_exclusions_need_no_task_status() {
+        let mut conv = conversation("closed");
+        conv.conv_mode = work_mode();
+        conv.archived = true;
+        assert!(is_intrinsically_closed(&conv));
+
+        conv.archived = false;
+        conv.user_initiated = false;
+        assert!(is_intrinsically_closed(&conv));
+
+        conv.user_initiated = true;
+        conv.state = ConvState::Terminal;
+        assert!(is_intrinsically_closed(&conv));
     }
 
     #[test]

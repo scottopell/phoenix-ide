@@ -189,19 +189,26 @@ export function GlobalRecallPage() {
   const ask = async () => {
     if (!activeSessionId || !question.trim() || asking || sessionLoading) return;
     const text = question.trim();
+    const submittedSessionId = activeSessionId;
+    const submittedGeneration = sessionSelectionGenerationRef.current;
+    const selectionIsCurrent = () => (
+      activeSessionIdRef.current === submittedSessionId
+      && sessionSelectionGenerationRef.current === submittedGeneration
+    );
     setQuestion('');
     setAsking(true);
     setError(null);
     try {
-      const submittedSessionId = activeSessionId;
       const res = await api.askGlobalRecallSession(submittedSessionId, text);
-      if (activeSessionIdRef.current === submittedSessionId) {
+      if (selectionIsCurrent()) {
         setMessages((prev) => [...prev, res.user_message, res.assistant_message]);
       }
       void refreshSessions();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setQuestion(text);
+      if (selectionIsCurrent()) {
+        setError(e instanceof Error ? e.message : String(e));
+        setQuestion(text);
+      }
     } finally {
       setAsking(false);
     }
