@@ -22,6 +22,7 @@ import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';
+import { isViewportOwnedRoute, useDocumentViewportOwnership } from './viewportRoutes';
 import {
   closeNotificationsForConversation,
   consumeNotificationPermissionCue,
@@ -115,6 +116,8 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   }, []);
 
   const location = useLocation();
+  const ownsViewport = isViewportOwnedRoute(location.pathname);
+  useDocumentViewportOwnership(ownsViewport);
   const { toasts, dismissToast, showSuccess, showError, showInfo } = useToast();
   useNotificationClickNavigationBridge();
 
@@ -196,7 +199,13 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
       browserSessionActive={browserSessionActive}
     >
      <FileExplorerProvider>
-      <div ref={layoutRef} className={isDesktop ? 'desktop-layout' : undefined}>
+      <div
+        ref={layoutRef}
+        className={[
+          isDesktop ? 'desktop-layout' : '',
+          ownsViewport ? 'app-viewport' : '',
+        ].filter(Boolean).join(' ') || undefined}
+      >
         {isDesktop && (
           <Sidebar
             collapsed={sidebarPane.collapsed}
@@ -240,7 +249,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           />
         )}
         {/* children is always at this position — never remounts on breakpoint crossing */}
-        <div className={isDesktop ? 'desktop-main' : undefined}>
+        <div className={`layout-main${isDesktop ? ' desktop-main' : ''}`}>
           {children}
         </div>
         {isDesktop && <SubAgentViewerDock />}

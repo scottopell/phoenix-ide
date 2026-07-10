@@ -76,3 +76,18 @@ A Chromium mobile viewport without the software keyboard is insufficient to repr
 - Long conversation away from newest: keyboard focus does not force document movement or regress user-owned message scrolling.
 - Rotate portrait/landscape and exercise Safari URL-bar expansion/collapse.
 - Desktop and Android/Chromium mobile: no new clipping; intentional page routes remain scrollable.
+
+## Implementation result
+
+- `/new` and `/c/:slug` now opt into a route-scoped dynamic viewport owner at `DesktopLayout`; `html`, `body`, and `#root` are contained only while that owner is active.
+- The mobile and desktop wrapper chain has explicit flex sizing and `min-height: 0`. `/new` inherits the owned viewport instead of creating a nested `100vh` minimum, and `.new-conv-main` remains its intentional inner scroller.
+- Conversation `#app` inherits the shared owner while `#messages` remains the content scroller.
+- The unused timer- and scroll-reset-based `useIOSKeyboardFix` hook was removed.
+- Regression coverage checks route scope, global-class lifecycle across ownership changes, viewport/flex containment, and the absence of a nested `/new` viewport minimum.
+
+## Verification
+
+- Chromium at 390×844: `/new` and `/c/fixture-turn-one` both reported document `scrollHeight === clientHeight`, `window.scrollY === 0` after a forced scroll attempt, and focused composers remained inside the shell. The conversation message scroller remained independently scrollable.
+- Chromium at 1440×900: conversation shell remained viewport-sized. Navigating to `/about` removed document containment and restored the route's normal overflow ownership.
+- iOS 17.4 Simulator, iPhone 15 Pro: Safari rendered `/new` with the page and composer fitted to the visible browser area in portrait. This environment has no Simulator input driver and macOS accessibility automation is blocked, so software-keyboard drag gestures still require reviewer/device manual QA using the matrix above.
+- `./dev.py check` passes.
