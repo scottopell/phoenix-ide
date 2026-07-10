@@ -177,7 +177,7 @@ describe('scrollMachine durable follow policy', () => {
 
   it('tail advance while following requests one live follow action', () => {
     const result = reduceScrollMachine(liveFollowing(), { type: 'tailContentAdvanced' });
-    expect(result.effects).toEqual([{ type: 'scheduleTailFollow' }]);
+    expect(result.effects).toEqual([{ type: 'scheduleTailFollow', conversationId: 'conv' }]);
     expect(result.state.kind === 'live' && result.state.unread).toBe(false);
   });
 
@@ -201,7 +201,7 @@ describe('scrollMachine durable follow policy', () => {
 
   it('first content after an empty mount enters bounded rescue', () => {
     let result = measured(0, snap(0, 0, 500));
-    expect(result.state.kind).toBe('unmeasured');
+    expect(result.state.kind).toBe('measured-empty');
 
     result = reduceScrollMachine(result.state, {
       type: 'conversationMeasured',
@@ -249,6 +249,69 @@ describe('scrollMachine durable follow policy', () => {
     expect(effectTypes(height.effects)).not.toContain('scheduleDomBottomWrite');
   });
 
+  it('mismatched measurement preserves reset and new-mount effects', () => {
+    const unread = reduceScrollMachine(reading(), { type: 'tailContentAdvanced' }).state;
+    const unreadResult = reduceScrollMachine(unread, {
+      type: 'conversationMeasured',
+      conversationId: 'new',
+      totalHeight: 800,
+      unitCount: 4,
+      snapshot: snap(800, 400, 400),
+      nowMs: 2_000,
+    });
+    expect(effectTypes(unreadResult.effects)).toEqual([
+      'clearUnread',
+      'startSettleWatch',
+      'scheduleDomBottomWrite',
+    ]);
+
+    const rescueResult = reduceScrollMachine(measured().state, {
+      type: 'conversationMeasured',
+      conversationId: 'new',
+      totalHeight: 800,
+      unitCount: 4,
+      snapshot: snap(800, 400, 400),
+      nowMs: 2_000,
+    });
+    expect(effectTypes(rescueResult.effects)).toEqual([
+      'stopSettleWatch',
+      'startSettleWatch',
+      'scheduleDomBottomWrite',
+    ]);
+  });
+
+  it('keeps a multi-touch gesture active until the final touch ends or cancels', () => {
+    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchMoved' }).state;
+    state = reduceScrollMachine(state, { type: 'touchEnded', remainingTouches: 2 }).state;
+    expect(state.kind === 'live' && state.gesture.kind).toBe('touch');
+    expectLiveMode(state, 'reading');
+
+    state = reduceScrollMachine(state, { type: 'touchCancelled', remainingTouches: 1 }).state;
+    expect(state.kind === 'live' && state.gesture.kind).toBe('touch');
+    expectLiveMode(state, 'reading');
+
+    state = reduceScrollMachine(state, { type: 'touchCancelled', remainingTouches: 0 }).state;
+    expect(state.kind === 'live' && state.gesture.kind).toBe('idle');
+    expectLiveMode(state, 'reading');
+  });
+
+  it('stationary touch cancellation restores the pre-gesture mode', () => {
+    let state: ScrollMachineState = reduceScrollMachine(liveFollowing(), { type: 'touchStarted' }).state;
+    state = reduceScrollMachine(state, { type: 'touchCancelled', remainingTouches: 0 }).state;
+    expect(state.kind === 'live' && state.gesture.kind).toBe('idle');
+    expectLiveMode(state, 'following');
+  });
+
+  it('never scrolls an empty jump-to-newest request', () => {
+    const result = reduceScrollMachine(reading(), {
+      type: 'jumpToNewestRequested',
+      unitCount: 0,
+    });
+    expect(result.effects).toEqual([]);
+    expectLiveMode(result.state, 'reading');
+  });
+
   it('conversation switch atomically resets lifecycle, unread, gesture, and geometry', () => {
     let state: ScrollMachineState = reduceScrollMachine(reading(), { type: 'tailContentAdvanced' }).state;
     state = reduceScrollMachine(state, { type: 'touchStarted' }).state;
@@ -257,7 +320,7 @@ describe('scrollMachine durable follow policy', () => {
       conversationId: 'new',
     });
 
-    expect(result.state).toEqual({ kind: 'unmeasured', conversationId: 'new', measuredEmpty: false });
+    expect(result.state).toEqual({ kind: 'unmeasured', conversationId: 'new' });
     expect(result.effects).toEqual([{ type: 'clearUnread' }]);
   });
 });
@@ -266,8 +329,14 @@ const commandArb: fc.Arbitrary<ScrollEvent> = fc.oneof(
   fc.constant({ type: 'interactionStarted' } as const),
   fc.constant({ type: 'touchStarted' } as const),
   fc.constant({ type: 'touchMoved' } as const),
-  fc.constant({ type: 'touchEnded', remainingTouches: 0 } as const),
-  fc.constant({ type: 'touchCancelled', remainingTouches: 0 } as const),
+  fc.record({
+    type: fc.constant('touchEnded' as const),
+    remainingTouches: fc.integer({ min: 0, max: 4 }),
+  }),
+  fc.record({
+    type: fc.constant('touchCancelled' as const),
+    remainingTouches: fc.integer({ min: 0, max: 4 }),
+  }),
   fc.constant({ type: 'upwardIntent' } as const),
   fc.constant({ type: 'navigationJumped' } as const),
   fc.constant({ type: 'tailContentAdvanced' } as const),
@@ -294,7 +363,9 @@ function assertReachableInvariants(state: ScrollMachineState, effects: ScrollEff
   expect(visibleScrolls.length).toBeLessThanOrEqual(1);
   expect(!(effectTypes(effects).includes('showUnread') && effectTypes(effects).includes('clearUnread'))).toBe(true);
   if (effectTypes(effects).includes('writeDomBottom')) expect(state.kind).toBe('mount-rescue');
-  if (state.kind === 'unmeasured') expect('gesture' in state).toBe(false);
+  if (state.kind === 'unmeasured' || state.kind === 'measured-empty') {
+    expect('gesture' in state).toBe(false);
+  }
   if (state.kind === 'mount-rescue') expect(Number.isFinite(state.deadlineMs)).toBe(true);
 }
 

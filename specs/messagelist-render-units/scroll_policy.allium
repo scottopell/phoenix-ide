@@ -9,7 +9,7 @@ config {
     settle_window_ms: Integer = 3000
 }
 
-enum Lifecycle { unmeasured mount_rescue live }
+enum Lifecycle { unmeasured measured_empty mount_rescue live }
 enum FollowMode { following reading returning_to_tail }
 enum GestureMode { idle touch_stationary touch_moved }
 enum EffectKind {
@@ -32,22 +32,27 @@ entity ScrollPolicy {
     gesture_departed_bottom: Boolean
     at_bottom: Boolean
     unread: Boolean
-    has_content: Boolean
     previous_total_height: Integer
+    last_scroll_top: Integer
     settle_deadline: Integer
 
     transitions lifecycle {
+        unmeasured -> measured_empty
         unmeasured -> mount_rescue
+        measured_empty -> mount_rescue
+        measured_empty -> unmeasured
         mount_rescue -> live
-        live -> unmeasured
         mount_rescue -> unmeasured
+        live -> unmeasured
     }
 
     transitions follow_mode {
         following -> reading
+        following -> returning_to_tail
+        reading -> following
         reading -> returning_to_tail
         returning_to_tail -> following
-        reading -> following
+        returning_to_tail -> reading
     }
 
     transitions gesture_mode {
@@ -76,6 +81,8 @@ surface ScrollPolicyAdapter {
     provides:
         ConversationChanged(policy, conversation_id)
         ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
+        ScrollerAttached(policy, snapshot)
+        DownwardMovement(policy, snapshot)
         ViewportPinnedChanged(policy, at_bottom)
         InteractionStarted(policy)
         TouchStarted(policy)
@@ -98,6 +105,19 @@ surface ScrollPolicyEffectSink {
         effect.kind
 }
 
+rule ScrollerAttachmentUpdatesReadyGeometry {
+    when: ScrollerAttached(policy, snapshot)
+    requires: policy.lifecycle in { mount_rescue, live }
+    ensures: policy.last_scroll_top = snapshot.scroll_top
+}
+
+rule DownwardMovementUpdatesGeometryWithoutChangingOwnership {
+    when: DownwardMovement(policy, snapshot)
+    requires: policy.lifecycle in { mount_rescue, live }
+    ensures: policy.last_scroll_top = snapshot.scroll_top
+    ensures: policy.follow_mode = policy.follow_mode
+}
+
 rule PopulatedMeasurementStartsMountRescue {
     when: ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
     requires: policy.lifecycle = unmeasured
@@ -108,7 +128,6 @@ rule PopulatedMeasurementStartsMountRescue {
     ensures: policy.gesture_mode = idle
     ensures: policy.at_bottom = true
     ensures: policy.unread = false
-    ensures: policy.has_content = true
     ensures: policy.previous_total_height = total_height
     ensures: policy.settle_deadline = now_ms + config.settle_window_ms
     ensures: ScrollEffect.created(policy: policy, kind: start_settle_watch)
@@ -120,19 +139,17 @@ rule EmptyMeasurementWaitsForContent {
     requires: policy.lifecycle = unmeasured
     requires: unit_count = 0
     ensures: policy.conversation_id = conversation_id
-    ensures: policy.has_content = false
+    ensures: policy.lifecycle = measured_empty
     ensures: policy.previous_total_height = total_height
 }
 
 rule FirstContentAfterEmptyStartsRescueAndSnaps {
     when: ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
-    requires: policy.lifecycle = unmeasured
-    requires: policy.has_content = false
+    requires: policy.lifecycle = measured_empty
     requires: unit_count > 0
     ensures: policy.conversation_id = conversation_id
     ensures: policy.lifecycle = mount_rescue
     ensures: policy.follow_mode = following
-    ensures: policy.has_content = true
     ensures: policy.previous_total_height = total_height
     ensures: policy.settle_deadline = now_ms + config.settle_window_ms
     ensures: ScrollEffect.created(policy: policy, kind: snap_to_last_index)
@@ -148,36 +165,51 @@ rule InteractionPermanentlyExitsMountRescue {
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
 
-rule NavigationTakesReadingOwnership {
+rule NavigationFromLiveTakesReadingOwnership {
     when: NavigationJumped(policy)
-    requires: policy.lifecycle != unmeasured
-    ensures: policy.lifecycle = live
+    requires: policy.lifecycle = live
     ensures: policy.follow_mode = reading
-    ensures:
-        if policy.lifecycle = mount_rescue:
-            ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
 
-rule UpwardIntentTakesReadingOwnership {
+rule NavigationExitsMountRescueIntoReading {
+    when: NavigationJumped(policy)
+    requires: policy.lifecycle = mount_rescue
+    ensures: policy.lifecycle = live
+    ensures: policy.follow_mode = reading
+    ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
+}
+
+rule UpwardIntentFromLiveTakesReadingOwnership {
     when: UpwardIntent(policy)
-    requires: policy.lifecycle != unmeasured
-    ensures: policy.lifecycle = live
+    requires: policy.lifecycle = live
     ensures: policy.follow_mode = reading
-    ensures:
-        if policy.lifecycle = mount_rescue:
-            ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
 
-rule TouchStartRemembersFollowMode {
-    when: TouchStarted(policy)
-    requires: policy.lifecycle != unmeasured
+rule UpwardIntentExitsMountRescueIntoReading {
+    when: UpwardIntent(policy)
+    requires: policy.lifecycle = mount_rescue
     ensures: policy.lifecycle = live
+    ensures: policy.follow_mode = reading
+    ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
+}
+
+rule LiveTouchStartRemembersFollowMode {
+    when: TouchStarted(policy)
+    requires: policy.lifecycle = live
     ensures: policy.gesture_mode = touch_stationary
     ensures: policy.mode_before_gesture = policy.follow_mode
     ensures: policy.gesture_departed_bottom = not policy.at_bottom
-    ensures:
-        if policy.lifecycle = mount_rescue:
-            ScrollEffect.created(policy: policy, kind: stop_settle_watch)
+}
+
+rule MountTouchStartExitsRescueAndRemembersFollowing {
+    when: TouchStarted(policy)
+    requires: policy.lifecycle = mount_rescue
+    ensures: policy.lifecycle = live
+    ensures: policy.follow_mode = following
+    ensures: policy.gesture_mode = touch_stationary
+    ensures: policy.mode_before_gesture = following
+    ensures: policy.gesture_departed_bottom = not policy.at_bottom
+    ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
 
 rule TouchMovementTakesReadingOwnership {
@@ -203,12 +235,42 @@ rule MovedTouchEndPreservesReadingOwnership {
     ensures: policy.follow_mode = reading
 }
 
-rule TouchCancellationHasExplicitGestureEnd {
+rule StationaryTouchCancellationRestoresPreGestureMode {
+    when: TouchCancelled(policy, remaining_touches)
+    requires: remaining_touches = 0
+    requires: policy.gesture_mode = touch_stationary
+    ensures: policy.gesture_mode = idle
+    ensures: policy.follow_mode = policy.mode_before_gesture
+}
+
+rule MovedTouchCancellationPreservesReadingOwnership {
     when: TouchCancelled(policy, remaining_touches)
     requires: remaining_touches = 0
     requires: policy.gesture_mode = touch_moved
     ensures: policy.gesture_mode = idle
     ensures: policy.follow_mode = reading
+}
+
+rule TouchEndWithRemainingTouchesPreservesGesture {
+    when: TouchEnded(policy, remaining_touches)
+    requires: remaining_touches > 0
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    ensures: policy.gesture_mode = policy.gesture_mode
+}
+
+rule TouchCancelWithRemainingTouchesPreservesGesture {
+    when: TouchCancelled(policy, remaining_touches)
+    requires: remaining_touches > 0
+    requires: policy.gesture_mode in { touch_stationary, touch_moved }
+    ensures: policy.gesture_mode = policy.gesture_mode
+}
+
+rule LeavingBottomWhileIdleUpdatesGeometry {
+    when: ViewportPinnedChanged(policy, at_bottom)
+    requires: at_bottom = false
+    requires: policy.lifecycle in { mount_rescue, live }
+    requires: policy.gesture_mode = idle
+    ensures: policy.at_bottom = false
 }
 
 rule LeavingBottomDuringTouchIsRemembered {
@@ -219,6 +281,13 @@ rule LeavingBottomDuringTouchIsRemembered {
     ensures: policy.gesture_departed_bottom = true
 }
 
+rule BottomDuringStationaryTouchOnlyUpdatesGeometry {
+    when: ViewportPinnedChanged(policy, at_bottom)
+    requires: at_bottom = true
+    requires: policy.gesture_mode = touch_stationary
+    ensures: policy.at_bottom = true
+}
+
 rule BottomDuringMovedTouchCannotReleaseOwnership {
     when: ViewportPinnedChanged(policy, at_bottom)
     requires: at_bottom = true
@@ -227,17 +296,27 @@ rule BottomDuringMovedTouchCannotReleaseOwnership {
     ensures: policy.follow_mode = reading
 }
 
-rule IdleBottomConfirmationRestoresFollowing {
+rule LiveIdleBottomConfirmationRestoresFollowing {
     when: ViewportPinnedChanged(policy, at_bottom)
     requires: at_bottom = true
     requires: policy.gesture_mode = idle
-    requires: policy.lifecycle != unmeasured
-    ensures: policy.lifecycle = live
+    requires: policy.lifecycle = live
+    ensures: policy.at_bottom = true
     ensures: policy.follow_mode = following
     ensures: policy.unread = false
-    ensures:
-        if policy.lifecycle = mount_rescue:
-            ScrollEffect.created(policy: policy, kind: stop_settle_watch)
+    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
+}
+
+rule MountIdleBottomConfirmationExitsRescue {
+    when: ViewportPinnedChanged(policy, at_bottom)
+    requires: at_bottom = true
+    requires: policy.gesture_mode = idle
+    requires: policy.lifecycle = mount_rescue
+    ensures: policy.lifecycle = live
+    ensures: policy.at_bottom = true
+    ensures: policy.follow_mode = following
+    ensures: policy.unread = false
+    ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
     ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
 }
 
@@ -306,6 +385,20 @@ rule MountProbeWritesCurrentDomBottomWhenStranded {
     ensures: ScrollEffect.created(policy: policy, kind: write_dom_bottom)
 }
 
+rule SettledMountProbeBeforeDeadlineDoesNothing {
+    when: SettleProbe(policy, stranded, now_ms)
+    requires: policy.lifecycle = mount_rescue
+    requires: stranded = false
+    requires: now_ms <= policy.settle_deadline
+    ensures: policy.lifecycle = mount_rescue
+}
+
+rule LiveSettleProbeDoesNothing {
+    when: SettleProbe(policy, _, _)
+    requires: policy.lifecycle = live
+    ensures: policy.lifecycle = live
+}
+
 rule MountProbeExpiresIntoFollowing {
     when: SettleProbe(policy, _, now_ms)
     requires: policy.lifecycle = mount_rescue
@@ -325,8 +418,9 @@ rule JumpToNewestRequestsTailReturn {
     ensures: ScrollEffect.created(policy: policy, kind: snap_to_last_index)
 }
 
-rule ConversationIdentityChangeResetsSessionAtomically {
+rule LiveConversationChangeResetsSessionAtomically {
     when: ConversationChanged(policy, conversation_id)
+    requires: policy.lifecycle = live
     requires: policy.conversation_id != conversation_id
     ensures: policy.conversation_id = conversation_id
     ensures: policy.lifecycle = unmeasured
@@ -334,11 +428,29 @@ rule ConversationIdentityChangeResetsSessionAtomically {
     ensures: policy.gesture_mode = idle
     ensures: policy.at_bottom = true
     ensures: policy.unread = false
-    ensures: policy.has_content = false
-    ensures:
-        if policy.lifecycle = mount_rescue:
-            ScrollEffect.created(policy: policy, kind: stop_settle_watch)
     ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
+}
+
+rule MountConversationChangeStopsRescueAndResetsSession {
+    when: ConversationChanged(policy, conversation_id)
+    requires: policy.lifecycle = mount_rescue
+    requires: policy.conversation_id != conversation_id
+    ensures: policy.conversation_id = conversation_id
+    ensures: policy.lifecycle = unmeasured
+    ensures: policy.follow_mode = following
+    ensures: policy.gesture_mode = idle
+    ensures: policy.at_bottom = true
+    ensures: policy.unread = false
+    ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
+    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
+}
+
+rule UnreadyConversationChangeResetsIdentity {
+    when: ConversationChanged(policy, conversation_id)
+    requires: policy.lifecycle in { unmeasured, measured_empty }
+    requires: policy.conversation_id != conversation_id
+    ensures: policy.conversation_id = conversation_id
+    ensures: policy.lifecycle = unmeasured
 }
 
 invariant OnlyExplicitTailReturnReleasesReading {

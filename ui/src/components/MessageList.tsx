@@ -393,11 +393,21 @@ function MessageListImpl({
     });
   }, [readScrollSnapshot]);
 
-  const scheduleTailFollow = useCallback(() => {
-    if (tailFollowRafRef.current !== 0) return;
+  const scheduleTailFollow = useCallback((conversationIdAtSchedule: string | undefined) => {
+    if (tailFollowRafRef.current !== 0) {
+      cancelAnimationFrame(tailFollowRafRef.current);
+    }
     tailFollowRafRef.current = requestAnimationFrame(() => {
       tailFollowRafRef.current = 0;
-      virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+      const machine = scrollMachineRef.current;
+      const authorized =
+        machine.kind === 'live' &&
+        machine.conversationId === conversationIdAtSchedule &&
+        machine.follow.kind !== 'reading' &&
+        !(machine.gesture.kind === 'touch' && machine.gesture.moved);
+      if (authorized) {
+        virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
+      }
     });
   }, []);
 
@@ -431,7 +441,7 @@ function MessageListImpl({
           virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
           break;
         case 'scheduleTailFollow':
-          scheduleTailFollow();
+          scheduleTailFollow(effect.conversationId);
           break;
         case 'scheduleDomBottomWrite':
           scheduleDomBottomWrite();
@@ -489,9 +499,9 @@ function MessageListImpl({
       const onScroll = () => {
         const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight };
         const machine = scrollMachineRef.current;
-        const previousTop = machine.kind === 'unmeasured'
-          ? snapshot.scrollTop
-          : machine.geometry.lastSnapshot?.scrollTop ?? snapshot.scrollTop;
+        const previousTop = machine.kind === 'live' || machine.kind === 'mount-rescue'
+          ? machine.geometry.lastSnapshot?.scrollTop ?? snapshot.scrollTop
+          : snapshot.scrollTop;
         dispatchScrollEvent(
           snapshot.scrollTop < previousTop
             ? { type: 'upwardIntent', snapshot }
@@ -565,7 +575,9 @@ function MessageListImpl({
       unitCount: allUnitsLengthRef.current,
       snapshot: readScrollSnapshot(),
     };
-    dispatchScrollEvent(machine.kind === 'unmeasured' || machine.conversationId !== conversationId
+    dispatchScrollEvent(
+      (machine.kind === 'unmeasured' || machine.kind === 'measured-empty') ||
+      machine.conversationId !== conversationId
       ? {
           type: 'conversationMeasured',
           conversationId,

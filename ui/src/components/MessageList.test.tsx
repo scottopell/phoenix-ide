@@ -899,6 +899,77 @@ describe('handleTotalListHeightChanged', () => {
     }
   });
 
+  it.each([
+    ['moved touch cancellation', (scroller: HTMLElement, rerender: (ui: React.ReactElement) => void) => {
+      void rerender;
+      fireEvent.touchStart(scroller, { touches: [{}] });
+      fireEvent.touchMove(scroller, { touches: [{}] });
+      fireEvent.touchCancel(scroller, { touches: [] });
+    }],
+    ['conversation reset', (_scroller: HTMLElement, rerender: (ui: React.ReactElement) => void) => {
+      rerender(withConvContext(
+        <MessageList
+          messages={Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'))}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-after-deferred-follow"
+        />,
+      ));
+    }],
+  ])('revalidates deferred tail follow after %s', async (_name, transferOwnership) => {
+    let releaseFrame: FrameRequestCallback | null = null;
+    const requestAnimationFrameSpy = vi
+      .spyOn(window, 'requestAnimationFrame')
+      .mockImplementation((callback) => {
+        releaseFrame = callback;
+        return 42;
+      });
+    const cancelAnimationFrameSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {});
+    try {
+      const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
+      const { container, rerender } = render(
+        withConvContext(
+          <MessageList
+            messages={historical}
+            pendingMessages={[]}
+            convState={idleState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-deferred-follow"
+          />,
+        ),
+      );
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      setupScroller(scroller, { scrollHeight: 500, scrollTop: 100, clientHeight: 400 });
+      act(() => virtuosoMock.totalListHeightChanged?.(500));
+      fireEvent.pointerDown(scroller);
+      releaseFrame = null;
+      virtuosoMock.scrollToIndex.mockClear();
+
+      rerender(withConvContext(
+        <MessageList
+          messages={[...historical, makeMessage(6, 'user')]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-deferred-follow"
+        />,
+      ));
+      await waitFor(() => expect(releaseFrame).not.toBeNull());
+
+      transferOwnership(scroller, rerender);
+      act(() => releaseFrame?.(performance.now()));
+
+      expect(virtuosoMock.scrollToIndex).not.toHaveBeenCalled();
+    } finally {
+      requestAnimationFrameSpy.mockRestore();
+      cancelAnimationFrameSpy.mockRestore();
+    }
+  });
+
   it('marks unread tail content when a gesture suppresses the pinned snap during tail growth', () => {
     const historical = Array.from({ length: 5 }, (_, i) => makeMessage(i + 1, 'user'));
     const subAgentsState: ConversationState = {
