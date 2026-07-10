@@ -17,5 +17,8 @@ CompactToolStrip.storyName = 'compact-tool-strip';
 export const ScrollPolicyLong = storyFor('scroll-policy-long');
 ScrollPolicyLong.storyName = 'scroll-policy-long';
 
+export const WideMarkdownTable = storyFor('wide-markdown-table');
+WideMarkdownTable.storyName = 'wide-markdown-table';
+
 export const MarkdownImageDark = storyFor('markdown-image-dark');
 MarkdownImageDark.storyName = 'markdown-image-dark';

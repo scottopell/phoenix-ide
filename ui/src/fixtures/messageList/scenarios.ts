@@ -208,6 +208,42 @@ const markdownImageMessages: Message[] = [
   },
 ];
 
+const wideMarkdownTableMessages: Message[] = [
+  {
+    message_id: 'user-wide-table-1',
+    conversation_id: 'fixture-message-list',
+    sequence_id: 1,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T10:00:00.000Z',
+    content: { text: 'Compare the operating models in a table.' },
+    display_data: {},
+  },
+  {
+    message_id: 'agent-wide-table-1',
+    conversation_id: 'fixture-message-list',
+    sequence_id: 2,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:00.000Z',
+    content: [{
+      type: 'text',
+      text: [
+        'The prose remains in the readable conversation column while the comparison uses the available pane width.',
+        '',
+        '| Operating model | Test world | Scarce expertise | Operational coupling | Primary consumers | Success horizon |',
+        '| --- | --- | --- | --- | --- | --- |',
+        '| Shared platform | kernels, fuzzing, workload replay | Linux, eBPF, security | release and fleet teams | infrastructure product groups | performance and correctness |',
+        '| Specialist program | device fixtures and adversarial testing | GPU and runtime integration | artifact owners | feature delivery teams | durable expertise transfer |',
+        '| Temporary initiative | large-cluster chaos and rollout tests | Kubernetes controllers | onboarding teams | service owners | convergence and safe migration |',
+        '',
+        'The paragraph after the table returns to the same readable prose width.',
+      ].join('\n'),
+    }],
+    display_data: {},
+  },
+];
+
 
 export const messageListScenarios = [
   {
@@ -226,6 +262,12 @@ export const messageListScenarios = [
     id: 'scroll-policy-long',
     title: 'Scroll policy long conversation',
     description: 'Long deterministic conversation with controls for real Virtuoso tail-follow QA.',
+    theme: 'dark',
+  },
+  {
+    id: 'wide-markdown-table',
+    title: 'Wide Markdown table',
+    description: 'Wide assistant tables expand beyond prose while staying inside the conversation pane.',
     theme: 'dark',
   },
   {
@@ -249,9 +291,11 @@ export function messageListFixtureData(scenario: MessageListScenario): MessageLi
     ? toolStripMessages
     : scenario.id === 'markdown-image-dark'
       ? markdownImageMessages
-      : scenario.id === 'scroll-policy-long'
-        ? scrollPolicyMessages
-        : baseMessages;
+      : scenario.id === 'wide-markdown-table'
+        ? wideMarkdownTableMessages
+        : scenario.id === 'scroll-policy-long'
+          ? scrollPolicyMessages
+          : baseMessages;
   return {
     conversationId: `fixture-message-list-${scenario.id}`,
     slug: `fixture-message-list-${scenario.id}`,
