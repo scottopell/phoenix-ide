@@ -2312,6 +2312,15 @@ impl Database {
                  SELECT lease_until AS deadline
                  FROM conversation_creation_jobs
                  WHERE status = 'claimed'
+                 UNION ALL
+                 SELECT updated_at AS deadline
+                 FROM conversation_creation_jobs
+                 WHERE status IN ('cancelling', 'deletion_pending', 'failed')
+                   AND EXISTS (
+                       SELECT 1 FROM conversation_creation_resource_reservations r
+                       WHERE r.job_id = conversation_creation_jobs.id
+                         AND r.status != 'released'
+                   )
              )",
         )
         .fetch_one(&self.pool)
@@ -2444,9 +2453,16 @@ impl Database {
     pub async fn next_conversation_creation_cleanup(&self) -> DbResult<Option<CreationCleanupJob>> {
         let row: Option<(String, String, String)> = sqlx::query_as(
             "SELECT id, conversation_id, status FROM conversation_creation_jobs
-             WHERE status IN ('cancelling', 'deletion_pending')
-             ORDER BY updated_at, id LIMIT 1",
+             WHERE status IN ('cancelling', 'deletion_pending', 'failed')
+               AND updated_at <= ?1
+               AND EXISTS (
+                   SELECT 1 FROM conversation_creation_resource_reservations r
+                   WHERE r.job_id = conversation_creation_jobs.id
+                     AND r.status != 'released'
+               )
+             ORDER BY COALESCE(next_attempt_at, updated_at), id LIMIT 1",
         )
+        .bind(Utc::now().to_rfc3339())
         .fetch_optional(&self.pool)
         .await?;
         let Some((job_id, conversation_id, status)) = row else {
@@ -2459,6 +2475,28 @@ impl Database {
             status,
             reservations,
         }))
+    }
+
+    /// Schedule another cleanup reconciliation attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails.
+    pub async fn schedule_conversation_creation_cleanup_retry(
+        &self,
+        job_id: &str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET updated_at = ?1
+             WHERE id = ?2 AND status IN ('cancelling', 'deletion_pending', 'failed')",
+        )
+        .bind(next_attempt_at.to_rfc3339())
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Mark one reserved resource released after reconciliation.
@@ -2511,7 +2549,7 @@ impl Database {
             .bind(&cleanup.job_id)
             .execute(&self.pool)
             .await?;
-        } else {
+        } else if cleanup.status == "deletion_pending" {
             sqlx::query("DELETE FROM conversations WHERE id = ?1")
                 .bind(&cleanup.conversation_id)
                 .execute(&self.pool)
@@ -2789,11 +2827,20 @@ impl Database {
         .bind(&claim.token.0)
         .execute(&self.pool)
         .await?;
-        Ok(if result.rows_affected() == 1 {
-            CreationCasOutcome::Applied
+        if result.rows_affected() == 1 {
+            sqlx::query(
+                "UPDATE conversation_creation_resource_reservations
+                 SET status = 'cleanup_required', updated_at = ?1
+                 WHERE job_id = ?2 AND status IN ('reserved', 'present')",
+            )
+            .bind(&now)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
+            Ok(CreationCasOutcome::Applied)
         } else {
-            CreationCasOutcome::ClaimLost
-        })
+            Ok(CreationCasOutcome::ClaimLost)
+        }
     }
 
     /// Mark a creation job ready only while the supplied claim is current.
@@ -7198,6 +7245,144 @@ mod tests {
                 .protocol
                 .status,
             CreationStatus::Ready
+        ));
+    }
+
+    #[tokio::test]
+    async fn creation_stage_checkpoint_rejects_stale_generation() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-stage", "conv-stage").await;
+        let now = Utc::now();
+        let first = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(first_job) = first else {
+            panic!("expected first claim");
+        };
+        let CreationStatus::Claimed(first_claim) = first_job.protocol.status else {
+            panic!("expected first authority");
+        };
+        assert_eq!(
+            db.advance_conversation_creation_stage(
+                "job-stage",
+                &first_claim,
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let takeover = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now + chrono::Duration::seconds(11),
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(second_job) = takeover else {
+            panic!("expected replacement claim");
+        };
+        let CreationStatus::Claimed(second_claim) = second_job.protocol.status else {
+            panic!("expected replacement authority");
+        };
+        assert_eq!(second_job.protocol.stage, CreationStage::ResolveRepository);
+        assert_eq!(
+            db.advance_conversation_creation_stage(
+                "job-stage",
+                &first_claim,
+                CreationStage::ResolveRepository,
+                CreationStage::ReserveResources,
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        assert_eq!(
+            db.advance_conversation_creation_stage(
+                "job-stage",
+                &second_claim,
+                CreationStage::ResolveRepository,
+                CreationStage::ReserveResources,
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_creation_reconciles_resources_without_deleting_record() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-failed-cleanup", "conv-failed-cleanup").await;
+        let now = Utc::now();
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected authority");
+        };
+        db.reserve_conversation_creation_resource(
+            "reservation-failed",
+            "job-failed-cleanup",
+            &claim,
+            "/repo",
+            "/repo/worktree",
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.fail_conversation_creation_job(
+                "job-failed-cleanup",
+                &claim,
+                "permanent failure",
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let cleanup = db
+            .next_conversation_creation_cleanup()
+            .await
+            .unwrap()
+            .expect("failed cleanup");
+        assert_eq!(cleanup.status, "failed");
+        db.release_creation_resource("reservation-failed")
+            .await
+            .unwrap();
+        db.finish_conversation_creation_cleanup(&cleanup, now)
+            .await
+            .unwrap();
+        assert!(db.get_conversation("conv-failed-cleanup").await.is_ok());
+        assert!(matches!(
+            db.get_conversation_creation_job("job-failed-cleanup")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Failed(_)
         ));
     }
 

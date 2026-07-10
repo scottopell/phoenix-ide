@@ -25,7 +25,17 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         .await
         .map_err(|error| error.to_string())?
     {
-        reconcile_creation_cleanup(manager, &cleanup).await?;
+        if let Err(error) = reconcile_creation_cleanup(manager, &cleanup).await {
+            tracing::warn!(job_id = %cleanup.job_id, error = %error, "conversation creation cleanup will retry");
+            manager
+                .db()
+                .schedule_conversation_creation_cleanup_retry(
+                    &cleanup.job_id,
+                    chrono::Utc::now() + chrono::Duration::seconds(30),
+                )
+                .await
+                .map_err(|db_error| db_error.to_string())?;
+        }
     }
     loop {
         let token = CreationClaimToken(uuid::Uuid::new_v4().to_string());
@@ -122,7 +132,7 @@ async fn process_claimed_job(
 #[allow(clippy::too_many_lines)]
 async fn process_job(
     manager: &Arc<RuntimeManager>,
-    job: crate::db::ConversationCreationJob,
+    mut job: crate::db::ConversationCreationJob,
 ) -> Result<(), String> {
     let conv_id = job.conversation_id.clone();
     let CreationStatus::Claimed(claim) = job.protocol.status.clone() else {
@@ -170,7 +180,7 @@ async fn process_job(
         });
     }
 
-    match provision_conversation(manager, &job).await {
+    match provision_conversation(manager, &mut job).await {
         Ok(ProvisionOutcome::SeededEmpty) => {
             let outcome = manager
                 .db()
@@ -256,10 +266,10 @@ enum ProvisionOutcome {
 #[allow(clippy::too_many_lines)]
 async fn provision_conversation(
     manager: &Arc<RuntimeManager>,
-    job: &crate::db::ConversationCreationJob,
+    job: &mut crate::db::ConversationCreationJob,
 ) -> Result<ProvisionOutcome, (String, ErrorKind)> {
-    let intent = &job.intent;
-    let CreationStatus::Claimed(claim) = &job.protocol.status else {
+    let intent = job.intent.clone();
+    let CreationStatus::Claimed(claim) = job.protocol.status.clone() else {
         return Err((
             "creation provisioning lacks claim authority".to_string(),
             ErrorKind::ServerError,
@@ -267,6 +277,13 @@ async fn provision_conversation(
     };
     let valid_cwd = crate::conversation_cwd::validate_conversation_cwd(&intent.cwd)
         .map_err(|e| (e.to_string(), ErrorKind::InvalidRequest))?;
+    checkpoint_creation_stage(
+        manager,
+        job,
+        &claim,
+        phoenix_core::domain::creation_protocol::CreationStage::ResolveRepository,
+    )
+    .await?;
     let initial_cwd = valid_cwd.into_raw();
     let repo_root = phoenix_core::git::detect_git_repo_root(Path::new(&initial_cwd));
     let requested_mode = intent.mode.as_deref().unwrap_or("direct");
@@ -318,7 +335,21 @@ async fn provision_conversation(
             })?;
             validate_user_ref(&branch_name).map_err(app_error_to_kind)?;
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
-            reserve_worktree(manager, job, claim, &repo_root, &existing_path).await?;
+            checkpoint_creation_stage(
+                manager,
+                job,
+                &claim,
+                phoenix_core::domain::creation_protocol::CreationStage::ReserveResources,
+            )
+            .await?;
+            reserve_worktree(manager, job, &claim, &repo_root, &existing_path).await?;
+            checkpoint_creation_stage(
+                manager,
+                job,
+                &claim,
+                phoenix_core::domain::creation_protocol::CreationStage::MaterializeWorktree,
+            )
+            .await?;
             let db = manager.db().clone();
             let conv_id = job.conversation_id.clone();
             let repo_for_blocking = repo_root.clone();
@@ -365,7 +396,14 @@ async fn provision_conversation(
                 )
             })?;
             let info = info?;
-            mark_worktree_present(manager, job, claim, &existing_path).await?;
+            mark_worktree_present(manager, job, &claim, &existing_path).await?;
+            checkpoint_creation_stage(
+                manager,
+                job,
+                &claim,
+                phoenix_core::domain::creation_protocol::CreationStage::FinalizeAttachments,
+            )
+            .await?;
             effective_cwd.clone_from(&info.worktree_path);
             desired_base_branch = Some(info.base_branch.clone());
             conv_mode = ConvMode::Branch {
@@ -411,7 +449,21 @@ async fn provision_conversation(
                 validate_user_ref(checkout_ref).map_err(app_error_to_kind)?;
             }
             let existing_path = deterministic_worktree_path(&repo_root, &job.conversation_id);
-            reserve_worktree(manager, job, claim, &repo_root, &existing_path).await?;
+            checkpoint_creation_stage(
+                manager,
+                job,
+                &claim,
+                phoenix_core::domain::creation_protocol::CreationStage::ReserveResources,
+            )
+            .await?;
+            reserve_worktree(manager, job, &claim, &repo_root, &existing_path).await?;
+            checkpoint_creation_stage(
+                manager,
+                job,
+                &claim,
+                phoenix_core::domain::creation_protocol::CreationStage::MaterializeWorktree,
+            )
+            .await?;
             let conv_id = job.conversation_id.clone();
             let repo_for_blocking = repo_root.clone();
             let path_for_blocking = existing_path.clone();
@@ -440,7 +492,14 @@ async fn provision_conversation(
                 )
             })?;
             let worktree = worktree?;
-            mark_worktree_present(manager, job, claim, &existing_path).await?;
+            mark_worktree_present(manager, job, &claim, &existing_path).await?;
+            checkpoint_creation_stage(
+                manager,
+                job,
+                &claim,
+                phoenix_core::domain::creation_protocol::CreationStage::FinalizeAttachments,
+            )
+            .await?;
             effective_cwd.clone_from(&worktree);
             desired_base_branch = Some(base_branch.clone());
             let tasks_dir_name = taskmd_core::discover::discover_or_default(Path::new(&worktree));
@@ -540,9 +599,15 @@ async fn provision_conversation(
         )
         .await
     {
-        cleanup_unpersisted_worktree(repo_root.as_deref(), &job.conversation_id, &conv_mode);
         return Err((e.to_string(), ErrorKind::ServerError));
     }
+    checkpoint_creation_stage(
+        manager,
+        job,
+        &claim,
+        phoenix_core::domain::creation_protocol::CreationStage::BootstrapInitialTurn,
+    )
+    .await?;
     let persisted_conversation = manager
         .db()
         .get_conversation(&job.conversation_id)
@@ -657,6 +722,13 @@ async fn provision_conversation(
         .send_event(&job.conversation_id, event)
         .await
         .map_err(|e| (e, ErrorKind::ServerError))?;
+    checkpoint_creation_stage(
+        manager,
+        job,
+        &claim,
+        phoenix_core::domain::creation_protocol::CreationStage::Finalize,
+    )
+    .await?;
     Ok(ProvisionOutcome::InitialMessageSubmitted)
 }
 
@@ -703,6 +775,36 @@ impl Drop for RepositoryMutationLock {
             tracing::warn!(error = %error, "failed to unlock repository creation lock");
         }
     }
+}
+
+async fn checkpoint_creation_stage(
+    manager: &Arc<RuntimeManager>,
+    job: &mut crate::db::ConversationCreationJob,
+    claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+    target: phoenix_core::domain::creation_protocol::CreationStage,
+) -> Result<(), (String, ErrorKind)> {
+    while job.protocol.stage < target {
+        let current = job.protocol.stage;
+        let Some(next) = current.next() else {
+            return Err((
+                "creation stage cannot advance beyond finalize".to_string(),
+                ErrorKind::ServerError,
+            ));
+        };
+        let outcome = manager
+            .db()
+            .advance_conversation_creation_stage(&job.id, claim, current, next, chrono::Utc::now())
+            .await
+            .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
+        if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+            return Err((
+                "creation claim was lost while checkpointing".to_string(),
+                ErrorKind::Cancelled,
+            ));
+        }
+        job.protocol.stage = next;
+    }
+    Ok(())
 }
 
 async fn reserve_worktree(
@@ -851,55 +953,6 @@ fn deterministic_worktree_path(repo_root: &str, conv_id: &str) -> std::path::Pat
         .join(".phoenix")
         .join("worktrees")
         .join(conv_id)
-}
-
-fn cleanup_unpersisted_worktree(
-    repo_root: Option<&str>,
-    conversation_id: &str,
-    conv_mode: &ConvMode,
-) {
-    let Some(worktree_path) = conv_mode.worktree_path() else {
-        return;
-    };
-    let worktree = PathBuf::from(worktree_path);
-    let branch_to_delete = match conv_mode {
-        ConvMode::Explore {
-            worktree_path: Some(_),
-            ..
-        } => {
-            let id_prefix: String = conversation_id.chars().take(8).collect();
-            Some(format!("task-pending-{id_prefix}"))
-        }
-        ConvMode::Work { .. }
-        | ConvMode::Branch { .. }
-        | ConvMode::Explore {
-            worktree_path: None,
-            ..
-        }
-        | ConvMode::Direct => None,
-    };
-
-    if let Some(repo_root) = repo_root {
-        let worktree_str = worktree.to_string_lossy().to_string();
-        if let Err(e) = crate::git_ops::run_git(
-            Path::new(repo_root),
-            &["worktree", "remove", &worktree_str, "--force"],
-        ) {
-            tracing::warn!(conversation_id, worktree = %worktree.display(), error = %e, "failed to remove unpersisted worktree via git; trying filesystem fallback");
-            if let Err(rm_err) = std::fs::remove_dir_all(&worktree) {
-                tracing::warn!(conversation_id, worktree = %worktree.display(), error = %rm_err, "failed to remove unpersisted worktree via filesystem fallback");
-            }
-        }
-        if let Some(branch) = branch_to_delete {
-            if let Err(e) =
-                crate::git_ops::run_git(Path::new(repo_root), &["branch", "-D", &branch])
-            {
-                tracing::debug!(conversation_id, branch, error = %e, "failed to delete unpersisted temporary branch");
-            }
-        }
-    } else if let Err(e) = std::fs::remove_dir_all(&worktree) {
-        tracing::warn!(conversation_id, worktree = %worktree.display(), error = %e, "failed to remove unpersisted worktree without repo root");
-    }
 }
 
 fn creation_error_is_retryable(kind: &ErrorKind) -> bool {
