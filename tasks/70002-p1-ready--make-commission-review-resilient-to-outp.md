@@ -26,6 +26,12 @@ Three consecutive attempts failed with the same shape:
 
 The third attempt explicitly narrowed the brief to the implementation files and actionable defects, but the tool still sent the full five-file branch diff, including an 86-line task document, and failed identically.
 
+## Provider-routing diagnosis
+
+The parent conversation was running on `gpt-5.6-sol`, but the failure text came from Anthropic. This is explained by `commission_review` selecting `ctx.llm_selector().default_service()` rather than the conversation's selected model. `ModelRegistry::pick_default_model` prefers `claude-sonnet-5`, `claude-sonnet-4-6`, and `claude-sonnet-4-5` before `gpt-5.6-sol`, so the nested capital-spend request can silently switch providers.
+
+The tool then records usage with the synthetic model label `commission_review`, which hides the actual reviewer model/provider. Users cannot know before approval which provider will receive the diff or diagnose provider-specific failures from structured usage metadata.
+
 ## Required behavior
 
 - Review work must produce a usable result when the reviewer exhausts its initial output budget.
@@ -35,6 +41,9 @@ The third attempt explicitly narrowed the brief to the implementation files and 
 - User-supplied focus/brief narrowing must affect the material sent for review, or the tool must expose an explicit file-scope mechanism.
 - A retry recommendation must change the execution strategy; it must not recommend repeating the same request unchanged.
 - Capital-spend accounting and diagnostics must distinguish provider work that yielded recoverable partial output from a true empty response.
+- Approval must disclose the actual reviewer model and provider selected for the nested request.
+- The result and usage metadata must record the actual reviewer model/provider, not only the synthetic `commission_review` label.
+- Reviewer routing must be explicit by design: either inherit the conversation model, select a documented dedicated review model, or expose the choice to the caller. It must not silently depend on global default-model preference order.
 
 ## Acceptance criteria
 
@@ -44,3 +53,4 @@ The third attempt explicitly narrowed the brief to the implementation files and 
 - Large task/spec prose cannot starve review findings for a small implementation diff.
 - Repeated identical calls do not fail three times through the same unchanged path.
 - Failure responses, when no recovery is possible, explain what was attempted and provide an actionable non-identical retry path.
+- A conversation using `gpt-5.6-sol` cannot silently send review content to Anthropic without the approval surface and output identifying that provider/model.
