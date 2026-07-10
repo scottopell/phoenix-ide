@@ -18,11 +18,36 @@ import process from 'node:process';
  * @property {string} readyAttribute       data-* attribute the fixture sets to the scenario id when settled.
  * @property {string} outDir               Output directory for PNGs (resolved against cwd).
  * @property {{width:number,height:number}} [viewport]   Capture viewport; defaults to 960x900.
+ * @property {{name:string,width:number,height:number}[]} [viewportMatrix]  Optional named viewport set; captures each story once per viewport.
  * @property {Map<string,string[]>} [expectedConsoleErrors]  scenario id → console-error substrings to tolerate.
  */
 
 const port = Number(process.env.LADLE_PORT ?? 61123);
 const baseUrl = process.env.LADLE_URL ?? `http://127.0.0.1:${port}`;
+
+function normalizeViewportMatrix(viewportMatrix, viewport) {
+  if (!Array.isArray(viewportMatrix) || viewportMatrix.length === 0) {
+    return [viewport];
+  }
+  return viewportMatrix.map((item, index) => {
+    if (!item || typeof item.name !== 'string' || item.name.length === 0) {
+      throw new Error(`viewportMatrix[${index}] must include a non-empty name`);
+    }
+    if (!Number.isFinite(item.width) || !Number.isFinite(item.height)) {
+      throw new Error(`viewportMatrix[${index}] must include finite width and height`);
+    }
+    return { name: item.name, width: item.width, height: item.height };
+  });
+}
+
+function screenshotFileName(id, viewport) {
+  return viewport.name ? `${id}--${viewport.name}.png` : `${id}.png`;
+}
+
+export const __testables = {
+  normalizeViewportMatrix,
+  screenshotFileName,
+};
 
 async function waitForLadle() {
   const deadline = Date.now() + 30_000;
@@ -72,10 +97,13 @@ export async function captureSurface(config) {
     readyAttribute,
     outDir,
     viewport = { width: 960, height: 900 },
+    viewportMatrix,
     expectedConsoleErrors = new Map(),
   } = config;
   const resolvedOut = path.resolve(outDir);
   await mkdir(resolvedOut, { recursive: true });
+
+  const captureViewports = normalizeViewportMatrix(viewportMatrix, viewport);
 
   const ladle = spawn('pnpm', ['exec', 'ladle', 'serve', '--port', String(port), '--host', '127.0.0.1'], {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -103,7 +131,10 @@ export async function captureSurface(config) {
   const stories = await discoverStories(storyPrefix);
   console.log(`Capturing ${stories.length} ${surface} stories`);
   const browser = await chromium.launch();
-  const page = await browser.newPage({ viewport, deviceScaleFactor: 1 });
+  const page = await browser.newPage({
+    viewport: { width: captureViewports[0].width, height: captureViewports[0].height },
+    deviceScaleFactor: 1,
+  });
   const consoleErrors = [];
   page.on('console', (message) => {
     if (message.type() === 'error') consoleErrors.push(message.text());
@@ -112,19 +143,22 @@ export async function captureSurface(config) {
 
   try {
     for (const { storyKey, id } of stories) {
-      consoleErrors.length = 0;
-      const url = `${baseUrl}/?story=${storyKey}&mode=preview`;
-      await page.goto(url, { waitUntil: 'networkidle' });
-      await page.waitForSelector(`[${readyAttribute}="${id}"]`, { timeout: 10_000 });
-      await page.screenshot({ path: path.join(resolvedOut, `${id}.png`), fullPage: true });
-      const unexpectedErrors = consoleErrors.filter((error) => {
-        const expected = expectedConsoleErrors.get(id) ?? [];
-        return !expected.some((item) => error.includes(item));
-      });
-      if (unexpectedErrors.length > 0) {
-        throw new Error(`Console errors while capturing ${id}:\n${unexpectedErrors.join('\n')}`);
+      for (const currentViewport of captureViewports) {
+        consoleErrors.length = 0;
+        await page.setViewportSize({ width: currentViewport.width, height: currentViewport.height });
+        const url = `${baseUrl}/?story=${storyKey}&mode=preview`;
+        await page.goto(url, { waitUntil: 'networkidle' });
+        await page.waitForSelector(`[${readyAttribute}="${id}"]`, { timeout: 10_000 });
+        await page.screenshot({ path: path.join(resolvedOut, screenshotFileName(id, currentViewport)), fullPage: true });
+        const unexpectedErrors = consoleErrors.filter((error) => {
+          const expected = expectedConsoleErrors.get(id) ?? [];
+          return !expected.some((item) => error.includes(item));
+        });
+        if (unexpectedErrors.length > 0) {
+          throw new Error(`Console errors while capturing ${id}${currentViewport.name ? ` (${currentViewport.name})` : ''}:\n${unexpectedErrors.join('\n')}`);
+        }
+        console.log(`✓ captured ${id}${currentViewport.name ? ` [${currentViewport.name}]` : ''}`);
       }
-      console.log(`✓ captured ${id}`);
     }
   } finally {
     await browser.close();

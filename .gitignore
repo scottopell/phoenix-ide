@@ -32,6 +32,3 @@ scripts/install.sh
 # Local QA screenshots — generated on demand, not committed
 ui/qa-artifacts/
 qa-artifacts/
-
-# UI audit screenshots — captured locally, not for git history
-ui-audit/screenshots/

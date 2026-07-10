@@ -1,0 +1,14 @@
+.tool-results-fixture-stage {
+  display: block;
+  min-height: calc(100vh - 40px);
+}
+
+.tool-results-fixture-shell {
+  width: min(100%, 900px);
+  margin: 0 auto;
+  overflow: visible;
+}
+
+.tool-results-fixture-shell > .message {
+  flex: none;
+}
