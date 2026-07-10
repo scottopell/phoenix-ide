@@ -399,7 +399,7 @@ pub struct ConversationCreationJob {
     pub conversation_id: String,
     #[serde(default)]
     pub message_id: Option<String>,
-    pub phase: ConversationCreationPhase,
+    pub protocol: crate::domain::creation_protocol::CreationProtocolState,
     pub intent: ConversationCreationIntent,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

@@ -201,6 +201,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_conversation_creation_job_images",
         sql: MIGRATION_037,
     },
+    Migration {
+        version: 38,
+        name: "add_fenced_creation_protocol",
+        sql: MIGRATION_038,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -1067,6 +1072,88 @@ WHERE json_type(j.intent_json, '$.images') = 'array'
   AND json_extract(image.value, '$.data') IS NOT NULL;
 ";
 
+const MIGRATION_038: &str = r"
+ALTER TABLE conversation_creation_jobs RENAME TO conversation_creation_jobs_legacy;
+ALTER TABLE conversation_creation_job_files RENAME TO conversation_creation_job_files_legacy;
+ALTER TABLE conversation_creation_job_images RENAME TO conversation_creation_job_images_legacy;
+
+CREATE TABLE conversation_creation_jobs (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL UNIQUE REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT UNIQUE,
+    status TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 0,
+    claim_worker_id TEXT,
+    claim_token TEXT,
+    lease_until TEXT,
+    next_attempt_at TEXT,
+    intent_json TEXT NOT NULL,
+    error TEXT,
+    accepted_at TEXT NOT NULL,
+    provisioning_started_at TEXT,
+    completed_at TEXT,
+    failed_at TEXT,
+    cancelled_at TEXT,
+    deletion_requested_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'deletion_pending', 'ready', 'failed')),
+    CHECK (stage IN ('validate_intent', 'resolve_repository', 'reserve_resources', 'materialize_worktree', 'finalize_attachments', 'expand_initial_message', 'commit_metadata', 'bootstrap_initial_turn', 'finalize')),
+    CHECK (attempt >= 0 AND attempt <= 4),
+    CHECK (generation >= attempt),
+    CHECK ((status = 'claimed') = (claim_worker_id IS NOT NULL AND claim_token IS NOT NULL AND lease_until IS NOT NULL)),
+    CHECK ((status = 'retry_scheduled') = (next_attempt_at IS NOT NULL)),
+    CHECK ((status = 'ready') = (completed_at IS NOT NULL)),
+    CHECK ((status = 'failed') = (failed_at IS NOT NULL AND error IS NOT NULL)),
+    CHECK ((status = 'cancelled') = (cancelled_at IS NOT NULL)),
+    CHECK ((status = 'deletion_pending') = (deletion_requested_at IS NOT NULL))
+);
+
+INSERT INTO conversation_creation_jobs (
+    id, conversation_id, message_id, status, stage, attempt, generation,
+    intent_json, error, accepted_at, provisioning_started_at, completed_at,
+    failed_at, created_at, updated_at
+)
+SELECT id, conversation_id, message_id,
+       CASE phase WHEN 'provisioning' THEN 'accepted' ELSE phase END,
+       'validate_intent', 0, 0, intent_json, error,
+       COALESCE(accepted_at, created_at), provisioning_started_at,
+       completed_at, failed_at, created_at, updated_at
+FROM conversation_creation_jobs_legacy;
+
+CREATE TABLE conversation_creation_job_files (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    stored_path TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+INSERT INTO conversation_creation_job_files SELECT * FROM conversation_creation_job_files_legacy;
+
+CREATE TABLE conversation_creation_job_images (
+    job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (job_id, ordinal)
+);
+INSERT INTO conversation_creation_job_images SELECT * FROM conversation_creation_job_images_legacy;
+
+DROP TABLE conversation_creation_job_files_legacy;
+DROP TABLE conversation_creation_job_images_legacy;
+DROP TABLE conversation_creation_jobs_legacy;
+
+DROP INDEX IF EXISTS idx_creation_jobs_phase_updated;
+CREATE INDEX idx_creation_jobs_due
+    ON conversation_creation_jobs(status, next_attempt_at, lease_until, accepted_at);
+CREATE INDEX idx_creation_job_files_stored_path
+    ON conversation_creation_job_files(stored_path);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -1904,16 +1991,13 @@ mod tests {
             "Expected conversation_creation_jobs table to exist after migration 35; got {columns:?}"
         );
 
-        let phase_index: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_creation_jobs_phase_updated'"
+        let due_index: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_creation_jobs_due'",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(
-            phase_index,
-            vec!["idx_creation_jobs_phase_updated".to_string()]
-        );
+        assert_eq!(due_index, vec!["idx_creation_jobs_due".to_string()]);
     }
 
     #[tokio::test]
@@ -1955,6 +2039,47 @@ mod tests {
         assert!(
             columns.iter().any(|c| c == "data"),
             "Expected conversation_creation_job_images table to exist after migration 37; got {columns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_035_adds_fenced_creation_protocol_constraints() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversation_creation_jobs)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        for expected in [
+            "status",
+            "stage",
+            "attempt",
+            "generation",
+            "claim_worker_id",
+            "claim_token",
+            "lease_until",
+            "next_attempt_at",
+        ] {
+            assert!(columns.iter().any(|column| column == expected));
+        }
+
+        let invalid = sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                id, conversation_id, status, stage, attempt, generation,
+                intent_json, accepted_at, created_at, updated_at
+             ) VALUES ('job-invalid', 'missing-conversation', 'claimed',
+                       'validate_intent', 1, 1, '{}', 'now', 'now', 'now')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            invalid.is_err(),
+            "claimed row without authority must be rejected"
         );
     }
 

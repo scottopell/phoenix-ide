@@ -4,33 +4,39 @@ use crate::api::handlers::{
     BranchWorktreeInfo, ManagedWorktreeError,
 };
 use crate::db::{
-    ConvMode, ConversationCreationMetadataUpdate, ConversationCreationPhase, ErrorKind,
-    NonEmptyString,
+    ConvMode, ConversationCreationMetadataUpdate, ConversationCreationPhase, CreationClaimOutcome,
+    ErrorKind, NonEmptyString,
 };
 use crate::runtime::{ConversationMetadataUpdate, EvictionReason, RuntimeManager, SseEvent};
 use crate::state_machine::{ConvState, Event};
-use futures::future::join_all;
+use phoenix_core::domain::creation_protocol::{
+    CreationClaimToken, CreationStatus, CreationWorkerId,
+};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<(), String> {
-    let jobs = manager
-        .db()
-        .list_pending_conversation_creation_jobs()
-        .await
-        .map_err(|e| e.to_string())?;
-    let results = join_all(jobs.into_iter().map(|job| {
-        let manager = Arc::clone(manager);
-        async move { process_job(&manager, job).await }
-    }))
-    .await;
-    for result in results {
-        if let Err(error) = result {
+    let worker_id = CreationWorkerId(format!("creation-worker-{}", uuid::Uuid::new_v4()));
+    loop {
+        let token = CreationClaimToken(uuid::Uuid::new_v4().to_string());
+        let outcome = manager
+            .db()
+            .claim_next_conversation_creation_job(
+                &worker_id,
+                &token,
+                chrono::Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let CreationClaimOutcome::Claimed(job) = outcome else {
+            return Ok(());
+        };
+        if let Err(error) = process_job(manager, *job).await {
             tracing::error!(error = %error, "conversation creation job processing failed");
         }
     }
-    Ok(())
 }
 
 async fn process_job(
@@ -38,6 +44,9 @@ async fn process_job(
     job: crate::db::ConversationCreationJob,
 ) -> Result<(), String> {
     let conv_id = job.conversation_id.clone();
+    let CreationStatus::Claimed(claim) = job.protocol.status.clone() else {
+        return Err("claimed creation job lacked claim authority".to_string());
+    };
     let message_already_exists = if let Some(message_id) = job.message_id.as_deref() {
         manager
             .db()
@@ -48,19 +57,17 @@ async fn process_job(
         false
     };
     if message_already_exists {
-        manager
+        let outcome = manager
             .db()
-            .mark_conversation_creation_job_complete(&job.id)
+            .complete_conversation_creation_job(&job.id, &claim, chrono::Utc::now())
             .await
             .map_err(|e| e.to_string())?;
+        if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+            tracing::debug!(job_id = %job.id, generation = claim.generation, "creation completion rejected after claim loss");
+        }
         return Ok(());
     }
 
-    manager
-        .db()
-        .mark_conversation_creation_job_phase(&job.id, ConversationCreationPhase::Provisioning)
-        .await
-        .map_err(|e| e.to_string())?;
     let provisioning = ConvState::Provisioning {
         job_id: job.id.clone(),
         phase: ConversationCreationPhase::Provisioning,
@@ -84,15 +91,27 @@ async fn process_job(
 
     match provision_conversation(manager, &job).await {
         Ok(ProvisionOutcome::SeededEmpty) => {
-            manager
+            let outcome = manager
                 .db()
-                .mark_conversation_creation_job_complete(&job.id)
+                .complete_conversation_creation_job(&job.id, &claim, chrono::Utc::now())
                 .await
                 .map_err(|e| e.to_string())?;
+            if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+                tracing::debug!(job_id = %job.id, generation = claim.generation, "seeded creation completion rejected after claim loss");
+            }
             Ok(())
         }
         Ok(ProvisionOutcome::InitialMessageSubmitted) => Ok(()),
         Err((message, kind)) => {
+            let outcome = manager
+                .db()
+                .fail_conversation_creation_job(&job.id, &claim, &message, chrono::Utc::now())
+                .await
+                .map_err(|e| e.to_string())?;
+            if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+                tracing::debug!(job_id = %job.id, generation = claim.generation, "creation failure rejected after claim loss");
+                return Ok(());
+            }
             let failed = ConvState::CreationFailed {
                 job_id: job.id.clone(),
                 error: message.clone(),
@@ -101,11 +120,6 @@ async fn process_job(
             manager
                 .db()
                 .update_conversation_state(&conv_id, &failed)
-                .await
-                .map_err(|e| e.to_string())?;
-            manager
-                .db()
-                .mark_conversation_creation_job_failed(&job.id, &message)
                 .await
                 .map_err(|e| e.to_string())?;
             if let Some(broadcast_tx) = {

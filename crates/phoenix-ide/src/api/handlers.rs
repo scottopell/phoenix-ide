@@ -1142,7 +1142,7 @@ async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet
          SELECT f.stored_path
          FROM conversation_creation_job_files f
          JOIN conversation_creation_jobs j ON j.id = f.job_id
-         WHERE j.phase IN ('accepted', 'provisioning', 'failed')",
+         WHERE j.status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling', 'cancelled', 'deletion_pending', 'failed')",
     )
     .fetch_all(db.pool())
     .await
@@ -6488,9 +6488,27 @@ mod conversation_cwd_validation_tests {
             })
             .await
             .expect("insert job");
+        let claimed = state
+            .db
+            .claim_next_conversation_creation_job(
+                &phoenix_core::domain::creation_protocol::CreationWorkerId("test-worker".into()),
+                &phoenix_core::domain::creation_protocol::CreationClaimToken("test-token".into()),
+                chrono::Utc::now(),
+                chrono::Duration::minutes(1),
+            )
+            .await
+            .expect("claim job");
+        let crate::db::CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claimed job");
+        };
+        let phoenix_core::domain::creation_protocol::CreationStatus::Claimed(claim) =
+            job.protocol.status
+        else {
+            panic!("expected claim authority");
+        };
         state
             .db
-            .mark_conversation_creation_job_complete("job-completed-shell")
+            .complete_conversation_creation_job("job-completed-shell", &claim, chrono::Utc::now())
             .await
             .expect("complete job");
         let mut req = create_request("/tmp".to_string());

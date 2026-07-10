@@ -9,6 +9,10 @@ pub mod retrieval;
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
 // file and `phoenix_db::*` call sites resolve unchanged.
+use phoenix_core::domain::creation_protocol::{
+    CreationClaim, CreationClaimToken, CreationError, CreationKind, CreationProtocolState,
+    CreationStage, CreationStatus, CreationWorkerId,
+};
 use phoenix_core::domain::db_schema as schema;
 
 pub use migrations::run_pending_migrations;
@@ -129,6 +133,18 @@ pub struct InsertConversationCreationJob {
     pub conversation_id: String,
     pub message_id: Option<String>,
     pub intent: ConversationCreationIntent,
+}
+
+#[derive(Debug, Clone)]
+pub enum CreationClaimOutcome {
+    Claimed(Box<ConversationCreationJob>),
+    NoEligibleJob,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreationCasOutcome {
+    Applied,
+    ClaimLost,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1900,15 +1916,15 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO conversation_creation_jobs (
-                id, conversation_id, message_id, phase, intent_json, error,
-                accepted_at, provisioning_started_at, completed_at, failed_at,
-                created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, NULL, NULL, ?6, ?6)",
+                id, conversation_id, message_id, status, stage, attempt, generation,
+                intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'accepted', 'validate_intent', 0, 0,
+                       ?4, NULL, ?5, NULL, NULL, NULL, NULL, NULL, ?5, ?5)",
         )
         .bind(&job.id)
         .bind(&job.conversation_id)
         .bind(&job.message_id)
-        .bind(ConversationCreationPhase::Accepted.as_str())
         .bind(intent_json)
         .bind(&now_str)
         .execute(&mut *tx)
@@ -2009,15 +2025,15 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO conversation_creation_jobs (
-                id, conversation_id, message_id, phase, intent_json, error,
-                accepted_at, provisioning_started_at, completed_at, failed_at,
-                created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, NULL, NULL, ?6, ?6)",
+                id, conversation_id, message_id, status, stage, attempt, generation,
+                intent_json, error, accepted_at, provisioning_started_at, completed_at,
+                failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'accepted', 'validate_intent', 0, 0,
+                       ?4, NULL, ?5, NULL, NULL, NULL, NULL, NULL, ?5, ?5)",
         )
         .bind(&job.id)
         .bind(&job.conversation_id)
         .bind(&job.message_id)
-        .bind(ConversationCreationPhase::Accepted.as_str())
         .bind(intent_json)
         .bind(&now_str)
         .execute(&mut *tx)
@@ -2063,9 +2079,10 @@ impl Database {
         job_id: &str,
     ) -> DbResult<ConversationCreationJob> {
         sqlx::query(
-            "SELECT id, conversation_id, message_id, phase, intent_json, error,
-                    accepted_at, provisioning_started_at, completed_at, failed_at,
-                    created_at, updated_at
+            "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
+                    claim_worker_id, claim_token, lease_until, next_attempt_at,
+                    intent_json, error, accepted_at, provisioning_started_at,
+                    completed_at, failed_at, created_at, updated_at
              FROM conversation_creation_jobs WHERE id = ?1",
         )
         .bind(job_id)
@@ -2085,9 +2102,10 @@ impl Database {
         conversation_id: &str,
     ) -> DbResult<Option<ConversationCreationJob>> {
         sqlx::query(
-            "SELECT id, conversation_id, message_id, phase, intent_json, error,
-                    accepted_at, provisioning_started_at, completed_at, failed_at,
-                    created_at, updated_at
+            "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
+                    claim_worker_id, claim_token, lease_until, next_attempt_at,
+                    intent_json, error, accepted_at, provisioning_started_at,
+                    completed_at, failed_at, created_at, updated_at
              FROM conversation_creation_jobs WHERE conversation_id = ?1",
         )
         .bind(conversation_id)
@@ -2107,9 +2125,10 @@ impl Database {
         message_id: &str,
     ) -> DbResult<Option<ConversationCreationJob>> {
         sqlx::query(
-            "SELECT id, conversation_id, message_id, phase, intent_json, error,
-                    accepted_at, provisioning_started_at, completed_at, failed_at,
-                    created_at, updated_at
+            "SELECT id, conversation_id, message_id, status, stage, attempt, generation,
+                    claim_worker_id, claim_token, lease_until, next_attempt_at,
+                    intent_json, error, accepted_at, provisioning_started_at,
+                    completed_at, failed_at, created_at, updated_at
              FROM conversation_creation_jobs WHERE message_id = ?1",
         )
         .bind(message_id)
@@ -2183,104 +2202,187 @@ impl Database {
             .collect()
     }
 
-    /// List accepted/provisioning creation jobs in processing order.
+    /// Atomically claim the oldest eligible creation job.
+    ///
+    /// Accepted jobs consume attempt one, due retries consume the next attempt,
+    /// and expired-lease takeover only increments the fencing generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the atomic claim transaction or row decoding fails.
+    pub async fn claim_next_conversation_creation_job(
+        &self,
+        worker_id: &CreationWorkerId,
+        token: &CreationClaimToken,
+        now: DateTime<Utc>,
+        lease_duration: chrono::Duration,
+    ) -> DbResult<CreationClaimOutcome> {
+        let now_str = now.to_rfc3339();
+        let lease_until = (now + lease_duration).to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        let candidate: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, status
+             FROM conversation_creation_jobs
+             WHERE status = 'accepted'
+                OR (status = 'retry_scheduled' AND next_attempt_at <= ?1)
+                OR (status = 'claimed' AND lease_until <= ?1)
+             ORDER BY accepted_at ASC, id ASC
+             LIMIT 1",
+        )
+        .bind(&now_str)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((job_id, prior_status)) = candidate else {
+            tx.rollback().await?;
+            return Ok(CreationClaimOutcome::NoEligibleJob);
+        };
+
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'claimed',
+                 attempt = CASE
+                     WHEN status = 'accepted' THEN 1
+                     WHEN status = 'retry_scheduled' THEN attempt + 1
+                     ELSE attempt
+                 END,
+                 generation = generation + 1,
+                 claim_worker_id = ?1,
+                 claim_token = ?2,
+                 lease_until = ?3,
+                 next_attempt_at = NULL,
+                 provisioning_started_at = COALESCE(provisioning_started_at, ?4),
+                 updated_at = ?4
+             WHERE id = ?5
+               AND status = ?6
+               AND (
+                   status = 'accepted'
+                   OR (status = 'retry_scheduled' AND next_attempt_at <= ?4)
+                   OR (status = 'claimed' AND lease_until <= ?4)
+               )",
+        )
+        .bind(&worker_id.0)
+        .bind(&token.0)
+        .bind(&lease_until)
+        .bind(&now_str)
+        .bind(&job_id)
+        .bind(&prior_status)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(CreationClaimOutcome::NoEligibleJob);
+        }
+        tx.commit().await?;
+        self.get_conversation_creation_job(&job_id)
+            .await
+            .map(Box::new)
+            .map(CreationClaimOutcome::Claimed)
+    }
+
+    /// Return the earliest durable scheduler deadline, if one exists.
     ///
     /// # Errors
     ///
     /// Returns [`DbError`] if the database read fails.
-    pub async fn list_pending_conversation_creation_jobs(
-        &self,
-    ) -> DbResult<Vec<ConversationCreationJob>> {
-        let stale_cutoff = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
-        sqlx::query(
-            "SELECT id, conversation_id, message_id, phase, intent_json, error,
-                    accepted_at, provisioning_started_at, completed_at, failed_at,
-                    created_at, updated_at
-             FROM conversation_creation_jobs
-             WHERE phase = 'accepted'
-                OR (phase = 'provisioning' AND updated_at < ?1)
-             ORDER BY updated_at ASC",
+    pub async fn next_conversation_creation_deadline(&self) -> DbResult<Option<DateTime<Utc>>> {
+        let deadline: Option<String> = sqlx::query_scalar(
+            "SELECT MIN(deadline) FROM (
+                 SELECT next_attempt_at AS deadline
+                 FROM conversation_creation_jobs
+                 WHERE status = 'retry_scheduled'
+                 UNION ALL
+                 SELECT lease_until AS deadline
+                 FROM conversation_creation_jobs
+                 WHERE status = 'claimed'
+             )",
         )
-        .bind(stale_cutoff)
-        .try_map(parse_conversation_creation_job_row)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(DbError::Sqlx)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(deadline.as_deref().map(parse_datetime))
     }
 
-    /// Mark a creation job with a new phase and phase timestamp.
+    /// Advance a stage only while the supplied claim remains authoritative.
     ///
     /// # Errors
     ///
-    /// Returns [`DbError`] if the update fails or `job_id` does not exist.
-    pub async fn mark_conversation_creation_job_phase(
+    /// Returns [`DbError`] if the update fails.
+    pub async fn advance_conversation_creation_stage(
         &self,
         job_id: &str,
-        phase: ConversationCreationPhase,
-    ) -> DbResult<()> {
-        let now = Utc::now().to_rfc3339();
+        claim: &CreationClaim,
+        expected: CreationStage,
+        next: CreationStage,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
         let result = sqlx::query(
             "UPDATE conversation_creation_jobs
-             SET phase = ?1,
-                 updated_at = ?2,
-                 provisioning_started_at = CASE
-                     WHEN ?1 = 'provisioning' AND provisioning_started_at IS NULL THEN ?2
-                     ELSE provisioning_started_at
-                 END,
-                 completed_at = CASE
-                     WHEN ?1 = 'ready' THEN ?2
-                     ELSE completed_at
-                 END,
-                 failed_at = CASE
-                     WHEN ?1 = 'failed' THEN ?2
-                     ELSE failed_at
-                 END
-             WHERE id = ?3",
+             SET stage = ?1, updated_at = ?2
+             WHERE id = ?3 AND status = 'claimed' AND stage = ?4
+               AND generation = ?5 AND claim_worker_id = ?6 AND claim_token = ?7
+               AND lease_until > ?2",
         )
-        .bind(phase.as_str())
-        .bind(&now)
+        .bind(creation_stage_db_str(next))
+        .bind(now.to_rfc3339())
         .bind(job_id)
+        .bind(creation_stage_db_str(expected))
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
         .execute(&self.pool)
         .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
-        }
-        Ok(())
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
     }
 
-    /// Mark a creation job failed and record the failure message.
+    /// Mark a creation job failed only while the supplied claim is current.
     ///
     /// # Errors
     ///
-    /// Returns [`DbError`] if the update fails or `job_id` does not exist.
-    pub async fn mark_conversation_creation_job_failed(
+    /// Returns [`DbError`] if the update fails.
+    pub async fn fail_conversation_creation_job(
         &self,
         job_id: &str,
+        claim: &CreationClaim,
         error: &str,
-    ) -> DbResult<()> {
-        let now = Utc::now().to_rfc3339();
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let now = now.to_rfc3339();
         let result = sqlx::query(
             "UPDATE conversation_creation_jobs
-             SET phase = 'failed', error = ?1, updated_at = ?2, failed_at = ?2
-             WHERE id = ?3",
+             SET status = 'failed', error = ?1, updated_at = ?2, failed_at = ?2,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
+             WHERE id = ?3 AND status = 'claimed' AND generation = ?4
+               AND claim_worker_id = ?5 AND claim_token = ?6 AND lease_until > ?2",
         )
         .bind(error)
         .bind(&now)
         .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
         .execute(&self.pool)
         .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
-        }
-        Ok(())
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
     }
 
-    /// Mark a creation job ready.
+    /// Mark a creation job ready only while the supplied claim is current.
     ///
     /// # Errors
     ///
-    /// Returns [`DbError`] if the update fails or `job_id` does not exist.
-    pub async fn mark_conversation_creation_job_complete(&self, job_id: &str) -> DbResult<()> {
+    /// Returns [`DbError`] if the update transaction fails.
+    pub async fn complete_conversation_creation_job(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        now: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
         let cleared_intent = serde_json::json!({
             "cwd": "",
             "model": null,
@@ -2296,20 +2398,26 @@ impl Database {
             "seed_label": null
         })
         .to_string();
-        let now = Utc::now().to_rfc3339();
+        let now = now.to_rfc3339();
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE conversation_creation_jobs
-             SET phase = 'ready', intent_json = ?1, updated_at = ?2, completed_at = ?2
-             WHERE id = ?3",
+             SET status = 'ready', intent_json = ?1, updated_at = ?2, completed_at = ?2,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
+             WHERE id = ?3 AND status = 'claimed' AND generation = ?4
+               AND claim_worker_id = ?5 AND claim_token = ?6 AND lease_until > ?2",
         )
         .bind(cleared_intent)
-        .bind(now)
+        .bind(&now)
         .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+            tx.rollback().await?;
+            return Ok(CreationCasOutcome::ClaimLost);
         }
         sqlx::query("DELETE FROM conversation_creation_job_files WHERE job_id = ?1")
             .bind(job_id)
@@ -2320,7 +2428,7 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(CreationCasOutcome::Applied)
     }
 
     /// Mark the creation job for a conversation complete after state leaves provisioning.
@@ -2336,11 +2444,9 @@ impl Database {
             .get_conversation_creation_job_for_conversation(conversation_id)
             .await?
         {
-            if matches!(
-                job.phase,
-                ConversationCreationPhase::Accepted | ConversationCreationPhase::Provisioning
-            ) {
-                self.mark_conversation_creation_job_complete(&job.id)
+            if let CreationStatus::Claimed(claim) = &job.protocol.status {
+                let _ = self
+                    .complete_conversation_creation_job(&job.id, claim, Utc::now())
                     .await?;
             }
         }
@@ -5631,17 +5737,93 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     })
 }
 
+fn claim_generation_i64(claim: &CreationClaim) -> DbResult<i64> {
+    i64::try_from(claim.generation).map_err(|_| {
+        DbError::Serialization("creation generation exceeds SQLite integer".to_string())
+    })
+}
+
+fn creation_stage_db_str(stage: CreationStage) -> &'static str {
+    match stage {
+        CreationStage::ValidateIntent => "validate_intent",
+        CreationStage::ResolveRepository => "resolve_repository",
+        CreationStage::ReserveResources => "reserve_resources",
+        CreationStage::MaterializeWorktree => "materialize_worktree",
+        CreationStage::FinalizeAttachments => "finalize_attachments",
+        CreationStage::ExpandInitialMessage => "expand_initial_message",
+        CreationStage::CommitMetadata => "commit_metadata",
+        CreationStage::BootstrapInitialTurn => "bootstrap_initial_turn",
+        CreationStage::Finalize => "finalize",
+    }
+}
+
+fn creation_stage_from_db(value: &str) -> Result<CreationStage, sqlx::Error> {
+    Ok(match value {
+        "validate_intent" => CreationStage::ValidateIntent,
+        "resolve_repository" => CreationStage::ResolveRepository,
+        "reserve_resources" => CreationStage::ReserveResources,
+        "materialize_worktree" => CreationStage::MaterializeWorktree,
+        "finalize_attachments" => CreationStage::FinalizeAttachments,
+        "expand_initial_message" => CreationStage::ExpandInitialMessage,
+        "commit_metadata" => CreationStage::CommitMetadata,
+        "bootstrap_initial_turn" => CreationStage::BootstrapInitialTurn,
+        "finalize" => CreationStage::Finalize,
+        _ => {
+            return Err(sqlx::Error::Decode(
+                format!("unknown conversation creation stage: {value:?}").into(),
+            ));
+        }
+    })
+}
+
+fn creation_time(value: &str) -> u64 {
+    u64::try_from(parse_datetime(value).timestamp_millis()).unwrap_or(0)
+}
+
 /// Parse a `conversation_creation_jobs` row from the database.
 #[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
 fn parse_conversation_creation_job_row(
     row: SqliteRow,
 ) -> Result<ConversationCreationJob, sqlx::Error> {
-    let phase_str: String = row.try_get("phase")?;
-    let phase = ConversationCreationPhase::from_db_str(&phase_str).ok_or_else(|| {
-        sqlx::Error::Decode(
-            format!("unknown conversation_creation_jobs.phase value: {phase_str:?}").into(),
-        )
+    let status_str: String = row.try_get("status")?;
+    let stage = creation_stage_from_db(&row.try_get::<String, _>("stage")?)?;
+    let generation_i64: i64 = row.try_get("generation")?;
+    let generation = u64::try_from(generation_i64).map_err(|_| {
+        sqlx::Error::Decode(format!("negative creation generation: {generation_i64}").into())
     })?;
+    let status = match status_str.as_str() {
+        "accepted" => CreationStatus::Accepted,
+        "claimed" => CreationStatus::Claimed(CreationClaim {
+            worker_id: CreationWorkerId(row.try_get("claim_worker_id")?),
+            generation,
+            token: CreationClaimToken(row.try_get("claim_token")?),
+            lease_until: creation_time(&row.try_get::<String, _>("lease_until")?),
+        }),
+        "retry_scheduled" => CreationStatus::RetryScheduled {
+            next_attempt_at: creation_time(&row.try_get::<String, _>("next_attempt_at")?),
+            last_error: CreationError {
+                kind: "transient".to_string(),
+                message: row
+                    .try_get::<Option<String>, _>("error")?
+                    .unwrap_or_default(),
+            },
+        },
+        "cancelling" => CreationStatus::Cancelling,
+        "cancelled" => CreationStatus::Cancelled,
+        "deletion_pending" => CreationStatus::DeletionPending,
+        "ready" => CreationStatus::Ready,
+        "failed" => CreationStatus::Failed(CreationError {
+            kind: "permanent".to_string(),
+            message: row
+                .try_get::<Option<String>, _>("error")?
+                .unwrap_or_default(),
+        }),
+        _ => {
+            return Err(sqlx::Error::Decode(
+                format!("unknown conversation creation status: {status_str:?}").into(),
+            ));
+        }
+    };
 
     let intent_json: String = row.try_get("intent_json")?;
     let intent = serde_json::from_str::<ConversationCreationIntent>(&intent_json).map_err(|e| {
@@ -5652,7 +5834,19 @@ fn parse_conversation_creation_job_row(
         id: row.try_get("id")?,
         conversation_id: row.try_get("conversation_id")?,
         message_id: row.try_get("message_id")?,
-        phase,
+        protocol: CreationProtocolState {
+            kind: match &row.try_get::<Option<String>, _>("message_id")? {
+                Some(message_id) => CreationKind::InitialTurn {
+                    message_id: message_id.clone(),
+                },
+                None => CreationKind::SeededEmpty,
+            },
+            status,
+            stage,
+            attempt: u32::try_from(row.try_get::<i64, _>("attempt")?)
+                .map_err(|_| sqlx::Error::Decode("invalid creation attempt".into()))?,
+            generation,
+        },
         intent,
         created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
         updated_at: parse_datetime(&row.try_get::<String, _>("updated_at")?),
@@ -6461,6 +6655,124 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 mod tests {
     use super::*;
     use phoenix_core::llm_language::LlmLanguage;
+
+    async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {
+        db.create_conversation(conversation_id, conversation_id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_conversation_creation_job(&InsertConversationCreationJob {
+            id: job_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: Some(format!("message-{job_id}")),
+            intent: ConversationCreationIntent {
+                cwd: "/tmp".to_string(),
+                model: None,
+                text: "test creation".to_string(),
+                expansion_preflighted: false,
+                llm_text: None,
+                skill_invocation: None,
+                message_id: format!("message-{job_id}"),
+                images: Vec::new(),
+                files: Vec::new(),
+                mode: None,
+                base_branch: None,
+                checkout_ref: None,
+                seed_parent_id: None,
+                seed_label: None,
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn creation_claim_has_one_winner_and_fences_late_results() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-claim", "conv-claim").await;
+        let now = Utc::now();
+        let first = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(first_job) = first else {
+            panic!("first worker must claim accepted job");
+        };
+        let CreationStatus::Claimed(first_claim) = first_job.protocol.status else {
+            panic!("claimed job must carry authority");
+        };
+
+        let concurrent = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now,
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(concurrent, CreationClaimOutcome::NoEligibleJob));
+
+        let takeover = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now + chrono::Duration::seconds(11),
+                chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(second_job) = takeover else {
+            panic!("expired claim must be recoverable");
+        };
+        let CreationStatus::Claimed(second_claim) = second_job.protocol.status else {
+            panic!("replacement must carry authority");
+        };
+        assert_eq!(first_claim.generation + 1, second_claim.generation);
+        assert_eq!(second_job.protocol.attempt, 1, "takeover is not a retry");
+
+        let stale_failure = db
+            .fail_conversation_creation_job(
+                "job-claim",
+                &first_claim,
+                "late failure",
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_failure, CreationCasOutcome::ClaimLost);
+
+        let completed = db
+            .complete_conversation_creation_job(
+                "job-claim",
+                &second_claim,
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed, CreationCasOutcome::Applied);
+        let late_completion = db
+            .complete_conversation_creation_job(
+                "job-claim",
+                &first_claim,
+                now + chrono::Duration::seconds(12),
+            )
+            .await
+            .unwrap();
+        assert_eq!(late_completion, CreationCasOutcome::ClaimLost);
+        assert!(matches!(
+            db.get_conversation_creation_job("job-claim")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Ready
+        ));
+    }
 
     #[cfg(unix)]
     #[test]
