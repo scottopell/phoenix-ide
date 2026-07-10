@@ -9,6 +9,13 @@ use thiserror::Error;
 pub const MAX_CREATION_ATTEMPTS: u32 = 4;
 pub const CREATION_RETRY_DELAYS_MS: [CreationTime; 3] = [2_000, 10_000, 30_000];
 
+/// Delay before the next attempt after the given failed attempt.
+#[must_use]
+pub fn creation_retry_delay_ms(attempt: u32) -> Option<CreationTime> {
+    let index = usize::try_from(attempt.checked_sub(1)?).ok()?;
+    CREATION_RETRY_DELAYS_MS.get(index).copied()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CreationProtocolEvent {
     ClaimRequested {
@@ -163,7 +170,11 @@ pub fn decide_creation(
             if state.attempt >= MAX_CREATION_ATTEMPTS {
                 state.status = CreationStatus::Failed(error);
             } else {
-                let delay = CREATION_RETRY_DELAYS_MS[(state.attempt - 1) as usize];
+                let Some(delay) = creation_retry_delay_ms(state.attempt) else {
+                    return Err(CreationProtocolError::InvalidStatus(
+                        "invalid retry attempt",
+                    ));
+                };
                 let next_attempt_at = now.saturating_add(delay);
                 state.status = CreationStatus::RetryScheduled {
                     next_attempt_at,

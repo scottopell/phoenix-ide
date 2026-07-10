@@ -33,12 +33,47 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         let CreationClaimOutcome::Claimed(job) = outcome else {
             return Ok(());
         };
-        if let Err(error) = process_job(manager, *job).await {
+        if let Err(error) = process_claimed_job(manager, *job).await {
             tracing::error!(error = %error, "conversation creation job processing failed");
         }
     }
 }
 
+async fn process_claimed_job(
+    manager: &Arc<RuntimeManager>,
+    job: crate::db::ConversationCreationJob,
+) -> Result<(), String> {
+    let CreationStatus::Claimed(claim) = job.protocol.status.clone() else {
+        return Err("claimed creation job lacked claim authority".to_string());
+    };
+    let job_id = job.id.clone();
+    let mut processing = std::pin::pin!(process_job(manager, job));
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut processing => return result,
+            _ = heartbeat.tick() => {
+                let outcome = manager
+                    .db()
+                    .renew_conversation_creation_claim(
+                        &job_id,
+                        &claim,
+                        chrono::Utc::now(),
+                        chrono::Duration::seconds(30),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+                    tracing::debug!(job_id = %job_id, generation = claim.generation, "stopping creation worker after lease authority was lost");
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 async fn process_job(
     manager: &Arc<RuntimeManager>,
     job: crate::db::ConversationCreationJob,
@@ -103,6 +138,32 @@ async fn process_job(
         }
         Ok(ProvisionOutcome::InitialMessageSubmitted) => Ok(()),
         Err((message, kind)) => {
+            if creation_error_is_retryable(&kind) && job.protocol.attempt < 4 {
+                let delay_ms = crate::state_machine::creation_protocol::creation_retry_delay_ms(
+                    job.protocol.attempt,
+                )
+                .ok_or_else(|| "retryable creation lacked configured delay".to_string())?;
+                let delay = chrono::Duration::milliseconds(
+                    i64::try_from(delay_ms)
+                        .map_err(|_| "creation retry delay exceeds chrono range".to_string())?,
+                );
+                let now = chrono::Utc::now();
+                let outcome = manager
+                    .db()
+                    .schedule_conversation_creation_retry(
+                        &job.id,
+                        &claim,
+                        &message,
+                        now,
+                        now + delay,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if matches!(outcome, crate::db::CreationCasOutcome::Applied) {
+                    tracing::warn!(job_id = %job.id, attempt = job.protocol.attempt, retry_at = %(now + delay), error = %message, "conversation creation retry scheduled");
+                }
+                return Ok(());
+            }
             let outcome = manager
                 .db()
                 .fail_conversation_creation_job(&job.id, &claim, &message, chrono::Utc::now())
@@ -663,6 +724,17 @@ fn cleanup_unpersisted_worktree(
     } else if let Err(e) = std::fs::remove_dir_all(&worktree) {
         tracing::warn!(conversation_id, worktree = %worktree.display(), error = %e, "failed to remove unpersisted worktree without repo root");
     }
+}
+
+fn creation_error_is_retryable(kind: &ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::RateLimit
+            | ErrorKind::Network
+            | ErrorKind::InvalidResponse
+            | ErrorKind::ServerError
+            | ErrorKind::TimedOut
+    )
 }
 
 fn app_error_to_kind(error: AppError) -> (String, ErrorKind) {

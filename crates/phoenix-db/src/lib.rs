@@ -2301,6 +2301,80 @@ impl Database {
         Ok(deadline.as_deref().map(parse_datetime))
     }
 
+    /// Renew a creation lease only while the supplied claim remains current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails.
+    pub async fn renew_conversation_creation_claim(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        now: DateTime<Utc>,
+        lease_duration: chrono::Duration,
+    ) -> DbResult<CreationCasOutcome> {
+        let now_str = now.to_rfc3339();
+        let lease_until = (now + lease_duration).to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET lease_until = ?1, updated_at = ?2
+             WHERE id = ?3 AND status = 'claimed' AND generation = ?4
+               AND claim_worker_id = ?5 AND claim_token = ?6 AND lease_until > ?2",
+        )
+        .bind(lease_until)
+        .bind(now_str)
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
+    }
+
+    /// Schedule the next bounded retry while the supplied claim is current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] if the update fails.
+    pub async fn schedule_conversation_creation_retry(
+        &self,
+        job_id: &str,
+        claim: &CreationClaim,
+        error: &str,
+        now: DateTime<Utc>,
+        next_attempt_at: DateTime<Utc>,
+    ) -> DbResult<CreationCasOutcome> {
+        let now = now.to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'retry_scheduled', error = ?1, next_attempt_at = ?2,
+                 updated_at = ?3, claim_worker_id = NULL, claim_token = NULL,
+                 lease_until = NULL
+             WHERE id = ?4 AND status = 'claimed' AND attempt < 4
+               AND generation = ?5 AND claim_worker_id = ?6 AND claim_token = ?7
+               AND lease_until > ?3",
+        )
+        .bind(error)
+        .bind(next_attempt_at.to_rfc3339())
+        .bind(now)
+        .bind(job_id)
+        .bind(claim_generation_i64(claim)?)
+        .bind(&claim.worker_id.0)
+        .bind(&claim.token.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
+    }
+
     /// Advance a stage only while the supplied claim remains authoritative.
     ///
     /// # Errors
@@ -6772,6 +6846,70 @@ mod tests {
                 .status,
             CreationStatus::Ready
         ));
+    }
+
+    #[tokio::test]
+    async fn creation_retry_is_durable_and_due_without_a_kick() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-retry", "conv-retry").await;
+        let now = Utc::now();
+        let first = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(first_job) = first else {
+            panic!("expected first claim");
+        };
+        let CreationStatus::Claimed(first_claim) = first_job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        let retry_at = now + chrono::Duration::seconds(2);
+        assert_eq!(
+            db.schedule_conversation_creation_retry(
+                "job-retry",
+                &first_claim,
+                "temporary failure",
+                now,
+                retry_at,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert_eq!(
+            db.next_conversation_creation_deadline().await.unwrap(),
+            Some(retry_at)
+        );
+        assert!(matches!(
+            db.claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                now + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap(),
+            CreationClaimOutcome::NoEligibleJob
+        ));
+        let second = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-b".into()),
+                &CreationClaimToken("token-b".into()),
+                retry_at,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(second_job) = second else {
+            panic!("due retry must be claimable");
+        };
+        assert_eq!(second_job.protocol.attempt, 2);
+        assert_eq!(second_job.protocol.generation, 2);
     }
 
     #[cfg(unix)]

@@ -1118,7 +1118,8 @@ INSERT INTO conversation_creation_jobs (
 )
 SELECT id, conversation_id, message_id,
        CASE phase WHEN 'provisioning' THEN 'accepted' ELSE phase END,
-       'validate_intent', 0, 0, intent_json, error,
+       'validate_intent', 0, 0, intent_json,
+       CASE WHEN phase = 'failed' THEN COALESCE(error, 'creation failed') ELSE error END,
        COALESCE(accepted_at, created_at), provisioning_started_at,
        completed_at, failed_at, created_at, updated_at
 FROM conversation_creation_jobs_legacy;

@@ -1742,7 +1742,26 @@ impl RuntimeManager {
                 {
                     tracing::error!(error = %error, "conversation creation worker drain failed");
                 }
-                if rx.changed().await.is_err() {
+                let next_deadline = match manager.db().next_conversation_creation_deadline().await {
+                    Ok(deadline) => deadline,
+                    Err(error) => {
+                        tracing::error!(error = %error, "failed to read conversation creation deadline");
+                        Some(chrono::Utc::now() + chrono::Duration::seconds(1))
+                    }
+                };
+                if let Some(deadline) = next_deadline {
+                    let delay = (deadline - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or(std::time::Duration::ZERO);
+                    tokio::select! {
+                        changed = rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                } else if rx.changed().await.is_err() {
                     break;
                 }
             }
