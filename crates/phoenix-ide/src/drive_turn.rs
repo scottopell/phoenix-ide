@@ -121,9 +121,9 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
     install_crypto_provider();
 
     let started = std::time::Instant::now();
-    let (db, database_result) = open_database(&request.database).await?;
-
     let runtime_env = Arc::new(PhoenixRuntimeEnvironment::detect());
+    let (db, database_result) = open_database(&request.database, &runtime_env).await?;
+
     let llm_config = LlmConfig::from_env(runtime_env);
     let credential_helper = llm_config.credential_helper.clone();
     let llm_registry = Arc::new(ModelRegistry::new_with_discovery(&llm_config).await);
@@ -206,15 +206,20 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
     })
 }
 
-async fn open_database(mode: &DatabaseMode) -> Result<(Database, DatabaseResult), DriveTurnError> {
+async fn open_database(
+    mode: &DatabaseMode,
+    runtime_env: &PhoenixRuntimeEnvironment,
+) -> Result<(Database, DatabaseResult), DriveTurnError> {
     match mode {
         DatabaseMode::Memory => Database::open_in_memory()
             .await
             .map(|db| (db, DatabaseResult::Memory))
             .map_err(|error| DriveTurnError::Database(error.to_string())),
         DatabaseMode::TemporaryFile => {
-            let path = std::env::temp_dir()
-                .join(format!("phoenix-drive-turn-{}.db", uuid::Uuid::new_v4()));
+            let directory = runtime_env
+                .tmp_subdir("drive-turn")
+                .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+            let path = directory.join(format!("{}.db", uuid::Uuid::new_v4()));
             open_file_database(path).await
         }
         DatabaseMode::File(path) => open_file_database(path.clone()).await,
