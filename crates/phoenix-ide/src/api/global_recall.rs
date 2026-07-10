@@ -1668,6 +1668,7 @@ mod tests {
             chain_name: None,
             llm_language: LlmLanguage::default(),
             spawned_from_conversation_id: None,
+            transcript_generation: 1,
         }
     }
 

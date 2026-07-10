@@ -138,4 +138,3 @@ Terminology:
 - Whether message-level deep links are included in MVP or deferred behind conversation-level links.
 - Whether Global Recall sessions are stored as a new table/entity or reuse conversation storage with a product-level discriminator.
 - Exact syntax for copied references, e.g. `@work:<id>`, `@chain:<id>`, `@conv:<id>`.
-

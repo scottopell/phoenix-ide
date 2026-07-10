@@ -1143,7 +1143,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 33);
+        assert_eq!(first, 34);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -1180,9 +1180,9 @@ mod tests {
             .unwrap();
 
         // Every version except the stamped 29 must run: 1–28 below the stamp
-        // and 30–33 above it.
+        // and 30–34 above it.
         let applied = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(applied, 32);
+        assert_eq!(applied, 33);
 
         // Migration 005's effects must be present.
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
