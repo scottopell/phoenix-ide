@@ -247,8 +247,7 @@ function ConversationPageContent() {
   // conversation subtree below it) on every pointer move — React state catches
   // up once, on pointer-up. See `useResizablePane`'s `onLiveResize`.
   const appElementRef = useRef<HTMLDivElement | null>(null);
-  const conversationColumnRef = useRef<HTMLDivElement | null>(null);
-  useAppTouchContainment(conversationColumnRef, true);
+  const setTouchContainmentElement = useAppTouchContainment<HTMLDivElement>(true);
   useLayoutEffect(() => {
     appElementRef.current?.style.setProperty(
       '--viewer-pane-width',
@@ -394,11 +393,12 @@ function ConversationPageContent() {
   };
   const setAppElement = useCallback((el: HTMLDivElement | null) => {
     appElementRef.current = el;
+    setTouchContainmentElement(el);
     if (el) {
       el.style.setProperty('--viewer-pane-width', paneVarsRef.current.viewerWidth);
       el.style.setProperty('--terminal-pane-height', paneVarsRef.current.terminalHeight);
     }
-  }, []);
+  }, [setTouchContainmentElement]);
 
   // Credential helper auto-open — shared hook consolidates the pattern.
   const { showAuthPanel, setShowAuthPanel } = useAutoAuth(credentialStatus);
@@ -1356,7 +1356,7 @@ function ConversationPageContent() {
       ref={setAppElement}
       className={showSplitPaneViewer ? 'app-split-pane' : undefined}
     >
-      <div ref={conversationColumnRef} className="conversation-column">
+      <div className="conversation-column">
       {seedBreadcrumb}
       {parentConvBreadcrumb}
       {viewerSlot.browserSessionActive && !isArchived && !browserOpen && (

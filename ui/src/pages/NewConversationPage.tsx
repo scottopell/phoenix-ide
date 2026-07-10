@@ -57,8 +57,7 @@ interface NewConversationPageProps {
 }
 
 export function NewConversationPage({ desktopMode }: NewConversationPageProps = {}) {
-  const pageRef = useRef<HTMLDivElement>(null);
-  useAppTouchContainment(pageRef, true);
+  const pageRef = useAppTouchContainment<HTMLDivElement>(true);
   const navigate = useNavigate();
   const conv = useCreateConversation(navigate);
   const textareaRef = useRef<HTMLTextAreaElement>(null);

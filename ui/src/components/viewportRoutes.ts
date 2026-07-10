@@ -1,4 +1,4 @@
-import { useLayoutEffect, type RefObject } from 'react';
+import { useCallback, useLayoutEffect, useState, type RefCallback } from 'react';
 
 export function isViewportOwnedRoute(pathname: string, desktop: boolean): boolean {
   return (desktop && /^\/$/.test(pathname))
@@ -18,12 +18,28 @@ export function useDocumentViewportOwnership(ownsViewport: boolean): void {
   }, [ownsViewport]);
 }
 
-export function useAppTouchContainment(
-  ownerRef: RefObject<HTMLElement>,
+function findScrollOwner(target: Element | null, boundary: HTMLElement): HTMLElement | null {
+  let element = target;
+  while (element && boundary.contains(element)) {
+    if (element instanceof HTMLElement) {
+      const overflowY = getComputedStyle(element).overflowY;
+      const isScrollable = element.scrollHeight > element.clientHeight
+        && (overflowY === 'auto' || overflowY === 'scroll');
+      if (element.matches('[data-app-scroll-owner], textarea') || isScrollable) return element;
+    }
+    if (element === boundary) break;
+    element = element.parentElement;
+  }
+  return null;
+}
+
+export function useAppTouchContainment<T extends HTMLElement>(
   ownsViewport: boolean,
-): void {
+): RefCallback<T> {
+  const [owner, setOwner] = useState<T | null>(null);
+  const ownerRef = useCallback((element: T | null) => setOwner(element), []);
+
   useLayoutEffect(() => {
-    const owner = ownerRef.current;
     if (!ownsViewport || !owner) return;
 
     let lastX = 0;
@@ -46,8 +62,8 @@ export function useAppTouchContainment(
       if (Math.abs(deltaY) <= Math.abs(deltaX)) return;
 
       const target = event.target instanceof Element ? event.target : null;
-      const scrollOwner = target?.closest<HTMLElement>('[data-app-scroll-owner]');
-      if (!scrollOwner || !owner.contains(scrollOwner)) {
+      const scrollOwner = findScrollOwner(target, owner);
+      if (!scrollOwner) {
         event.preventDefault();
         return;
       }
@@ -64,5 +80,7 @@ export function useAppTouchContainment(
       owner.removeEventListener('touchstart', onTouchStart);
       owner.removeEventListener('touchmove', onTouchMove);
     };
-  }, [ownerRef, ownsViewport]);
+  }, [owner, ownsViewport]);
+
+  return ownerRef;
 }

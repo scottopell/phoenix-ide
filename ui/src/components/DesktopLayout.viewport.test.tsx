@@ -1,6 +1,5 @@
 import { readFileSync } from 'node:fs';
 import { render } from '@testing-library/react';
-import { useRef } from 'react';
 import { describe, expect, it } from 'vitest';
 import {
   isViewportOwnedRoute,
@@ -56,14 +55,15 @@ describe('app viewport ownership', () => {
 
   it('blocks vertical touch chaining while preserving owned inner scrolling', () => {
     function Harness() {
-      const ownerRef = useRef<HTMLDivElement>(null);
-      useAppTouchContainment(ownerRef, true);
+      const ownerRef = useAppTouchContainment<HTMLDivElement>(true);
       return (
         <div>
           <div data-testid="outside-pane" />
           <div ref={ownerRef}>
             <div data-testid="chrome" />
             <div data-testid="scroller" data-app-scroll-owner />
+            <div data-testid="overlay-scroller" style={{ overflowY: 'auto' }} />
+            <textarea data-testid="textarea" />
           </div>
         </div>
       );
@@ -86,11 +86,20 @@ describe('app viewport ownership', () => {
     const outsidePane = getByTestId('outside-pane');
     const chrome = getByTestId('chrome');
     const scroller = getByTestId('scroller');
+    const overlayScroller = getByTestId('overlay-scroller');
+    const textarea = getByTestId('textarea');
     Object.defineProperties(scroller, {
       clientHeight: { configurable: true, value: 400 },
       scrollHeight: { configurable: true, value: 800 },
       scrollTop: { configurable: true, writable: true, value: 100 },
     });
+    for (const element of [overlayScroller, textarea]) {
+      Object.defineProperties(element, {
+        clientHeight: { configurable: true, value: 100 },
+        scrollHeight: { configurable: true, value: 300 },
+        scrollTop: { configurable: true, writable: true, value: 100 },
+      });
+    }
 
     start(outsidePane, 100);
     expect(touch(outsidePane, 80)).toBe(true);
@@ -104,6 +113,12 @@ describe('app viewport ownership', () => {
     start(scroller, 100);
     expect(touch(scroller, 80)).toBe(true);
 
+    start(overlayScroller, 100);
+    expect(touch(overlayScroller, 80)).toBe(true);
+
+    start(textarea, 100);
+    expect(touch(textarea, 80)).toBe(true);
+
     scroller.scrollTop = 400;
     start(scroller, 100);
     expect(touch(scroller, 80)).toBe(false);
@@ -111,6 +126,23 @@ describe('app viewport ownership', () => {
     scroller.scrollTop = 0;
     start(scroller, 80);
     expect(touch(scroller, 100)).toBe(false);
+  });
+
+  it('attaches containment when a cold-load shell mounts after the skeleton', () => {
+    function Harness({ loaded }: { loaded: boolean }) {
+      const ownerRef = useAppTouchContainment<HTMLDivElement>(true);
+      return loaded ? <div ref={ownerRef} data-testid="owner"><div data-testid="chrome" /></div> : null;
+    }
+
+    const { getByTestId, rerender } = render(<Harness loaded={false} />);
+    rerender(<Harness loaded />);
+    const chrome = getByTestId('chrome');
+    const start = new Event('touchstart', { bubbles: true, cancelable: true });
+    Object.defineProperty(start, 'touches', { value: [{ clientX: 10, clientY: 100 }] });
+    chrome.dispatchEvent(start);
+    const move = new Event('touchmove', { bubbles: true, cancelable: true });
+    Object.defineProperty(move, 'touches', { value: [{ clientX: 10, clientY: 80 }] });
+    expect(chrome.dispatchEvent(move)).toBe(false);
   });
 
   it('gives chat shells one dynamic viewport owner and contains the document', () => {
