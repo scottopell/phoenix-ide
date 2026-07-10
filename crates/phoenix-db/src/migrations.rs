@@ -214,7 +214,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_creation_resource_reservations",
         sql: MIGRATION_036,
     },
+<<<<<<< HEAD
 >>>>>>> 8ac6c360 (feat: fence creation worktree mutations)
+||||||| parent of cf4373dc (fix: make creation recovery claim authoritative)
+=======
+    Migration {
+        version: 37,
+        name: "add_creation_cleanup_claims",
+        sql: MIGRATION_037,
+    },
+>>>>>>> cf4373dc (fix: make creation recovery claim authoritative)
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -1181,6 +1190,15 @@ CREATE TABLE conversation_creation_resource_reservations (
 
 CREATE INDEX idx_creation_resource_reservations_job
     ON conversation_creation_resource_reservations(job_id, status);
+";
+
+const MIGRATION_037: &str = r"
+ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_worker_id TEXT;
+ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_token TEXT;
+ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_lease_until TEXT;
+
+CREATE INDEX idx_creation_cleanup_due
+    ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
 ";
 
 /// Run all pending migrations against the database.

@@ -4,8 +4,7 @@ use crate::api::handlers::{
     BranchWorktreeInfo, ManagedWorktreeError,
 };
 use crate::db::{
-    ConvMode, ConversationCreationMetadataUpdate, ConversationCreationPhase, CreationClaimOutcome,
-    ErrorKind, NonEmptyString,
+    ConvMode, ConversationCreationMetadataUpdate, CreationClaimOutcome, ErrorKind, NonEmptyString,
 };
 use crate::runtime::{ConversationMetadataUpdate, EvictionReason, RuntimeManager, SseEvent};
 use crate::state_machine::{ConvState, Event};
@@ -21,7 +20,12 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
     let worker_id = CreationWorkerId(format!("creation-worker-{}", uuid::Uuid::new_v4()));
     while let Some(cleanup) = manager
         .db()
-        .next_conversation_creation_cleanup()
+        .claim_next_conversation_creation_cleanup(
+            &worker_id.0,
+            &uuid::Uuid::new_v4().to_string(),
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        )
         .await
         .map_err(|error| error.to_string())?
     {
@@ -68,8 +72,23 @@ async fn reconcile_creation_cleanup(
         }
         let repo = reservation.repository_identity.clone();
         let resource = reservation.resource_identity.clone();
+        let reservation_id = reservation.id.clone();
+        let cleanup_for_blocking = cleanup.clone();
+        let db = manager.db().clone();
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let _lock = RepositoryMutationLock::acquire(&repo).map_err(|(message, _)| message)?;
+            let runtime = tokio::runtime::Handle::current();
+            let reservations = runtime
+                .block_on(db.get_creation_resource_reservations(&cleanup_for_blocking.job_id))
+                .map_err(|error| error.to_string())?;
+            let owned = reservations.iter().any(|current| {
+                current.id == reservation_id
+                    && current.generation == cleanup_for_blocking.generation
+                    && current.status == "cleanup_required"
+            });
+            if !owned {
+                return Ok(());
+            }
             let path = Path::new(&resource);
             if path.exists() {
                 crate::git_ops::run_git(
@@ -81,11 +100,14 @@ async fn reconcile_creation_cleanup(
         })
         .await
         .map_err(|error| error.to_string())??;
-        manager
+        let outcome = manager
             .db()
-            .release_creation_resource(&reservation.id)
+            .release_creation_resource(cleanup, &reservation.id, chrono::Utc::now())
             .await
             .map_err(|error| error.to_string())?;
+        if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+            return Ok(());
+        }
     }
     manager
         .db()
@@ -148,36 +170,23 @@ async fn process_job(
         false
     };
     if message_already_exists {
-        let outcome = manager
+        let conversation = manager
             .db()
-            .complete_conversation_creation_job(&job.id, &claim, chrono::Utc::now())
+            .get_conversation(&conv_id)
             .await
             .map_err(|e| e.to_string())?;
-        if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
-            tracing::debug!(job_id = %job.id, generation = claim.generation, "creation completion rejected after claim loss");
+        if creation_state_allows_existing_message_completion(&conversation.state) {
+            let outcome = manager
+                .db()
+                .complete_conversation_creation_job(&job.id, &claim, chrono::Utc::now())
+                .await
+                .map_err(|e| e.to_string())?;
+            if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+                tracing::debug!(job_id = %job.id, generation = claim.generation, "creation completion rejected after claim loss");
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
-
-    let provisioning = ConvState::Provisioning {
-        job_id: job.id.clone(),
-        phase: ConversationCreationPhase::Provisioning,
-    };
-    manager
-        .db()
-        .update_conversation_state(&conv_id, &provisioning)
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Some(broadcast_tx) = {
-        let runtimes = manager.runtimes.read().await;
-        runtimes.get(&conv_id).map(|h| h.broadcast_tx.clone())
-    } {
-        let _ = broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-            sequence_id: seq,
-            state: provisioning.clone(),
-            presentation_mode: provisioning.presentation_mode().to_string(),
-            state_updated_at: chrono::Utc::now(),
-        });
+        tracing::info!(job_id = %job.id, message_id = ?job.message_id, "replaying creation bootstrap after message persisted without state advancement");
     }
 
     match provision_conversation(manager, &mut job).await {
@@ -220,25 +229,26 @@ async fn process_job(
                 }
                 return Ok(());
             }
+            let failed = ConvState::CreationFailed {
+                job_id: job.id.clone(),
+                error: message.clone(),
+                error_kind: kind.clone(),
+            };
             let outcome = manager
                 .db()
-                .fail_conversation_creation_job(&job.id, &claim, &message, chrono::Utc::now())
+                .fail_conversation_creation_job(
+                    &job.id,
+                    &claim,
+                    &message,
+                    &kind,
+                    chrono::Utc::now(),
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
                 tracing::debug!(job_id = %job.id, generation = claim.generation, "creation failure rejected after claim loss");
                 return Ok(());
             }
-            let failed = ConvState::CreationFailed {
-                job_id: job.id.clone(),
-                error: message.clone(),
-                error_kind: kind,
-            };
-            manager
-                .db()
-                .update_conversation_state(&conv_id, &failed)
-                .await
-                .map_err(|e| e.to_string())?;
             if let Some(broadcast_tx) = {
                 let runtimes = manager.runtimes.read().await;
                 runtimes.get(&conv_id).map(|h| h.broadcast_tx.clone())
@@ -256,6 +266,10 @@ async fn process_job(
             Err(message)
         }
     }
+}
+
+fn creation_state_allows_existing_message_completion(state: &ConvState) -> bool {
+    !matches!(state, ConvState::Provisioning { .. })
 }
 
 enum ProvisionOutcome {
@@ -714,6 +728,22 @@ async fn provision_conversation(
             skill_invocation,
         },
     };
+    let authority = manager
+        .db()
+        .renew_conversation_creation_claim(
+            &job.id,
+            &claim,
+            chrono::Utc::now(),
+            chrono::Duration::seconds(30),
+        )
+        .await
+        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
+    if matches!(authority, crate::db::CreationCasOutcome::ClaimLost) {
+        return Err((
+            "creation claim was lost before runtime bootstrap".to_string(),
+            ErrorKind::Cancelled,
+        ));
+    }
     let _handle = manager
         .get_or_create(&job.conversation_id)
         .await
@@ -876,6 +906,27 @@ fn managed_worktree_error_to_kind(error: ManagedWorktreeError) -> (String, Error
     match error {
         ManagedWorktreeError::BadRequest(message) => (message, ErrorKind::InvalidRequest),
         ManagedWorktreeError::Git(message) => (message, ErrorKind::ServerError),
+    }
+}
+
+#[cfg(test)]
+mod existing_message_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_message_does_not_complete_job_while_state_is_provisioning() {
+        let state = ConvState::Provisioning {
+            job_id: "job".to_string(),
+            phase: phoenix_core::domain::db_schema::ConversationCreationPhase::Provisioning,
+        };
+        assert!(!creation_state_allows_existing_message_completion(&state));
+    }
+
+    #[test]
+    fn persisted_message_completes_job_after_state_advances() {
+        assert!(creation_state_allows_existing_message_completion(
+            &ConvState::Idle
+        ));
     }
 }
 
