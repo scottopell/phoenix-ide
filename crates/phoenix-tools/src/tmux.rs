@@ -342,7 +342,18 @@ where
 async fn collect_drain(task: tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
     match tokio::time::timeout(Duration::from_secs(2), task).await {
         Ok(Ok(buf)) => buf,
-        _ => Vec::new(),
+        Ok(Err(error)) if error.is_panic() => {
+            tracing::warn!(%error, "tmux output drain task panicked; dropping output");
+            Vec::new()
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "tmux output drain task was cancelled; dropping output");
+            Vec::new()
+        }
+        Err(error) => {
+            tracing::debug!(%error, "tmux output drain timed out; dropping output");
+            Vec::new()
+        }
     }
 }
 
@@ -412,6 +423,25 @@ mod tests {
 
     fn skip_unless_tmux() -> bool {
         which::which("tmux").is_err()
+    }
+
+    #[tokio::test]
+    async fn collect_drain_returns_successful_output() {
+        let task = tokio::spawn(async { b"captured".to_vec() });
+        assert_eq!(collect_drain(task).await, b"captured");
+    }
+
+    #[tokio::test]
+    async fn collect_drain_drops_cancelled_task_output() {
+        let task = tokio::spawn(std::future::pending::<Vec<u8>>());
+        task.abort();
+        assert!(collect_drain(task).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_drain_drops_panicked_task_output() {
+        let task = tokio::spawn(async { panic!("drain panic test") });
+        assert!(collect_drain(task).await.is_empty());
     }
 
     #[tokio::test]

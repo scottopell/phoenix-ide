@@ -2356,10 +2356,16 @@ where
         if worktree_path.exists() {
             let worktree_str = worktree_path.to_string_lossy().to_string();
             tracing::info!(worktree = %worktree_str, "Cleaning up worktree on terminal");
-            let _ = crate::git_ops::run_git(
+            if let Err(error) = crate::git_ops::run_git(
                 &repo_root,
                 &["worktree", "remove", &worktree_str, "--force"],
-            );
+            ) {
+                tracing::warn!(
+                    worktree = %worktree_str,
+                    %error,
+                    "Failed to remove worktree on terminal; it may remain on disk"
+                );
+            }
         }
     }
 

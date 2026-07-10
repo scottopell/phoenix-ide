@@ -51,11 +51,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+import unittest
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -65,6 +67,8 @@ from httpx_sse import connect_sse
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / "target" / "debug" / "phoenix_ide"
+STARTUP_ATTEMPTS = 3
+STARTUP_TIMEOUT_SECONDS = 30.0
 
 # 1x1 transparent PNG, base64-encoded.
 TINY_PNG_B64 = (
@@ -93,11 +97,77 @@ def _build_binary() -> None:
     print(f"[e2e] build done in {time.monotonic() - t0:.1f}s", flush=True)
 
 
+class _StartupFailure(RuntimeError):
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _is_addr_in_use(log_text: str) -> bool:
+    return "kind: AddrInUse" in log_text or "Address already in use" in log_text
+
+
+def _start_server_attempt(env: dict[str, str], tmpdir: Path, attempt: int):
+    port = _free_port()
+    attempt_env = env | {"PHOENIX_PORT": str(port)}
+    log_path = tmpdir / f"phoenix-startup-{attempt}.log"
+    log_file = log_path.open("w")
+    proc = subprocess.Popen(
+        [str(BINARY)],
+        cwd=ROOT,
+        env=attempt_env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+
+    base_url = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            log_file.close()
+            log_text = log_path.read_text()
+            raise _StartupFailure(
+                f"phoenix-ide exited during startup (code {proc.returncode})\n"
+                f"--- log ({log_path}) ---\n{log_text}",
+                retryable=_is_addr_in_use(log_text),
+            )
+        try:
+            response = httpx.get(f"{base_url}/version", timeout=2.0)
+            if response.status_code == 200:
+                return proc, base_url, log_path, log_file
+        except Exception as error:
+            last_err = error
+        time.sleep(0.1)
+
+    proc.kill()
+    proc.wait(timeout=5)
+    log_file.close()
+    raise _StartupFailure(
+        f"phoenix-ide did not become healthy in {STARTUP_TIMEOUT_SECONDS:g}s: {last_err}\n"
+        f"--- log ({log_path}) ---\n{log_path.read_text()}"
+    )
+
+
+def _start_server_with_retries(env: dict[str, str], tmpdir: Path, start_attempt=_start_server_attempt):
+    for attempt in range(1, STARTUP_ATTEMPTS + 1):
+        try:
+            return start_attempt(env, tmpdir, attempt)
+        except _StartupFailure as error:
+            if not error.retryable or attempt == STARTUP_ATTEMPTS:
+                raise
+            print(
+                f"[e2e] startup port was taken; retrying with a fresh port "
+                f"({attempt}/{STARTUP_ATTEMPTS})",
+                flush=True,
+            )
+    raise AssertionError("bounded startup loop completed without a result")
+
+
 @contextmanager
 def _server():
-    port = _free_port()
-    tmpdir = tempfile.mkdtemp(prefix="phoenix-e2e-")
-    db_path = Path(tmpdir) / "phoenix.db"
+    tmpdir = Path(tempfile.mkdtemp(prefix="phoenix-e2e-"))
+    db_path = tmpdir / "phoenix.db"
     env = os.environ.copy()
     # Strip every channel that could register a non-mock provider so the
     # registry contains exactly one model and behavior is reproducible.
@@ -116,7 +186,6 @@ def _server():
         {
             "PHOENIX_ENABLE_MOCK_MODEL": "1",
             "DEFAULT_MODEL": "mock",
-            "PHOENIX_PORT": str(port),
             "PHOENIX_DB_PATH": str(db_path),
             # Bind loopback: the harness talks to the server over 127.0.0.1, so a
             # loopback bind is correct and satisfies the binary's fail-closed
@@ -128,46 +197,12 @@ def _server():
             "RUST_LOG": os.environ.get("E2E_RUST_LOG", "warn"),
         },
     )
-    log_path = Path(tmpdir) / "phoenix.log"
-    log_file = log_path.open("w")
-    proc = subprocess.Popen(
-        [str(BINARY)],
-        cwd=ROOT,
-        env=env,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-    )
 
-    base_url = f"http://127.0.0.1:{port}"
-    deadline = time.monotonic() + 30.0
-    last_err: Exception | None = None
-    import shutil
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            log_file.close()
-            err = RuntimeError(
-                f"phoenix-ide exited during startup (code {proc.returncode})\n"
-                f"--- log ({log_path}) ---\n{log_path.read_text()}"
-            )
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            raise err
-        try:
-            r = httpx.get(f"{base_url}/version", timeout=2.0)
-            if r.status_code == 200:
-                break
-        except Exception as e:
-            last_err = e
-            time.sleep(0.1)
-    else:
-        proc.kill()
-        proc.wait(timeout=5)
-        log_file.close()
-        err = RuntimeError(
-            f"phoenix-ide did not become healthy in 30s: {last_err}\n"
-            f"--- log ({log_path}) ---\n{log_path.read_text()}"
-        )
+    try:
+        proc, base_url, log_path, log_file = _start_server_with_retries(env, tmpdir)
+    except Exception:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        raise err
+        raise
 
     try:
         yield base_url, log_path
@@ -179,7 +214,7 @@ def _server():
             proc.kill()
             proc.wait(timeout=5)
         log_file.close()
-        # Clean up the per-run tempdir (DB + log). Without this, repeated
+        # Clean up the per-run tempdir (DB + logs). Without this, repeated
         # local / CI runs leak /tmp/phoenix-e2e-* directories.
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -578,7 +613,58 @@ SCENARIOS = [
 ]
 
 
+class StartupRetryTests(unittest.TestCase):
+    def test_addr_in_use_detection_accepts_rust_and_os_messages(self):
+        self.assertTrue(_is_addr_in_use('Error: Os { code: 48, kind: AddrInUse }'))
+        self.assertTrue(_is_addr_in_use("bind failed: Address already in use"))
+        self.assertFalse(_is_addr_in_use("database migration failed"))
+
+    def test_retries_retryable_failures_and_returns_success(self):
+        attempts: list[int] = []
+        expected = object()
+
+        def start_attempt(_env, _tmpdir, attempt):
+            attempts.append(attempt)
+            if attempt < STARTUP_ATTEMPTS:
+                raise _StartupFailure("port taken", retryable=True)
+            return expected
+
+        actual = _start_server_with_retries({}, Path("/unused"), start_attempt)
+        self.assertIs(actual, expected)
+        self.assertEqual(attempts, [1, 2, 3])
+
+    def test_non_retryable_failure_stops_immediately(self):
+        attempts: list[int] = []
+
+        def start_attempt(_env, _tmpdir, attempt):
+            attempts.append(attempt)
+            raise _StartupFailure("bad config")
+
+        with self.assertRaisesRegex(_StartupFailure, "bad config"):
+            _start_server_with_retries({}, Path("/unused"), start_attempt)
+        self.assertEqual(attempts, [1])
+
+    def test_retryable_failure_stops_at_attempt_bound(self):
+        attempts: list[int] = []
+
+        def start_attempt(_env, _tmpdir, attempt):
+            attempts.append(attempt)
+            raise _StartupFailure("port taken", retryable=True)
+
+        with self.assertRaisesRegex(_StartupFailure, "port taken"):
+            _start_server_with_retries({}, Path("/unused"), start_attempt)
+        self.assertEqual(attempts, list(range(1, STARTUP_ATTEMPTS + 1)))
+
+
+def _run_self_tests() -> int:
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(StartupRetryTests)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
 def main() -> int:
+    if _run_self_tests() != 0:
+        return 1
     _build_binary()
     failures: list[tuple[str, str]] = []
     log_text = ""
@@ -626,4 +712,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_run_self_tests() if "--self-test" in sys.argv[1:] else main())
