@@ -42,6 +42,11 @@ WHEN user expands or collapses a directory
 THE SYSTEM SHALL persist expansion state per conversation
 AND retain expansion state when switching between conversations
 
+WHEN user requests a file-tree refresh
+THE SYSTEM SHALL reload the tree root and every visible expanded directory
+AND preserve the current directory expansion state
+AND SHALL NOT reload descendants hidden beneath a collapsed directory
+
 **Rationale:** The file tree reflects the conversation's project context. Expansion state helps users maintain their place when reviewing multiple files.
 
 ---

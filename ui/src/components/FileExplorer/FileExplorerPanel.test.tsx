@@ -13,7 +13,9 @@ import { api } from '../../api';
 import type { SkillEntry, TaskEntry } from '../../api';
 
 vi.mock('./FileTree', () => ({
-  FileTree: () => <div data-testid="file-tree" />,
+  FileTree: ({ refreshKey }: { refreshKey?: number }) => (
+    <div data-testid="file-tree" data-refresh-key={refreshKey} />
+  ),
 }));
 
 vi.mock('../McpStatusPanel', () => ({
@@ -104,6 +106,23 @@ afterEach(() => {
 });
 
 describe('FileExplorerPanel grounding detail navigation', () => {
+  it('advances the file-tree refresh signal when Refresh is clicked', async () => {
+    renderPanel();
+    await waitFor(() => {
+      expect(api.getConversationTaskCount).toHaveBeenCalled();
+      expect(api.listConversationSkills).toHaveBeenCalled();
+    });
+
+    const tree = screen.getByTestId('file-tree');
+    const initialRefreshKey = Number(tree.getAttribute('data-refresh-key'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh file tree' }));
+
+    await waitFor(() => {
+      expect(tree).toHaveAttribute('data-refresh-key', String(initialRefreshKey + 1));
+    });
+  });
+
   it('keeps Tasks expanded and preserves task group state after Back', async () => {
     renderPanel();
 

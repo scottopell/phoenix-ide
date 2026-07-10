@@ -140,8 +140,11 @@ function extensionColor(name: string): string | undefined {
 }
 
 // API
-async function listFiles(path: string): Promise<FileItem[]> {
-  const response = await fetch(`/api/files/list?path=${encodeURIComponent(path)}`);
+async function listFiles(path: string, signal?: AbortSignal): Promise<FileItem[]> {
+  const response = await fetch(
+    `/api/files/list?path=${encodeURIComponent(path)}`,
+    signal ? { signal } : undefined,
+  );
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: 'Unknown error' }));
     throw new Error(error.error || 'Failed to list files');
@@ -186,6 +189,25 @@ function fingerprintFiles(items: FileItem[]): string {
     parts.push(it.is_directory ? 'd' : 'f');
   }
   return parts.join('|');
+}
+
+function visibleExpandedDirectories(
+  items: FileItem[],
+  childItems: Map<string, FileItem[]>,
+  expandedPaths: Set<string>,
+): string[] {
+  const paths: string[] = [];
+
+  function visit(entries: FileItem[]) {
+    for (const entry of entries) {
+      if (!entry.is_directory || !expandedPaths.has(entry.path)) continue;
+      paths.push(entry.path);
+      visit(childItems.get(entry.path) ?? EMPTY_FILE_ITEMS);
+    }
+  }
+
+  visit(items);
+  return paths;
 }
 
 function computeDirLabel(rootPath: string): string {
@@ -379,6 +401,8 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
   const [childItems, setChildItems] = useState<Map<string, FileItem[]>>(new Map());
   const treeRootRef = useRef<HTMLDivElement | null>(null);
+  const childRequestsRef = useRef<Map<string, AbortController>>(new Map());
+  const previousRefreshKeyRef = useRef(refreshKey);
   // Tracks the activeFile we last successfully scrolled to, so an updated
   // childItems map (from any later directory load) doesn't yank scroll
   // position back to the same row over and over.
@@ -524,11 +548,10 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     }
   }, []);
 
-  // When conversation changes, atomically load new expansion state
-  useEffect(() => {
-    setExpansion({ convId: conversationId, paths: loadExpansion(conversationId) });
-    setChildItems(new Map());
-  }, [conversationId]);
+  useEffect(() => () => {
+    for (const controller of childRequestsRef.current.values()) controller.abort();
+    childRequestsRef.current.clear();
+  }, []);
 
   // Persist — always correct because convId is part of the atom
   useEffect(() => {
@@ -605,14 +628,18 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
 
   // Load root directory contents
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
     setLoading(true);
     setError(null);
-    listFiles(rootPath)
-      .then(result => { if (!cancelled) setItems(result); })
-      .catch(err => { if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load'); })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+    listFiles(rootPath, controller.signal)
+      .then(result => { if (!controller.signal.aborted) setItems(result); })
+      .catch(err => {
+        if (!controller.signal.aborted) {
+          setError(err instanceof Error ? err.message : 'Failed to load');
+        }
+      })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
   }, [rootPath, refreshKey]);
 
   // Auto-refresh every ~10s while page is visible. Only `setItems` if the
@@ -626,13 +653,15 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
+    let requestController: AbortController | undefined;
     function scheduleRefresh() {
       const jitter = Math.random() * 4000 - 2000; // +/- 2s
       timer = setTimeout(async () => {
         if (cancelled) return;
         if (document.visibilityState === 'visible') {
           try {
-            const result = await listFiles(rootPath);
+            requestController = new AbortController();
+            const result = await listFiles(rootPath, requestController.signal);
             if (cancelled) return;
             setItems(prev => {
               if (fingerprintFiles(prev) === fingerprintFiles(result)) {
@@ -650,34 +679,54 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     return () => {
       cancelled = true;
       clearTimeout(timer);
+      requestController?.abort();
     };
   }, [rootPath]);
 
-  // Load children for expanded folder
+  // Load children for an expanded folder. One request owns each path; replacing
+  // it aborts the older request so a rapid refresh cannot restore stale data.
   const loadChildren = useCallback(async (path: string) => {
+    childRequestsRef.current.get(path)?.abort();
+    const controller = new AbortController();
+    childRequestsRef.current.set(path, controller);
     setLoadingPaths(prev => new Set(prev).add(path));
     try {
-      const result = await listFiles(path);
-      setChildItems(prev => new Map(prev).set(path, result));
+      const result = await listFiles(path, controller.signal);
+      if (childRequestsRef.current.get(path) === controller) {
+        setChildItems(prev => new Map(prev).set(path, result));
+      }
     } catch (err) {
-      console.error('Failed to load children:', err);
+      if (!controller.signal.aborted) console.error('Failed to load children:', err);
     } finally {
-      setLoadingPaths(prev => {
-        const next = new Set(prev);
-        next.delete(path);
-        return next;
-      });
+      if (childRequestsRef.current.get(path) === controller) {
+        childRequestsRef.current.delete(path);
+        setLoadingPaths(prev => {
+          const next = new Set(prev);
+          next.delete(path);
+          return next;
+        });
+      }
     }
   }, []);
+
+  // An explicit refresh reloads every expanded directory that is currently
+  // visible. Descendants of collapsed directories remain cached and untouched.
+  useEffect(() => {
+    if (previousRefreshKeyRef.current === refreshKey) return;
+    previousRefreshKeyRef.current = refreshKey;
+    for (const path of visibleExpandedDirectories(items, childItems, expandedPaths)) {
+      void loadChildren(path);
+    }
+  }, [refreshKey, items, childItems, expandedPaths, loadChildren]);
 
   // Auto-load children for already-expanded paths when switching conversations
   useEffect(() => {
     for (const path of expandedPaths) {
-      if (!childItems.has(path)) {
-        loadChildren(path);
+      if (!childItems.has(path) && !loadingPaths.has(path)) {
+        void loadChildren(path);
       }
     }
-  }, [expandedPaths, childItems, loadChildren]);
+  }, [expandedPaths, childItems, loadingPaths, loadChildren]);
 
   // Toggle folder expansion
   const toggleExpand = useCallback((path: string) => {

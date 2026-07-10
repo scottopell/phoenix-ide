@@ -32,6 +32,7 @@ export function FileBrowserOverlay({ isOpen, rootPath, conversationId, onClose, 
         </div>
         <div className="file-browser-content">
           <FileTree
+            key={`${conversationId}\0${rootPath}`}
             rootPath={rootPath}
             onFileSelect={onFileSelect}
             conversationId={conversationId}

@@ -212,6 +212,140 @@ describe('FileTree — reveal active file', () => {
     expect(screen.getByText('Other.tsx')).toBeInTheDocument();
   });
 
+  it('refreshes visible expanded directories while preserving expansion', async () => {
+    const onFileSelect = vi.fn();
+    const originalUiItems = FS['/proj/ui']!;
+    const { rerender } = render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={onFileSelect}
+        activeFile={null}
+        conversationId="conv-test-refresh"
+        refreshKey={0}
+      />,
+    );
+
+    const uiRow = await screen.findByText('ui');
+    fireEvent.click(uiRow.closest('.ft-item')!);
+    expect(await screen.findByText('src')).toBeInTheDocument();
+
+    try {
+      FS['/proj/ui'] = [
+        ...originalUiItems,
+        { name: 'new-file.ts', path: '/proj/ui/new-file.ts', is_directory: false, viewer: TEXT('code'), is_gitignored: false },
+      ];
+
+      rerender(
+        <FileTree
+          rootPath="/proj"
+          onFileSelect={onFileSelect}
+          activeFile={null}
+          conversationId="conv-test-refresh"
+          refreshKey={1}
+        />,
+      );
+
+      expect(await screen.findByText('new-file.ts')).toBeInTheDocument();
+      expect(screen.getByText('src')).toBeInTheDocument();
+      expect(uiRow.closest('.ft-item')).toHaveAttribute('aria-expanded', 'true');
+    } finally {
+      FS['/proj/ui'] = originalUiItems;
+    }
+  });
+
+  it('does not refresh expanded descendants hidden beneath a collapsed directory', async () => {
+    const fetchMock = vi.mocked(fetch);
+    const { rerender } = render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={vi.fn()}
+        conversationId="conv-test-collapsed-refresh"
+        refreshKey={0}
+      />,
+    );
+
+    const uiRow = (await screen.findByText('ui')).closest('.ft-item')!;
+    fireEvent.click(uiRow);
+    const srcRow = (await screen.findByText('src')).closest('.ft-item')!;
+    fireEvent.click(srcRow);
+    await screen.findByText('components');
+    fireEvent.click(uiRow);
+    expect(screen.queryByText('src')).not.toBeInTheDocument();
+
+    fetchMock.mockClear();
+    rerender(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={vi.fn()}
+        conversationId="conv-test-collapsed-refresh"
+        refreshKey={1}
+      />,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const refreshedPaths = fetchMock.mock.calls.map(([url]) => (
+      new URL(String(url), 'http://localhost').searchParams.get('path')
+    ));
+    expect(refreshedPaths).toContain('/proj');
+    expect(refreshedPaths).not.toContain('/proj/ui');
+    expect(refreshedPaths).not.toContain('/proj/ui/src');
+  });
+
+  it('does not let a superseded child refresh overwrite the latest result', async () => {
+    const fetchMock = vi.mocked(fetch);
+    const onFileSelect = vi.fn();
+    const { rerender } = render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={onFileSelect}
+        conversationId="conv-test-refresh-race"
+        refreshKey={0}
+      />,
+    );
+
+    fireEvent.click((await screen.findByText('ui')).closest('.ft-item')!);
+    await screen.findByText('src');
+
+    let resolveStale!: (response: Response) => void;
+    const staleResponse = new Promise<Response>(resolve => {
+      resolveStale = resolve;
+    });
+    let uiRefreshCount = 0;
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const path = new URL(String(url), 'http://localhost').searchParams.get('path') || '';
+      if (path === '/proj/ui') {
+        uiRefreshCount += 1;
+        if (uiRefreshCount === 1) return staleResponse;
+        return {
+          ok: true,
+          json: async () => ({ items: [
+            ...FS['/proj/ui']!,
+            { name: 'latest.ts', path: '/proj/ui/latest.ts', is_directory: false, viewer: TEXT('code'), is_gitignored: false },
+          ] }),
+        } as Response;
+      }
+      return { ok: true, json: async () => ({ items: FS[path] ?? [] }) } as Response;
+    });
+
+    rerender(
+      <FileTree rootPath="/proj" onFileSelect={onFileSelect} conversationId="conv-test-refresh-race" refreshKey={1} />,
+    );
+    await waitFor(() => expect(uiRefreshCount).toBe(1));
+    rerender(
+      <FileTree rootPath="/proj" onFileSelect={onFileSelect} conversationId="conv-test-refresh-race" refreshKey={2} />,
+    );
+    expect(await screen.findByText('latest.ts')).toBeInTheDocument();
+
+    const staleJson = vi.fn(async () => ({ items: [
+      ...FS['/proj/ui']!,
+      { name: 'stale.ts', path: '/proj/ui/stale.ts', is_directory: false, viewer: TEXT('code'), is_gitignored: false },
+    ] }));
+    resolveStale({ ok: true, json: staleJson } as unknown as Response);
+    await waitFor(() => expect(staleJson).toHaveBeenCalled());
+    expect(screen.queryByText('stale.ts')).not.toBeInTheDocument();
+    expect(screen.getByText('latest.ts')).toBeInTheDocument();
+  });
+
   it('uses depth-only row indentation with stable file/folder slots', async () => {
     const onFileSelect = vi.fn();
     render(

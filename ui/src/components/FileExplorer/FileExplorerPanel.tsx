@@ -146,6 +146,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
           {rootPath && (
             <div className="fe-tree-scroll">
               <FileTree
+                key={`${conversationId ?? ''}\0${rootPath}`}
                 rootPath={rootPath}
                 onFileSelect={handleFileSelect}
                 activeFile={activeFile}
