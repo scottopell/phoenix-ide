@@ -490,21 +490,13 @@ async fn provision_conversation(
                 desired_base_branch: Some(desired_base_branch.clone()),
             },
             &conv_mode,
+            &resolved_model,
         )
         .await
     {
         cleanup_unpersisted_worktree(repo_root.as_deref(), &job.conversation_id, &conv_mode);
         return Err((e.to_string(), ErrorKind::ServerError));
     }
-    if let Err(e) = manager
-        .db()
-        .update_conversation_model(&job.conversation_id, &resolved_model)
-        .await
-    {
-        cleanup_unpersisted_worktree(repo_root.as_deref(), &job.conversation_id, &conv_mode);
-        return Err((e.to_string(), ErrorKind::ServerError));
-    }
-
     let persisted_conversation = manager
         .db()
         .get_conversation(&job.conversation_id)
@@ -600,36 +592,21 @@ async fn provision_conversation(
             ErrorKind::ServerError,
         )
     })?;
-    let event = Event::UserMessage {
-        text: display_text,
-        llm_text,
-        images,
-        files,
-        message_id,
-        user_agent: None,
-        skill_invocation,
+    let event = Event::CreationProvisioned {
+        initial_message: phoenix_core::domain::sm_event::SteerEntry {
+            text: display_text,
+            llm_text,
+            images,
+            files,
+            message_id,
+            user_agent: None,
+            skill_invocation,
+        },
     };
-    manager
-        .db()
-        .update_conversation_state(&job.conversation_id, &ConvState::Idle)
-        .await
-        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
-    manager
-        .evict_runtime(&job.conversation_id, EvictionReason::CreationProvisioned)
-        .await;
     let _handle = manager
         .get_or_create(&job.conversation_id)
         .await
         .map_err(|e| (e, ErrorKind::ServerError))?;
-    let provisioning = ConvState::Provisioning {
-        job_id: job.id.clone(),
-        phase: ConversationCreationPhase::Provisioning,
-    };
-    manager
-        .db()
-        .update_conversation_state(&job.conversation_id, &provisioning)
-        .await
-        .map_err(|e| (e.to_string(), ErrorKind::ServerError))?;
     manager
         .send_event(&job.conversation_id, event)
         .await

@@ -471,6 +471,27 @@ pub fn transition(
     context: &ConvContext,
     event: Event,
 ) -> Result<TransitionResult, TransitionError> {
+    if let Event::CreationProvisioned { initial_message } = event {
+        if !matches!(state, ConvState::Provisioning { .. }) || context.is_sub_agent {
+            return Err(TransitionError::InvalidTransition {
+                state: state.variant_name(),
+                event: "CreationProvisioned",
+            });
+        }
+        return transition(
+            &ConvState::Idle,
+            context,
+            Event::UserMessage {
+                text: initial_message.text,
+                llm_text: initial_message.llm_text,
+                images: initial_message.images,
+                files: initial_message.files,
+                message_id: initial_message.message_id,
+                user_agent: initial_message.user_agent,
+                skill_invocation: initial_message.skill_invocation,
+            },
+        );
+    }
     if context.is_sub_agent {
         let sub_state = SubAgentState::try_from(state.clone()).map_err(|e| {
             TransitionError::InvalidTransition {
@@ -4108,6 +4129,82 @@ mod tests {
             ConvState::LlmRequesting { attempt: 1 }
         ));
         assert!(!result.effects.is_empty());
+    }
+
+    #[test]
+    fn creation_provisioned_reuses_normal_initial_turn_transition() {
+        let message = phoenix_core::domain::sm_event::SteerEntry {
+            text: "Hello".to_string(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            message_id: "creation-message-id".to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let from_provisioning = transition(
+            &ConvState::Provisioning {
+                job_id: "creation-job".to_string(),
+                phase: phoenix_core::domain::db_schema::ConversationCreationPhase::Provisioning,
+            },
+            &test_context(),
+            Event::CreationProvisioned {
+                initial_message: message.clone(),
+            },
+        )
+        .unwrap();
+        let from_idle = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::UserMessage {
+                text: message.text,
+                llm_text: message.llm_text,
+                images: message.images,
+                files: message.files,
+                message_id: message.message_id,
+                user_agent: message.user_agent,
+                skill_invocation: message.skill_invocation,
+            },
+        )
+        .unwrap();
+        assert_eq!(from_provisioning.new_state, from_idle.new_state);
+        let provisioning_effects: Vec<String> = from_provisioning
+            .effects
+            .iter()
+            .map(|effect| format!("{effect:?}"))
+            .collect();
+        let idle_effects: Vec<String> = from_idle
+            .effects
+            .iter()
+            .map(|effect| format!("{effect:?}"))
+            .collect();
+        assert_eq!(provisioning_effects, idle_effects);
+    }
+
+    #[test]
+    fn creation_provisioned_is_rejected_outside_provisioning() {
+        let result = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::CreationProvisioned {
+                initial_message: phoenix_core::domain::sm_event::SteerEntry {
+                    text: "Hello".to_string(),
+                    llm_text: None,
+                    images: vec![],
+                    files: vec![],
+                    message_id: "creation-message-id".to_string(),
+                    user_agent: None,
+                    skill_invocation: None,
+                },
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(TransitionError::InvalidTransition {
+                event: "CreationProvisioned",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -4170,6 +4170,7 @@ impl Database {
         id: &str,
         update: &ConversationCreationMetadataUpdate,
         mode: &ConvMode,
+        model: &str,
     ) -> DbResult<()> {
         let cm = conv_mode_columns(mode);
         let base_slug = update.slug.clone();
@@ -4201,8 +4202,9 @@ impl Database {
                      cm_task_id = ?13,
                      cm_task_title = ?14,
                      cm_next_taskmd_id_hint = ?15,
-                     updated_at = ?16
-                 WHERE id = ?17",
+                     model = ?16,
+                     updated_at = ?17
+                 WHERE id = ?18",
             )
             .bind(candidate_slug.as_deref())
             .bind(update.title.is_some())
@@ -4224,6 +4226,7 @@ impl Database {
             .bind(cm.task_id)
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
+            .bind(model)
             .bind(now)
             .bind(id)
             .execute(&mut *tx)
