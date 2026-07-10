@@ -622,9 +622,11 @@ async fn provision_conversation(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(generate_slug);
 
-    if let Err(e) = manager
+    let metadata_outcome = manager
         .db()
         .update_conversation_creation_metadata_and_mode(
+            &job.id,
+            &claim,
             &job.conversation_id,
             &ConversationCreationMetadataUpdate {
                 slug: Some(slug.clone()),
@@ -637,8 +639,12 @@ async fn provision_conversation(
             &resolved_model,
         )
         .await
-    {
-        return Err((e.to_string(), ErrorKind::ServerError));
+        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
+    if matches!(metadata_outcome, crate::db::CreationCasOutcome::ClaimLost) {
+        return Err((
+            "creation claim was lost before metadata commit".to_string(),
+            ErrorKind::Cancelled,
+        ));
     }
     checkpoint_creation_stage(
         manager,

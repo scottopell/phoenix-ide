@@ -1912,6 +1912,10 @@ impl Database {
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
+               AND NOT EXISTS (
+                   SELECT 1 FROM conversation_creation_jobs j
+                   WHERE j.conversation_id = c.id AND j.status = 'deletion_pending'
+               )
              ORDER BY c.updated_at DESC",
         )
         .try_map(parse_conversation_row)
@@ -2360,19 +2364,24 @@ impl Database {
             tx.rollback().await?;
             return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
         };
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE conversation_creation_jobs
              SET status = 'cancelling', generation = generation + 1,
                  claim_worker_id = NULL, claim_token = NULL, lease_until = NULL,
                  cleanup_worker_id = NULL, cleanup_token = NULL, cleanup_lease_until = NULL,
                  next_attempt_at = NULL, updated_at = ?1
-             WHERE id = ?2 AND generation = ?3",
+             WHERE id = ?2 AND generation = ?3
+               AND status IN ('accepted', 'claimed', 'retry_scheduled')",
         )
         .bind(&now)
         .bind(&job_id)
         .bind(generation)
         .execute(&mut *tx)
         .await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+        }
         let state = serde_json::to_string(&ConvState::CreationCancelled {
             job_id: job_id.clone(),
         })
@@ -4738,14 +4747,16 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// Returns [`DbError`] if the conversation does not exist or either write fails.
+    /// Returns [`DbError`] if serialization or either write fails.
     pub async fn update_conversation_creation_metadata_and_mode(
         &self,
+        job_id: &str,
+        claim: &CreationClaim,
         id: &str,
         update: &ConversationCreationMetadataUpdate,
         mode: &ConvMode,
         model: &str,
-    ) -> DbResult<()> {
+    ) -> DbResult<CreationCasOutcome> {
         let cm = conv_mode_columns(mode);
         let base_slug = update.slug.clone();
         let mut candidate_slug = base_slug.clone();
@@ -4778,7 +4789,14 @@ impl Database {
                      cm_next_taskmd_id_hint = ?15,
                      model = ?16,
                      updated_at = ?17
-                 WHERE id = ?18",
+                 WHERE id = ?18
+                   AND EXISTS (
+                       SELECT 1 FROM conversation_creation_jobs j
+                       WHERE j.id = ?19 AND j.conversation_id = conversations.id
+                         AND j.status = 'claimed' AND j.generation = ?20
+                         AND j.claim_worker_id = ?21 AND j.claim_token = ?22
+                         AND j.lease_until > ?17
+                   )",
             )
             .bind(candidate_slug.as_deref())
             .bind(update.title.is_some())
@@ -4801,17 +4819,22 @@ impl Database {
             .bind(cm.task_title)
             .bind(cm.next_taskmd_id_hint)
             .bind(model)
-            .bind(now)
+            .bind(&now)
             .bind(id)
+            .bind(job_id)
+            .bind(claim_generation_i64(claim)?)
+            .bind(&claim.worker_id.0)
+            .bind(&claim.token.0)
             .execute(&mut *tx)
             .await;
             match result {
                 Ok(result) => {
                     if result.rows_affected() == 0 {
-                        return Err(DbError::ConversationNotFound(id.to_string()));
+                        tx.rollback().await?;
+                        return Ok(CreationCasOutcome::ClaimLost);
                     }
                     tx.commit().await?;
-                    return Ok(());
+                    return Ok(CreationCasOutcome::Applied);
                 }
                 Err(sqlx::Error::Database(ref e))
                     if is_sqlite_unique_constraint(e.as_ref()) && base_slug.is_some() =>
@@ -7699,6 +7722,120 @@ mod tests {
             .await
             .unwrap();
         assert!(db.get_conversation("conv-cancel").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn creation_cancel_rejects_ready_job_without_mutating_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-ready-cancel", "conv-ready-cancel").await;
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'ready', completed_at = ?1 WHERE id = ?2",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind("job-ready-cancel")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let state_before = db
+            .get_conversation("conv-ready-cancel")
+            .await
+            .unwrap()
+            .state;
+
+        let result = db
+            .cancel_conversation_creation("conv-ready-cancel", Utc::now())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(DbError::Sqlx(sqlx::Error::RowNotFound))
+        ));
+        assert_eq!(
+            db.get_conversation("conv-ready-cancel")
+                .await
+                .unwrap()
+                .state,
+            state_before
+        );
+        assert!(matches!(
+            db.get_conversation_creation_job("job-ready-cancel")
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Ready
+        ));
+    }
+
+    #[tokio::test]
+    async fn deletion_pending_creation_is_hidden_from_archived_listing() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-hidden-delete", "conv-hidden-delete").await;
+        db.request_conversation_creation_deletion("conv-hidden-delete", Utc::now())
+            .await
+            .unwrap();
+
+        assert!(db
+            .list_archived_conversations()
+            .await
+            .unwrap()
+            .iter()
+            .all(|conversation| conversation.id != "conv-hidden-delete"));
+        assert!(db.get_conversation("conv-hidden-delete").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stale_claim_cannot_commit_creation_metadata() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-stale-metadata", "conv-stale-metadata").await;
+        let now = Utc::now();
+        let claimed = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker-a".into()),
+                &CreationClaimToken("token-a".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let CreationClaimOutcome::Claimed(job) = claimed else {
+            panic!("expected claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        db.cancel_conversation_creation("conv-stale-metadata", now)
+            .await
+            .unwrap();
+
+        let outcome = db
+            .update_conversation_creation_metadata_and_mode(
+                "job-stale-metadata",
+                &claim,
+                "conv-stale-metadata",
+                &ConversationCreationMetadataUpdate {
+                    slug: Some("stale-slug".to_string()),
+                    title: Some(Some("stale title".to_string())),
+                    cwd: Some("/stale".to_string()),
+                    project_id: Some(None),
+                    desired_base_branch: Some(None),
+                },
+                &ConvMode::Direct,
+                "stale-model",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CreationCasOutcome::ClaimLost);
+        let conversation = db.get_conversation("conv-stale-metadata").await.unwrap();
+        assert_ne!(conversation.slug.as_deref(), Some("stale-slug"));
+        assert_ne!(conversation.cwd, "/stale");
+        assert!(matches!(
+            conversation.state,
+            ConvState::CreationCancelled { .. }
+        ));
     }
 
     #[tokio::test]
