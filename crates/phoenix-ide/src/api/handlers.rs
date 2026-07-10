@@ -1581,9 +1581,6 @@ async fn create_conversation_with_id(
         }
         None => uuid::Uuid::new_v4().to_string(),
     };
-    let valid_cwd = crate::conversation_cwd::validate_conversation_cwd(&req.cwd)
-        .map_err(|e| AppError::BadRequest(e.to_string()))?;
-
     // REQ-SEED-001: seeded conversations may be created empty so the UI can
     // hydrate the input area with a draft and let the user review before
     // sending. For unseeded creates the text is still required.
@@ -1694,168 +1691,24 @@ async fn create_conversation_with_id(
         }
     }
 
-    let mode_for_preflight = req.mode.as_deref().unwrap_or("direct");
-    let repo_root_for_preflight = detect_git_repo_root(valid_cwd.as_path());
-    if matches!(mode_for_preflight, "managed" | "branch") && repo_root_for_preflight.is_none() {
-        return Err(AppError::BadRequest(
-            "Worktree mode requires a git repository".to_string(),
-        ));
-    }
-    let mut resolved_base_branch_for_intent = req.base_branch.clone();
-    let managed_like_preflight = matches!(mode_for_preflight, "managed" | "auto")
-        && (mode_for_preflight == "managed" || repo_root_for_preflight.is_some());
-    if managed_like_preflight {
-        let repo_root_for_blocking = repo_root_for_preflight.clone();
-        let requested_base = req.base_branch.clone();
-        let checkout_ref = req.checkout_ref.clone();
-        let infer_base = mode_for_preflight == "auto" && requested_base.is_none();
-        resolved_base_branch_for_intent = tokio::task::spawn_blocking(move || {
-            let inferred_base = if infer_base {
-                repo_root_for_blocking.as_deref().and_then(|repo_root| {
-                    crate::git_ops::run_git(
-                        std::path::Path::new(repo_root),
-                        &["rev-parse", "--abbrev-ref", "HEAD"],
-                    )
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty() && s != "HEAD")
-                })
-            } else {
-                None
-            };
-            let base_branch = requested_base
-                .as_deref()
-                .or(inferred_base.as_deref())
-                .ok_or_else(|| {
-                    AppError::BadRequest("Managed mode requires base_branch".to_string())
-                })?;
-            validate_user_ref(base_branch)?;
-            if let Some(checkout_ref) = checkout_ref.as_deref() {
-                validate_user_ref(checkout_ref)?;
-            }
-            Ok::<Option<String>, AppError>(Some(base_branch.to_string()))
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("managed ref preflight task failed: {e}")))??;
-    }
-    let worktree_backed = matches!(mode_for_preflight, "managed" | "branch")
-        || (mode_for_preflight == "auto" && repo_root_for_preflight.is_some());
+    let requested_mode = req.mode.as_deref().unwrap_or("direct");
     let persisted_prompt_text = req.text.clone();
-    let mut expansion_preflighted = false;
-    let mut persisted_llm_text = None;
-    let mut persisted_skill_invocation = None;
-    if !worktree_backed && !req.text.trim().is_empty() {
-        let resolution_root =
-            crate::resolution_root::ResolutionRoot::working_dir(valid_cwd.path_buf());
-        let expanded =
-            crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
-                AppError::UnprocessableEntity(ExpansionErrorResponse {
-                    error: e.to_string(),
-                    error_type: e.error_type().to_string(),
-                    reference: e.reference(),
-                })
-            })?;
-        expansion_preflighted = true;
-        persisted_llm_text =
-            (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
-        persisted_skill_invocation = expanded.skill_invocation;
-    }
-
-    if mode_for_preflight == "branch" {
-        let branch_name = req
-            .base_branch
-            .as_deref()
-            .ok_or_else(|| AppError::BadRequest("Branch mode requires base_branch".to_string()))?;
-        validate_user_ref(branch_name)?;
-        if let Some(repo_root) = repo_root_for_preflight.as_deref() {
-            let repo_root_for_materialize = repo_root.to_string();
-            let branch_for_materialize = branch_name.to_string();
-            match tokio::task::spawn_blocking(move || {
-                materialize_branch(
-                    std::path::Path::new(&repo_root_for_materialize),
-                    &branch_for_materialize,
-                )
-            })
-            .await
-            .map_err(|e| AppError::Internal(format!("branch materialization task failed: {e}")))?
-            {
-                Ok(()) => {}
-                Err(GitOpError::BranchNotFound(branch)) => {
-                    return Err(AppError::BadRequest(format!(
-                        "Branch '{branch}' not found locally or at origin"
-                    )));
-                }
-                Err(other) => return Err(AppError::BadRequest(other.to_string())),
-            }
-            let repo_root_for_conflict = repo_root.to_string();
-            let branch_for_conflict = branch_name.to_string();
-            let db_for_conflict = state.runtime.db().clone();
-            match tokio::task::spawn_blocking(move || {
-                check_branch_conflict(
-                    std::path::Path::new(&repo_root_for_conflict),
-                    &db_for_conflict,
-                    &branch_for_conflict,
-                )
-            })
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("branch conflict preflight task failed: {e}"))
-            })? {
-                Ok(()) => {}
-                Err(BranchConflict::PhoenixConversation { slug }) => {
-                    return Err(AppError::Conflict(Box::new(
-                        ConflictErrorResponse::new(
-                            "Branch is already checked out by another Phoenix conversation",
-                            "branch_in_use",
-                        )
-                        .with_conflict_slug(slug),
-                    )));
-                }
-                Err(BranchConflict::ExternalCheckout { branch, location }) => {
-                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        format!("Branch '{branch}' is already checked out in {location}"),
-                        "branch_checked_out",
-                    ))));
-                }
-            }
-        }
-    }
-
-    if !req.files.is_empty() {
-        let validated = validate_submitted_attachments(&id, &req.files).await?;
-        req.files = validated
-            .into_iter()
-            .map(|file| crate::api::types::FileAttachment {
-                original_name: file.original_name,
-                media_type: file.media_type,
-                size_bytes: file.size_bytes,
-                stored_path: file.stored_path,
-            })
-            .collect();
-    }
 
     let short_id: String = id.chars().take(8).collect();
     let slug = format!("conv-{short_id}");
     let conv_mode = crate::db::ConvMode::Direct;
-    let effective_cwd = valid_cwd.into_raw();
-    let desired_base_branch = resolved_base_branch_for_intent.as_deref();
+    let effective_cwd = req.cwd.clone();
+    let desired_base_branch = req.base_branch.as_deref();
     let registry_default_model = state.llm_registry.default_model_id().to_string();
     let shell_model = req
         .model
         .clone()
         .unwrap_or_else(|| registry_default_model.clone());
-    let intent_model = req.model.clone().unwrap_or_else(|| {
-        if managed_like_preflight {
-            state
-                .llm_registry
-                .cheap_model_id_for_provider(&registry_default_model)
-        } else {
-            registry_default_model.clone()
-        }
-    });
-    let resolved_mode_for_intent = match mode_for_preflight {
-        "auto" if repo_root_for_preflight.is_some() => Some("managed".to_string()),
-        "auto" => Some("direct".to_string()),
+    let intent_model = req
+        .model
+        .clone()
+        .unwrap_or_else(|| registry_default_model.clone());
+    let resolved_mode_for_intent = match requested_mode {
         "direct" => None,
         other => Some(other.to_string()),
     };
@@ -1900,22 +1753,18 @@ async fn create_conversation_with_id(
         }
     }
     if !req.files.is_empty() {
-        match validate_submitted_attachments(&id, &req.files).await {
-            Ok(validated) => {
-                req.files = validated
-                    .into_iter()
-                    .map(|file| crate::api::types::FileAttachment {
-                        original_name: file.original_name,
-                        media_type: file.media_type,
-                        size_bytes: file.size_bytes,
-                        stored_path: file.stored_path,
-                    })
-                    .collect();
-            }
-            Err(e) => {
-                delete_files(&stored_file_paths).await;
-                return Err(e);
-            }
+        let mut total_bytes = 0_u64;
+        for file in &req.files {
+            let size = usize::try_from(file.size_bytes)
+                .map_err(|_| AppError::BadRequest("Attachment size is invalid".to_string()))?;
+            validate_attachment_file(&file.original_name, &file.media_type, size)?;
+            total_bytes = total_bytes.saturating_add(file.size_bytes);
+        }
+        if total_bytes > u64::try_from(MAX_TOTAL_ATTACHMENT_BYTES).unwrap_or(u64::MAX) {
+            delete_files(&stored_file_paths).await;
+            return Err(AppError::BadRequest(
+                "Attachments exceed the 25 MB total limit".to_string(),
+            ));
         }
     }
 
@@ -1923,9 +1772,9 @@ async fn create_conversation_with_id(
         cwd: effective_cwd.clone(),
         model: Some(intent_model),
         text: persisted_prompt_text,
-        expansion_preflighted,
-        llm_text: persisted_llm_text,
-        skill_invocation: persisted_skill_invocation,
+        expansion_preflighted: false,
+        llm_text: None,
+        skill_invocation: None,
         message_id: req.message_id.clone(),
         images: req
             .images
@@ -1938,7 +1787,7 @@ async fn create_conversation_with_id(
             .collect(),
         files: req.files.iter().cloned().map(Into::into).collect(),
         mode: resolved_mode_for_intent,
-        base_branch: resolved_base_branch_for_intent.clone(),
+        base_branch: req.base_branch.clone(),
         checkout_ref: req.checkout_ref.clone(),
         seed_parent_id: req.seed_parent_id.clone(),
         seed_label: req.seed_label.clone(),
@@ -6260,29 +6109,27 @@ mod conversation_cwd_validation_tests {
     }
 
     #[tokio::test]
-    async fn create_conversation_rejects_filesystem_root_cwd() {
+    async fn create_conversation_accepts_root_cwd_for_async_validation() {
         let state = hard_delete_cascade_tests::make_test_state().await;
-        let err = create_conversation_with_id(state, create_request("/".to_string()), Vec::new())
-            .await
-            .expect_err("root cwd rejected before shell creation");
-
-        match err {
-            AppError::BadRequest(msg) => assert!(msg.contains("filesystem root"), "got: {msg}"),
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
+        let Json(response) =
+            create_conversation_with_id(state, create_request("/".to_string()), Vec::new())
+                .await
+                .expect("root cwd is persisted before worker validation");
+        assert_eq!(response.conversation["cwd"].as_str(), Some("/"));
+        assert_eq!(
+            response.conversation["state"]["type"].as_str(),
+            Some("provisioning")
+        );
     }
 
     #[tokio::test]
-    async fn create_conversation_rejects_cwd_that_resolves_to_root() {
+    async fn create_conversation_preserves_raw_cwd_for_async_validation() {
         let state = hard_delete_cascade_tests::make_test_state().await;
-        let err = create_conversation_with_id(state, create_request("/..".to_string()), Vec::new())
-            .await
-            .expect_err("canonical root rejected before shell creation");
-
-        match err {
-            AppError::BadRequest(msg) => assert!(msg.contains("filesystem root"), "got: {msg}"),
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
+        let Json(response) =
+            create_conversation_with_id(state, create_request("/..".to_string()), Vec::new())
+                .await
+                .expect("raw cwd accepted");
+        assert_eq!(response.conversation["cwd"].as_str(), Some("/.."));
     }
 
     #[tokio::test]
@@ -6300,10 +6147,9 @@ mod conversation_cwd_validation_tests {
         .await
         .expect("deep cwd accepted");
 
-        let canonical = deep.canonicalize().unwrap();
         assert_eq!(
             response.conversation["cwd"].as_str(),
-            Some(canonical.to_str().unwrap())
+            Some(deep.to_str().unwrap())
         );
         assert_eq!(
             response.conversation["state"]["type"].as_str(),
@@ -6312,30 +6158,18 @@ mod conversation_cwd_validation_tests {
     }
 
     #[tokio::test]
-    async fn explicit_worktree_mode_outside_git_rejects_before_shell_creation() {
+    async fn explicit_worktree_mode_outside_git_returns_provisioning_shell() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = hard_delete_cascade_tests::make_test_state().await;
         let mut req = create_request(tmp.path().to_string_lossy().to_string());
         req.mode = Some("managed".to_string());
 
-        let err = create_conversation_with_id(state.clone(), req, Vec::new())
+        let Json(response) = create_conversation_with_id(state, req, Vec::new())
             .await
-            .expect_err("explicit managed mode outside git must be synchronous 400");
-
-        match err {
-            AppError::BadRequest(msg) => {
-                assert!(msg.contains("git repository"), "got: {msg}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-        assert!(
-            state
-                .db
-                .list_conversations()
-                .await
-                .expect("list")
-                .is_empty(),
-            "rejected explicit worktree create must not leave a failed shell"
+            .expect("managed intent accepted before git validation");
+        assert_eq!(
+            response.conversation["state"]["type"].as_str(),
+            Some("provisioning")
         );
     }
 
@@ -6346,31 +6180,19 @@ mod conversation_cwd_validation_tests {
     }
 
     #[tokio::test]
-    async fn managed_mode_without_base_branch_rejects_before_shell_creation() {
+    async fn managed_mode_without_base_branch_is_deferred_to_worker() {
         let tmp = tempfile::tempdir().expect("tempdir");
         init_git_repo(tmp.path());
         let state = hard_delete_cascade_tests::make_test_state().await;
         let mut req = create_request(tmp.path().to_string_lossy().to_string());
         req.mode = Some("managed".to_string());
 
-        let err = create_conversation_with_id(state.clone(), req, Vec::new())
+        let Json(response) = create_conversation_with_id(state, req, Vec::new())
             .await
-            .expect_err("explicit managed mode requires synchronous base_branch validation");
-
-        match err {
-            AppError::BadRequest(msg) => {
-                assert!(msg.contains("base_branch"), "got: {msg}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-        assert!(
-            state
-                .db
-                .list_conversations()
-                .await
-                .expect("list")
-                .is_empty(),
-            "rejected managed create must not leave a failed shell"
+            .expect("managed intent accepted before base validation");
+        assert_eq!(
+            response.conversation["state"]["type"].as_str(),
+            Some("provisioning")
         );
     }
 
@@ -6585,7 +6407,7 @@ mod conversation_cwd_validation_tests {
     }
 
     #[tokio::test]
-    async fn branch_mode_nonexistent_branch_rejects_before_shell_creation() {
+    async fn branch_mode_nonexistent_branch_is_deferred_to_worker() {
         let tmp = tempfile::tempdir().expect("tempdir");
         init_git_repo(tmp.path());
         let state = hard_delete_cascade_tests::make_test_state().await;
@@ -6593,34 +6415,21 @@ mod conversation_cwd_validation_tests {
         req.mode = Some("branch".to_string());
         req.base_branch = Some("does-not-exist".to_string());
 
-        let err = create_conversation_with_id(state.clone(), req, Vec::new())
+        let Json(response) = create_conversation_with_id(state, req, Vec::new())
             .await
-            .expect_err("branch existence must be validated before shell creation");
-
-        match err {
-            AppError::BadRequest(msg) => {
-                assert!(msg.contains("not found"), "got: {msg}");
-            }
-            other => panic!("expected BadRequest, got {other:?}"),
-        }
-        assert!(
-            state
-                .db
-                .list_conversations()
-                .await
-                .expect("list")
-                .is_empty(),
-            "rejected branch create must not leave a failed shell"
+            .expect("branch intent accepted before git validation");
+        assert_eq!(
+            response.conversation["state"]["type"].as_str(),
+            Some("provisioning")
         );
     }
 
     #[tokio::test]
-    async fn creation_intent_stores_canonical_cwd() {
+    async fn creation_intent_preserves_raw_cwd() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).expect("project dir");
         let raw_cwd = project.join("..").join("project");
-        let canonical = project.canonicalize().expect("canonical project");
         let state = hard_delete_cascade_tests::make_test_state().await;
         let mut req = create_request(raw_cwd.to_string_lossy().to_string());
         req.conversation_id = Some(uuid::Uuid::new_v4().to_string());
@@ -6636,7 +6445,7 @@ mod conversation_cwd_validation_tests {
             .await
             .expect("load job")
             .expect("job exists");
-        assert_eq!(job.intent.cwd, canonical.to_string_lossy());
+        assert_eq!(job.intent.cwd, raw_cwd.to_string_lossy());
     }
 
     #[tokio::test]
