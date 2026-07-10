@@ -677,6 +677,7 @@ body {
   flex: 1 1 auto;
   min-height: 0;
   padding: 12px;
+  container-type: inline-size;
 }
 
 .message-virtuoso {
@@ -971,6 +972,19 @@ body {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   margin: 12px 0;
+}
+
+@supports (width: 1cqw) {
+  @container (width > 800px) {
+    .markdown-table-scroll {
+      position: relative;
+      left: 50%;
+      width: max-content;
+      min-width: 100%;
+      max-width: calc(100cqw - 16px);
+      transform: translateX(-50%);
+    }
+  }
 }
 
 .markdown-table-scroll table {

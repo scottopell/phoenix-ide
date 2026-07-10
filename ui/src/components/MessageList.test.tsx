@@ -359,6 +359,22 @@ describe('MessageList', () => {
     expect(getComputedStyle(messagesScroller!).overflowY).toBe('auto');
   });
 
+  it('sizes wide markdown tables from the non-scrolling chat boundary', () => {
+    const chatViewRule = appCss.match(/#chat-view\.view\.active\s*{[^}]*}/s)?.[0];
+    const tableFallbackRule = appCss.match(/\.markdown-table-scroll\s*{[^}]*}/s)?.[0];
+    const tableBreakoutRule = appCss.match(/@supports\s*\(width:\s*1cqw\)\s*{\s*@container\s*\(width\s*>\s*800px\)\s*{\s*(\.markdown-table-scroll\s*{[^}]*})/s)?.[1];
+    const virtuosoRule = appCss.match(/\.message-virtuoso\s*{[^}]*}/s)?.[0];
+
+    expect(chatViewRule).toMatch(/container-type:\s*inline-size/);
+    expect(tableFallbackRule).toMatch(/max-width:\s*100%/);
+    expect(tableFallbackRule).toMatch(/overflow-x:\s*auto/);
+    expect(tableBreakoutRule).toMatch(/width:\s*max-content/);
+    expect(tableBreakoutRule).toMatch(/min-width:\s*100%/);
+    expect(tableBreakoutRule).toMatch(/max-width:\s*calc\(100cqw\s*-\s*16px\)/);
+    expect(virtuosoRule).not.toMatch(/container-type/);
+    expect(virtuosoRule).not.toMatch(/overflow-x/);
+  });
+
   it('renders a 100-message conversation without throwing', () => {
     // The deleted spacer-based windowing layer had a separate test that
     // asserted a bounded number of rendered units + presence of spacers.
