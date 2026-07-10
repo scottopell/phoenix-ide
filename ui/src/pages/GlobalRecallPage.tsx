@@ -16,6 +16,7 @@ export function GlobalRecallPage() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<GlobalRecallMessage[]>([]);
   const [olderMessageCursor, setOlderMessageCursor] = useState<number | null>(null);
+  const [olderMessagesLoading, setOlderMessagesLoading] = useState(false);
   const [question, setQuestion] = useState('');
   const [loading, setLoading] = useState(true);
   const [asking, setAsking] = useState(false);
@@ -23,9 +24,12 @@ export function GlobalRecallPage() {
   const [error, setError] = useState<string | null>(null);
   const [copiedReference, setCopiedReference] = useState<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const sessionSelectionGenerationRef = useRef(0);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
+    sessionSelectionGenerationRef.current += 1;
+    setOlderMessagesLoading(false);
   }, [activeSessionId]);
 
   const refreshOpenWork = useCallback(() => {
@@ -128,14 +132,35 @@ export function GlobalRecallPage() {
   };
 
   const loadOlderMessages = async () => {
-    if (!activeSessionId || olderMessageCursor === null) return;
+    if (!activeSessionId || olderMessageCursor === null || olderMessagesLoading) return;
+    const requestedSessionId = activeSessionId;
+    const requestedCursor = olderMessageCursor;
+    const requestedGeneration = sessionSelectionGenerationRef.current;
+    setOlderMessagesLoading(true);
     setError(null);
     try {
-      const page = await api.getGlobalRecallSession(activeSessionId, olderMessageCursor);
-      setMessages((prev) => [...page.messages, ...prev]);
-      setOlderMessageCursor(page.older_cursor);
+      const page = await api.getGlobalRecallSession(requestedSessionId, requestedCursor);
+      if (
+        activeSessionIdRef.current === requestedSessionId
+        && sessionSelectionGenerationRef.current === requestedGeneration
+      ) {
+        setMessages((prev) => [...page.messages, ...prev]);
+        setOlderMessageCursor(page.older_cursor);
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (
+        activeSessionIdRef.current === requestedSessionId
+        && sessionSelectionGenerationRef.current === requestedGeneration
+      ) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (
+        activeSessionIdRef.current === requestedSessionId
+        && sessionSelectionGenerationRef.current === requestedGeneration
+      ) {
+        setOlderMessagesLoading(false);
+      }
     }
   };
 
@@ -274,8 +299,8 @@ export function GlobalRecallPage() {
         <div className="global-recall-chat">
           <div className="global-recall-messages" aria-live="polite">
             {olderMessageCursor !== null && !sessionLoading && (
-              <button type="button" onClick={() => { void loadOlderMessages(); }}>
-                Load older messages
+              <button type="button" onClick={() => { void loadOlderMessages(); }} disabled={olderMessagesLoading}>
+                {olderMessagesLoading ? 'Loading…' : 'Load older messages'}
               </button>
             )}
             {activeSessionId === null ? (
