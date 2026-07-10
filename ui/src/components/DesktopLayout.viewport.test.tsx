@@ -1,7 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { render } from '@testing-library/react';
+import { useRef } from 'react';
 import { describe, expect, it } from 'vitest';
-import { isViewportOwnedRoute, useDocumentViewportOwnership } from './viewportRoutes';
+import {
+  isViewportOwnedRoute,
+  useAppTouchContainment,
+  useDocumentViewportOwnership,
+} from './viewportRoutes';
 
 const appCss = readFileSync(`${process.cwd()}/src/index.css`, 'utf8');
 
@@ -42,6 +47,53 @@ describe('app viewport ownership', () => {
     unmount();
     expect(document.documentElement).not.toHaveClass('app-viewport-active');
     expect(document.body).not.toHaveClass('app-viewport-active');
+  });
+
+  it('blocks vertical touch chaining while preserving owned inner scrolling', () => {
+    function Harness() {
+      const ownerRef = useRef<HTMLDivElement>(null);
+      useAppTouchContainment(ownerRef, true);
+      return (
+        <div ref={ownerRef}>
+          <div data-testid="chrome" />
+          <div data-testid="scroller" data-app-scroll-owner />
+        </div>
+      );
+    }
+
+    const touch = (target: Element, y: number) => {
+      const event = new Event('touchmove', { bubbles: true, cancelable: true });
+      Object.defineProperty(event, 'touches', { value: [{ clientX: 10, clientY: y }] });
+      return target.dispatchEvent(event);
+    };
+    const start = (target: Element, y: number) => {
+      const event = new Event('touchstart', { bubbles: true, cancelable: true });
+      Object.defineProperty(event, 'touches', { value: [{ clientX: 10, clientY: y }] });
+      target.dispatchEvent(event);
+    };
+
+    const { getByTestId } = render(<Harness />);
+    const chrome = getByTestId('chrome');
+    const scroller = getByTestId('scroller');
+    Object.defineProperties(scroller, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 800 },
+      scrollTop: { configurable: true, writable: true, value: 100 },
+    });
+
+    start(chrome, 100);
+    expect(touch(chrome, 80)).toBe(false);
+
+    start(scroller, 100);
+    expect(touch(scroller, 80)).toBe(true);
+
+    scroller.scrollTop = 400;
+    start(scroller, 100);
+    expect(touch(scroller, 80)).toBe(false);
+
+    scroller.scrollTop = 0;
+    start(scroller, 80);
+    expect(touch(scroller, 100)).toBe(false);
   });
 
   it('gives chat shells one dynamic viewport owner and contains the document', () => {

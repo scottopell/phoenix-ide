@@ -22,7 +22,11 @@ import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';
-import { isViewportOwnedRoute, useDocumentViewportOwnership } from './viewportRoutes';
+import {
+  isViewportOwnedRoute,
+  useAppTouchContainment,
+  useDocumentViewportOwnership,
+} from './viewportRoutes';
 import {
   closeNotificationsForConversation,
   consumeNotificationPermissionCue,
@@ -118,6 +122,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const location = useLocation();
   const ownsViewport = isViewportOwnedRoute(location.pathname);
   useDocumentViewportOwnership(ownsViewport);
+  useAppTouchContainment(layoutRef, ownsViewport);
   const { toasts, dismissToast, showSuccess, showError, showInfo } = useToast();
   useNotificationClickNavigationBridge();
 

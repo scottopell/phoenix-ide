@@ -241,7 +241,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
         </header>
       )}
 
-      <main className="new-conv-main">
+      <main className="new-conv-main" data-app-scroll-owner>
         {/* Desktop: workbench card */}
         <div className="new-conv-card desktop-only">
           <ConversationSettings

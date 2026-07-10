@@ -475,6 +475,7 @@ function MessageListImpl({
     scrollerRef.current = ref instanceof HTMLElement ? ref : null;
     if (ref instanceof HTMLElement) {
       ref.id = 'messages';
+      ref.dataset['appScrollOwner'] = '';
       dispatchScrollEvent({
         type: 'scrollerAttached',
         snapshot: { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight },

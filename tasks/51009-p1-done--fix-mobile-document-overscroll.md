@@ -83,11 +83,13 @@ A Chromium mobile viewport without the software keyboard is insufficient to repr
 - The mobile and desktop wrapper chain has explicit flex sizing and `min-height: 0`. `/new` inherits the owned viewport instead of creating a nested `100vh` minimum, and `.new-conv-main` remains its intentional inner scroller.
 - Conversation `#app` inherits the shared owner while `#messages` remains the content scroller.
 - The unused timer- and scroll-reset-based `useIOSKeyboardFix` hook was removed.
-- Regression coverage checks route scope, global-class lifecycle across ownership changes, viewport/flex containment, and the absence of a nested `/new` viewport minimum.
+- Route-owned shells stop vertical touch chaining at explicit inner-scroll boundaries: an inner scroller can move normally, but a gesture at its top or bottom edge cannot escape into Safari's document rubber-band.
+- Regression coverage checks route scope, global-class lifecycle across ownership changes, viewport/flex containment, touch-boundary behavior, and the absence of a nested `/new` viewport minimum.
 
 ## Verification
 
 - Chromium at 390×844: `/new` and `/c/fixture-turn-one` both reported document `scrollHeight === clientHeight`, `window.scrollY === 0` after a forced scroll attempt, and focused composers remained inside the shell. The conversation message scroller remained independently scrollable.
 - Chromium at 1440×900: conversation shell remained viewport-sized. Navigating to `/about` removed document containment and restored the route's normal overflow ownership.
-- iOS 17.4 Simulator, iPhone 15 Pro: Safari rendered `/new` with the page and composer fitted to the visible browser area in portrait. This environment has no Simulator input driver and macOS accessibility automation is blocked, so software-keyboard drag gestures still require reviewer/device manual QA using the matrix above.
+- iOS 17.4 Simulator, iPhone 15 Pro: Safari rendered `/new` with the page and composer fitted to the visible browser area in portrait.
+- Physical iPhone Safari QA: CSS-only containment still allowed document rubber-banding, and a rejected `visualViewport` resize/translate experiment fought Safari's native keyboard pan without stopping overscroll. The final touch-boundary approach preserved normal keyboard focus behavior and prevented the reported empty-space overscroll on `/new`.
 - `./dev.py check` passes.
