@@ -3,6 +3,7 @@
 //! layers depend *down* onto a common vocabulary instead of onto each other.
 
 pub mod bash_types;
+pub mod creation_protocol;
 pub mod db_schema;
 pub mod kill_signal;
 pub mod llm_error_kind;

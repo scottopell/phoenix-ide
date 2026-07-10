@@ -4,6 +4,7 @@
 //! Two pure entry points: `transition()` for user events, `handle_outcome()`
 //! for executor-produced outcomes.
 
+pub mod creation_protocol;
 pub mod effect;
 pub mod outcome;
 pub mod transition;
@@ -16,6 +17,8 @@ pub mod transition;
 pub use phoenix_core::domain::sm_event as event;
 pub use phoenix_core::domain::sm_state as state;
 
+#[cfg(test)]
+mod creation_protocol_proptests;
 #[cfg(test)]
 mod project_proptests;
 #[cfg(test)]

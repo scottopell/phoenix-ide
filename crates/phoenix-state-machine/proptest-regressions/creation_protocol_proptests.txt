@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4e6c19bfd4c615e2d0c78db9254469557ce113cde251656d789998ecc85c9452 # shrinks to operations = [Cancel, ReconcileSuccess, Delete]
+cc 9abe20142de103530953491f1a4023bf32cb8bcf6bf74b6a659ec58ce89fedc4 # shrinks to operations = [Claim { worker: 0 }, PermanentFailure, Delete]

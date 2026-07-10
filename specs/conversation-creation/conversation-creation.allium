@@ -1,0 +1,316 @@
+-- allium: 3
+-- Durable Conversation Creation: Behavioural Specification
+--
+-- Scope: shell acceptance, exclusive provisioning authority, retry and
+-- reconciliation, cancellation, and deletion cleanup.
+-- Excludes: Git command details, database representation, HTTP and UI layout.
+--
+-- Requirement traceability: REQ-CCR-001 through REQ-CCR-010.
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    claim_lease: Duration = 30_000.ms
+    retry_delay_2: Duration = 2_000.ms
+    retry_delay_3: Duration = 10_000.ms
+    retry_delay_4: Duration = 30_000.ms
+    max_attempts: Integer = 4
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum CreationStatus {
+    accepted | claimed | retry_scheduled | cancelling | cancelled
+    | deletion_pending | ready | failed
+}
+
+enum CreationStage {
+    validate_intent | resolve_repository | reserve_resources
+    | materialize_worktree | finalize_attachments | expand_initial_message
+    | commit_metadata | bootstrap_initial_turn | finalize
+}
+
+enum ReservationStatus { reserved | present | cleanup_required | released | conflict }
+
+------------------------------------------------------------
+-- Actors
+------------------------------------------------------------
+
+actor CreationUser {}
+actor CreationWorker {}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity CreationJob {
+    conversation_id: String
+    status: CreationStatus
+    stage: CreationStage
+    attempt: Integer
+    generation: Integer
+    creation_intent: String
+    reservations: ResourceReservation with job = this
+
+    claim_owner: CreationWorker when status = claimed
+    claim_token: String when status = claimed
+    lease_until: Timestamp when status = claimed
+    next_attempt_at: Timestamp when status = retry_scheduled
+    error_message: String when status = failed
+
+    transitions status {
+        accepted -> claimed
+        accepted -> cancelling
+        accepted -> deletion_pending
+        claimed -> claimed
+        claimed -> retry_scheduled
+        claimed -> ready
+        claimed -> failed
+        claimed -> cancelling
+        claimed -> deletion_pending
+        retry_scheduled -> claimed
+        retry_scheduled -> failed
+        retry_scheduled -> cancelling
+        retry_scheduled -> deletion_pending
+        cancelling -> cancelled
+        cancelling -> deletion_pending
+        cancelled -> deletion_pending
+        failed -> deletion_pending
+        terminal: ready
+    }
+
+    invariant AttemptBudgetBounded {
+        attempt >= 0 and attempt <= config.max_attempts
+    }
+
+    invariant ClaimedGenerationCurrent {
+        status = claimed implies generation > 0
+    }
+}
+
+entity ResourceReservation {
+    job: CreationJob
+    generation: Integer
+    repository_identity: String
+    resource_identity: String
+    status: ReservationStatus
+
+    transitions status {
+        reserved -> present
+        reserved -> conflict
+        reserved -> cleanup_required
+        present -> cleanup_required
+        cleanup_required -> released
+        cleanup_required -> conflict
+        terminal: released, conflict
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule CreationAcceptedDurably {
+    when: StructurallyValidCreationRequested(conversation_id, creation_intent)
+
+    ensures: CreationJob.created(
+        conversation_id: conversation_id,
+        status: accepted,
+        stage: validate_intent,
+        attempt: 0,
+        generation: 0,
+        creation_intent: creation_intent
+    )
+    ensures: ConversationShellAccepted(conversation_id)
+
+    @guidance
+        -- Persist the shell, intent, and normalized child records atomically.
+        -- Filesystem, Git, expansion, and runtime work begins only afterward.
+}
+
+rule EligibleCreationClaimed {
+    when: WorkerClaimsEligibleJob(worker, job, token, lease_until)
+
+    requires: job.status = accepted
+        or (job.status = retry_scheduled and job.next_attempt_at <= now())
+        or (job.status = claimed and job.lease_until <= now())
+
+    ensures: job.status = claimed
+    ensures: job.claim_owner = worker
+    ensures: job.claim_token = token
+    ensures: job.lease_until = lease_until
+    ensures: job.generation = job.generation + 1
+}
+
+rule ExpiredClaimReconciledBeforeResume {
+    when: WorkerReplacesExpiredClaim(worker, job)
+
+    requires: job.status = claimed
+    requires: job.lease_until <= now()
+
+    ensures: ExternalStateInspectionRequested(worker, job, job.stage)
+
+    @guidance
+        -- Replacement observes reservations and external state before deciding
+        -- whether to adopt, conflict, clean, or resume the interrupted stage.
+}
+
+rule CurrentClaimAdvancesStage {
+    when: ProvisioningStageSucceeded(job, worker, token, generation)
+
+    requires: job.status = claimed
+    requires: job.claim_owner = worker
+    requires: job.claim_token = token
+    requires: job.generation = generation
+    requires: job.lease_until > now()
+    requires: job.stage != finalize
+
+    ensures: job.stage = next_creation_stage(job.stage)
+}
+
+rule CurrentClaimCompletesCreation {
+    when: ProvisioningStageSucceeded(job, worker, token, generation)
+
+    requires: job.status = claimed
+    requires: job.claim_owner = worker
+    requires: job.claim_token = token
+    requires: job.generation = generation
+    requires: job.lease_until > now()
+    requires: job.stage = finalize
+
+    ensures: job.status = ready
+    ensures: ConversationCreationReady(job.conversation_id)
+}
+
+rule StaleClaimResultRejected {
+    when: ProvisioningResultReported(job, worker, token, generation)
+
+    requires: job.status != claimed
+        or job.claim_owner != worker
+        or job.claim_token != token
+        or job.generation != generation
+        or job.lease_until <= now()
+
+    ensures: ProvisioningResultRejectedAsStale(job, generation)
+}
+
+rule TransientFailureSchedulesRetry {
+    when: ProvisioningStageFailed(job, worker, token, generation, transient, error_message)
+
+    requires: job.status = claimed
+    requires: job.claim_owner = worker
+    requires: job.claim_token = token
+    requires: job.generation = generation
+    requires: job.lease_until > now()
+    requires: job.attempt < config.max_attempts
+
+    ensures: job.status = retry_scheduled
+    ensures: job.next_attempt_at = retry_deadline(job.attempt + 1)
+    ensures: CreationSchedulerWakeRequested(job.next_attempt_at)
+}
+
+rule RetryBudgetExhaustedFailsCreation {
+    when: ProvisioningStageFailed(job, worker, token, generation, transient, error_message)
+
+    requires: job.status = claimed
+    requires: job.claim_owner = worker
+    requires: job.claim_token = token
+    requires: job.generation = generation
+    requires: job.attempt >= config.max_attempts
+
+    ensures: job.status = failed
+    ensures: job.error_message = error_message
+}
+
+rule PermanentFailureFailsCreation {
+    when: ProvisioningStageFailed(job, worker, token, generation, permanent, error_message)
+
+    requires: job.status = claimed
+    requires: job.claim_owner = worker
+    requires: job.claim_token = token
+    requires: job.generation = generation
+
+    ensures: job.status = failed
+    ensures: job.error_message = error_message
+}
+
+rule CreationCancellationRevokesAuthority {
+    when: UserCancelsCreation(user, job)
+
+    requires: job.status in { accepted, claimed, retry_scheduled }
+
+    ensures: job.generation = job.generation + 1
+    ensures: job.status = cancelling
+    ensures: ResourceReconciliationRequested(job)
+}
+
+rule CancelledCreationPreserved {
+    when: ResourceReconciliationCompleted(job)
+
+    requires: job.status = cancelling
+
+    ensures: job.status = cancelled
+    ensures: CancelledCreationVisible(job.conversation_id, job.creation_intent)
+}
+
+rule CreationDeletionHidesImmediately {
+    when: UserDeletesCreation(user, job)
+
+    requires: job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed }
+
+    ensures: job.generation = job.generation + 1
+    ensures: job.status = deletion_pending
+    ensures: CreationHiddenFromNormalSurfaces(job.conversation_id)
+    ensures: ResourceReconciliationRequested(job)
+}
+
+rule DeletionCompletesAfterReconciliation {
+    when: ResourceReconciliationCompleted(job)
+
+    requires: job.status = deletion_pending
+
+    ensures: CreationTombstoneDeletionRequested(job)
+}
+
+rule ReservationCleanupRequiresCurrentOwnership {
+    when: ReservationCleanupRequested(reservation, job, generation)
+
+    requires: reservation.job = job
+    requires: reservation.generation = generation
+    requires: job.generation = generation
+    requires: reservation.status = cleanup_required
+
+    ensures: ReservationCleanupAuthorized(reservation)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface CreationControls {
+    facing user: CreationUser
+    context job: CreationJob
+
+    exposes:
+        job.status
+        job.creation_intent when job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed }
+
+    provides:
+        StructurallyValidCreationRequested(conversation_id, creation_intent)
+        UserCancelsCreation(user, job)
+            when job.status in { accepted, claimed, retry_scheduled }
+        UserDeletesCreation(user, job)
+            when job.status in { accepted, claimed, retry_scheduled, cancelling, cancelled, failed }
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- next_creation_stage(stage) returns the next value in CreationStage order.
+-- retry_deadline(attempt) uses config.retry_delay_2, retry_delay_3, or
+-- config.retry_delay_4 for attempts two, three, and four respectively.
