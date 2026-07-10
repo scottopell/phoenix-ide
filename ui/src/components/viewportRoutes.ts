@@ -1,7 +1,9 @@
 import { useLayoutEffect, type RefObject } from 'react';
 
-export function isViewportOwnedRoute(pathname: string): boolean {
-  return /^\/new\/?$/.test(pathname) || /^\/c\/[^/]+\/?$/.test(pathname);
+export function isViewportOwnedRoute(pathname: string, desktop: boolean): boolean {
+  return (desktop && /^\/$/.test(pathname))
+    || /^\/new\/?$/.test(pathname)
+    || /^\/c\/[^/]+\/?$/.test(pathname);
 }
 
 export function useDocumentViewportOwnership(ownsViewport: boolean): void {
@@ -33,6 +35,7 @@ export function useAppTouchContainment(
       lastY = touch.clientY;
     };
     const onTouchMove = (event: TouchEvent) => {
+      if (event.touches.length !== 1) return;
       const touch = event.touches[0];
       if (!touch) return;
 

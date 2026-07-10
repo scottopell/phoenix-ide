@@ -13,6 +13,7 @@ import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { PaneDivider } from '../components/PaneDivider';
+import { useAppTouchContainment } from '../components/viewportRoutes';
 import { QuestionPanel } from '../components/QuestionPanel';
 import {
   useMessageQueue,
@@ -246,6 +247,8 @@ function ConversationPageContent() {
   // conversation subtree below it) on every pointer move — React state catches
   // up once, on pointer-up. See `useResizablePane`'s `onLiveResize`.
   const appElementRef = useRef<HTMLDivElement | null>(null);
+  const conversationColumnRef = useRef<HTMLDivElement | null>(null);
+  useAppTouchContainment(conversationColumnRef, true);
   useLayoutEffect(() => {
     appElementRef.current?.style.setProperty(
       '--viewer-pane-width',
@@ -1353,7 +1356,7 @@ function ConversationPageContent() {
       ref={setAppElement}
       className={showSplitPaneViewer ? 'app-split-pane' : undefined}
     >
-      <div className="conversation-column">
+      <div ref={conversationColumnRef} className="conversation-column">
       {seedBreadcrumb}
       {parentConvBreadcrumb}
       {viewerSlot.browserSessionActive && !isArchived && !browserOpen && (

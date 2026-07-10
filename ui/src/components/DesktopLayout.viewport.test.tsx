@@ -20,12 +20,17 @@ function ruleFor(selector: string): string {
 describe('app viewport ownership', () => {
   it.each(['/new', '/new/', '/c/example', '/c/example/', '/c/with%20space'])(
     'contains the document for the chat shell route %s',
-    (pathname) => expect(isViewportOwnedRoute(pathname)).toBe(true),
+    (pathname) => expect(isViewportOwnedRoute(pathname, false)).toBe(true),
   );
 
-  it.each(['/', '/about', '/settings/llm-language', '/usage', '/terminal', '/s/token', '/c/', '/c/a/b'])(
+  it('contains the desktop home composer but not the mobile conversation list', () => {
+    expect(isViewportOwnedRoute('/', true)).toBe(true);
+    expect(isViewportOwnedRoute('/', false)).toBe(false);
+  });
+
+  it.each(['/about', '/settings/llm-language', '/usage', '/terminal', '/s/token', '/c/', '/c/a/b'])(
     'keeps intentional document-scrolling route %s outside containment',
-    (pathname) => expect(isViewportOwnedRoute(pathname)).toBe(false),
+    (pathname) => expect(isViewportOwnedRoute(pathname, true)).toBe(false),
   );
 
   it('applies and releases document containment as route ownership changes', () => {
@@ -54,16 +59,21 @@ describe('app viewport ownership', () => {
       const ownerRef = useRef<HTMLDivElement>(null);
       useAppTouchContainment(ownerRef, true);
       return (
-        <div ref={ownerRef}>
-          <div data-testid="chrome" />
-          <div data-testid="scroller" data-app-scroll-owner />
+        <div>
+          <div data-testid="outside-pane" />
+          <div ref={ownerRef}>
+            <div data-testid="chrome" />
+            <div data-testid="scroller" data-app-scroll-owner />
+          </div>
         </div>
       );
     }
 
-    const touch = (target: Element, y: number) => {
+    const touch = (target: Element, ...ys: number[]) => {
       const event = new Event('touchmove', { bubbles: true, cancelable: true });
-      Object.defineProperty(event, 'touches', { value: [{ clientX: 10, clientY: y }] });
+      Object.defineProperty(event, 'touches', {
+        value: ys.map((clientY, index) => ({ clientX: 10 + index * 20, clientY })),
+      });
       return target.dispatchEvent(event);
     };
     const start = (target: Element, y: number) => {
@@ -73,6 +83,7 @@ describe('app viewport ownership', () => {
     };
 
     const { getByTestId } = render(<Harness />);
+    const outsidePane = getByTestId('outside-pane');
     const chrome = getByTestId('chrome');
     const scroller = getByTestId('scroller');
     Object.defineProperties(scroller, {
@@ -80,6 +91,12 @@ describe('app viewport ownership', () => {
       scrollHeight: { configurable: true, value: 800 },
       scrollTop: { configurable: true, writable: true, value: 100 },
     });
+
+    start(outsidePane, 100);
+    expect(touch(outsidePane, 80)).toBe(true);
+
+    start(chrome, 100);
+    expect(touch(chrome, 80, 120)).toBe(true);
 
     start(chrome, 100);
     expect(touch(chrome, 80)).toBe(false);

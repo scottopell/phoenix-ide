@@ -10,6 +10,7 @@ import { useCreateConversation } from '../hooks/useCreateConversation';
 import { useResizablePane } from '../hooks/useResizablePane';
 import { useIsDesktop } from '../hooks/useMediaQuery';
 import { useInlineReferences } from '../hooks';
+import { useAppTouchContainment } from '../components/viewportRoutes';
 
 // Lazy: xterm + addon are a non-trivial bundle slice. Deferred behind the
 // `everExpanded` gate below — the dynamic import only fires once the user
@@ -56,6 +57,8 @@ interface NewConversationPageProps {
 }
 
 export function NewConversationPage({ desktopMode }: NewConversationPageProps = {}) {
+  const pageRef = useRef<HTMLDivElement>(null);
+  useAppTouchContainment(pageRef, true);
   const navigate = useNavigate();
   const conv = useCreateConversation(navigate);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -220,6 +223,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
 
   return (
     <div
+      ref={pageRef}
       className={`new-conv-page${conv.isDragOver ? ' input-area--drag-over' : ''}`}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
