@@ -76,7 +76,7 @@ describe('notification policy reducer', () => {
       {
         type: 'conversation_state_changed',
         conversation: conversation({ state: creationFailed }),
-        previousState: { type: 'provisioning', job_id: 'job-1', message_id: 'msg-1' },
+        previousState: { type: 'provisioning' },
         nextState: creationFailed,
       },
     ]);

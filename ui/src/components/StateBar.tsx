@@ -546,9 +546,13 @@ export function StateBar({
             break;
           case "terminal":
           case "handed_off":
+          case "creation_cancelled":
             dotClass += " terminal";
-            stateText =
-              convState.type === "handed_off" ? "handed off" : "completed";
+            stateText = convState.type === "handed_off"
+              ? "handed off"
+              : convState.type === "creation_cancelled"
+                ? "creation cancelled"
+                : "completed";
             break;
           case 'awaiting_task_approval':
           case 'awaiting_commission_review_approval':

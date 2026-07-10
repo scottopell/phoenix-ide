@@ -140,6 +140,8 @@ export function getStateDescription(state: ConversationState): string {
       return 'provisioning';
     case 'creation_failed':
       return 'creation failed';
+    case 'creation_cancelled':
+      return 'creation cancelled';
     case 'handed_off':
       return 'handed off';
     case 'awaiting_task_approval':
