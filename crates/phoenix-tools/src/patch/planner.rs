@@ -4,7 +4,7 @@
 //! operating on string content without any IO. This makes it ideal
 //! for property-based testing.
 
-use super::matching::{find_all_exact, find_unique_match};
+use super::matching::{find_all_exact, find_unique_match, MatchError};
 use super::types::{Edit, Operation, PatchEffect, PatchError, PatchPlan, PatchRequest, Reindent};
 use similar::TextDiff;
 use std::collections::HashMap;
@@ -136,7 +136,26 @@ impl PatchPlanner {
         })
     }
 
-    /// Build a list of edits from patch requests
+    fn locate_anchor(
+        original: &str,
+        old_text: &str,
+        patch_number: usize,
+        operation: Operation,
+    ) -> Result<super::types::EditSpec, PatchError> {
+        find_unique_match(original, old_text).map_err(|error| match error {
+            MatchError::NotFound => PatchError::AnchorNotFound {
+                patch_number,
+                operation,
+            },
+            MatchError::NotUnique(diagnostics) => PatchError::AnchorNotUnique {
+                patch_number,
+                operation,
+                diagnostics,
+            },
+        })
+    }
+
+    /// Build a list of edits from patch requests.
     fn build_edits(
         &mut self,
         original: &str,
@@ -144,7 +163,7 @@ impl PatchPlanner {
     ) -> Result<Vec<Edit>, PatchError> {
         let mut edits = Vec::new();
 
-        for patch in patches {
+        for (patch_index, patch) in patches.iter().enumerate() {
             // replaceAll is only meaningful for replace; reject other combinations
             // rather than silently ignoring the flag (which could mask a malformed
             // call such as overwrite + replaceAll).
@@ -204,7 +223,8 @@ impl PatchPlanner {
                 }),
                 Operation::InsertBefore => {
                     let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
-                    let spec = find_unique_match(original, old_text)?;
+                    let spec =
+                        Self::locate_anchor(original, old_text, patch_index + 1, patch.operation)?;
                     edits.push(Edit {
                         offset: spec.offset,
                         length: 0,
@@ -213,7 +233,8 @@ impl PatchPlanner {
                 }
                 Operation::InsertAfter => {
                     let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
-                    let spec = find_unique_match(original, old_text)?;
+                    let spec =
+                        Self::locate_anchor(original, old_text, patch_index + 1, patch.operation)?;
                     edits.push(Edit {
                         offset: spec.offset + spec.length,
                         length: 0,
@@ -229,7 +250,10 @@ impl PatchPlanner {
                         // match would otherwise surface as a misleading "not
                         // found". find_unique_match runs the full fuzzy cascade.
                         return match find_unique_match(original, old_text) {
-                            Err(PatchError::OldTextNotFound) => Err(PatchError::OldTextNotFound),
+                            Err(MatchError::NotFound) => Err(PatchError::AnchorNotFound {
+                                patch_number: patch_index + 1,
+                                operation: patch.operation,
+                            }),
                             _ => Err(PatchError::ReplaceAllInexact),
                         };
                     }
@@ -244,7 +268,8 @@ impl PatchPlanner {
                 Operation::Replace => {
                     let old_text = patch.old_text.as_ref().ok_or(PatchError::MissingOldText)?;
 
-                    let spec = find_unique_match(original, old_text)?;
+                    let spec =
+                        Self::locate_anchor(original, old_text, patch_index + 1, patch.operation)?;
 
                     // Update clipboard with actual matched text if it differed
                     if let Some(name) = &patch.to_clipboard {
@@ -768,7 +793,14 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(matches!(err, PatchError::OldTextNotUnique(_)));
+        assert!(matches!(
+            err,
+            PatchError::AnchorNotUnique {
+                patch_number: 1,
+                operation: Operation::InsertBefore,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -859,7 +891,118 @@ mod tests {
             )
             .unwrap_err();
 
-        assert_eq!(err, PatchError::OldTextNotFound);
+        assert_eq!(
+            err,
+            PatchError::AnchorNotFound {
+                patch_number: 1,
+                operation: Operation::Replace,
+            }
+        );
+    }
+
+    #[test]
+    fn multi_patch_anchor_error_identifies_failing_request() {
+        let mut planner = PatchPlanner::new();
+        let err = planner
+            .plan(
+                &path("test.txt"),
+                Some("alpha\nbeta\ngamma"),
+                &[
+                    PatchRequest {
+                        operation: Operation::Replace,
+                        old_text: Some("alpha".to_string()),
+                        new_text: Some("first".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                    PatchRequest {
+                        operation: Operation::InsertAfter,
+                        old_text: Some("stale beta".to_string()),
+                        new_text: Some("\ninserted".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                ],
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            PatchError::AnchorNotFound {
+                patch_number: 2,
+                operation: Operation::InsertAfter,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "Patch 2 (insert_after) failed: oldText not found in file. Re-read the file and retry this patch with current text."
+        );
+    }
+
+    #[test]
+    fn multi_patch_duplicate_error_identifies_failing_request() {
+        let mut planner = PatchPlanner::new();
+        let err = planner
+            .plan(
+                &path("test.txt"),
+                Some("alpha\ntarget\ntarget"),
+                &[
+                    PatchRequest {
+                        operation: Operation::Replace,
+                        old_text: Some("alpha".to_string()),
+                        new_text: Some("first".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                    PatchRequest {
+                        operation: Operation::InsertBefore,
+                        old_text: Some("target".to_string()),
+                        new_text: Some("prefix ".to_string()),
+                        replace_all: false,
+                        to_clipboard: None,
+                        from_clipboard: None,
+                        reindent: None,
+                    },
+                ],
+            )
+            .unwrap_err();
+
+        match err {
+            PatchError::AnchorNotUnique {
+                patch_number,
+                operation,
+                diagnostics,
+            } => {
+                assert_eq!(patch_number, 2);
+                assert_eq!(operation, Operation::InsertBefore);
+                assert_eq!(diagnostics.total, 2);
+                assert!(PatchError::AnchorNotUnique {
+                    patch_number,
+                    operation,
+                    diagnostics,
+                }
+                .to_string()
+                .starts_with("Patch 2 (insert_before) failed: oldText appears 2 times"));
+            }
+            other @ (PatchError::ReplaceOnNonexistent
+            | PatchError::MissingOldText
+            | PatchError::ClipboardNotFound(_)
+            | PatchError::AnchorNotFound { .. }
+            | PatchError::EditOutOfBounds
+            | PatchError::OverlappingEdits
+            | PatchError::ReplaceAllRequiresReplace
+            | PatchError::ReplaceAllInexact
+            | PatchError::ReindentPrefixMismatch { .. }
+            | PatchError::NoPatches) => {
+                panic!("expected duplicate anchor error, got {other:?}")
+            }
+        }
     }
 
     #[test]

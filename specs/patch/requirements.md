@@ -26,6 +26,7 @@ AND insert newText adjacent to the anchor without altering the anchor's bytes
 
 WHEN oldText appears more than once after all safe matching strategies are exhausted
 THE SYSTEM SHALL reject the operation
+AND identify the failing patch's 1-based position in the patches array and its operation
 AND return duplicate-match diagnostics that include:
 - the total match count;
 - a bounded list of matching locations;
@@ -55,6 +56,9 @@ AND leave the file unchanged
 WHEN any patch fails to apply
 THE SYSTEM SHALL reject the entire operation
 AND leave the file unchanged
+
+WHEN an anchor-based patch fails to locate a unique anchor
+THE SYSTEM SHALL identify that patch by its 1-based position in the patches array and operation
 
 **Rationale:** Agents often need multiple related edits. Atomic application prevents partial modifications that leave files in broken states. Because every edit resolves against the original content, two edits whose byte ranges overlap have no well-defined combined result — applying both would silently corrupt the region, so the conflict is rejected rather than resolved by edit ordering. A zero-length insertion positioned exactly at the boundary of another edit does not overlap and is permitted.
 
@@ -110,7 +114,9 @@ THE SYSTEM SHALL apply the patch using matched boundaries
 AND update any toClipboard with actual matched text
 
 WHEN all matching attempts fail
-THE SYSTEM SHALL return error with "old text not found" message
+THE SYSTEM SHALL return an "old text not found" error
+AND identify the failing patch's 1-based position in the patches array and its operation
+AND instruct the agent to re-read the file and retry that patch with current text
 
 **Rationale:** LLMs occasionally generate patches with minor whitespace differences. Safe recovery improves reliability without compromising precision.
 

@@ -656,6 +656,7 @@ mod tests {
         );
         let output = result.output();
         assert!(output.contains("oldText appears 2 times"), "{output}");
+        assert!(output.contains("Patch 1 (replace) failed"), "{output}");
         assert!(output.contains("line 2"), "{output}");
         assert!(
             output.contains("first block\n  TARGET\n  after first"),

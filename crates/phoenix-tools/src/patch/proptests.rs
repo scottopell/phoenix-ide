@@ -504,7 +504,13 @@ fn test_replace_not_found() {
             reindent: None,
         }],
     );
-    assert!(matches!(result, Err(PatchError::OldTextNotFound)));
+    assert!(matches!(
+        result,
+        Err(PatchError::AnchorNotFound {
+            patch_number: 1,
+            operation: Operation::Replace
+        })
+    ));
 }
 
 #[test]
@@ -524,24 +530,19 @@ fn test_replace_not_unique() {
         }],
     );
     match result {
-        Err(PatchError::OldTextNotUnique(diagnostics)) => {
+        Err(PatchError::AnchorNotUnique {
+            patch_number,
+            operation,
+            diagnostics,
+        }) => {
+            assert_eq!(patch_number, 1);
+            assert_eq!(operation, Operation::Replace);
             assert_eq!(diagnostics.total, 2);
             assert_eq!(diagnostics.reported.len(), 2);
             assert_eq!(diagnostics.reported[0].start_line, 1);
             assert_eq!(diagnostics.reported[0].snippet, "hello hello");
         }
-        Err(
-            other @ (PatchError::ReplaceOnNonexistent
-            | PatchError::MissingOldText
-            | PatchError::ClipboardNotFound(_)
-            | PatchError::OldTextNotFound
-            | PatchError::EditOutOfBounds
-            | PatchError::OverlappingEdits
-            | PatchError::ReplaceAllInexact
-            | PatchError::ReplaceAllRequiresReplace
-            | PatchError::ReindentPrefixMismatch { .. }
-            | PatchError::NoPatches),
-        ) => panic!("expected duplicate diagnostic, got {other:?}"),
+        Err(other) => panic!("expected duplicate diagnostic, got {other:?}"),
         Ok(plan) => panic!("expected duplicate diagnostic, got plan: {plan:?}"),
     }
 }

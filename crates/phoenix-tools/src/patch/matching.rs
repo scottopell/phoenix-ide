@@ -2,7 +2,7 @@
 //!
 //! Implements exact matching with fuzzy fallbacks for common whitespace issues.
 
-use super::types::{DuplicateMatchDiagnostics, DuplicateMatchLocation, EditSpec, PatchError};
+use super::types::{DuplicateMatchDiagnostics, DuplicateMatchLocation, EditSpec};
 use unicode_security::skeleton;
 
 const MAX_DUPLICATE_LOCATIONS: usize = 5;
@@ -13,6 +13,12 @@ const MAX_SNIPPET_CHARS: usize = 240;
 enum MatchOutcome {
     Unique(EditSpec),
     Duplicate(DuplicateMatchDiagnostics),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MatchError {
+    NotFound,
+    NotUnique(DuplicateMatchDiagnostics),
 }
 
 /// Find every non-overlapping exact occurrence of `old_text` in `content`.
@@ -41,7 +47,7 @@ pub(super) fn find_all_exact(content: &str, old_text: &str) -> Vec<EditSpec> {
 /// 2. Dedent matching (different indentation levels)
 /// 3. Trimmed line matching (first/last line variations)
 /// 4. Unicode confusable-skeleton match (handles lookalike characters)
-pub fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpec, PatchError> {
+pub(super) fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpec, MatchError> {
     let mut duplicate: Option<DuplicateMatchDiagnostics> = None;
 
     if let Some(outcome) = find_exact_match(content, old_text) {
@@ -72,8 +78,8 @@ pub fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpec, Patc
         };
     }
 
-    duplicate.map_or(Err(PatchError::OldTextNotFound), |diagnostics| {
-        Err(PatchError::OldTextNotUnique(diagnostics))
+    duplicate.map_or(Err(MatchError::NotFound), |diagnostics| {
+        Err(MatchError::NotUnique(diagnostics))
     })
 }
 
@@ -464,7 +470,7 @@ mod tests {
     fn test_no_match() {
         let content = "hello world";
         let err = find_unique_match(content, "foo").unwrap_err();
-        assert_eq!(err, PatchError::OldTextNotFound);
+        assert_eq!(err, MatchError::NotFound);
     }
 
     #[test]
@@ -472,7 +478,7 @@ mod tests {
         let content = "hello hello";
         let err = find_unique_match(content, "hello").unwrap_err();
         match err {
-            PatchError::OldTextNotUnique(diagnostics) => {
+            MatchError::NotUnique(diagnostics) => {
                 assert_eq!(diagnostics.total, 2);
                 assert_eq!(diagnostics.omitted, 0);
                 assert_eq!(diagnostics.reported.len(), 2);
@@ -480,16 +486,7 @@ mod tests {
                 assert_eq!(diagnostics.reported[1].start_line, 1);
                 assert_eq!(diagnostics.reported[0].snippet, "hello hello");
             }
-            other @ (PatchError::ReplaceOnNonexistent
-            | PatchError::MissingOldText
-            | PatchError::ClipboardNotFound(_)
-            | PatchError::OldTextNotFound
-            | PatchError::EditOutOfBounds
-            | PatchError::OverlappingEdits
-            | PatchError::ReplaceAllInexact
-            | PatchError::ReplaceAllRequiresReplace
-            | PatchError::ReindentPrefixMismatch { .. }
-            | PatchError::NoPatches) => panic!("unexpected error: {other:?}"),
+            other @ MatchError::NotFound => panic!("unexpected error: {other:?}"),
         }
     }
 
@@ -546,22 +543,13 @@ mod tests {
         let err = find_unique_match(content, "  indented line").unwrap_err();
 
         match err {
-            PatchError::OldTextNotUnique(diagnostics) => {
+            MatchError::NotUnique(diagnostics) => {
                 assert_eq!(diagnostics.total, 2);
                 assert_eq!(diagnostics.reported[0].start_line, 1);
                 assert_eq!(diagnostics.reported[1].start_line, 3);
                 assert!(diagnostics.reported[0].snippet.contains("\tindented line"));
             }
-            other @ (PatchError::ReplaceOnNonexistent
-            | PatchError::MissingOldText
-            | PatchError::ClipboardNotFound(_)
-            | PatchError::OldTextNotFound
-            | PatchError::EditOutOfBounds
-            | PatchError::OverlappingEdits
-            | PatchError::ReplaceAllInexact
-            | PatchError::ReplaceAllRequiresReplace
-            | PatchError::ReindentPrefixMismatch { .. }
-            | PatchError::NoPatches) => {
+            other @ MatchError::NotFound => {
                 panic!("expected fuzzy duplicate diagnostics, got {other:?}")
             }
         }
@@ -573,22 +561,13 @@ mod tests {
         let err = find_unique_match(content, "say \u{201C}hello\u{201D}").unwrap_err();
 
         match err {
-            PatchError::OldTextNotUnique(diagnostics) => {
+            MatchError::NotUnique(diagnostics) => {
                 assert_eq!(diagnostics.total, 2);
                 assert_eq!(diagnostics.reported[0].start_line, 1);
                 assert_eq!(diagnostics.reported[1].start_line, 3);
                 assert!(diagnostics.reported[0].snippet.contains("say \"hello\""));
             }
-            other @ (PatchError::ReplaceOnNonexistent
-            | PatchError::MissingOldText
-            | PatchError::ClipboardNotFound(_)
-            | PatchError::OldTextNotFound
-            | PatchError::EditOutOfBounds
-            | PatchError::OverlappingEdits
-            | PatchError::ReplaceAllInexact
-            | PatchError::ReplaceAllRequiresReplace
-            | PatchError::ReindentPrefixMismatch { .. }
-            | PatchError::NoPatches) => {
+            other @ MatchError::NotFound => {
                 panic!("expected normalised duplicate diagnostics, got {other:?}")
             }
         }
@@ -690,7 +669,7 @@ mod tests {
         // edit that would insert before the ellipsis.
         let content = "x\u{2026}y";
         let err = find_unique_match(content, "..").unwrap_err();
-        assert_eq!(err, PatchError::OldTextNotFound);
+        assert_eq!(err, MatchError::NotFound);
     }
 
     #[test]
@@ -698,6 +677,6 @@ mod tests {
         // Normalisation can't help if the text simply isn't there
         let content = "hello world";
         let err = find_unique_match(content, "goodbye").unwrap_err();
-        assert_eq!(err, PatchError::OldTextNotFound);
+        assert_eq!(err, MatchError::NotFound);
     }
 }

@@ -86,6 +86,12 @@ entity MatchAttempt {
     normalised_duplicate: find_skeleton_duplicate(content, old_text)
 }
 
+-- Helpers (pure functions referenced by the rules below)
+--
+--   position_of(patch: PatchRequest) -> Integer
+--       Returns the patch's 1-based position in the enclosing PlanRequested
+--       patches sequence.
+
 rule ExactMatchSucceeds {
     when: attempt: MatchAttempt.created
     requires: attempt.exact_result != null
@@ -283,6 +289,19 @@ rule StoreToClipboardFromOldText {
         -- separately-matched text to prefer.
 }
 
+rule IdentifyFailedAnchorPatch {
+    when: BuildEdit(planner, patch, original)
+    requires: patch.operation in {replace, insert_before, insert_after}
+    requires: patch.old_text != null
+    requires: find_unique_match(original, patch.old_text) in {not_found, not_unique}
+    ensures: AnchorFailure(position_of(patch), patch.operation)
+    @guidance
+        -- patch_number is 1-based in the request's patches array. A not-found
+        -- failure also directs the agent to re-read the file and retry that patch
+        -- with current text. Matching itself remains unaware of request position;
+        -- the planner adds this context when it consumes the match result.
+}
+
 rule BuildReplaceEdit {
     when: BuildEdit(planner, patch, original)
     requires: patch.operation = replace
@@ -312,7 +331,7 @@ rule BuildReplaceAllEdits {
         -- Zero exact occurrences splits two ways, so an exact-only miss is never
         -- surfaced as a misleading "not found" when the text is visibly present:
         --   * genuinely absent (the fuzzy cascade also finds nothing) ->
-        --     OldTextNotFound.
+        --     AnchorNotFound with request position and operation.
         --   * present only as a near match (the fuzzy cascade would have matched)
         --     -> ReplaceAllInexact, which tells the agent to copy the exact bytes
         --     or use per-site replace patches.

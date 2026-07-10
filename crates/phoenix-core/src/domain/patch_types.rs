@@ -16,6 +16,19 @@ pub enum Operation {
     Overwrite,
 }
 
+impl std::fmt::Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Replace => "replace",
+            Self::InsertBefore => "insert_before",
+            Self::InsertAfter => "insert_after",
+            Self::AppendEof => "append_eof",
+            Self::PrependBof => "prepend_bof",
+            Self::Overwrite => "overwrite",
+        })
+    }
+}
+
 /// Reindentation specification
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Reindent {
@@ -144,11 +157,20 @@ pub enum PatchError {
     #[error("Clipboard '{0}' not found")]
     ClipboardNotFound(String),
 
-    #[error("oldText not found in file")]
-    OldTextNotFound,
+    #[error(
+        "Patch {patch_number} ({operation}) failed: oldText not found in file. Re-read the file and retry this patch with current text."
+    )]
+    AnchorNotFound {
+        patch_number: usize,
+        operation: Operation,
+    },
 
-    #[error("{0}")]
-    OldTextNotUnique(DuplicateMatchDiagnostics),
+    #[error("Patch {patch_number} ({operation}) failed: {diagnostics}")]
+    AnchorNotUnique {
+        patch_number: usize,
+        operation: Operation,
+        diagnostics: DuplicateMatchDiagnostics,
+    },
 
     #[error("Edit extends beyond file content")]
     EditOutOfBounds,
