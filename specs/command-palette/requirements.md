@@ -132,3 +132,23 @@ THE SYSTEM SHALL render the palette as a centered modal (approximately 600px wid
 AND show results without requiring scroll for common cases (8-10 items visible)
 
 **Rationale:** Mobile lacks keyboard shortcuts to trigger the palette. Rather than inventing touch-based triggers, we scope to desktop initially and revisit mobile integration when use cases are clearer.
+
+---
+
+### REQ-CP-009: Source-Scoped Search
+
+WHEN user types `c` followed by whitespace in search mode
+THE SYSTEM SHALL search only conversations
+AND SHALL use the text after the prefix as the conversation slug query
+AND SHALL preserve the full prefixed text in the input field
+
+WHEN the conversation slug query is empty
+THE SYSTEM SHALL show the default conversation results
+
+WHEN input begins with `c` without following whitespace
+THE SYSTEM SHALL treat the input as an unscoped search query
+
+WHEN user removes the conversation scope prefix
+THE SYSTEM SHALL resume searching all sources available in the current context
+
+**Rationale:** A short, explicit scope lets keyboard users avoid file and code results while retaining fuzzy slug matching and predictable first-result selection.

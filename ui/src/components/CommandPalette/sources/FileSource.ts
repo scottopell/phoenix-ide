@@ -55,6 +55,7 @@ function toItem(relPath: string, rootDir: string): PaletteItem {
     title: name,
     subtitle: dir,
     category: 'Files',
+    sourceId: 'files',
     metadata: relPath,
   };
 }

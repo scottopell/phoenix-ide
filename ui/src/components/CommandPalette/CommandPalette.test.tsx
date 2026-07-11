@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { CommandPalette } from './CommandPalette';
 import { activeConversationFileRoot } from './fileRoot';
 import { createFileSource } from './sources/FileSource';
@@ -41,7 +41,15 @@ function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
   };
 }
 
-function renderPalette(activeConversation: Conversation) {
+function LocationProbe() {
+  const location = useLocation();
+  return <output data-testid="location">{location.pathname}</output>;
+}
+
+function renderPalette(
+  activeConversation: Conversation,
+  conversations: readonly Conversation[] = [activeConversation],
+) {
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: vi.fn().mockImplementation(() => ({
@@ -60,9 +68,10 @@ function renderPalette(activeConversation: Conversation) {
         openFileState: null,
       }}>
         <CommandPalette
-          conversations={[activeConversation]}
+          conversations={conversations}
           activeConversation={activeConversation}
         />
+        <LocationProbe />
       </FileExplorerContext.Provider>
     </MemoryRouter>,
   );
@@ -183,6 +192,75 @@ describe('CommandPalette file root', () => {
   });
 });
 
+describe('CommandPalette conversation scope', () => {
+  it('shows only conversations for c and does not search files or code', async () => {
+    const activeConversation = makeConversation();
+    mocks.searchConversationFiles.mockResolvedValue({ items: [{ path: 'c-file.ts', viewer: { kind: 'text', category: 'code' } }] });
+    mocks.searchConversationCode.mockResolvedValue({ items: [{
+      path: 'src/c.ts',
+      line_number: 1,
+      line_text: 'const c = true;',
+      match_start: 6,
+      match_end: 7,
+    }] });
+
+    renderPalette(activeConversation);
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'c ' } });
+
+    expect(await screen.findByText('active-conv')).toBeInTheDocument();
+    expect(mocks.searchConversationFiles).not.toHaveBeenCalled();
+    expect(mocks.searchConversationCode).not.toHaveBeenCalled();
+    expect(screen.queryByText('c-file.ts')).not.toBeInTheDocument();
+  });
+
+  it('ranks the matching slug first and navigates to it on Enter', async () => {
+    const activeConversation = makeConversation();
+    const emojiConversation = makeConversation({
+      id: 'conv-emoji',
+      slug: 'emoji-search-improvements',
+      updated_at: '2025-01-01T00:00:00Z',
+    });
+    const fuzzyConversation = makeConversation({
+      id: 'conv-fuzzy',
+      slug: 'extract-model-output',
+      updated_at: '2026-02-01T00:00:00Z',
+    });
+
+    renderPalette(activeConversation, [activeConversation, fuzzyConversation, emojiConversation]);
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'c emo' } });
+
+    const results = await screen.findAllByRole('button');
+    expect(results[0]).toHaveTextContent('emoji-search-improvements');
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+
+    expect(screen.getByTestId('location')).toHaveTextContent('/c/emoji-search-improvements');
+  });
+
+  it('returns to global search when the scope prefix is removed', async () => {
+    const activeConversation = makeConversation();
+    mocks.searchConversationFiles.mockResolvedValue({ items: [] });
+    mocks.searchConversationCode.mockResolvedValue({ items: [] });
+
+    renderPalette(activeConversation);
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    const input = screen.getByRole('textbox');
+    fireEvent.change(input, { target: { value: 'c ' } });
+    expect(await screen.findByText('active-conv')).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: 'main' } });
+    await waitFor(() => {
+      expect(mocks.searchConversationFiles).toHaveBeenCalledWith(
+        'conv-1',
+        'main',
+        50,
+        expect.any(AbortSignal),
+      );
+    });
+  });
+});
+
 describe('FileSource', () => {
   it('opens selected relative paths under the root used for search', () => {
     const source = createFileSource(
@@ -195,6 +273,7 @@ describe('FileSource', () => {
       id: 'src/main.rs',
       title: 'main.rs',
       category: 'Files',
+      sourceId: 'files',
       metadata: 'src/main.rs',
     });
 

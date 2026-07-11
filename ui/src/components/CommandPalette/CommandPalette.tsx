@@ -142,6 +142,7 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
   // when SET_RESULTS updates state.results.
   const isOpen = state.status === 'open';
   const searchMode = state.status === 'open' ? state.mode : null;
+  const searchScope = state.status === 'open' ? state.scope : null;
   const searchQuery = state.status === 'open' ? state.query : null;
 
   useEffect(() => {
@@ -158,8 +159,11 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
 
       // Read sources via ref — latest value without making sources a dep.
       // This prevents the 5s conversation-poll from re-aborting in-flight requests.
+      const eligibleSources = searchScope === 'conversations'
+        ? sourcesRef.current.filter(source => source.id === 'conversations')
+        : sourcesRef.current;
       const allResults = await Promise.all(
-        sourcesRef.current.map(s => s.search(query, controller.signal))
+        eligibleSources.map(source => source.search(query, controller.signal))
       );
 
       if (!controller.signal.aborted) {
@@ -170,7 +174,7 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [isOpen, searchMode, searchQuery, actions]);
+  }, [isOpen, searchMode, searchScope, searchQuery, actions]);
 
   // Global Cmd/Ctrl+P shortcut (REQ-CP-001)
   useEffect(() => {
@@ -218,7 +222,7 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
             if (selected) {
               // Execute the selection side effect
               if (state.mode === 'search') {
-                const source = sources.find(s => s.category === selected.category);
+                const source = sources.find(s => s.id === selected.sourceId);
                 source?.onSelect(selected);
               } else {
                 const action = actions.find(a => a.id === selected.id);
@@ -263,7 +267,7 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
       const selected = state.results[index];
       if (selected) {
         if (state.mode === 'search') {
-          const source = sources.find(s => s.category === selected.category);
+          const source = sources.find(s => s.id === selected.sourceId);
           source?.onSelect(selected);
         } else {
           const action = actions.find(a => a.id === selected.id);

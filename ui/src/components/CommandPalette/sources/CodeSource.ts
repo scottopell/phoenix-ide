@@ -47,6 +47,7 @@ function toItem(entry: CodeSearchEntry): PaletteItem {
     subtitle: `${dir}/${name}:${entry.line_number}`,
     snippet: entry.line_text,
     category: 'Code',
+    sourceId: 'code',
     metadata: { relPath: entry.path, lineNumber: entry.line_number } satisfies CodeSearchMetadata,
   };
 }

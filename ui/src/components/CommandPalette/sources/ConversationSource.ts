@@ -34,6 +34,7 @@ function toItem(conv: Conversation): PaletteItem {
     title: conv.slug,
     subtitle: conv.cwd,
     category: 'Conversations',
+    sourceId: 'conversations',
     metadata: conv,
   };
 }

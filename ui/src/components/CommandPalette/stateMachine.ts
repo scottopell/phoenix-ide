@@ -22,6 +22,7 @@ export function transition(
       return {
         status: 'open',
         mode: 'search',
+        scope: 'global',
         query: '',
         rawInput: '',
         selectedIndex: 0,
@@ -36,8 +37,12 @@ export function transition(
       if (state.status !== 'open') return state;
       const rawInput = event.rawInput;
       const isAction = rawInput.startsWith('>');
-      const query = isAction ? rawInput.slice(1).trimStart() : rawInput;
+      const conversationScopeMatch = isAction ? null : rawInput.match(/^c\s(.*)$/s);
+      const query = isAction
+        ? rawInput.slice(1).trimStart()
+        : conversationScopeMatch?.[1] ?? rawInput;
       const mode = isAction ? 'action' : 'search';
+      const scope = conversationScopeMatch ? 'conversations' : 'global';
 
       // Action mode: compute results synchronously from in-memory list.
       // Search mode: leave results stale — component useEffect fires async search
@@ -49,6 +54,7 @@ export function transition(
       return {
         ...state,
         mode,
+        scope,
         query,
         rawInput,
         selectedIndex: 0,
@@ -92,6 +98,7 @@ function getActionResults(query: string, actions: PaletteAction[]): PaletteItem[
       id: a.id,
       title: a.title,
       category: a.category || 'Actions',
+      sourceId: 'actions',
       metadata: { actionId: a.id },
     };
     if (a.shortcut) item.subtitle = a.shortcut;

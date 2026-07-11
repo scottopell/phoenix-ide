@@ -4,10 +4,13 @@ import type React from 'react';
 
 export type ClosedState = { status: 'closed' };
 
+export type SearchScope = 'global' | 'conversations';
+
 export type OpenState = {
   status: 'open';
   mode: 'search' | 'action';
-  query: string; // Without the '>' prefix in action mode
+  scope: SearchScope;
+  query: string; // Without a mode or scope prefix
   rawInput: string; // Exact text in input field
   selectedIndex: number;
   results: PaletteItem[];
@@ -34,6 +37,7 @@ export interface PaletteItem {
   snippet?: string;
   icon?: React.ReactNode;
   category: string;
+  sourceId: string;
   metadata?: unknown;
   /** Match score for ranking (higher = better) */
   score?: number;
