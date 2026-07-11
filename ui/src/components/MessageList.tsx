@@ -379,11 +379,14 @@ function MessageListImpl({
     requestAnimationFrame(() => findPreviousFocusRef.current?.focus());
   }, []);
   useViewerFindKeyboardShortcut({ scopeId: findScopeId, onOpen: openFind });
+  const findConversationRef = useRef(conversationId);
   useEffect(() => {
-    setFindOpen(false);
-    setFindQuery('');
-    setFindActiveIndex(0);
-  }, [conversationId]);
+    if (findConversationRef.current === conversationId) return;
+    findConversationRef.current = conversationId;
+    if (findOpen) setFindOpen(false);
+    if (findQuery) setFindQuery('');
+    if (findActiveIndex !== 0) setFindActiveIndex(0);
+  }, [conversationId, findActiveIndex, findOpen, findQuery]);
   const changeFindQuery = useCallback((query: string) => {
     setFindQuery(query);
     setFindActiveIndex(0);
