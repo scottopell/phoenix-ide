@@ -438,6 +438,7 @@ fn row_to_work_scope_active_pr_selection(
     })
 }
 
+#[must_use]
 pub fn qualifies_observed_branch(
     observed: &phoenix_core::domain::observed_branch::LocalGitHeadObservation,
     input: &ObservedBranchQualificationInput,
@@ -550,9 +551,7 @@ fn infer_active_pr_selection(
         return Some(active_pr_identity_from_association(actionable[0]));
     }
 
-    let Some(prior_inferred) = prior_inferred else {
-        return None;
-    };
+    let prior_inferred = prior_inferred?;
     let retained = find_association_by_identity(prs, prior_inferred)?;
     if !is_actionable_pr(retained) {
         return None;
@@ -1074,8 +1073,7 @@ impl Database {
         let expected_generation = self
             .active_work_scope_pr_selection(scope)
             .await?
-            .map(|state| state.inference_generation)
-            .unwrap_or(0);
+            .map_or(0, |state| state.inference_generation);
         self.derive_active_work_scope_pr_selection_for_scope_id(
             work_scope_id,
             input,
@@ -1125,6 +1123,7 @@ impl Database {
         ))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn derive_active_work_scope_pr_selection_for_scope_id(
         &self,
         work_scope_id: i64,
@@ -1200,7 +1199,7 @@ impl Database {
             row.selection.as_ref().and_then(|selection| {
                 (selection.provenance
                     == phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Inferred)
-                    .then(|| &selection.pr)
+                    .then_some(&selection.pr)
             })
         });
         let inferred = infer_active_pr_selection(
@@ -9122,8 +9121,8 @@ mod tests {
         head: &str,
     ) -> WorkScopePrObservation {
         let state = match display_state {
-            phoenix_core::domain::pr_display_state::PrDisplayState::Open => "OPEN",
-            phoenix_core::domain::pr_display_state::PrDisplayState::Draft => "OPEN",
+            phoenix_core::domain::pr_display_state::PrDisplayState::Open
+            | phoenix_core::domain::pr_display_state::PrDisplayState::Draft => "OPEN",
             phoenix_core::domain::pr_display_state::PrDisplayState::Merged => "MERGED",
             phoenix_core::domain::pr_display_state::PrDisplayState::Closed => "CLOSED",
         };
