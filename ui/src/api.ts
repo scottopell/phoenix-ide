@@ -180,18 +180,13 @@ export interface PrCheckSummary {
 }
 
 export type PrFeedbackSource = 'issue_comment' | 'review_comment' | 'review_summary' | 'review_thread';
-export type PrFeedbackCoverageSurface = 'issue_comments' | 'issue_comment_reactions' | 'review_comments' | 'review_comment_reactions' | 'review_summaries' | 'review_summary_reactions' | 'review_threads';
+export type PrFeedbackCoverageSurface = 'issue_comments' | 'review_comments' | 'review_summaries' | 'review_threads';
 export type PrFeedbackCoverageStatus = 'fetched' | 'unavailable' | 'auth_failed';
 
 export interface PrFeedbackCoverage {
   surface: PrFeedbackCoverageSurface;
   status: PrFeedbackCoverageStatus;
   detail?: string;
-}
-
-export interface PrFeedbackReaction {
-  content: string;
-  count: number;
 }
 
 export interface PrFeedbackItem {
@@ -204,15 +199,13 @@ export interface PrFeedbackItem {
   path?: string;
   url?: string;
   created_at?: string;
-  reactions: PrFeedbackReaction[];
-  feedback_status: PrFeedbackStatus;
   resolved?: boolean;
 }
 
 export interface PrFeedbackSummary {
   total: number;
   unresolved: number;
-  feedback_status: PrFeedbackStatus;
+  feedback_status?: PrFeedbackStatus;
   items: PrFeedbackItem[];
   coverage: PrFeedbackCoverage[];
 }

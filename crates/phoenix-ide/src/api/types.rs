@@ -927,11 +927,8 @@ pub struct PrCheckLogSnippet {
 #[serde(rename_all = "snake_case")]
 pub enum PrFeedbackCoverageSurface {
     IssueComments,
-    IssueCommentReactions,
     ReviewComments,
-    ReviewCommentReactions,
     ReviewSummaries,
-    ReviewSummaryReactions,
     ReviewThreads,
 }
 
@@ -952,12 +949,6 @@ pub struct PrFeedbackCoverage {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct PrFeedbackReaction {
-    pub content: String,
-    pub count: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PrFeedbackItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -975,10 +966,6 @@ pub struct PrFeedbackItem {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
-    #[serde(default)]
-    pub reactions: Vec<PrFeedbackReaction>,
-    #[serde(default)]
-    pub feedback_status: PrFeedbackStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved: Option<bool>,
 }
@@ -987,8 +974,9 @@ pub struct PrFeedbackItem {
 pub struct PrFeedbackSummary {
     pub total: u32,
     pub unresolved: u32,
+    // owned: pre-reaction and failed-reaction captures have no trustworthy status
     #[serde(default)]
-    pub feedback_status: PrFeedbackStatus,
+    pub feedback_status: Option<PrFeedbackStatus>,
     pub items: Vec<PrFeedbackItem>,
     pub coverage: Vec<PrFeedbackCoverage>,
 }

@@ -665,21 +665,23 @@ async fn attach_pr_feedback_freshness(
         match feedback {
             Ok(feedback) => {
                 let coverage_health = crate::api::pr_monitoring::coverage_health(&feedback);
-                let (effective_feedback_status, should_update_cache) =
-                    effective_feedback_status_for_cache(
-                        previous_feedback_status,
-                        feedback.feedback_status,
-                        coverage_health.is_some(),
-                    );
-                response.feedback_status = effective_feedback_status;
-                if should_update_cache {
-                    db.update_work_scope_pr_feedback_status(
-                        work_scope,
-                        pr_number,
-                        feedback.feedback_status,
-                    )
-                    .await
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                if let Some(fetched_status) = feedback.feedback_status {
+                    let (effective_feedback_status, should_update_cache) =
+                        effective_feedback_status_for_cache(
+                            previous_feedback_status,
+                            fetched_status,
+                            coverage_health.is_some(),
+                        );
+                    response.feedback_status = effective_feedback_status;
+                    if should_update_cache {
+                        db.update_work_scope_pr_feedback_status(
+                            work_scope,
+                            pr_number,
+                            fetched_status,
+                        )
+                        .await
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    }
                 }
                 response.feedback_freshness =
                     crate::api::pr_monitoring::actionable_feedback_freshness_from_baseline(
@@ -785,7 +787,7 @@ pub(crate) async fn create_pr_auto_fix_context(
             Ok(capture.response),
             capture.observations,
             Some(capture.baseline),
-            Some(capture.feedback_status),
+            capture.feedback_status,
         ),
         Err(crate::api::pr_monitoring::PrMonitorError::BadRequestWithObservations {
             message,
