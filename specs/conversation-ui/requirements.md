@@ -87,6 +87,13 @@ THE SYSTEM SHALL send the message
 WHEN user presses Shift+Enter
 THE SYSTEM SHALL insert a newline
 
+WHEN the agent is busy and accepts steering messages
+THE SYSTEM SHALL display a message action that queues the composed message as a follow-up
+AND keep cancellation independently accessible when cancellation is also available
+
+WHEN composer controls are displayed at any supported responsive width
+THE SYSTEM SHALL keep every control outside the editable and selectable text region
+
 **Rationale:** Users expect standard text input behavior. Draft persistence prevents frustrating message loss.
 
 ---

@@ -1,0 +1,132 @@
+.input-textarea-wrap {
+  --composer-control-height: 44px;
+  --pulse-color: var(--accent-purple, #a371f7);
+
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  overflow: hidden;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.input-textarea-wrap:focus-within {
+  border-color: var(--accent-blue);
+}
+
+#message-input {
+  width: 100%;
+  min-width: 0;
+  min-height: var(--composer-control-height);
+  max-height: 120px;
+  padding: 10px 12px;
+  box-sizing: border-box;
+  resize: none;
+  background: transparent;
+  border: 0;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+#message-input:focus {
+  outline: none;
+}
+
+#message-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.input-textarea-wrap--working {
+  border-color: color-mix(in srgb, var(--pulse-color) 40%, transparent);
+  background: color-mix(in srgb, var(--bg-primary) 90%, var(--pulse-color));
+  animation: input-pulse 2s ease-in-out infinite;
+}
+
+.input-textarea-wrap--working:focus-within {
+  border-color: color-mix(in srgb, var(--pulse-color) 60%, transparent);
+}
+
+@keyframes input-pulse {
+  0%, 100% { border-color: color-mix(in srgb, var(--pulse-color) 30%, transparent); }
+  50% { border-color: color-mix(in srgb, var(--pulse-color) 60%, transparent); }
+}
+
+.input-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: var(--composer-control-height);
+  padding: 0 5px 0 2px;
+}
+
+.input-send-btn,
+.input-stop-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 34px;
+  min-width: 54px;
+  padding: 0 10px;
+  border-radius: 5px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.input-send-btn {
+  border: 0;
+  background: var(--accent-blue);
+  color: white;
+  transition: background 0.15s;
+}
+
+.input-stop-btn {
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.input-send-btn:disabled,
+.input-stop-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.input-send-btn:hover:not(:disabled) {
+  background: #4c9aed;
+}
+
+.input-stop-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+  background: color-mix(in srgb, var(--bg-tertiary) 60%, transparent);
+}
+
+@media (width <= 480px) {
+  .input-textarea-wrap {
+    grid-template-columns: 1fr;
+  }
+
+  .input-inline-actions {
+    justify-content: flex-end;
+    padding: 2px 5px 5px;
+  }
+
+  .input-send-btn,
+  .input-stop-btn {
+    min-height: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .input-textarea-wrap--working {
+    animation: none;
+  }
+}

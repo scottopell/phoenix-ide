@@ -16,6 +16,7 @@ interface InputAreaTestProps {
   draft?: string;
   onDraftChange?: (text: string) => void;
   onCancel?: () => void;
+  onSend?: (text: string) => void;
   focusToken?: number;
 }
 
@@ -26,6 +27,7 @@ function renderInput({
   draft = '',
   onDraftChange = () => {},
   onCancel = () => {},
+  onSend = () => {},
   focusToken,
 }: InputAreaTestProps) {
   const focusProps = focusToken === undefined ? {} : { focusToken };
@@ -41,7 +43,7 @@ function renderInput({
       draft={draft}
       onDraftChange={onDraftChange}
       {...focusProps}
-      onSend={() => {}}
+      onSend={onSend}
       onCancel={onCancel}
       onRetry={() => {}}
     />,
@@ -238,16 +240,53 @@ describe('InputArea focusToken contract', () => {
 });
 
 describe('InputArea cancellation affordance', () => {
-  it('shows Stop and calls onCancel for cancellable working states', () => {
+  it('keeps Stop and steering Queue independently available while working', () => {
     const onCancel = vi.fn();
+    const onSend = vi.fn();
     renderInput({
       cwd: 'conv-cancel',
       convState: { type: 'llm_requesting', attempt: 1 },
+      draft: 'change direction',
       onCancel,
+      onSend,
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+    const stop = screen.getByRole('button', { name: 'Stop' });
+    const queue = screen.getByRole('button', { name: 'Queue follow-up' });
+    expect(queue).toHaveAttribute('title', 'Queue follow-up (Enter)');
+
+    fireEvent.click(queue);
+    expect(onSend).toHaveBeenCalledWith('change direction', [], []);
+    expect(onCancel).not.toHaveBeenCalled();
+
+    fireEvent.click(stop);
     expect(onCancel).toHaveBeenCalledOnce();
+  });
+
+  it('queues a steering message with Enter while working', () => {
+    const onSend = vi.fn();
+    renderInput({
+      cwd: 'conv-steer',
+      convState: { type: 'tool_executing', current_tool: { id: 't', name: 'bash', input: {} }, remaining_tools: [] },
+      draft: 'try the other approach',
+      onSend,
+    });
+
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(onSend).toHaveBeenCalledWith('try the other approach', [], []);
+  });
+
+  it('submits Enter but preserves Shift+Enter and IME composition', () => {
+    const onSend = vi.fn();
+    renderInput({ cwd: 'conv-keys', draft: 'hello', onSend });
+    const textarea = screen.getByRole('textbox');
+
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: true });
+    fireEvent.keyDown(textarea, { key: 'Enter', isComposing: true });
+    expect(onSend).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(onSend).toHaveBeenCalledWith('hello', [], []);
   });
 
   it('renders continuation progress without a Stop button', () => {
@@ -282,9 +321,9 @@ describe('InputArea cancellation affordance', () => {
       />,
     );
 
-    const send = screen.getByRole('button', { name: 'Send' });
-    expect(send).toBeDisabled();
-    fireEvent.click(send);
+    const queue = screen.getByRole('button', { name: 'Queue follow-up' });
+    expect(queue).toBeDisabled();
+    fireEvent.click(queue);
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
     expect(onSend).not.toHaveBeenCalled();
   });
@@ -309,7 +348,7 @@ describe('InputArea cancellation affordance', () => {
     );
 
     expect(screen.getByRole('button', { name: 'Stopping...' })).toBeDisabled();
-    expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /send|queue/i })).not.toBeInTheDocument();
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
     expect(onSend).not.toHaveBeenCalled();
   });
@@ -333,7 +372,7 @@ describe('InputArea cancellation affordance', () => {
       />,
     );
 
-    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Queue follow-up' })).toBeDisabled();
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
     expect(onSend).not.toHaveBeenCalled();
   });

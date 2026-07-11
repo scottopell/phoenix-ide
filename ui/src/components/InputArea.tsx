@@ -21,6 +21,7 @@ import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { FILE_TREE_DRAG_TYPE } from './FileExplorer/FileTree';
+import './InputArea.css';
 
 export interface InputAreaHandle {
   focus: () => void;
@@ -445,7 +446,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
       if (refKeyDown(e)) return;
-      if (e.key === 'Enter' && !e.shiftKey) {
+      if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
         e.preventDefault();
         handleSend();
       }
@@ -664,13 +665,19 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         </div>
       )}
 
-      {/* Textarea container -- Send/Stop button always inside */}
-      <div className={`input-textarea-wrap${agentWorking ? ' input-textarea-wrap--working' : ''}`}>
+      <form
+        className={`input-textarea-wrap${agentWorking ? ' input-textarea-wrap--working' : ''}`}
+        onSubmit={(event) => {
+          event.preventDefault();
+          handleSend();
+        }}
+      >
         <textarea
           ref={textareaRef}
           id="message-input"
           placeholder={placeholder}
           rows={2}
+          enterKeyHint="send"
           value={voiceBase !== null
             ? (voiceBase.trim()
                 ? voiceBase.trimEnd() + (voiceInterim ? ' ' + voiceInterim : '')
@@ -691,8 +698,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               disabled={agentWorking}
             />
           )}
-          {canCancel || isCancelling ? (
+          {(canCancel || isCancelling) && (
             <button
+              type="button"
               className="input-stop-btn"
               onClick={onCancel}
               disabled={isCancelling || isOffline}
@@ -700,18 +708,20 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
             >
               {isCancelling ? 'Stopping...' : 'Stop'}
             </button>
-          ) : (
+          )}
+          {!isCancelling && (
             <button
+              type="submit"
               className="input-send-btn"
-              onClick={handleSend}
               disabled={!sendEnabled}
-              title="Enter to send"
+              title={agentWorking ? 'Queue follow-up (Enter)' : 'Send message (Enter)'}
+              aria-label={agentWorking ? 'Queue follow-up' : 'Send message'}
             >
-              Send
+              {agentWorking ? 'Queue' : 'Send'}
             </button>
           )}
         </div>
-      </div>
+      </form>
     </footer>
   );
 });
