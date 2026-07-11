@@ -182,12 +182,17 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         .await
         .map_err(DriveTurnError::Runtime)?;
 
-    let outcome = tokio::time::timeout(
+    let outcome = if let Ok(result) = tokio::time::timeout(
         request.timeout,
         wait_for_stable_turn(&db, &conversation_id, &mut state_rx),
     )
     .await
-    .map_err(|_| DriveTurnError::Timeout(request.timeout))??;
+    {
+        result?
+    } else {
+        cancel_timed_out_turn(&manager, &conversation_id, &mut state_rx).await?;
+        return Err(DriveTurnError::Timeout(request.timeout));
+    };
     let messages = db
         .get_messages(&conversation_id)
         .await
@@ -204,6 +209,34 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         elapsed_ms: started.elapsed().as_millis(),
         messages,
     })
+}
+
+async fn cancel_timed_out_turn(
+    manager: &Arc<RuntimeManager>,
+    conversation_id: &str,
+    state_rx: &mut tokio::sync::watch::Receiver<ConvState>,
+) -> Result<(), DriveTurnError> {
+    manager
+        .send_event(
+            conversation_id,
+            Event::UserCancel {
+                reason: Some("drive-turn timeout".into()),
+                cause: phoenix_core::domain::sm_event::CancelCause::Timeout,
+            },
+        )
+        .await
+        .map_err(|error| {
+            DriveTurnError::Runtime(format!("timeout cancellation failed: {error}"))
+        })?;
+
+    tokio::time::timeout(Duration::from_secs(10), wait_for_stable_state(state_rx))
+        .await
+        .map_err(|_| {
+            DriveTurnError::Runtime(
+                "timed-out turn did not reach a stable state after cancellation".into(),
+            )
+        })??;
+    Ok(())
 }
 
 async fn open_database(
@@ -226,8 +259,13 @@ async fn open_database(
     }
 }
 
+fn parent_directory(path: &std::path::Path) -> Option<&std::path::Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+}
+
 async fn open_file_database(path: PathBuf) -> Result<(Database, DatabaseResult), DriveTurnError> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = parent_directory(&path) {
         std::fs::create_dir_all(parent)
             .map_err(|error| DriveTurnError::Database(error.to_string()))?;
     }
@@ -259,6 +297,20 @@ async fn wait_for_stable_turn(
             if has_agent_output || !matches!(outcome, StableOutcome::Idle) {
                 return Ok(outcome);
             }
+        }
+        state_rx
+            .changed()
+            .await
+            .map_err(|_| DriveTurnError::Runtime("runtime state channel closed".into()))?;
+    }
+}
+
+async fn wait_for_stable_state(
+    state_rx: &mut tokio::sync::watch::Receiver<ConvState>,
+) -> Result<StableOutcome, DriveTurnError> {
+    loop {
+        if let Some(outcome) = stable_outcome(&state_rx.borrow()) {
+            return Ok(outcome);
         }
         state_rx
             .changed()
@@ -306,6 +358,15 @@ fn install_crypto_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_database_filename_has_no_directory_to_create() {
+        assert_eq!(parent_directory(std::path::Path::new("results.db")), None);
+        assert_eq!(
+            parent_directory(std::path::Path::new("results/run.db")),
+            Some(std::path::Path::new("results"))
+        );
+    }
 
     #[test]
     fn transient_states_are_not_stable() {

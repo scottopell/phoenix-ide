@@ -13,7 +13,9 @@ THE SYSTEM SHALL stop driving the turn
 AND report the typed stable outcome
 
 IF the conversation does not reach a stable state within the requested timeout
-THEN THE SYSTEM SHALL fail the invocation
+THEN THE SYSTEM SHALL cancel the turn through the production cancellation path
+AND wait for cancellation to reach a stable state before returning
+AND fail the invocation
 
 ## REQ-DRIVE-TURN-003: Database Lifetime
 

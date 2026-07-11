@@ -4,7 +4,7 @@
 
 `drive-turn` is a separate workspace binary that drives one user turn without starting HTTP, SSE, TLS, or UI services. The `phoenix-ide` package exposes its existing server modules as a library; both the server binary and `phoenix-drive-turn` link that same library. The driver constructs the production `RuntimeManager`, provider registry, database adapter, MCP manager, built-in tool registry, state machine, and continuation loop, then observes the runtime's authoritative state watch until a typed stable outcome.
 
-The CLI supports transient in-memory SQLite, retained unique temporary-file SQLite, and an explicit retained database path. Successful output is one JSON object containing raw persisted messages and run metadata.
+The CLI supports transient in-memory SQLite, retained unique temporary-file SQLite, and an explicit retained database path. Successful output is one JSON object containing raw persisted messages and run metadata. A timed-out turn is cancelled through the production cancellation event and must reach a stable state before the driver returns.
 
 ## Usage
 
@@ -29,7 +29,7 @@ The process reads the same LLM environment variables as the server. Standard out
 
 ## Verification
 
-Live smoke tests using `gpt-5.5` completed through both memory and retained temporary-file modes, reached authoritative `Idle`, and persisted user and agent messages. A natural patch-recovery fixture also produced the prescribed initial multi-patch call, received the real patch error through the production tool path, recovered with normal model behavior, and produced the expected file.
+Live smoke tests using `gpt-5.5` completed through both memory and retained temporary-file modes, reached authoritative `Idle`, and persisted user and agent messages. A timed-out live bash turn (`sleep 8; touch marker`) returned after production cancellation settled; the marker remained absent and the retained database stopped changing after return. A natural patch-recovery fixture also produced the prescribed initial multi-patch call, received the real patch error through the production tool path, recovered with normal model behavior, and produced the expected file.
 
 A preliminary control/treatment review compared production patch code before and after request-position diagnostics while holding the driver and prompt constant. All 18 observed runs conformed to their required initial tool call, produced the correct final file, and succeeded on the next patch attempt. In the repeated duplicate-anchor cohort, both arms performed 2 reads/searches and 8 total recovery calls across 6 runs. Missing-anchor behavior also matched: both arms re-read before retrying. The review is therefore neutral rather than evidence of a behavioral improvement; it validates the evaluation path and shows that matching-location diagnostics already let `gpt-5.5` infer many duplicate failures without an explicit request position.
 
