@@ -664,40 +664,35 @@ async fn provision_conversation(
         phoenix_core::domain::creation_protocol::CreationStage::ExpandInitialMessage
     };
 
-    let metadata_outcome = manager
-        .db()
-        .update_conversation_creation_metadata_and_mode(
-            &job.id,
-            &claim,
-            &job.conversation_id,
-            &ConversationCreationMetadataUpdate {
-                slug: Some(slug.clone()),
-                title: Some(title.clone()),
-                cwd: Some(effective_cwd.clone()),
-                project_id: Some(project_id.clone()),
-                desired_base_branch: Some(desired_base_branch.clone()),
-            },
-            &conv_mode,
-            &resolved_model,
-            metadata_expected_stage,
-            phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata,
-        )
-        .await
-        .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
-    if matches!(metadata_outcome, crate::db::CreationCasOutcome::ClaimLost) {
-        return Err((
-            "creation claim was lost before metadata commit".to_string(),
-            ErrorKind::Cancelled,
-        ));
+    if creation_metadata_needs_commit(job.protocol.stage) {
+        let metadata_outcome = manager
+            .db()
+            .update_conversation_creation_metadata_and_mode(
+                &job.id,
+                &claim,
+                &job.conversation_id,
+                &ConversationCreationMetadataUpdate {
+                    slug: Some(slug.clone()),
+                    title: Some(title.clone()),
+                    cwd: Some(effective_cwd.clone()),
+                    project_id: Some(project_id.clone()),
+                    desired_base_branch: Some(desired_base_branch.clone()),
+                },
+                &conv_mode,
+                &resolved_model,
+                metadata_expected_stage,
+                phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata,
+            )
+            .await
+            .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
+        if matches!(metadata_outcome, crate::db::CreationCasOutcome::ClaimLost) {
+            return Err((
+                "creation claim was lost before metadata commit".to_string(),
+                ErrorKind::Cancelled,
+            ));
+        }
+        job.protocol.stage = phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata;
     }
-    job.protocol.stage = phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata;
-    checkpoint_creation_stage(
-        manager,
-        job,
-        &claim,
-        phoenix_core::domain::creation_protocol::CreationStage::BootstrapInitialTurn,
-    )
-    .await?;
     let persisted_conversation = manager
         .db()
         .get_conversation(&job.conversation_id)
@@ -881,6 +876,12 @@ impl Drop for RepositoryMutationLock {
             tracing::warn!(error = %error, "failed to unlock repository creation lock");
         }
     }
+}
+
+fn creation_metadata_needs_commit(
+    stage: phoenix_core::domain::creation_protocol::CreationStage,
+) -> bool {
+    stage < phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata
 }
 
 async fn checkpoint_creation_stage(
@@ -1158,6 +1159,29 @@ mod branch_error_classification_tests {
             "branch not found".to_string(),
         ));
         assert_eq!(kind, ErrorKind::InvalidRequest);
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_stage_recovery_tests {
+    use super::*;
+    use phoenix_core::domain::creation_protocol::CreationStage;
+
+    #[test]
+    fn metadata_is_not_recommitted_when_bootstrap_replays() {
+        assert!(!creation_metadata_needs_commit(
+            CreationStage::CommitMetadata
+        ));
+        assert!(!creation_metadata_needs_commit(
+            CreationStage::BootstrapInitialTurn
+        ));
+    }
+
+    #[test]
+    fn metadata_is_committed_after_initial_message_expansion() {
+        assert!(creation_metadata_needs_commit(
+            CreationStage::ExpandInitialMessage
+        ));
     }
 }
 
