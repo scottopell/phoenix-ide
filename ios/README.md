@@ -111,7 +111,10 @@ PhoenixMobile/Sources/
     Keychain.swift          Password storage
     CertPinStore.swift      Trust-on-first-use certificate pin (self-signed TLS)
     ConnectivityMonitor.swift  NWPathMonitor -> offline banner + drain triggers
-    DiskStore.swift         Atomic JSON persistence (Application Support)
+    DiskStore.swift         Versioned atomic JSON persistence — read the
+                            versioning rule in its header before changing
+                            any persisted struct
+    ImageProcessing.swift   Picked photos -> bounded JPEG ImagePayload
   API/
     Models.swift            Wire types (Conversation, Message, envelopes)
     PhoenixAPI.swift        REST client, Bearer auth, self-signed trust delegate
@@ -127,5 +130,7 @@ PhoenixMobile/Sources/
                             unknown tools fall back to the generic JSON cards
     StateViews.swift        Typed-state detail dispatch (working detail,
                             needs-action cards, error card + dismiss)
+    AttachmentViews.swift   Base64 image rendering with visible decode
+                            fallback; strips for messages + tool results
 ```
 

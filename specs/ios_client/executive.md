@@ -38,10 +38,11 @@ injection first).
 | REQ-IOS-011 typed state | `ConversationState.swift` (decode + fallback, tested), `StateViews.swift` (detail dispatch) |
 | REQ-IOS-012 action policy | `ConversationAction.swift` (policy axis), `ConversationSession.perform`, `AppModel.archive` |
 | REQ-IOS-013 task approval | `TaskApprovalCard` (StateViews.swift), approve/reject/feedback actions |
+| REQ-IOS-014 versioned persistence | `DiskStore.saveVersioned/loadVersioned` (tested), per-store schema version constants |
+| REQ-IOS-015 image attachments | `AttachmentViews.swift`, `ImageProcessing` (tested), composer PhotosPicker, outbox `images` |
 
 ## Known Gaps / Future Work
 
-- No image attachments in the composer (wire types support them; UI does not).
 - No push notifications; updates arrive only while the app is foregrounded
   with a stream open.
 - Steering-queue entries are not reorderable/deletable server-side from the app.

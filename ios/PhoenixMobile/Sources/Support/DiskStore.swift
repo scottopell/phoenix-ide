@@ -4,6 +4,23 @@ import Foundation
 /// conversation list, per-conversation snapshots, outboxes — goes through
 /// here so the app renders instantly with no network.
 ///
+/// ## The versioning rule (REQ-IOS-014)
+///
+/// Durable stores use `saveVersioned`/`loadVersioned`, which wrap the
+/// payload in `{schema_version, payload}`. **Changing any persisted struct
+/// requires one of:**
+///   1. bumping that store's schema version constant and adding a branch
+///      to its `migrate` closure that upgrades the old payload, OR
+///   2. a comment on the changed field noting it is additive-optional
+///      (old files decode it as nil/default — no bump owed).
+/// Without this, a shape change makes old files undecodable and `try?`
+/// silently wipes the cache — for the outbox, that is queued-message loss.
+///
+/// Load semantics: same version → decode; older version → the store's
+/// migrate hook; **newer** version (downgraded app) → refuse and treat as
+/// absent rather than misparse; a pre-envelope legacy file decodes as the
+/// bare payload (version 0).
+///
 /// MainActor-isolated: every caller (stores, sessions, AppModel) is already
 /// MainActor, and isolation is what makes the mutable `baseDirectory` test
 /// seam safe.
@@ -46,6 +63,69 @@ enum DiskStore {
 
     static func remove(name: String) {
         try? FileManager.default.removeItem(at: url(for: name))
+    }
+
+    // MARK: - Versioned stores (see the versioning rule above)
+
+    private struct SaveEnvelope<T: Encodable>: Encodable {
+        var schema_version: Int
+        var payload: T
+    }
+
+    private struct LoadEnvelope<T: Decodable>: Decodable {
+        var schema_version: Int
+        var payload: T
+    }
+
+    /// Probe for the envelope discriminator. Decoding this against a bare
+    /// legacy payload either throws (arrays) or yields nil (objects
+    /// without the key) — both route to the legacy path.
+    private struct VersionProbe: Decodable {
+        var schema_version: Int?
+    }
+
+    @discardableResult
+    static func saveVersioned<T: Encodable>(_ value: T, name: String, version: Int) -> Bool {
+        guard let data = try? JSONEncoder().encode(
+            SaveEnvelope(schema_version: version, payload: value))
+        else { return false }
+        do {
+            try data.write(to: url(for: name), options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Load a versioned store. `migrate` receives the stored version and
+    /// the raw file bytes for any version older than `version` (including
+    /// 0 for a legacy bare file the current shape can't decode); return
+    /// nil to treat the file as unusable.
+    static func loadVersioned<T: Decodable>(
+        _ type: T.Type, name: String, version: Int,
+        migrate: ((_ storedVersion: Int, _ fileData: Data) -> T?)? = nil
+    ) -> T? {
+        guard let data = try? Data(contentsOf: url(for: name)) else { return nil }
+
+        if let stored = (try? JSONDecoder().decode(VersionProbe.self, from: data))?
+            .schema_version
+        {
+            if stored == version {
+                return (try? JSONDecoder().decode(LoadEnvelope<T>.self, from: data))?.payload
+            }
+            if stored > version {
+                // Written by a newer app; guessing at the shape risks
+                // corrupting it — treat as absent (never delete on load).
+                return nil
+            }
+            return migrate?(stored, data)
+        }
+
+        // Legacy pre-envelope file: the payload was stored bare.
+        if let bare = try? JSONDecoder().decode(T.self, from: data) {
+            return bare
+        }
+        return migrate?(0, data)
     }
 
     /// Names (without extension) of stored files matching a prefix. Used to

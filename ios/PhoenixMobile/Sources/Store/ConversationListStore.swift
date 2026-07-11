@@ -14,6 +14,9 @@ final class ConversationListStore {
 
     private static let cacheName = "conversations"
     private static let metaName = "conversations-meta"
+    /// Bump when the persisted list/meta shapes change incompatibly
+    /// (DiskStore versioning rule).
+    private static let schemaVersion = 1
 
     private struct Meta: Codable {
         var lastRefreshed: Date
@@ -27,8 +30,10 @@ final class ConversationListStore {
     private var generation = 0
 
     init() {
-        conversations = DiskStore.load([Conversation].self, name: Self.cacheName) ?? []
-        lastRefreshed = DiskStore.load(Meta.self, name: Self.metaName)?.lastRefreshed
+        conversations = DiskStore.loadVersioned(
+            [Conversation].self, name: Self.cacheName, version: Self.schemaVersion) ?? []
+        lastRefreshed = DiskStore.loadVersioned(
+            Meta.self, name: Self.metaName, version: Self.schemaVersion)?.lastRefreshed
     }
 
     func refresh(api: PhoenixAPI) async {
@@ -53,8 +58,10 @@ final class ConversationListStore {
             ($0.updatedAtDate ?? .distantPast) > ($1.updatedAtDate ?? .distantPast)
         }
         lastRefreshed = Date()
-        DiskStore.save(conversations, name: Self.cacheName)
-        DiskStore.save(Meta(lastRefreshed: lastRefreshed!), name: Self.metaName)
+        DiskStore.saveVersioned(conversations, name: Self.cacheName, version: Self.schemaVersion)
+        DiskStore.saveVersioned(
+            Meta(lastRefreshed: lastRefreshed!), name: Self.metaName,
+            version: Self.schemaVersion)
     }
 
     /// Merge a single updated conversation (e.g. after creation or an SSE
@@ -69,13 +76,13 @@ final class ConversationListStore {
         conversations.sort {
             ($0.updatedAtDate ?? .distantPast) > ($1.updatedAtDate ?? .distantPast)
         }
-        DiskStore.save(conversations, name: Self.cacheName)
+        DiskStore.saveVersioned(conversations, name: Self.cacheName, version: Self.schemaVersion)
     }
 
     func remove(id: String) {
         generation += 1
         conversations.removeAll { $0.id == id }
-        DiskStore.save(conversations, name: Self.cacheName)
+        DiskStore.saveVersioned(conversations, name: Self.cacheName, version: Self.schemaVersion)
     }
 
     /// Drop in-memory state after the disk cache is cleared (or the user

@@ -54,6 +54,10 @@ final class ConversationSession {
 
     private var snapshotName: String { "conv-\(conversationId)" }
 
+    /// Bump when Snapshot's persisted shape changes incompatibly (DiskStore
+    /// versioning rule). Additive-optional fields (savedAt) need no bump.
+    private static let snapshotSchemaVersion = 1
+
     private struct Snapshot: Codable {
         var conversation: Conversation?
         var messages: [Message]
@@ -74,7 +78,9 @@ final class ConversationSession {
         self.outbox = Outbox(conversationId: conversationId)
 
         // Cached snapshot renders immediately; the stream refreshes it.
-        if let snap = DiskStore.load(Snapshot.self, name: snapshotName) {
+        if let snap = DiskStore.loadVersioned(
+            Snapshot.self, name: snapshotName, version: Self.snapshotSchemaVersion)
+        {
             conversation = snap.conversation
             messages = snap.messages
             lastSequenceId = snap.lastSequenceId
@@ -142,22 +148,23 @@ final class ConversationSession {
     private func persistSnapshot() {
         let now = Date()
         snapshotSavedAt = now
-        DiskStore.save(
+        DiskStore.saveVersioned(
             Snapshot(
                 conversation: conversation, messages: messages,
                 lastSequenceId: lastSequenceId, savedAt: now),
-            name: snapshotName)
+            name: snapshotName, version: Self.snapshotSchemaVersion)
     }
 
     // MARK: - Sending
 
     /// Optimistic enqueue-then-send. The entry is persisted before the POST
     /// leaves the device; if the network is down the send is deferred, not
-    /// failed.
-    func send(text: String) {
+    /// failed. Images ride the same outbox path as text — same durability,
+    /// same idempotent delivery.
+    func send(text: String, images: [ImagePayload] = []) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        _ = outbox.enqueue(text: trimmed)
+        guard !trimmed.isEmpty || !images.isEmpty else { return }
+        _ = outbox.enqueue(text: trimmed, images: images)
         drainOutbox()
     }
 

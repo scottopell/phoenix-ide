@@ -61,6 +61,11 @@ final class Outbox {
     /// won't survive an app restart. Cleared by the next successful write.
     private(set) var persistenceHealthy = true
 
+    /// Bump when OutboxEntry's persisted shape changes incompatibly, and
+    /// add a migrate branch below (DiskStore versioning rule). v1 is the
+    /// full current shape; pre-envelope legacy files load as bare payload.
+    static let schemaVersion = 1
+
     private var storeName: String { "outbox-\(conversationId)" }
 
     init(conversationId: String) {
@@ -68,7 +73,8 @@ final class Outbox {
         // Rehydrate only entries tagged with this conversation — a foreign
         // entry can never reconcile here and must not render (spec rule
         // RehydrateQueueForConversationOnly).
-        let loaded = DiskStore.load([OutboxEntry].self, name: storeName) ?? []
+        let loaded = DiskStore.loadVersioned(
+            [OutboxEntry].self, name: storeName, version: Self.schemaVersion) ?? []
         entries = loaded.filter { $0.conversationId == conversationId && $0.isVisible }
     }
 
@@ -83,7 +89,8 @@ final class Outbox {
     private func persist() {
         // Terminal entries are pruned at persistence time; they carry no
         // future obligation.
-        persistenceHealthy = DiskStore.save(entries.filter(\.isVisible), name: storeName)
+        persistenceHealthy = DiskStore.saveVersioned(
+            entries.filter(\.isVisible), name: storeName, version: Self.schemaVersion)
     }
 
     private func update(_ localId: String, _ mutate: (inout OutboxEntry) -> Void) {
