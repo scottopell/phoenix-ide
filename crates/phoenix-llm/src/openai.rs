@@ -9,11 +9,15 @@ use super::rate_limit::{
 use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage};
 use super::LlmError;
 use chrono::{DateTime, Utc};
+use futures::{SinkExt, StreamExt};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio_tungstenite::{connect_async, tungstenite};
 
 // ---------------------------------------------------------------------------
 // Endpoint resolution
@@ -54,6 +58,7 @@ pub async fn complete(
             request,
             &chunk_tx,
             use_codex_backend,
+            None,
         )
         .await;
     }
@@ -451,6 +456,273 @@ impl ResponsesStreamAccumulator {
     }
 }
 
+type CodexSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[derive(Debug, Default)]
+pub(crate) struct CodexWsSessions {
+    /// The outer mutex protects only entry creation. Each cache cohort has its
+    /// own mutex so requests for that cohort are serialized for the lifetime of
+    /// its connection without blocking unrelated conversations.
+    by_cache_key: HashMap<String, Arc<Mutex<CodexWsSession>>>,
+}
+
+#[derive(Debug, Default)]
+struct CodexWsSession {
+    socket: Option<CodexSocket>,
+    response_id: Option<String>,
+    compatibility: Option<serde_json::Value>,
+    prefix: Vec<serde_json::Value>,
+    auth_identity: Option<[u8; 32]>,
+}
+
+fn websocket_url(http_url: &str) -> Result<String, LlmError> {
+    if let Some(rest) = http_url.strip_prefix("https://") {
+        Ok(format!("wss://{rest}"))
+    } else if let Some(rest) = http_url.strip_prefix("http://") {
+        Ok(format!("ws://{rest}"))
+    } else {
+        Err(LlmError::invalid_request(
+            "Responses WebSocket URL must be HTTP(S)",
+        ))
+    }
+}
+
+/// Split a fully typed request into the complete input and an exact fingerprint
+/// of every other serialized request property. Adding a field to the request
+/// type automatically adds it to this fingerprint; only `input` and the
+/// continuation-only `previous_response_id` are excluded.
+fn continuation_parts(
+    request: &ResponsesBackendRequest,
+) -> Result<(serde_json::Value, Vec<serde_json::Value>), LlmError> {
+    let mut value = serde_json::to_value(request)
+        .map_err(|e| LlmError::invalid_request(format!("serialize WebSocket request: {e}")))?;
+    let input = value
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+        .map(std::mem::take)
+        .ok_or_else(|| LlmError::invalid_request("Responses request has no input array"))?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("previous_response_id");
+    }
+    Ok((value, input))
+}
+
+fn canonical_server_output(output: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    output
+        .into_iter()
+        .filter_map(
+            |item| match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("message") => {
+                    let text = item
+                        .get("content")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Some(serde_json::json!({"type":"message", "role":"assistant", "content":text}))
+                }
+                Some("function_call") => Some(serde_json::json!({
+                    "type":"function_call",
+                    "call_id":item.get("call_id")?,
+                    "name":item.get("name")?,
+                    "arguments":item.get("arguments")?
+                })),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+fn continuation_suffix(
+    old: &CodexWsSession,
+    compatibility: &serde_json::Value,
+    full_input: &[serde_json::Value],
+) -> Option<(String, Vec<serde_json::Value>)> {
+    (old.compatibility.as_ref() == Some(compatibility) && full_input.starts_with(&old.prefix))
+        .then(|| {
+            old.response_id
+                .as_ref()
+                .map(|id| (id.clone(), full_input[old.prefix.len()..].to_vec()))
+        })
+        .flatten()
+}
+
+#[allow(clippy::too_many_lines)]
+async fn complete_codex_websocket(
+    http_url: &str,
+    api_key: &str,
+    custom_headers: &[(String, String)],
+    cache_key: &str,
+    full_request: &ResponsesBackendRequest,
+    chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
+    sessions: &Arc<Mutex<CodexWsSessions>>,
+) -> Result<LlmResponse, LlmError> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    use sha2::{Digest, Sha256};
+
+    let (compatibility, full_input) = continuation_parts(full_request)?;
+    let auth_identity: [u8; 32] = Sha256::digest(api_key.as_bytes()).into();
+    let session = {
+        let mut guard = sessions.lock().await;
+        guard
+            .by_cache_key
+            .entry(cache_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(CodexWsSession::default())))
+            .clone()
+    };
+    // One in-flight response.create per connection. Holding this lock through
+    // the terminal event also makes continuation metadata and socket state an
+    // atomic unit.
+    let mut session = session.lock().await;
+    if session.auth_identity != Some(auth_identity) {
+        session.socket = None;
+        session.response_id = None;
+        session.compatibility = None;
+        session.prefix.clear();
+        session.auth_identity = Some(auth_identity);
+    }
+
+    let mut wire = serde_json::to_value(full_request)
+        .map_err(|e| LlmError::invalid_request(format!("serialize WebSocket request: {e}")))?;
+    let full_payload_bytes = serde_json::to_vec(&wire).map_or(0, |bytes| bytes.len());
+    let incremental = if let Some((previous_response_id, suffix)) =
+        continuation_suffix(&session, &compatibility, &full_input)
+    {
+        wire["input"] = serde_json::Value::Array(suffix);
+        wire["previous_response_id"] = serde_json::Value::String(previous_response_id);
+        true
+    } else {
+        false
+    };
+    let sent_payload_bytes = serde_json::to_vec(&wire).map_or(0, |bytes| bytes.len());
+    let connection_reused = session.socket.is_some();
+    tracing::debug!(
+        cache_key,
+        connection_reused,
+        incremental,
+        full_payload_bytes,
+        sent_payload_bytes,
+        "sending Codex Responses WebSocket request"
+    );
+    let envelope = serde_json::json!({"type": "response.create", "response": wire});
+
+    // Buffer WebSocket emissions until a terminal success. If the socket fails,
+    // the HTTP fallback starts from a clean public stream and cannot duplicate
+    // speculative deltas already observed on the failed transport.
+    let (buffer_tx, mut buffer_rx) = tokio::sync::broadcast::channel(1024);
+
+    let mut upgrade = websocket_url(http_url)?
+        .into_client_request()
+        .map_err(|e| LlmError::network(format!("WebSocket request: {e}")))?;
+    let headers = upgrade.headers_mut();
+    headers.insert(
+        "Authorization",
+        format!("Bearer {api_key}")
+            .parse()
+            .map_err(|e| LlmError::invalid_request(format!("authorization header: {e}")))?,
+    );
+    headers.insert(
+        "OpenAI-Beta",
+        "responses_websockets=2026-02-06"
+            .parse()
+            .expect("static header"),
+    );
+    headers.insert(
+        "x-openai-internal-codex-responses-lite",
+        "true".parse().expect("static header"),
+    );
+    for (name, value) in custom_headers {
+        let name = tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| LlmError::invalid_request(format!("WebSocket header name: {e}")))?;
+        let value = tungstenite::http::HeaderValue::from_str(value)
+            .map_err(|e| LlmError::invalid_request(format!("WebSocket header value: {e}")))?;
+        headers.insert(name, value);
+    }
+
+    let result = async {
+        if session.socket.is_none() {
+            let (socket, _) = connect_async(upgrade)
+                .await
+                .map_err(|e| LlmError::network(format!("WebSocket connect: {e}")))?;
+            session.socket = Some(socket);
+        }
+        let socket = session.socket.as_mut().expect("socket initialized");
+        socket
+            .send(tungstenite::Message::Text(envelope.to_string().into()))
+            .await
+            .map_err(|e| LlmError::network(format!("WebSocket send: {e}")))?;
+        let mut acc = ResponsesStreamAccumulator::new();
+        let mut response_id = None;
+        let mut server_output = Vec::new();
+        while let Some(message) = socket.next().await {
+            let message =
+                message.map_err(|e| LlmError::network(format!("WebSocket stream: {e}")))?;
+            let text = match message {
+                tungstenite::Message::Text(text) => text,
+                tungstenite::Message::Close(_) => break,
+                tungstenite::Message::Binary(_)
+                | tungstenite::Message::Ping(_)
+                | tungstenite::Message::Pong(_)
+                | tungstenite::Message::Frame(_) => continue,
+            };
+            let value: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|e| LlmError::invalid_response(format!("WebSocket event JSON: {e}")))?;
+            let event_type = value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            acc.process_event(event_type, &text, &buffer_tx)?;
+            if event_type == "response.completed" {
+                response_id = value
+                    .pointer("/response/id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                server_output = value
+                    .pointer("/response/output")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+            }
+            if acc.done {
+                break;
+            }
+        }
+        let id = response_id
+            .ok_or_else(|| LlmError::invalid_response("WebSocket completed without response id"))?;
+        let response = acc.into_response()?;
+        Ok::<_, LlmError>((response, id, server_output))
+    }
+    .await;
+
+    match result {
+        Ok((response, response_id, server_output)) => {
+            drop(buffer_tx);
+            while let Ok(chunk) = buffer_rx.try_recv() {
+                let _ = chunk_tx.send(chunk);
+            }
+            let mut prefix = full_input;
+            prefix.extend(canonical_server_output(server_output));
+            session.response_id = Some(response_id);
+            session.compatibility = Some(compatibility);
+            session.prefix = prefix;
+            Ok(response)
+        }
+        Err(error) => {
+            // A protocol or transport failure poisons the stream. Reconnect on
+            // the next request and require a full create; never continue from
+            // metadata whose terminal response was not observed.
+            session.socket = None;
+            session.response_id = None;
+            session.compatibility = None;
+            session.prefix.clear();
+            Err(error)
+        }
+    }
+}
+
 /// Complete with streaming, emitting `TokenChunk::Text` events via `chunk_tx`.
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_streaming(
@@ -462,14 +734,34 @@ pub async fn complete_streaming(
     request: &LlmRequest,
     chunk_tx: &tokio::sync::broadcast::Sender<super::TokenChunk>,
     use_codex_backend: bool,
+    ws_sessions: Option<&Arc<Mutex<CodexWsSessions>>>,
 ) -> Result<LlmResponse, LlmError> {
-    use futures::StreamExt;
-
     let url = resolve_endpoint(base_url_override);
     let mut responses_request =
         translate_to_backend_request(&spec.api_name, request, use_codex_backend);
     responses_request.set_streaming();
     responses_request.set_tags(request_tags);
+
+    if use_codex_backend && supports_responses_lite(&spec.api_name) {
+        if let Some(sessions) = ws_sessions {
+            match complete_codex_websocket(
+                &url,
+                api_key,
+                custom_headers,
+                request.cache_key.as_str(),
+                &responses_request,
+                chunk_tx,
+                sessions,
+            )
+            .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) if !error.kind.is_auto_retryable() => return Err(error),
+                Err(error) => tracing::warn!(error = %error.message,
+                    "Codex WebSocket failed; reset continuation and falling back once to full HTTP/SSE"),
+            }
+        }
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_mins(10))
@@ -1364,6 +1656,258 @@ mod tests {
     use super::*;
     use crate::headers::has_custom_source_header;
     use crate::types::{LlmMessage, LlmRequest, PromptCacheKey};
+
+    use crate::models::{ModelBackend, ModelSource};
+    use crate::types::MessageRole;
+    use axum::extract::{ws::Message as AxumWsMessage, State, WebSocketUpgrade};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use axum::Router;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default)]
+    struct MockResponsesState {
+        connections: Arc<AtomicUsize>,
+        http_requests: Arc<AtomicUsize>,
+        ws_requests: Arc<Mutex<Vec<(usize, serde_json::Value)>>>,
+    }
+
+    async fn mock_ws(ws: WebSocketUpgrade, State(state): State<MockResponsesState>) -> Response {
+        let connection = state.connections.fetch_add(1, Ordering::SeqCst);
+        ws.on_upgrade(move |mut socket| async move {
+            while let Some(Ok(AxumWsMessage::Text(text))) = socket.recv().await {
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                state.ws_requests.lock().await.push((connection, request.clone()));
+                let marker = request["response"]["input"].to_string();
+                if marker.contains("ws-fail") {
+                    socket
+                        .send(AxumWsMessage::Text(
+                            serde_json::json!({"type":"response.output_text.delta","delta":"speculative"})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    return;
+                }
+                if marker.contains("terminal") {
+                    socket
+                        .send(AxumWsMessage::Text(
+                            serde_json::json!({"type":"error","code":"context_length_exceeded","message":"too long"})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                let n = state.ws_requests.lock().await.len();
+                let answer = format!("answer-{n}");
+                socket
+                    .send(AxumWsMessage::Text(
+                        serde_json::json!({
+                            "type":"response.completed",
+                            "response":{
+                                "id":format!("resp-{n}"),
+                                "usage":{"input_tokens":10,"output_tokens":1},
+                                "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":answer}]}]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        })
+    }
+
+    async fn mock_http(State(state): State<MockResponsesState>) -> impl IntoResponse {
+        state.http_requests.fetch_add(1, Ordering::SeqCst);
+        (
+            [("content-type", "text/event-stream")],
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"http-1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1},\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"http-answer\"}]}]}}\n\n",
+        )
+    }
+
+    async fn mock_server() -> (String, MockResponsesState) {
+        let state = MockResponsesState::default();
+        let app = Router::new()
+            .route("/responses", get(mock_ws).post(mock_http))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/responses"), state)
+    }
+
+    fn codex_spec() -> ModelSpec {
+        ModelSpec {
+            id: "gpt-5.6".into(),
+            api_name: "gpt-5.6".into(),
+            backend: ModelBackend::OpenAIResponses,
+            description: String::new(),
+            context_window: 100_000,
+            recommended: false,
+            supports_tool_search: false,
+            source: ModelSource::BuiltIn,
+        }
+    }
+
+    fn request_with(messages: &[(&str, MessageRole)]) -> LlmRequest {
+        LlmRequest {
+            system: vec![],
+            messages: messages
+                .iter()
+                .map(|(text, role)| LlmMessage {
+                    role: *role,
+                    content: vec![ContentBlock::text(*text)],
+                })
+                .collect(),
+            tools: vec![],
+            max_tokens: None,
+            cache_key: PromptCacheKey::stable("integration"),
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_reuses_connection_continues_resets_and_falls_back_safely() {
+        let (url, state) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
+        let (tx, mut rx) = tokio::sync::broadcast::channel(32);
+        let call = |request: LlmRequest| {
+            let url = url.clone();
+            let sessions = sessions.clone();
+            let tx = tx.clone();
+            async move {
+                complete_streaming(
+                    &codex_spec(),
+                    "account-a",
+                    Some(&url),
+                    &[],
+                    &BTreeMap::new(),
+                    &request,
+                    &tx,
+                    true,
+                    Some(&sessions),
+                )
+                .await
+            }
+        };
+
+        call(request_with(&[("one", MessageRole::User)]))
+            .await
+            .unwrap();
+        call(request_with(&[
+            ("one", MessageRole::User),
+            ("answer-1", MessageRole::Assistant),
+            ("two", MessageRole::User),
+        ]))
+        .await
+        .unwrap();
+        let requests = state.ws_requests.lock().await.clone();
+        assert_eq!(state.connections.load(Ordering::SeqCst), 1);
+        assert!(requests[0].1["response"]
+            .get("previous_response_id")
+            .is_none());
+        assert_eq!(requests[1].1["response"]["previous_response_id"], "resp-1");
+        assert_eq!(
+            requests[1].1["response"]["input"].as_array().unwrap().len(),
+            1
+        );
+
+        // A non-prefix request is a full create, but the healthy transport is retained.
+        call(request_with(&[("changed", MessageRole::User)]))
+            .await
+            .unwrap();
+        let requests = state.ws_requests.lock().await.clone();
+        assert!(requests[2].1["response"]
+            .get("previous_response_id")
+            .is_none());
+        assert_eq!(state.connections.load(Ordering::SeqCst), 1);
+
+        // A cache-relevant property change also sends a full create on the same
+        // live connection rather than applying stale continuation metadata.
+        let mut property_changed = request_with(&[("changed", MessageRole::User)]);
+        property_changed.max_tokens = Some(42);
+        call(property_changed).await.unwrap();
+        let requests = state.ws_requests.lock().await.clone();
+        assert!(requests[3].1["response"]
+            .get("previous_response_id")
+            .is_none());
+        assert_eq!(state.connections.load(Ordering::SeqCst), 1);
+
+        // A failed socket may have produced speculative deltas internally. Exactly
+        // one HTTP fallback occurs and only the fallback chunk becomes public.
+        call(request_with(&[("ws-fail", MessageRole::User)]))
+            .await
+            .unwrap();
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
+        let chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(!chunks
+            .iter()
+            .any(|c| matches!(c, super::super::TokenChunk::Text(t) if t == "speculative")));
+
+        // Reconnect after failure, but a terminal model error is returned as-is
+        // rather than changing semantics by replaying it over HTTP.
+        let err = call(request_with(&[("terminal", MessageRole::User)]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, crate::LlmErrorKind::ContextWindowExceeded);
+        assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+    }
+
+    fn ws_session(
+        prefix: Vec<serde_json::Value>,
+        compatibility: serde_json::Value,
+    ) -> CodexWsSession {
+        CodexWsSession {
+            response_id: Some("resp-1".into()),
+            compatibility: Some(compatibility),
+            prefix,
+            ..CodexWsSession::default()
+        }
+    }
+
+    #[test]
+    fn websocket_continuation_requires_exact_prefix_including_server_output() {
+        let compatibility = serde_json::json!({"model":"gpt-5.6","stream":true});
+        let prefix = vec![
+            serde_json::json!({"type":"message","role":"user","content":"one"}),
+            serde_json::json!({"type":"message","role":"assistant","content":"two"}),
+        ];
+        let old = ws_session(prefix.clone(), compatibility.clone());
+        let mut next = prefix;
+        next.push(serde_json::json!({"type":"message","role":"user","content":"three"}));
+        assert_eq!(
+            continuation_suffix(&old, &compatibility, &next),
+            Some(("resp-1".into(), vec![next[2].clone()]))
+        );
+        next[1]["content"] = serde_json::json!("changed output");
+        assert!(continuation_suffix(&old, &compatibility, &next).is_none());
+    }
+
+    #[test]
+    fn websocket_continuation_resets_on_non_prefix_or_property_change() {
+        let compatibility = serde_json::json!({"model":"gpt-5.6","stream":true});
+        let old = ws_session(vec![serde_json::json!("a")], compatibility.clone());
+        assert!(continuation_suffix(&old, &compatibility, &[serde_json::json!("x")]).is_none());
+        assert!(continuation_suffix(
+            &old,
+            &serde_json::json!({"model":"gpt-5.6-x","stream":true}),
+            &[serde_json::json!("a"), serde_json::json!("b")]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn websocket_server_output_canonicalizes_to_next_request_input_shape() {
+        let output = vec![
+            serde_json::json!({"type":"message","content":[{"type":"output_text","text":"answer"}]}),
+        ];
+        assert_eq!(
+            canonical_server_output(output),
+            vec![serde_json::json!({"type":"message","role":"assistant","content":"answer"})]
+        );
+    }
 
     fn empty_request() -> LlmRequest {
         LlmRequest {

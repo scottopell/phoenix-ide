@@ -9,7 +9,7 @@ use super::{
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 
 /// Empty placeholder used when no tags should be forwarded — keeps the
 /// provider-call signatures uniform without allocating per request.
@@ -44,6 +44,9 @@ pub struct LlmServiceImpl {
     /// `codex login` against a different account during the session reaches
     /// the wire instead of being pinned at registry build time.
     pub codex_credential: Option<Arc<CodexCredential>>,
+    /// WebSocket continuation is shared by all calls through this service and
+    /// isolated by the caller's prompt-cache cohort.
+    pub(crate) codex_ws_sessions: Arc<Mutex<openai::CodexWsSessions>>,
 }
 
 impl LlmServiceImpl {
@@ -66,6 +69,7 @@ impl LlmServiceImpl {
             request_tags,
             use_codex_backend: false,
             codex_credential: None,
+            codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
         }
     }
 
@@ -90,6 +94,7 @@ impl LlmServiceImpl {
             request_tags: BTreeMap::new(),
             use_codex_backend: true,
             codex_credential: Some(codex_credential),
+            codex_ws_sessions: Arc::new(Mutex::new(openai::CodexWsSessions::default())),
         }
     }
 
@@ -292,6 +297,7 @@ impl LlmServiceImpl {
                     request,
                     chunk_tx,
                     self.use_codex_backend,
+                    Some(&self.codex_ws_sessions),
                 )
                 .await
             }

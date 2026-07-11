@@ -66,6 +66,7 @@ enum ResponsesEndpointSource { base_url_override | provider_default }
 -- non-terminal state. `done` is reached by response.completed; `failed`
 -- by an `error` event, response.failed, or response.incomplete.
 enum ResponsesStreamStatus { accumulating | done | failed }
+enum CodexWebSocketDisposition { full | incremental | http_fallback }
 
 -- Where a translated wire content part sits. Both surfaces draw from the
 -- same accepted-discriminant set — that shared set is exactly what the
@@ -193,6 +194,22 @@ entity CodexResponsesLiteRequest {
     compatibility_header: Boolean
 }
 
+-- A continuation snapshot is isolated by PromptCacheKey in the shared model
+-- service. `prefix` contains every prior client input item followed by the
+-- exact output items returned by the server.
+entity CodexWebSocketSession {
+    cache_key: String
+    response_id: String
+    compatibility_fingerprint: String
+    prefix: String
+}
+
+entity CodexWebSocketAttempt {
+    disposition: CodexWebSocketDisposition
+    emitted_before_success: Boolean
+    beta_header: String
+}
+
 ------------------------------------------------------------
 -- Rules — endpoint resolution
 ------------------------------------------------------------
@@ -214,6 +231,57 @@ rule ResponsesEndpointResolved {
 ------------------------------------------------------------
 -- Rules — request translation
 ------------------------------------------------------------
+
+rule CodexWebSocketContinuationSelected {
+    when: SendCodexResponses(model, cache_key, request)
+
+    requires: starts_with(model, "gpt-5.6")
+
+    ensures:
+        if CodexWebSocketSession.exists(
+            cache_key: cache_key,
+            compatibility_fingerprint: fingerprint_without_input(request),
+            prefix: strict_prefix_of(request.input)
+        ):
+            CodexWebSocketAttempt.created(
+                disposition: incremental,
+                emitted_before_success: false,
+                beta_header: "responses_websockets=2026-02-06"
+            )
+        else:
+            CodexWebSocketAttempt.created(
+                disposition: full,
+                emitted_before_success: false,
+                beta_header: "responses_websockets=2026-02-06"
+            )
+
+    @guidance
+        -- The incremental response.create carries only the input suffix and
+        -- previous_response_id. The fingerprint is the exact serialized request
+        -- with input removed, so model, instructions/tools/tool choice, reasoning,
+        -- store/stream/include, service tier, cache key, text controls, tags, and
+        -- every future non-input field participate automatically. A successful
+        -- terminal event replaces the session prefix with full input plus exact
+        -- server output. Auth/model/property/compaction or non-prefix changes do
+        -- not reuse the old response id.
+}
+
+rule CodexWebSocketFailureFallsBackOnce {
+    when: CodexWebSocketAttemptFails(cache_key)
+
+    ensures:
+        CodexWebSocketSession.deleted(cache_key: cache_key)
+        CodexWebSocketAttempt.created(
+            disposition: http_fallback,
+            emitted_before_success: false,
+            beta_header: "responses_websockets=2026-02-06"
+        )
+
+    @guidance
+        -- WebSocket token chunks remain private until response.completed.
+        -- Failure discards them and issues exactly one full HTTP/SSE request,
+        -- preventing both omitted history and duplicate public token emission.
+}
 
 rule CodexResponsesLitePrefixTranslated {
     when: TranslateCodexResponsesRequest(model, request)
