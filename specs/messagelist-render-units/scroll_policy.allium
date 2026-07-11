@@ -10,7 +10,7 @@ config {
 }
 
 enum Lifecycle { unmeasured measured_empty mount_rescue live }
-enum FollowMode { following reading returning_to_tail }
+enum FollowMode { following reading navigating returning_to_tail }
 enum GestureMode { idle touch_stationary touch_moved }
 enum EffectKind {
     snap_to_last_index
@@ -48,9 +48,13 @@ entity ScrollPolicy {
 
     transitions follow_mode {
         following -> reading
+        following -> navigating
         following -> returning_to_tail
         reading -> following
+        reading -> navigating
         reading -> returning_to_tail
+        navigating -> reading
+        navigating -> returning_to_tail
         returning_to_tail -> following
         returning_to_tail -> reading
     }
@@ -165,18 +169,28 @@ rule InteractionPermanentlyExitsMountRescue {
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
 
-rule NavigationFromLiveTakesReadingOwnership {
+rule NavigationFromLiveTakesDurableOwnership {
     when: NavigationJumped(policy)
     requires: policy.lifecycle = live
-    ensures: policy.follow_mode = reading
+    ensures: policy.follow_mode = navigating
 }
 
 rule NavigationExitsMountRescueIntoReading {
     when: NavigationJumped(policy)
     requires: policy.lifecycle = mount_rescue
     ensures: policy.lifecycle = live
-    ensures: policy.follow_mode = reading
+    ensures: policy.follow_mode = navigating
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
+}
+
+rule NavigationOwnershipSurvivesBottomConfirmation {
+    when: ViewportPinnedChanged(policy, true)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: policy.gesture_mode = idle
+    ensures: policy.follow_mode = navigating
+    ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
+    ensures: not ScrollEffect.created(policy: policy, kind: schedule_tail_follow)
 }
 
 rule ReadingOwnershipSurvivesDownwardGeometryChanges {

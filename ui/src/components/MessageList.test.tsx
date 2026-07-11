@@ -432,11 +432,11 @@ describe('MessageList', () => {
       const secondMessage = container.querySelector<HTMLElement>('[data-render-unit-key="msg-2"] .message')!;
 
       act(() => listRef.current?.scrollToUnitIndex(0));
-      expect(virtuosoMock.scrollToIndex).toHaveBeenLastCalledWith({ index: 0, align: 'center', behavior: 'auto' });
+      expect(virtuosoMock.scrollToIndex).toHaveBeenLastCalledWith({ index: 0, align: 'start', behavior: 'auto' });
       expect(firstMessage).toHaveClass('jump-highlight');
 
       act(() => listRef.current?.scrollToUnitIndex(1));
-      expect(virtuosoMock.scrollToIndex).toHaveBeenLastCalledWith({ index: 1, align: 'center', behavior: 'auto' });
+      expect(virtuosoMock.scrollToIndex).toHaveBeenLastCalledWith({ index: 1, align: 'start', behavior: 'auto' });
       expect(virtuosoMock.scrollToIndex).toHaveBeenCalledTimes(2);
       expect(firstMessage).not.toHaveClass('jump-highlight');
       expect(secondMessage).toHaveClass('jump-highlight');

@@ -659,7 +659,7 @@ function MessageListImpl({
     pendingPulseRef.current = { conversationId, key: unit.key };
     virtuosoRef.current?.scrollToIndex({
       index: unitIndex,
-      align: 'center',
+      align: 'start',
       behavior: 'auto',
     });
     pulseIfMounted(unit.key);

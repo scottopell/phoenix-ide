@@ -45,7 +45,7 @@ function reading(): Extract<ScrollMachineState, { kind: 'live' }> {
 
 const effectTypes = (effects: ScrollEffect[]) => effects.map((effect) => effect.type);
 
-function expectLiveMode(state: ScrollMachineState, mode: 'following' | 'reading' | 'returning-to-tail') {
+function expectLiveMode(state: ScrollMachineState, mode: 'following' | 'reading' | 'navigating' | 'returning-to-tail') {
   expect(state.kind).toBe('live');
   if (state.kind === 'live') expect(state.follow.kind).toBe(mode);
 }
@@ -194,7 +194,7 @@ describe('scrollMachine durable follow policy', () => {
     const mounted = measured();
     const result = reduceScrollMachine(mounted.state, { type: 'navigationJumped' });
 
-    expectLiveMode(result.state, 'reading');
+    expectLiveMode(result.state, 'navigating');
     expect(result.effects).toEqual([{ type: 'stopSettleWatch' }]);
     expect(reduceScrollMachine(result.state, {
       type: 'settleProbe',
@@ -209,7 +209,11 @@ describe('scrollMachine durable follow policy', () => {
       type: 'downwardMovement',
       snapshot: snap(1_000, 250, 400),
     });
-    expectLiveMode(result.state, 'reading');
+    expectLiveMode(result.state, 'navigating');
+    expect(result.effects).toEqual([]);
+
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'navigating');
     expect(result.effects).toEqual([]);
 
     result = reduceScrollMachine(result.state, {
@@ -219,7 +223,7 @@ describe('scrollMachine durable follow policy', () => {
       snapshot: snap(1_200, 250, 400),
       tailActivity: 'active',
     });
-    expectLiveMode(result.state, 'reading');
+    expectLiveMode(result.state, 'navigating');
     expect(result.effects).toEqual([{ type: 'showUnread' }]);
   });
 
@@ -445,7 +449,9 @@ describe('scrollMachine reachable-history properties', () => {
 
   it('never returns reading ownership merely because more events or time pass', () => {
     const nonReleaseArb = commandArb.filter((event) =>
-      event.type !== 'viewportPinnedChanged' && event.type !== 'jumpToNewestRequested',
+      event.type !== 'viewportPinnedChanged' &&
+      event.type !== 'jumpToNewestRequested' &&
+      event.type !== 'navigationJumped',
     );
     fc.assert(
       fc.property(fc.array(nonReleaseArb, { maxLength: 100 }), (events) => {
