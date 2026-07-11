@@ -971,13 +971,15 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
 async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResourcesSnapshot {
     let current_pid = sysinfo::get_current_pid().ok().map(sysinfo::Pid::as_u32);
     let api_pids = current_pid.into_iter().collect::<BTreeSet<_>>();
-    let bash_pids = match state {
+    let bash_pid_snapshot = match state {
         Some(state) => snapshot_bash_pids(state).await,
-        None => BTreeSet::new(),
+        None => BashPidSnapshot::Available(BTreeSet::new()),
     };
 
     let mut all_pids = api_pids.clone();
-    all_pids.extend(bash_pids.iter().copied());
+    if let BashPidSnapshot::Available(bash_pids) = &bash_pid_snapshot {
+        all_pids.extend(bash_pids.iter().copied());
+    }
 
     let (host, observed_rows) = tokio::join!(
         sample_host_resources(),
@@ -999,12 +1001,8 @@ async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResource
     ));
 
     if let Some(state) = state {
-        categories.push(build_category_from_observations(
-            ManagedResourceCategoryKind::Bash,
-            "Bash",
-            ManagedResourceAttribution::Available,
-            None,
-            &bash_pids,
+        categories.push(build_bash_category(
+            &bash_pid_snapshot,
             &observed_rows_by_pid,
         ));
 
@@ -1035,12 +1033,8 @@ async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResource
             },
         ));
     } else {
-        categories.push(build_category_from_observations(
-            ManagedResourceCategoryKind::Bash,
-            "Bash",
-            ManagedResourceAttribution::Available,
-            None,
-            &bash_pids,
+        categories.push(build_bash_category(
+            &bash_pid_snapshot,
             &observed_rows_by_pid,
         ));
         categories.push(unavailable_category(
@@ -1069,7 +1063,13 @@ async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResource
     }
 }
 
-async fn snapshot_bash_pids(state: &AppState) -> BTreeSet<u32> {
+#[derive(Debug, PartialEq, Eq)]
+enum BashPidSnapshot {
+    Available(BTreeSet<u32>),
+    Unavailable,
+}
+
+async fn snapshot_bash_pids(state: &AppState) -> BashPidSnapshot {
     let pgids = state
         .runtime
         .bash_handles()
@@ -1077,10 +1077,31 @@ async fn snapshot_bash_pids(state: &AppState) -> BTreeSet<u32> {
         .await
         .into_iter()
         .collect::<BTreeSet<_>>();
-    group_member_pids_for_sampling(&pgids)
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
+    match group_member_pids_for_sampling(&pgids) {
+        Some(member_pids) => BashPidSnapshot::Available(member_pids.into_iter().collect()),
+        None => BashPidSnapshot::Unavailable,
+    }
+}
+
+fn build_bash_category(
+    snapshot: &BashPidSnapshot,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
+) -> ManagedResourceCategory {
+    match snapshot {
+        BashPidSnapshot::Available(pids) => build_category_from_observations(
+            ManagedResourceCategoryKind::Bash,
+            "Bash",
+            ManagedResourceAttribution::Available,
+            None,
+            pids,
+            observed_rows_by_pid,
+        ),
+        BashPidSnapshot::Unavailable => unavailable_category(
+            ManagedResourceCategoryKind::Bash,
+            "Bash",
+            "live bash process groups exist, but native process enumeration failed",
+        ),
+    }
 }
 
 #[derive(Default)]
@@ -1700,6 +1721,22 @@ mod tests {
         // complete (including its CPU-sample window) without panicking.
         assert!(usage.system_total_memory_bytes.is_some());
         assert!(usage.system_available_memory_bytes.is_some());
+    }
+
+    #[test]
+    fn unavailable_bash_snapshot_preserves_capability_failure() {
+        let category = build_bash_category(&BashPidSnapshot::Unavailable, &BTreeMap::new());
+
+        assert_eq!(
+            category.attribution,
+            ManagedResourceAttribution::Unavailable
+        );
+        assert!(category.reason.is_some());
+        assert!(category.processes.is_empty());
+        assert_eq!(category.totals.cpu_percent, None);
+        assert_eq!(category.totals.memory_bytes, None);
+        assert_eq!(category.totals.process_count, 0);
+        assert_eq!(category.totals.deduplicated_pid_count, 0);
     }
 
     #[test]
