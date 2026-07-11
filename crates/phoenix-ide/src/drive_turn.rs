@@ -152,11 +152,13 @@ async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClien
 pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurnError> {
     let cwd = request.validate()?;
     install_crypto_provider();
+    crate::tools::bash::install_reaper();
 
     let started = std::time::Instant::now();
     let runtime_env = Arc::new(PhoenixRuntimeEnvironment::detect());
     extract_builtin_skills(&runtime_env);
     let (db, database_result) = open_database(&request.database, &runtime_env).await?;
+    crate::reconcile_project_main_refs(&db).await;
 
     let llm_config = LlmConfig::from_env(runtime_env);
     let credential_helper = llm_config.credential_helper.clone();
@@ -213,6 +215,7 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         started,
     )
     .await;
+    manager.browser_sessions().shutdown_all().await;
     crate::tools::bash::shutdown_kill_tree(manager.bash_handles()).await;
     result
 }

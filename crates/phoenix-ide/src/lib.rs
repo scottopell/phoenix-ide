@@ -1162,7 +1162,7 @@ fn local_branch_exists(repo_path: &std::path::Path, branch: &str) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-async fn reconcile_project_main_refs(db: &Database) {
+pub(crate) async fn reconcile_project_main_refs(db: &Database) {
     let projects = match db.list_projects().await {
         Ok(projects) => projects,
         Err(e) => {
