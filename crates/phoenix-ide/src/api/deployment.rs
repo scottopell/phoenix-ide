@@ -959,7 +959,7 @@ async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResource
     let mut all_pids = BTreeSet::new();
     let mut categories = Vec::new();
 
-    let current_pid = sysinfo::get_current_pid().ok().map(|pid| pid.as_u32());
+    let current_pid = sysinfo::get_current_pid().ok().map(sysinfo::Pid::as_u32);
     let api_pids = current_pid.into_iter().collect::<BTreeSet<_>>();
     all_pids.extend(api_pids.iter().copied());
     categories.push(
@@ -1155,9 +1155,10 @@ async fn sample_pid_set(kind: ManagedResourceCategoryKind, pids: &BTreeSet<u32>)
         let sys_pid = Pid::from_u32(*pid);
         let process = sys.process(sys_pid);
         rows.push(ManagedProcessRow {
-            name: process
-                .map(|p| p.name().to_string_lossy().into_owned())
-                .unwrap_or_else(|| format!("pid {pid}")),
+            name: process.map_or_else(
+                || format!("pid {pid}"),
+                |p| p.name().to_string_lossy().into_owned(),
+            ),
             category: kind,
             pid: *pid,
             cpu_percent: None,
