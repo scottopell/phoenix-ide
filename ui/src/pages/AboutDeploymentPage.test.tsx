@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { AboutResourcesSnapshot } from '../generated/AboutResourcesSnapshot';
@@ -203,14 +203,11 @@ describe('AboutDeploymentPage disk usage health', () => {
     apiMock.deploymentResources.mockReset();
     apiMock.cleanupManagedWorktree.mockReset();
     apiMock.revealPath.mockReset();
-    vi.useFakeTimers();
-    vi.setConfig({ testTimeout: 15_000 });
     Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'visible' });
   });
 
   afterEach(() => {
     vi.clearAllTimers();
-    vi.resetConfig();
     vi.useRealTimers();
     vi.clearAllMocks();
   });
@@ -226,9 +223,6 @@ describe('AboutDeploymentPage disk usage health', () => {
       ],
     }));
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(50);
-    });
     const summary = await screen.findByLabelText('Disk usage health');
     expect(within(summary).getByText('Largest measured')).toBeInTheDocument();
     expect(within(summary).getByText('2.0 KiB')).toBeInTheDocument();
@@ -241,9 +235,6 @@ describe('AboutDeploymentPage disk usage health', () => {
 
   it('renders the live resource monitor with unavailable category reasons and process rows', async () => {
     renderPage(deployment());
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(50);
-    });
 
     expect(await screen.findByText('Host mostly idle')).toBeInTheDocument();
     expect(screen.getByText('Phoenix managed')).toBeInTheDocument();
@@ -255,6 +246,7 @@ describe('AboutDeploymentPage disk usage health', () => {
   });
 
   it('polls only while visible, avoids overlap, and keeps the last good sample stale on error', async () => {
+    vi.useFakeTimers();
     let resolveFirst: ((value: AboutResourcesSnapshot) => void) | undefined;
     apiMock.deploymentInfo.mockResolvedValue(deployment());
     apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
@@ -274,12 +266,18 @@ describe('AboutDeploymentPage disk usage health', () => {
 
     const firstResolve = resolveFirst;
     if (!firstResolve) throw new Error('expected first resource request to be pending');
-    firstResolve(resourcesSnapshot());
-    await waitFor(() => expect(screen.getByText('Host mostly idle')).toBeInTheDocument());
+    await act(async () => {
+      firstResolve(resourcesSnapshot());
+      await Promise.resolve();
+    });
+    expect(screen.getByText('Host mostly idle')).toBeInTheDocument();
 
-    await vi.advanceTimersByTimeAsync(1_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.resolve();
+    });
     expect(apiMock.deploymentResources).toHaveBeenCalledTimes(2);
-    await waitFor(() => expect(screen.getByText(/Live data stale — backend unavailable/)).toBeInTheDocument());
+    expect(screen.getByText(/Live data stale — backend unavailable/)).toBeInTheDocument();
     expect(screen.getByText(/Resource sample captured/)).toHaveTextContent('stale');
 
     Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'hidden' });
@@ -289,8 +287,11 @@ describe('AboutDeploymentPage disk usage health', () => {
 
     Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'visible' });
     apiMock.deploymentResources.mockResolvedValueOnce(resourcesSnapshot({ sampled_at: '2026-06-01T00:00:10Z' }));
-    document.dispatchEvent(new Event('visibilitychange'));
-    await waitFor(() => expect(apiMock.deploymentResources).toHaveBeenCalledTimes(3));
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+    });
+    expect(apiMock.deploymentResources).toHaveBeenCalledTimes(3);
   });
 
   it('highlights managed worktrees when they are the largest measured category', async () => {
@@ -301,9 +302,6 @@ describe('AboutDeploymentPage disk usage health', () => {
       ],
     }));
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(50);
-    });
     expect(await screen.findByText('Phoenix-managed worktrees are the largest measured disk category.')).toBeInTheDocument();
     expect(screen.getByText('Phoenix-managed worktrees').closest('tr')).toHaveClass('deploy-table__row--largest');
   });
@@ -331,9 +329,6 @@ describe('AboutDeploymentPage disk usage health', () => {
       ],
     }));
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(50);
-    });
     fireEvent.click(await screen.findByText('Show worktrees'));
 
     expect(screen.getByText(/Live: Live task/)).toBeInTheDocument();
