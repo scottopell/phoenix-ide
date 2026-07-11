@@ -179,6 +179,16 @@ rule NavigationExitsMountRescueIntoReading {
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
 
+rule ReadingOwnershipSurvivesDownwardGeometryChanges {
+    when: DownwardMovement(policy, snapshot)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = reading
+    ensures: policy.follow_mode = reading
+    ensures: policy.last_scroll_top = snapshot.scroll_top
+    ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
+    ensures: not ScrollEffect.created(policy: policy, kind: schedule_tail_follow)
+}
+
 rule UpwardIntentFromLiveTakesReadingOwnership {
     when: UpwardIntent(policy)
     requires: policy.lifecycle = live

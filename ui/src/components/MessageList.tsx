@@ -36,7 +36,6 @@ import {
   type ScrollSnapshot,
   type TailActivity,
 } from '../conversation/scrollMachine';
-import { ensureTargetTopVisible } from './jumpScroll';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -599,97 +598,66 @@ function MessageListImpl({
     dispatchScrollEvent({ type: 'jumpToNewestRequested', unitCount: allUnitsLengthRef.current });
   }, [dispatchScrollEvent]);
 
-  // Conversation-nav jump + post-mount pulse. The target row is usually
-  // unmounted at click time (react-virtuoso), so we can't add the highlight
-  // class synchronously for a near-viewport target.
-  // We stash the target unit's render-unit key and apply the pulse once the
-  // row exists, after the scroll settles. `data-render-unit-key` is stamped on
-  // every virtuoso row wrapper (see `itemContent`).
+  // A navigation jump has one positioning owner: Virtuoso. The selected key
+  // remains pending until its virtualized row mounts, at which point the row
+  // ref applies presentation-only highlighting without moving the scroller.
   const pendingPulseKeyRef = useRef<string | null>(null);
-  const activeJumpKeyRef = useRef<string | null>(null);
+  const highlightedTargetRef = useRef<Element | null>(null);
   const jumpedTargetMessageIdRef = useRef<string | null>(null);
-  const jumpRetryTimersRef = useRef<number[]>([]);
-  const pulseTimersRef = useRef<number[]>([]);
+  const pulseTimerRef = useRef(0);
 
-  const clearJumpRetryTimers = useCallback(() => {
-    jumpRetryTimersRef.current.forEach((t) => clearTimeout(t));
-    jumpRetryTimersRef.current.length = 0;
-  }, []);
-
-  const findRowByKey = useCallback((key: string): Element | null => {
-    const scroller = scrollerRef.current;
-    if (!scroller) return null;
-    // CSS.escape may be absent (or throw on a pathological key) in some
-    // environments; guard it so a missing escape degrades to "no pulse"
-    // rather than throwing out of the timer callback (matches FileTree).
-    try {
-      return scroller.querySelector(`[data-render-unit-key="${CSS.escape(key)}"]`);
-    } catch {
-      return null;
+  const clearHighlight = useCallback(() => {
+    if (pulseTimerRef.current !== 0) {
+      clearTimeout(pulseTimerRef.current);
+      pulseTimerRef.current = 0;
     }
+    highlightedTargetRef.current?.classList.remove('jump-highlight');
+    highlightedTargetRef.current = null;
   }, []);
 
-  const correctPendingJumpOffset = useCallback((key: string) => {
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-    const row = findRowByKey(key);
-    const target = row?.querySelector('.message') ?? row;
-    if (target) ensureTargetTopVisible(target, scroller);
-  }, [findRowByKey]);
-
-  const applyPendingPulse = useCallback(() => {
-    const key = pendingPulseKeyRef.current;
-    if (key === null) return;
-    const row = findRowByKey(key);
-    // The pulse styling lives on `.message`; fall back to the row wrapper if a
-    // unit kind renders without a `.message` element (skill/system don't, but
-    // chapters only target user/agent units which do).
-    const target = row?.querySelector('.message') ?? row;
-    if (!target) return;
+  const pulseMountedRow = useCallback((key: string, row: HTMLDivElement | null) => {
+    if (row === null || pendingPulseKeyRef.current !== key) return;
     pendingPulseKeyRef.current = null;
+    clearHighlight();
+    const target = row.querySelector('.message') ?? row;
+    highlightedTargetRef.current = target;
     target.classList.add('jump-highlight');
-    const t = window.setTimeout(() => {
+    pulseTimerRef.current = window.setTimeout(() => {
       target.classList.remove('jump-highlight');
+      if (highlightedTargetRef.current === target) highlightedTargetRef.current = null;
+      pulseTimerRef.current = 0;
     }, 1500);
-    pulseTimersRef.current.push(t);
-  }, [findRowByKey]);
+  }, [clearHighlight]);
+
+  useEffect(() => () => {
+    pendingPulseKeyRef.current = null;
+    clearHighlight();
+  }, [clearHighlight]);
 
   useEffect(() => {
-    const pulseTimers = pulseTimersRef.current;
-    const jumpRetryTimers = jumpRetryTimersRef.current;
-    return () => {
-      pulseTimers.forEach((t) => clearTimeout(t));
-      jumpRetryTimers.forEach((t) => clearTimeout(t));
-    };
-  }, []);
+    pendingPulseKeyRef.current = null;
+    clearHighlight();
+  }, [conversationId, clearHighlight]);
+
+  const pulseIfMounted = useCallback((key: string) => {
+    const row = Array.from(scrollerRef.current?.querySelectorAll<HTMLDivElement>('[data-render-unit-key]') ?? [])
+      .find((candidate) => candidate.dataset['renderUnitKey'] === key);
+    if (row) pulseMountedRow(key, row);
+  }, [pulseMountedRow]);
 
   const scrollToUnitIndex = useCallback((unitIndex: number) => {
     const unit = historicalUnits[unitIndex];
     if (!unit) return;
-    // A nav jump is user engagement even though it never touches the
-    // scroller: without this, a pre-engagement height delta would snap the
-    // viewport back to the bottom and clobber the jump.
     dispatchScrollEvent({ type: 'navigationJumped' });
-    clearJumpRetryTimers();
-    activeJumpKeyRef.current = unit.key;
+    clearHighlight();
     pendingPulseKeyRef.current = unit.key;
     virtuosoRef.current?.scrollToIndex({
       index: unitIndex,
       align: 'center',
-      behavior: 'smooth',
+      behavior: 'auto',
     });
-    // The row mounts during the smooth scroll; querying immediately would miss
-    // it. Retry as the scroll progresses so the pulse lands even on a long jump
-    // and the final mounted position is nudged below the nav strip if needed.
-    [120, 320, 600].forEach((delay) => {
-      const t = window.setTimeout(() => {
-        if (activeJumpKeyRef.current !== unit.key) return;
-        correctPendingJumpOffset(unit.key);
-        applyPendingPulse();
-      }, delay);
-      jumpRetryTimersRef.current.push(t);
-    });
-  }, [historicalUnits, clearJumpRetryTimers, correctPendingJumpOffset, applyPendingPulse, dispatchScrollEvent]);
+    pulseIfMounted(unit.key);
+  }, [historicalUnits, clearHighlight, dispatchScrollEvent, pulseIfMounted]);
 
   const findUnitIndexByMessageId = useCallback((messageId: string) => {
     return historicalUnits.findIndex((unit) => {
@@ -745,11 +713,15 @@ function MessageListImpl({
 
   const itemContent = useCallback(
     (_index: number, unit: RenderUnit) => (
-      <div className="virtuoso-row" data-render-unit-key={unit.key}>
+      <div
+        className="virtuoso-row"
+        data-render-unit-key={unit.key}
+        ref={(row) => pulseMountedRow(unit.key, row)}
+      >
         {renderUnit(unit, slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, unit.kind === 'agent_turn' && unit.key === latestAgentKey)}
       </div>
     ),
-    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey],
+    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering, workScopeKey, activeToolUseId, latestAgentKey, pulseMountedRow],
   );
 
   const computeItemKey = useCallback(

@@ -203,6 +203,26 @@ describe('scrollMachine durable follow policy', () => {
     }).effects).toEqual([]);
   });
 
+  it('navigation ownership survives movement and later height growth without a tail snap', () => {
+    let result = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' });
+    result = reduceScrollMachine(result.state, {
+      type: 'downwardMovement',
+      snapshot: snap(1_000, 250, 400),
+    });
+    expectLiveMode(result.state, 'reading');
+    expect(result.effects).toEqual([]);
+
+    result = reduceScrollMachine(result.state, {
+      type: 'heightChanged',
+      totalHeight: 1_200,
+      unitCount: 5,
+      snapshot: snap(1_200, 250, 400),
+      tailActivity: 'active',
+    });
+    expectLiveMode(result.state, 'reading');
+    expect(result.effects).toEqual([{ type: 'showUnread' }]);
+  });
+
   it('tail advance while following requests one live follow action', () => {
     const result = reduceScrollMachine(liveFollowing(), { type: 'tailContentAdvanced' });
     expect(result.effects).toEqual([{ type: 'scheduleTailFollow', conversationId: 'conv' }]);

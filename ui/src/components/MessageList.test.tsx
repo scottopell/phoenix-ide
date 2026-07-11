@@ -404,7 +404,7 @@ describe('MessageList', () => {
     expect(container.querySelectorAll('[data-render-unit-key]').length).toBe(100);
   });
 
-  it('ignores stale chapter jump offset retries after a newer jump', () => {
+  it('uses one Virtuoso-owned position command per chapter jump without delayed DOM correction', () => {
     vi.useFakeTimers();
     try {
       const historical = Array.from({ length: 2 }, (_, i) => makeMessage(i + 1, 'user'));
@@ -425,60 +425,22 @@ describe('MessageList', () => {
 
       const scroller = container.querySelector<HTMLElement>('#messages')!;
       scroller.scrollTop = 100;
-      scroller.getBoundingClientRect = () => ({
-        left: 0,
-        right: 800,
-        top: 36,
-        bottom: 600,
-        width: 800,
-        height: 564,
-        x: 0,
-        y: 36,
-        toJSON: () => ({}),
-      } as DOMRect);
-      const firstRow = container.querySelector<HTMLElement>('[data-render-unit-key="msg-1"]')!;
-      firstRow.getBoundingClientRect = () => ({
-        left: 0,
-        right: 800,
-        top: 20 + (100 - scroller.scrollTop),
-        bottom: 80 + (100 - scroller.scrollTop),
-        width: 800,
-        height: 60,
-        x: 0,
-        y: 20 + (100 - scroller.scrollTop),
-        toJSON: () => ({}),
-      } as DOMRect);
-      firstRow.querySelector<HTMLElement>('.message')!.getBoundingClientRect = firstRow.getBoundingClientRect;
-      const secondRow = container.querySelector<HTMLElement>('[data-render-unit-key="msg-2"]')!;
-      secondRow.getBoundingClientRect = () => ({
-        left: 0,
-        right: 800,
-        top: 25 + (100 - scroller.scrollTop),
-        bottom: 85 + (100 - scroller.scrollTop),
-        width: 800,
-        height: 60,
-        x: 0,
-        y: 25 + (100 - scroller.scrollTop),
-        toJSON: () => ({}),
-      } as DOMRect);
-      secondRow.querySelector<HTMLElement>('.message')!.getBoundingClientRect = secondRow.getBoundingClientRect;
+      const firstMessage = container.querySelector<HTMLElement>('[data-render-unit-key="msg-1"] .message')!;
+      const secondMessage = container.querySelector<HTMLElement>('[data-render-unit-key="msg-2"] .message')!;
 
-      act(() => {
-        listRef.current?.scrollToUnitIndex(0);
-      });
-      act(() => {
-        vi.advanceTimersByTime(60);
-      });
-      act(() => {
-        listRef.current?.scrollToUnitIndex(1);
-      });
-      act(() => {
-        vi.advanceTimersByTime(601);
-      });
+      act(() => listRef.current?.scrollToUnitIndex(0));
+      expect(virtuosoMock.scrollToIndex).toHaveBeenLastCalledWith({ index: 0, align: 'center', behavior: 'auto' });
+      expect(firstMessage).toHaveClass('jump-highlight');
 
-      expect(scroller.scrollTop).toBe(81);
-      expect(firstRow.querySelector('.message')).not.toHaveClass('jump-highlight');
-      expect(secondRow.querySelector('.message')).toHaveClass('jump-highlight');
+      act(() => listRef.current?.scrollToUnitIndex(1));
+      expect(virtuosoMock.scrollToIndex).toHaveBeenLastCalledWith({ index: 1, align: 'center', behavior: 'auto' });
+      expect(virtuosoMock.scrollToIndex).toHaveBeenCalledTimes(2);
+      expect(firstMessage).not.toHaveClass('jump-highlight');
+      expect(secondMessage).toHaveClass('jump-highlight');
+
+      act(() => vi.advanceTimersByTime(601));
+      expect(scroller.scrollTop).toBe(100);
+      expect(virtuosoMock.scrollToIndex).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }

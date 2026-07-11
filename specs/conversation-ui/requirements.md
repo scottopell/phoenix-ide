@@ -493,8 +493,13 @@ AND render each chapter as a type-styled pill distinguishing a user prompt from 
 AND label each pill with the truncated prompt or the first line of the prose
 
 WHEN a chapter pill is clicked
-THE SYSTEM SHALL scroll the message list to that chapter's message, including when the target is outside the rendered window
-AND briefly highlight the message once it is in view
+THE SYSTEM SHALL issue one virtualizer-owned positioning command to that chapter's message, including when the target is outside the rendered window
+AND SHALL give the reader durable scroll ownership so later tail growth does not displace the selected chapter
+AND SHALL briefly highlight the selected message once its row is rendered
+AND SHALL NOT use delayed DOM scroll-position corrections to land or highlight the target
+
+WHEN another chapter pill is clicked before the prior selected row is rendered
+THE SYSTEM SHALL make the newest selection authoritative for both positioning and highlighting
 
 WHILE the user scrolls the conversation
 THE SYSTEM SHALL highlight the chapter currently in view (scroll-spy)
