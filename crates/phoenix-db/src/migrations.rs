@@ -1394,10 +1394,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Every version except the stamped 29 must run: 1–28 below the stamp
-        // and 30–34 above it.
+        // Every version except the stamped 29 must run.
         let applied = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(applied, 33);
+        assert_eq!(applied as usize, MIGRATIONS.len() - 1);
 
         // Migration 005's effects must be present.
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")

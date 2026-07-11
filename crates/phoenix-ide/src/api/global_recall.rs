@@ -571,6 +571,8 @@ fn is_closed_runtime_state(state: &ConvState) -> bool {
         state,
         ConvState::Completed { .. }
             | ConvState::Failed { .. }
+            | ConvState::CreationFailed { .. }
+            | ConvState::CreationCancelled { .. }
             | ConvState::HandedOff { .. }
             | ConvState::Terminal
     )
@@ -1917,6 +1919,22 @@ mod tests {
             result: "done".to_string(),
         };
         direct.updated_at = now;
+        assert!(!is_open_work_candidate(&direct, None, now));
+    }
+
+    #[test]
+    fn failed_and_cancelled_creation_are_not_open_work() {
+        let now = Utc::now();
+        let mut direct = conversation("direct");
+        direct.state = ConvState::CreationFailed {
+            job_id: "job-1".to_string(),
+            error: "setup failed".to_string(),
+            error_kind: phoenix_core::domain::db_schema::ErrorKind::ServerError,
+        };
+        assert!(!is_open_work_candidate(&direct, None, now));
+        direct.state = ConvState::CreationCancelled {
+            job_id: "job-1".to_string(),
+        };
         assert!(!is_open_work_candidate(&direct, None, now));
     }
 

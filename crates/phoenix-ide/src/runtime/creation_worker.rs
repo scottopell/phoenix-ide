@@ -1121,13 +1121,10 @@ mod missing_resource_cleanup_tests {
 
     #[test]
     fn missing_repository_and_resource_are_already_reconciled() {
-        let root = std::env::temp_dir().join(format!(
-            "phoenix-missing-creation-resource-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = tempfile::tempdir().unwrap();
         assert!(missing_repository_and_resource(
-            &root.join("repo"),
-            &root.join("worktree")
+            &root.path().join("repo"),
+            &root.path().join("worktree")
         ));
     }
 

@@ -4139,48 +4139,66 @@ async fn regenerate_conversation_name(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationResponse>, AppError> {
-    let first_text = state
+    let opening = state
         .runtime
         .db()
         .first_opening_message_text(&id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| {
-            AppError::BadRequest("No opening message available to summarize".to_string())
+            tracing::debug!(
+                conv_id = %id,
+                "conversation regenerate-name: no opening message; leaving slug unchanged"
+            );
+            AppError::Internal(
+                "cannot regenerate conversation name: no opening message to summarize".to_string(),
+            )
         })?;
-    let title = if let Some(cheap_model) = state.llm_registry.get_cheap_model() {
-        crate::title_generator::generate_title(&first_text, cheap_model)
-            .await
-            .unwrap_or_else(|| title_from_text(&first_text))
-    } else {
-        title_from_text(&first_text)
-    };
-    let mut slug = slugify_label(&title);
-    if slug.is_empty() {
-        slug = generate_slug();
-    }
+
+    let cheap_model = state.llm_registry.get_cheap_model().ok_or_else(|| {
+        AppError::Internal("no cheap LLM model is available for name regeneration".to_string())
+    })?;
+
+    let generated = crate::title_generator::generate_title(&opening, cheap_model)
+        .await
+        .filter(|slug| !slug.is_empty())
+        .ok_or_else(|| {
+            AppError::Internal(
+                "conversation name regeneration failed — the existing name is unchanged"
+                    .to_string(),
+            )
+        })?;
+
+    rename_conversation_slug(&state, &id, &generated).await?;
+    conversation_response(&state, &id).await
+}
+
+async fn rename_conversation_slug(state: &AppState, id: &str, slug: &str) -> Result<(), AppError> {
     state
         .runtime
         .db()
-        .update_conversation_creation_metadata(
-            &id,
-            &crate::db::ConversationCreationMetadataUpdate {
-                slug: Some(slug),
-                title: Some(Some(title)),
-                cwd: None,
-                project_id: None,
-                desired_base_branch: None,
-            },
-        )
+        .rename_conversation(id, slug)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(|e| match e {
+            crate::db::DbError::SlugExists(_) => {
+                AppError::BadRequest("Slug already exists".to_string())
+            }
+            crate::db::DbError::ConversationNotFound(_) => AppError::NotFound(e.to_string()),
+            _ => AppError::Internal(e.to_string()),
+        })
+}
+
+async fn conversation_response(
+    state: &AppState,
+    id: &str,
+) -> Result<Json<ConversationResponse>, AppError> {
     let conversation = state
         .runtime
         .db()
-        .get_conversation(&id)
+        .get_conversation(id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let conversation = enrich_conversation_with_seed(&state, &conversation, true).await?;
+
     Ok(Json(ConversationResponse {
         conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
     }))

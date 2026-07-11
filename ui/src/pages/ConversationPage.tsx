@@ -233,6 +233,7 @@ function ConversationPageContent() {
 
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
+  const [deletingConversation, setDeletingConversation] = useState(false);
 
   // File explorer context (shared with desktop panel) — a projection of the
   // unified viewer slot below.
@@ -381,6 +382,7 @@ function ConversationPageContent() {
     setLastSlug(slug);
     // useState resets — React batches these into the same render.
     setError(null);
+    setDeletingConversation(false);
     setShowFileBrowser(false);
     setImages([]);
     setFiles([]);
@@ -1333,6 +1335,19 @@ function ConversationPageContent() {
     }
     navigate('/new');
   }, [creationFailedDraft, navigate]);
+  const handleDeleteProvisioningConversation = useCallback(async () => {
+    if (!conversationId || deletingConversation) return;
+    setDeletingConversation(true);
+    try {
+      await api.deleteConversation(conversationId);
+      await cacheDB.deleteConversation(conversationId);
+      clearCreateIntent(conversationId);
+      navigate('/');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to delete conversation');
+      setDeletingConversation(false);
+    }
+  }, [conversationId, deletingConversation, navigate]);
 
   useEffect(() => {
     if (convStateForChildren.type === 'provisioning') return;
