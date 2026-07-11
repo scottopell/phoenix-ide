@@ -210,7 +210,10 @@ async fn process_job(
             let handle = manager.get_or_create(&conv_id).await?;
             handle
                 .event_tx
-                .send(Event::CreationRequestResume)
+                .send(Event::CreationRequestResume {
+                    job_id: job.id.clone(),
+                    claim: claim.clone(),
+                })
                 .await
                 .map_err(|error| format!("failed to resume creation request: {error}"))?;
             return Ok(());
@@ -785,6 +788,8 @@ async fn provision_conversation(
         )
     })?;
     let event = Event::CreationProvisioned {
+        job_id: job.id.clone(),
+        claim: claim.clone(),
         initial_message: phoenix_core::domain::sm_event::SteerEntry {
             text: display_text,
             llm_text,

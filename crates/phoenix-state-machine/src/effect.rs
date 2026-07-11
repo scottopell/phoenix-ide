@@ -114,6 +114,12 @@ pub enum Effect {
     /// Make an LLM request
     RequestLlm,
 
+    /// Complete an initial-turn creation using the authority that enqueued it.
+    CompleteCreation {
+        job_id: String,
+        claim: phoenix_core::domain::creation_protocol::CreationClaim,
+    },
+
     /// Execute a tool (spawns as background task)
     ExecuteTool { tool: ToolCall },
 

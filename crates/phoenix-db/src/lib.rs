@@ -3162,28 +3162,6 @@ impl Database {
         Ok(CreationCasOutcome::Applied)
     }
 
-    /// Mark the creation job for a conversation complete after state leaves provisioning.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError`] if the lookup or completion update fails.
-    pub async fn mark_conversation_creation_job_complete_for_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> DbResult<()> {
-        if let Some(job) = self
-            .get_conversation_creation_job_for_conversation(conversation_id)
-            .await?
-        {
-            if let CreationStatus::Claimed(claim) = &job.protocol.status {
-                let _ = self
-                    .complete_conversation_creation_job(&job.id, claim, Utc::now())
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
     /// Update conversation state, stamping `state_updated_at = now()`.
     /// Callers that own the authoritative entry timestamp (the runtime
     /// executor) should use [`Self::update_conversation_state_at`] so the

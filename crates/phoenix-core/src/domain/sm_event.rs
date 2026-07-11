@@ -48,9 +48,14 @@ pub enum Event {
     /// Internal first-turn event accepted only while the shell is provisioning.
     CreationProvisioned {
         initial_message: SteerEntry,
+        job_id: String,
+        claim: super::creation_protocol::CreationClaim,
     },
     /// Internal crash-recovery event for an initial request persisted before dispatch.
-    CreationRequestResume,
+    CreationRequestResume {
+        job_id: String,
+        claim: super::creation_protocol::CreationClaim,
+    },
     UserCancel {
         /// Why the cancel was issued. `None` means user-initiated or parent-propagated.
         reason: Option<String>,
@@ -246,7 +251,7 @@ impl Event {
         match self {
             Event::UserMessage { .. } => "UserMessage",
             Event::CreationProvisioned { .. } => "CreationProvisioned",
-            Event::CreationRequestResume => "CreationRequestResume",
+            Event::CreationRequestResume { .. } => "CreationRequestResume",
             Event::UserCancel { .. } => "UserCancel",
             Event::LlmResponse { .. } => "LlmResponse",
             Event::LlmError { .. } => "LlmError",
@@ -463,7 +468,7 @@ impl TryFrom<Event> for ParentEvent {
                 event_variant: "CreationProvisioned",
                 target_type: "ParentEvent",
             }),
-            Event::CreationRequestResume => Err(EventConversionError {
+            Event::CreationRequestResume { .. } => Err(EventConversionError {
                 event_variant: "CreationRequestResume",
                 target_type: "ParentEvent",
             }),
@@ -620,7 +625,7 @@ impl TryFrom<Event> for SubAgentEvent {
                 event_variant: "CreationProvisioned",
                 target_type: "SubAgentEvent",
             }),
-            Event::CreationRequestResume => Err(EventConversionError {
+            Event::CreationRequestResume { .. } => Err(EventConversionError {
                 event_variant: "CreationRequestResume",
                 target_type: "SubAgentEvent",
             }),

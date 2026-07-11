@@ -82,12 +82,13 @@ pub trait MessageStore: Send + Sync {
     /// recovery (re-drain after partial steering-queue drain).
     async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
 
-    /// Mark a pending async creation job complete after the conversation state leaves provisioning.
-    async fn mark_creation_job_complete_for_conversation(
+    /// Complete an async creation job using the authority that enqueued the initial turn.
+    async fn complete_creation_job(
         &self,
-        _conversation_id: &str,
-    ) -> Result<(), String> {
-        Ok(())
+        _job_id: &str,
+        _claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+    ) -> Result<crate::db::CreationCasOutcome, String> {
+        Ok(crate::db::CreationCasOutcome::ClaimLost)
     }
 
     /// Update `display_data` for an existing message
@@ -362,13 +363,12 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         (**self).message_exists(message_id).await
     }
 
-    async fn mark_creation_job_complete_for_conversation(
+    async fn complete_creation_job(
         &self,
-        conversation_id: &str,
-    ) -> Result<(), String> {
-        (**self)
-            .mark_creation_job_complete_for_conversation(conversation_id)
-            .await
+        job_id: &str,
+        claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+    ) -> Result<crate::db::CreationCasOutcome, String> {
+        (**self).complete_creation_job(job_id, claim).await
     }
 
     async fn update_message_display_data(
@@ -662,12 +662,13 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
-    async fn mark_creation_job_complete_for_conversation(
+    async fn complete_creation_job(
         &self,
-        conversation_id: &str,
-    ) -> Result<(), String> {
+        job_id: &str,
+        claim: &phoenix_core::domain::creation_protocol::CreationClaim,
+    ) -> Result<crate::db::CreationCasOutcome, String> {
         self.db
-            .mark_conversation_creation_job_complete_for_conversation(conversation_id)
+            .complete_conversation_creation_job(job_id, claim, chrono::Utc::now())
             .await
             .map_err(|e| e.to_string())
     }

@@ -3788,16 +3788,19 @@ where
 
             Effect::PersistState => self.persist_state_effect(true).await,
 
-            Effect::RequestLlm => {
-                let generated_event = self.dispatch_llm_request().await?;
-                if let Err(error) = self
-                    .storage
-                    .mark_creation_job_complete_for_conversation(&self.context.conversation_id)
-                    .await
-                {
-                    tracing::warn!(conv_id = %self.context.conversation_id, %error, "failed to mark creation job complete after LLM dispatch");
+            Effect::RequestLlm => self.dispatch_llm_request().await,
+
+            Effect::CompleteCreation { job_id, claim } => {
+                match self.storage.complete_creation_job(&job_id, &claim).await {
+                    Ok(crate::db::CreationCasOutcome::Applied) => {}
+                    Ok(crate::db::CreationCasOutcome::ClaimLost) => {
+                        tracing::debug!(conv_id = %self.context.conversation_id, %job_id, generation = claim.generation, "creation completion rejected after authority loss");
+                    }
+                    Err(error) => {
+                        tracing::warn!(conv_id = %self.context.conversation_id, %job_id, %error, "failed to mark creation job complete after LLM dispatch");
+                    }
                 }
-                Ok(generated_event)
+                Ok(None)
             }
 
             Effect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,
