@@ -719,14 +719,16 @@ export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, r
     }
   }, [refreshKey, items, childItems, expandedPaths, loadChildren]);
 
-  // Auto-load children for already-expanded paths when switching conversations
+  // Auto-load children for restored expanded paths. The request registry
+  // deduplicates in-flight loads without making request completion an effect
+  // trigger; a failed load therefore waits for explicit user action to retry.
   useEffect(() => {
     for (const path of expandedPaths) {
-      if (!childItems.has(path) && !loadingPaths.has(path)) {
+      if (!childItems.has(path) && !childRequestsRef.current.has(path)) {
         void loadChildren(path);
       }
     }
-  }, [expandedPaths, childItems, loadingPaths, loadChildren]);
+  }, [expandedPaths, childItems, loadChildren]);
 
   // Toggle folder expansion
   const toggleExpand = useCallback((path: string) => {

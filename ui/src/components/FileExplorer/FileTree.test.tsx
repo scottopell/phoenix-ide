@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, cleanup, fireEvent, act } from '@testing-library/react';
 import { FileTree } from './FileTree';
 import { computeAncestors, isUnderRoot } from './computeAncestors';
 
@@ -251,6 +251,42 @@ describe('FileTree — reveal active file', () => {
     } finally {
       FS['/proj/ui'] = originalUiItems;
     }
+  });
+
+  it('does not automatically retry a failed expanded directory load', async () => {
+    const fetchMock = vi.mocked(fetch);
+    let uiRequestCount = 0;
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const path = new URL(String(url), 'http://localhost').searchParams.get('path') || '';
+      if (path === '/proj/ui') {
+        uiRequestCount += 1;
+        if (uiRequestCount === 1) throw new Error('permission denied');
+      }
+      return { ok: true, json: async () => ({ items: FS[path] ?? [] }) } as Response;
+    });
+
+    render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={vi.fn()}
+        conversationId="conv-test-failed-load"
+      />,
+    );
+
+    const uiRow = (await screen.findByText('ui')).closest('.ft-item')!;
+    fireEvent.click(uiRow);
+    await waitFor(() => expect(uiRequestCount).toBe(1));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(uiRequestCount).toBe(1);
+
+    fireEvent.click(uiRow);
+    fireEvent.click(uiRow);
+    await waitFor(() => expect(uiRequestCount).toBe(2));
+    expect(await screen.findByText('src')).toBeInTheDocument();
   });
 
   it('does not refresh expanded descendants hidden beneath a collapsed directory', async () => {
