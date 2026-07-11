@@ -1219,8 +1219,29 @@ pub(crate) fn read_pr_auto_fix_context_artifact(
     let body = std::fs::read_to_string(path).map_err(|e| {
         PrMonitorError::Internal(format!("Failed to read PR context artifact: {e}"))
     })?;
-    serde_json::from_str(&body)
+    let mut value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        PrMonitorError::Internal(format!("Failed to parse PR context artifact: {e}"))
+    })?;
+    remove_legacy_reaction_coverage(&mut value);
+    serde_json::from_value(value)
         .map_err(|e| PrMonitorError::Internal(format!("Failed to parse PR context artifact: {e}")))
+}
+
+fn remove_legacy_reaction_coverage(value: &mut serde_json::Value) {
+    let Some(coverage) = value
+        .pointer_mut("/feedback/coverage")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    coverage.retain(|entry| {
+        !matches!(
+            entry.get("surface").and_then(serde_json::Value::as_str),
+            Some(
+                "issue_comment_reactions" | "review_comment_reactions" | "review_summary_reactions"
+            )
+        )
+    });
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2623,8 +2644,8 @@ mod tests {
     }
 
     #[test]
-    fn artifact_deserialization_defaults_reaction_status_for_legacy_contexts() {
-        let artifact: PrAutoFixContextArtifact = serde_json::from_value(serde_json::json!({
+    fn artifact_deserialization_normalizes_legacy_reaction_coverage() {
+        let value = serde_json::json!({
             "manifest_version": ARTIFACT_VERSION,
             "fetched_at": "now",
             "pr": {
@@ -2660,12 +2681,29 @@ mod tests {
                     "author": "u",
                     "body": "todo"
                 }],
-                "coverage": []
+                "coverage": [
+                    { "surface": "issue_comments", "status": "fetched" },
+                    { "surface": "issue_comment_reactions", "status": "fetched" },
+                    { "surface": "review_comment_reactions", "status": "unavailable" },
+                    { "surface": "review_summary_reactions", "status": "fetched" }
+                ]
             }
-        }))
-        .expect("legacy manifest-version-1 artifact should remain readable");
+        });
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("legacy-context.json");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let artifact = read_pr_auto_fix_context_artifact(&path)
+            .expect("legacy manifest-version-1 artifact should remain readable");
 
         assert_eq!(artifact.feedback.feedback_status, None);
+        assert_eq!(
+            artifact.feedback.coverage,
+            vec![PrFeedbackCoverage {
+                surface: PrFeedbackCoverageSurface::IssueComments,
+                status: PrFeedbackCoverageStatus::Fetched,
+                detail: None,
+            }]
+        );
         assert_eq!(
             artifact.baseline().feedback_identities,
             vec!["IssueComment:1".to_string()]

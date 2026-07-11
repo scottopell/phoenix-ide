@@ -515,16 +515,8 @@ async fn pr_status_response_for_missing_worktree(
 fn effective_feedback_status_for_cache(
     previous: Option<PrFeedbackStatus>,
     fetched: PrFeedbackStatus,
-    degraded: bool,
 ) -> (Option<PrFeedbackStatus>, bool) {
-    let preserve_previous = degraded
-        && fetched == PrFeedbackStatus::Open
-        && previous.is_some_and(|status| status != PrFeedbackStatus::Open);
-    if preserve_previous {
-        (previous, false)
-    } else {
-        (Some(fetched), true)
-    }
+    (Some(fetched), previous != Some(fetched))
 }
 
 pub(crate) async fn get_conversation_pr_status(
@@ -670,7 +662,6 @@ async fn attach_pr_feedback_freshness(
                         effective_feedback_status_for_cache(
                             previous_feedback_status,
                             fetched_status,
-                            coverage_health.is_some(),
                         );
                     response.feedback_status = effective_feedback_status;
                     if should_update_cache {
@@ -993,34 +984,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn degraded_open_feedback_preserves_previous_non_open_cache_status() {
-        assert_eq!(
-            effective_feedback_status_for_cache(
-                Some(PrFeedbackStatus::Approved),
-                PrFeedbackStatus::Open,
-                true,
-            ),
-            (Some(PrFeedbackStatus::Approved), false)
-        );
+    fn successful_root_status_clears_stale_cache_independent_of_feedback_coverage() {
         assert_eq!(
             effective_feedback_status_for_cache(
                 Some(PrFeedbackStatus::InProgress),
                 PrFeedbackStatus::Open,
-                true,
             ),
-            (Some(PrFeedbackStatus::InProgress), false)
+            (Some(PrFeedbackStatus::Open), true)
         );
     }
 
     #[test]
-    fn complete_open_feedback_updates_cache_status() {
+    fn unchanged_root_status_skips_cache_write() {
         assert_eq!(
             effective_feedback_status_for_cache(
                 Some(PrFeedbackStatus::Approved),
-                PrFeedbackStatus::Open,
-                false,
+                PrFeedbackStatus::Approved,
             ),
-            (Some(PrFeedbackStatus::Open), true)
+            (Some(PrFeedbackStatus::Approved), false)
         );
     }
 
