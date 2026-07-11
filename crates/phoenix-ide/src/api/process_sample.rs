@@ -446,7 +446,7 @@ fn proc_start_time(pid: u32) -> Option<u64> {
         )
     };
     if rc == size {
-        Some(info.pbi_start_tvsec as u64)
+        Some(info.pbi_start_tvsec)
     } else {
         None
     }
