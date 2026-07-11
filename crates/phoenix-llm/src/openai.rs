@@ -641,16 +641,16 @@ fn translate_to_responses_request(
             let content = if image_blocks.is_empty() {
                 ResponsesApiMessageContent::Text(text_blocks.join("\n"))
             } else {
-                let mut parts: Vec<ResponsesApiContentPart> = text_blocks
+                let mut parts: Vec<ResponsesApiMessagePart> = text_blocks
                     .iter()
-                    .map(|t| ResponsesApiContentPart::InputText {
+                    .map(|t| ResponsesApiMessagePart::InputText {
                         text: (*t).to_string(),
                         prompt_cache_breakpoint: None,
                     })
                     .collect();
                 for source in &image_blocks {
                     let ImageSource::Base64 { media_type, data } = source;
-                    parts.push(ResponsesApiContentPart::InputImage {
+                    parts.push(ResponsesApiMessagePart::InputImage {
                         image_url: format!("data:{media_type};base64,{data}"),
                         prompt_cache_breakpoint: None,
                     });
@@ -691,15 +691,11 @@ fn translate_to_responses_request(
                 let output = if images.is_empty() {
                     ResponsesApiFunctionOutput::Text(text)
                 } else {
-                    let mut parts = vec![ResponsesApiContentPart::InputText {
-                        text,
-                        prompt_cache_breakpoint: None,
-                    }];
+                    let mut parts = vec![ResponsesApiFunctionOutputPart::InputText { text }];
                     for img in images {
                         let ImageSource::Base64 { media_type, data } = img;
-                        parts.push(ResponsesApiContentPart::InputImage {
+                        parts.push(ResponsesApiFunctionOutputPart::InputImage {
                             image_url: format!("data:{media_type};base64,{data}"),
-                            prompt_cache_breakpoint: None,
                         });
                     }
                     ResponsesApiFunctionOutput::Parts(parts)
@@ -731,7 +727,7 @@ fn translate_to_responses_request(
 
     let explicit_cache_supported = !use_codex_backend && supports_explicit_prompt_cache(api_name);
     if explicit_cache_supported {
-        place_explicit_cache_breakpoints(&mut input_items, 3);
+        place_explicit_cache_breakpoints(&mut input_items);
     }
 
     let has_tools = !request.tools.is_empty();
@@ -782,21 +778,22 @@ fn supports_explicit_prompt_cache(api_name: &str) -> bool {
     api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-")
 }
 
-/// Mark the latest eligible message blocks. In implicit mode the service's
-/// latest-message marker consumes one of four write slots, leaving three for
-/// explicit markers. Function-call outputs are separate typed variants and
-/// therefore cannot accidentally receive an unsupported marker.
-fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem], limit: usize) {
-    let mut remaining = limit;
-    for item in items.iter_mut().rev() {
-        if remaining == 0 {
-            break;
-        }
-        let ResponsesApiInputItem::Message { content, .. } = item else {
-            continue;
-        };
+/// Preserve `OpenAI`'s historical read boundaries while leaving the latest
+/// message to implicit mode. The service considers the latest 50 explicit
+/// markers for reads and decides which newest markers consume its write slots.
+fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
+    const READ_BREAKPOINT_LIMIT: usize = 50;
+
+    let mut messages = items.iter_mut().filter_map(|item| match item {
+        ResponsesApiInputItem::Message { content, .. } => Some(content),
+        ResponsesApiInputItem::FunctionCall { .. }
+        | ResponsesApiInputItem::FunctionCallOutput { .. } => None,
+    });
+    let Some(_implicit_latest_message) = messages.next_back() else {
+        return;
+    };
+    for content in messages.rev().take(READ_BREAKPOINT_LIMIT) {
         content.mark_last_block();
-        remaining -= 1;
     }
 }
 
@@ -1116,14 +1113,14 @@ pub(crate) enum ResponsesApiInputItem {
 #[serde(untagged)]
 pub(crate) enum ResponsesApiMessageContent {
     Text(String),
-    Parts(Vec<ResponsesApiContentPart>),
+    Parts(Vec<ResponsesApiMessagePart>),
 }
 
 impl ResponsesApiMessageContent {
     fn mark_last_block(&mut self) {
         match self {
             Self::Text(text) => {
-                *self = Self::Parts(vec![ResponsesApiContentPart::InputText {
+                *self = Self::Parts(vec![ResponsesApiMessagePart::InputText {
                     text: std::mem::take(text),
                     prompt_cache_breakpoint: Some(PromptCacheBreakpoint::explicit()),
                 }]);
@@ -1139,7 +1136,7 @@ impl ResponsesApiMessageContent {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ResponsesApiContentPart {
+pub(crate) enum ResponsesApiMessagePart {
     InputText {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1152,7 +1149,7 @@ pub(crate) enum ResponsesApiContentPart {
     }, // "data:{media_type};base64,{data}"
 }
 
-impl ResponsesApiContentPart {
+impl ResponsesApiMessagePart {
     fn set_breakpoint(&mut self) {
         match self {
             Self::InputText {
@@ -1171,12 +1168,21 @@ impl ResponsesApiContentPart {
 ///
 /// The Responses API treats a `function_call_output` payload as model *input*,
 /// so its content parts use the same `input_text`/`input_image` discriminants as
-/// `ResponsesApiContentPart` — not `text`/`image_url`, which the API rejects.
+/// `ResponsesApiFunctionOutputPart` — not `text`/`image_url`, which the API
+/// rejects. This surface-specific type intentionally cannot represent a cache
+/// breakpoint, which `OpenAI` rejects on function-call outputs.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum ResponsesApiFunctionOutput {
     Text(String),
-    Parts(Vec<ResponsesApiContentPart>),
+    Parts(Vec<ResponsesApiFunctionOutputPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ResponsesApiFunctionOutputPart {
+    InputText { text: String },
+    InputImage { image_url: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -1820,7 +1826,18 @@ mod tests {
         assert_eq!(wire["prompt_cache_options"]["mode"], "implicit");
         assert_eq!(wire["prompt_cache_options"]["ttl"], "30m");
         let serialized = serde_json::to_string(&wire).unwrap();
-        assert_eq!(serialized.matches("prompt_cache_breakpoint").count(), 3);
+        assert_eq!(serialized.matches("prompt_cache_breakpoint").count(), 4);
+        let messages: Vec<_> = wire["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "message")
+            .collect();
+        assert!(!messages
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("prompt_cache_breakpoint"));
         let output = wire["input"].as_array().unwrap().last().unwrap();
         assert_eq!(output["type"], "function_call_output");
         assert!(output.get("prompt_cache_breakpoint").is_none());
@@ -1833,6 +1850,32 @@ mod tests {
             assert!(legacy.get("prompt_cache_options").is_none());
             assert!(!legacy.to_string().contains("prompt_cache_breakpoint"));
         }
+    }
+
+    #[test]
+    fn explicit_cache_breakpoints_preserve_fifty_read_boundaries() {
+        let mut request = empty_request();
+        for i in 0..55 {
+            request.messages.push(LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text(format!("stable-{i}"))],
+            });
+        }
+
+        let wire = serde_json::to_value(translate_to_responses_request("gpt-5.6", &request, false))
+            .unwrap();
+        let input = wire["input"].as_array().unwrap();
+        assert_eq!(
+            wire.to_string().matches("prompt_cache_breakpoint").count(),
+            50
+        );
+        assert!(!input
+            .last()
+            .unwrap()
+            .to_string()
+            .contains("prompt_cache_breakpoint"));
+        assert!(!input[3].to_string().contains("prompt_cache_breakpoint"));
+        assert!(input[4].to_string().contains("prompt_cache_breakpoint"));
     }
 
     /// A gateway that omits `input_tokens_details` must not panic or shift

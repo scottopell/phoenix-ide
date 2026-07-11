@@ -275,18 +275,19 @@ rule ResponsesExplicitCacheBreakpointsPlaced {
     requires: uses_codex_backend = false
 
     ensures: ResponsesCachePolicyEmitted(mode: "implicit", ttl: "30m")
-    ensures: ResponsesCacheBreakpoints.count <= 3
+    ensures: ResponsesCacheBreakpoints.count <= 50
     ensures:
         for breakpoint in ResponsesCacheBreakpoints:
             breakpoint.wire_type in { "input_text", "input_image", "input_file" }
             breakpoint.explicit = true
 
     @guidance
-        -- In implicit mode OpenAI reserves one of four new-write slots for its
-        -- latest-message marker, so Phoenix marks at most the latest three
-        -- eligible message content blocks. The translator never traverses
-        -- function_call_output items when placing markers. GPT-5.5-era and
-        -- Codex bridge requests omit both prompt_cache_options and markers.
+        -- Implicit mode owns the latest-message boundary, so Phoenix skips
+        -- that message and preserves explicit markers on up to the latest 50
+        -- earlier message boundaries considered for reads. OpenAI decides
+        -- which newest boundaries consume its four write slots. The translator
+        -- never traverses function_call_output items when placing markers.
+        -- GPT-5.5-era and Codex bridge requests omit the policy and markers.
 }
 
 -- Capability gap. An Anthropic server-handled block has no Responses API
@@ -679,10 +680,8 @@ invariant ResponsesEmitsOnlyInputParts {
         part.wire_type in { "input_text", "input_image" }
 }
 
--- The "no parallel representations" guarantee. A part on the
--- function_call_output surface obeys the same discriminant rule as one
--- on the message_content surface — they cannot diverge the way they did
--- before the 2026-05 fix merged the two part types into one.
+-- Surface-specific Rust types make cache breakpoints unrepresentable on
+-- function_call_output while both types obey the same discriminant contract.
 invariant ResponsesPartContractSurfaceIndependent {
     for part in ResponsesWireContentParts:
         (part.surface = function_call_output) implies
@@ -698,14 +697,13 @@ invariant ResponsesDroppedBlockAlwaysLogged {
         dropped.logged = true
 }
 
--- The cached-token count is a subset of the raw input-token count. This
--- is the OpenAI guarantee that makes the cached-token de-duplication in
--- ResponsesResponseNormalized (saturating_sub of cached out of input)
--- never underflow, so the four llm/Usage buckets sum to OpenAI's own
--- input+output total rather than double-counting the cache.
-invariant ResponsesCachedSubsetOfInput {
+-- The combined cache-read and cache-write detail buckets are subsets of
+-- the raw input-token count. This guarantees normalization never underflows
+-- and the four llm/Usage buckets sum to OpenAI's input+output total.
+invariant ResponsesCacheDetailsSubsetOfInput {
     for stream in ResponsesStreams:
-        stream.status = done implies stream.cached_tokens <= stream.input_tokens
+        stream.status = done implies
+            stream.cached_tokens + stream.cache_write_tokens <= stream.input_tokens
 }
 
 ------------------------------------------------------------

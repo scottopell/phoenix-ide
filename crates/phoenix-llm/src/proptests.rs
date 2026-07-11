@@ -10,8 +10,8 @@
 
 use super::anthropic::{self, AnthropicContentBlock, AnthropicResponse, AnthropicUsage};
 use super::openai::{
-    self, ResponsesApiContentPart, ResponsesApiFunctionOutput, ResponsesApiInputItem,
-    ResponsesApiMessageContent,
+    self, ResponsesApiFunctionOutput, ResponsesApiFunctionOutputPart, ResponsesApiInputItem,
+    ResponsesApiMessageContent, ResponsesApiMessagePart,
 };
 use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, MessageRole, ToolReference,
@@ -377,7 +377,7 @@ proptest! {
             if let ResponsesApiMessageContent::Parts(parts) = content {
                 let expected_url = format!("data:{media_type};base64,{data}");
                 let has_image = parts.iter().any(|p| {
-                    matches!(p, ResponsesApiContentPart::InputImage { image_url, .. }
+                    matches!(p, ResponsesApiMessagePart::InputImage { image_url, .. }
                         if image_url == &expected_url)
                 });
                 prop_assert!(has_image, "Parts must contain InputImage with correct data URL");
@@ -453,11 +453,11 @@ proptest! {
             if let ResponsesApiFunctionOutput::Parts(parts) = output {
                 prop_assert_eq!(parts.len(), 1 + n_images, "Expected 1 text + {} image parts", n_images);
                 prop_assert!(
-                    matches!(&parts[0], ResponsesApiContentPart::InputText { .. }),
+                    matches!(&parts[0], ResponsesApiFunctionOutputPart::InputText { .. }),
                     "Parts[0] must be InputText"
                 );
                 for (i, expected_url) in expected_urls.iter().enumerate() {
-                    if let ResponsesApiContentPart::InputImage { image_url, .. } = &parts[1 + i] {
+                    if let ResponsesApiFunctionOutputPart::InputImage { image_url } = &parts[1 + i] {
                         prop_assert_eq!(
                             image_url, expected_url,
                             "InputImage data URL mismatch at index {}", i
