@@ -4,22 +4,22 @@
 
 use super::handlers::AppError;
 use super::types::{
-    ActivePrIdentityResponse, ActivePrSelectionMutationResponse, ActivePrSelectionProvenanceResponse,
-    ActivePrSelectionResponse, AssociatedPrStatusEnvelope, AssociatedPrSummaryResponse,
-    ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
-    ObservedBranchSummaryResponse, PinAssociatedPrRequest, PrAutoFixContextResponse,
-    PrFeedbackStatus, PrStatusResponse, PrUnavailableReason, WorkChangeNeedsReviewReason,
-    WorkChangeSummary,
+    ActivePrIdentityResponse, ActivePrSelectionMutationResponse,
+    ActivePrSelectionProvenanceResponse, ActivePrSelectionResponse, AssociatedPrStatusEnvelope,
+    AssociatedPrSummaryResponse, ConversationDiffResponse, GitBranchEntry, GitBranchesQuery,
+    GitBranchesResponse, ObservedBranchSummaryResponse, PinAssociatedPrRequest,
+    PrAutoFixContextResponse, PrFeedbackStatus, PrStatusResponse, PrUnavailableReason,
+    WorkChangeNeedsReviewReason, WorkChangeSummary,
 };
 use super::AppState;
 use crate::db::ConvMode;
 use crate::git_ops::{capture_branch_diff, run_git};
 
+use axum::http::StatusCode;
 use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use axum::http::StatusCode;
 use std::fmt::Write as _;
 use std::path::{Path as FsPath, PathBuf};
 
@@ -72,7 +72,9 @@ fn active_pr_selection_response(
     }
 }
 
-fn associated_pr_summary_response(pr: crate::db::WorkScopePrAssociation) -> AssociatedPrSummaryResponse {
+fn associated_pr_summary_response(
+    pr: crate::db::WorkScopePrAssociation,
+) -> AssociatedPrSummaryResponse {
     AssociatedPrSummaryResponse {
         repo_owner: pr.repo_owner,
         repo_name: pr.repo_name,
@@ -620,14 +622,15 @@ async fn pr_status_response_for_missing_worktree(
     work_scope: &crate::work_scope::WorkScope,
 ) -> Result<PrStatusResponse, AppError> {
     let attempted_at = chrono::Utc::now().to_rfc3339();
-    let mut response = match active_selection_target_for_scope(state.runtime.db(), work_scope).await? {
-        Some(pr) => crate::api::pr_monitoring::stale_response(
-            pr,
-            PrUnavailableReason::NotGitRepo,
-            attempted_at,
-        ),
-        None => PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
-    };
+    let mut response =
+        match active_selection_target_for_scope(state.runtime.db(), work_scope).await? {
+            Some(pr) => crate::api::pr_monitoring::stale_response(
+                pr,
+                PrUnavailableReason::NotGitRepo,
+                attempted_at,
+            ),
+            None => PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo),
+        };
     response.work_change = WorkChangeSummary::Unavailable {
         reason: "worktree path is not a directory".to_string(),
     };
@@ -720,9 +723,14 @@ pub(crate) async fn get_conversation_pr_status(
         if refresh.response.refresh.state != crate::api::types::PrRefreshState::Fresh {
             stale_primary_response_with_work_change(&active_pr, refresh)
         } else if refresh.response.number != Some(active_pr.pr_number) {
-            crate::api::pr_monitoring::persisted_primary_response(&active_pr, refresh.response.refresh, true)
+            crate::api::pr_monitoring::persisted_primary_response(
+                &active_pr,
+                refresh.response.refresh,
+                true,
+            )
         } else {
-            attach_pr_feedback_freshness(refresh.response, &db, &work_scope, &cwd, &active_pr).await?
+            attach_pr_feedback_freshness(refresh.response, &db, &work_scope, &cwd, &active_pr)
+                .await?
         }
     } else {
         refresh.response
@@ -750,7 +758,8 @@ async fn attach_pr_feedback_freshness(
         return Ok(response);
     };
 
-    let previous_feedback_status = (active_pr.pr_number == pr_number).then_some(active_pr.feedback_status);
+    let previous_feedback_status =
+        (active_pr.pr_number == pr_number).then_some(active_pr.feedback_status);
 
     let baseline = db
         .work_scope_pr_feedback_baseline(work_scope, pr_number)
