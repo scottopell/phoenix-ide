@@ -2,9 +2,9 @@
 
 ## Current Reality
 
-`drive-turn` is a separate workspace binary that drives one user turn without starting HTTP, SSE, TLS, or UI services. The `phoenix-ide` package exposes its existing server modules as a library; both the server binary and `phoenix-drive-turn` link that same library. The driver constructs the production `RuntimeManager`, provider registry, database adapter, MCP manager, built-in tool registry, state machine, and continuation loop, then observes the runtime's authoritative state watch until a typed stable outcome.
+`drive-turn` is a separate workspace binary that drives one user turn without starting HTTP, SSE, TLS, or UI services. The `phoenix-ide` package exposes its existing server modules as a library; both the server binary and `phoenix-drive-turn` link that same library. The driver constructs the production `RuntimeManager`, provider registry, database adapter, MCP manager, built-in tool registry, state machine, and continuation loop, then observes the runtime's authoritative state watch until a typed stable outcome is also visible in persistence.
 
-The CLI supports transient in-memory SQLite, retained unique temporary-file SQLite, and an explicit retained database path. Successful output is one JSON object containing raw persisted messages and run metadata. A timed-out turn is cancelled through the production cancellation event and must reach a stable state before the driver returns.
+The CLI supports transient in-memory SQLite, retained unique temporary-file SQLite, and an explicit retained database path. Successful output is one JSON object containing raw persisted messages and run metadata. A timed-out turn is cancelled through the production cancellation event and must reach a persisted stable state before the driver returns. Awaiting external recovery is reported as a stable outcome. Every return path tears down conversation-owned tmux, browser, and bash resources.
 
 ## Usage
 

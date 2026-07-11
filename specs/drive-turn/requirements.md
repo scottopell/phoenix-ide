@@ -9,8 +9,12 @@ AND SHALL NOT inject synthetic tool results or implement a parallel agent loop
 ## REQ-DRIVE-TURN-002: Stable Completion
 
 WHEN the driven conversation reaches a stable state after processing the submitted user message
+AND that state has been persisted
 THE SYSTEM SHALL stop driving the turn
 AND report the typed stable outcome
+
+WHEN the conversation is waiting for external recovery
+THE SYSTEM SHALL report awaiting recovery as a stable outcome
 
 IF the conversation does not reach a stable state within the requested timeout
 THEN THE SYSTEM SHALL cancel the turn through the production cancellation path
@@ -42,3 +46,6 @@ THE SYSTEM SHALL emit one structured JSON result containing the conversation ide
 WHEN drive-turn creates a conversation
 THE SYSTEM SHALL validate the supplied working directory through the production conversation working-directory validation path
 AND tools SHALL execute within that conversation scope
+
+WHEN the driven turn ends for any reason
+THE SYSTEM SHALL tear down conversation-owned tmux, browser, and bash resources before returning

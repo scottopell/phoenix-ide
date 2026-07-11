@@ -42,6 +42,7 @@ pub enum StableOutcome {
         message: String,
         error_kind: phoenix_core::domain::db_schema::ErrorKind,
     },
+    AwaitingRecovery,
     AwaitingTaskApproval,
     AwaitingUserResponse,
     AwaitingCommissionReviewApproval,
@@ -215,6 +216,21 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         started,
     )
     .await;
+    let work_scope = phoenix_core::work_scope::WorkScope::Conversation(conversation_id.clone());
+    let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
+        manager.tmux_registry(),
+        &work_scope,
+        None,
+    )
+    .await;
+    if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
+        tracing::warn!(
+            socket_path = %tmux_report.socket_path.display(),
+            kill_server_error = ?tmux_report.kill_server_error,
+            unlink_error = ?tmux_report.unlink_error,
+            "drive-turn tmux cleanup partially failed"
+        );
+    }
     manager.browser_sessions().shutdown_all().await;
     crate::tools::bash::shutdown_kill_tree(manager.bash_handles()).await;
     result
@@ -257,7 +273,7 @@ async fn drive_conversation(
     {
         result?
     } else {
-        cancel_timed_out_turn(manager, conversation_id, &mut state_rx).await?;
+        cancel_timed_out_turn(manager, db, conversation_id, &mut state_rx).await?;
         return Err(DriveTurnError::Timeout(request.timeout));
     };
     let messages = db
@@ -280,6 +296,7 @@ async fn drive_conversation(
 
 async fn cancel_timed_out_turn(
     manager: &Arc<RuntimeManager>,
+    db: &Database,
     conversation_id: &str,
     state_rx: &mut tokio::sync::watch::Receiver<ConvState>,
 ) -> Result<(), DriveTurnError> {
@@ -299,7 +316,7 @@ async fn cancel_timed_out_turn(
 
     tokio::time::timeout(
         Duration::from_secs(10),
-        wait_for_post_cancel_stable_state(state_rx),
+        wait_for_post_cancel_stable_state(db, conversation_id, state_rx),
     )
     .await
     .map_err(|_| {
@@ -358,25 +375,35 @@ async fn wait_for_stable_turn(
     loop {
         let state = state_rx.borrow().clone();
         if let Some(outcome) = stable_outcome(&state) {
-            let messages = db
-                .get_messages(conversation_id)
+            let conversation = db
+                .get_conversation(conversation_id)
                 .await
                 .map_err(|error| DriveTurnError::Database(error.to_string()))?;
-            let has_agent_output = messages
-                .iter()
-                .any(|message| message.message_type == MessageType::Agent);
-            if has_agent_output || !matches!(outcome, StableOutcome::Idle) {
-                return Ok(outcome);
+            if conversation.state == state {
+                let messages = db
+                    .get_messages(conversation_id)
+                    .await
+                    .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+                let has_agent_output = messages
+                    .iter()
+                    .any(|message| message.message_type == MessageType::Agent);
+                if has_agent_output || !matches!(outcome, StableOutcome::Idle) {
+                    return Ok(outcome);
+                }
             }
         }
-        state_rx
-            .changed()
-            .await
-            .map_err(|_| DriveTurnError::Runtime("runtime state channel closed".into()))?;
+        tokio::select! {
+            changed = state_rx.changed() => changed.map_err(|_| {
+                DriveTurnError::Runtime("runtime state channel closed".into())
+            })?,
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
     }
 }
 
 async fn wait_for_post_cancel_stable_state(
+    db: &Database,
+    conversation_id: &str,
     state_rx: &mut tokio::sync::watch::Receiver<ConvState>,
 ) -> Result<StableOutcome, DriveTurnError> {
     state_rx
@@ -384,13 +411,22 @@ async fn wait_for_post_cancel_stable_state(
         .await
         .map_err(|_| DriveTurnError::Runtime("runtime state channel closed".into()))?;
     loop {
-        if let Some(outcome) = stable_outcome(&state_rx.borrow()) {
-            return Ok(outcome);
+        let state = state_rx.borrow().clone();
+        if let Some(outcome) = stable_outcome(&state) {
+            let conversation = db
+                .get_conversation(conversation_id)
+                .await
+                .map_err(|error| DriveTurnError::Database(error.to_string()))?;
+            if conversation.state == state {
+                return Ok(outcome);
+            }
         }
-        state_rx
-            .changed()
-            .await
-            .map_err(|_| DriveTurnError::Runtime("runtime state channel closed".into()))?;
+        tokio::select! {
+            changed = state_rx.changed() => changed.map_err(|_| {
+                DriveTurnError::Runtime("runtime state channel closed".into())
+            })?,
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
     }
 }
 
@@ -405,6 +441,7 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
             message: message.clone(),
             error_kind: error_kind.clone(),
         }),
+        ConvState::AwaitingRecovery { .. } => Some(StableOutcome::AwaitingRecovery),
         ConvState::AwaitingTaskApproval { .. } => Some(StableOutcome::AwaitingTaskApproval),
         ConvState::AwaitingUserResponse { .. } => Some(StableOutcome::AwaitingUserResponse),
         ConvState::AwaitingCommissionReviewApproval { .. } => {
@@ -421,7 +458,6 @@ fn stable_outcome(state: &ConvState) -> Option<StableOutcome> {
         | ConvState::CancellingSubAgents { .. }
         | ConvState::Completed { .. }
         | ConvState::Failed { .. }
-        | ConvState::AwaitingRecovery { .. }
         | ConvState::AwaitingContinuation { .. } => None,
     }
 }
@@ -452,16 +488,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_cancel_waiter_requires_a_new_state_observation() {
+    async fn post_cancel_waiter_requires_new_and_persisted_state() {
+        let db = Database::open_in_memory().await.unwrap();
+        let conversation_id = "cancel-barrier";
+        db.create_conversation_with_project(
+            conversation_id,
+            "test",
+            "/tmp",
+            true,
+            None,
+            Some("test-model"),
+            None,
+            &ConvMode::Direct,
+            None,
+            None,
+            None,
+            phoenix_core::llm_language::LlmLanguage::default(),
+        )
+        .await
+        .unwrap();
         let (tx, mut rx) = tokio::sync::watch::channel(ConvState::Idle);
         rx.borrow_and_update();
-        let waiter = tokio::spawn(async move { wait_for_post_cancel_stable_state(&mut rx).await });
+        let waiter_db = db.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_post_cancel_stable_state(&waiter_db, conversation_id, &mut rx).await
+        });
 
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
         tx.send(ConvState::Terminal).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+        db.update_conversation_state(conversation_id, &ConvState::Terminal)
+            .await
+            .unwrap();
 
         assert_eq!(waiter.await.unwrap().unwrap(), StableOutcome::Terminal);
+    }
+
+    #[test]
+    fn awaiting_recovery_is_a_stable_user_boundary() {
+        let state = ConvState::AwaitingRecovery {
+            message: "retryable".into(),
+            error_kind: phoenix_core::domain::db_schema::ErrorKind::InvalidRequest,
+            recovery_kind: phoenix_core::domain::sm_state::RecoveryKind::Credential,
+            resume: phoenix_core::domain::sm_state::RecoveryResumeTarget::ConversationTurn,
+        };
+        assert_eq!(
+            stable_outcome(&state),
+            Some(StableOutcome::AwaitingRecovery)
+        );
     }
 
     #[test]
