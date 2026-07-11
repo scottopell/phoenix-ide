@@ -40,11 +40,13 @@ describe('ToolResultsFixture', () => {
     expect(screen.getByText('family=shell')).toBeInTheDocument();
     expect(screen.getByText('density=full')).toBeInTheDocument();
     expect(screen.getByText(/This shell family is the transcript-level smoke test/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'thinking (1 line)' })).toBeInTheDocument();
     expect(screen.getByText(/Navigation complete — fixture page ready/)).toBeInTheDocument();
     expect(screen.getByText(/earlier click is a finalized missing result/)).toBeInTheDocument();
     expect(container.querySelectorAll('.tool-missing-result')).toHaveLength(1);
     expect(container.querySelector('[data-tool-id="shell-pending"]')).not.toBeNull();
     expect(container.querySelector('[data-tool-id="shell-pending"] .tool-missing-result')).toBeNull();
+    expect(container.querySelector('[data-tool-id="shell-pending"] .tool-block-elapsed')?.textContent).toMatch(/• [4-9]s/);
     expect(screen.getByText('custom_fixture_tool')).toBeInTheDocument();
   });
 
@@ -78,6 +80,8 @@ describe('ToolResultsFixture', () => {
     expect(screen.getByText('trace')).toBeInTheDocument();
     expect(screen.getByText('heap diff')).toBeInTheDocument();
     expect(screen.getByText('ScriptDuration')).toBeInTheDocument();
+    expect(screen.getByText(/browser_profile run_scenario failed: page crashed/)).toBeInTheDocument();
+    expect(screen.queryByText('unknown')).not.toBeInTheDocument();
 
     rerender(<ToolResultsFixture scenario={getToolResultsScenario('subagents-full')} />);
     await screen.findByText('scenario=subagents-full');

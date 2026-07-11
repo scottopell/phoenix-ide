@@ -69,7 +69,7 @@ describe('tool results fixture scenarios', () => {
 
   it('pairs every tool result exactly once except intentional active/missing cases', () => {
     const expectedUnpaired: Record<ToolResultsScenarioFamily, string[]> = {
-      shell: ['shell-missing', 'shell-pending'],
+      shell: ['shell-missing', 'shell-pending', 'shell-think'],
       execution: [],
       discovery: [],
       media: [],
@@ -89,7 +89,10 @@ describe('tool results fixture scenarios', () => {
     const data = familyData('shell');
     const uses = toolUses(data.messages);
     expect(data.convState).toMatchObject({ type: 'tool_executing', current_tool: { id: 'shell-pending' } });
+    const pendingMessage = data.messages.find((message) => message.message_id === 'agent-9');
+    expect(pendingMessage?.display_data).toMatchObject({ tool_starts: { 'shell-pending': expect.any(Number) } });
     expect(uses.map(({ name }) => name)).toEqual([
+      'think',
       'browser_click',
       'browser_navigate',
       'browser_clear_console_logs',
@@ -168,7 +171,9 @@ describe('tool results fixture scenarios', () => {
     ]);
     expect(resultFor(messages, 'profile-run-completed')?.message.display_data).toMatchObject({ outcome: 'completed' });
     expect(resultFor(messages, 'profile-run-blocked')?.message.display_data).toMatchObject({ outcome: 'blocked' });
-    expect(resultFor(messages, 'profile-run-error')?.content.is_error).toBe(true);
+    const profileError = resultFor(messages, 'profile-run-error');
+    expect(profileError?.content.is_error).toBe(true);
+    expect(profileError?.message).not.toHaveProperty('display_data');
     expect(resultFor(messages, 'profile-generic')?.content.content).toContain('browser profile raw text fallback');
   });
 

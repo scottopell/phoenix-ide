@@ -23,7 +23,11 @@ function userMessage(sequence_id: number, text: string): Message {
   };
 }
 
-function agentMessage(sequence_id: number, blocks: Message['content']): Message {
+function agentMessage(
+  sequence_id: number,
+  blocks: Message['content'],
+  display_data: Record<string, unknown> = {},
+): Message {
   return {
     message_id: `agent-${sequence_id}`,
     conversation_id: CONVERSATION_ID,
@@ -32,7 +36,7 @@ function agentMessage(sequence_id: number, blocks: Message['content']): Message 
     message_type: 'agent',
     created_at: createdAt(sequence_id, '30'),
     content: blocks,
-    display_data: {},
+    display_data,
   };
 }
 
@@ -60,7 +64,7 @@ function toolMessage(
     message_type: 'tool',
     created_at: createdAt(sequence_id, '45'),
     content: toolContent,
-    display_data: options?.display_data ?? {},
+    ...(options && 'display_data' in options ? { display_data: options.display_data } : {}),
   };
 }
 
@@ -102,6 +106,7 @@ const shellMessages: Message[] = [
   userMessage(1, 'Show the comprehensive tool-result transcript shell, including lifecycle states and specialized input summaries.'),
   agentMessage(2, [
     { type: 'text', text: 'This shell family is the transcript-level smoke test: prose, browser action summaries, lifecycle placeholders, and fallback rendering all appear in one conversation.' },
+    { type: 'tool_use', id: 'shell-think', name: 'think', input: { thoughts: 'Keep specialized tool results scannable without exposing raw payloads by default.' } },
     { type: 'tool_use', id: 'shell-missing', name: 'browser_click', input: { selector: '[data-testid="missing-result"]', wait: true, timeout: '5s' } },
     { type: 'tool_use', id: 'shell-short', name: 'browser_navigate', input: { url: 'https://fixture.local/tool-results', timeout: '5s' } },
     { type: 'tool_use', id: 'shell-empty', name: 'browser_clear_console_logs', input: {} },
@@ -132,7 +137,9 @@ const shellMessages: Message[] = [
   agentMessage(9, [
     { type: 'text', text: 'The earlier click is a finalized missing result. This last operation is intentionally still active so its elapsed treatment remains distinct.' },
     { type: 'tool_use', id: 'shell-pending', name: 'browser_wait_for_selector', input: { selector: '.fixture-ready', visible: true, timeout: '5s' } },
-  ]),
+  ], {
+    tool_starts: { 'shell-pending': Date.now() - 4_000 },
+  }),
 ];
 
 const executionMessages: Message[] = [
@@ -356,7 +363,6 @@ const profilingMessages: Message[] = [
   }),
   toolMessage(5, 'profile-run-error', 'browser_profile run_scenario failed: page crashed before measurement window opened.', {
     is_error: true,
-    display_data: { duration_ms: 44 },
   }),
   toolMessage(6, 'profile-metrics', 'Metrics snapshot', {
     display_data: {
