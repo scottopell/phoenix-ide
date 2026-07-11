@@ -102,6 +102,9 @@ async fn reconcile_creation_cleanup(
                 return Ok(());
             }
             remove_owned_worktree_for_cleanup(&repo, Path::new(&resource))?;
+            if let Some(branch) = temporary_creation_branch(&cleanup_for_blocking) {
+                delete_temporary_creation_branch(&repo, &branch)?;
+            }
             Ok(())
         })
         .await
@@ -149,6 +152,16 @@ async fn process_claimed_job(
                     .await
                     .map_err(|error| error.to_string())?;
                 if matches!(outcome, crate::db::CreationCasOutcome::ClaimLost) {
+                    let terminal = manager
+                        .db()
+                        .get_conversation_creation_job(&job_id)
+                        .await
+                        .map(|job| job.protocol.status.is_terminal())
+                        .unwrap_or(false);
+                    if terminal {
+                        tracing::debug!(job_id = %job_id, generation = claim.generation, "creation heartbeat observed terminal commit");
+                        return processing.await;
+                    }
                     tracing::debug!(job_id = %job_id, generation = claim.generation, "stopping creation worker after lease authority was lost");
                     return Ok(());
                 }
@@ -614,6 +627,8 @@ async fn provision_conversation(
             },
             &conv_mode,
             &resolved_model,
+            phoenix_core::domain::creation_protocol::CreationStage::ExpandInitialMessage,
+            phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata,
         )
         .await
         .map_err(|error| (error.to_string(), ErrorKind::ServerError))?;
@@ -623,6 +638,7 @@ async fn provision_conversation(
             ErrorKind::Cancelled,
         ));
     }
+    job.protocol.stage = phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata;
     checkpoint_creation_stage(
         manager,
         job,
@@ -932,6 +948,82 @@ fn managed_worktree_error_to_kind(error: ManagedWorktreeError) -> (String, Error
 }
 
 #[cfg(test)]
+mod temporary_creation_branch_tests {
+    use super::*;
+
+    #[test]
+    fn managed_cleanup_deletes_only_implicit_temporary_branch() {
+        let mut cleanup = test_cleanup_job();
+        cleanup.intent.mode = Some("managed".to_string());
+        cleanup.intent.checkout_ref = None;
+        assert_eq!(
+            temporary_creation_branch(&cleanup),
+            Some("task-pending-conversa".to_string())
+        );
+        cleanup.intent.checkout_ref = Some("feature".to_string());
+        assert_eq!(temporary_creation_branch(&cleanup), None);
+        cleanup.intent.mode = Some("direct".to_string());
+        cleanup.intent.checkout_ref = None;
+        assert_eq!(temporary_creation_branch(&cleanup), None);
+    }
+
+    #[test]
+    fn temporary_branch_is_deleted_after_worktree_cleanup() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["config", "user.email", "test@example.com"])
+            .unwrap();
+        crate::git_ops::run_git(repo.path(), &["config", "user.name", "Test"]).unwrap();
+        std::fs::write(repo.path().join("README"), b"test").unwrap();
+        crate::git_ops::run_git(repo.path(), &["add", "README"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["commit", "-m", "initial"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["branch", "task-pending-conversa"]).unwrap();
+
+        delete_temporary_creation_branch(&repo.path().to_string_lossy(), "task-pending-conversa")
+            .unwrap();
+        assert!(crate::git_ops::run_git(
+            repo.path(),
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/task-pending-conversa"
+            ]
+        )
+        .is_err());
+    }
+
+    fn test_cleanup_job() -> crate::db::CreationCleanupJob {
+        crate::db::CreationCleanupJob {
+            job_id: "job".to_string(),
+            conversation_id: "conversation-id".to_string(),
+            intent: phoenix_core::domain::db_schema::ConversationCreationIntent {
+                cwd: "/tmp".to_string(),
+                model: None,
+                text: String::new(),
+                expansion_preflighted: false,
+                llm_text: None,
+                skill_invocation: None,
+                message_id: String::new(),
+                images: vec![],
+                files: vec![],
+                mode: None,
+                base_branch: None,
+                checkout_ref: None,
+                seed_parent_id: None,
+                seed_label: None,
+            },
+            status: "cancelling".to_string(),
+            generation: 1,
+            worker_id: "worker".to_string(),
+            token: "token".to_string(),
+            lease_until: chrono::Utc::now(),
+            reservations: vec![],
+        }
+    }
+}
+
+#[cfg(test)]
 mod partial_worktree_cleanup_tests {
     use super::*;
 
@@ -1093,6 +1185,39 @@ mod repository_lock_tests {
         acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         thread.join().unwrap();
     }
+}
+
+fn temporary_creation_branch(cleanup: &crate::db::CreationCleanupJob) -> Option<String> {
+    let mode = cleanup.intent.mode.as_deref()?;
+    if !matches!(mode, "managed" | "auto") || cleanup.intent.checkout_ref.is_some() {
+        return None;
+    }
+    Some(format!(
+        "task-pending-{}",
+        cleanup.conversation_id.chars().take(8).collect::<String>()
+    ))
+}
+
+fn delete_temporary_creation_branch(repo_root: &str, branch: &str) -> Result<(), String> {
+    let repo = Path::new(repo_root);
+    if crate::git_ops::find_branch_in_worktree_list(repo, branch).is_some() {
+        return Err(format!(
+            "temporary creation branch '{branch}' remains checked out"
+        ));
+    }
+    let exists = crate::git_ops::run_git(
+        repo,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    );
+    if exists.is_ok() {
+        crate::git_ops::run_git(repo, &["branch", "-D", "--", branch])?;
+    }
+    Ok(())
 }
 
 fn remove_owned_worktree_for_cleanup(repo_root: &str, path: &Path) -> Result<(), String> {

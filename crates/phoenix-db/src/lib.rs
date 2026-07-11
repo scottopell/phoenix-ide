@@ -157,10 +157,11 @@ pub struct CreationResourceReservation {
     pub status: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreationCleanupJob {
     pub job_id: String,
     pub conversation_id: String,
+    pub intent: ConversationCreationIntent,
     pub status: String,
     pub generation: u64,
     pub worker_id: String,
@@ -2539,8 +2540,8 @@ impl Database {
         let now_str = now.to_rfc3339();
         let lease_until = now + lease_duration;
         let mut tx = self.pool.begin().await?;
-        let row: Option<(String, String, String, i64)> = sqlx::query_as(
-            "SELECT id, conversation_id, status, generation
+        let row: Option<(String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT id, conversation_id, intent_json, status, generation
              FROM conversation_creation_jobs
              WHERE updated_at <= ?1
                AND (cleanup_lease_until IS NULL OR cleanup_lease_until <= ?1)
@@ -2557,7 +2558,7 @@ impl Database {
         .bind(&now_str)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((job_id, conversation_id, status, generation)) = row else {
+        let Some((job_id, conversation_id, intent_json, status, generation)) = row else {
             tx.rollback().await?;
             return Ok(None);
         };
@@ -2582,9 +2583,12 @@ impl Database {
         }
         tx.commit().await?;
         let reservations = self.get_creation_resource_reservations(&job_id).await?;
+        let intent = serde_json::from_str(&intent_json)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
         Ok(Some(CreationCleanupJob {
             job_id,
             conversation_id,
+            intent,
             status,
             generation: u64::try_from(generation)
                 .map_err(|_| DbError::Serialization("negative cleanup generation".to_string()))?,
@@ -4818,6 +4822,7 @@ impl Database {
     /// # Errors
     ///
     /// Returns [`DbError`] if serialization or either write fails.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn update_conversation_creation_metadata_and_mode(
         &self,
         job_id: &str,
@@ -4826,6 +4831,8 @@ impl Database {
         update: &ConversationCreationMetadataUpdate,
         mode: &ConvMode,
         model: &str,
+        expected_stage: CreationStage,
+        next_stage: CreationStage,
     ) -> DbResult<CreationCasOutcome> {
         let cm = conv_mode_columns(mode);
         let base_slug = update.slug.clone();
@@ -4865,7 +4872,7 @@ impl Database {
                        WHERE j.id = ?19 AND j.conversation_id = conversations.id
                          AND j.status = 'claimed' AND j.generation = ?20
                          AND j.claim_worker_id = ?21 AND j.claim_token = ?22
-                         AND j.lease_until > ?17
+                         AND j.lease_until > ?17 AND j.stage = ?23
                    )",
             )
             .bind(candidate_slug.as_deref())
@@ -4895,11 +4902,31 @@ impl Database {
             .bind(claim_generation_i64(claim)?)
             .bind(&claim.worker_id.0)
             .bind(&claim.token.0)
+            .bind(creation_stage_db_str(expected_stage))
             .execute(&mut *tx)
             .await;
             match result {
                 Ok(result) => {
                     if result.rows_affected() == 0 {
+                        tx.rollback().await?;
+                        return Ok(CreationCasOutcome::ClaimLost);
+                    }
+                    let stage_updated = sqlx::query(
+                        "UPDATE conversation_creation_jobs SET stage = ?1, updated_at = ?2
+                         WHERE id = ?3 AND status = 'claimed' AND generation = ?4
+                           AND claim_worker_id = ?5 AND claim_token = ?6
+                           AND lease_until > ?2 AND stage = ?7",
+                    )
+                    .bind(creation_stage_db_str(next_stage))
+                    .bind(&now)
+                    .bind(job_id)
+                    .bind(claim_generation_i64(claim)?)
+                    .bind(&claim.worker_id.0)
+                    .bind(&claim.token.0)
+                    .bind(creation_stage_db_str(expected_stage))
+                    .execute(&mut *tx)
+                    .await?;
+                    if stage_updated.rows_affected() != 1 {
                         tx.rollback().await?;
                         return Ok(CreationCasOutcome::ClaimLost);
                     }
@@ -8008,6 +8035,8 @@ mod tests {
                 },
                 &ConvMode::Direct,
                 "stale-model",
+                CreationStage::ValidateIntent,
+                CreationStage::ResolveRepository,
             )
             .await
             .unwrap();
