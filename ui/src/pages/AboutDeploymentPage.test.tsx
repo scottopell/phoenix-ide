@@ -73,7 +73,7 @@ function resourcesSnapshot(overrides: Partial<AboutResourcesSnapshot> = {}): Abo
     sampled_at: '2026-06-01T00:00:03Z',
     host: {
       logical_cpu_count: 8,
-      cpu_user_percent: 18,
+      cpu_busy_percent: 25,
       cpu_system_percent: 7,
       cpu_idle_percent: 75,
       total_memory_bytes: 16 * 1024,
@@ -261,7 +261,9 @@ describe('AboutDeploymentPage disk usage health', () => {
     );
 
     expect(apiMock.deploymentResources).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
     expect(apiMock.deploymentResources).toHaveBeenCalledTimes(1);
 
     const firstResolve = resolveFirst;
@@ -282,7 +284,9 @@ describe('AboutDeploymentPage disk usage health', () => {
 
     Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'hidden' });
     document.dispatchEvent(new Event('visibilitychange'));
-    await vi.advanceTimersByTimeAsync(3_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
     expect(apiMock.deploymentResources).toHaveBeenCalledTimes(2);
 
     Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'visible' });
@@ -292,6 +296,58 @@ describe('AboutDeploymentPage disk usage health', () => {
       await Promise.resolve();
     });
     expect(apiMock.deploymentResources).toHaveBeenCalledTimes(3);
+  });
+
+  it('skips the initial resource fetch while hidden and fetches immediately when visible', async () => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'hidden' });
+    apiMock.deploymentInfo.mockResolvedValue(deployment());
+    apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
+    apiMock.deploymentResources.mockResolvedValue(resourcesSnapshot());
+
+    render(
+      <MemoryRouter>
+        <AboutDeploymentPage />
+      </MemoryRouter>,
+    );
+
+    expect(apiMock.deploymentResources).not.toHaveBeenCalled();
+    await screen.findByText('No resource sample available yet.');
+
+    Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'visible' });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+    });
+
+    expect(apiMock.deploymentResources).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText('Host mostly idle')).toBeInTheDocument();
+  });
+
+  it('ignores an in-flight resource completion after unmount', async () => {
+    let resolveFirst: ((value: AboutResourcesSnapshot) => void) | undefined;
+    apiMock.deploymentInfo.mockResolvedValue(deployment());
+    apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
+    apiMock.deploymentResources.mockImplementationOnce(() => new Promise<AboutResourcesSnapshot>((resolve) => { resolveFirst = resolve; }));
+
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const view = render(
+      <MemoryRouter>
+        <AboutDeploymentPage />
+      </MemoryRouter>,
+    );
+
+    expect(apiMock.deploymentResources).toHaveBeenCalledTimes(1);
+    view.unmount();
+
+    const firstResolve = resolveFirst;
+    if (!firstResolve) throw new Error('expected first resource request to be pending');
+    await act(async () => {
+      firstResolve(resourcesSnapshot());
+      await Promise.resolve();
+    });
+
+    expect(consoleError).not.toHaveBeenCalled();
+    consoleError.mockRestore();
   });
 
   it('highlights managed worktrees when they are the largest measured category', async () => {

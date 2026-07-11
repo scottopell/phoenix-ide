@@ -185,11 +185,23 @@ export function computeResourceRollups(history: ResourceHistoryPoint[]): Resourc
 }
 
 function hostBusyLabel(snapshot: AboutResourcesSnapshot | null): string {
-  if (!snapshot?.host.cpu_idle_percent && snapshot?.host.cpu_idle_percent !== 0) return 'Host busy state unavailable';
-  const idle = snapshot.host.cpu_idle_percent;
-  if (idle >= 70) return 'Host mostly idle';
-  if (idle >= 35) return 'Host moderately busy';
-  return 'Host busy';
+  const busy = snapshot?.host.cpu_busy_percent;
+  const idle = snapshot?.host.cpu_idle_percent;
+  if (busy === null || busy === undefined) {
+    if (idle === null || idle === undefined) return 'Host busy state unavailable';
+    if (idle >= 70) return 'Host mostly idle';
+    if (idle >= 35) return 'Host moderately busy';
+    return 'Host busy';
+  }
+  if (busy >= 65) return 'Host busy';
+  if (busy >= 30) return 'Host moderately busy';
+  return 'Host mostly idle';
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  return error instanceof DOMException
+    ? error.name === 'AbortError'
+    : error instanceof Error && error.name === 'AbortError';
 }
 
 function categoryUnavailableReason(category: ManagedResourceCategory): string {
@@ -310,14 +322,18 @@ function ResourceMonitor({ state, refresh }: { state: ResourceState; refresh: ()
               <h4>{hostBusyLabel(sample)}</h4>
               <div className="about-resources-card__stat-row">
                 <div>
+                  <span>Busy</span>
+                  <strong>{resourceText(sample.host.cpu_busy_percent, (value) => formatPercent(value))}</strong>
+                </div>
+                <div>
                   <span>Idle</span>
                   <strong>{resourceText(sample.host.cpu_idle_percent, (value) => formatPercent(value))}</strong>
                 </div>
                 <div>
-                  <span>User + system</span>
+                  <span>User / system</span>
                   <strong>
-                    {sample.host.cpu_user_percent !== null || sample.host.cpu_system_percent !== null
-                      ? `${resourceText(sample.host.cpu_user_percent, (value) => formatPercent(value))} / ${resourceText(sample.host.cpu_system_percent, (value) => formatPercent(value))}`
+                    {sample.host.cpu_busy_percent !== null || sample.host.cpu_system_percent !== null
+                      ? `${resourceText(sample.host.cpu_busy_percent, (value) => formatPercent(value))} / ${resourceText(sample.host.cpu_system_percent, (value) => formatPercent(value))}`
                       : 'unavailable'}
                   </strong>
                 </div>
@@ -546,6 +562,8 @@ export function AboutDeploymentPage() {
   const [resources, setResources] = useState<ResourceState>(EMPTY_RESOURCES);
   const resourcesInFlightRef = useRef(false);
   const resourcesTimerRef = useRef<number | null>(null);
+  const resourcesMountedRef = useRef(false);
+  const resourcesGenerationRef = useRef(0);
 
   const handleReveal = useCallback((path: string) => {
     setRevealError(null);
@@ -564,57 +582,80 @@ export function AboutDeploymentPage() {
       .finally(() => setDiskLoading(false));
   }, []);
 
-  const fetchResources = useCallback(async () => {
-    if (resourcesInFlightRef.current) return;
+  const fetchResources = useCallback(() => {
+    if (resourcesInFlightRef.current) return undefined;
     resourcesInFlightRef.current = true;
-    setResources((current) => ({ ...current, loading: true, error: current.sample ? current.error : null }));
-    try {
-      const sample = await api.deploymentResources();
-      setResources((current) => ({
-        sample,
-        history: appendResourceHistory(current.history, sample),
-        loading: false,
-        stale: false,
-        error: null,
-      }));
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      setResources((current) => ({
-        ...current,
-        loading: false,
-        stale: current.sample !== null,
-        error: message,
-      }));
-    } finally {
-      resourcesInFlightRef.current = false;
+    const generation = resourcesGenerationRef.current;
+    const controller = new AbortController();
+    if (resourcesMountedRef.current) {
+      setResources((current) => ({ ...current, loading: true, error: current.sample ? current.error : null }));
     }
+
+    void api.deploymentResources({ signal: controller.signal })
+      .then((sample) => {
+        if (!resourcesMountedRef.current || generation !== resourcesGenerationRef.current) return;
+        setResources((current) => ({
+          sample,
+          history: appendResourceHistory(current.history, sample),
+          loading: false,
+          stale: false,
+          error: null,
+        }));
+      })
+      .catch((e) => {
+        if (isAbortLikeError(e) || !resourcesMountedRef.current || generation !== resourcesGenerationRef.current) return;
+        const message = e instanceof Error ? e.message : String(e);
+        setResources((current) => ({
+          ...current,
+          loading: false,
+          stale: current.sample !== null,
+          error: message,
+        }));
+      })
+      .finally(() => {
+        if (generation === resourcesGenerationRef.current) {
+          resourcesInFlightRef.current = false;
+        }
+      });
+
+    return () => {
+      controller.abort();
+    };
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
+    resourcesMountedRef.current = true;
+    let abortCurrentFetch: (() => void) | undefined;
 
     const schedule = () => {
       if (resourcesTimerRef.current !== null) window.clearTimeout(resourcesTimerRef.current);
-      resourcesTimerRef.current = window.setTimeout(async () => {
-        if (!cancelled && document.visibilityState === 'visible') {
-          await fetchResources();
+      resourcesTimerRef.current = window.setTimeout(() => {
+        if (document.visibilityState === 'visible') {
+          abortCurrentFetch = fetchResources();
         }
-        if (!cancelled) schedule();
+        if (resourcesMountedRef.current) schedule();
       }, RESOURCE_POLL_MS);
     };
 
-    void fetchResources();
+    if (document.visibilityState === 'visible') {
+      abortCurrentFetch = fetchResources();
+    } else {
+      setResources((current) => ({ ...current, loading: false }));
+    }
     schedule();
 
     const onVisibilityChange = () => {
-      if (!cancelled && document.visibilityState === 'visible') {
-        void fetchResources();
+      if (document.visibilityState === 'visible') {
+        abortCurrentFetch = fetchResources();
       }
     };
 
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
-      cancelled = true;
+      resourcesMountedRef.current = false;
+      resourcesGenerationRef.current += 1;
+      abortCurrentFetch?.();
+      resourcesInFlightRef.current = false;
       if (resourcesTimerRef.current !== null) window.clearTimeout(resourcesTimerRef.current);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };

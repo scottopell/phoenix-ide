@@ -130,7 +130,8 @@ THE SYSTEM SHALL display host-wide resource usage including:
 
 - Logical CPU count
 - CPU busy/idle state derived from sampled CPU percentages
-- CPU user and system percentages when available
+- CPU busy and idle percentages
+- System CPU percentage when available
 - Total, available, and used system memory
 - Load averages over one, five, and fifteen minutes
 
@@ -196,12 +197,14 @@ this host or for this process."
 THE SYSTEM SHALL refresh the managed-resource endpoint approximately once per
 second while the deployment page is visible.
 
-THE SYSTEM SHALL suspend periodic polling while the document is hidden.
+THE SYSTEM SHALL suspend the initial managed-resource fetch and all periodic polling while the document is hidden.
 
 WHEN the page becomes visible after being hidden
 THE SYSTEM SHALL promptly request a fresh managed-resource sample.
 
 THE SYSTEM SHALL avoid overlapping managed-resource requests.
+
+THE SYSTEM SHALL ignore managed-resource completions that arrive after the observing effect has unmounted or been superseded.
 
 **Rationale:** Resource monitoring is useful only when it stays fresh, but
 continuous background polling for a hidden tab wastes work and distorts the

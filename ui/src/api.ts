@@ -1033,8 +1033,8 @@ export const api = {
     return resp.json();
   },
 
-  async deploymentResources(): Promise<AboutResourcesSnapshot> {
-    const resp = await fetch('/api/about/resources');
+  async deploymentResources(options?: { signal?: AbortSignal }): Promise<AboutResourcesSnapshot> {
+    const resp = await fetch('/api/about/resources', options?.signal ? { signal: options.signal } : undefined);
     if (!resp.ok) throw new Error('Failed to load deployment resources');
     return resp.json();
   },
