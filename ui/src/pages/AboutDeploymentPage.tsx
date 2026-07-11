@@ -157,9 +157,9 @@ function maxOf(values: Array<number | null>): number | null {
 export function appendResourceHistory(
   history: ResourceHistoryPoint[],
   snapshot: AboutResourcesSnapshot,
-  nowMs = Date.now(),
 ): ResourceHistoryPoint[] {
-  const cutoff = nowMs - RESOURCE_HISTORY_RETENTION_MS;
+  const sampledAtMs = Date.parse(snapshot.sampled_at);
+  const cutoff = sampledAtMs - RESOURCE_HISTORY_RETENTION_MS;
   const point: ResourceHistoryPoint = {
     sampledAt: snapshot.sampled_at,
     timeLabel: formatTimeLabel(snapshot.sampled_at),
@@ -169,7 +169,7 @@ export function appendResourceHistory(
   const deduped = history.filter((entry) => entry.sampledAt !== point.sampledAt);
   const next = [...deduped, point].filter((entry) => {
     const parsed = Date.parse(entry.sampledAt);
-    return !Number.isNaN(parsed) && parsed >= cutoff;
+    return !Number.isNaN(sampledAtMs) && !Number.isNaN(parsed) && parsed >= cutoff;
   });
   next.sort((a, b) => Date.parse(a.sampledAt) - Date.parse(b.sampledAt));
   return next;

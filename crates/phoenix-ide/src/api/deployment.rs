@@ -945,12 +945,23 @@ async fn sample_resources() -> ResourceUsage {
         .find(|c| c.kind == ManagedResourceCategoryKind::Api);
 
     ResourceUsage {
-        process_memory_bytes: api.and_then(|c| c.totals.memory_bytes),
+        process_memory_bytes: current_process_rss_bytes(),
         process_cpu_percent: api.and_then(|c| c.totals.cpu_percent),
         system_total_memory_bytes: about.host.total_memory_bytes,
         system_available_memory_bytes: about.host.available_memory_bytes,
         logical_cpu_count: about.host.logical_cpu_count,
     }
+}
+
+fn current_process_rss_bytes() -> Option<u64> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+
+    let pid = sysinfo::get_current_pid().ok()?;
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
+    );
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    sys.process(pid).map(sysinfo::Process::memory)
 }
 
 async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {

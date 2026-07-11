@@ -171,13 +171,22 @@ describe('AboutDeploymentPage resource helpers', () => {
     const newer = resourcesSnapshot({ sampled_at: '2026-06-01T00:04:30Z', managed_total: { cpu_percent: 20, memory_bytes: 2000, process_count: 1, deduplicated_pid_count: 1 } });
     const latest = resourcesSnapshot({ sampled_at: '2026-06-01T00:05:01Z', managed_total: { cpu_percent: 30, memory_bytes: 3000, process_count: 1, deduplicated_pid_count: 1 } });
 
-    const one = appendResourceHistory([], older, Date.parse('2026-06-01T00:05:01Z'));
-    const two = appendResourceHistory(one, newer, Date.parse('2026-06-01T00:05:01Z'));
-    const three = appendResourceHistory(two, latest, Date.parse('2026-06-01T00:05:01Z'));
-    const deduped = appendResourceHistory(three, latest, Date.parse('2026-06-01T00:05:01Z'));
+    const one = appendResourceHistory([], older);
+    const two = appendResourceHistory(one, newer);
+    const three = appendResourceHistory(two, latest);
+    const deduped = appendResourceHistory(three, latest);
 
     expect(deduped).toHaveLength(2);
     expect(deduped.map((entry) => entry.sampledAt)).toEqual(['2026-06-01T00:04:30Z', '2026-06-01T00:05:01Z']);
+  });
+
+  it('bases retention on server sample time rather than the browser clock', () => {
+    const first = resourcesSnapshot({ sampled_at: '2026-06-01T00:00:00Z' });
+    const latest = resourcesSnapshot({ sampled_at: '2026-06-01T00:05:01Z' });
+
+    const history = appendResourceHistory(appendResourceHistory([], first), latest);
+
+    expect(history.map((entry) => entry.sampledAt)).toEqual(['2026-06-01T00:05:01Z']);
   });
 
   it('computes current, average, and peak rollups from history', () => {
@@ -454,7 +463,7 @@ describe('AboutDeploymentPage disk usage health', () => {
       await Promise.resolve();
     });
     expect(screen.getByText(/Resource sample captured/)).not.toHaveTextContent('stale');
-    expect(screen.getByText('40.0%')).toBeInTheDocument();
+    expect(screen.getAllByText('40.0%').length).toBeGreaterThan(0);
 
     const first = resolveFirst;
     if (!first) throw new Error('expected first resource request to be pending');
@@ -464,7 +473,7 @@ describe('AboutDeploymentPage disk usage health', () => {
     });
 
     expect(apiMock.deploymentResources).toHaveBeenCalledTimes(2);
-    expect(screen.getByText('40.0%')).toBeInTheDocument();
+    expect(screen.getAllByText('40.0%').length).toBeGreaterThan(0);
     expect(screen.queryByText('5.0%')).not.toBeInTheDocument();
     expect(screen.getByText(/Resource sample captured/)).not.toHaveTextContent('stale');
   });

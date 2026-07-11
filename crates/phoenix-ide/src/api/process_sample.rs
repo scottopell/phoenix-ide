@@ -121,6 +121,7 @@ pub async fn sample_process_observations(pids: &BTreeSet<u32>) -> Vec<ProcessObs
             continue;
         };
         let memory_bytes = stable_process_memory_bytes(*pid, expected_identity);
+        let cpu_time_seconds = stable_process_cpu_time_seconds(*pid, expected_identity);
         rows.push(ProcessObservation {
             pid: *pid,
             name: process.name().to_string_lossy().into_owned(),
@@ -129,7 +130,7 @@ pub async fn sample_process_observations(pids: &BTreeSet<u32>) -> Vec<ProcessObs
             thread_count: process
                 .tasks()
                 .map(|tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX)),
-            cpu_time_seconds: None,
+            cpu_time_seconds,
         });
     }
     rows
@@ -181,6 +182,16 @@ fn stable_process_memory_bytes(pid: u32, expected_identity: ProcessIdentity) -> 
     (after == expected_identity).then_some(memory_bytes)
 }
 
+fn stable_process_cpu_time_seconds(pid: u32, expected_identity: ProcessIdentity) -> Option<f64> {
+    let before = current_process_identity(pid)?;
+    if before != expected_identity {
+        return None;
+    }
+    let cpu_time_seconds = process_cpu_time_seconds_impl(pid)?;
+    let after = current_process_identity(pid)?;
+    (after == expected_identity).then_some(cpu_time_seconds)
+}
+
 #[cfg(target_os = "linux")]
 fn current_process_identity(pid: u32) -> Option<ProcessIdentity> {
     Some(ProcessIdentity {
@@ -199,6 +210,11 @@ fn current_process_identity(pid: u32) -> Option<ProcessIdentity> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn current_process_identity(_pid: u32) -> Option<ProcessIdentity> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_cpu_time_seconds_impl(_pid: u32) -> Option<f64> {
     None
 }
 
@@ -316,6 +332,32 @@ fn proc_start_time(pid: u32) -> Option<u64> {
     let close = stat.rfind(')')?;
     let tail = stat.get(close + 1..)?;
     tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_cpu_time_seconds_impl(pid: u32) -> Option<f64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let fields = stat
+        .get(close + 1..)?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
+    let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
+    // SAFETY: sysconf reads the host's immutable clock-tick configuration.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    let ticks_per_second = u64::try_from(ticks_per_second).ok()?;
+    let total_ticks = user_ticks.saturating_add(system_ticks);
+    let whole_seconds = total_ticks / ticks_per_second;
+    let fractional_ticks = u32::try_from(total_ticks % ticks_per_second).ok()?;
+    let ticks_per_second = u32::try_from(ticks_per_second).ok()?;
+    Some(
+        std::time::Duration::from_secs(whole_seconds).as_secs_f64()
+            + f64::from(fractional_ticks) / f64::from(ticks_per_second),
+    )
 }
 
 /// Sum `/proc/<pid>/smaps_rollup` `Pss:` (in kB, converted to bytes) over the
@@ -494,6 +536,25 @@ fn proc_phys_footprint(pid: u32) -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
+fn process_cpu_time_seconds_impl(pid: u32) -> Option<f64> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: proc_pid_rusage writes a rusage_info_v2 into the typed buffer.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            std::ptr::addr_of_mut!(info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let cpu_nanoseconds = info.ri_user_time.saturating_add(info.ri_system_time);
+    Some(std::time::Duration::from_nanos(cpu_nanoseconds).as_secs_f64())
+}
+
+#[cfg(target_os = "macos")]
 fn process_pss_bytes_impl(pid: u32) -> Option<u64> {
     proc_phys_footprint(pid)
 }
@@ -629,6 +690,25 @@ mod tests {
             observation.memory_bytes.is_some_and(|m| m > 0),
             "current process must report proportional memory when smaps_rollup is readable: {:?}",
             observation.memory_bytes
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn current_process_observation_reports_cpu_time() {
+        let pid = std::process::id();
+        let observations = sample_process_observations(&BTreeSet::from([pid])).await;
+        let observation = observations
+            .iter()
+            .find(|observation| observation.pid == pid)
+            .expect("current process should be observed when sysinfo sees it");
+
+        assert!(
+            observation
+                .cpu_time_seconds
+                .is_some_and(|seconds| seconds >= 0.0),
+            "current process must report cumulative CPU time: {:?}",
+            observation.cpu_time_seconds
         );
     }
 
