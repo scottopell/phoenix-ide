@@ -101,6 +101,8 @@ fn clear_inherited_config(command: &mut std::process::Command) {
     }
 }
 
+use crate::domain::observed_branch::LocalGitHeadObservation;
+
 /// Detect the git repository root for a given directory path.
 ///
 /// Returns `None` if the path is not inside a git repository.
@@ -158,6 +160,65 @@ pub fn resolve_remote_default_branch(path: &Path) -> Option<String> {
         return None;
     }
     Some(branch.to_string())
+}
+
+/// Observe the authoritative local Git HEAD state for a repository worktree.
+///
+/// Distinguishes a named branch from detached HEAD, unborn HEAD, and
+/// unavailable/error states without parsing shell command intent.
+#[must_use]
+pub fn observe_local_git_head(path: &Path) -> LocalGitHeadObservation {
+    let repo_root = detect_git_repo_root(path);
+    let Some(repository_identity) = repo_root else {
+        return LocalGitHeadObservation::Unavailable {
+            repository_identity: None,
+            error: "not a git repository".to_string(),
+        };
+    };
+
+    match git_capture(path, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        Some(branch_name) if !branch_name.is_empty() => {
+            if let Some(head_oid) =
+                git_capture(path, &["rev-parse", "HEAD^{commit}"]).filter(|oid| !oid.is_empty())
+            {
+                return LocalGitHeadObservation::NamedBranch {
+                    repository_identity,
+                    branch_name,
+                    head_oid,
+                };
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(head_oid) = git_capture(path, &["rev-parse", "HEAD^{commit}"]) {
+        if !head_oid.is_empty() {
+            return LocalGitHeadObservation::Detached {
+                repository_identity,
+                head_oid,
+            };
+        }
+    }
+
+    let branch_name = git_capture(path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .filter(|name| !name.is_empty() && name != "HEAD");
+    let head_exists = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(path)
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success());
+    if !head_exists {
+        return LocalGitHeadObservation::Unborn {
+            repository_identity,
+            branch_name,
+        };
+    }
+
+    LocalGitHeadObservation::Unavailable {
+        repository_identity: Some(repository_identity),
+        error: "unable to resolve HEAD state".to_string(),
+    }
 }
 
 /// Run `git <args>` in `path`, returning trimmed stdout on success.
@@ -239,5 +300,117 @@ mod command_tests {
             "signing-program-must-never-run",
         ]);
         run(&["commit", "--allow-empty", "--quiet", "-m", "unsigned"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(path: &std::path::Path, args: &[&str]) {
+        let status = command()
+            .args(args)
+            .current_dir(path)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn git_out(path: &std::path::Path, args: &[&str]) -> String {
+        let output = command()
+            .args(args)
+            .current_dir(path)
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {:?} failed", args);
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    fn init_repo() -> tempfile::TempDir {
+        let dir = temp_dir();
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["config", "user.name", "Phoenix Test"]);
+        git(dir.path(), &["config", "user.email", "phoenix@example.com"]);
+        dir
+    }
+
+    fn commit_file(path: &std::path::Path, name: &str, body: &str) -> String {
+        std::fs::write(path.join(name), body).expect("write file");
+        git(path, &["add", name]);
+        git(path, &["commit", "-m", "commit"]);
+        git_out(path, &["rev-parse", "HEAD^{commit}"])
+    }
+
+    #[test]
+    fn observe_local_git_head_reports_named_branch_and_head_oid() {
+        let repo = init_repo();
+        let head_oid = commit_file(repo.path(), "f.txt", "hi");
+
+        let observed = observe_local_git_head(repo.path());
+        assert_eq!(
+            observed,
+            LocalGitHeadObservation::NamedBranch {
+                repository_identity: std::fs::canonicalize(repo.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                branch_name: "main".to_string(),
+                head_oid,
+            }
+        );
+    }
+
+    #[test]
+    fn observe_local_git_head_reports_detached_head() {
+        let repo = init_repo();
+        let head_oid = commit_file(repo.path(), "f.txt", "hi");
+        git(repo.path(), &["checkout", "--detach", "HEAD"]);
+
+        let observed = observe_local_git_head(repo.path());
+        assert_eq!(
+            observed,
+            LocalGitHeadObservation::Detached {
+                repository_identity: std::fs::canonicalize(repo.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                head_oid,
+            }
+        );
+    }
+
+    #[test]
+    fn observe_local_git_head_reports_unborn_head() {
+        let repo = init_repo();
+
+        let observed = observe_local_git_head(repo.path());
+        assert_eq!(
+            observed,
+            LocalGitHeadObservation::Unborn {
+                repository_identity: std::fs::canonicalize(repo.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                branch_name: None,
+            }
+        );
+    }
+
+    #[test]
+    fn observe_local_git_head_reports_unavailable_for_non_repo() {
+        let dir = temp_dir();
+
+        let observed = observe_local_git_head(dir.path());
+        assert_eq!(
+            observed,
+            LocalGitHeadObservation::Unavailable {
+                repository_identity: None,
+                error: "not a git repository".to_string(),
+            }
+        );
     }
 }

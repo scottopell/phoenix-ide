@@ -240,6 +240,19 @@ pub struct WorkScopePrObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedBranchQualificationInput {
+    pub conversation_base_branch: String,
+    pub task_relative_work_base_head_oid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkScopeObservedBranchUpsert {
+    pub repository_identity: String,
+    pub branch_name: String,
+    pub head_oid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkScopePrFeedbackBaseline {
     pub work_scope_id: i64,
     pub pr_number: u64,
@@ -277,6 +290,17 @@ pub struct WorkScopePrAssociation {
     pub feedback_status: PrFeedbackStatus,
     pub first_seen_at: String,
     pub last_seen_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkScopeObservedBranch {
+    pub work_scope_id: i64,
+    pub repository_identity: String,
+    pub branch_name: String,
+    pub first_observed_head_oid: String,
+    pub last_observed_head_oid: String,
+    pub first_observed_at: String,
+    pub last_observed_at: String,
 }
 
 fn pr_display_state_db(
@@ -321,6 +345,43 @@ fn pr_feedback_status_from_db(value: &str) -> DbResult<PrFeedbackStatus> {
             "invalid PR feedback_status in database: {other}"
         ))),
     }
+}
+
+fn row_to_work_scope_observed_branch(row: &SqliteRow) -> WorkScopeObservedBranch {
+    WorkScopeObservedBranch {
+        work_scope_id: row.get("work_scope_id"),
+        repository_identity: row.get("repository_identity"),
+        branch_name: row.get("branch_name"),
+        first_observed_head_oid: row.get("first_observed_head_oid"),
+        last_observed_head_oid: row.get("last_observed_head_oid"),
+        first_observed_at: row.get("first_observed_at"),
+        last_observed_at: row.get("last_observed_at"),
+    }
+}
+
+pub fn qualifies_observed_branch(
+    observed: &phoenix_core::domain::observed_branch::LocalGitHeadObservation,
+    input: &ObservedBranchQualificationInput,
+) -> Option<WorkScopeObservedBranchUpsert> {
+    let phoenix_core::domain::observed_branch::LocalGitHeadObservation::NamedBranch {
+        repository_identity,
+        branch_name,
+        head_oid,
+    } = observed
+    else {
+        return None;
+    };
+    if branch_name == &input.conversation_base_branch {
+        return None;
+    }
+    if head_oid == &input.task_relative_work_base_head_oid {
+        return None;
+    }
+    Some(WorkScopeObservedBranchUpsert {
+        repository_identity: repository_identity.clone(),
+        branch_name: branch_name.clone(),
+        head_oid: head_oid.clone(),
+    })
 }
 
 fn row_to_work_scope_pr(row: &SqliteRow) -> DbResult<WorkScopePrAssociation> {
@@ -478,12 +539,9 @@ impl Database {
         Ok(id)
     }
 
-    /// # Errors
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn upsert_work_scope_pr_observations(
+    async fn ensure_work_scope_id(
         &self,
         scope: &phoenix_core::work_scope::WorkScope,
-        observations: &[WorkScopePrObservation],
     ) -> DbResult<i64> {
         let (scope_type, scope_value) = work_scope_db_key(scope);
         let now = Utc::now().to_rfc3339();
@@ -505,6 +563,20 @@ impl Database {
         .bind(scope_value)
         .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
+        Ok(work_scope_id)
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn upsert_work_scope_pr_observations(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScope,
+        observations: &[WorkScopePrObservation],
+    ) -> DbResult<i64> {
+        let work_scope_id = self.ensure_work_scope_id(scope).await?;
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
         for pr in observations {
             sqlx::query(
                 "INSERT INTO work_scope_pr_associations (
@@ -674,26 +746,8 @@ impl Database {
         scope: &phoenix_core::work_scope::WorkScope,
         baseline: &WorkScopePrFeedbackBaselineInput,
     ) -> DbResult<i64> {
-        let (scope_type, scope_value) = work_scope_db_key(scope);
-        let now = Utc::now().to_rfc3339();
+        let work_scope_id = self.ensure_work_scope_id(scope).await?;
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO work_scopes (scope_type, scope_value, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(scope_type, scope_value) DO UPDATE SET updated_at = excluded.updated_at",
-        )
-        .bind(scope_type)
-        .bind(scope_value)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        let work_scope_id = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM work_scopes WHERE scope_type = ?1 AND scope_value = ?2",
-        )
-        .bind(scope_type)
-        .bind(scope_value)
-        .fetch_one(&mut *tx)
-        .await?;
         let mut feedback_identities = baseline.feedback_identities.clone();
         feedback_identities.sort();
         feedback_identities.dedup();
@@ -724,6 +778,59 @@ impl Database {
         .await?;
         tx.commit().await?;
         Ok(work_scope_id)
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn upsert_work_scope_observed_branch(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScope,
+        observed: &WorkScopeObservedBranchUpsert,
+    ) -> DbResult<i64> {
+        let work_scope_id = self.ensure_work_scope_id(scope).await?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO work_scope_observed_branches (
+                work_scope_id, repository_identity, branch_name, first_observed_head_oid,
+                last_observed_head_oid, first_observed_at, last_observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?5)
+             ON CONFLICT(work_scope_id, repository_identity, branch_name) DO UPDATE SET
+                last_observed_head_oid = excluded.last_observed_head_oid,
+                last_observed_at = excluded.last_observed_at",
+        )
+        .bind(work_scope_id)
+        .bind(&observed.repository_identity)
+        .bind(&observed.branch_name)
+        .bind(&observed.head_oid)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(work_scope_id)
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn list_work_scope_observed_branches(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScope,
+    ) -> DbResult<Vec<WorkScopeObservedBranch>> {
+        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            "SELECT work_scope_id, repository_identity, branch_name, first_observed_head_oid,
+                    last_observed_head_oid, first_observed_at, last_observed_at
+             FROM work_scope_observed_branches
+             WHERE work_scope_id = ?1
+             ORDER BY last_observed_at DESC, branch_name ASC",
+        )
+        .bind(work_scope_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row_to_work_scope_observed_branch(&row))
+            .collect())
     }
 
     /// # Errors
@@ -8768,6 +8875,115 @@ mod tests {
         let anchors = db.usage_anchor_messages("root-anchor").await.unwrap();
         let ids: Vec<_> = anchors.iter().map(|a| a.conversation_id.as_str()).collect();
         assert_eq!(ids, vec!["root-anchor", "sub-anchor"]);
+    }
+
+    #[tokio::test]
+    async fn work_scope_observed_branch_upsert_preserves_first_seen_and_updates_last_seen() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-observed".to_string());
+
+        db.upsert_work_scope_observed_branch(
+            &scope,
+            &WorkScopeObservedBranchUpsert {
+                repository_identity: "/tmp/repo-a".to_string(),
+                branch_name: "feature/a".to_string(),
+                head_oid: "aaaa".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let first = db.list_work_scope_observed_branches(&scope).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].first_observed_head_oid, "aaaa");
+        assert_eq!(first[0].last_observed_head_oid, "aaaa");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        db.upsert_work_scope_observed_branch(
+            &scope,
+            &WorkScopeObservedBranchUpsert {
+                repository_identity: "/tmp/repo-a".to_string(),
+                branch_name: "feature/a".to_string(),
+                head_oid: "bbbb".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let second = db.list_work_scope_observed_branches(&scope).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].first_observed_head_oid, "aaaa");
+        assert_eq!(second[0].last_observed_head_oid, "bbbb");
+        assert_eq!(second[0].first_observed_at, first[0].first_observed_at);
+        assert!(second[0].last_observed_at >= first[0].last_observed_at);
+    }
+
+    #[test]
+    fn observed_branch_qualification_rejects_base_and_no_relative_work() {
+        use phoenix_core::domain::observed_branch::LocalGitHeadObservation;
+
+        let base = ObservedBranchQualificationInput {
+            conversation_base_branch: "main".to_string(),
+            task_relative_work_base_head_oid: "baseoid".to_string(),
+        };
+
+        assert!(qualifies_observed_branch(
+            &LocalGitHeadObservation::NamedBranch {
+                repository_identity: "/repo".to_string(),
+                branch_name: "main".to_string(),
+                head_oid: "headoid".to_string(),
+            },
+            &base,
+        )
+        .is_none());
+        assert!(qualifies_observed_branch(
+            &LocalGitHeadObservation::NamedBranch {
+                repository_identity: "/repo".to_string(),
+                branch_name: "feature/no-work".to_string(),
+                head_oid: "baseoid".to_string(),
+            },
+            &base,
+        )
+        .is_none());
+        assert_eq!(
+            qualifies_observed_branch(
+                &LocalGitHeadObservation::NamedBranch {
+                    repository_identity: "/repo".to_string(),
+                    branch_name: "feature/stacked".to_string(),
+                    head_oid: "stackoid".to_string(),
+                },
+                &base,
+            ),
+            Some(WorkScopeObservedBranchUpsert {
+                repository_identity: "/repo".to_string(),
+                branch_name: "feature/stacked".to_string(),
+                head_oid: "stackoid".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn observed_branch_qualification_rejects_non_named_head_states() {
+        use phoenix_core::domain::observed_branch::LocalGitHeadObservation;
+
+        let input = ObservedBranchQualificationInput {
+            conversation_base_branch: "main".to_string(),
+            task_relative_work_base_head_oid: "baseoid".to_string(),
+        };
+        for observed in [
+            LocalGitHeadObservation::Detached {
+                repository_identity: "/repo".to_string(),
+                head_oid: "abcd".to_string(),
+            },
+            LocalGitHeadObservation::Unborn {
+                repository_identity: "/repo".to_string(),
+                branch_name: Some("main".to_string()),
+            },
+            LocalGitHeadObservation::Unavailable {
+                repository_identity: Some("/repo".to_string()),
+                error: "git failed".to_string(),
+            },
+        ] {
+            assert!(qualifies_observed_branch(&observed, &input).is_none());
+        }
     }
 
     #[tokio::test]

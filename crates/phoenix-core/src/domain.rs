@@ -10,6 +10,7 @@ pub mod llm_error_kind;
 pub mod llm_types;
 pub mod message_text;
 pub mod mode_context;
+pub mod observed_branch;
 pub mod patch_types;
 pub mod pr_display_state;
 pub mod pr_feedback_status;
