@@ -18,6 +18,9 @@ LargeTextFallbackLight.storyName = 'large-text-fallback-light';
 export const PatchContextDark = storyFor('patch-context-dark');
 PatchContextDark.storyName = 'patch-context-dark';
 
+export const ReadRangeFocusDark = storyFor('read-range-focus-dark');
+ReadRangeFocusDark.storyName = 'read-range-focus-dark';
+
 export const LongLinesTextDark = storyFor('long-lines-text-dark');
 LongLinesTextDark.storyName = 'long-lines-text-dark';
 

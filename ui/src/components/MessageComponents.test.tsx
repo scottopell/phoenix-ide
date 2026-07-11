@@ -223,7 +223,7 @@ describe('inline tool timers', () => {
       </MemoryRouter>,
     );
 
-    expect(document.querySelector('.tool-block-output-content')).toHaveTextContent('# README Done');
+    expect(screen.getByText('Malformed read_file output')).toBeInTheDocument();
     expect(document.querySelector('.tool-block-elapsed')).toBeNull();
     expect(screen.getByText('• 1.2s')).toBeInTheDocument();
 
@@ -1367,6 +1367,76 @@ describe('finalized code fence highlighting', () => {
     });
 
     unmount();
+  });
+});
+
+describe('read_file structured result view', () => {
+  it('renders a ranged preview with metadata, copy, and open actions', async () => {
+    const onOpenFile = vi.fn();
+    const lines = Array.from({ length: 25 }, (_, index) => `${index + 40}\tfixture line ${index + 40}`).join('\n');
+
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-structured', [
+            { type: 'tool_use', id: 'tool-read-structured', name: 'read_file', input: { path: 'src/lib.rs', offset: 40, limit: 25 } },
+          ])}
+          toolResults={new Map([['tool-read-structured', toolMessage('tool-read-structured', lines)]])}
+          onOpenFile={onOpenFile}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('src/lib.rs')).toBeInTheDocument();
+    expect(screen.getByText(/25 lines • lines 40-64/)).toBeInTheDocument();
+    expect(screen.getByText('requested 25')).toBeInTheDocument();
+    expect(screen.getByText('fixture line 40')).toBeInTheDocument();
+    expect(screen.queryByText('fixture line 60')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'View full file' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'View full file' }));
+    expect(onOpenFile).toHaveBeenCalledWith('src/lib.rs', new Set(), 40, 64);
+
+    fireEvent.click(screen.getByRole('button', { name: /Copy file excerpt/i }));
+    await waitFor(() => {
+      expect(copyToClipboard).toHaveBeenCalledWith(lines);
+    });
+
+    expect(screen.getByText(/5 more returned lines/)).toBeInTheDocument();
+    expect(screen.queryByText('fixture line 60')).not.toBeInTheDocument();
+  });
+
+  it('renders empty and malformed fallback states', () => {
+    const { rerender } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-empty', [
+            { type: 'tool_use', id: 'tool-read-empty', name: 'read_file', input: { path: 'empty.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-empty', toolMessage('tool-read-empty', '')]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('(empty file)')).toBeInTheDocument();
+    expect(screen.getByText('No file content returned')).toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-malformed', [
+            { type: 'tool_use', id: 'tool-read-malformed', name: 'read_file', input: { path: 'broken.txt', offset: 10, limit: 3 } },
+          ])}
+          toolResults={new Map([['tool-read-malformed', toolMessage('tool-read-malformed', 'oops\n12\tvalid line')]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('broken.txt')).toBeInTheDocument();
+    expect(screen.getByText(/Ignored 1 non-numbered line/)).toBeInTheDocument();
+    expect(screen.getByText('valid line')).toBeInTheDocument();
   });
 });
 

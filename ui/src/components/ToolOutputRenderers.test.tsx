@@ -7,6 +7,7 @@ import {
   BrowserConsoleLogsView,
   SearchResultsView,
   KeywordSearchView,
+  __readFileResultTestables,
 } from './MessageComponents';
 
 describe('parseSearchOutput', () => {
@@ -239,3 +240,23 @@ describe('search result CSS contracts', () => {
   });
 });
 
+
+
+describe('parseReadFileOutput', () => {
+  it('parses numbered read_file lines with tabs', () => {
+    const parsed = __readFileResultTestables.parseOutput('12\talpha\n13\tbeta');
+    expect(parsed.malformed).toBe(false);
+    expect(parsed.notes).toEqual([]);
+    expect(parsed.lines).toEqual([
+      { lineNumber: 12, content: 'alpha' },
+      { lineNumber: 13, content: 'beta' },
+    ]);
+  });
+
+  it('marks non-numbered output as malformed fallback data', () => {
+    const parsed = __readFileResultTestables.parseOutput('not numbered\n12\tstill parsed');
+    expect(parsed.malformed).toBe(true);
+    expect(parsed.notes).toEqual(['not numbered']);
+    expect(parsed.lines).toEqual([{ lineNumber: 12, content: 'still parsed' }]);
+  });
+});

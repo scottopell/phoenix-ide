@@ -216,6 +216,13 @@ const byId: Record<MetaViewerScenarioId, Omit<MetaViewerScenario, 'id' | 'title'
       patchContext: { modifiedLines: new Set([3, 4, 5]), firstModifiedLine: 3 },
     }),
   },
+  'read-range-focus-dark': {
+    settleSelector: '.phoenix-file-codeview [data-line="3"]',
+    payload: textPayload('config/service.txt', PATCH_FILE, {
+      focusLine: 3,
+      focusRange: { startLine: 3, endLine: 5 },
+    }),
+  },
   'long-lines-text-dark': {
     settleSelector: '.phoenix-file-codeview [data-line]',
     payload: textPayload('logs/long-lines.txt', LONG_LINES_TEXT),

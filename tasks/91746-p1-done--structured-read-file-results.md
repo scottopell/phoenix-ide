@@ -1,0 +1,3 @@
+# Add structured read-file result rendering
+
+Implement the locked read_file experience: a production-shaped inline, line-numbered syntax-highlighted preview with path, requested/returned range, line count, truncation state, copy action, and actions that open the complete current file in the existing viewer focused/highlighted on the requested range. Cover short, long, ranged, EOF-shortened, long-line, empty, missing-file error, and malformed legacy results in deterministic full/compact fixtures captured on desktop and mobile. Do not expand giant results inline. Add focused derivation/component/viewer-command tests, run QA captures and full checks, and present screenshots.

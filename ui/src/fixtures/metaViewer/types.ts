@@ -32,6 +32,7 @@ export const metaViewerScenarioDefinitions = [
   { id: 'large-text-fallback-dark', title: 'Large-file plain-text fallback', theme: 'dark', interaction: 'none' },
   { id: 'large-text-fallback-light', title: 'Large-file plain-text fallback / light', theme: 'light', interaction: 'none' },
   { id: 'patch-context-dark', title: 'Patch context: changed lines + banner', theme: 'dark', interaction: 'none' },
+  { id: 'read-range-focus-dark', title: 'Tool read: full file focused on requested range', theme: 'dark', interaction: 'none' },
   { id: 'long-lines-text-dark', title: 'Plain text with lines past the viewport', theme: 'dark', interaction: 'none' },
   { id: 'long-lines-code-dark', title: 'Code with lines past the viewport', theme: 'dark', interaction: 'none' },
   { id: 'html-source-dark', title: 'HTML source mode', theme: 'dark', interaction: 'none' },

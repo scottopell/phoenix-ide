@@ -36,7 +36,7 @@ import type { ViewerBodyProps } from './AnnotatableBlock';
 export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   useRegisterFocusScope('file-viewer');
 
-  const { absolutePath, title, onClose, onSendNotes, inline, focusLine } = payload;
+  const { absolutePath, title, onClose, onSendNotes, inline, focusLine, focusRange } = payload;
   const textLike = isTextLikePayload(payload);
   const content = textLike ? payload.content : '';
   const patchContext: PatchContext | undefined = textLike ? payload.patchContext : undefined;
@@ -182,21 +182,22 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // Auto-scroll to a search/jump target line. Runs after file content is loaded
   // and flashes the line without creating a review note.
   useEffect(() => {
-    if (!content || !focusLine) return undefined;
+    const targetLine = focusRange?.startLine ?? focusLine;
+    if (!content || !targetLine) return undefined;
     const timer = setTimeout(() => {
       if (usePierreCode) {
-        fileCodeRef.current?.scrollToLine(focusLine);
-        highlight(focusLine);
+        fileCodeRef.current?.scrollToLine(targetLine);
+        highlight(targetLine);
       } else {
-        const lineEl = lineRefs.current.get(focusLine);
+        const lineEl = lineRefs.current.get(targetLine);
         if (lineEl) {
           lineEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          highlight(focusLine);
+          highlight(targetLine);
         }
       }
     }, 100);
     return () => clearTimeout(timer);
-  }, [content, focusLine, highlight, usePierreCode]);
+  }, [content, focusLine, focusRange, highlight, usePierreCode]);
 
   // Jump-to-line lives here, not in the notes hook, because it needs the DOM
   // refs the rendered body registers into `lineRefs`.
@@ -220,7 +221,14 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     [absolutePath, highlight, closePanel, usePierreCode],
   );
 
-  const modifiedLines = patchContext?.modifiedLines ?? EMPTY_SET;
+  const focusedRangeLines = useMemo(() => {
+    if (!focusRange) return EMPTY_SET;
+    return new Set(Array.from(
+      { length: focusRange.endLine - focusRange.startLine + 1 },
+      (_, index) => focusRange.startLine + index,
+    ));
+  }, [focusRange]);
+  const modifiedLines = patchContext?.modifiedLines ?? focusedRangeLines;
   const bodyProps: ViewerBodyProps = {
     content,
     modifiedLines,
@@ -286,6 +294,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   ) : null;
 
   const patchChangeCount = patchContext?.modifiedLines.size ?? 0;
+  const rangeLineCount = focusedRangeLines.size;
   const banner: ReactNode = largeFallback ? (
     <span>
       Large file shown as plain text for responsiveness. Rich highlighting and line notes are disabled.
@@ -297,6 +306,10 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     <span>
       Viewing {title}: {patchChangeCount} change
       {patchChangeCount !== 1 ? 's' : ''} from patch
+    </span>
+  ) : textLike && rangeLineCount > 0 && focusRange ? (
+    <span>
+      Showing the current file focused on lines {focusRange.startLine}–{focusRange.endLine} read by the agent
     </span>
   ) : null;
 
@@ -345,7 +358,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           notes={notes.fileNotes}
           modifiedLines={modifiedLines}
           highlightedLine={notes.highlightedLine}
-          firstModifiedLine={patchContext?.firstModifiedLine ?? focusLine}
+          firstModifiedLine={patchContext?.firstModifiedLine ?? focusRange?.startLine ?? focusLine}
           scrollKey={scrollKey}
           onAnnotateLine={notes.startAnnotate}
         />

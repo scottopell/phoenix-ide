@@ -1,0 +1,133 @@
+.read-file-result {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.read-file-result-meta {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.read-file-result-meta-main {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.read-file-result-path {
+  color: var(--text-primary);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.read-file-result-summary,
+.read-file-result-note {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.read-file-result-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.read-file-result-open {
+  border: 1px solid var(--border-color);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.read-file-result-open:hover,
+.read-file-result-open:focus-visible {
+  background: var(--bg-hover, var(--bg-secondary));
+  outline: none;
+}
+
+.read-file-result-preview {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--code-bg);
+}
+
+.read-file-result-line {
+  display: grid;
+  grid-template-columns: minmax(3.5rem, auto) minmax(0, 1fr);
+  gap: 10px;
+  padding: 3px 8px;
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 65%, transparent);
+}
+
+.read-file-result-line:first-child {
+  border-top: none;
+}
+
+.read-file-result-lineno {
+  text-align: right;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.read-file-result-content,
+.read-file-result-raw,
+.read-file-result-empty {
+  white-space: pre;
+  color: var(--text-primary);
+}
+
+.read-file-result-content {
+  overflow-x: auto;
+}
+
+.read-file-result-more {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.read-file-result-fallback {
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.read-file-result-raw {
+  margin: 0;
+  padding: 8px;
+  background: var(--code-bg);
+}
+
+@media (width <= 640px) {
+  .read-file-result {
+    padding: 8px;
+  }
+
+  .read-file-result-line {
+    grid-template-columns: 3rem minmax(0, 1fr);
+    gap: 8px;
+    padding: 3px 6px;
+  }
+
+  .read-file-result-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .read-file-result-open {
+    flex: 1;
+  }
+}
