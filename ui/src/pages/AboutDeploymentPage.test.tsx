@@ -403,6 +403,71 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(abortedSignals[0]?.aborted).toBe(true);
     consoleError.mockRestore();
   });
+  it('starts a new request on visible immediately after hide even when the old promise ignores abort', async () => {
+    let resolveFirst: ((value: AboutResourcesSnapshot) => void) | undefined;
+    let resolveSecond: ((value: AboutResourcesSnapshot) => void) | undefined;
+    const abortedSignals: AbortSignal[] = [];
+    apiMock.deploymentInfo.mockResolvedValue(deployment());
+    apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
+    apiMock.deploymentResources
+      .mockImplementationOnce(({ signal }: { signal: AbortSignal }) => {
+        abortedSignals.push(signal);
+        return new Promise<AboutResourcesSnapshot>((resolve) => {
+          resolveFirst = resolve;
+        });
+      })
+      .mockImplementationOnce(({ signal }: { signal: AbortSignal }) => {
+        abortedSignals.push(signal);
+        return new Promise<AboutResourcesSnapshot>((resolve) => {
+          resolveSecond = resolve;
+        });
+      });
+
+    render(
+      <MemoryRouter>
+        <AboutDeploymentPage />
+      </MemoryRouter>,
+    );
+
+    expect(apiMock.deploymentResources).toHaveBeenCalledTimes(1);
+    expect(abortedSignals[0]?.aborted).toBe(false);
+
+    Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'hidden' });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+    });
+    expect(abortedSignals[0]?.aborted).toBe(true);
+
+    Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'visible' });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+    });
+    expect(apiMock.deploymentResources).toHaveBeenCalledTimes(2);
+    expect(abortedSignals[1]?.aborted).toBe(false);
+
+    const second = resolveSecond;
+    if (!second) throw new Error('expected second resource request to be pending');
+    await act(async () => {
+      second(resourcesSnapshot({ sampled_at: '2026-06-01T00:00:10Z', managed_total: { cpu_percent: 40, memory_bytes: 4 * 1024, process_count: 3, deduplicated_pid_count: 2 } }));
+      await Promise.resolve();
+    });
+    expect(screen.getByText(/Resource sample captured/)).not.toHaveTextContent('stale');
+    expect(screen.getByText('40.0%')).toBeInTheDocument();
+
+    const first = resolveFirst;
+    if (!first) throw new Error('expected first resource request to be pending');
+    await act(async () => {
+      first(resourcesSnapshot({ sampled_at: '2026-06-01T00:00:20Z', managed_total: { cpu_percent: 5, memory_bytes: 512, process_count: 1, deduplicated_pid_count: 1 } }));
+      await Promise.resolve();
+    });
+
+    expect(apiMock.deploymentResources).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('40.0%')).toBeInTheDocument();
+    expect(screen.queryByText('5.0%')).not.toBeInTheDocument();
+    expect(screen.getByText(/Resource sample captured/)).not.toHaveTextContent('stale');
+  });
 
   it('highlights managed worktrees when they are the largest measured category', async () => {
     renderPage(deployment(), deploymentDisk({

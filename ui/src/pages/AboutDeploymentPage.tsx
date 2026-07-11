@@ -571,6 +571,34 @@ export function AboutDeploymentPage() {
   const resourcesGenerationRef = useRef(0);
   const activeResourceRequestRef = useRef<ActiveResourceRequest | null>(null);
 
+  const invalidateActiveResourceRequest = useCallback(() => {
+    resourcesGenerationRef.current += 1;
+    const activeRequest = activeResourceRequestRef.current;
+    if (!activeRequest) {
+      resourcesInFlightRef.current = false;
+      if (resourcesMountedRef.current) {
+        setResources((current) => ({
+          ...current,
+          loading: false,
+          stale: current.sample !== null,
+        }));
+      }
+      return;
+    }
+    activeRequest.abort();
+    if (activeResourceRequestRef.current === activeRequest) {
+      activeResourceRequestRef.current = null;
+    }
+    resourcesInFlightRef.current = false;
+    if (resourcesMountedRef.current) {
+      setResources((current) => ({
+        ...current,
+        loading: false,
+        stale: current.sample !== null,
+      }));
+    }
+  }, []);
+
   const handleReveal = useCallback((path: string) => {
     setRevealError(null);
     api.revealPath(path).catch((e) => {
@@ -651,7 +679,11 @@ export function AboutDeploymentPage() {
     if (document.visibilityState === 'visible') {
       fetchResources();
     } else {
-      setResources((current) => ({ ...current, loading: false }));
+      setResources((current) => ({
+        ...current,
+        loading: false,
+        stale: current.sample !== null,
+      }));
     }
     schedule();
 
@@ -660,20 +692,17 @@ export function AboutDeploymentPage() {
         fetchResources();
         return;
       }
-      activeResourceRequestRef.current?.abort();
+      invalidateActiveResourceRequest();
     };
 
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       resourcesMountedRef.current = false;
-      resourcesGenerationRef.current += 1;
-      activeResourceRequestRef.current?.abort();
-      resourcesInFlightRef.current = false;
-      activeResourceRequestRef.current = null;
+      invalidateActiveResourceRequest();
       if (resourcesTimerRef.current !== null) window.clearTimeout(resourcesTimerRef.current);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [fetchResources]);
+  }, [fetchResources, invalidateActiveResourceRequest]);
 
   const handleCleanup = useCallback((path: string) => {
     setCleanupPath(path);
