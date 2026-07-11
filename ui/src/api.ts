@@ -2,6 +2,7 @@ import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
+import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktreeCleanupResponse';
 import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
@@ -1029,6 +1030,12 @@ export const api = {
   async deploymentDiskInfo(): Promise<DeploymentDiskInfo> {
     const resp = await fetch('/api/deployment/disk');
     if (!resp.ok) throw new Error('Failed to load deployment disk info');
+    return resp.json();
+  },
+
+  async deploymentResources(): Promise<AboutResourcesSnapshot> {
+    const resp = await fetch('/api/about/resources');
+    if (!resp.ok) throw new Error('Failed to load deployment resources');
     return resp.json();
   },
 
