@@ -1646,6 +1646,7 @@ async fn create_conversation_with_id(
             tracing::info!(conversation_id = %id, "Create request hit existing conversation id");
             let mut conversation_json = conversation_to_json(&state, &conv, None);
             inject_creation_job_state_fields(&state, &conv, &mut conversation_json).await;
+            state.runtime.kick_creation_worker();
             return Ok(Json(ConversationResponse {
                 conversation: conversation_json,
             }));
@@ -1671,6 +1672,7 @@ async fn create_conversation_with_id(
             tracing::info!(message_id = %req.message_id, "Create request hit existing creation job message id");
             let mut conversation_json = conversation_to_json(&state, &conv, None);
             inject_creation_job_state_fields(&state, &conv, &mut conversation_json).await;
+            state.runtime.kick_creation_worker();
             return Ok(Json(ConversationResponse {
                 conversation: conversation_json,
             }));

@@ -2602,19 +2602,31 @@ impl Database {
     /// Returns [`DbError`] if the update fails.
     pub async fn schedule_conversation_creation_cleanup_retry(
         &self,
-        job_id: &str,
+        cleanup: &CreationCleanupJob,
         next_attempt_at: DateTime<Utc>,
-    ) -> DbResult<()> {
-        sqlx::query(
+    ) -> DbResult<CreationCasOutcome> {
+        let result = sqlx::query(
             "UPDATE conversation_creation_jobs
-             SET updated_at = ?1
-             WHERE id = ?2 AND status IN ('cancelling', 'deletion_pending', 'failed')",
+             SET updated_at = ?1, cleanup_worker_id = NULL, cleanup_token = NULL,
+                 cleanup_lease_until = NULL
+             WHERE id = ?2 AND generation = ?3
+               AND status IN ('cancelling', 'deletion_pending', 'failed')
+               AND cleanup_worker_id = ?4 AND cleanup_token = ?5",
         )
         .bind(next_attempt_at.to_rfc3339())
-        .bind(job_id)
+        .bind(&cleanup.job_id)
+        .bind(i64::try_from(cleanup.generation).map_err(|_| {
+            DbError::Serialization("cleanup generation exceeds SQLite integer".to_string())
+        })?)
+        .bind(&cleanup.worker_id)
+        .bind(&cleanup.token)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(if result.rows_affected() == 1 {
+            CreationCasOutcome::Applied
+        } else {
+            CreationCasOutcome::ClaimLost
+        })
     }
 
     /// Mark one reserved resource released after reconciliation.
@@ -8100,6 +8112,58 @@ mod tests {
         assert_eq!(reservations.len(), 1);
         assert_eq!(reservations[0].generation, second_claim.generation);
         assert_eq!(reservations[0].status, "present");
+    }
+
+    #[tokio::test]
+    async fn creation_cleanup_retry_clears_lease_and_uses_retry_deadline() {
+        let db = Database::open_in_memory().await.unwrap();
+        insert_test_creation_job(&db, "job-cleanup-retry", "conv-cleanup-retry").await;
+        let now = Utc::now();
+        db.cancel_conversation_creation("conv-cleanup-retry", now)
+            .await
+            .unwrap();
+        let cleanup = db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-a",
+                "cleanup-token-a",
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("cleanup claim");
+        let retry_at = now + chrono::Duration::seconds(60);
+
+        assert_eq!(
+            db.schedule_conversation_creation_cleanup_retry(&cleanup, retry_at)
+                .await
+                .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        assert_eq!(
+            db.next_conversation_creation_deadline().await.unwrap(),
+            Some(retry_at)
+        );
+        assert!(db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-b",
+                "cleanup-token-b",
+                now + chrono::Duration::seconds(31),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .claim_next_conversation_creation_cleanup(
+                "cleanup-b",
+                "cleanup-token-b",
+                retry_at,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

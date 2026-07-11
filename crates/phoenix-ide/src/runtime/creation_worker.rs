@@ -34,7 +34,7 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
             manager
                 .db()
                 .schedule_conversation_creation_cleanup_retry(
-                    &cleanup.job_id,
+                    &cleanup,
                     chrono::Utc::now() + chrono::Duration::seconds(30),
                 )
                 .await
@@ -101,13 +101,7 @@ async fn reconcile_creation_cleanup(
             if !owned {
                 return Ok(());
             }
-            let path = Path::new(&resource);
-            if path.exists() {
-                crate::git_ops::run_git(
-                    Path::new(&repo),
-                    &["worktree", "remove", "--force", &resource],
-                )?;
-            }
+            remove_owned_worktree_for_cleanup(&repo, Path::new(&resource))?;
             Ok(())
         })
         .await
@@ -938,6 +932,43 @@ fn managed_worktree_error_to_kind(error: ManagedWorktreeError) -> (String, Error
 }
 
 #[cfg(test)]
+mod partial_worktree_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_removes_unregistered_partial_directory() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        let partial = repo.path().join(".phoenix/worktrees/conversation");
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join("partial"), b"incomplete").unwrap();
+
+        remove_owned_worktree_for_cleanup(&repo.path().to_string_lossy(), &partial).unwrap();
+        assert!(!partial.exists());
+    }
+}
+
+#[cfg(test)]
+mod worktree_repository_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_checkout_is_not_adopted_for_reserved_repository() {
+        let expected = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(expected.path(), &["init"]).unwrap();
+        crate::git_ops::run_git(foreign.path(), &["init"]).unwrap();
+
+        let error = validate_worktree_belongs_to_repository(
+            &expected.path().to_string_lossy(),
+            foreign.path(),
+        )
+        .expect_err("foreign checkout must not be adopted");
+        assert_eq!(error.1, ErrorKind::InvalidRequest);
+    }
+}
+
+#[cfg(test)]
 mod partial_worktree_reconciliation_tests {
     use super::*;
 
@@ -1064,6 +1095,47 @@ mod repository_lock_tests {
     }
 }
 
+fn remove_owned_worktree_for_cleanup(repo_root: &str, path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match phoenix_core::git::detect_git_repo_root(path) {
+        Some(detected) => {
+            let owning_repo = Path::new(repo_root)
+                .canonicalize()
+                .map_err(|error| format!("Could not canonicalize repository {repo_root}: {error}"))?
+                .to_string_lossy()
+                .to_string();
+            if detected == owning_repo {
+                std::fs::remove_dir_all(path).map_err(|error| {
+                    format!(
+                        "Could not remove partial worktree {}: {error}",
+                        path.display()
+                    )
+                })?;
+            } else {
+                validate_existing_worktree(path).map_err(|(message, _)| message)?;
+                validate_worktree_belongs_to_repository(repo_root, path)
+                    .map_err(|(message, _)| message)?;
+                crate::git_ops::run_git(
+                    Path::new(repo_root),
+                    &["worktree", "remove", "--force", &path.to_string_lossy()],
+                )?;
+            }
+        }
+        None => {
+            std::fs::remove_dir_all(path).map_err(|error| {
+                format!(
+                    "Could not remove partial worktree {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    let _ = crate::git_ops::run_git(Path::new(repo_root), &["worktree", "prune"]);
+    Ok(())
+}
+
 fn reconcile_owned_worktree_path(
     repo_root: &str,
     path: &Path,
@@ -1084,6 +1156,7 @@ fn reconcile_owned_worktree_path(
             .to_string();
         if detected != owning_repo {
             validate_existing_worktree(path)?;
+            validate_worktree_belongs_to_repository(repo_root, path)?;
             return Ok(true);
         }
     }
@@ -1112,6 +1185,32 @@ fn reconcile_owned_worktree_path(
     })?;
     let _ = crate::git_ops::run_git(Path::new(repo_root), &["worktree", "prune"]);
     Ok(false)
+}
+
+fn validate_worktree_belongs_to_repository(
+    repo_root: &str,
+    worktree: &Path,
+) -> Result<(), (String, ErrorKind)> {
+    let common_dir = |cwd: &Path| {
+        crate::git_ops::run_git(
+            cwd,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .map(|value| value.trim().to_string())
+        .map_err(|error| (error, ErrorKind::ServerError))
+    };
+    let expected = common_dir(Path::new(repo_root))?;
+    let actual = common_dir(worktree)?;
+    if actual != expected {
+        return Err((
+            format!(
+                "Existing worktree {} belongs to a different repository",
+                worktree.display()
+            ),
+            ErrorKind::InvalidRequest,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_existing_worktree(path: &Path) -> Result<(), (String, ErrorKind)> {
