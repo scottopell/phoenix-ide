@@ -79,12 +79,14 @@ const virtuosoMock = {
   scrollToIndex: vi.fn(),
   totalListHeightChanged: null as ((height: number) => void) | null,
   atBottomStateChange: null as ((atBottom: boolean) => void) | null,
+  renderedIndices: null as Set<number> | null,
 };
 
 beforeEach(() => {
   virtuosoMock.scrollToIndex = vi.fn();
   virtuosoMock.totalListHeightChanged = null;
   virtuosoMock.atBottomStateChange = null;
+  virtuosoMock.renderedIndices = null;
   agentRenderCounter.count = 0;
   agentMessageProps.length = 0;
 });
@@ -131,6 +133,7 @@ vi.mock('react-virtuoso', () => ({
       >
         {Header && <Header context={context as C} />}
         {data.map((item, i) => {
+          if (virtuosoMock.renderedIndices && !virtuosoMock.renderedIndices.has(i)) return null;
           const key = computeItemKey ? computeItemKey(i, item) : i;
           return <div key={key}>{itemContent(i, item, context as C)}</div>;
         })}
@@ -444,6 +447,65 @@ describe('MessageList', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('highlights only the newest pending jump when virtualized rows mount late', () => {
+    const historical = Array.from({ length: 3 }, (_, i) => makeMessage(i + 1, 'user'));
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    virtuosoMock.renderedIndices = new Set([0]);
+    const renderList = () => withConvContext(
+      <MessageList
+        ref={listRef}
+        messages={historical}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-delayed-jumps"
+      />,
+    );
+    const { container, rerender } = render(renderList());
+    const scroller = container.querySelector<HTMLElement>('#messages')!;
+    scroller.scrollTop = 100;
+
+    act(() => listRef.current?.scrollToUnitIndex(1));
+    act(() => listRef.current?.scrollToUnitIndex(2));
+    expect(virtuosoMock.scrollToIndex).toHaveBeenCalledTimes(2);
+
+    virtuosoMock.renderedIndices = new Set([0, 1]);
+    rerender(renderList());
+    expect(container.querySelector('[data-render-unit-key="msg-2"] .message')).not.toHaveClass('jump-highlight');
+
+    virtuosoMock.renderedIndices = new Set([0, 1, 2]);
+    rerender(renderList());
+    expect(container.querySelector('[data-render-unit-key="msg-2"] .message')).not.toHaveClass('jump-highlight');
+    expect(container.querySelector('[data-render-unit-key="msg-3"] .message')).toHaveClass('jump-highlight');
+    expect(scroller.scrollTop).toBe(100);
+    expect(virtuosoMock.scrollToIndex).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not apply a pending highlight to a new conversation reusing the same row key', () => {
+    const listRef = createRef<React.ElementRef<typeof MessageList>>();
+    const messages = [makeMessage(1, 'user')];
+    virtuosoMock.renderedIndices = new Set();
+    const renderList = (conversationId: string) => withConvContext(
+      <MessageList
+        ref={listRef}
+        messages={messages}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId={conversationId}
+      />,
+    );
+    const { container, rerender } = render(renderList('conv-old'));
+
+    act(() => listRef.current?.scrollToUnitIndex(0));
+    virtuosoMock.renderedIndices = new Set([0]);
+    rerender(renderList('conv-new'));
+
+    expect(container.querySelector('[data-render-unit-key="msg-1"] .message')).not.toHaveClass('jump-highlight');
   });
 
   // Toggling the system prompt must not change the Virtuoso Header slot's

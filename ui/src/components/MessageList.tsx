@@ -601,7 +601,7 @@ function MessageListImpl({
   // A navigation jump has one positioning owner: Virtuoso. The selected key
   // remains pending until its virtualized row mounts, at which point the row
   // ref applies presentation-only highlighting without moving the scroller.
-  const pendingPulseKeyRef = useRef<string | null>(null);
+  const pendingPulseRef = useRef<{ conversationId: string | undefined; key: string } | null>(null);
   const highlightedTargetRef = useRef<Element | null>(null);
   const jumpedTargetMessageIdRef = useRef<string | null>(null);
   const pulseTimerRef = useRef(0);
@@ -616,8 +616,14 @@ function MessageListImpl({
   }, []);
 
   const pulseMountedRow = useCallback((key: string, row: HTMLDivElement | null) => {
-    if (row === null || pendingPulseKeyRef.current !== key) return;
-    pendingPulseKeyRef.current = null;
+    const pending = pendingPulseRef.current;
+    if (
+      row === null ||
+      pending === null ||
+      pending.conversationId !== conversationId ||
+      pending.key !== key
+    ) return;
+    pendingPulseRef.current = null;
     clearHighlight();
     const target = row.querySelector('.message') ?? row;
     highlightedTargetRef.current = target;
@@ -627,15 +633,15 @@ function MessageListImpl({
       if (highlightedTargetRef.current === target) highlightedTargetRef.current = null;
       pulseTimerRef.current = 0;
     }, 1500);
-  }, [clearHighlight]);
+  }, [clearHighlight, conversationId]);
 
   useEffect(() => () => {
-    pendingPulseKeyRef.current = null;
+    pendingPulseRef.current = null;
     clearHighlight();
   }, [clearHighlight]);
 
   useEffect(() => {
-    pendingPulseKeyRef.current = null;
+    pendingPulseRef.current = null;
     clearHighlight();
   }, [conversationId, clearHighlight]);
 
@@ -650,14 +656,14 @@ function MessageListImpl({
     if (!unit) return;
     dispatchScrollEvent({ type: 'navigationJumped' });
     clearHighlight();
-    pendingPulseKeyRef.current = unit.key;
+    pendingPulseRef.current = { conversationId, key: unit.key };
     virtuosoRef.current?.scrollToIndex({
       index: unitIndex,
       align: 'center',
       behavior: 'auto',
     });
     pulseIfMounted(unit.key);
-  }, [historicalUnits, clearHighlight, dispatchScrollEvent, pulseIfMounted]);
+  }, [historicalUnits, clearHighlight, conversationId, dispatchScrollEvent, pulseIfMounted]);
 
   const findUnitIndexByMessageId = useCallback((messageId: string) => {
     return historicalUnits.findIndex((unit) => {
