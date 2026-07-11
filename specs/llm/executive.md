@@ -6,6 +6,8 @@ The LLM provider abstracts communication with multiple LLM APIs behind a common 
 
 ## Technical Summary
 
+The ChatGPT/Codex-auth backend supports automatic prompt caching with a stable `prompt_cache_key` but rejects GPT-5.6 direct-platform `prompt_cache_options` and explicit breakpoints. A pinned upstream codex-rs and sanitized live-wire investigation is recorded in [`codex-prompt-caching-investigation.md`](../../docs/research/codex-prompt-caching-investigation.md). Confirmed parity work is tracked separately for Responses Lite request shaping, WebSocket continuation, account-specific model discovery, and stable system-prompt snapshots.
+
 Implements `LlmService` trait with `complete()` method returning `LlmResponse`. Backend implementations translate common request format to Anthropic Messages or OpenAI Responses JSON and normalize responses back. Base URL overrides are exact endpoints; Phoenix does not construct gateway paths. `ModelRegistry` merges built-in specs with additive configured specs, registers only models with an available auth route, and keeps Codex bridge routing scoped to built-in OpenAI Responses models. `LlmError` includes exhaustive `LlmErrorKind` enum (no `Unknown` variant, no catch-all) with separate `auto_retry_policy()` and `user_resume_policy()` methods. `LoggingService` wrapper records model, duration, and token counts. Usage tracking includes input/output tokens and cache statistics for context window computation.
 
 ## Status Summary
