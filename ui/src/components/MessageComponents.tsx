@@ -1682,7 +1682,7 @@ function parseReadFileOutput(text: string): ReadFileParseResult {
 
   for (const rawLine of text.split('\n')) {
     if (!rawLine.trim()) continue;
-    const match = /^(\d+)\t([\s\S]*)$/.exec(rawLine);
+    const match = /^\s*(\d+)\t([\s\S]*)$/.exec(rawLine);
     if (match && match[1] !== undefined) {
       lines.push({ lineNumber: parseInt(match[1], 10), content: match[2] ?? '' });
       continue;
@@ -1721,6 +1721,11 @@ function buildReadFileCopyText(_request: ReadFileRequest, parsed: ReadFileParseR
   return parsed.lines.map((line) => `${line.lineNumber}\t${line.content}`).join('\n');
 }
 
+function canOpenReadFilePath(path: string): boolean {
+  if (!path || path.startsWith('/')) return false;
+  return !path.split(/[\\/]+/).includes('..');
+}
+
 function ReadFileResultView({
   input,
   rawText,
@@ -1743,19 +1748,14 @@ function ReadFileResultView({
   const firstVisibleLine = metadata.returned_start_line ?? parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
   const lastVisibleLine = metadata.returned_end_line ?? parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
 
-  if (parsed.lines.length === 0) {
+  if (metadata.returned_line_count === 0) {
     return (
-      <div className="read-file-result read-file-result-fallback" data-read-file-state={parsed.malformed ? 'malformed' : 'empty'}>
+      <div className="read-file-result read-file-result-fallback" data-read-file-state="empty">
         <div className="read-file-result-meta">
           <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
-          <span className="read-file-result-summary">
-            {parsed.malformed ? 'Malformed read_file output' : 'No file content returned'}
-          </span>
+          <span className="read-file-result-summary">No file content returned</span>
         </div>
-        <div className="read-file-result-empty">
-          {parsed.malformed ? 'The tool returned text that was not line-numbered.' : '(empty file)'}
-        </div>
-        {rawText && <pre className="read-file-result-raw">{rawText}</pre>}
+        <div className="read-file-result-empty">(empty file)</div>
       </div>
     );
   }
@@ -1775,7 +1775,7 @@ function ReadFileResultView({
           <span className="read-file-result-summary">requested {metadata.requested_limit}</span>
         </div>
         <div className="read-file-result-actions">
-          {onOpenFile && request.path && (
+          {onOpenFile && canOpenReadFilePath(request.path) && (
             <button
               type="button"
               className="read-file-result-open"

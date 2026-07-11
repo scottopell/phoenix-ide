@@ -244,6 +244,10 @@ describe('search result CSS contracts', () => {
 
 describe('parseReadFileOutput', () => {
   it('parses numbered read_file lines with tabs', () => {
+    const padded = __readFileResultTestables.parseOutput('     7\tproduction format');
+    expect(padded.malformed).toBe(false);
+    expect(padded.lines).toEqual([{ lineNumber: 7, content: 'production format' }]);
+
     const parsed = __readFileResultTestables.parseOutput('12\talpha\n13\tbeta');
     expect(parsed.malformed).toBe(false);
     expect(parsed.notes).toEqual([]);

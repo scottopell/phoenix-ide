@@ -253,12 +253,15 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   );
 
   const focusedRangeLines = useMemo(() => {
-    if (!focusRange) return EMPTY_SET;
+    if (!focusRange || !content) return EMPTY_SET;
+    const loadedLineCount = content.split('\n').length;
+    const startLine = Math.max(1, Math.min(focusRange.startLine, loadedLineCount));
+    const endLine = Math.max(startLine, Math.min(focusRange.endLine, loadedLineCount));
     return new Set(Array.from(
-      { length: focusRange.endLine - focusRange.startLine + 1 },
-      (_, index) => focusRange.startLine + index,
+      { length: endLine - startLine + 1 },
+      (_, index) => startLine + index,
     ));
-  }, [focusRange]);
+  }, [content, focusRange]);
   const modifiedLines = patchContext?.modifiedLines ?? focusedRangeLines;
   const bodyProps: ViewerBodyProps = {
     content,

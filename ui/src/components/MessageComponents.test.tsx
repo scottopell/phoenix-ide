@@ -1480,6 +1480,39 @@ describe('read_file structured result view', () => {
     expect(screen.queryByText('fixture line 60')).not.toBeInTheDocument();
   });
 
+  it('hides the viewer action for absolute and traversal read paths', () => {
+    const metadata = {
+      type: 'read_file', requested_offset: 1, requested_limit: 1,
+      returned_start_line: 1, returned_end_line: 1, returned_line_count: 1,
+      total_line_count: 1, remaining_line_count: 0,
+    };
+    const { rerender } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-absolute', [
+            { type: 'tool_use', id: 'tool-read-absolute', name: 'read_file', input: { path: '/tmp/outside.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-absolute', toolMessage('tool-read-absolute', '     1\toutside', 2, { ...metadata, path: '/tmp/outside.txt' })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByRole('button', { name: 'View full file' })).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-traversal', [
+            { type: 'tool_use', id: 'tool-read-traversal', name: 'read_file', input: { path: '../outside.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-traversal', toolMessage('tool-read-traversal', '     1\toutside', 2, { ...metadata, path: '../outside.txt' })]])}
+          onOpenFile={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByRole('button', { name: 'View full file' })).not.toBeInTheDocument();
+  });
+
   it('renders empty and malformed fallback states', () => {
     const { rerender } = render(
       <MemoryRouter>
