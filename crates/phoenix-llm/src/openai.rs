@@ -60,10 +60,8 @@ pub async fn complete(
 
     let url = resolve_endpoint(base_url_override);
     let mut responses_request =
-        translate_to_responses_request(&spec.api_name, request, use_codex_backend);
-    if !request_tags.is_empty() {
-        responses_request.tags = Some(request_tags.clone());
-    }
+        translate_to_backend_request(&spec.api_name, request, use_codex_backend);
+    responses_request.set_tags(request_tags);
 
     let client = Client::builder()
         .timeout(Duration::from_mins(5))
@@ -74,6 +72,9 @@ pub async fn complete(
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json");
+    if use_codex_backend && supports_responses_lite(&spec.api_name) {
+        builder = builder.header("x-openai-internal-codex-responses-lite", "true");
+    }
     builder = apply_source_header(builder, custom_headers);
     let response = builder.json(&responses_request).send().await.map_err(|e| {
         if e.is_timeout() {
@@ -466,11 +467,9 @@ pub async fn complete_streaming(
 
     let url = resolve_endpoint(base_url_override);
     let mut responses_request =
-        translate_to_responses_request(&spec.api_name, request, use_codex_backend);
-    responses_request.stream = Some(true);
-    if !request_tags.is_empty() {
-        responses_request.tags = Some(request_tags.clone());
-    }
+        translate_to_backend_request(&spec.api_name, request, use_codex_backend);
+    responses_request.set_streaming();
+    responses_request.set_tags(request_tags);
 
     let client = Client::builder()
         .timeout(Duration::from_mins(10))
@@ -481,6 +480,9 @@ pub async fn complete_streaming(
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json");
+    if use_codex_backend && supports_responses_lite(&spec.api_name) {
+        builder = builder.header("x-openai-internal-codex-responses-lite", "true");
+    }
     builder = apply_source_header(builder, custom_headers);
     let response = builder.json(&responses_request).send().await.map_err(|e| {
         if e.is_timeout() {
@@ -774,6 +776,23 @@ fn translate_to_responses_request(
     }
 }
 
+fn translate_to_backend_request(
+    api_name: &str,
+    request: &LlmRequest,
+    use_codex_backend: bool,
+) -> ResponsesBackendRequest {
+    let platform = translate_to_responses_request(api_name, request, use_codex_backend);
+    if use_codex_backend && supports_responses_lite(api_name) {
+        ResponsesBackendRequest::CodexLite(CodexResponsesLiteRequest::from_platform(platform))
+    } else {
+        ResponsesBackendRequest::Platform(platform)
+    }
+}
+
+fn supports_responses_lite(api_name: &str) -> bool {
+    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-")
+}
+
 fn supports_explicit_prompt_cache(api_name: &str) -> bool {
     api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-")
 }
@@ -786,7 +805,8 @@ fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem]) {
 
     let mut messages = items.iter_mut().filter_map(|item| match item {
         ResponsesApiInputItem::Message { content, .. } => Some(content),
-        ResponsesApiInputItem::FunctionCall { .. }
+        ResponsesApiInputItem::AdditionalTools { .. }
+        | ResponsesApiInputItem::FunctionCall { .. }
         | ResponsesApiInputItem::FunctionCallOutput { .. } => None,
     });
     let Some(_implicit_latest_message) = messages.next_back() else {
@@ -1002,6 +1022,96 @@ struct OpenAIError {
 // Responses API types (for codex models)
 
 #[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ResponsesBackendRequest {
+    Platform(ResponsesApiRequest),
+    CodexLite(CodexResponsesLiteRequest),
+}
+
+impl ResponsesBackendRequest {
+    fn set_streaming(&mut self) {
+        match self {
+            Self::Platform(request) => request.stream = Some(true),
+            Self::CodexLite(request) => request.stream = Some(true),
+        }
+    }
+
+    fn set_tags(&mut self, tags: &BTreeMap<String, String>) {
+        if tags.is_empty() {
+            return;
+        }
+        match self {
+            Self::Platform(request) => request.tags = Some(tags.clone()),
+            Self::CodexLite(request) => request.tags = Some(tags.clone()),
+        }
+    }
+}
+
+/// ChatGPT-backend Responses Lite wire shape. Unlike the platform type, this
+/// type cannot represent top-level instructions/tools or explicit cache policy.
+#[derive(Debug, Serialize)]
+struct CodexResponsesLiteRequest {
+    model: String,
+    input: Vec<ResponsesApiInputItem>,
+    store: bool,
+    prompt_cache_key: String,
+    parallel_tool_calls: bool,
+    reasoning: CodexResponsesLiteReasoning,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexResponsesLiteReasoning {
+    context: CodexReasoningContext,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CodexReasoningContext {
+    AllTurns,
+}
+
+impl CodexResponsesLiteRequest {
+    fn from_platform(mut request: ResponsesApiRequest) -> Self {
+        let tools = request.tools.take().unwrap_or_default();
+        let instructions = request
+            .instructions
+            .take()
+            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+        let mut input = Vec::with_capacity(request.input.len() + 2);
+        input.push(ResponsesApiInputItem::AdditionalTools {
+            role: "developer".to_string(),
+            tools,
+        });
+        input.push(ResponsesApiInputItem::Message {
+            role: "developer".to_string(),
+            content: ResponsesApiMessageContent::Parts(vec![ResponsesApiMessagePart::InputText {
+                text: instructions,
+                prompt_cache_breakpoint: None,
+            }]),
+        });
+        input.append(&mut request.input);
+        Self {
+            model: request.model,
+            input,
+            store: false,
+            prompt_cache_key: request
+                .prompt_cache_key
+                .expect("LlmRequest always supplies a prompt cache key"),
+            parallel_tool_calls: false,
+            reasoning: CodexResponsesLiteReasoning {
+                context: CodexReasoningContext::AllTurns,
+            },
+            stream: request.stream,
+            tags: request.tags,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct ResponsesApiRequest {
     model: String,
     pub(crate) input: Vec<ResponsesApiInputItem>,
@@ -1090,6 +1200,11 @@ impl PromptCacheBreakpoint {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum ResponsesApiInputItem {
+    #[serde(rename = "additional_tools")]
+    AdditionalTools {
+        role: String,
+        tools: Vec<ResponsesApiTool>,
+    },
     #[serde(rename = "message")]
     Message {
         role: String,
@@ -1186,7 +1301,7 @@ pub(crate) enum ResponsesApiFunctionOutputPart {
 }
 
 #[derive(Debug, Serialize)]
-struct ResponsesApiTool {
+pub(crate) struct ResponsesApiTool {
     r#type: String,
     name: String,
     description: String,
@@ -2008,6 +2123,19 @@ pub(crate) mod test_helpers {
         request: &crate::types::LlmRequest,
     ) -> ResponsesApiRequest {
         super::translate_to_responses_request(api_name, request, false)
+    }
+
+    pub fn translate_to_backend_request_wire(
+        api_name: &str,
+        request: &crate::types::LlmRequest,
+        use_codex_backend: bool,
+    ) -> serde_json::Value {
+        serde_json::to_value(super::translate_to_backend_request(
+            api_name,
+            request,
+            use_codex_backend,
+        ))
+        .expect("request serializes")
     }
 
     pub fn translate_to_responses_request_codex(

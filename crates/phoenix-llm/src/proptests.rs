@@ -692,6 +692,83 @@ mod codex_request_shape {
         assert_eq!(codex.prompt_cache_key.as_deref(), Some("conv-abc-123"));
     }
 
+    #[test]
+    fn codex_gpt56_responses_lite_golden_wire_and_stable_prefix() {
+        use crate::types::{PromptCacheKey, SystemContent, ToolDefinition};
+        let mut req = make_llm_request(vec![user_msg("first turn")]);
+        req.system = vec![SystemContent::new("be exact")];
+        req.cache_key = PromptCacheKey::stable("conversation-1");
+        req.tools = vec![ToolDefinition {
+            name: "bash".into(),
+            description: "Run a command".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{"cmd":{"type":"string"}}}),
+            defer_loading: false,
+        }];
+
+        let first =
+            openai::test_helpers::translate_to_backend_request_wire("gpt-5.6-sol", &req, true);
+        assert_eq!(
+            first,
+            serde_json::json!({
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {"type":"additional_tools","role":"developer","tools":[{
+                        "type":"function","name":"bash","description":"Run a command",
+                        "parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}
+                    }]},
+                    {"type":"message","role":"developer","content":[{"type":"input_text","text":"be exact"}]},
+                    {"type":"message","role":"user","content":"first turn"}
+                ],
+                "store": false,
+                "prompt_cache_key": "conversation-1",
+                "parallel_tool_calls": false,
+                "reasoning": {"context":"all_turns"}
+            })
+        );
+
+        req.messages.push(user_msg("second turn"));
+        let second =
+            openai::test_helpers::translate_to_backend_request_wire("gpt-5.6-sol", &req, true);
+        assert_eq!(first["input"][0], second["input"][0]);
+        assert_eq!(first["input"][1], second["input"][1]);
+        let first_input = first["input"].as_array().unwrap();
+        let second_input = second["input"].as_array().unwrap();
+        assert_eq!(
+            serde_json::to_vec(&first_input[..2]).unwrap(),
+            serde_json::to_vec(&second_input[..2]).unwrap()
+        );
+    }
+
+    #[test]
+    fn responses_lite_is_codex_gpt56_only_and_platform_shape_is_unchanged() {
+        use crate::types::{SystemContent, ToolDefinition};
+        let mut req = make_llm_request(vec![user_msg("hi")]);
+        req.system = vec![SystemContent::new("be exact")];
+        req.tools = vec![ToolDefinition {
+            name: "bash".into(),
+            description: "Run".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            defer_loading: false,
+        }];
+        let platform =
+            openai::test_helpers::translate_to_backend_request_wire("gpt-5.6-sol", &req, false);
+        assert_eq!(platform["instructions"], "be exact");
+        assert!(platform.get("tools").is_some());
+        assert!(platform["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["type"] != "additional_tools"));
+        assert_eq!(platform["parallel_tool_calls"], true);
+        assert_eq!(platform["prompt_cache_options"]["mode"], "implicit");
+
+        let older_codex =
+            openai::test_helpers::translate_to_backend_request_wire("gpt-5.5", &req, true);
+        assert_eq!(older_codex["instructions"], "be exact");
+        assert!(older_codex.get("tools").is_some());
+        assert!(older_codex.get("reasoning").is_none());
+    }
+
     /// `ephemeral()` produces distinct keys per call (UUID-shaped).
     #[test]
     fn ephemeral_produces_distinct_keys() {

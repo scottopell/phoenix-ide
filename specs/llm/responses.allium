@@ -181,6 +181,18 @@ entity ResponsesDroppedServerBlock {
     logged: Boolean
 }
 
+-- A GPT-5.6 request routed through ChatGPT/Codex authentication uses the
+-- Responses Lite capability type. Its shape cannot carry platform-only
+-- top-level tools, top-level instructions, or explicit cache controls.
+entity CodexResponsesLiteRequest {
+    model: String
+    additional_tools_is_first: Boolean
+    developer_instructions_is_second: Boolean
+    parallel_tool_calls: Boolean
+    reasoning_context: String
+    compatibility_header: Boolean
+}
+
 ------------------------------------------------------------
 -- Rules — endpoint resolution
 ------------------------------------------------------------
@@ -202,6 +214,30 @@ rule ResponsesEndpointResolved {
 ------------------------------------------------------------
 -- Rules — request translation
 ------------------------------------------------------------
+
+rule CodexResponsesLitePrefixTranslated {
+    when: TranslateCodexResponsesRequest(model, request)
+
+    requires: starts_with(model, "gpt-5.6")
+
+    ensures:
+        CodexResponsesLiteRequest.created(
+            model: model,
+            additional_tools_is_first: true,
+            developer_instructions_is_second: true,
+            parallel_tool_calls: false,
+            reasoning_context: "all_turns",
+            compatibility_header: true
+        )
+
+    @guidance
+        -- The leading additional_tools item has role developer and contains
+        -- the function tools in stable request order. The following developer
+        -- message contains base instructions as one input_text part. Top-level
+        -- instructions and tools are absent. The request retains store=false
+        -- and prompt_cache_key. Direct-platform requests and pre-GPT-5.6 Codex
+        -- requests retain the platform-shaped translation.
+}
 
 -- A message carrying at least one image is translated to a Responses API
 -- message item whose `content` is an array of parts: one input_text part
