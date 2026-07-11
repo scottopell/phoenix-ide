@@ -90,7 +90,7 @@ surface ScrollPolicyAdapter {
 
     provides:
         ConversationChanged(policy, conversation_id)
-        ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
+        ConversationMeasured(policy, conversation_id, total_height, unit_count, snapshot, now_ms)
         ScrollerAttached(policy, snapshot)
         DownwardMovement(policy, snapshot)
         ViewportPinnedChanged(policy, at_bottom)
@@ -135,7 +135,7 @@ rule NavigationBeforeMeasurementRemainsPending {
 }
 
 rule PendingNavigationMeasurementEntersLiveNavigation {
-    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, _)
+    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, snapshot, _)
     requires: policy.lifecycle in { unmeasured, measured_empty }
     requires: policy.navigation_pending = true
     requires: unit_count > 0
@@ -144,13 +144,14 @@ rule PendingNavigationMeasurementEntersLiveNavigation {
     ensures: policy.follow_mode = navigating
     ensures: policy.previous_total_height = total_height
     ensures: policy.navigation_pending = false
-    ensures: policy.navigation_departed_bottom = not policy.at_bottom
+    ensures: policy.at_bottom = snapshot.at_bottom
+    ensures: policy.navigation_departed_bottom = not snapshot.at_bottom
     ensures: not ScrollEffect.created(policy: policy, kind: start_settle_watch)
     ensures: not ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
 }
 
 rule PopulatedMeasurementStartsMountRescue {
-    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
+    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, _, now_ms)
     requires: policy.lifecycle = unmeasured
     requires: policy.navigation_pending = false
     requires: unit_count > 0
@@ -167,16 +168,17 @@ rule PopulatedMeasurementStartsMountRescue {
 }
 
 rule EmptyMeasurementWaitsForContent {
-    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, _)
+    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, _, _)
     requires: policy.lifecycle = unmeasured
     requires: unit_count = 0
     ensures: policy.conversation_id = conversation_id
     ensures: policy.lifecycle = measured_empty
     ensures: policy.previous_total_height = total_height
+    ensures: policy.navigation_pending = policy.navigation_pending
 }
 
 rule FirstContentAfterEmptyStartsRescueAndSnaps {
-    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
+    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, _, now_ms)
     requires: policy.lifecycle = measured_empty
     requires: policy.navigation_pending = false
     requires: unit_count > 0
