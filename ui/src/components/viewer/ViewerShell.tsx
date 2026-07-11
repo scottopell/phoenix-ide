@@ -5,6 +5,9 @@ import type { ReactNode } from 'react';
 export type ViewerMode = 'overlay' | 'inline' | 'takeover';
 
 interface ViewerShellProps {
+  /** When false, shell-level Escape handling stands down so an inner surface
+   *  (for example viewer find) can consume Escape first. */
+  closeOnEscape?: boolean | undefined;
   mode: ViewerMode;
   /** ARIA label for the dialog/region — used by screen readers and
    *  test queries (e.g. `getByRole('dialog', { name: 'Worktree diff' })`). */
@@ -76,6 +79,7 @@ export function ViewerShell({
   dialog,
   confirm,
   bodyScroll = 'shell',
+  closeOnEscape = true,
 }: ViewerShellProps) {
   // Esc closes (deferring to caller — they may guard with a confirm).
   // Registered in capture phase with stopPropagation so this shell
@@ -84,14 +88,15 @@ export function ViewerShell({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      // If a dialog or confirm is rendered, let those handle Esc first.
-      if (dialog || confirm) return;
+      // If a dialog/confirm is rendered, or the caller temporarily disables
+      // shell Escape handling, let the inner surface own Esc first.
+      if (dialog || confirm || !closeOnEscape) return;
       e.stopPropagation();
       onClose();
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onClose, dialog, confirm]);
+  }, [onClose, dialog, confirm, closeOnEscape]);
 
   const modal = mode !== 'inline';
   const className = mode === 'inline'

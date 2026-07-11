@@ -16,14 +16,16 @@
  */
 import React from 'react';
 
-export const codeViewMockState: { scrollToCalls: unknown[]; lastItems: unknown[] } = {
+export const codeViewMockState: { scrollToCalls: unknown[]; lastItems: unknown[]; lastUnsafeCss: string } = {
   scrollToCalls: [],
   lastItems: [],
+  lastUnsafeCss: '',
 };
 
 export function resetCodeViewMock(): void {
   codeViewMockState.scrollToCalls = [];
   codeViewMockState.lastItems = [];
+  codeViewMockState.lastUnsafeCss = '';
 }
 
 /** Latest controlled `version` Pierre would reconcile against for an item. */
@@ -70,6 +72,7 @@ export function makeCodeViewMock() {
     }));
 
     codeViewMockState.lastItems = [...(props.items ?? [])];
+    codeViewMockState.lastUnsafeCss = props.options?.unsafeCSS ?? '';
     return (
       <div data-testid="codeview-mock" className={props.className} ref={props.containerRef}>
         {(props.items ?? []).map((item: any) => {
@@ -91,9 +94,11 @@ export function makeCodeViewMock() {
                 else itemEls.current.delete(item.id);
               }}
             >
-              {props.renderHeaderPrefix?.(item)}
-              {props.renderHeaderMetadata?.(item)}
-              <span data-filename>{isFile ? item.file?.name : item.fileDiff?.name}</span>
+              <div data-testid={`mock-header-${item.id}`}>
+                {props.renderHeaderPrefix?.(item)}
+                {props.renderHeaderMetadata?.(item)}
+                <span data-filename>{isFile ? item.file?.name : item.fileDiff?.name}</span>
+              </div>
               {/* Pierre-like line DOM (data attributes the touch resolver reads). */}
               <div data-code="" data-additions="">
                 <span data-line="1" data-line-type="change-addition" data-testid={`mock-line-el-${item.id}`}>

@@ -10,10 +10,16 @@
  * drops the entire pile. Jump-to-line uses Pierre's typed scroll target.
  */
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Columns2, Rows3 } from 'lucide-react';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
+import {
+  FindBar,
+  buildDiffSearchProjection,
+  useViewerFind,
+  useViewerFindKeyboardShortcut,
+} from '../viewer-find';
 import { ViewerShell } from './ViewerShell';
 import { NotesPanel } from './NotesPanel';
 import { AnnotationDialog } from './AnnotationDialog';
@@ -72,6 +78,22 @@ export function DiffView({
   const codeViewRef = useRef<PhoenixDiffCodeViewHandle>(null);
 
   const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
+  const findSourcesProjection = useMemo(
+    () => buildDiffSearchProjection(committedDiff, uncommittedDiff, ''),
+    [committedDiff, uncommittedDiff],
+  );
+  const find = useViewerFind({
+    text: findSourcesProjection.sources.map((source) => source.text).join('\n'),
+  });
+  const findProjection = useMemo(
+    () => buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query),
+    [committedDiff, uncommittedDiff, find.query],
+  );
+  useViewerFindKeyboardShortcut({ scopeId: 'diff-viewer', onOpen: find.open });
+
+  const activeFindMatchTarget = find.activeIndex >= 0 ? findProjection.matches[find.activeIndex]?.target ?? null : null;
+  const findMatchTargets = useMemo(() => findProjection.matches.map((match) => match.target), [findProjection.matches]);
+
   const toggleDiffStyle = useCallback(() => {
     setDiffStyle((prev) => {
       const next = prev === 'unified' ? 'split' : 'unified';
@@ -95,12 +117,42 @@ export function DiffView({
     [highlight, closePanel],
   );
 
+  const handleFindQueryChange = useCallback((query: string) => {
+    find.setQuery(query);
+    const nextProjection = buildDiffSearchProjection(committedDiff, uncommittedDiff, query);
+    const target = nextProjection.matches[0]?.target;
+    if (target) codeViewRef.current?.scrollToFindTarget(target);
+  }, [find, committedDiff, uncommittedDiff]);
+
+  const handleFindNext = useCallback(() => {
+    find.nextMatch();
+    const nextIndex = find.matchCount === 0
+      ? -1
+      : find.activeIndex < 0
+        ? 0
+        : (find.activeIndex + 1) % find.matchCount;
+    const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
+    if (target) codeViewRef.current?.scrollToFindTarget(target);
+  }, [find, findProjection.matches]);
+
+  const handleFindPrevious = useCallback(() => {
+    find.previousMatch();
+    const nextIndex = find.matchCount === 0
+      ? -1
+      : find.activeIndex < 0
+        ? Math.max(find.matchCount - 1, 0)
+        : (find.activeIndex - 1 + find.matchCount) % find.matchCount;
+    const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
+    if (target) codeViewRef.current?.scrollToFindTarget(target);
+  }, [find, findProjection.matches]);
+
   if (!open) return null;
 
   const empty = !commitLog.trim() && !committedDiff.trim() && !uncommittedDiff.trim();
 
   return (
     <ViewerShell
+      closeOnEscape={!find.isOpen}
       mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
       ariaLabel="Worktree diff"
       title={
@@ -109,15 +161,37 @@ export function DiffView({
         </span>
       }
       headerExtras={
-        <button
-          className="viewer-shell-btn"
-          onClick={toggleDiffStyle}
-          aria-label={diffStyle === 'unified' ? 'Switch to split view' : 'Switch to unified view'}
-          title={diffStyle === 'unified' ? 'Split view' : 'Unified view'}
-        >
-          {diffStyle === 'unified' ? <Columns2 size={18} /> : <Rows3 size={18} />}
-        </button>
+        <>
+          <button
+            className="viewer-shell-btn"
+            onClick={find.open}
+            aria-label="Find in diff"
+            title="Find in diff"
+          >
+            Find
+          </button>
+          <button
+            className="viewer-shell-btn"
+            onClick={toggleDiffStyle}
+            aria-label={diffStyle === 'unified' ? 'Switch to split view' : 'Switch to unified view'}
+            title={diffStyle === 'unified' ? 'Split view' : 'Unified view'}
+          >
+            {diffStyle === 'unified' ? <Columns2 size={18} /> : <Rows3 size={18} />}
+          </button>
+        </>
       }
+      banner={find.isOpen ? (
+        <FindBar
+          query={find.query}
+          activeIndex={find.activeIndex}
+          matchCount={find.matchCount}
+          onQueryChange={handleFindQueryChange}
+          onNext={handleFindNext}
+          onPrevious={handleFindPrevious}
+          onClose={find.close}
+          autoFocus={false}
+        />
+      ) : undefined}
       noteCount={diffNotes.length}
       onToggleNotes={notes.togglePanel}
       onSend={notes.send}
@@ -171,6 +245,8 @@ export function DiffView({
               committedDiff={committedDiff}
               uncommittedDiff={uncommittedDiff}
               diffStyle={diffStyle}
+              findMatches={findMatchTargets}
+              activeFindMatch={activeFindMatchTarget}
               notes={diffNotes}
               highlightedNoteId={notes.highlightedNoteId}
               onAnnotateLine={notes.startAnnotateLine}

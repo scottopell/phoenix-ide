@@ -62,6 +62,69 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(container.querySelector('.diff-viewer-body .phoenix-diff-codeview')).toBeTruthy();
   });
 
+  it('opens shared viewer find for diff-viewer scope and navigates header then line matches via typed scroll targets', () => {
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'bar' } });
+
+    expect(codeViewMockState.scrollToCalls).toEqual([
+      { type: 'item', id: 'uncommitted:bar.txt', align: 'start', behavior: 'smooth' },
+    ]);
+
+    fireEvent.change(input, { target: { value: 'hello' } });
+    expect(codeViewMockState.scrollToCalls.at(-1)).toEqual({
+      type: 'line',
+      id: 'committed:foo.txt',
+      lineNumber: 1,
+      side: 'additions',
+      align: 'center',
+      behavior: 'smooth',
+    });
+  });
+
+  it('decorates matched diff lines with unsafeCSS and highlights the active header match through Phoenix header slots', () => {
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+
+    fireEvent.change(input, { target: { value: 'hello' } });
+    expect(codeViewMockState.lastUnsafeCss).toContain('[data-item-id="committed:foo.txt"] [data-additions=""] [data-line="1"]');
+
+    fireEvent.change(input, { target: { value: 'bar' } });
+    expect(within(screen.getByTestId('mock-header-uncommitted:bar.txt')).getByRole('button', { name: 'Add file-level note to bar.txt' })).toHaveClass(
+      'phoenix-diff-file-note-btn--find-active',
+    );
+  });
+
+  it('lets find Escape close the find bar before the shell closes the viewer', () => {
+    const onClose = vi.fn();
+    render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          uncommittedDiff=""
+          onClose={onClose}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it('adds a line note via the gutter affordance and surfaces it in the badge, panel, and inline annotation', () => {
     renderDiff();
     addNoteViaGutter('looks good');
