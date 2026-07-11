@@ -229,20 +229,20 @@ const executionMessages: Message[] = [
   toolMessage(18, 'exec-patch-trivial', 'Applied patch successfully', {
     display_data: {
       duration_ms: 28,
-      diff: ['--- a/ui/src/components/MessageComponents.tsx', '+++ b/ui/src/components/MessageComponents.tsx', '@@', '-pending', '+running'].join('\n'),
+      diff: ['--- a/ui/src/components/MessageComponents.tsx', '+++ b/ui/src/components/MessageComponents.tsx', '@@ -1918,1 +1918,1 @@', '-pending', '+running'].join('\n'),
     },
   }),
   toolMessage(19, 'exec-patch-multi', 'Applied patch successfully', {
     display_data: {
       duration_ms: 151,
-      diff: ['--- a/ui/src/fixtures/toolResults/scenarios.ts', '+++ b/ui/src/fixtures/toolResults/scenarios.ts', '@@', '+const y = 2;', '@@', '+const z = 3;'].join('\n'),
+      diff: ['--- a/ui/src/fixtures/toolResults/scenarios.ts', '+++ b/ui/src/fixtures/toolResults/scenarios.ts', '@@ -72,2 +72,3 @@', ' const x = 1;', '+const y = 2;', ' const anchor = true;', '@@ -112,2 +113,3 @@', ' const y = 2;', '+const z = 3;', ' const tail = true;'].join('\n'),
     },
   }),
   toolMessage(20, 'exec-patch-error', 'Patch failed: oldText not found exactly once in ui/src/fixtures/toolResults/scenarios.ts', {
     is_error: true,
     display_data: { duration_ms: 19 },
   }),
-  toolMessage(21, 'exec-patch-legacy', ['--- a/README.md', '+++ b/README.md', '@@', '+legacy diff only'].join('\n'), {
+  toolMessage(21, 'exec-patch-legacy', ['--- a/README.md', '+++ b/README.md', '@@ -10,0 +11,1 @@', '+legacy diff only'].join('\n'), {
     display_data: { duration_ms: 13 },
   }),
   agentMessage(22, [

@@ -1,8 +1,8 @@
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { AgentMessage } from '../../components/MessageComponents';
 import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
-import { ForkProposalsProvider } from '../../contexts/ForkProposalsContext';
+import { ForkProposalsProvider, useForkProposals } from '../../contexts/ForkProposalsContext';
 import { ConversationContext } from '../../conversation/ConversationContext';
 import { ConversationStore } from '../../conversation/ConversationStore';
 import { DensityContext } from '../../hooks/useDensity';
@@ -17,10 +17,17 @@ interface Props {
   scenario: ToolResultsScenario;
 }
 
-export function ToolResultsFixture({ scenario }: Props) {
+function ToolResultsFixtureContent({ scenario }: Props) {
+  const forkProposals = useForkProposals();
+  const proposalReady = scenario.family !== 'shell'
+    || (forkProposals?.loaded === true && forkProposals.getProposal('fixture-fork-proposal') !== undefined);
+
+  return <ToolResultsFixtureBody scenario={scenario} ready={proposalReady} />;
+}
+
+function ToolResultsFixtureBody({ scenario, ready }: Props & { ready: boolean }) {
   const data = toolResultsFixtureData(scenario);
   const store = useMemo(() => new ConversationStore(), []);
-  const restoreApi = useMemo(() => installToolResultsFixtureApi(), []);
   const activeToolUseId = data.convState.type === 'tool_executing'
     ? data.convState.current_tool.id
     : undefined;
@@ -37,20 +44,17 @@ export function ToolResultsFixture({ scenario }: Props) {
     [renderedMessages],
   );
 
-  useEffect(() => restoreApi, [restoreApi]);
-
   document.documentElement.dataset['theme'] = data.theme;
 
   return (
     <ConversationContext.Provider value={store}>
       <DensityContext.Provider value={{ density: data.density, setDensity: () => {} }}>
         <MemoryRouter initialEntries={[`/c/${data.slug}`]}>
-          <ForkProposalsProvider conversationId={data.conversationId}>
-            <ViewerSlotProvider scopeKey={data.workScopeKey} browserSessionActive={false}>
+          <ViewerSlotProvider scopeKey={data.workScopeKey} browserSessionActive={false}>
               <main
               className="fixture-page"
               data-tool-results-fixture={scenario.id}
-              data-tool-results-fixture-ready={scenario.id}
+              {...(ready ? { 'data-tool-results-fixture-ready': scenario.id } : {})}
             >
               <div className="fixture-toolbar">
                 <strong>Tool results fixture</strong>
@@ -77,10 +81,28 @@ export function ToolResultsFixture({ scenario }: Props) {
                 </div>
               </div>
               </main>
-            </ViewerSlotProvider>
-          </ForkProposalsProvider>
+          </ViewerSlotProvider>
         </MemoryRouter>
       </DensityContext.Provider>
     </ConversationContext.Provider>
+  );
+}
+
+export function ToolResultsFixture({ scenario }: Props) {
+  const [mockInstalled, setMockInstalled] = useState(false);
+  const data = toolResultsFixtureData(scenario);
+
+  useEffect(() => {
+    const restoreApi = installToolResultsFixtureApi();
+    setMockInstalled(true);
+    return restoreApi;
+  }, []);
+
+  if (!mockInstalled) return null;
+
+  return (
+    <ForkProposalsProvider conversationId={data.conversationId}>
+      <ToolResultsFixtureContent scenario={scenario} />
+    </ForkProposalsProvider>
   );
 }

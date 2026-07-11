@@ -45,6 +45,7 @@ describe('ToolResultsFixture', () => {
     expect(screen.getByText('resize 390x844')).toBeInTheDocument();
     expect(screen.getByText(/Which tool-result family should we refine next/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Review' })).toBeInTheDocument();
+    expect(container.querySelector('[data-tool-results-fixture-ready="shell-full"]')).not.toBeNull();
     expect(screen.getByText(/more chars\)/)).toBeInTheDocument();
     expect(screen.getByText(/earlier click is a finalized missing result/)).toBeInTheDocument();
     expect(container.querySelectorAll('.tool-missing-result')).toHaveLength(1);
@@ -65,6 +66,7 @@ describe('ToolResultsFixture', () => {
     expect(screen.getByText(/This family deliberately mixes typed payloads/)).toBeInTheDocument();
     expect(screen.getByText(/without a live backend/)).toBeInTheDocument();
     expect(container.querySelectorAll('.compact-tool-card').length).toBeGreaterThan(0);
+    expect(container.querySelector('[data-tool-results-fixture-ready="execution-compact"]')).not.toBeNull();
   });
 
   it('renders the grouped specialized renderer families for discovery, media, profiling, and subagents', async () => {
