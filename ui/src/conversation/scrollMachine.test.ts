@@ -199,12 +199,16 @@ describe('scrollMachine durable follow policy', () => {
       conversationId: 'conv',
       totalHeight: 1_000,
       unitCount: 5,
-      snapshot: snap(1_000, 600, 400),
+      snapshot: snap(1_000, 200, 400),
       nowMs: 1_000,
     });
 
     expectLiveMode(result.state, 'navigating');
+    expect(result.state.kind === 'live' && result.state.follow.kind === 'navigating' && result.state.follow.departedBottom).toBe(true);
     expect(result.effects).toEqual([]);
+
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'following');
   });
 
   it('preserves a navigation jump while an initially empty list waits for content', () => {

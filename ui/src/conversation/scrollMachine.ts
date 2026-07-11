@@ -109,6 +109,10 @@ function isReady(state: ScrollMachineState): state is ReadySession {
   return state.kind === 'mount-rescue' || state.kind === 'live';
 }
 
+function snapshotIsPinned(snapshot: ScrollSnapshot): boolean {
+  return snapshot.scrollHeight - snapshot.scrollTop - snapshot.clientHeight <= PIN_TO_BOTTOM_THRESHOLD;
+}
+
 function geometryFrom(snapshot: ScrollSnapshot | null, totalHeight: number): ScrollGeometry {
   return {
     atBottom: true,
@@ -309,8 +313,8 @@ export function reduceScrollMachine(
           state: {
             kind: 'live',
             conversationId: event.conversationId,
-            follow: { kind: 'navigating', departedBottom: false },
-            geometry: geometryFrom(event.snapshot, event.totalHeight),
+            follow: { kind: 'navigating', departedBottom: !snapshotIsPinned(event.snapshot) },
+            geometry: { ...geometryFrom(event.snapshot, event.totalHeight), atBottom: snapshotIsPinned(event.snapshot) },
             gesture: IDLE,
             unread: false,
           },

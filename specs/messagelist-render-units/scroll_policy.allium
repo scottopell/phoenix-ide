@@ -41,7 +41,9 @@ entity ScrollPolicy {
     transitions lifecycle {
         unmeasured -> measured_empty
         unmeasured -> mount_rescue
+        unmeasured -> live
         measured_empty -> mount_rescue
+        measured_empty -> live
         measured_empty -> unmeasured
         mount_rescue -> live
         mount_rescue -> unmeasured
@@ -142,6 +144,7 @@ rule PendingNavigationMeasurementEntersLiveNavigation {
     ensures: policy.follow_mode = navigating
     ensures: policy.previous_total_height = total_height
     ensures: policy.navigation_pending = false
+    ensures: policy.navigation_departed_bottom = not policy.at_bottom
     ensures: not ScrollEffect.created(policy: policy, kind: start_settle_watch)
     ensures: not ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
 }
@@ -537,6 +540,7 @@ rule LiveConversationChangeResetsSessionAtomically {
     ensures: policy.gesture_mode = idle
     ensures: policy.at_bottom = true
     ensures: policy.unread = false
+    ensures: policy.navigation_pending = false
     ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
 }
 
@@ -550,6 +554,7 @@ rule MountConversationChangeStopsRescueAndResetsSession {
     ensures: policy.gesture_mode = idle
     ensures: policy.at_bottom = true
     ensures: policy.unread = false
+    ensures: policy.navigation_pending = false
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
     ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
 }
@@ -560,6 +565,7 @@ rule UnreadyConversationChangeResetsIdentity {
     requires: policy.conversation_id != conversation_id
     ensures: policy.conversation_id = conversation_id
     ensures: policy.lifecycle = unmeasured
+    ensures: policy.navigation_pending = false
 }
 
 invariant OnlyExplicitTailReturnReleasesReading {
