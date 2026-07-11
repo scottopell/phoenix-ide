@@ -54,6 +54,25 @@ flow.
 
 ---
 
+### REQ-KB-002A: Topmost Eligible Shortcut Ownership
+
+WHEN multiple focus scopes are mounted
+THE SYSTEM SHALL route a scope-owned shortcut only to the topmost eligible
+scope
+AND a lower scope SHALL NOT respond while a higher scope obscures it
+
+IF the focused element is an editable control that owns the shortcut's normal
+text-editing behavior
+THE SYSTEM SHALL leave the event to that control unless the topmost eligible
+scope explicitly documents a stronger override
+
+**Rationale:** Scope-owned shortcuts such as in-viewer find only feel reliable
+when the visible surface owns them exclusively. Without topmost ownership,
+`Cmd/Ctrl+F` can open find in a hidden viewer or steal browser/input behavior
+from the field the user is actively editing.
+
+---
+
 ### REQ-KB-003: Scope-Local Key Consumption
 
 WHEN a focus scope consumes a key event
@@ -78,9 +97,28 @@ AND the user SHALL be able to begin keyboard interaction without clicking
 WHEN focus cannot be set (element not yet rendered)
 THE SYSTEM SHALL retry focus on the next animation frame
 
+WHEN a scope-local keyboard affordance opens within an already-open panel
+THE SYSTEM SHALL move focus to that affordance's primary input without
+requiring an extra click
+AND closing that affordance SHALL restore focus to the element that owned focus
+within the enclosing scope before the affordance opened
+
 **Rationale:** If the user has to click into a panel before keyboard works, the
 keyboard flow never starts. Auto-focus is the critical gate that determines
 whether keyboard navigation gets used at all.
+
+---
+
+### REQ-KB-004A: Repeated Shortcut Refocus
+
+WHEN the topmost eligible scope's open shortcut is pressed again while its
+scope-local affordance is already open
+THE SYSTEM SHALL keep the existing affordance open
+AND refocus and select the existing primary query/input field
+
+**Rationale:** Repeated shortcuts are a fast path back into an already-open
+control. Reopening a duplicate affordance or leaving focus elsewhere forces the
+user back to the mouse.
 
 ---
 
@@ -91,8 +129,8 @@ THE SYSTEM SHALL dismiss or close that panel (with confirmation if the panel
 has unsaved state)
 
 WHEN Escape is pressed and the topmost scope has a sub-context (e.g.,
-ProseReader with an open annotation input, or QuestionPanel with an open
-notes field)
+ProseReader with an open annotation input, QuestionPanel with an open
+notes field, or a viewer with an open in-viewer find bar)
 THE SYSTEM SHALL close the sub-context first, not the panel itself
 
 WHEN Escape is pressed and no interactive panel is active
