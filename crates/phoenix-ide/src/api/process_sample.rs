@@ -33,12 +33,24 @@ use phoenix_core::domain::process_inspection::ResourceSample;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ProcessObservation {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_percent: Option<f32>,
+    pub memory_bytes: Option<u64>,
+    pub thread_count: Option<u32>,
+    pub cpu_time_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub struct SampledProcesses {
     pub cpu_pct: Option<f32>,
     pub memory_bytes: Option<u64>,
     pub process_count: Option<u32>,
 }
 
+#[allow(dead_code)]
 impl SampledProcesses {
     #[must_use]
     pub fn empty() -> Self {
@@ -50,6 +62,7 @@ impl SampledProcesses {
     }
 }
 
+#[allow(dead_code)]
 pub async fn sample_processes(pids: &BTreeSet<u32>) -> SampledProcesses {
     if pids.is_empty() {
         return SampledProcesses::empty();
@@ -71,6 +84,45 @@ pub async fn sample_processes(pids: &BTreeSet<u32>) -> SampledProcesses {
 
 pub fn process_pss_bytes(pid: u32) -> Option<u64> {
     process_pss_bytes_impl(pid)
+}
+
+pub async fn sample_process_observations(pids: &BTreeSet<u32>) -> Vec<ProcessObservation> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+
+    if pids.is_empty() {
+        return Vec::new();
+    }
+
+    let sys_pids: Vec<Pid> = pids.iter().copied().map(Pid::from_u32).collect();
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+    );
+    sys.refresh_processes(ProcessesToUpdate::Some(&sys_pids), true);
+    tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+    sys.refresh_processes(ProcessesToUpdate::Some(&sys_pids), true);
+
+    let mut rows = Vec::new();
+    for pid in pids {
+        let sys_pid = Pid::from_u32(*pid);
+        let Some(process) = sys.process(sys_pid) else {
+            continue;
+        };
+        rows.push(ProcessObservation {
+            pid: *pid,
+            name: process.name().to_string_lossy().into_owned(),
+            cpu_percent: Some(process.cpu_usage()),
+            memory_bytes: process_pss_bytes(*pid),
+            thread_count: process
+                .tasks()
+                .map(|tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX)),
+            cpu_time_seconds: None,
+        });
+    }
+    rows
+}
+
+pub fn group_member_pids_for_sampling(pgid: i32) -> Option<Vec<u32>> {
+    group_member_pids(pgid)
 }
 
 /// Sample the resource trio over the process group identified by `pgid`.
@@ -355,6 +407,7 @@ fn group_pss_bytes(_pids: &[u32]) -> Option<u64> {
     None
 }
 
+#[allow(dead_code)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,7 +10,9 @@
 //! yields current values.
 
 use super::AppState;
-use crate::api::process_sample::process_pss_bytes;
+use crate::api::process_sample::{
+    group_member_pids_for_sampling, sample_process_observations, ProcessObservation,
+};
 use axum::{
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
@@ -165,7 +167,7 @@ pub struct AboutResourcesSnapshot {
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct HostResources {
     pub logical_cpu_count: Option<u32>,
-    pub cpu_user_percent: Option<f32>,
+    pub cpu_busy_percent: Option<f32>,
     pub cpu_system_percent: Option<f32>,
     pub cpu_idle_percent: Option<f32>,
     pub total_memory_bytes: Option<u64>,
@@ -956,36 +958,44 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
 }
 
 async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResourcesSnapshot {
-    let mut all_pids = BTreeSet::new();
-    let mut categories = Vec::new();
-
     let current_pid = sysinfo::get_current_pid().ok().map(sysinfo::Pid::as_u32);
     let api_pids = current_pid.into_iter().collect::<BTreeSet<_>>();
-    all_pids.extend(api_pids.iter().copied());
-    categories.push(
-        build_category_from_pids(
-            ManagedResourceCategoryKind::Api,
-            "API",
-            ManagedResourceAttribution::Available,
-            None,
-            &api_pids,
-        )
-        .await,
+    let bash_pids = match state {
+        Some(state) => snapshot_bash_pids(state).await,
+        None => BTreeSet::new(),
+    };
+
+    let mut all_pids = api_pids.clone();
+    all_pids.extend(bash_pids.iter().copied());
+
+    let (host, observed_rows) = tokio::join!(
+        sample_host_resources(),
+        sample_process_observations(&all_pids)
     );
+    let observed_rows_by_pid: BTreeMap<u32, ProcessObservation> = observed_rows
+        .into_iter()
+        .map(|row| (row.pid, row))
+        .collect();
+
+    let mut categories = Vec::new();
+    categories.push(build_category_from_observations(
+        ManagedResourceCategoryKind::Api,
+        "API",
+        ManagedResourceAttribution::Available,
+        None,
+        &api_pids,
+        &observed_rows_by_pid,
+    ));
 
     if let Some(state) = state {
-        let bash_pids = snapshot_bash_member_pids(state).await;
-        all_pids.extend(bash_pids.iter().copied());
-        categories.push(
-            build_category_from_pids(
-                ManagedResourceCategoryKind::Bash,
-                "Bash",
-                ManagedResourceAttribution::Available,
-                None,
-                &bash_pids,
-            )
-            .await,
-        );
+        categories.push(build_category_from_observations(
+            ManagedResourceCategoryKind::Bash,
+            "Bash",
+            ManagedResourceAttribution::Available,
+            None,
+            &bash_pids,
+            &observed_rows_by_pid,
+        ));
 
         categories.push(unavailable_category(
             ManagedResourceCategoryKind::Browser,
@@ -1014,16 +1024,14 @@ async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResource
             },
         ));
     } else {
-        categories.push(
-            build_category_from_pids(
-                ManagedResourceCategoryKind::Bash,
-                "Bash",
-                ManagedResourceAttribution::Available,
-                None,
-                &BTreeSet::new(),
-            )
-            .await,
-        );
+        categories.push(build_category_from_observations(
+            ManagedResourceCategoryKind::Bash,
+            "Bash",
+            ManagedResourceAttribution::Available,
+            None,
+            &bash_pids,
+            &observed_rows_by_pid,
+        ));
         categories.push(unavailable_category(
             ManagedResourceCategoryKind::Browser,
             "Browser",
@@ -1041,35 +1049,29 @@ async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResource
         ));
     }
 
-    let total_sample = sample_pid_set(ManagedResourceCategoryKind::Api, &all_pids).await;
-    let host = sample_host_resources(&all_pids).await;
+    let managed_total = totals_from_observations(&all_pids, &observed_rows_by_pid);
     AboutResourcesSnapshot {
         sampled_at: Utc::now(),
         host,
-        managed_total: ManagedResourceTotals {
-            cpu_percent: total_sample.cpu_percent,
-            memory_bytes: total_sample.memory_bytes,
-            process_count: total_sample.process_count,
-            deduplicated_pid_count: u32::try_from(all_pids.len()).unwrap_or(u32::MAX),
-        },
+        managed_total,
         categories,
     }
 }
 
-async fn snapshot_bash_member_pids(state: &AppState) -> BTreeSet<u32> {
-    state
-        .runtime
-        .bash_handles()
-        .snapshot_live_member_pids()
-        .await
-        .into_iter()
-        .collect()
+async fn snapshot_bash_pids(state: &AppState) -> BTreeSet<u32> {
+    let mut pids = BTreeSet::new();
+    for pgid in state.runtime.bash_handles().snapshot_live_pgids().await {
+        if let Some(members) = group_member_pids_for_sampling(pgid) {
+            pids.extend(members);
+        }
+    }
+    pids
 }
 
 #[derive(Default)]
 struct HostCpuBreakdown {
     logical_cpu_count: Option<u32>,
-    user_percent: Option<f32>,
+    busy_percent: Option<f32>,
     system_percent: Option<f32>,
     idle_percent: Option<f32>,
 }
@@ -1088,32 +1090,41 @@ async fn sample_host_cpu_breakdown() -> HostCpuBreakdown {
 
     HostCpuBreakdown {
         logical_cpu_count,
-        user_percent: Some(busy),
+        busy_percent: Some(busy),
         system_percent: None,
         idle_percent: Some((100.0_f32 - busy).max(0.0)),
     }
 }
 
-async fn build_category_from_pids(
+fn build_category_from_observations(
     kind: ManagedResourceCategoryKind,
     label: &str,
     attribution: ManagedResourceAttribution,
     reason: Option<String>,
     pids: &BTreeSet<u32>,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
 ) -> ManagedResourceCategory {
-    let sample = sample_pid_set(kind, pids).await;
+    let processes: Vec<ManagedProcessRow> = pids
+        .iter()
+        .filter_map(|pid| observed_rows_by_pid.get(pid))
+        .map(|row| ManagedProcessRow {
+            name: row.name.clone(),
+            category: kind,
+            pid: row.pid,
+            cpu_percent: row.cpu_percent,
+            memory_bytes: row.memory_bytes,
+            thread_count: row.thread_count,
+            cpu_time_seconds: row.cpu_time_seconds,
+        })
+        .collect();
+    let totals = totals_from_rows(&processes);
     ManagedResourceCategory {
         kind,
         label: label.to_string(),
         attribution,
         reason,
-        totals: ManagedResourceTotals {
-            cpu_percent: sample.cpu_percent,
-            memory_bytes: sample.memory_bytes,
-            process_count: sample.process_count,
-            deduplicated_pid_count: u32::try_from(pids.len()).unwrap_or(u32::MAX),
-        },
-        processes: sample.processes,
+        totals,
+        processes,
     }
 }
 
@@ -1133,60 +1144,50 @@ fn unavailable_category(
     }
 }
 
-struct PidSetSample {
-    cpu_percent: Option<f32>,
-    memory_bytes: Option<u64>,
-    process_count: u32,
-    processes: Vec<ManagedProcessRow>,
+fn totals_from_observations(
+    expected_pids: &BTreeSet<u32>,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
+) -> ManagedResourceTotals {
+    let processes: Vec<ManagedProcessRow> = expected_pids
+        .iter()
+        .filter_map(|pid| observed_rows_by_pid.get(pid))
+        .map(|row| ManagedProcessRow {
+            name: row.name.clone(),
+            category: ManagedResourceCategoryKind::Api,
+            pid: row.pid,
+            cpu_percent: row.cpu_percent,
+            memory_bytes: row.memory_bytes,
+            thread_count: row.thread_count,
+            cpu_time_seconds: row.cpu_time_seconds,
+        })
+        .collect();
+    totals_from_rows(&processes)
 }
 
-async fn sample_pid_set(kind: ManagedResourceCategoryKind, pids: &BTreeSet<u32>) -> PidSetSample {
-    use crate::api::process_sample::sample_processes;
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
-
-    let resource = sample_processes(pids).await;
-    let sys_pids: Vec<Pid> = pids.iter().copied().map(Pid::from_u32).collect();
-    let mut sys = System::new_with_specifics(
-        RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-    );
-    sys.refresh_processes(ProcessesToUpdate::Some(&sys_pids), true);
-    let mut rows = Vec::new();
-    for pid in pids {
-        let sys_pid = Pid::from_u32(*pid);
-        let process = sys.process(sys_pid);
-        rows.push(ManagedProcessRow {
-            name: process.map_or_else(
-                || format!("pid {pid}"),
-                |p| p.name().to_string_lossy().into_owned(),
-            ),
-            category: kind,
-            pid: *pid,
-            cpu_percent: None,
-            memory_bytes: process_pss_bytes(*pid),
-            thread_count: process.and_then(|p| {
-                p.tasks()
-                    .map(|t| u32::try_from(t.len()).unwrap_or(u32::MAX))
-            }),
-            cpu_time_seconds: None,
-        });
-    }
-
-    let row_count = rows.len();
-    if row_count == 1 {
-        if let (Some(row), Some(total_cpu)) = (rows.first_mut(), resource.cpu_pct) {
-            row.cpu_percent = Some(total_cpu);
+fn totals_from_rows(processes: &[ManagedProcessRow]) -> ManagedResourceTotals {
+    let mut cpu_total = 0.0_f32;
+    let mut cpu_seen = false;
+    let mut memory_total: u64 = 0;
+    let mut memory_seen = false;
+    for row in processes {
+        if let Some(cpu) = row.cpu_percent {
+            cpu_total += cpu;
+            cpu_seen = true;
+        }
+        if let Some(memory) = row.memory_bytes {
+            memory_total = memory_total.saturating_add(memory);
+            memory_seen = true;
         }
     }
-
-    PidSetSample {
-        cpu_percent: resource.cpu_pct,
-        memory_bytes: resource.memory_bytes,
-        process_count: resource.process_count.unwrap_or(0),
-        processes: rows,
+    ManagedResourceTotals {
+        cpu_percent: cpu_seen.then_some(cpu_total),
+        memory_bytes: memory_seen.then_some(memory_total),
+        process_count: u32::try_from(processes.len()).unwrap_or(u32::MAX),
+        deduplicated_pid_count: u32::try_from(processes.len()).unwrap_or(u32::MAX),
     }
 }
 
-async fn sample_host_resources(_managed_pids: &BTreeSet<u32>) -> HostResources {
+async fn sample_host_resources() -> HostResources {
     use sysinfo::System;
 
     let cpu = sample_host_cpu_breakdown().await;
@@ -1201,7 +1202,7 @@ async fn sample_host_resources(_managed_pids: &BTreeSet<u32>) -> HostResources {
     let load = System::load_average();
     HostResources {
         logical_cpu_count: cpu.logical_cpu_count,
-        cpu_user_percent: cpu.user_percent,
+        cpu_busy_percent: cpu.busy_percent,
         cpu_system_percent: cpu.system_percent,
         cpu_idle_percent: cpu.idle_percent,
         total_memory_bytes,
@@ -1729,13 +1730,13 @@ mod tests {
     async fn host_cpu_breakdown_preserves_idle_plus_busy_budget() {
         let cpu = sample_host_cpu_breakdown().await;
 
-        if let (Some(user), Some(idle)) = (cpu.user_percent, cpu.idle_percent) {
+        if let (Some(busy), Some(idle)) = (cpu.busy_percent, cpu.idle_percent) {
             assert!(
-                (user + idle) <= 100.5,
+                (busy + idle) <= 100.5,
                 "busy + idle should stay near 100%, got {}",
-                user + idle
+                busy + idle
             );
-            assert!(user >= 0.0);
+            assert!(busy >= 0.0);
             assert!(idle >= 0.0);
         }
     }
