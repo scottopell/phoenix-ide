@@ -22,7 +22,8 @@ It does **not** own:
   `mode ∈ {work, branch}`, no continuation pointer). That is bedrock's `TaskResolved` rule
   and `TerminalActionRequiresNoContinuation` invariant (REQ-BED-029, REQ-BED-031). The
   handlers in this spec validate against that gate; they do not define it.
-- **PR feedback freshness, auto-fix, and remediation context** — the `pr-association` spec.
+- **PR feedback freshness, explicit active-PR targeting, auto-fix, and remediation context** —
+  the `pr-association` spec.
 - **UI surface composition** — button labels, action zones, disposition derivation, tooltips.
   The `work-actions-bar` spec owns these.
 
@@ -104,6 +105,16 @@ as Merged may be initiated.
 WHEN a Work or Branch conversation has an associated pull request
 AND `gh` can observe the pull request's state for the branch
 THE SYSTEM SHALL use the observed PR state to guide the cleanup action:
+WHEN a Work or Branch conversation has multiple associated pull requests
+THE SYSTEM SHALL summarize their mixed states honestly to the user-facing cleanup surface
+AND SHALL preserve cleanup as one task/worktree action rather than one lifecycle per PR
+
+WHEN one explicit active PR is selected by `pr-association`
+THE SYSTEM SHALL allow sibling cleanup surfaces to name that PR specifically where PR-specific
+  wording is needed
+AND SHALL NOT treat that selected PR as the sole owner of task cleanup when other associated PR
+  history exists
+
 - a `gh`-confirmed merged PR is presented as the happy path for cleanup
 - an open, draft, failing, pending, or closed-unmerged PR annotates or discourages cleanup
   with explanatory text while leaving terminal disposition user-initiated
@@ -115,6 +126,8 @@ THE SYSTEM SHALL NOT use PR merge state as an automatic trigger for the terminal
   cleanup occurs only when the user initiates the action
 THE SYSTEM SHALL NOT display local commits-ahead or commits-behind badges as the branch
   health signal; PR state is the branch health signal
+THE SYSTEM SHALL NOT mutate, close, merge, or retarget any associated PR as part of cleanup
+AND SHALL NOT make PR feedback freshness a cleanup gate
 
 **Design:** PR state makes the happy-path cleanup self-describing while preserving user-initiated
 cleanup for repositories where `gh` is not authenticated or configured. The advisory character

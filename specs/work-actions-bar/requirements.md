@@ -16,10 +16,10 @@ It does **not** govern:
 
 - Terminal action git semantics (worktree deletion, diff snapshot, mode-dependent branch
   disposition, confirmation gate) → `work-lifecycle` spec (REQ-WL-001/002/003).
-- PR status, primary PR derivation, the CI check-state and feedback-freshness signals, and
-  the auto-fix affordance → `pr-association` spec (`PrStatusView`, `PrCheckState`,
-  `PrFeedbackFreshness`, `PrAutoFixAffordance`, `WorkScopePrStatusContract`,
-  `WorkActionsPrAffordanceContract`).
+- PR status, explicit active-PR selection, any compatibility primary-PR projection, the CI
+  check-state and feedback-freshness signals, and the auto-fix affordance → `pr-association`
+  spec (`PrStatusView`, `PrCheckState`, `PrFeedbackFreshness`, `PrAutoFixAffordance`,
+  `WorkScopePrStatusContract`, `WorkActionsPrAffordanceContract`).
 - Action legality — the gate that permits a terminal action to fire → bedrock's `TaskResolved`
   rule (REQ-BED-029 for terminal-on-resolution; REQ-BED-031 for context-exhausted
   disposability).
@@ -106,9 +106,10 @@ never glowing — so it cannot collapse into a second primary.
 ### REQ-WAB-004: WorkDisposition Derivation
 
 THE SYSTEM SHALL derive a single `WorkDisposition` value from the conversation's phase, mode,
-`continued_in_conv_id`, `PrStatusView` (from `pr-association`, including its `check_state` and
-`feedback_freshness` fields), and `PrAutoFixAffordance` (from `pr-association`). The
-`WorkDisposition` selects the primary verb and which verbs are present.
+`continued_in_conv_id`, the explicit active PR selected by `pr-association`, `PrStatusView`
+(from `pr-association`, including its `check_state` and `feedback_freshness` fields), and
+`PrAutoFixAffordance` (from `pr-association`). The `WorkDisposition` selects the primary verb and
+which verbs are present.
 
 The derivation is evaluated top-to-bottom; the first matching row wins. It is **total**: every
 reachable combination of phase, continuation, and PR state maps to exactly one row.
@@ -128,6 +129,11 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 | 9 | idle, gh unavailable (no PR identity, refresh = unavailable) | `gh_unavailable` | **Clean up** (FINISH) | warning note; single click |
 
 The **Address feedback** affordance is enabled when Phoenix can post an auto-fix message to
+
+Every PR-specific verb or marker the bar renders SHALL identify and target the same explicit
+active PR supplied by `pr-association`. The bar SHALL NOT silently choose among multiple
+associated actionable PRs on its own, and SHALL NOT treat any compatibility singular primary-PR
+projection as authority over an explicit pinned or inferred active selection.
 the conversation: the conversation has a live message channel and the PR is open
 (`PrAutoFixAffordance`, `pr-association`). A draft PR is never addressable. A degraded or
 stale refresh changes the secondary link-out from `Merge on GitHub` to `Open PR`; it does not

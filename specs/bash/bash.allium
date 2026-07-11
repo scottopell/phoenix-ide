@@ -29,7 +29,10 @@
 -- Requirement traceability: REQ-BASH-001 through REQ-BASH-015,
 --   REQ-BASH-WS-001, REQ-BASH-WS-002. REQ-BASH-011 (command safety) is
 --   enforced by the permission seam (specs/permissions/) and is not modelled
---   as a bash run-path rule here.
+--   as a bash run-path rule here. REQ-BASH-010a..010c (terminal-edge
+--   WorkScope reconciliation for branch observation) are deferred below because
+--   the bash lifecycle edge is normative now even though the consuming multi-PR
+--   implementation lands in later increments.
 -- Dependencies: specs/bedrock/bedrock.allium
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -367,6 +370,21 @@ config {
     -- rejected with `error: "label_too_long"`.
 }
 
+deferred BashTerminalEdgeWorkScopeReconciliation
+    -- REQ-BASH-010a, REQ-BASH-010b, REQ-BASH-010c. When a bash handle reaches a
+    -- terminal lifecycle edge, Phoenix schedules one authoritative local-Git
+    -- reconciliation for that WorkScope. The observed state is the final settled
+    -- post-command state, not intermediate branch changes inside one process.
+    -- Handles whose initial run/wait call already returned still emit this edge
+    -- when the underlying process later exits. Overlapping terminal edges for
+    -- one WorkScope are deduplicated so slower older observations may append or
+    -- refresh durable history but cannot overwrite newer authoritative active-PR
+    -- inference. This contract does not claim visibility into tmux, external
+    -- terminals, IDE activity, or transient non-terminal branch states.
+
+------------------------------------------------------------
+-- Rules — Phoenix process-level setup
+------------------------------------------------------------
 ------------------------------------------------------------
 -- Rules — Phoenix process-level setup
 ------------------------------------------------------------

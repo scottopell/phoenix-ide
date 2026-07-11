@@ -23,10 +23,10 @@ re-derives none of its inputs. It owns:
 
 It does **not** own:
 
-- **PR status, primary PR derivation, the CI check-state and feedback-freshness signals, or
-  the auto-fix affordance** — the `pr-association` spec (`PrStatusView`, `PrCheckState`,
-  `PrFeedbackFreshness`, `PrAutoFixAffordance`, `WorkScopePrStatusContract`,
-  `WorkActionsPrAffordanceContract`).
+- **PR status, explicit active-PR selection, any compatibility primary-PR projection, the CI
+  check-state and feedback-freshness signals, or the auto-fix affordance** — the
+  `pr-association` spec (`PrStatusView`, `PrCheckState`, `PrFeedbackFreshness`,
+  `PrAutoFixAffordance`, `WorkScopePrStatusContract`, `WorkActionsPrAffordanceContract`).
 - **Terminal action git semantics** — worktree deletion, diff snapshot, confirmation gate,
   mode-dependent branch disposition — the `work-lifecycle` spec (REQ-WL-001/002/003).
 - **Action legality** — when a terminal action may legally fire — bedrock's `TaskResolved`
@@ -56,6 +56,12 @@ click to arm.
 | REQ-WAB-008 | No disabled-as-status buttons; no two-step toggle affordances |
 | REQ-WAB-009 | Continuation mute: when continued_in_conv_id is set, RESOLVE and FINISH are suppressed and there is no primary |
 | REQ-WAB-010 | PR link verbs (Merge / Open PR) are GitHub links; Phoenix has no merge API |
+
+Increment 1 also depends on the `pr-association` migration from hidden singular-primary targeting
+to one explicit active PR. The work actions bar remains a composition surface: it does not infer
+among multiple associated PRs itself. Its job is to render whatever explicit active selection the
+PR-association layer provides, and to stay silent rather than silently retarget when selection is
+ambiguous.
 
 ## Implementation Status
 

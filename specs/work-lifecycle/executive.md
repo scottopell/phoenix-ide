@@ -21,7 +21,8 @@ It does **not** own:
   (`core_status`, `parent_status`, `mode`, continuation pointer). That is bedrock's
   `TaskResolved` rule and its `TerminalActionRequiresNoContinuation` invariant (REQ-BED-029,
   REQ-BED-031). This spec's handlers validate against that same gate but do not define it.
-- **PR feedback freshness, auto-fix, or remediation context** — the `pr-association` spec.
+- **PR feedback freshness, explicit active-PR targeting, auto-fix, or remediation context** —
+  the `pr-association` spec.
 - **UI surface composition** — button labels, action zones, disposition derivation, tooltips.
   The `work-actions-bar` spec owns these.
 
@@ -41,6 +42,12 @@ branches are kept.
 | REQ-WL-001 | Abandon a conversation — confirmation, diff snapshot, mode-dependent branch disposition |
 | REQ-WL-002 | Mark as merged — worktree cleanup, mode-dependent branch disposition, no squash, no push |
 | REQ-WL-003 | PR merge state is the cleanup gate — advisory only, never a lifecycle trigger |
+
+Increment 1 clarifies that plural PR association does not create plural cleanup ownership.
+Cleanup remains one task/worktree action even when multiple associated PRs exist. Mixed PR states
+may be summarized by sibling UI surfaces, and an explicit active PR may be named for clarity, but
+cleanup does not merge, close, or retarget PRs and does not treat feedback freshness as a cleanup
+gate.
 
 Both terminal actions (REQ-WL-001, REQ-WL-002) are organized by **action**, with conversation
 mode appearing as a row in each action's disposition table rather than as a separate

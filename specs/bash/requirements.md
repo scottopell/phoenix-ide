@@ -589,6 +589,71 @@ agent a stable annotation across all responses.
 
 ---
 
+### REQ-BASH-010a: Terminal-State WorkScope Reconciliation Hook
+
+WHEN a bash handle's wrapper process reaches a terminal lifecycle state
+THE SYSTEM SHALL treat that lifecycle edge as a supported WorkScope reconciliation boundary for
+  local Git observation owned by sibling specs
+
+THE SYSTEM SHALL observe authoritative Git state after the process settles
+AND SHALL NOT parse command strings, shell traces, or stdout as the correctness mechanism for
+  branch observation
+
+WHEN one bash command switches branches multiple times before exit
+THE SYSTEM SHALL expose only the final settled Git state at that terminal lifecycle boundary
+AND SHALL NOT promise intermediate branch-observation events inside one bash process
+
+WHEN the tool call returns before the process finishes
+THE eventual terminal lifecycle edge for that handle SHALL still trigger the same reconciliation
+  path
+
+**Rationale:** The bash tool already owns the most reliable cheap boundary Phoenix has for
+observing worktree mutations made through agent shell commands: the process lifecycle edge. The
+reconciliation contract belongs normatively here because follow-on multi-PR discovery depends on
+bash delivering one settled post-command observation even for backgrounded handles. Using the
+terminal edge avoids parsing shell intent and keeps observation anchored to authoritative Git
+state.
+
+---
+
+### REQ-BASH-010b: Reconciliation Emits One Settled Observation Per Terminal Edge
+
+WHEN multiple bash handles in the same WorkScope reach terminal state near the same time
+THE SYSTEM SHALL deduplicate and serialize the sibling Git-reconciliation work per WorkScope so a
+  slower older observation cannot overwrite newer active-selection inference
+
+THE SYSTEM SHALL allow a slower older reconciliation result to persist durable historical facts
+  that remain valid
+AND SHALL prevent it from replacing newer authoritative settled-head inference for PR selection
+
+WHEN a bash process never reaches terminal state
+THE SYSTEM SHALL NOT claim that its transient branch changes were observed through the bash
+  reconciliation path
+
+**Rationale:** Multi-PR discovery needs a structural stale-result rule. Branch history and PR
+association history are append-or-refresh facts, but active selection is recency-sensitive.
+Deduplicated per-WorkScope reconciliation lets Phoenix keep valid history without letting an older
+async refresh retarget PR-specific surfaces after a newer authoritative checkout.
+
+---
+
+### REQ-BASH-010c: Bash Reconciliation Is a Source, Not the Whole Observation Model
+
+THE SYSTEM SHALL treat bash terminal-state reconciliation as one supported branch-observation
+source
+AND SHALL NOT claim that tmux, external terminals, IDE actions, or transient in-process branch
+states are observed through this contract
+
+THE SYSTEM SHALL permit recovery by later authoritative observation of a branch at a supported
+reconciliation boundary
+
+**Rationale:** This keeps the contract honest. Bash is the first implementation source, not a
+promise of omniscient repository observation. Recovery through later settled observations is good
+enough for stacked or sibling PR discovery without installing Git hooks or exposing raw branch-
+registration tools.
+
+---
+
 ### REQ-BASH-011: Command Safety Checks
 
 WHEN a bash `run` command is dispatched

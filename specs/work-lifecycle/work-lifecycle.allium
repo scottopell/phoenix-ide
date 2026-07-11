@@ -9,7 +9,8 @@
 --             cleanup with mode-dependent disposition),
 --           Mark as merged (worktree + branch cleanup, mode-dependent
 --             disposition, no squash, no push),
---           PR merge state as the advisory cleanup-affordance gate.
+--           PR merge state as the advisory cleanup-affordance gate for one
+--             task/worktree lifecycle even when multiple associated PRs exist.
 -- Excludes: the canonical scope boundary is stated in requirements.md and
 --           executive.md (transition legality is bedrock's TaskResolved rule
 --           and TerminalActionRequiresNoContinuation invariant; PR freshness/
@@ -17,6 +18,11 @@
 --           work-actions-bar spec). Not re-duplicated here.
 --
 -- Requirement traceability: REQ-WL-001 through REQ-WL-003
+-- Increment-1 clarification: plural PR association belongs to
+-- pr-association; this spec remains singular in ownership of cleanup. Multiple
+-- associated PRs may be summarized by sibling surfaces, and one explicit active
+-- PR may be named for clarity, but cleanup is still one user-initiated
+-- task/worktree action and never mutates PRs.
 
 use "../bedrock/bedrock.allium" as bedrock
 

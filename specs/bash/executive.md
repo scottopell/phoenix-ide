@@ -2,6 +2,12 @@
 
 ## Requirements Summary
 
+Increment 1 adds the normative branch-observation contract that the bash tool exposes to sibling
+multi-PR specs: the terminal lifecycle edge of a bash handle is a supported WorkScope
+reconciliation boundary for authoritative local Git observation. Current implementation may still
+lack that reconciliation path; this executive document records the distinction between the new
+spec and current reality.
+
 The bash tool executes shell commands as pipe-backed children of the Phoenix
 process. Commands run via `bash -c` with combined stdout/stderr captured into
 a per-handle ring buffer; no TTY is attached. The agent specifies how long it
@@ -86,6 +92,9 @@ entirely.
 | **REQ-BASH-008:** Error Reporting | 🔄 Rewrite | Stable error ids, structured envelopes; non-zero exit is not an error |
 | **REQ-BASH-009:** No TTY Attached | 🔄 Carry-forward | Existing behavior; tool description points at `tmux` |
 | **REQ-BASH-010:** Tool Schema and Mutual Exclusion | 🔄 Rewrite (rev 3) | `op` discriminator with `run`/`peek`/`wait`/`kill`; `label` field added; legacy four-sibling inference, `mode` shim, `command` alias, and empty-string-as-absent tolerance retired (`deny_unknown_fields`); two narrow tolerances retained for active GPT default-fill (`since=0`, `lines+since`) |
+| **REQ-BASH-010a:** Terminal-State WorkScope Reconciliation Hook | ❌ New | Normative spec for bash-handle terminal edge triggering authoritative local Git reconciliation for sibling multi-PR discovery |
+| **REQ-BASH-010b:** Reconciliation Emits One Settled Observation Per Terminal Edge | ❌ New | Per-WorkScope deduplication / stale-result rule for overlapping terminal edges |
+| **REQ-BASH-010c:** Bash Reconciliation Is a Source, Not the Whole Observation Model | ❌ New | Honest scope boundary: bash terminal edges are observed; tmux/external/IDE/transient states are not |
 | **REQ-BASH-011:** Command Safety Checks | 🔄 Relocated | Enforcement moved to the permission seam (specs/permissions/); `brush-parser` AST walk (`bash_check`) unchanged, now invoked by the seam |
 | **REQ-BASH-012:** Explore `nono` Sandbox | ✅ Complete | `SandboxedBashTool` uses a Phoenix child-process launcher; the server never applies the irreversible sandbox to itself |
 | **REQ-BASH-013:** Fail-Closed Explore Bash | ✅ Complete | Startup uses `nono::Sandbox::support_info()`; unsupported hosts omit bash from top-level Explore registries |
@@ -140,5 +149,10 @@ The corresponding Allium spec is `specs/bash/bash.allium`. It models:
 The deferred entry `BashHandleCrossRestartPersistence` documents the
 explicit decision to drop the SQLite shadow store and `lost_in_restart`
 machinery from v1, including the panel-review reasoning that led to it.
+
+For increment 1 of task-branch observation, bash also normatively owns the terminal-edge
+reconciliation trigger but not the PR/domain logic that consumes it. That sibling logic lives in
+`pr-association`; the bash contract is only that authoritative post-command Git observation hangs
+off the handle lifecycle edge, including for handles whose initial `run` call already returned.
 
 Open questions: none.
