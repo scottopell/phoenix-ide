@@ -203,6 +203,31 @@ describe('scrollMachine durable follow policy', () => {
     }).effects).toEqual([]);
   });
 
+  it('seeds navigation departure from current geometry and releases at bottom', () => {
+    let state = reduceScrollMachine(liveFollowing(), {
+      type: 'viewportPinnedChanged',
+      atBottom: false,
+    }).state;
+    state = reduceScrollMachine(state, { type: 'navigationJumped' }).state;
+
+    expectLiveMode(state, 'navigating');
+    expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.departedBottom).toBe(true);
+
+    const result = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'following');
+  });
+
+  it('preserves navigation ownership through programmatic upward scroll events', () => {
+    let state = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' }).state;
+    state = reduceScrollMachine(state, {
+      type: 'upwardIntent',
+      snapshot: snap(1_000, 200, 400),
+    }).state;
+
+    expectLiveMode(state, 'navigating');
+    expect(state.kind === 'live' && state.follow.kind === 'navigating' && state.follow.departedBottom).toBe(true);
+  });
+
   it('navigation ownership survives movement and later height growth without a tail snap', () => {
     let result = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' });
     result = reduceScrollMachine(result.state, {

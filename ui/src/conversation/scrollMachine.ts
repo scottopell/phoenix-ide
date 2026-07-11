@@ -99,8 +99,11 @@ interface Reduction {
 const IDLE: Gesture = { kind: 'idle' };
 const FOLLOWING: FollowMode = { kind: 'following' };
 const READING: FollowMode = { kind: 'reading' };
-const NAVIGATING: FollowMode = { kind: 'navigating', departedBottom: false };
 const RETURNING: FollowMode = { kind: 'returning-to-tail' };
+
+function navigationMode(state: ReadySession): FollowMode {
+  return { kind: 'navigating', departedBottom: !state.geometry.atBottom };
+}
 
 function isReady(state: ScrollMachineState): state is ReadySession {
   return state.kind === 'mount-rescue' || state.kind === 'live';
@@ -401,12 +404,22 @@ export function reduceScrollMachine(
 
     case 'upwardIntent':
       if (!isReady(state)) return { state, effects: [] };
+      if (state.kind === 'live' && state.follow.kind === 'navigating') {
+        return {
+          state: {
+            ...state,
+            geometry: event.snapshot ? updateGeometry(state.geometry, event.snapshot) : state.geometry,
+            follow: { ...state.follow, departedBottom: true },
+          },
+          effects: [],
+        };
+      }
       return takeUserOwnership(state, event.snapshot);
 
     case 'navigationJumped':
       if (!isReady(state)) return { state, effects: [] };
-      if (state.kind === 'mount-rescue') return exitMountRescue(state, NAVIGATING);
-      return { state: { ...state, follow: NAVIGATING }, effects: [] };
+      if (state.kind === 'mount-rescue') return exitMountRescue(state, navigationMode(state));
+      return { state: { ...state, follow: navigationMode(state) }, effects: [] };
 
     case 'downwardMovement':
       if (!isReady(state)) return { state, effects: [] };

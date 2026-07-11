@@ -176,7 +176,7 @@ rule NavigationFromLiveTakesDurableOwnership {
     when: NavigationJumped(policy)
     requires: policy.lifecycle = live
     ensures: policy.follow_mode = navigating
-    ensures: policy.navigation_departed_bottom = false
+    ensures: policy.navigation_departed_bottom = not policy.at_bottom
 }
 
 rule NavigationExitsMountRescueIntoReading {
@@ -184,7 +184,7 @@ rule NavigationExitsMountRescueIntoReading {
     requires: policy.lifecycle = mount_rescue
     ensures: policy.lifecycle = live
     ensures: policy.follow_mode = navigating
-    ensures: policy.navigation_departed_bottom = false
+    ensures: policy.navigation_departed_bottom = not policy.at_bottom
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
 
@@ -212,7 +212,16 @@ rule ReadingOwnershipSurvivesDownwardGeometryChanges {
 rule UpwardIntentFromLiveTakesReadingOwnership {
     when: UpwardIntent(policy)
     requires: policy.lifecycle = live
+    requires: policy.follow_mode != navigating
     ensures: policy.follow_mode = reading
+}
+
+rule NavigationUpwardMovementPreservesNavigationOwnership {
+    when: UpwardIntent(policy)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    ensures: policy.follow_mode = navigating
+    ensures: policy.navigation_departed_bottom = true
 }
 
 rule UpwardIntentExitsMountRescueIntoReading {
