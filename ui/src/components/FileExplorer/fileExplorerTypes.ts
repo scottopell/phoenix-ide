@@ -7,13 +7,15 @@ export interface PatchContext {
 
 export type OpenFileOptions =
   | { kind: 'patch'; patchContext: PatchContext }
-  | { kind: 'line'; lineNumber: number };
+  | { kind: 'line'; lineNumber: number }
+  | { kind: 'range'; startLine: number; endLine: number };
 
 export interface OpenFileState {
   path: string;
   rootDir: string;
   patchContext?: PatchContext;
   focusLine?: number;
+  focusRange?: { startLine: number; endLine: number };
 }
 
 export interface FileExplorerContextValue {

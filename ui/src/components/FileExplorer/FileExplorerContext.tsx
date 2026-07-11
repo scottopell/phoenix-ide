@@ -20,6 +20,9 @@ export function FileExplorerProvider({ children }: { children: ReactNode }) {
     const state: OpenFileState = { path: slot.file.path, rootDir: slot.file.rootDir };
     if (slot.patchContext) state.patchContext = slot.patchContext;
     if (slot.file.focusLine !== undefined) state.focusLine = slot.file.focusLine;
+    if (slot.file.focusLine !== undefined && slot.file.focusEndLine !== undefined) {
+      state.focusRange = { startLine: slot.file.focusLine, endLine: slot.file.focusEndLine };
+    }
     return state;
   }, [slot]);
 

@@ -31,6 +31,8 @@ interface CommonPayload {
   onSendNotes: (notes: string) => void;
   /** Initial search/jump target line. */
   focusLine?: number | undefined;
+  /** Initial inclusive range to shade after opening from a ranged tool read. */
+  focusRange?: { startLine: number; endLine: number } | undefined;
   /** Render inline (desktop split-pane) instead of as an overlay. */
   inline?: boolean | undefined;
 }

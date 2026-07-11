@@ -244,6 +244,15 @@ describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
     expect(h.search()).not.toContain('presentation=');
   });
 
+  it('parses a focused file range without patch provenance', () => {
+    const range = renderSlot('/c/conv-A?viewer=prose&file=%2Frepo%2Fsrc%2Fmain.ts&root=%2Frepo&line=40&endLine=64');
+    expect(range.get().slot).toEqual({
+      kind: 'prose',
+      file: { path: '/repo/src/main.ts', rootDir: '/repo', focusLine: 40, focusEndLine: 64 },
+      patchContext: null,
+    });
+  });
+
   it('ignores malformed line params instead of jumping to parsed prefixes', () => {
     const junk = renderSlot('/c/conv-A?viewer=prose&file=%2Frepo%2Fa.ts&root=%2Frepo&line=42junk');
     expect(junk.get().slot.kind).toBe('prose');

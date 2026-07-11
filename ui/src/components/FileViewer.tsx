@@ -27,6 +27,7 @@ export interface FileViewerProps {
   onSendNotes: (notes: string) => void;
   patchContext?: PatchContext | undefined;
   focusLine?: number | undefined;
+  focusRange?: { startLine: number; endLine: number } | undefined;
   /** Render inline (no overlay) for desktop split-pane mode. */
   inline?: boolean | undefined;
 }
@@ -56,6 +57,7 @@ export function FileViewer({
   onSendNotes,
   patchContext,
   focusLine,
+  focusRange,
   inline,
 }: FileViewerProps) {
   const [fileData, setFileData] = useState<ReadFileResult | null>(null);
@@ -97,6 +99,7 @@ export function FileViewer({
       onSendNotes,
       ...(patchContext !== undefined ? { patchContext } : {}),
       ...(focusLine !== undefined ? { focusLine } : {}),
+      ...(focusRange !== undefined ? { focusRange } : {}),
       ...(inline !== undefined ? { inline } : {}),
     });
     return <MetaViewer payload={payload} />;
@@ -157,6 +160,7 @@ interface PayloadContext {
   onSendNotes: (notes: string) => void;
   patchContext?: PatchContext | undefined;
   focusLine?: number | undefined;
+  focusRange?: { startLine: number; endLine: number } | undefined;
   inline?: boolean | undefined;
 }
 
@@ -167,6 +171,7 @@ function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayl
     onClose: ctx.onClose,
     onSendNotes: ctx.onSendNotes,
     ...(ctx.focusLine !== undefined ? { focusLine: ctx.focusLine } : {}),
+    ...(ctx.focusRange !== undefined ? { focusRange: ctx.focusRange } : {}),
     ...(ctx.inline !== undefined ? { inline: ctx.inline } : {}),
   };
 

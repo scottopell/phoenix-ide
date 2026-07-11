@@ -144,7 +144,8 @@ describe('tool results fixture scenarios', () => {
   it('covers structured, empty, and raw fallback search result shapes', () => {
     const messages = familyData('discovery').messages;
     expect(toolUses(messages).map(({ name }) => name)).toEqual([
-      'search', 'search', 'search', 'keyword_search', 'keyword_search', 'keyword_search', 'read_file',
+      'search', 'search', 'search', 'keyword_search', 'keyword_search', 'keyword_search',
+      'read_file', 'read_file', 'read_file', 'read_file', 'read_file', 'read_file', 'read_file', 'read_file',
     ]);
     expectTextStates(messages, {
       'discover-search-empty': 'No matches found.',
@@ -152,6 +153,20 @@ describe('tool results fixture scenarios', () => {
       'discover-keyword-empty': 'No relevant files found',
       'discover-keyword-raw': '--',
     });
+    expectTextStates(messages, {
+      'discover-search-empty': 'No matches found.',
+      'discover-search-raw': 'permission denied',
+      'discover-keyword-empty': 'No relevant files found',
+      'discover-keyword-raw': '--',
+      'discover-read-short': 'deterministicFixtureLine1',
+      'discover-read-long': 'fixture long line 24',
+      'discover-read-range': 'MessageComponents excerpt 711',
+      'discover-read-eof': 'EOF excerpt 501',
+      'discover-read-long-lines': 'wrap me please',
+      'discover-read-malformed': 'valid line',
+    });
+    expect(resultFor(messages, 'discover-read-empty')?.content.content).toBe('');
+    expect(resultFor(messages, 'discover-read-error')?.content.is_error).toBe(true);
   });
 
   it('covers image compatibility and console structured/empty/pointer/raw paths', () => {
