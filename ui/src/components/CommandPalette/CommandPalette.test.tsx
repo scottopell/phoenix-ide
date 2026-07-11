@@ -214,6 +214,25 @@ describe('CommandPalette conversation scope', () => {
     expect(screen.queryByText('c-file.ts')).not.toBeInTheDocument();
   });
 
+  it('removes global results immediately when conversation scope is entered', async () => {
+    const activeConversation = makeConversation();
+    mocks.searchConversationFiles.mockResolvedValue({
+      items: [{ path: 'src/main.rs', viewer: { kind: 'text', category: 'code' } }],
+    });
+    mocks.searchConversationCode.mockResolvedValue({ items: [] });
+
+    renderPalette(activeConversation);
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    const input = screen.getByRole('textbox');
+    fireEvent.change(input, { target: { value: 'main' } });
+    expect(await screen.findByText('main.rs')).toBeInTheDocument();
+
+    fireEvent.change(input, { target: { value: 'c ' } });
+    expect(screen.queryByText('main.rs')).not.toBeInTheDocument();
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(mocks.openFile).not.toHaveBeenCalled();
+  });
+
   it('ranks the matching slug first and navigates to it on Enter', async () => {
     const activeConversation = makeConversation();
     const emojiConversation = makeConversation({

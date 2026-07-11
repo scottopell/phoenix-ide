@@ -44,12 +44,12 @@ export function transition(
       const mode = isAction ? 'action' : 'search';
       const scope = conversationScopeMatch ? 'conversations' : 'global';
 
-      // Action mode: compute results synchronously from in-memory list.
-      // Search mode: leave results stale — component useEffect fires async search
-      // and dispatches SET_RESULTS when done.
+      // Action mode computes from its in-memory list. Search mode clears prior
+      // results synchronously so rows from a previous query or scope cannot be
+      // selected while the debounced async search is pending.
       const results = isAction
         ? getActionResults(query, actions ?? [])
-        : state.results;
+        : [];
 
       return {
         ...state,

@@ -28,6 +28,28 @@ describe('command palette query parsing', () => {
     });
   });
 
+  it('clears stale search results before an async scoped search completes', () => {
+    const open = openPalette();
+    if (open.status !== 'open') throw new Error('palette did not open');
+    const withGlobalResults = transition(open, {
+      type: 'SET_RESULTS',
+      results: [{
+        id: 'src/main.rs',
+        title: 'main.rs',
+        category: 'Files',
+        sourceId: 'files',
+      }],
+    });
+
+    const scoped = transition(withGlobalResults, { type: 'SET_QUERY', rawInput: 'c ' });
+    expect(scoped).toMatchObject({
+      status: 'open',
+      scope: 'conversations',
+      selectedIndex: 0,
+      results: [],
+    });
+  });
+
   it('leaves words beginning with c in global search', () => {
     const state = transition(openPalette(), { type: 'SET_QUERY', rawInput: 'code' });
     expect(state).toMatchObject({
