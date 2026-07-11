@@ -233,7 +233,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           </span>
         );
 
-    }, []);
+    }, [activeFindHeaderKey]);
 
     const renderHeaderMetadata = useCallback(
       (item: CodeViewItem<Meta>) => {
