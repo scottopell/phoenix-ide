@@ -136,8 +136,11 @@ pub async fn sample_process_observations(pids: &BTreeSet<u32>) -> Vec<ProcessObs
     rows
 }
 
-pub fn group_member_pids_for_sampling(pgid: i32) -> Option<Vec<u32>> {
-    group_member_pids(pgid)
+pub fn group_member_pids_for_sampling(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
+    if pgids.is_empty() {
+        return Some(Vec::new());
+    }
+    group_member_pids(pgids)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,7 +232,7 @@ fn process_cpu_time_seconds_impl(_pid: u32) -> Option<f64> {
 /// kernel without `smaps_rollup`, a `proc_pid_rusage` failure, a pid that
 /// exited between enumeration and read); the gap is logged at `debug`.
 pub async fn sample_process_group(pgid: i32) -> ResourceSample {
-    let members = group_member_pids(pgid);
+    let members = group_member_pids(&BTreeSet::from([pgid]));
 
     let process_count = match &members {
         Some(pids) => u32::try_from(pids.len()).ok(),
@@ -288,7 +291,7 @@ async fn group_cpu_percent(pids: &[u32]) -> Option<f32> {
 // ===========================================================================
 
 #[cfg(target_os = "linux")]
-fn group_member_pids(pgid: i32) -> Option<Vec<u32>> {
+fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
     let entries = match std::fs::read_dir("/proc") {
         Ok(e) => e,
         Err(e) => {
@@ -304,7 +307,7 @@ fn group_member_pids(pgid: i32) -> Option<Vec<u32>> {
         let Ok(member_pid) = name.parse::<u32>() else {
             continue;
         };
-        if proc_pgrp(member_pid) == Some(pgid) {
+        if proc_pgrp(member_pid).is_some_and(|pgid| pgids.contains(&pgid)) {
             out.push(member_pid);
         }
     }
@@ -403,7 +406,7 @@ fn process_pss_bytes_impl(pid: u32) -> Option<u64> {
 // ===========================================================================
 
 #[cfg(target_os = "macos")]
-fn group_member_pids(pgid: i32) -> Option<Vec<u32>> {
+fn group_member_pids(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
     // Size the all-pids buffer. A null buffer returns the *count* of pids the
     // kernel would write — not a byte size — so we allocate that many `c_int`
     // slots (plus headroom to absorb pids that appear between the two calls).
@@ -432,7 +435,7 @@ fn group_member_pids(pgid: i32) -> Option<Vec<u32>> {
     buf.truncate(written_count);
     Some(
         buf.into_iter()
-            .filter(|&p| p > 0 && proc_pgid(p) == Some(pgid))
+            .filter(|&p| p > 0 && proc_pgid(p).is_some_and(|pgid| pgids.contains(&pgid)))
             .map(u32::try_from)
             .filter_map(Result::ok)
             .collect(),
@@ -564,7 +567,7 @@ fn process_pss_bytes_impl(pid: u32) -> Option<u64> {
 // ===========================================================================
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn group_member_pids(_pgid: i32) -> Option<Vec<u32>> {
+fn group_member_pids(_pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
     tracing::debug!(
         "process-inspector: process-group membership unsupported on this platform \
          — resource trio null"
@@ -588,6 +591,14 @@ mod tests {
         let pids = BTreeSet::new();
         let sample = sample_processes(&pids).await;
         assert_eq!(sample, SampledProcesses::empty());
+    }
+
+    #[test]
+    fn empty_process_group_snapshot_returns_no_members() {
+        assert_eq!(
+            group_member_pids_for_sampling(&BTreeSet::new()),
+            Some(Vec::new())
+        );
     }
 
     #[test]

@@ -1070,13 +1070,17 @@ async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResource
 }
 
 async fn snapshot_bash_pids(state: &AppState) -> BTreeSet<u32> {
-    let mut pids = BTreeSet::new();
-    for pgid in state.runtime.bash_handles().snapshot_live_pgids().await {
-        if let Some(members) = group_member_pids_for_sampling(pgid) {
-            pids.extend(members);
-        }
-    }
-    pids
+    let pgids = state
+        .runtime
+        .bash_handles()
+        .snapshot_live_pgids()
+        .await
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    group_member_pids_for_sampling(&pgids)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
 }
 
 #[derive(Default)]
