@@ -228,6 +228,12 @@ pub struct RuntimeManager {
     creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
 }
 
+#[derive(Debug, Clone)]
+struct WorkScopeReconciliationRequest {
+    work_scope: WorkScope,
+    terminal_generation: u64,
+}
+
 /// Handle to interact with a running conversation
 pub struct ConversationHandle {
     pub event_tx: mpsc::Sender<Event>,
@@ -1415,16 +1421,219 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                let work_scope = tokio::select! {
-                    Some(event) = bash_rx.recv() => event.work_scope,
-                    Some(event) = tmux_rx.recv() => event.work_scope,
-                    Some(scope) = browser_rx.recv() => scope,
+                enum BridgeEvent {
+                    Bash(BashLifecycleEvent),
+                    Tmux(WorkScope),
+                    Browser(WorkScope),
+                }
+                let event = tokio::select! {
+                    Some(event) = bash_rx.recv() => BridgeEvent::Bash(event),
+                    Some(event) = tmux_rx.recv() => BridgeEvent::Tmux(event.work_scope),
+                    Some(scope) = browser_rx.recv() => BridgeEvent::Browser(scope),
                     else => break,
                 };
-                manager.broadcast_work_scope_update(&work_scope).await;
+                match event {
+                    BridgeEvent::Bash(event) if event.phase.schedules_reconciliation() => {
+                        let generation = manager
+                            .db()
+                            .active_work_scope_pr_selection(&event.work_scope)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map_or(0, |state| state.inference_generation);
+                        manager
+                            .reconcile_work_scope_after_bash_terminal(
+                                WorkScopeReconciliationRequest {
+                                    work_scope: event.work_scope,
+                                    terminal_generation: generation,
+                                },
+                            )
+                            .await;
+                    }
+                    BridgeEvent::Bash(event) => {
+                        manager.broadcast_work_scope_update(&event.work_scope).await;
+                    }
+                    BridgeEvent::Tmux(work_scope) | BridgeEvent::Browser(work_scope) => {
+                        manager.broadcast_work_scope_update(&work_scope).await;
+                    }
+                }
             }
             tracing::info!("Work-scope bridge stopped");
         });
+    }
+
+    async fn reconcile_work_scope_after_bash_terminal(
+        self: &Arc<Self>,
+        request: WorkScopeReconciliationRequest,
+    ) {
+        if let Err(error) = self
+            .reconcile_work_scope_after_bash_terminal_inner(&request)
+            .await
+        {
+            tracing::debug!(
+                work_scope = %request.work_scope,
+                terminal_generation = request.terminal_generation,
+                error = %error,
+                "bash terminal reconciliation failed"
+            );
+        }
+        self.broadcast_work_scope_update(&request.work_scope).await;
+    }
+
+    async fn reconcile_work_scope_after_bash_terminal_inner(
+        &self,
+        request: &WorkScopeReconciliationRequest,
+    ) -> Result<(), String> {
+        let scope = &request.work_scope;
+        let Some(conv) = self.authoritative_conversation_for_scope(scope).await? else {
+            return Ok(());
+        };
+        let Some(worktree_path) = conv.conv_mode.worktree_path() else {
+            return Ok(());
+        };
+        let worktree = std::path::PathBuf::from(worktree_path);
+        let observed = phoenix_core::git::observe_local_git_head(&worktree);
+        let latest_observed_branch = match &observed {
+            phoenix_core::domain::observed_branch::LocalGitHeadObservation::NamedBranch {
+                repository_identity,
+                branch_name,
+                ..
+            } => Some(
+                phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                    repository_identity: repository_identity.clone(),
+                    branch_name: branch_name.clone(),
+                },
+            ),
+            _ => None,
+        };
+
+        if let Some(upsert) =
+            Self::qualify_observed_branch_for_conversation(&conv, &worktree, &observed)
+        {
+            self.db()
+                .upsert_work_scope_observed_branch(scope, &upsert)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+
+        let mut candidates = std::collections::BTreeSet::new();
+        for branch in self
+            .db()
+            .list_work_scope_observed_branches(scope)
+            .await
+            .map_err(|err| err.to_string())?
+        {
+            candidates.insert(branch.branch_name);
+        }
+        if let Some(branch_name) = conv.conv_mode.branch_name() {
+            candidates.insert(branch_name.to_string());
+        }
+
+        let refreshes = tokio::task::spawn_blocking({
+            let worktree = worktree.clone();
+            let branches: Vec<String> = candidates.into_iter().collect();
+            move || {
+                branches
+                    .into_iter()
+                    .map(|branch_name| {
+                        crate::api::pr_monitoring::get_pr_status_for_branch(&worktree, &branch_name)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+
+        let observations: Vec<_> = refreshes
+            .into_iter()
+            .flat_map(|refresh| refresh.observations)
+            .collect();
+        if !observations.is_empty() {
+            self.db()
+                .upsert_work_scope_pr_observations(scope, &observations)
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+
+        self.db()
+            .derive_active_work_scope_pr_selection(
+                scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch,
+                },
+                Some(request.terminal_generation),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    async fn authoritative_conversation_for_scope(
+        &self,
+        work_scope: &WorkScope,
+    ) -> Result<Option<crate::db::Conversation>, String> {
+        match work_scope {
+            WorkScope::Conversation(id) => {
+                self.db()
+                    .get_conversation(id)
+                    .await
+                    .map(Some)
+                    .or_else(|err| match err {
+                        crate::db::DbError::ConversationNotFound(_) => Ok(None),
+                        other => Err(other.to_string()),
+                    })
+            }
+            WorkScope::Worktree(path) => {
+                let convs = self
+                    .db()
+                    .get_work_conversations()
+                    .await
+                    .map_err(|err| err.to_string())?;
+                if let Some(conv) = convs.iter().find(|conv| {
+                    conv.conv_mode.worktree_path() == Some(path.as_str())
+                        && !conv.state.is_terminal()
+                        && !conv.archived
+                }) {
+                    return Ok(Some(conv.clone()));
+                }
+                Ok(convs
+                    .into_iter()
+                    .find(|conv| conv.conv_mode.worktree_path() == Some(path.as_str())))
+            }
+            WorkScope::Global => Ok(None),
+        }
+    }
+
+    fn qualify_observed_branch_for_conversation(
+        conv: &crate::db::Conversation,
+        worktree: &std::path::Path,
+        observed: &phoenix_core::domain::observed_branch::LocalGitHeadObservation,
+    ) -> Option<crate::db::WorkScopeObservedBranchUpsert> {
+        let base_branch = conv.conv_mode.base_branch()?;
+        let comparator = crate::git_ops::effective_base_ref(worktree, base_branch);
+        let ahead = crate::git_ops::run_git(
+            worktree,
+            &["rev-list", "--count", &format!("{comparator}..HEAD")],
+        )
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+        if ahead == 0 {
+            return None;
+        }
+        match observed {
+            phoenix_core::domain::observed_branch::LocalGitHeadObservation::NamedBranch {
+                repository_identity,
+                branch_name,
+                head_oid,
+            } if branch_name != base_branch => Some(crate::db::WorkScopeObservedBranchUpsert {
+                repository_identity: repository_identity.clone(),
+                branch_name: branch_name.clone(),
+                head_oid: head_oid.clone(),
+            }),
+            _ => None,
+        }
     }
 
     /// Assemble `work_scope`'s inventory and broadcast a `WorkScopeUpdate` to

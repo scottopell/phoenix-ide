@@ -516,7 +516,10 @@ async fn run_run(
                 // work-scope state-transition signal (REQ-WSUI-007). The
                 // detached waiter started below carries the sink so it can
                 // emit the terminal edge off-thread.
-                registry.emit_lifecycle(&ctx.work_scope);
+                registry.emit_lifecycle(
+                    &ctx.work_scope,
+                    crate::bash::registry::BashLifecyclePhase::Spawned,
+                );
                 start_io_tasks(
                     &inserted,
                     child,
@@ -786,6 +789,7 @@ async fn run_waiter(
         if let Some(sink) = &lifecycle_sink {
             if let Err(e) = sink.send(crate::bash::registry::BashLifecycleEvent {
                 work_scope: handle.work_scope.clone(),
+                phase: crate::bash::registry::BashLifecyclePhase::Terminal,
             }) {
                 tracing::debug!(
                     work_scope = %handle.work_scope,
@@ -992,7 +996,7 @@ async fn run_kill(handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> Too
             // Kill edge: the handle moved running -> kill_pending_kernel, a
             // state the inventory reflects (REQ-WSUI-007). Emit now; the
             // later tombstone transition emits again from the waiter.
-            ctx.bash_handle_registry().emit_lifecycle(&ctx.work_scope);
+            ctx.bash_handle_registry().emit_lifecycle(&ctx.work_scope, crate::bash::registry::BashLifecyclePhase::Terminal);
             shape_handle_response(
                 &handle,
                 &ReadArgs::default(),

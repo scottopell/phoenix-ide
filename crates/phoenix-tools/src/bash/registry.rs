@@ -174,9 +174,23 @@ impl WorkScopeHandles {
 /// `WorkScope`, leaving inventory assembly and conversation routing to the
 /// runtime's work-scope bridge. State transitions only — NOT per output line
 /// (REQ-WSUI-007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BashLifecyclePhase {
+    Spawned,
+    Terminal,
+}
+
+impl BashLifecyclePhase {
+    #[must_use]
+    pub fn schedules_reconciliation(self) -> bool {
+        matches!(self, Self::Terminal)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BashLifecycleEvent {
     pub work_scope: WorkScope,
+    pub phase: BashLifecyclePhase,
 }
 
 /// Sink the registry publishes [`BashLifecycleEvent`]s into. A bounded `mpsc`
@@ -250,12 +264,13 @@ impl BashHandleRegistry {
     /// wired. Best-effort: a dropped receiver / closed channel is logged at
     /// `debug` (capability gap) and does not affect handle correctness.
     /// Mirrors `BrowserSessionManager::emit_lifecycle`.
-    pub fn emit_lifecycle(&self, work_scope: &WorkScope) {
+    pub fn emit_lifecycle(&self, work_scope: &WorkScope, phase: BashLifecyclePhase) {
         let Some(sink) = self.lifecycle_sink.as_ref() else {
             return;
         };
         let event = BashLifecycleEvent {
             work_scope: work_scope.clone(),
+            phase,
         };
         if let Err(e) = sink.send(event) {
             tracing::debug!(
@@ -498,7 +513,7 @@ pub async fn cascade_bash_on_delete(
     // the bridge would leave the collapsed work-scope badge showing the
     // killed handles (REQ-WSUI-007). NOT emitted on the preserved early
     // return above, where nothing changed.
-    registry.emit_lifecycle(work_scope);
+    registry.emit_lifecycle(work_scope, BashLifecyclePhase::Terminal);
 
     report
 }
@@ -556,20 +571,22 @@ mod tests {
         let registry = BashHandleRegistry::with_lifecycle_sink(Some(tx));
         let a = scope("conv-A");
         let b = scope("conv-B");
-        registry.emit_lifecycle(&a);
-        registry.emit_lifecycle(&b);
+        registry.emit_lifecycle(&a, BashLifecyclePhase::Spawned);
+        registry.emit_lifecycle(&b, BashLifecyclePhase::Terminal);
 
         let e1 = rx.try_recv().expect("first event missing");
         assert_eq!(e1.work_scope, a);
+        assert_eq!(e1.phase, BashLifecyclePhase::Spawned);
         let e2 = rx.try_recv().expect("second event missing");
         assert_eq!(e2.work_scope, b);
+        assert_eq!(e2.phase, BashLifecyclePhase::Terminal);
         assert!(rx.try_recv().is_err(), "no more events expected");
     }
 
     #[tokio::test]
     async fn emit_lifecycle_without_sink_is_no_op() {
         let registry = BashHandleRegistry::new();
-        registry.emit_lifecycle(&scope("conv-X"));
+        registry.emit_lifecycle(&scope("conv-X"), BashLifecyclePhase::Spawned);
         assert!(registry.lifecycle_sink().is_none());
     }
 

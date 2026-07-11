@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,8 +15,8 @@ pub(crate) const POLL_JITTER: Duration = Duration::from_secs(90);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PollTarget {
     work_scope: WorkScope,
-    branch_name: String,
     worktree_path: PathBuf,
+    candidate_branches: Vec<String>,
 }
 
 pub(crate) fn interval_with_jitter(
@@ -74,13 +74,22 @@ async fn collect_targets(db: &Database) -> Result<Vec<PollTarget>, String> {
             _ => continue,
         };
         let work_scope = WorkScope::resolve(&conv.id, Some(Path::new(&worktree_path)));
-        if !seen.insert((work_scope.clone(), branch_name.clone())) {
+        if !seen.insert(work_scope.clone()) {
             continue;
+        }
+        let mut branches = BTreeSet::new();
+        branches.insert(branch_name);
+        for observed in db
+            .list_work_scope_observed_branches(&work_scope)
+            .await
+            .map_err(|err| err.to_string())?
+        {
+            branches.insert(observed.branch_name);
         }
         targets.push(PollTarget {
             work_scope,
-            branch_name,
             worktree_path: PathBuf::from(worktree_path),
+            candidate_branches: branches.into_iter().collect(),
         });
     }
 
@@ -92,27 +101,36 @@ async fn poll_target(manager: &Arc<RuntimeManager>, target: PollTarget) {
         return;
     }
 
-    let branch_name = target.branch_name.clone();
     let worktree_path = target.worktree_path.clone();
-    let refresh = match tokio::task::spawn_blocking(move || {
-        crate::api::pr_monitoring::get_pr_status_for_branch(&worktree_path, &branch_name)
+    let candidate_branches = target.candidate_branches.clone();
+    let refreshes = match tokio::task::spawn_blocking(move || {
+        candidate_branches
+            .into_iter()
+            .map(|branch_name| {
+                crate::api::pr_monitoring::get_pr_status_for_branch(&worktree_path, &branch_name)
+            })
+            .collect::<Vec<_>>()
     })
     .await
     {
-        Ok(refresh) => refresh,
+        Ok(refreshes) => refreshes,
         Err(err) => {
             tracing::debug!(work_scope = %target.work_scope, error = %err, "background PR status poll task failed");
             return;
         }
     };
 
-    if refresh.observations.is_empty() {
+    let observations: Vec<_> = refreshes
+        .into_iter()
+        .flat_map(|refresh| refresh.observations)
+        .collect();
+    if observations.is_empty() {
         return;
     }
 
     match manager
         .db()
-        .upsert_work_scope_pr_observations(&target.work_scope, &refresh.observations)
+        .upsert_work_scope_pr_observations(&target.work_scope, &observations)
         .await
     {
         Ok(_) => {

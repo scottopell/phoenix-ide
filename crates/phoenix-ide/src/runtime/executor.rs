@@ -5498,7 +5498,10 @@ where
                 // affected scope, so a single emit on any registry sink covers
                 // all three kinds; bash is used as the carrier.
                 if bash_moved || browser_moved || tmux_moved {
-                    self.bash_handles.emit_lifecycle(&new_scope);
+                    self.bash_handles.emit_lifecycle(
+                        &new_scope,
+                        phoenix_tools::bash::BashLifecyclePhase::Spawned,
+                    );
                 }
 
                 // Upgrade tool registry from Explore to Work mode so the agent
