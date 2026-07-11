@@ -41,8 +41,8 @@ interface MeasuredSession {
 }
 
 type UnreadySession =
-  | { kind: 'unmeasured'; conversationId: string | undefined }
-  | { kind: 'measured-empty'; conversationId: string | undefined };
+  | { kind: 'unmeasured'; conversationId: string | undefined; navigationPending: boolean }
+  | { kind: 'measured-empty'; conversationId: string | undefined; navigationPending: boolean };
 
 type ReadySession =
   | (MeasuredSession & { kind: 'mount-rescue'; deadlineMs: number })
@@ -136,7 +136,7 @@ function updateGeometry(
 export function initialScrollMachineState(
   conversationId?: string,
 ): ScrollMachineState {
-  return { kind: 'unmeasured', conversationId };
+  return { kind: 'unmeasured', conversationId, navigationPending: false };
 }
 
 function unreadEffects(wasUnread: boolean, unread: boolean): ScrollEffect[] {
@@ -299,8 +299,21 @@ export function reduceScrollMachine(
       if (event.unitCount === 0 || event.snapshot === null) {
         return {
           state: event.unitCount === 0
-            ? { kind: 'measured-empty', conversationId: event.conversationId }
+            ? { kind: 'measured-empty', conversationId: event.conversationId, navigationPending: state.navigationPending }
             : state,
+          effects: [],
+        };
+      }
+      if (state.navigationPending) {
+        return {
+          state: {
+            kind: 'live',
+            conversationId: event.conversationId,
+            follow: { kind: 'navigating', departedBottom: false },
+            geometry: geometryFrom(event.snapshot, event.totalHeight),
+            gesture: IDLE,
+            unread: false,
+          },
           effects: [],
         };
       }
@@ -417,7 +430,7 @@ export function reduceScrollMachine(
       return takeUserOwnership(state, event.snapshot);
 
     case 'navigationJumped':
-      if (!isReady(state)) return { state, effects: [] };
+      if (!isReady(state)) return { state: { ...state, navigationPending: true }, effects: [] };
       if (state.kind === 'mount-rescue') return exitMountRescue(state, navigationMode(state));
       return { state: { ...state, follow: navigationMode(state) }, effects: [] };
 

@@ -190,6 +190,47 @@ describe('scrollMachine durable follow policy', () => {
     expect(stranded.effects).toEqual([{ type: 'writeDomBottom' }]);
   });
 
+  it('preserves a navigation jump made before first measurement', () => {
+    let result = reduceScrollMachine(initialScrollMachineState('conv'), { type: 'navigationJumped' });
+    expect(result.state.kind === 'unmeasured' && result.state.navigationPending).toBe(true);
+
+    result = reduceScrollMachine(result.state, {
+      type: 'conversationMeasured',
+      conversationId: 'conv',
+      totalHeight: 1_000,
+      unitCount: 5,
+      snapshot: snap(1_000, 600, 400),
+      nowMs: 1_000,
+    });
+
+    expectLiveMode(result.state, 'navigating');
+    expect(result.effects).toEqual([]);
+  });
+
+  it('preserves a navigation jump while an initially empty list waits for content', () => {
+    let result = reduceScrollMachine(initialScrollMachineState('conv'), { type: 'navigationJumped' });
+    result = reduceScrollMachine(result.state, {
+      type: 'conversationMeasured',
+      conversationId: 'conv',
+      totalHeight: 0,
+      unitCount: 0,
+      snapshot: snap(0, 0, 400),
+      nowMs: 1_000,
+    });
+    expect(result.state.kind === 'measured-empty' && result.state.navigationPending).toBe(true);
+
+    result = reduceScrollMachine(result.state, {
+      type: 'conversationMeasured',
+      conversationId: 'conv',
+      totalHeight: 1_000,
+      unitCount: 5,
+      snapshot: snap(1_000, 600, 400),
+      nowMs: 1_100,
+    });
+    expectLiveMode(result.state, 'navigating');
+    expect(result.effects).toEqual([]);
+  });
+
   it('navigation jumps take durable ownership and disable mount rescue', () => {
     const mounted = measured();
     const result = reduceScrollMachine(mounted.state, { type: 'navigationJumped' });
@@ -406,7 +447,7 @@ describe('scrollMachine durable follow policy', () => {
       conversationId: 'new',
     });
 
-    expect(result.state).toEqual({ kind: 'unmeasured', conversationId: 'new' });
+    expect(result.state).toEqual({ kind: 'unmeasured', conversationId: 'new', navigationPending: false });
     expect(result.effects).toEqual([{ type: 'clearUnread' }]);
   });
 });

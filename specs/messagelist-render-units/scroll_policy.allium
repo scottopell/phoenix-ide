@@ -30,6 +30,7 @@ entity ScrollPolicy {
     gesture_mode: GestureMode
     mode_before_gesture: FollowMode
     navigation_departed_bottom: Boolean
+    navigation_pending: Boolean
     gesture_departed_bottom: Boolean
     at_bottom: Boolean
     unread: Boolean
@@ -125,9 +126,30 @@ rule DownwardMovementUpdatesGeometryWithoutChangingOwnership {
     ensures: policy.follow_mode = policy.follow_mode
 }
 
+rule NavigationBeforeMeasurementRemainsPending {
+    when: NavigationJumped(policy)
+    requires: policy.lifecycle in { unmeasured, measured_empty }
+    ensures: policy.navigation_pending = true
+}
+
+rule PendingNavigationMeasurementEntersLiveNavigation {
+    when: ConversationMeasured(policy, conversation_id, total_height, unit_count, _)
+    requires: policy.lifecycle in { unmeasured, measured_empty }
+    requires: policy.navigation_pending = true
+    requires: unit_count > 0
+    ensures: policy.conversation_id = conversation_id
+    ensures: policy.lifecycle = live
+    ensures: policy.follow_mode = navigating
+    ensures: policy.previous_total_height = total_height
+    ensures: policy.navigation_pending = false
+    ensures: not ScrollEffect.created(policy: policy, kind: start_settle_watch)
+    ensures: not ScrollEffect.created(policy: policy, kind: schedule_dom_bottom_write)
+}
+
 rule PopulatedMeasurementStartsMountRescue {
     when: ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
     requires: policy.lifecycle = unmeasured
+    requires: policy.navigation_pending = false
     requires: unit_count > 0
     ensures: policy.conversation_id = conversation_id
     ensures: policy.lifecycle = mount_rescue
@@ -153,6 +175,7 @@ rule EmptyMeasurementWaitsForContent {
 rule FirstContentAfterEmptyStartsRescueAndSnaps {
     when: ConversationMeasured(policy, conversation_id, total_height, unit_count, now_ms)
     requires: policy.lifecycle = measured_empty
+    requires: policy.navigation_pending = false
     requires: unit_count > 0
     ensures: policy.conversation_id = conversation_id
     ensures: policy.lifecycle = mount_rescue
