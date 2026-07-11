@@ -146,7 +146,7 @@ pub fn group_member_pids_for_sampling(pgids: &BTreeSet<i32>) -> Option<Vec<u32>>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProcessIdentity {
     pid: u32,
-    start_time: u64,
+    start_time: u128,
 }
 
 fn observed_process_identities(
@@ -330,11 +330,11 @@ fn proc_pgrp(pid: u32) -> Option<i32> {
 }
 
 #[cfg(target_os = "linux")]
-fn proc_start_time(pid: u32) -> Option<u64> {
+fn proc_start_time(pid: u32) -> Option<u128> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let close = stat.rfind(')')?;
     let tail = stat.get(close + 1..)?;
-    tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+    tail.split_whitespace().nth(19)?.parse::<u128>().ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -469,7 +469,7 @@ fn proc_pgid(pid: i32) -> Option<i32> {
 }
 
 #[cfg(target_os = "macos")]
-fn proc_start_time(pid: u32) -> Option<u64> {
+fn proc_start_time(pid: u32) -> Option<u128> {
     let pid = libc::c_int::try_from(pid).ok()?;
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
@@ -485,11 +485,12 @@ fn proc_start_time(pid: u32) -> Option<u64> {
             size,
         )
     };
-    if rc == size {
-        Some(info.pbi_start_tvsec)
-    } else {
-        None
+    if rc != size {
+        return None;
     }
+    u128::from(info.pbi_start_tvsec)
+        .checked_mul(1_000_000)
+        .and_then(|seconds| seconds.checked_add(u128::from(info.pbi_start_tvusec)))
 }
 
 /// Sum `proc_pid_rusage(pid, RUSAGE_INFO_V2)`'s `ri_phys_footprint` over the

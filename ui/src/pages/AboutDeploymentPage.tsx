@@ -335,12 +335,8 @@ function ResourceMonitor({ state, refresh }: { state: ResourceState; refresh: ()
                   <strong>{resourceText(sample.host.cpu_idle_percent, (value) => formatPercent(value))}</strong>
                 </div>
                 <div>
-                  <span>User / system</span>
-                  <strong>
-                    {sample.host.cpu_busy_percent !== null || sample.host.cpu_system_percent !== null
-                      ? `${resourceText(sample.host.cpu_busy_percent, (value) => formatPercent(value))} / ${resourceText(sample.host.cpu_system_percent, (value) => formatPercent(value))}`
-                      : 'unavailable'}
-                  </strong>
+                  <span>System</span>
+                  <strong>{resourceText(sample.host.cpu_system_percent, (value) => formatPercent(value))}</strong>
                 </div>
               </div>
               <div className="about-resources-card__stat-row">

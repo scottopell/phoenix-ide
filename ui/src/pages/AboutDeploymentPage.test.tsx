@@ -45,13 +45,6 @@ function deployment(overrides: Partial<DeploymentInfo> = {}): DeploymentInfo {
         hosts: [],
       },
     },
-    resources: {
-      process_memory_bytes: 1024,
-      process_cpu_percent: 1.5,
-      system_total_memory_bytes: 4096,
-      system_available_memory_bytes: 2048,
-      logical_cpu_count: 4,
-    },
     log: { stdout: true, file: null },
     local_access: false,
     sampled_at: '2026-06-01T00:00:01Z',

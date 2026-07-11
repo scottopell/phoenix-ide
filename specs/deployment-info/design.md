@@ -28,7 +28,6 @@ names below are the JSON field names.
 DeploymentInfo {
   build:      BuildInfo
   network:    NetworkInfo
-  resources:  ResourceUsage
   disk:       DiskEntry[]
   log:        LogInfo
   sampled_at: string            // RFC3339 (DateTime<Utc>)
@@ -56,14 +55,6 @@ TlsInfo {
   hosts:        string[]                    // auto mode host list; empty otherwise
 }
 
-ResourceUsage {                  // every field null when unsamplable on the host
-  process_memory_bytes:           number | null   // RSS
-  process_cpu_percent:            number | null
-  system_total_memory_bytes:      number | null
-  system_available_memory_bytes:  number | null
-  logical_cpu_count:              number | null
-}
-
 DiskEntry {
   label: string                  // "Database", "Data directory", "TLS", ...
   path:  string                  // absolute path
@@ -87,11 +78,6 @@ semantically distinct and a bare nullable number cannot tell "not measured"
 apart from "absent" apart from "inline in the DB." Modelling them as a tagged
 union makes the invalid combinations unrepresentable and forces the UI to render
 each state deliberately (correct-by-construction; see AGENTS.md).
-
-`ResourceUsage` fields are individually `Option` because availability is
-per-metric, not all-or-nothing — a host may expose system memory but not
-per-process CPU. `null` is the explicit "unavailable" marker REQ-DEPLOY-004
-requires; the UI renders it as "unavailable," never as `0`.
 
 ## Backend
 
@@ -160,15 +146,7 @@ Sampling steps:
    from `hot_restart`. `hot_restart` exposes the process start `Instant` and the
    start wall-clock `DateTime<Utc>` through public accessors so the handler can
    report both uptime and an absolute start time.
-2. **Resources:** via the `sysinfo` crate, refreshing process and global
-   memory plus the CPU list. Each metric is mapped to `Some(_)` when sysinfo
-   provides it and `None` when it does not. The logical CPU count is the length
-   of sysinfo's CPU list — the host total this field labels — rather than
-   `std::thread::available_parallelism()`, which reflects the process's CPU
-   affinity/quota and would under-report under a cgroup limit. sysinfo is the
-   cross-platform sampler that satisfies the macOS + Linux requirement without
-   per-OS `/proc` scraping.
-3. **Disk:** one `DiskEntry` per static `DiskLocation`, sized per its
+2. **Disk:** one `DiskEntry` per static `DiskLocation`, sized per its
    `MeasureMode` (see Config capture). `File`/`RecurseSmall` produce
    `DiskSize::measured`; `NoMeasure`/`Pattern` produce `DiskSize::not_measured`;
    a missing real path yields `DiskSize::absent`; the attachment store yields
@@ -191,7 +169,7 @@ Sampling steps:
    worktrees created and torn down after startup. Each PR-context bundle directory
    is capacity-bounded by the capture-site retention, so that aggregate walk stays
    cheap.
-4. **`sampled_at`:** `Utc::now()` at the moment the snapshot is assembled.
+3. **`sampled_at`:** `Utc::now()` at the moment the snapshot is assembled.
 
 The `dir_size` helper is bounded: it recurses only the directories the spec
 classifies as small — the owned data directory, TLS and skills directories, and
@@ -209,7 +187,8 @@ large-cache paths, so a single request cannot trigger a multi-gigabyte walk
 - **Page:** `AboutDeploymentPage` calls `api.deploymentInfo()` on mount, holds
   loading/error/data state, and renders grouped sections — Build, Network &
   TLS, Resources, Disk, Logs — using the existing `.view-header` and
-  `.settings-section` classes. A refresh control re-invokes the fetch
+  `.settings-section` classes. Live resources come exclusively from the focused
+  managed-resource endpoint. A refresh control re-invokes the deployment fetch
   (REQ-DEPLOY-007). The `sampled_at` time is shown so the snapshot is visibly
   point-in-time.
 - **Rendering rules:** `DiskSize` is matched exhaustively — `measured` shows a
@@ -218,8 +197,7 @@ large-cache paths, so a single request cannot trigger a multi-gigabyte walk
   derives a point-in-time health summary from the typed sizes:
   measured/not-measured/absent row counts, a warning when rows are path-only or
   potentially overlapping, and a highlight for the largest measured category.
-  `null` resource values show
-  "unavailable." TLS-disabled renders "Serving plain HTTP." The log section
+  TLS-disabled renders "Serving plain HTTP." The log section
   renders one row per sink: stdout on/off, and the file path (or "none").
 - **API:** `api.deploymentInfo()` is a plain `GET /api/deployment` returning the
   `ts_rs`-generated `DeploymentInfo` type imported from `ui/src/generated/`.

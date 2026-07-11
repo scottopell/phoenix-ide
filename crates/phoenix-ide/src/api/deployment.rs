@@ -76,7 +76,6 @@ pub struct DeploymentConfig {
 pub struct DeploymentInfo {
     pub build: BuildInfo,
     pub network: NetworkInfo,
-    pub resources: ResourceUsage,
     pub log: LogInfo,
     /// Whether the requesting browser is on the server host, and so may use
     /// host-local actions like revealing a path in the OS file manager. False
@@ -137,21 +136,6 @@ impl TlsInfo {
             hosts: Vec::new(),
         }
     }
-}
-
-/// Live process + system resource usage. Each field is `None` when the metric
-/// cannot be sampled on the host — never a misleading `0`.
-#[derive(Serialize, TS)]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ResourceUsage {
-    /// Resident set size of this process, in bytes.
-    pub process_memory_bytes: Option<u64>,
-    /// CPU utilization of this process, as a percent (may exceed 100 on
-    /// multi-core hosts).
-    pub process_cpu_percent: Option<f32>,
-    pub system_total_memory_bytes: Option<u64>,
-    pub system_available_memory_bytes: Option<u64>,
-    pub logical_cpu_count: Option<u32>,
 }
 
 #[derive(Serialize, TS)]
@@ -350,12 +334,9 @@ pub async fn deployment_info(
         tls: cfg.tls.clone(),
     };
 
-    let resources = sample_resources().await;
-
     Json(DeploymentInfo {
         build,
         network,
-        resources,
         log: cfg.log.clone(),
         local_access: super::local_reveal::client_is_local(peer.ip(), &headers),
         sampled_at: Utc::now(),
@@ -933,35 +914,6 @@ pub fn absolutize(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
-}
-
-/// Sample live process and system resource usage. Returns `None` for any metric
-/// the host does not expose rather than a misleading zero.
-async fn sample_resources() -> ResourceUsage {
-    let about = sample_about_resources_inner(None).await;
-    let api = about
-        .categories
-        .iter()
-        .find(|c| c.kind == ManagedResourceCategoryKind::Api);
-
-    ResourceUsage {
-        process_memory_bytes: current_process_rss_bytes(),
-        process_cpu_percent: api.and_then(|c| c.totals.cpu_percent),
-        system_total_memory_bytes: about.host.total_memory_bytes,
-        system_available_memory_bytes: about.host.available_memory_bytes,
-        logical_cpu_count: about.host.logical_cpu_count,
-    }
-}
-
-fn current_process_rss_bytes() -> Option<u64> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
-
-    let pid = sysinfo::get_current_pid().ok()?;
-    let mut sys = System::new_with_specifics(
-        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
-    );
-    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-    sys.process(pid).map(sysinfo::Process::memory)
 }
 
 async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
@@ -1712,15 +1664,6 @@ mod tests {
         let abs = absolutize(Path::new("phoenix.db"));
         assert!(abs.is_absolute());
         assert_eq!(abs, cwd.join("phoenix.db"));
-    }
-
-    #[tokio::test]
-    async fn sample_resources_completes_with_system_metrics() {
-        let usage = sample_resources().await;
-        // System totals are always populated on supported hosts; the call must
-        // complete (including its CPU-sample window) without panicking.
-        assert!(usage.system_total_memory_bytes.is_some());
-        assert!(usage.system_available_memory_bytes.is_some());
     }
 
     #[test]

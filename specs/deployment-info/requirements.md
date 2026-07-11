@@ -126,6 +126,8 @@ the socket), which is worth knowing when the bind address looks surprising.
 THE SYSTEM SHALL provide a dedicated managed-resource endpoint distinct from the
 general deployment snapshot and the disk-sizing endpoint.
 
+THE SYSTEM SHALL expose live CPU, memory, load, and managed-process telemetry only through the dedicated managed-resource endpoint, not through the general deployment snapshot.
+
 THE SYSTEM SHALL display host-wide resource usage including:
 
 - Logical CPU count
