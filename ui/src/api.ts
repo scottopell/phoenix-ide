@@ -173,6 +173,72 @@ export interface CachedPrSummary {
   feedback_status?: PrFeedbackStatus;
 }
 
+export interface ActivePrIdentityResponse {
+  repo_owner: string;
+  repo_name: string;
+  pr_number: number;
+}
+
+export type ActivePrSelectionProvenanceResponse = 'inferred' | 'pinned';
+
+export interface ActivePrSelectionResponse {
+  pr: ActivePrIdentityResponse;
+  provenance: ActivePrSelectionProvenanceResponse;
+}
+
+export interface ObservedBranchSummaryResponse {
+  repository_identity: string;
+  branch_name: string;
+}
+
+export interface AssociatedPrSummaryResponse {
+  repo_owner: string;
+  repo_name: string;
+  pr_number: number;
+  title: string;
+  url: string;
+  state: string;
+  draft: boolean;
+  display_state: PrDisplayState;
+  base: string;
+  head: string;
+  github_updated_at?: string;
+  feedback_status: PrFeedbackStatus;
+}
+
+export interface AssociatedPrStatusEnvelope {
+  associated_prs: AssociatedPrSummaryResponse[];
+  active_pr?: ActivePrSelectionResponse;
+  latest_observed_branch?: ObservedBranchSummaryResponse;
+}
+
+export interface ActivePrSelectionMutationResponse {
+  active_pr?: ActivePrSelectionResponse;
+  latest_observed_branch?: ObservedBranchSummaryResponse;
+}
+
+export interface PinAssociatedPrRequest {
+  repo_owner: string;
+  repo_name: string;
+  pr_number: number;
+}
+
+export type ConversationDiffKind = 'workspace' | 'active_pr';
+
+export interface ConversationDiffResponse {
+  comparator: string;
+  commit_log: string;
+  committed_diff: string;
+  committed_truncated_kib?: number;
+  committed_saturated?: boolean;
+  uncommitted_diff: string;
+  uncommitted_truncated_kib?: number;
+  uncommitted_saturated?: boolean;
+  kind?: ConversationDiffKind;
+  label?: string;
+  pr_number?: number;
+}
+
 export interface PrCheckSummary {
   passing: number;
   pending: number;
@@ -300,6 +366,7 @@ export interface PrStatusResponse {
   feedback_status?: PrFeedbackStatus;
   feedback_coverage?: PrFeedbackCoverageHealth;
   work_change: WorkChangeSummary;
+  selection?: AssociatedPrStatusEnvelope;
 }
 
 export interface Project {
@@ -1921,23 +1988,33 @@ export const api = {
    *  bare `<base>` for local-only repos. Used by the WorkActions
    *  "View diff" action. Diff sections are capped at 256KiB server-side;
    *  truncation_kib fields hold the original size when truncation hit. */
-  async getConversationDiff(conversationId: string): Promise<{
-    comparator: string;
-    commit_log: string;
-    committed_diff: string;
-    committed_truncated_kib?: number;
-    /** When true, committed_truncated_kib is a lower bound — UI should
-     *  prefix the size with "≥". Set when the streaming reader hit its
-     *  hard limit and killed the git child without seeing EOF. */
-    committed_saturated?: boolean;
-    uncommitted_diff: string;
-    uncommitted_truncated_kib?: number;
-    uncommitted_saturated?: boolean;
-  }> {
+  async getConversationDiff(conversationId: string): Promise<ConversationDiffResponse> {
     const resp = await fetch(`/api/conversations/${conversationId}/diff`);
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to fetch diff'); }
     return resp.json();
   },
+  async getActivePrDiff(conversationId: string): Promise<ConversationDiffResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/active-pr/diff`);
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to fetch PR diff'); }
+    return resp.json();
+  },
+
+  async pinAssociatedPr(conversationId: string, request: PinAssociatedPrRequest): Promise<ActivePrSelectionMutationResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/associated-pr/pin`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to select active PR'); }
+    return resp.json();
+  },
+
+  async resumeAssociatedPrInference(conversationId: string): Promise<ActivePrSelectionMutationResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/associated-pr/resume-inference`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to resume active PR inference'); }
+    return resp.json();
+  },
+
 
   /** POST /api/conversations/:id/continue — context-exhausted handoff.
    *

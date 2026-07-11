@@ -9,7 +9,7 @@ use super::chains::{
     stream_chain, submit_chain_question,
 };
 use super::git_handlers::{
-    create_pr_auto_fix_context, get_conversation_diff, get_conversation_pr_status,
+    create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff, get_conversation_pr_status,
     list_git_branches, pin_associated_pr, record_pr_auto_fix_context_baseline,
     resume_associated_pr_inference,
 };
@@ -352,6 +352,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Per-conversation worktree diff and PR state
         .route("/api/conversations/:id/diff", get(get_conversation_diff))
+        .route(
+            "/api/conversations/:id/active-pr/diff",
+            get(get_active_pr_diff),
+        )
         .route(
             "/api/conversations/:id/pr-status",
             get(get_conversation_pr_status),

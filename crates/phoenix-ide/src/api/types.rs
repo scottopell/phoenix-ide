@@ -826,6 +826,13 @@ pub struct ConversationDiffResponse {
     /// The ref used as the comparator — e.g. `"origin/main"` when the
     /// remote-tracking ref exists, or bare `"main"` for local-only repos.
     pub comparator: String,
+    /// Human label for this diff surface (`Workspace Diff`, `PR #123 Diff`).
+    pub label: String,
+    /// Which diff surface this payload represents.
+    pub kind: String,
+    /// The active PR number for PR-specific diffs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u64>,
     /// `git log --oneline <comparator>..HEAD` — commits on the branch
     /// not yet in the comparator. Subject lines only; uncapped (commit
     /// titles are tiny).

@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type CachedPrSummary, type PrStatusResponse } from '../api';
+import {
+  api,
+  type ActivePrSelectionResponse,
+  type AssociatedPrStatusEnvelope,
+  type AssociatedPrSummaryResponse,
+  type CachedPrSummary,
+  type PinAssociatedPrRequest,
+  type PrStatusResponse,
+} from '../api';
 
 export type ConversationPrStatusState =
   | { status: 'disabled'; prStatus: null }
@@ -11,6 +19,11 @@ type InternalConversationPrStatusState = ConversationPrStatusState & { scopeKey:
 export interface ConversationPrStatusHandle {
   state: ConversationPrStatusState;
   refresh: () => Promise<void>;
+  activeSelection: AssociatedPrStatusEnvelope | null;
+  activePrSummary: AssociatedPrSummaryResponse | null;
+  ambiguous: boolean;
+  pinActivePr: (request: PinAssociatedPrRequest) => Promise<void>;
+  resumeInference: () => Promise<void>;
 }
 
 function displayStateToGhState(displayState: CachedPrSummary['display_state']): string {
@@ -63,6 +76,56 @@ function cachedSeedMatchesStatus(cachedSeed: PrStatusResponse, prStatus: PrStatu
     && (prStatus.head ?? prStatus.pr?.head) === cachedSeed.head;
 }
 
+function isActionablePr(pr: AssociatedPrSummaryResponse): boolean {
+  return pr.display_state === 'open' || pr.display_state === 'draft';
+}
+
+function samePrIdentity(
+  activePr: ActivePrSelectionResponse | undefined,
+  pr: AssociatedPrSummaryResponse,
+): boolean {
+  return activePr?.pr.repo_owner === pr.repo_owner
+    && activePr?.pr.repo_name === pr.repo_name
+    && activePr?.pr.pr_number === pr.pr_number;
+}
+
+function selectionForCachedPr(cachedPr: CachedPrSummary | null | undefined): AssociatedPrStatusEnvelope | null {
+  if (!cachedPr) return null;
+  return {
+    associated_prs: [{
+      repo_owner: '',
+      repo_name: '',
+      pr_number: cachedPr.number,
+      title: cachedPr.title,
+      url: cachedPr.url,
+      state: cachedPr.display_state.toUpperCase(),
+      draft: cachedPr.display_state === 'draft',
+      display_state: cachedPr.display_state,
+      base: cachedPr.base,
+      head: cachedPr.head,
+      feedback_status: cachedPr.feedback_status ?? 'open',
+    }],
+    active_pr: {
+      pr: {
+        repo_owner: '',
+        repo_name: '',
+        pr_number: cachedPr.number,
+      },
+      provenance: 'inferred',
+    },
+  };
+}
+
+function activePrSummaryFromSelection(selection: AssociatedPrStatusEnvelope | null): AssociatedPrSummaryResponse | null {
+  if (!selection) return null;
+  return selection.associated_prs.find((pr) => samePrIdentity(selection.active_pr, pr)) ?? null;
+}
+
+function isSelectionAmbiguous(selection: AssociatedPrStatusEnvelope | null): boolean {
+  if (!selection || selection.active_pr) return false;
+  return selection.associated_prs.filter(isActionablePr).length > 1;
+}
+
 function shouldShowCachedSeed(
   internalState: InternalConversationPrStatusState,
   cachedSeed: PrStatusResponse | null,
@@ -107,6 +170,10 @@ export function useConversationPrStatus({
     : null;
   const cachedSeed = useMemo(
     () => (scopeKey && cachedPr ? cachedPrToStatus(cachedPr) : null),
+    [cachedPr, scopeKey],
+  );
+  const cachedSelection = useMemo(
+    () => (scopeKey ? selectionForCachedPr(cachedPr) : null),
     [cachedPr, scopeKey],
   );
   const cachedSeedRef = useRef<PrStatusResponse | null>(null);
@@ -206,8 +273,30 @@ export function useConversationPrStatus({
     };
   }, [scopeKey, refresh]);
 
+  const publicState = publicStateForScope(internalState, scopeKey, cachedSeed);
+  const activeSelection = publicState.status === 'ready'
+    ? (publicState.prStatus.selection ?? cachedSelection)
+    : cachedSelection;
+
+  const pinActivePr = useCallback(async (request: PinAssociatedPrRequest) => {
+    if (!scopeKey || !conversationId) return;
+    await api.pinAssociatedPr(conversationId, request);
+    await refresh();
+  }, [conversationId, refresh, scopeKey]);
+
+  const resumeInference = useCallback(async () => {
+    if (!scopeKey || !conversationId) return;
+    await api.resumeAssociatedPrInference(conversationId);
+    await refresh();
+  }, [conversationId, refresh, scopeKey]);
+
   return {
-    state: publicStateForScope(internalState, scopeKey, cachedSeed),
+    state: publicState,
     refresh,
+    activeSelection,
+    activePrSummary: activePrSummaryFromSelection(activeSelection),
+    ambiguous: isSelectionAmbiguous(activeSelection),
+    pinActivePr,
+    resumeInference,
   };
 }

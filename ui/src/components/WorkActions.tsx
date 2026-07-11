@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { api } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { useViewerSlotCommands } from '../contexts/ViewerSlotContext';
@@ -118,6 +118,15 @@ export function WorkControlBar({
 
   const prLoading = prStatusHandle.state.status === 'loading';
   const prStatus = prStatusHandle.state.status === 'ready' ? prStatusHandle.state.prStatus : null;
+  const activePr = prStatusHandle.activePrSummary;
+  const activePrNumber = activePr?.pr_number ?? prStatus?.number ?? prStatus?.pr?.number ?? null;
+  const activePrLabel = activePrNumber ? `PR #${activePrNumber}` : 'PR';
+  const selection = prStatusHandle.activeSelection;
+  const canShowPrDiff = !!activePr;
+  const diffLabel = useMemo(
+    () => (canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff'),
+    [activePrLabel, canShowPrDiff],
+  );
   const disposition = deriveWorkDisposition({
     convModeLabel,
     phaseType,
@@ -163,8 +172,17 @@ export function WorkControlBar({
           data-testid="view-diff-button"
           onClick={() => openDiffFullscreen()}
         >
-          View Diff
+          Workspace Diff
         </button>
+        {canShowPrDiff && (
+          <button
+            className="work-actions-btn work-actions-view-diff"
+            data-testid="view-active-pr-diff-button"
+            onClick={() => openDiffFullscreen()}
+          >
+            {diffLabel}
+          </button>
+        )}
       </div>
 
       {/* RESOLVE zone — only when the disposition pushes forward (idle). */}
@@ -178,7 +196,7 @@ export function WorkControlBar({
               disabled={capturing}
               onClick={handleAddressFeedback}
             >
-              {capturing ? 'Capturing...' : 'Address feedback'}
+              {capturing ? `Capturing ${activePrLabel}...` : `Address feedback for ${activePrLabel}`}
               {freshnessLabel && <span className="work-actions-pr-freshness">{freshnessLabel}</span>}
               <CoverageMarker marker={coverageMarker} />
             </button>
@@ -270,6 +288,11 @@ export function WorkControlBar({
         <span className="work-actions-pr-note">{note.text}</span>
       )}
 
+      {prStatusHandle.ambiguous && selection && (
+        <span className="work-actions-pr-note work-actions-pr-note--warning" data-testid="active-pr-ambiguity-note">
+          Multiple actionable PRs are associated with this work. Select one before PR-specific actions.
+        </span>
+      )}
       {error && <div className="work-actions-error">{error}</div>}
     </div>
   );

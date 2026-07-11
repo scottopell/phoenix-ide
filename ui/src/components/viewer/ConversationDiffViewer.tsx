@@ -22,6 +22,7 @@ interface ConversationDiffViewerProps {
   onSendNotes: (notes: string) => void;
   inline?: boolean | undefined;
   takeover?: boolean | undefined;
+  target?: 'workspace' | 'active_pr' | undefined;
 }
 
 /**
@@ -37,14 +38,17 @@ export function ConversationDiffViewer({
   onSendNotes,
   inline,
   takeover,
+  target = 'workspace',
 }: ConversationDiffViewerProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
 
   useEffect(() => {
     let cancelled = false;
     setState({ status: 'loading' });
-    api
-      .getConversationDiff(conversationId)
+    const load = target === 'active_pr'
+      ? api.getActivePrDiff(conversationId)
+      : api.getConversationDiff(conversationId);
+    load
       .then((payload) => { if (!cancelled) setState({ status: 'ready', payload, conversationId }); })
       .catch((err: unknown) => {
         if (!cancelled) {
@@ -52,7 +56,7 @@ export function ConversationDiffViewer({
         }
       });
     return () => { cancelled = true; };
-  }, [conversationId]);
+  }, [conversationId, target]);
 
   // Treat a resolved state from a previous conversation as still-loading until
   // the effect refetches for the current conversationId.
@@ -64,6 +68,7 @@ export function ConversationDiffViewer({
       <DiffView
         open
         comparator={p.comparator}
+        label={p.label}
         commitLog={p.commit_log}
         committedDiff={p.committed_diff}
         committedTruncatedKib={p.committed_truncated_kib}
@@ -82,8 +87,8 @@ export function ConversationDiffViewer({
   return (
     <ViewerShell
       mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
-      ariaLabel="Worktree diff"
-      title="Diff"
+      ariaLabel={target === 'active_pr' ? 'Pull request diff' : 'Worktree diff'}
+      title={target === 'active_pr' ? 'PR Diff' : 'Workspace Diff'}
       noteCount={0}
       onToggleNotes={() => undefined}
       onSend={() => undefined}

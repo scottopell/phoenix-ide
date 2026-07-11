@@ -23,6 +23,35 @@ use axum::http::StatusCode;
 use std::fmt::Write as _;
 use std::path::{Path as FsPath, PathBuf};
 
+fn build_diff_response(
+    captured: crate::git_ops::CapturedDiff,
+    label: String,
+    kind: &str,
+    pr_number: Option<u64>,
+) -> ConversationDiffResponse {
+    ConversationDiffResponse {
+        comparator: captured.comparator,
+        label,
+        kind: kind.to_string(),
+        pr_number,
+        commit_log: captured.commit_log,
+        committed_truncated_kib: truncated_kib(
+            &captured.committed_diff,
+            captured.committed_total_bytes,
+            captured.committed_saturated,
+        ),
+        committed_saturated: captured.committed_saturated,
+        committed_diff: captured.committed_diff,
+        uncommitted_truncated_kib: truncated_kib(
+            &captured.uncommitted_diff,
+            captured.uncommitted_total_bytes,
+            captured.uncommitted_saturated,
+        ),
+        uncommitted_saturated: captured.uncommitted_saturated,
+        uncommitted_diff: captured.uncommitted_diff,
+    }
+}
+
 fn active_pr_selection_response(
     selection: phoenix_core::domain::active_pr_selection::ActivePrSelection,
 ) -> ActivePrSelectionResponse {
@@ -1068,10 +1097,70 @@ pub(crate) async fn resume_associated_pr_inference(
     ))
 }
 
-/// `GET /api/conversations/:id/diff` — committed and uncommitted changes
+/// `GET /api/conversations/:id/active-pr/diff` — committed and uncommitted changes
+/// in the conversation's worktree, compared against the explicit active PR's
+/// actual base branch. Read-only; used by the PR-specific diff action.
+pub(crate) async fn get_active_pr_diff(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationDiffResponse>, AppError> {
+    const MAX_DIFF_BYTES: usize = 256 * 1024;
+
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let worktree_path = match &conv.conv_mode {
+        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
+            worktree_path.to_string()
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work or Branch mode (no worktree to diff)".to_string(),
+            ));
+        }
+    };
+    let work_scope = crate::work_scope::WorkScope::resolve(
+        &id,
+        Some(std::path::Path::new(worktree_path.as_str())),
+    );
+    let active_pr = active_selection_target_for_scope(state.runtime.db(), &work_scope)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "PR-specific diff unavailable until an active PR is selected".to_string(),
+            )
+        })?;
+    let base_branch = active_pr.base.clone();
+    let pr_number = active_pr.pr_number;
+
+    tokio::task::spawn_blocking(move || {
+        let wt = PathBuf::from(&worktree_path);
+        if !wt.exists() {
+            return Err(AppError::NotFound(format!(
+                "Worktree no longer exists: {worktree_path}"
+            )));
+        }
+
+        let captured = capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES);
+        Ok(build_diff_response(
+            captured,
+            format!("PR #{pr_number} Diff"),
+            "active_pr",
+            Some(pr_number),
+        ))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+    .map(Json)
+}
+
 /// `GET /api/conversations/:id/diff` — committed and uncommitted changes
 /// in the conversation's worktree, vs the base branch. Read-only; used by
-/// the Work/Branch-mode "View diff" action so users can review before
+/// the Work/Branch-mode workspace diff action so users can review before
 /// deciding to merge or abandon.
 ///
 /// Requires the conversation to be in Work or Branch mode (anything else
@@ -1121,24 +1210,12 @@ pub(crate) async fn get_conversation_diff(
 
         let captured = capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES);
 
-        Ok(ConversationDiffResponse {
-            comparator: captured.comparator,
-            commit_log: captured.commit_log,
-            committed_truncated_kib: truncated_kib(
-                &captured.committed_diff,
-                captured.committed_total_bytes,
-                captured.committed_saturated,
-            ),
-            committed_saturated: captured.committed_saturated,
-            committed_diff: captured.committed_diff,
-            uncommitted_truncated_kib: truncated_kib(
-                &captured.uncommitted_diff,
-                captured.uncommitted_total_bytes,
-                captured.uncommitted_saturated,
-            ),
-            uncommitted_saturated: captured.uncommitted_saturated,
-            uncommitted_diff: captured.uncommitted_diff,
-        })
+        Ok(build_diff_response(
+            captured,
+            "Workspace Diff".to_string(),
+            "workspace",
+            None,
+        ))
     })
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?

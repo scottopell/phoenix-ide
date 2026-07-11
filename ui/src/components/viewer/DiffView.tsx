@@ -32,6 +32,7 @@ import type { PhoenixDiffCodeViewHandle } from './PhoenixDiffCodeView';
 export interface DiffViewProps {
   open: boolean;
   comparator: string;
+  label?: string;
   commitLog: string;
   committedDiff: string;
   committedTruncatedKib?: number | undefined;
@@ -62,6 +63,7 @@ function initialDiffStyle(): DiffStyle {
 export function DiffView({
   open,
   comparator,
+  label,
   commitLog,
   committedDiff,
   committedTruncatedKib,
@@ -195,10 +197,10 @@ export function DiffView({
       closeOnEscape={!find.isOpen}
       onInnerEscape={closeFind}
       mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
-      ariaLabel="Worktree diff"
+      ariaLabel={label ?? 'Worktree diff'}
       title={
         <span>
-          Diff vs <code>{comparator}</code>
+          {label ?? 'Diff'} vs <code>{comparator}</code>
         </span>
       }
       headerExtras={

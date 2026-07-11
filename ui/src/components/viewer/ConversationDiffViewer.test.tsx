@@ -4,7 +4,7 @@ import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import { ConversationDiffViewer } from './ConversationDiffViewer';
 import { api } from '../../api';
 
-vi.mock('../../api', () => ({ api: { getConversationDiff: vi.fn() } }));
+vi.mock('../../api', () => ({ api: { getConversationDiff: vi.fn(), getActivePrDiff: vi.fn() } }));
 
 // CodeView renders asynchronously through Shiki; the mock surfaces the parsed
 // file name synchronously so the loader's conversation-keyed behavior is
@@ -17,6 +17,8 @@ vi.mock('@pierre/diffs/react', async () => {
 function payloadFor(marker: string) {
   return {
     comparator: 'origin/main',
+    label: 'Workspace Diff',
+    kind: 'workspace',
     commit_log: '',
     committed_diff: `diff --git a/${marker}.txt b/${marker}.txt\n--- a/${marker}.txt\n+++ b/${marker}.txt\n@@ -0,0 +1 @@\n+${marker}`,
     uncommitted_diff: '',
@@ -61,12 +63,33 @@ describe('ConversationDiffViewer — conversation-keyed payload', () => {
     await waitFor(() => expect(screen.getByText('CONV2.txt')).toBeInTheDocument());
   });
 
+
+  it('loads the active PR diff endpoint when requested', async () => {
+    (api.getActivePrDiff as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...payloadFor('STACKED'),
+      label: 'PR #88 Diff',
+      kind: 'active_pr',
+      pr_number: 88,
+      comparator: 'task/base-pr',
+    });
+
+    render(
+      <ReviewNotesProvider>
+        <ConversationDiffViewer conversationId="conv-pr" target="active_pr" onClose={() => undefined} onSendNotes={() => undefined} />
+      </ReviewNotesProvider>,
+    );
+
+    await waitFor(() => expect(api.getActivePrDiff).toHaveBeenCalledWith('conv-pr'));
+    expect(await screen.findByText('STACKED.txt')).toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'PR #88 Diff' })).toBeInTheDocument();
+  });
+
   it('renders fullscreen presentation as a takeover dialog', async () => {
     (api.getConversationDiff as ReturnType<typeof vi.fn>).mockResolvedValue(payloadFor('TAKEOVER'));
 
     renderViewer('conv-1', true);
 
-    const dialog = await screen.findByRole('dialog', { name: 'Worktree diff' });
+    const dialog = await screen.findByRole('dialog', { name: 'Workspace Diff' });
     expect(dialog).toHaveClass('viewer-shell--takeover');
     expect(dialog).not.toHaveClass('viewer-shell--inline');
   });
