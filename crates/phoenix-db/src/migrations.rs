@@ -191,7 +191,6 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_conversation_creation_jobs",
         sql: MIGRATION_035,
     },
-<<<<<<< HEAD
     Migration {
         version: 36,
         name: "create_conversation_creation_job_files",
@@ -207,23 +206,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_fenced_creation_protocol",
         sql: MIGRATION_038,
     },
-||||||| parent of 8ac6c360 (feat: fence creation worktree mutations)
-=======
     Migration {
-        version: 36,
+        version: 39,
         name: "add_creation_resource_reservations",
-        sql: MIGRATION_036,
+        sql: MIGRATION_039,
     },
-<<<<<<< HEAD
->>>>>>> 8ac6c360 (feat: fence creation worktree mutations)
-||||||| parent of cf4373dc (fix: make creation recovery claim authoritative)
-=======
     Migration {
-        version: 37,
+        version: 40,
         name: "add_creation_cleanup_claims",
-        sql: MIGRATION_037,
+        sql: MIGRATION_040,
     },
->>>>>>> cf4373dc (fix: make creation recovery claim authoritative)
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -1173,7 +1165,7 @@ CREATE INDEX idx_creation_job_files_stored_path
     ON conversation_creation_job_files(stored_path);
 ";
 
-const MIGRATION_036: &str = r"
+const MIGRATION_039: &str = r"
 CREATE TABLE conversation_creation_resource_reservations (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES conversation_creation_jobs(id) ON DELETE CASCADE,
@@ -1192,7 +1184,7 @@ CREATE INDEX idx_creation_resource_reservations_job
     ON conversation_creation_resource_reservations(job_id, status);
 ";
 
-const MIGRATION_037: &str = r"
+const MIGRATION_040: &str = r"
 ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_worker_id TEXT;
 ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_token TEXT;
 ALTER TABLE conversation_creation_jobs ADD COLUMN cleanup_lease_until TEXT;

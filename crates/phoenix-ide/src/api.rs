@@ -120,12 +120,8 @@ impl AppState {
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
-<<<<<<< ours
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));
-||||||| base
-=======
         runtime.start_creation_worker().await;
->>>>>>> theirs
         handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
         // Conversation-retrieval index: bring it in line with `messages` once

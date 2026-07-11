@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::path::{Path, PathBuf};
 
 use crate::git_ops::{find_branch_in_worktree_list, materialize_branch, run_git, GitOpError};

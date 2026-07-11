@@ -594,12 +594,14 @@ pub struct TaskEntry {
     pub conversation_slug: Option<String>,
 }
 
+#[allow(dead_code)]
 /// Response for the tasks list endpoint.
 #[derive(Debug, Serialize)]
 pub struct TasksResponse {
     pub tasks: Vec<TaskEntry>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct TaskAvailabilityResponse {
     pub available: bool,

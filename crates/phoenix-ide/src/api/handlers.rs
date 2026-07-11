@@ -30,14 +30,12 @@ use super::types::{
     MkdirResponse, ModelsResponse, NotificationSettingsRequest, ProjectFileSearchQuery,
     ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry,
     SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
-    TaskAvailabilityResponse, TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse,
-    UpgradeModelRequest, ValidateCwdResponse,
+    TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
+    ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
-use crate::db::{
-    ConvMode, Conversation, ConversationUsage, DbError, ImageData, NotificationSettings,
-};
+use crate::db::{ConvMode, ConversationUsage, DbError, ImageData, NotificationSettings};
 use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
     GitOpError, PhoenixIgnoreStrategy,
@@ -342,6 +340,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/credential-helper/invalidate",
             post(invalidate_credential),
+        )
+        .route(
+            "/api/conversations/:id/regenerate-name",
+            post(regenerate_conversation_name),
         )
         .route(
             "/api/conversations/:id/upgrade-model",
@@ -649,6 +651,8 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
             conv.conv_mode.worktree_path().map(std::path::Path::new),
         )
         .stable_key(),
+        creation_prompt: None,
+        creation_error: None,
         cached_pr: None,
         inner: conv.clone(),
     }
@@ -2044,6 +2048,7 @@ pub(crate) fn create_managed_explore_worktree_blocking(
     repo_root: &str,
     conv_id: &str,
     base_branch: &str,
+    checkout_ref: Option<&str>,
 ) -> Result<String, ManagedWorktreeError> {
     let cwd = std::path::Path::new(repo_root);
 
@@ -2061,7 +2066,7 @@ pub(crate) fn create_managed_explore_worktree_blocking(
         cwd,
         conv_id,
         &temp_branch,
-        Some(base_branch),
+        checkout_ref.or(Some(base_branch)),
         PhoenixIgnoreStrategy::StageGitignore,
     )
     .map_err(|e| {
@@ -5365,6 +5370,8 @@ async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<Ta
                 status: t.status.to_string(),
                 slug: t.slug,
                 path: t.path.to_string_lossy().into_owned(),
+                source_ref: None,
+                content: None,
                 conversation_slug,
             }
         })
@@ -6124,6 +6131,7 @@ mod conversation_cwd_validation_tests {
             mode: Some("direct".to_string()),
             base_branch: None,
             seed_parent_id: None,
+            checkout_ref: None,
             seed_label: None,
         }
     }

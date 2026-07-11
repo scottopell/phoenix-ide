@@ -524,6 +524,9 @@ fn item_signals(conv: &Conversation, member_count: usize, now: DateTime<Utc>) ->
         | ConvState::AwaitingContinuation { .. }
         | ConvState::ContextExhausted { .. } => signals.push("needs action".to_string()),
         ConvState::Error { .. } => signals.push("error".to_string()),
+        ConvState::Provisioning { .. } => signals.push("provisioning".to_string()),
+        ConvState::CreationFailed { .. } => signals.push("creation failed".to_string()),
+        ConvState::CreationCancelled { .. } => signals.push("creation cancelled".to_string()),
         ConvState::Idle
         | ConvState::Completed { .. }
         | ConvState::Failed { .. }
@@ -1663,6 +1666,7 @@ fn map_db_not_found(e: DbError) -> AppError {
         other @ (DbError::Sqlx(_)
         | DbError::MessageNotFound(_)
         | DbError::SlugExists(_)
+        | DbError::ConversationAlreadyExists(_)
         | DbError::Serialization(_)
         | DbError::ForkProposalConflict(_)) => AppError::Internal(other.to_string()),
     }

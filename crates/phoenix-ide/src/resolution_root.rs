@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! The single source of truth for where a conversation's inline references
 //! (`@file`, `./path`, `/skill`) resolve.
 //!
