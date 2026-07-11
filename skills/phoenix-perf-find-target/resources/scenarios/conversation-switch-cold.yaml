@@ -1,0 +1,53 @@
+# Deterministic cache-cold SPA switch into the production-shaped fixture.
+# All state normalization precedes the first wait step, so browser_profile
+# excludes setup from the measurement window. Readiness names fixture-specific
+# tail content; a generic virtuoso row can belong to the conversation being left.
+name: conversation-switch-cold
+covers:
+  - ui/src/pages/ConversationPage.tsx
+  - ui/src/components/MessageList.tsx
+  - ui/src/cache.ts
+
+params:
+  base_url: "{UI_URL}"
+  source: "fixture-turn-one"
+  fixture: "fixture-heavy-prod-shape"
+
+runs: 20
+warmup: 3
+throttle_rate: 2
+
+reset:
+  url: "{base_url}/c/{source}"
+
+steps:
+  - eval: >
+      new Promise((resolve, reject) => {
+        const request = indexedDB.open('phoenix-ide-cache', 2);
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => {
+          const db = request.result;
+          const stores = ['conversations', 'messages', 'replicaMeta'];
+          const tx = db.transaction(stores, 'readwrite');
+          stores.forEach(name => tx.objectStore(name).clear());
+          tx.oncomplete = () => resolve(true);
+          tx.onerror = () => reject(tx.error);
+        };
+      })
+  - wait-for-eval-predicate:
+      expr: >
+        location.pathname.endsWith('/{source}')
+        && document.body.textContent.includes('Fixture agent turn 23')
+        && !document.querySelector('.skeleton-messages')
+      timeout_ms: 60000
+  - eval: >
+      (() => {
+        history.pushState({}, '', '/c/{fixture}');
+        window.dispatchEvent(new PopStateEvent('popstate'));
+      })()
+  - wait-for-eval-predicate:
+      expr: >
+        location.pathname.endsWith('/{fixture}')
+        && document.body.textContent.includes('Heavy fixture agent step 232')
+        && !document.querySelector('.skeleton-messages')
+      timeout_ms: 60000
