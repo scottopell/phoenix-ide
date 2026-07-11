@@ -687,24 +687,7 @@ pub(crate) fn capture_pr_auto_fix_context_for_pr(
     })
 }
 
-pub(crate) fn capture_pr_auto_fix_context_for_branch(
-    worktree: &Path,
-    branch_name: &str,
-    llm_language: phoenix_core::llm_language::LlmLanguage,
-) -> Result<PrAutoFixCapture, PrMonitorError> {
-    if !worktree.is_dir() || run_git(worktree, &["rev-parse", "--is-inside-work-tree"]).is_err() {
-        return Err(PrMonitorError::BadRequest(
-            "Conversation worktree is not a git repository".to_string(),
-        ));
-    }
-    capture_pr_auto_fix_context_for_branch_with_client(
-        worktree,
-        branch_name,
-        &ShellGhClient::new(worktree),
-        llm_language,
-    )
-}
-
+#[cfg(test)]
 fn capture_pr_auto_fix_context_for_branch_with_client(
     worktree: &Path,
     branch_name: &str,
