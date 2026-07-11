@@ -985,10 +985,79 @@ pub struct PrFeedbackSummary {
     pub coverage: Vec<PrFeedbackCoverage>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ActivePrIdentityResponse {
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivePrSelectionProvenanceResponse {
+    Inferred,
+    Pinned,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ActivePrSelectionResponse {
+    pub pr: ActivePrIdentityResponse,
+    pub provenance: ActivePrSelectionProvenanceResponse,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ObservedBranchSummaryResponse {
+    pub repository_identity: String,
+    pub branch_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AssociatedPrSummaryResponse {
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub draft: bool,
+    pub display_state: PrDisplayState,
+    pub base: String,
+    pub head: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_updated_at: Option<String>,
+    pub feedback_status: PrFeedbackStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AssociatedPrStatusEnvelope {
+    pub associated_prs: Vec<AssociatedPrSummaryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_pr: Option<ActivePrSelectionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_observed_branch: Option<ObservedBranchSummaryResponse>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct PinAssociatedPrRequest {
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ActivePrSelectionMutationResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_pr: Option<ActivePrSelectionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_observed_branch: Option<ObservedBranchSummaryResponse>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PrAutoFixContextResponse {
     pub artifact_path: String,
     pub pr_number: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
     pub message: String,
 }
 
@@ -1097,6 +1166,8 @@ pub struct PrStatusResponse {
     pub found: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr: Option<PrIdentity>,
+    #[serde(flatten)]
+    pub selection: AssociatedPrStatusEnvelope,
     pub refresh: PrRefreshMetadata,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<PrUnavailableReason>,
@@ -1144,6 +1215,11 @@ impl PrStatusResponse {
         Self {
             found: false,
             pr: None,
+            selection: AssociatedPrStatusEnvelope {
+                associated_prs: Vec::new(),
+                active_pr: None,
+                latest_observed_branch: None,
+            },
             refresh: PrRefreshMetadata {
                 state: PrRefreshState::NotFound,
                 reason: None,
