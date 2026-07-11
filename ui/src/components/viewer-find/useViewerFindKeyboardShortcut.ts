@@ -10,7 +10,7 @@ interface UseViewerFindKeyboardShortcutOptions {
 function isEditableTarget(target: EventTarget | null): boolean {
   const element = target as HTMLElement | null;
   if (!element || !(element instanceof HTMLElement)) return false;
-  if (element.dataset.viewerFindInput === 'true') return false;
+  if (element.dataset['viewerFindInput'] === 'true') return false;
   const tag = element.tagName;
   return tag === 'INPUT' || tag === 'TEXTAREA' || element.isContentEditable;
 }

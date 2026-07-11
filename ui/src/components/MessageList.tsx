@@ -17,7 +17,7 @@ import { StreamingMessage } from './StreamingMessage';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { MessageContextMenu } from './MessageContextMenu';
 import { FilePathContextMenu } from './FilePathContextMenu';
-import { useStreamingRequestId } from '../conversation/useConversationAtom';
+import { useStreamingBuffer, useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
   buildHistoricalUnits,
   buildTailUnits,
@@ -302,6 +302,12 @@ const VIRTUOSO_COMPONENTS: NonNullable<
   EmptyPlaceholder: VirtuosoEmptySlot,
 };
 
+function OpenFindStreamingBuffer({ slug, onChange }: { slug: string; onChange: (buffer: import('../conversation/atom').StreamingBuffer | null) => void }) {
+  const buffer = useStreamingBuffer(slug);
+  useEffect(() => onChange(buffer), [buffer, onChange]);
+  return null;
+}
+
 function MessageListImpl({
   messages,
   pendingMessages,
@@ -326,6 +332,7 @@ function MessageListImpl({
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [findActiveIndex, setFindActiveIndex] = useState(0);
+  const [findStreamingBuffer, setFindStreamingBuffer] = useState<import('../conversation/atom').StreamingBuffer | null>(null);
   const findPreviousFocusRef = useRef<HTMLElement | null>(null);
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
@@ -368,9 +375,9 @@ function MessageListImpl({
 
   const findProjection = useMemo(
     () => (findOpen || findQuery.length > 0
-      ? buildConversationSearchProjection(allUnits, findQuery, { density, streamingBuffer: null })
+      ? buildConversationSearchProjection(allUnits, findQuery, { density, streamingBuffer: findStreamingBuffer })
       : { sources: [], matches: [] }),
-    [allUnits, density, findOpen, findQuery],
+    [allUnits, density, findOpen, findQuery, findStreamingBuffer],
   );
   const findMatches = findProjection.matches;
   const normalizedFindIndex = findMatches.length === 0 ? -1 : Math.min(findActiveIndex, findMatches.length - 1);
@@ -812,7 +819,9 @@ function MessageListImpl({
   return (
     <main id="main-area" className="chat-main-area">
       {findOpen && (
-        <FindBar
+        <>
+          {slug && <OpenFindStreamingBuffer slug={slug} onChange={setFindStreamingBuffer} />}
+          <FindBar
           query={findQuery}
           activeIndex={normalizedFindIndex}
           matchCount={findMatches.length}
@@ -820,7 +829,8 @@ function MessageListImpl({
           onNext={nextFindMatch}
           onPrevious={previousFindMatch}
           onClose={closeFind}
-        />
+          />
+        </>
       )}
       <section id="chat-view" className="view active">
         <Virtuoso

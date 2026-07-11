@@ -28,7 +28,7 @@ function toolbarButtons() {
 }
 
 describe('TaskApprovalReader markdown rendering', () => {
-  it.skip('renders fenced mermaid diagrams through the shared diagram component', async () => {
+  it('renders fenced mermaid diagrams through the shared diagram component', async () => {
     const { container } = renderTaskApprovalReader([
       '# Plan',
       '',
@@ -38,7 +38,7 @@ describe('TaskApprovalReader markdown rendering', () => {
       '```',
     ].join('\n'));
 
-    expect(await screen.findByText('flowchart TD')).toBeInTheDocument();
+    expect(container.querySelector('[data-testid="mermaid-diagram"]')).not.toBeNull();
     expect(container.querySelector('code.language-mermaid')).not.toBeInTheDocument();
   });
 });

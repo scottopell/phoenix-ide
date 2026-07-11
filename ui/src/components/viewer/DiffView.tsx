@@ -80,10 +80,6 @@ export function DiffView({
   const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
   const find = useViewerFind({ text: '' });
   const findSearchActive = find.isOpen || find.query.length > 0;
-  const findSourcesProjection = useMemo(
-    () => (findSearchActive ? buildDiffSearchProjection(committedDiff, uncommittedDiff, '') : { sources: [], matches: [] }),
-    [committedDiff, uncommittedDiff, findSearchActive],
-  );
   const findProjection = useMemo(
     () => (findSearchActive ? buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query) : { sources: [], matches: [] }),
     [committedDiff, uncommittedDiff, find.query, findSearchActive],
