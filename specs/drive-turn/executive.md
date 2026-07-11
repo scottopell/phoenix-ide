@@ -9,15 +9,13 @@ The CLI supports transient in-memory SQLite, retained unique temporary-file SQLi
 ## Usage
 
 ```bash
-cargo build -p phoenix-drive-turn
-
-./target/debug/drive-turn \
+./dev.py drive-turn \
   --cwd /path/to/fixture \
   --model gpt-5.5 \
   --prompt-file prompt.txt \
   --memory
 
-./target/debug/drive-turn \
+./dev.py drive-turn \
   --cwd /path/to/fixture \
   --model gpt-5.5 \
   --prompt 'Perform the requested edit.' \
@@ -25,7 +23,7 @@ cargo build -p phoenix-drive-turn
   --timeout 180
 ```
 
-The process reads the same LLM environment variables as the server. Standard output is reserved for JSON; invocation and runtime failures are written to standard error with a non-zero exit status.
+The `dev.py` wrapper layers `.phoenix-ide.env` and `.phoenix-ide.dev.env` exactly as development server startup does, builds the driver, and forwards all arguments. Direct binary invocation remains available when the caller has already prepared the process environment. The process reads the same LLM environment variables as the server. Standard output is reserved for JSON; invocation and runtime failures are written to standard error with a non-zero exit status.
 
 ## Verification
 
