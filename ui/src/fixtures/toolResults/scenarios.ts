@@ -72,6 +72,10 @@ const fixtureImageMediaType = 'image/svg+xml';
 const fixtureImageData = 'PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NDAiIGhlaWdodD0iMjQwIiB2aWV3Qm94PSIwIDAgNjQwIDI0MCI+PHJlY3Qgd2lkdGg9IjY0MCIgaGVpZ2h0PSIyNDAiIHJ4PSIxOCIgZmlsbD0iIzExMTgyNyIvPjxyZWN0IHg9IjI0IiB5PSIyNCIgd2lkdGg9IjU5MiIgaGVpZ2h0PSIxOTIiIHJ4PSIxMiIgZmlsbD0iIzFmMjkzNyIgc3Ryb2tlPSIjNjBhNWZhIiBzdHJva2Utd2lkdGg9IjMiLz48Y2lyY2xlIGN4PSI1OCIgY3k9IjU4IiByPSI5IiBmaWxsPSIjMjJjNTVlIi8+PHRleHQgeD0iODIiIHk9IjY2IiBmaWxsPSIjZjlmYWZiIiBmb250LWZhbWlseT0ibW9ub3NwYWNlIiBmb250LXNpemU9IjI0Ij50b29sIHJlc3VsdCBpbWFnZSBmaXh0dXJlPC90ZXh0Pjx0ZXh0IHg9IjQ0IiB5PSIxMjQiIGZpbGw9IiM5M2M1ZmQiIGZvbnQtZmFtaWx5PSJtb25vc3BhY2UiIGZvbnQtc2l6ZT0iMTgiPnR5cGVkIGltYWdlcyDigKIgZGlzcGxheV9kYXRhIOKAoiBsZWdhY3kgSlNPTjwvdGV4dD48cGF0aCBkPSJNNDQgMTc0IEwxNTAgMTQyIEwyMzIgMTg1IEwzMzIgMTEyIEw0MzAgMTY2IEw1OTYgOTIiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2E3OGJmYSIgc3Ryb2tlLXdpZHRoPSI2Ii8+PC9zdmc+';
 const longToolText = Array.from({ length: 20 }, (_, index) => `line ${index + 1}: deterministic long fixture output`).join('\n');
 const veryLongToolText = Array.from({ length: 18 }, (_, index) => `capture ${index + 1}: browser profile raw text fallback sample`).join('\n');
+const overLimitFileText = Array.from(
+  { length: 140 },
+  (_, index) => `${String(index + 1).padStart(3, '0')}\tconst rendererFixtureLine${index + 1} = "${'x'.repeat(32)}";`,
+).join('\n');
 
 function bashLines(lines: string[]) {
   return lines.map((bytes, index) => ({ offset: index + 1, bytes }));
@@ -112,7 +116,11 @@ const shellMessages: Message[] = [
     { type: 'tool_use', id: 'shell-empty', name: 'browser_clear_console_logs', input: {} },
     { type: 'tool_use', id: 'shell-error', name: 'browser_eval', input: { expression: 'window.__fixture?.crash()', timeout: '5s', await: true } },
     { type: 'tool_use', id: 'shell-long', name: 'browser_type', input: { selector: '#query', text: 'render every structured tool result family', clear: true, timeout: '5s' } },
-    { type: 'tool_use', id: 'shell-truncated', name: 'browser_key_press', input: { key: 'Enter', modifiers: ['ctrl'], method: 'cdp' } },
+    { type: 'tool_use', id: 'shell-key', name: 'browser_key_press', input: { key: 'Enter', modifiers: ['ctrl'], method: 'cdp' } },
+    { type: 'tool_use', id: 'shell-resize', name: 'browser_resize', input: { width: 390, height: 844, timeout: '5s' } },
+    { type: 'tool_use', id: 'shell-question', name: 'ask_user_question', input: { questions: [{ header: 'Renderer', question: 'Which tool-result family should we refine next?', options: [{ label: 'Execution', description: 'Bash, tmux, and patch results' }, { label: 'Browser', description: 'Console and profile results' }], multiSelect: false }] } },
+    { type: 'tool_use', id: 'shell-truncated', name: 'read_file', input: { path: 'ui/src/fixtures/toolResults/oversized-fixture.ts', offset: 1, limit: 140 } },
+    { type: 'tool_use', id: 'shell-proposal', name: 'propose_task', input: { title: 'Refine structured tool-result rendering', priority: 'p2', body: 'Use the executable fixture matrix to replace generic JSON fallbacks.' } },
     { type: 'tool_use', id: 'shell-unknown', name: 'custom_fixture_tool', input: { payload: 'unknown renderer fallback', mode: 'raw' } },
   ]),
   toolMessage(3, 'shell-short', 'Navigation complete — fixture page ready.', {
@@ -128,17 +136,21 @@ const shellMessages: Message[] = [
   toolMessage(6, 'shell-long', longToolText, {
     display_data: { duration_ms: 61 },
   }),
-  toolMessage(7, 'shell-truncated', `${veryLongToolText}\n... (312 more chars)`, {
-    display_data: { duration_ms: 22 },
+  toolMessage(7, 'shell-key', 'Enter dispatched with ctrl modifier.', { display_data: { duration_ms: 22 } }),
+  toolMessage(8, 'shell-resize', 'Viewport resized to 390 × 844.', { display_data: { duration_ms: 19 } }),
+  toolMessage(9, 'shell-question', 'Selected Execution.', { display_data: { duration_ms: 2_100 } }),
+  toolMessage(10, 'shell-truncated', overLimitFileText, { display_data: { duration_ms: 35 } }),
+  toolMessage(11, 'shell-proposal', 'Task fork proposal prepared for review.', {
+    display_data: { duration_ms: 28, fork_proposal_id: 'fixture-fork-proposal' },
   }),
-  toolMessage(8, 'shell-unknown', '{"unexpected":true,"note":"unknown tool renderer falls back to generic short output"}', {
+  toolMessage(12, 'shell-unknown', '{"unexpected":true,"note":"unknown tool renderer falls back to generic short output"}', {
     display_data: { duration_ms: 5 },
   }),
-  agentMessage(9, [
+  agentMessage(13, [
     { type: 'text', text: 'The earlier click is a finalized missing result. This last operation is intentionally still active so its elapsed treatment remains distinct.' },
     { type: 'tool_use', id: 'shell-pending', name: 'browser_wait_for_selector', input: { selector: '.fixture-ready', visible: true, timeout: '5s' } },
   ], {
-    tool_starts: { 'shell-pending': Date.now() - 4_000 },
+    tool_starts: { 'shell-pending': 0 },
   }),
 ];
 

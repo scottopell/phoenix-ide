@@ -89,8 +89,8 @@ describe('tool results fixture scenarios', () => {
     const data = familyData('shell');
     const uses = toolUses(data.messages);
     expect(data.convState).toMatchObject({ type: 'tool_executing', current_tool: { id: 'shell-pending' } });
-    const pendingMessage = data.messages.find((message) => message.message_id === 'agent-9');
-    expect(pendingMessage?.display_data).toMatchObject({ tool_starts: { 'shell-pending': expect.any(Number) } });
+    const pendingMessage = data.messages.find((message) => message.message_id === 'agent-13');
+    expect(pendingMessage?.display_data).toMatchObject({ tool_starts: { 'shell-pending': 0 } });
     expect(uses.map(({ name }) => name)).toEqual([
       'think',
       'browser_click',
@@ -99,13 +99,19 @@ describe('tool results fixture scenarios', () => {
       'browser_eval',
       'browser_type',
       'browser_key_press',
+      'browser_resize',
+      'ask_user_question',
+      'read_file',
+      'propose_task',
       'custom_fixture_tool',
       'browser_wait_for_selector',
     ]);
     expect(resultFor(data.messages, 'shell-empty')?.content.content).toBe('');
     expect(resultFor(data.messages, 'shell-error')?.content.is_error).toBe(true);
     expect(resultFor(data.messages, 'shell-long')?.content.content?.split('\n')).toHaveLength(20);
-    expect(resultFor(data.messages, 'shell-truncated')?.content.content).toContain('... (312 more chars)');
+    expect(resultFor(data.messages, 'shell-truncated')?.content.content?.length).toBeGreaterThan(5_000);
+    expect(resultFor(data.messages, 'shell-truncated')?.content.content).not.toContain('more chars)');
+    expect(resultFor(data.messages, 'shell-proposal')?.message.display_data).toMatchObject({ fork_proposal_id: 'fixture-fork-proposal' });
     expect(resultFor(data.messages, 'shell-unknown')?.content.content).toContain('unknown tool renderer');
   });
 

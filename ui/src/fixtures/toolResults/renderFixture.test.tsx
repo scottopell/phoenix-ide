@@ -42,6 +42,10 @@ describe('ToolResultsFixture', () => {
     expect(screen.getByText(/This shell family is the transcript-level smoke test/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'thinking (1 line)' })).toBeInTheDocument();
     expect(screen.getByText(/Navigation complete — fixture page ready/)).toBeInTheDocument();
+    expect(screen.getByText('resize 390x844')).toBeInTheDocument();
+    expect(screen.getByText(/Which tool-result family should we refine next/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Review' })).toBeInTheDocument();
+    expect(screen.getByText(/more chars\)/)).toBeInTheDocument();
     expect(screen.getByText(/earlier click is a finalized missing result/)).toBeInTheDocument();
     expect(container.querySelectorAll('.tool-missing-result')).toHaveLength(1);
     expect(container.querySelector('[data-tool-id="shell-pending"]')).not.toBeNull();
@@ -59,6 +63,7 @@ describe('ToolResultsFixture', () => {
     expect(screen.getByText('agent-browser')).toBeInTheDocument();
     expect(screen.getByText('running')).toBeInTheDocument();
     expect(screen.getByText(/This family deliberately mixes typed payloads/)).toBeInTheDocument();
+    expect(screen.getByText(/without a live backend/)).toBeInTheDocument();
     expect(container.querySelectorAll('.compact-tool-card').length).toBeGreaterThan(0);
   });
 
