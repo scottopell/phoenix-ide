@@ -190,8 +190,10 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
 struct ResponsesStreamAccumulator {
     input_tokens: u32,
     output_tokens: u32,
-    /// Cached subset of `input_tokens` (`OpenAI` `input_tokens_details.cached_tokens`).
+    /// Cached-read subset of `input_tokens`.
     cached_tokens: u32,
+    /// Cache-write subset of `input_tokens` on GPT-5.6-era models.
+    cache_write_tokens: u32,
     /// Completed output items collected from `response.output_item.done` events.
     output_items: Vec<ResponsesApiOutput>,
     /// Set true when `response.done` is received.
@@ -210,6 +212,7 @@ impl ResponsesStreamAccumulator {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cache_write_tokens: 0,
             output_items: Vec::new(),
             done: false,
             logged_empty_dispatch: false,
@@ -354,6 +357,13 @@ impl ResponsesStreamAccumulator {
                             .unwrap_or(0),
                     )
                     .unwrap_or(0);
+                    self.cache_write_tokens = u32::try_from(
+                        usage
+                            .pointer("/input_tokens_details/cache_write_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                    )
+                    .unwrap_or(0);
                 } else {
                     tracing::warn!(data, "responses_api terminal event had no /response/usage");
                 }
@@ -433,6 +443,7 @@ impl ResponsesStreamAccumulator {
                 output_tokens: self.output_tokens,
                 input_tokens_details: ResponsesApiInputTokensDetails {
                     cached_tokens: self.cached_tokens,
+                    cache_write_tokens: self.cache_write_tokens,
                 },
             },
         })
@@ -634,12 +645,14 @@ fn translate_to_responses_request(
                     .iter()
                     .map(|t| ResponsesApiContentPart::InputText {
                         text: (*t).to_string(),
+                        prompt_cache_breakpoint: None,
                     })
                     .collect();
                 for source in &image_blocks {
                     let ImageSource::Base64 { media_type, data } = source;
                     parts.push(ResponsesApiContentPart::InputImage {
                         image_url: format!("data:{media_type};base64,{data}"),
+                        prompt_cache_breakpoint: None,
                     });
                 }
                 ResponsesApiMessageContent::Parts(parts)
@@ -678,11 +691,15 @@ fn translate_to_responses_request(
                 let output = if images.is_empty() {
                     ResponsesApiFunctionOutput::Text(text)
                 } else {
-                    let mut parts = vec![ResponsesApiContentPart::InputText { text }];
+                    let mut parts = vec![ResponsesApiContentPart::InputText {
+                        text,
+                        prompt_cache_breakpoint: None,
+                    }];
                     for img in images {
                         let ImageSource::Base64 { media_type, data } = img;
                         parts.push(ResponsesApiContentPart::InputImage {
                             image_url: format!("data:{media_type};base64,{data}"),
+                            prompt_cache_breakpoint: None,
                         });
                     }
                     ResponsesApiFunctionOutput::Parts(parts)
@@ -712,6 +729,11 @@ fn translate_to_responses_request(
         )
     };
 
+    let explicit_cache_supported = !use_codex_backend && supports_explicit_prompt_cache(api_name);
+    if explicit_cache_supported {
+        place_explicit_cache_breakpoints(&mut input_items, 3);
+    }
+
     let has_tools = !request.tools.is_empty();
     ResponsesApiRequest {
         model: api_name.to_string(),
@@ -726,6 +748,10 @@ fn translate_to_responses_request(
         stream: None,
         store: if use_codex_backend { Some(false) } else { None },
         prompt_cache_key: Some(request.cache_key.as_str().to_string()),
+        prompt_cache_options: explicit_cache_supported.then_some(PromptCacheOptions {
+            mode: PromptCacheMode::Implicit,
+            ttl: PromptCacheTtl::ThirtyMinutes,
+        }),
         // Match the explicit defaults Codex CLI and Pi send. `tool_choice`
         // mirrors the server-side default but stabilises the wire shape so
         // non-default strategies become a smaller change later. Omitted when
@@ -749,6 +775,28 @@ fn translate_to_responses_request(
         parallel_tool_calls: if has_tools { Some(true) } else { None },
         include: Vec::new(),
         tags: None,
+    }
+}
+
+fn supports_explicit_prompt_cache(api_name: &str) -> bool {
+    api_name == "gpt-5.6" || api_name.starts_with("gpt-5.6-")
+}
+
+/// Mark the latest eligible message blocks. In implicit mode the service's
+/// latest-message marker consumes one of four write slots, leaving three for
+/// explicit markers. Function-call outputs are separate typed variants and
+/// therefore cannot accidentally receive an unsupported marker.
+fn place_explicit_cache_breakpoints(items: &mut [ResponsesApiInputItem], limit: usize) {
+    let mut remaining = limit;
+    for item in items.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let ResponsesApiInputItem::Message { content, .. } = item else {
+            continue;
+        };
+        content.mark_last_block();
+        remaining -= 1;
     }
 }
 
@@ -836,17 +884,16 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmRes
         content,
         end_turn,
         usage: {
-            // OpenAI's `input_tokens` is inclusive of `cached_tokens`, whereas
-            // `Usage::context_window_used()` sums input + cache_read. Split the
-            // cached subset out of `input_tokens` so the sum stays accurate
-            // and the cached count is no longer silently discarded.
+            // Both detail buckets are subsets of OpenAI's inclusive
+            // `input_tokens`. Split them out so Phoenix's additive Usage shape
+            // preserves the provider-reported context total.
             let cached = u64::from(resp.usage.input_tokens_details.cached_tokens);
+            let written = u64::from(resp.usage.input_tokens_details.cache_write_tokens);
             Usage {
-                input_tokens: u64::from(resp.usage.input_tokens).saturating_sub(cached),
+                input_tokens: u64::from(resp.usage.input_tokens)
+                    .saturating_sub(cached.saturating_add(written)),
                 output_tokens: u64::from(resp.usage.output_tokens),
-                // The Responses API has no cache-*creation* concept; this is a
-                // typed sink for OpenAI, not an unparsed field.
-                cache_creation_tokens: 0,
+                cache_creation_tokens: written,
                 cache_read_tokens: cached,
             }
         },
@@ -979,6 +1026,10 @@ pub(crate) struct ResponsesApiRequest {
     /// `PromptCacheKey`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prompt_cache_key: Option<String>,
+    /// GPT-5.6-era request-wide cache policy. Omitted for older models and
+    /// the ChatGPT/Codex bridge, which reject the new platform fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_options: Option<PromptCacheOptions>,
     /// Tool selection strategy. `"auto"` is the server-side default; sent
     /// explicitly to stabilise the wire shape and to make non-default
     /// strategies a smaller change later. Omitted when no tools are sent.
@@ -1000,6 +1051,43 @@ pub(crate) struct ResponsesApiRequest {
     /// from the wire when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tags: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PromptCacheOptions {
+    mode: PromptCacheMode,
+    ttl: PromptCacheTtl,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PromptCacheMode {
+    Implicit,
+}
+
+#[derive(Debug, Serialize)]
+enum PromptCacheTtl {
+    #[serde(rename = "30m")]
+    ThirtyMinutes,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct PromptCacheBreakpoint {
+    mode: PromptCacheBreakpointMode,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PromptCacheBreakpointMode {
+    Explicit,
+}
+
+impl PromptCacheBreakpoint {
+    fn explicit() -> Self {
+        Self {
+            mode: PromptCacheBreakpointMode::Explicit,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1031,11 +1119,52 @@ pub(crate) enum ResponsesApiMessageContent {
     Parts(Vec<ResponsesApiContentPart>),
 }
 
+impl ResponsesApiMessageContent {
+    fn mark_last_block(&mut self) {
+        match self {
+            Self::Text(text) => {
+                *self = Self::Parts(vec![ResponsesApiContentPart::InputText {
+                    text: std::mem::take(text),
+                    prompt_cache_breakpoint: Some(PromptCacheBreakpoint::explicit()),
+                }]);
+            }
+            Self::Parts(parts) => {
+                if let Some(part) = parts.last_mut() {
+                    part.set_breakpoint();
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ResponsesApiContentPart {
-    InputText { text: String },
-    InputImage { image_url: String }, // "data:{media_type};base64,{data}"
+    InputText {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_breakpoint: Option<PromptCacheBreakpoint>,
+    },
+    InputImage {
+        image_url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_breakpoint: Option<PromptCacheBreakpoint>,
+    }, // "data:{media_type};base64,{data}"
+}
+
+impl ResponsesApiContentPart {
+    fn set_breakpoint(&mut self) {
+        match self {
+            Self::InputText {
+                prompt_cache_breakpoint,
+                ..
+            }
+            | Self::InputImage {
+                prompt_cache_breakpoint,
+                ..
+            } => *prompt_cache_breakpoint = Some(PromptCacheBreakpoint::explicit()),
+        }
+    }
 }
 
 /// Function call output: plain string when text-only, array of parts when images present.
@@ -1087,12 +1216,14 @@ pub(crate) struct ResponsesApiContent {
     pub(crate) refusal: Option<String>,
 }
 
-/// `usage.input_tokens_details` on the Responses API wire. Only the cached
-/// subset is consumed; the field defaults to zero when the gateway omits it.
+/// `usage.input_tokens_details` on the Responses API wire. Detail buckets
+/// default to zero for older models and gateways that omit them.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct ResponsesApiInputTokensDetails {
     #[serde(default)]
     pub(crate) cached_tokens: u32,
+    #[serde(default)]
+    pub(crate) cache_write_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1111,7 +1242,7 @@ pub(crate) struct ResponsesApiUsage {
 mod tests {
     use super::*;
     use crate::headers::has_custom_source_header;
-    use crate::types::{LlmRequest, PromptCacheKey};
+    use crate::types::{LlmMessage, LlmRequest, PromptCacheKey};
 
     fn empty_request() -> LlmRequest {
         LlmRequest {
@@ -1616,13 +1747,10 @@ mod tests {
         assert_eq!(acc.output_tokens, 5);
     }
 
-    /// `OpenAI` reports the cached input subset under
-    /// `usage.input_tokens_details.cached_tokens`. It must reach `Usage` and
-    /// must not double-count: `input_tokens` already includes the cached
-    /// portion, so `context_window_used()` (which sums input + `cache_read`)
-    /// stays equal to `OpenAI`'s reported input+output.
+    /// `OpenAI`'s cached-read and cache-write details are both subsets of
+    /// `input_tokens`; normalization splits both without changing context usage.
     #[test]
-    fn responses_api_cached_tokens_are_threaded_without_double_counting() {
+    fn responses_api_cache_details_are_threaded_without_double_counting() {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
         let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{
@@ -1631,7 +1759,7 @@ mod tests {
                 "usage":{
                     "input_tokens":1000,
                     "output_tokens":50,
-                    "input_tokens_details":{"cached_tokens":800}
+                    "input_tokens_details":{"cached_tokens":600,"cache_write_tokens":200}
                 },
                 "output":[
                     {"type":"message","role":"assistant","content":[
@@ -1642,7 +1770,8 @@ mod tests {
         }"#;
         acc.process_event("response.completed", data, &tx)
             .expect("handler should not error");
-        assert_eq!(acc.cached_tokens, 800);
+        assert_eq!(acc.cached_tokens, 600);
+        assert_eq!(acc.cache_write_tokens, 200);
 
         let resp = normalize_responses_api_response(ResponsesApiResponse {
             status: "completed".to_string(),
@@ -1652,14 +1781,58 @@ mod tests {
                 output_tokens: acc.output_tokens,
                 input_tokens_details: ResponsesApiInputTokensDetails {
                     cached_tokens: acc.cached_tokens,
+                    cache_write_tokens: acc.cache_write_tokens,
                 },
             },
         })
         .expect("a response with a message item normalizes");
-        assert_eq!(resp.usage.cache_read_tokens, 800);
+        assert_eq!(resp.usage.cache_read_tokens, 600);
         assert_eq!(resp.usage.input_tokens, 200);
-        assert_eq!(resp.usage.cache_creation_tokens, 0);
+        assert_eq!(resp.usage.cache_creation_tokens, 200);
         assert_eq!(resp.usage.context_window_used(), 1050);
+    }
+
+    #[test]
+    fn gpt56_emits_valid_breakpoints_but_older_and_codex_models_do_not() {
+        let mut request = empty_request();
+        for i in 0..5 {
+            request.messages.push(LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::text(format!("stable-{i}"))],
+            });
+        }
+        request.messages.push(LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-1".into(),
+                content: "tool output".into(),
+                images: vec![],
+                is_error: false,
+            }],
+        });
+
+        let wire = serde_json::to_value(translate_to_responses_request(
+            "gpt-5.6-2026-07-01",
+            &request,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(wire["prompt_cache_options"]["mode"], "implicit");
+        assert_eq!(wire["prompt_cache_options"]["ttl"], "30m");
+        let serialized = serde_json::to_string(&wire).unwrap();
+        assert_eq!(serialized.matches("prompt_cache_breakpoint").count(), 3);
+        let output = wire["input"].as_array().unwrap().last().unwrap();
+        assert_eq!(output["type"], "function_call_output");
+        assert!(output.get("prompt_cache_breakpoint").is_none());
+        assert!(!output.to_string().contains("prompt_cache_breakpoint"));
+
+        for (model, codex) in [("gpt-5.5", false), ("gpt-5.6", true)] {
+            let legacy =
+                serde_json::to_value(translate_to_responses_request(model, &request, codex))
+                    .unwrap();
+            assert!(legacy.get("prompt_cache_options").is_none());
+            assert!(!legacy.to_string().contains("prompt_cache_breakpoint"));
+        }
     }
 
     /// A gateway that omits `input_tokens_details` must not panic or shift
@@ -1694,7 +1867,10 @@ mod tests {
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
                 output_tokens: 42,
-                input_tokens_details: ResponsesApiInputTokensDetails { cached_tokens: 0 },
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                },
             },
         })
         .expect_err("empty content with billed output tokens must fail");
@@ -1726,7 +1902,10 @@ mod tests {
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
                 output_tokens: 7,
-                input_tokens_details: ResponsesApiInputTokensDetails { cached_tokens: 0 },
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: 0,
+                    cache_write_tokens: 0,
+                },
             },
         })
         .expect("a refusal is valid content, not a billed-but-empty failure");

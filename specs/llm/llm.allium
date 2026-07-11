@@ -117,9 +117,9 @@ value ImageBase64 {
     data: String
 }
 
--- One system-prompt segment. `cache` requests a provider cache anchor on
--- this segment (Anthropic per-block cache_control; the Responses API has
--- no per-segment cache control and ignores the flag).
+-- One system-prompt segment. `cache` requests an Anthropic per-block
+-- cache_control anchor. OpenAI instructions cannot carry breakpoints; its
+-- explicit markers are placed on supported message content blocks.
 value SystemContent {
     text: String
     cache: Boolean

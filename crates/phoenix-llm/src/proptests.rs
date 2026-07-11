@@ -377,7 +377,7 @@ proptest! {
             if let ResponsesApiMessageContent::Parts(parts) = content {
                 let expected_url = format!("data:{media_type};base64,{data}");
                 let has_image = parts.iter().any(|p| {
-                    matches!(p, ResponsesApiContentPart::InputImage { image_url }
+                    matches!(p, ResponsesApiContentPart::InputImage { image_url, .. }
                         if image_url == &expected_url)
                 });
                 prop_assert!(has_image, "Parts must contain InputImage with correct data URL");
@@ -457,7 +457,7 @@ proptest! {
                     "Parts[0] must be InputText"
                 );
                 for (i, expected_url) in expected_urls.iter().enumerate() {
-                    if let ResponsesApiContentPart::InputImage { image_url } = &parts[1 + i] {
+                    if let ResponsesApiContentPart::InputImage { image_url, .. } = &parts[1 + i] {
                         prop_assert_eq!(
                             image_url, expected_url,
                             "InputImage data URL mismatch at index {}", i

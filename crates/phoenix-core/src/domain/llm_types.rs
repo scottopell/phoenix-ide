@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 /// but silently omitting one is exactly the failure mode this type prevents.
 ///
 /// Same key + same prefix bytes (system prompt, leading messages, tools) =
-/// cache hit on the `OpenAI` Responses backend. `Anthropic` ignores this
-/// field; it has its own per-block `cache_control` mechanism wired through
-/// `SystemContent::cached`.
+/// cache hit on the `OpenAI` Responses backend. GPT-5.6-era direct platform
+/// requests also combine this key with implicit and explicit wire breakpoints.
+/// `Anthropic` ignores the key and uses per-block `cache_control` instead.
 ///
 /// # Choosing a constructor
 ///
@@ -71,6 +71,9 @@ pub struct LlmRequest {
 
 /// System prompt content
 #[derive(Debug, Clone)]
+/// A system segment's `cache` flag is an Anthropic cache anchor. `OpenAI`'s
+/// instructions field cannot carry a breakpoint; its explicit markers are
+/// placed only on supported message content blocks during translation.
 pub struct SystemContent {
     pub text: String,
     pub cache: bool,

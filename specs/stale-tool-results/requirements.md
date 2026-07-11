@@ -118,6 +118,7 @@ so that the removed portion presented to the model is identical from one turn to
 the next except on the turns that remove more. THE SYSTEM SHALL NOT remove
 results from the most recent rounds that anchor the reusable portion of the
 request.
+Where a provider supports explicit cache breakpoints, THE SYSTEM SHALL place them only on provider-supported content and SHALL preserve the same monotonic removed prefix; a tool result that cannot legally carry a provider breakpoint SHALL remain unmarked rather than causing an invalid request.
 
 ### REQ-STR-008 — Make Removal Observable
 
