@@ -10,7 +10,7 @@
  */
 
 import { memo, useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 import {
   ChevronRight,
   ChevronDown,
@@ -41,18 +41,16 @@ export interface FileItem {
 
 const EMPTY_FILE_ITEMS: FileItem[] = [];
 
-const TREE_ROW_BASE_INDENT_PX = 12;
-const TREE_ROW_DEPTH_STEP_PX = 16;
+const TREE_ROW_BASE_INDENT_PX = 4;
+const TREE_ROW_DEPTH_STEP_PX = 12;
 
-type TreeRowDisclosure = 'chevron-right' | 'chevron-down' | 'spinner' | 'empty';
-type TreeRowIcon = 'file-dot' | 'empty';
+type TreeRowAdornment = 'chevron-right' | 'chevron-down' | 'spinner' | 'file-dot';
 
 type TreeRowView = {
   path: string;
   depth: number;
   indentPx: number;
-  disclosure: TreeRowDisclosure;
-  icon: TreeRowIcon;
+  adornment: TreeRowAdornment;
   label: string;
   disabled: boolean;
   active: boolean;
@@ -70,20 +68,19 @@ function buildTreeRowView(
   isLoadingChildren: boolean,
   isActive: boolean,
 ): TreeRowView {
-  const disclosure: TreeRowDisclosure = item.is_directory
+  const adornment: TreeRowAdornment = item.is_directory
     ? isLoadingChildren
       ? 'spinner'
       : isExpanded
         ? 'chevron-down'
         : 'chevron-right'
-    : 'empty';
+    : 'file-dot';
 
   return {
     path: item.path,
     depth,
     indentPx: treeRowIndentPx(depth),
-    disclosure,
-    icon: item.is_directory ? 'empty' : 'file-dot',
+    adornment,
     label: item.name,
     disabled: !item.is_directory && item.viewer.kind === 'opaque',
     active: isActive,
@@ -91,26 +88,21 @@ function buildTreeRowView(
   };
 }
 
-function renderDisclosure(disclosure: TreeRowDisclosure): ReactNode {
-  switch (disclosure) {
+function renderAdornment(adornment: TreeRowAdornment, itemName: string): ReactNode {
+  switch (adornment) {
     case 'spinner':
       return <Loader2 size={12} className="spinning" />;
     case 'chevron-down':
       return <ChevronDown size={12} />;
     case 'chevron-right':
       return <ChevronRight size={12} />;
-    case 'empty':
-      return null;
+    case 'file-dot':
+      return (
+        <span className="ft-dot" style={{ color: extensionColor(itemName) || 'var(--text-muted)' }}>
+          &#8226;
+        </span>
+      );
   }
-}
-
-function renderIcon(icon: TreeRowIcon, itemName: string): ReactNode {
-  if (icon !== 'file-dot') return null;
-  return (
-    <span className="ft-dot" style={{ color: extensionColor(itemName) || 'var(--text-muted)' }}>
-      &#8226;
-    </span>
-  );
 }
 
 interface FileTreeProps {
@@ -274,16 +266,18 @@ const FileTreeItem = memo(function FileTreeItem({
         draggable
         onDragStart={handleDragStart}
       >
-        <span className="ft-disclosure-slot" aria-hidden="true">
-          {renderDisclosure(row.disclosure)}
-        </span>
-        <span className="ft-icon-slot" aria-hidden="true">
-          {renderIcon(row.icon, item.name)}
+        <span className="ft-leading-slot" aria-hidden="true">
+          {renderAdornment(row.adornment, item.name)}
         </span>
         <span className={`ft-name ${item.is_directory ? 'ft-name--folder' : ''}`}>{row.label}</span>
       </div>
       {item.is_directory && isExpanded && (
-        <div className="ft-children">
+        <div
+          className="ft-children"
+          style={{
+            '--ft-guide-left': `${treeRowIndentPx(depth + 1) - TREE_ROW_DEPTH_STEP_PX / 2}px`,
+          } as CSSProperties}
+        >
           {isLoadingChildren && visibleChildren.length === 0 ? (
             <div className="ft-loading" style={{ paddingLeft: treeRowIndentPx(depth + 1) }}>
               <Loader2 size={14} className="spinning" /> Loading...

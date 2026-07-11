@@ -226,19 +226,65 @@ describe('FileTree — reveal active file', () => {
     const folderRow = (await screen.findByText('ui')).closest('.ft-item') as HTMLElement;
     const fileRow = screen.getByText('README.md').closest('.ft-item') as HTMLElement;
 
-    expect(folderRow.style.paddingLeft).toBe('12px');
-    expect(fileRow.style.paddingLeft).toBe('12px');
-    expect(fileRow.querySelector('.ft-disclosure-slot')).not.toBeNull();
-    expect(fileRow.querySelector('.ft-icon-slot')).not.toBeNull();
-    expect(fileRow.querySelector('.ft-dot')).not.toBeNull();
-    expect(folderRow.querySelector('.ft-disclosure-slot svg')).not.toBeNull();
-    expect(folderRow.querySelector('.ft-icon-slot')?.textContent).toBe('');
+    expect(folderRow.style.paddingLeft).toBe('4px');
+    expect(fileRow.style.paddingLeft).toBe('4px');
+    expect(fileRow.querySelectorAll(':scope > .ft-leading-slot')).toHaveLength(1);
+    expect(folderRow.querySelectorAll(':scope > .ft-leading-slot')).toHaveLength(1);
+    expect(fileRow.querySelector('.ft-leading-slot .ft-dot')).not.toBeNull();
+    expect(folderRow.querySelector('.ft-leading-slot svg')).not.toBeNull();
+    for (const legacyClass of [
+      '.ft-disclosure-slot',
+      '.ft-icon-slot',
+      '.ft-indent-spacer',
+      '.ft-expand-icon',
+    ]) {
+      expect(fileRow.querySelector(legacyClass)).toBeNull();
+      expect(folderRow.querySelector(legacyClass)).toBeNull();
+    }
 
     fireEvent.click(folderRow);
     const childRow = (await screen.findByText('src')).closest('.ft-item') as HTMLElement;
+    const children = childRow.closest('.ft-children') as HTMLElement;
 
-    expect(childRow.style.paddingLeft).toBe('28px');
-    expect(parseInt(childRow.style.paddingLeft, 10) - parseInt(folderRow.style.paddingLeft, 10)).toBe(16);
+    expect(childRow.style.paddingLeft).toBe('16px');
+    expect(parseInt(childRow.style.paddingLeft, 10) - parseInt(folderRow.style.paddingLeft, 10)).toBe(12);
+    expect(children.classList.contains('ft-children')).toBe(true);
+    expect(children.style.getPropertyValue('--ft-guide-left')).toBe('10px');
+  });
+
+  it('keeps a loading directory spinner in the shared adornment slot', async () => {
+    let resolveChildren!: (response: { ok: true; json: () => Promise<{ items: typeof FS['/proj/ui'] }> }) => void;
+    const childrenResponse = new Promise<{ ok: true; json: () => Promise<{ items: typeof FS['/proj/ui'] }> }>((resolve) => {
+      resolveChildren = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        const path = new URL(url, 'http://localhost').searchParams.get('path') || '';
+        if (path === '/proj/ui') return childrenResponse;
+        return { ok: true, json: async () => ({ items: FS[path] ?? [] }) };
+      }),
+    );
+
+    render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={vi.fn()}
+        activeFile={null}
+        conversationId="conv-test-loading-slot"
+      />,
+    );
+
+    const folderRow = (await screen.findByText('ui')).closest('.ft-item') as HTMLElement;
+    fireEvent.click(folderRow);
+
+    await waitFor(() => {
+      expect(folderRow.querySelectorAll(':scope > .ft-leading-slot')).toHaveLength(1);
+      expect(folderRow.querySelector('.ft-leading-slot .spinning')).not.toBeNull();
+    });
+
+    resolveChildren({ ok: true, json: async () => ({ items: FS['/proj/ui']! }) });
+    expect(await screen.findByText('src')).toBeInTheDocument();
   });
 
   it('opens image files and disables only non-viewable (opaque) files', async () => {

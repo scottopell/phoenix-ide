@@ -8811,21 +8811,13 @@ html * {
   background: color-mix(in srgb, var(--accent-blue) 20%, transparent);
 }
 
-.ft-disclosure-slot,
-.ft-icon-slot {
+.ft-leading-slot {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  width: 14px;
   flex-shrink: 0;
-}
-
-.ft-disclosure-slot {
-  width: 16px;
   color: var(--text-muted);
-}
-
-.ft-icon-slot {
-  width: 12px;
 }
 
 .ft-name {
@@ -8880,7 +8872,18 @@ html * {
 }
 
 .ft-children {
-  /* nested items */
+  position: relative;
+}
+
+.ft-children::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 2px;
+  left: var(--ft-guide-left);
+  width: 1px;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--text-muted) 38%, transparent);
 }
 
 .ft-loading,
