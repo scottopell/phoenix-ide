@@ -221,6 +221,13 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_work_scope_observed_branches",
         sql: MIGRATION_041,
     },
+
+    Migration {
+        version: 42,
+        name: "create_work_scope_active_pr_selection",
+        sql: MIGRATION_042,
+    },
+
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -511,6 +518,23 @@ CREATE TABLE IF NOT EXISTS work_scope_observed_branches (
 
 CREATE INDEX IF NOT EXISTS idx_work_scope_observed_branches_last_seen
 ON work_scope_observed_branches(work_scope_id, last_observed_at);
+";
+const MIGRATION_042: &str = r"
+CREATE TABLE IF NOT EXISTS work_scope_active_pr_selection (
+    work_scope_id INTEGER PRIMARY KEY REFERENCES work_scopes(id) ON DELETE CASCADE,
+    repo_owner TEXT,
+    repo_name TEXT,
+    pr_number INTEGER,
+    provenance TEXT NOT NULL,
+    latest_observed_repository_identity TEXT,
+    latest_observed_branch_name TEXT,
+    inference_generation INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (repo_owner IS NULL AND repo_name IS NULL AND pr_number IS NULL)
+        OR (repo_owner IS NOT NULL AND repo_name IS NOT NULL AND pr_number IS NOT NULL)
+    )
+);
 ";
 
 const MIGRATION_014: &str = r"

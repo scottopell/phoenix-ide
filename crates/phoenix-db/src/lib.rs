@@ -303,6 +303,16 @@ pub struct WorkScopeObservedBranch {
     pub last_observed_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkScopeActivePrSelectionRow {
+    pub work_scope_id: i64,
+    pub selection: Option<phoenix_core::domain::active_pr_selection::ActivePrSelection>,
+    pub latest_observed_branch:
+        Option<phoenix_core::domain::active_pr_selection::ActivePrBranchContext>,
+    pub inference_generation: u64,
+    pub updated_at: String,
+}
+
 fn pr_display_state_db(
     state: &phoenix_core::domain::pr_display_state::PrDisplayState,
 ) -> &'static str {
@@ -359,6 +369,75 @@ fn row_to_work_scope_observed_branch(row: &SqliteRow) -> WorkScopeObservedBranch
     }
 }
 
+fn active_pr_provenance_from_db(
+    value: &str,
+) -> DbResult<phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance> {
+    match value {
+        "inferred" => {
+            Ok(phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Inferred)
+        }
+        "pinned" => {
+            Ok(phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Pinned)
+        }
+        other => Err(DbError::Serialization(format!(
+            "invalid active PR provenance in database: {other}"
+        ))),
+    }
+}
+
+fn row_to_work_scope_active_pr_selection(
+    row: &SqliteRow,
+) -> DbResult<WorkScopeActivePrSelectionRow> {
+    let repo_owner: Option<String> = row.get("repo_owner");
+    let repo_name: Option<String> = row.get("repo_name");
+    let pr_number: Option<i64> = row.get("pr_number");
+    let selection = match (repo_owner, repo_name, pr_number) {
+        (Some(repo_owner), Some(repo_name), Some(pr_number)) => Some(
+            phoenix_core::domain::active_pr_selection::ActivePrSelection {
+                pr: phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+                    repo_owner,
+                    repo_name,
+                    pr_number: pr_number.cast_unsigned(),
+                },
+                provenance: active_pr_provenance_from_db(&row.get::<String, _>("provenance"))?,
+            },
+        ),
+        (None, None, None) => None,
+        _ => {
+            return Err(DbError::Serialization(
+                "invalid active PR selection row: partial PR identity".to_string(),
+            ));
+        }
+    };
+    let latest_observed_repository_identity: Option<String> =
+        row.get("latest_observed_repository_identity");
+    let latest_observed_branch_name: Option<String> = row.get("latest_observed_branch_name");
+    let latest_observed_branch = match (
+        latest_observed_repository_identity,
+        latest_observed_branch_name,
+    ) {
+        (Some(repository_identity), Some(branch_name)) => Some(
+            phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                repository_identity,
+                branch_name,
+            },
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(DbError::Serialization(
+                "invalid active PR selection row: partial latest observed branch".to_string(),
+            ));
+        }
+    };
+    Ok(WorkScopeActivePrSelectionRow {
+        work_scope_id: row.get("work_scope_id"),
+        selection,
+        latest_observed_branch,
+        inference_generation: row.get::<i64, _>("inference_generation").cast_unsigned(),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 pub fn qualifies_observed_branch(
     observed: &phoenix_core::domain::observed_branch::LocalGitHeadObservation,
     input: &ObservedBranchQualificationInput,
@@ -413,6 +492,79 @@ pub fn sort_work_scope_pr_associations(prs: &mut [WorkScopePrAssociation]) {
             .then_with(|| b.last_seen_at.cmp(&a.last_seen_at))
             .then_with(|| b.pr_number.cmp(&a.pr_number))
     });
+}
+
+fn active_pr_identity_from_association(
+    pr: &WorkScopePrAssociation,
+) -> phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+    phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+        repo_owner: pr.repo_owner.clone(),
+        repo_name: pr.repo_name.clone(),
+        pr_number: pr.pr_number,
+    }
+}
+
+fn is_actionable_pr(pr: &WorkScopePrAssociation) -> bool {
+    matches!(
+        pr.display_state,
+        phoenix_core::domain::pr_display_state::PrDisplayState::Open
+            | phoenix_core::domain::pr_display_state::PrDisplayState::Draft
+    )
+}
+
+fn find_association_by_identity<'a>(
+    prs: &'a [WorkScopePrAssociation],
+    identity: &phoenix_core::domain::active_pr_selection::ActivePrIdentity,
+) -> Option<&'a WorkScopePrAssociation> {
+    prs.iter().find(|pr| {
+        pr.repo_owner == identity.repo_owner
+            && pr.repo_name == identity.repo_name
+            && pr.pr_number == identity.pr_number
+    })
+}
+
+fn infer_active_pr_selection(
+    prs: &[WorkScopePrAssociation],
+    latest_observed_branch: Option<
+        &phoenix_core::domain::active_pr_selection::ActivePrBranchContext,
+    >,
+    prior_inferred: Option<&phoenix_core::domain::active_pr_selection::ActivePrIdentity>,
+) -> Option<phoenix_core::domain::active_pr_selection::ActivePrIdentity> {
+    let actionable: Vec<&WorkScopePrAssociation> =
+        prs.iter().filter(|pr| is_actionable_pr(pr)).collect();
+
+    if let Some(branch) = latest_observed_branch {
+        let mut matching = actionable.iter().copied().filter(|pr| {
+            pr.head == branch.branch_name
+                && format!("{}/{}", pr.repo_owner, pr.repo_name) == branch.repository_identity
+        });
+        let first = matching.next();
+        if let Some(first) = first {
+            if matching.next().is_none() {
+                return Some(active_pr_identity_from_association(first));
+            }
+        }
+    }
+
+    if actionable.len() == 1 {
+        return Some(active_pr_identity_from_association(actionable[0]));
+    }
+
+    let Some(prior_inferred) = prior_inferred else {
+        return None;
+    };
+    let retained = find_association_by_identity(prs, prior_inferred)?;
+    if !is_actionable_pr(retained) {
+        return None;
+    }
+    let contradicts_branch = latest_observed_branch.is_some_and(|branch| {
+        format!("{}/{}", retained.repo_owner, retained.repo_name) != branch.repository_identity
+            || retained.head != branch.branch_name
+    });
+    if contradicts_branch {
+        return None;
+    }
+    Some(prior_inferred.clone())
 }
 
 fn pr_association_rank(state: &phoenix_core::domain::pr_display_state::PrDisplayState) -> u8 {
@@ -831,6 +983,279 @@ impl Database {
             .into_iter()
             .map(|row| row_to_work_scope_observed_branch(&row))
             .collect())
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn active_work_scope_pr_selection(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScope,
+    ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
+        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+            return Ok(None);
+        };
+        let row = sqlx::query(
+            "SELECT work_scope_id, repo_owner, repo_name, pr_number, provenance,
+                    latest_observed_repository_identity, latest_observed_branch_name,
+                    inference_generation, updated_at
+             FROM work_scope_active_pr_selection
+             WHERE work_scope_id = ?1",
+        )
+        .bind(work_scope_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            row_to_work_scope_active_pr_selection(&row).map(|row| {
+                phoenix_core::domain::active_pr_selection::ActivePrSelectionState {
+                    selection: row.selection,
+                    inference_generation: row.inference_generation,
+                }
+            })
+        })
+        .transpose()
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn pin_active_work_scope_pr_selection(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScope,
+        pr: &phoenix_core::domain::active_pr_selection::ActivePrIdentity,
+    ) -> DbResult<phoenix_core::domain::active_pr_selection::ActivePrSelectionState> {
+        let work_scope_id = self.ensure_work_scope_id(scope).await?;
+        let now = Utc::now().to_rfc3339();
+        let latest = self
+            .current_latest_observed_branch_context(work_scope_id)
+            .await?;
+        sqlx::query(
+            "INSERT INTO work_scope_active_pr_selection (
+                work_scope_id, repo_owner, repo_name, pr_number, provenance,
+                latest_observed_repository_identity, latest_observed_branch_name,
+                inference_generation, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'pinned', ?5, ?6, 0, ?7)
+             ON CONFLICT(work_scope_id) DO UPDATE SET
+                repo_owner = excluded.repo_owner,
+                repo_name = excluded.repo_name,
+                pr_number = excluded.pr_number,
+                provenance = excluded.provenance,
+                latest_observed_repository_identity = excluded.latest_observed_repository_identity,
+                latest_observed_branch_name = excluded.latest_observed_branch_name,
+                updated_at = excluded.updated_at",
+        )
+        .bind(work_scope_id)
+        .bind(&pr.repo_owner)
+        .bind(&pr.repo_name)
+        .bind(pr.pr_number.cast_signed())
+        .bind(latest.as_ref().map(|b| b.repository_identity.as_str()))
+        .bind(latest.as_ref().map(|b| b.branch_name.as_str()))
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(phoenix_core::domain::active_pr_selection::ActivePrSelectionState {
+            selection: Some(phoenix_core::domain::active_pr_selection::ActivePrSelection {
+                pr: pr.clone(),
+                provenance:
+                    phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Pinned,
+            }),
+            inference_generation: 0,
+        })
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn clear_active_work_scope_pr_pin(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScope,
+        input: &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput,
+    ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
+        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+            return Ok(None);
+        };
+        let expected_generation = self
+            .active_work_scope_pr_selection(scope)
+            .await?
+            .map(|state| state.inference_generation)
+            .unwrap_or(0);
+        self.derive_active_work_scope_pr_selection_for_scope_id(
+            work_scope_id,
+            input,
+            Some(expected_generation),
+        )
+        .await
+    }
+
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn derive_active_work_scope_pr_selection(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScope,
+        input: &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput,
+        expected_generation: Option<u64>,
+    ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
+        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+            return Ok(None);
+        };
+        self.derive_active_work_scope_pr_selection_for_scope_id(
+            work_scope_id,
+            input,
+            expected_generation,
+        )
+        .await
+    }
+
+    async fn current_latest_observed_branch_context(
+        &self,
+        work_scope_id: i64,
+    ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrBranchContext>> {
+        let row = sqlx::query(
+            "SELECT repository_identity, branch_name
+             FROM work_scope_observed_branches
+             WHERE work_scope_id = ?1
+             ORDER BY last_observed_at DESC, branch_name ASC
+             LIMIT 1",
+        )
+        .bind(work_scope_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |row| phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                repository_identity: row.get("repository_identity"),
+                branch_name: row.get("branch_name"),
+            },
+        ))
+    }
+
+    async fn derive_active_work_scope_pr_selection_for_scope_id(
+        &self,
+        work_scope_id: i64,
+        input: &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput,
+        expected_generation: Option<u64>,
+    ) -> DbResult<Option<phoenix_core::domain::active_pr_selection::ActivePrSelectionState>> {
+        let mut tx = self.pool.begin().await?;
+        let persisted = sqlx::query(
+            "SELECT work_scope_id, repo_owner, repo_name, pr_number, provenance,
+                    latest_observed_repository_identity, latest_observed_branch_name,
+                    inference_generation, updated_at
+             FROM work_scope_active_pr_selection
+             WHERE work_scope_id = ?1",
+        )
+        .bind(work_scope_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row_to_work_scope_active_pr_selection(&row))
+        .transpose()?;
+
+        if let Some(expected_generation) = expected_generation {
+            let current_generation = persisted.as_ref().map_or(0, |row| row.inference_generation);
+            if current_generation != expected_generation {
+                tx.commit().await?;
+                return Ok(persisted.map(|row| {
+                    phoenix_core::domain::active_pr_selection::ActivePrSelectionState {
+                        selection: row.selection,
+                        inference_generation: row.inference_generation,
+                    }
+                }));
+            }
+        }
+
+        let associations = sqlx::query(
+            "SELECT work_scope_id, repo_owner, repo_name, pr_number, title, url, state, draft,
+                    display_state, base, head, github_updated_at, feedback_status, first_seen_at, last_seen_at
+             FROM work_scope_pr_associations
+             WHERE work_scope_id = ?1",
+        )
+        .bind(work_scope_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| row_to_work_scope_pr(&row))
+        .collect::<DbResult<Vec<_>>>()?;
+
+        let latest_observed_branch = input.latest_observed_branch.clone().or_else(|| {
+            persisted
+                .as_ref()
+                .and_then(|row| row.latest_observed_branch.clone())
+        });
+
+        if persisted
+            .as_ref()
+            .and_then(|row| row.selection.as_ref())
+            .is_some_and(|selection| {
+                selection.provenance
+                == phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Pinned
+                && expected_generation.is_none()
+                && find_association_by_identity(&associations, &selection.pr).is_some()
+            })
+        {
+            tx.commit().await?;
+            return Ok(persisted.map(|row| {
+                phoenix_core::domain::active_pr_selection::ActivePrSelectionState {
+                    selection: row.selection,
+                    inference_generation: row.inference_generation,
+                }
+            }));
+        }
+
+        let prior_inferred = persisted.as_ref().and_then(|row| {
+            row.selection.as_ref().and_then(|selection| {
+                (selection.provenance
+                    == phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Inferred)
+                    .then(|| &selection.pr)
+            })
+        });
+        let inferred = infer_active_pr_selection(
+            &associations,
+            latest_observed_branch.as_ref(),
+            prior_inferred,
+        );
+        let next_generation = persisted
+            .as_ref()
+            .map_or(0, |row| row.inference_generation + 1);
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO work_scope_active_pr_selection (
+                work_scope_id, repo_owner, repo_name, pr_number, provenance,
+                latest_observed_repository_identity, latest_observed_branch_name,
+                inference_generation, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'inferred', ?5, ?6, ?7, ?8)
+             ON CONFLICT(work_scope_id) DO UPDATE SET
+                repo_owner = excluded.repo_owner,
+                repo_name = excluded.repo_name,
+                pr_number = excluded.pr_number,
+                provenance = excluded.provenance,
+                latest_observed_repository_identity = excluded.latest_observed_repository_identity,
+                latest_observed_branch_name = excluded.latest_observed_branch_name,
+                inference_generation = excluded.inference_generation,
+                updated_at = excluded.updated_at",
+        )
+        .bind(work_scope_id)
+        .bind(inferred.as_ref().map(|pr| pr.repo_owner.as_str()))
+        .bind(inferred.as_ref().map(|pr| pr.repo_name.as_str()))
+        .bind(inferred.as_ref().map(|pr| pr.pr_number.cast_signed()))
+        .bind(
+            latest_observed_branch
+                .as_ref()
+                .map(|b| b.repository_identity.as_str()),
+        )
+        .bind(
+            latest_observed_branch
+                .as_ref()
+                .map(|b| b.branch_name.as_str()),
+        )
+        .bind(next_generation.cast_signed())
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(Some(phoenix_core::domain::active_pr_selection::ActivePrSelectionState {
+            selection: inferred.map(|pr| phoenix_core::domain::active_pr_selection::ActivePrSelection {
+                pr,
+                provenance:
+                    phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Inferred,
+            }),
+            inference_generation: next_generation,
+        }))
     }
 
     /// # Errors
@@ -8686,6 +9111,456 @@ mod tests {
         assert_eq!(
             db.get_default_llm_language().await.unwrap(),
             LlmLanguage::default()
+        );
+    }
+
+    fn pr_observation(
+        repo_owner: &str,
+        repo_name: &str,
+        pr_number: u64,
+        display_state: phoenix_core::domain::pr_display_state::PrDisplayState,
+        head: &str,
+    ) -> WorkScopePrObservation {
+        let state = match display_state {
+            phoenix_core::domain::pr_display_state::PrDisplayState::Open => "OPEN",
+            phoenix_core::domain::pr_display_state::PrDisplayState::Draft => "OPEN",
+            phoenix_core::domain::pr_display_state::PrDisplayState::Merged => "MERGED",
+            phoenix_core::domain::pr_display_state::PrDisplayState::Closed => "CLOSED",
+        };
+        WorkScopePrObservation {
+            repo_owner: repo_owner.to_string(),
+            repo_name: repo_name.to_string(),
+            pr_number,
+            title: format!("pr-{pr_number}"),
+            url: format!("https://example.test/{repo_owner}/{repo_name}/{pr_number}"),
+            state: state.to_string(),
+            draft: matches!(
+                display_state,
+                phoenix_core::domain::pr_display_state::PrDisplayState::Draft
+            ),
+            display_state,
+            base: "main".to_string(),
+            head: head.to_string(),
+            github_updated_at: Some(format!("2024-01-{pr_number:02}T00:00:00Z")),
+        }
+    }
+
+    async fn seed_latest_observed_branch(
+        db: &Database,
+        scope: &phoenix_core::work_scope::WorkScope,
+        repository_identity: &str,
+        branch_name: &str,
+        head_oid: &str,
+    ) {
+        db.upsert_work_scope_observed_branch(
+            scope,
+            &WorkScopeObservedBranchUpsert {
+                repository_identity: repository_identity.to_string(),
+                branch_name: branch_name.to_string(),
+                head_oid: head_oid.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_pr_pinned_selection_survives_association_updates() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-pinned".to_string());
+        let pr = pr_observation(
+            "owner",
+            "repo",
+            7,
+            phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+            "feature/a",
+        );
+        db.upsert_work_scope_pr_observations(&scope, std::slice::from_ref(&pr))
+            .await
+            .unwrap();
+        seed_latest_observed_branch(&db, &scope, "owner/repo", "feature/a", "aaaa").await;
+
+        let pinned = db
+            .pin_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+                    repo_owner: "owner".to_string(),
+                    repo_name: "repo".to_string(),
+                    pr_number: 7,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned.selection.unwrap().provenance,
+            phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Pinned
+        );
+
+        let updated = pr_observation(
+            "owner",
+            "repo",
+            7,
+            phoenix_core::domain::pr_display_state::PrDisplayState::Draft,
+            "feature/a",
+        );
+        db.upsert_work_scope_pr_observations(&scope, &[updated])
+            .await
+            .unwrap();
+        let derived = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: Some(
+                        phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                            repository_identity: "owner/repo".to_string(),
+                            branch_name: "feature/a".to_string(),
+                        },
+                    ),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            derived.selection.unwrap().provenance,
+            phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Pinned
+        );
+    }
+
+    #[tokio::test]
+    async fn active_pr_infers_unique_branch_match() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-branch".to_string());
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                pr_observation(
+                    "owner",
+                    "repo",
+                    1,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/a",
+                ),
+                pr_observation(
+                    "owner",
+                    "repo",
+                    2,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/b",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let state = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: Some(
+                        phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                            repository_identity: "owner/repo".to_string(),
+                            branch_name: "feature/b".to_string(),
+                        },
+                    ),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.selection.unwrap().pr.pr_number, 2);
+    }
+
+    #[tokio::test]
+    async fn active_pr_only_actionable_ignores_merged_and_closed() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-actionable".to_string());
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                pr_observation(
+                    "owner",
+                    "repo",
+                    1,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Merged,
+                    "feature/a",
+                ),
+                pr_observation(
+                    "owner",
+                    "repo",
+                    2,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Closed,
+                    "feature/b",
+                ),
+                pr_observation(
+                    "owner",
+                    "repo",
+                    3,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/c",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let state = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: None,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.selection.unwrap().pr.pr_number, 3);
+    }
+
+    #[tokio::test]
+    async fn active_pr_ambiguity_leaves_selection_unset() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-ambiguous".to_string());
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                pr_observation(
+                    "owner",
+                    "repo",
+                    1,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/a",
+                ),
+                pr_observation(
+                    "owner",
+                    "repo",
+                    2,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Draft,
+                    "feature/b",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let state = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: None,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn active_pr_retains_prior_inferred_selection_when_still_valid() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-retain".to_string());
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                pr_observation(
+                    "owner",
+                    "repo",
+                    1,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/a",
+                ),
+                pr_observation(
+                    "owner",
+                    "repo",
+                    2,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/b",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let first = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: Some(
+                        phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                            repository_identity: "owner/repo".to_string(),
+                            branch_name: "feature/a".to_string(),
+                        },
+                    ),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.selection.as_ref().unwrap().pr.pr_number, 1);
+
+        let retained = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: None,
+                },
+                Some(first.inference_generation),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.selection.unwrap().pr.pr_number, 1);
+    }
+
+    #[tokio::test]
+    async fn active_pr_stale_generation_protection_returns_current_state() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-generation".to_string());
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                pr_observation(
+                    "owner",
+                    "repo",
+                    1,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/a",
+                ),
+                pr_observation(
+                    "owner",
+                    "repo",
+                    2,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/b",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let first = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: Some(
+                        phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                            repository_identity: "owner/repo".to_string(),
+                            branch_name: "feature/a".to_string(),
+                        },
+                    ),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let second = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: Some(
+                        phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                            repository_identity: "owner/repo".to_string(),
+                            branch_name: "feature/b".to_string(),
+                        },
+                    ),
+                },
+                Some(first.inference_generation),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.selection.as_ref().unwrap().pr.pr_number, 2);
+
+        let stale = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: Some(
+                        phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                            repository_identity: "owner/repo".to_string(),
+                            branch_name: "feature/a".to_string(),
+                        },
+                    ),
+                },
+                Some(first.inference_generation),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale.selection.unwrap().pr.pr_number, 2);
+        assert_eq!(stale.inference_generation, second.inference_generation);
+    }
+
+    #[tokio::test]
+    async fn active_pr_clear_pin_resumes_inference() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope =
+            phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-active-clear".to_string());
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                pr_observation(
+                    "owner",
+                    "repo",
+                    1,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/a",
+                ),
+                pr_observation(
+                    "owner",
+                    "repo",
+                    2,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/b",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        db.pin_active_work_scope_pr_selection(
+            &scope,
+            &phoenix_core::domain::active_pr_selection::ActivePrIdentity {
+                repo_owner: "owner".to_string(),
+                repo_name: "repo".to_string(),
+                pr_number: 1,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resumed = db
+            .clear_active_work_scope_pr_pin(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: Some(
+                        phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                            repository_identity: "owner/repo".to_string(),
+                            branch_name: "feature/b".to_string(),
+                        },
+                    ),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let selection = resumed.selection.unwrap();
+        assert_eq!(selection.pr.pr_number, 2);
+        assert_eq!(
+            selection.provenance,
+            phoenix_core::domain::active_pr_selection::ActivePrSelectionProvenance::Inferred
         );
     }
 
