@@ -11,25 +11,32 @@ the machine is it using right now?"
 - Build identity: version, git SHA, uptime, start time
 - Network binding and TLS posture (mode, cert/key/CA paths, auto-mode hosts,
   socket activation)
-- Live process + system resource usage (RSS, CPU, system memory, CPU count),
-  cross-platform (macOS + Linux)
+- A live managed-resource monitor with a focused resource endpoint, host and
+  managed totals, per-category attribution, per-process rows, and bounded
+  client-side recent history
 - On-disk locations with sizes for small owned artifacts, paths-only for large
   caches, and a stable row for the attachment store
 - The active log sinks (stdout and/or a process-owned file path) — path only,
   never contents
-- A single-snapshot fetch with explicit refresh
+- Typed managed-worktree drilldown and backend-revalidated cleanup for leftover
+  Phoenix-managed worktrees
 
 **Owned by other specs:**
-- `specs/api/` — the HTTP router, JSON-handler pattern, and the registration of
-  `GET /api/deployment`
-- `specs/auth/` — the password middleware that gates the endpoint
+- `specs/api/` — the HTTP router, JSON-handler pattern, and registration of the
+  deployment endpoints
+- `specs/auth/` — the password middleware that gates the deployment data
+  endpoints
 - `specs/conversation-ui/` — the settings dropdown and conversation-list chrome
   the page entry attaches to
+- `specs/process-inspector/` — the shared process-sampling primitives reused for
+  managed bash attribution
 
 **Explicitly out of scope:**
 - Rendering log file contents (path/sink only)
-- Live-streaming resource gauges or historical charts (snapshot + refresh only)
-- Any control that mutates server state (the page is observational)
+- Durable server-side time-series retention or a general-purpose monitoring
+  system
+- Attribution for Browser, tmux/terminal, or MCP native processes until those
+  subsystems surface process identity
 
 ## Why It Exists
 
@@ -37,38 +44,44 @@ The operator of a Phoenix instance — frequently the same person running it on
 their own machine — needs to confirm what is actually running and where its bytes
 live without dropping to a shell to read env vars, `du` the data directory, or
 `ps` the process. The running process already knows its build, its binding, its
-TLS configuration, and its data layout, and can cheaply sample its own resource
-usage. Surfacing those facts in one read-only page turns a multi-command
-investigation into a single glance, while staying safe to open because it changes
-nothing.
+TLS configuration, and its data layout, and can sample both its host environment
+and the native processes Phoenix manages. Surfacing those facts in one
+read-only page turns a multi-command investigation into a single glance, while
+staying safe to open because ordinary inspection changes nothing.
 
-## Status Summary
+## Current Reality
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-DEPLOY-001:** Reach "About this deployment" from settings | Planned | New lazy route mounting `AboutDeploymentPage`; entry added to `SettingsDropdown`. Read-only — no mutating controls. |
-| **REQ-DEPLOY-002:** Report build identity and uptime | Planned | `BuildInfo` from `env!("CARGO_PKG_VERSION")`, `env!("PHOENIX_GIT_SHA")` (`unknown` sentinel preserved), and `hot_restart` start-instant/start-wallclock accessors. |
-| **REQ-DEPLOY-003:** Report network binding and TLS configuration | Planned | `NetworkInfo` from the captured `DeploymentConfig`; `TlsInfo` derived from the resolved `tls::ConfigSource`/`LoadedConfig`. Plain-HTTP stated when disabled. |
-| **REQ-DEPLOY-004:** Report live process and system resource usage | Planned | `ResourceUsage` sampled via the `sysinfo` crate; per-metric `Option` → `null` for unavailable, never `0`. Cross-platform macOS + Linux. |
-| **REQ-DEPLOY-005:** Report on-disk locations and their sizes | Planned | `DiskEntry[]` with a `DiskSize` tagged union (`measured` / `not_measured` / `absent` / `inline_db`). Small owned dirs recursed; large caches paths-only. Attachment store row is `inline_db` until file-based attachment storage is active. |
-| **REQ-DEPLOY-006:** Surface the log sinks, never the contents | Planned | `LogInfo` reports the independent stdout + file sinks, built from the same `LogConfig` (`PHOENIX_LOG_STDOUT` / `PHOENIX_LOG_FILE`) that wires the subscriber. The binary writes the file sink itself, so a reported path is always one the process genuinely writes — never a launcher redirection. |
-| **REQ-DEPLOY-007:** Freshness of sampled values | Planned | `sampled_at` timestamp on every snapshot; the page refresh re-fetches `GET /api/deployment` rather than caching. |
+| **REQ-DEPLOY-001:** Reach "About this deployment" from settings | Implemented | `ui/src/components/SettingsDropdown.tsx` links to the route rendered by `ui/src/pages/AboutDeploymentPage.tsx`. The page is read-only apart from typed leftover-worktree cleanup actions. |
+| **REQ-DEPLOY-002:** Report build identity and uptime | Implemented | `crates/phoenix-ide/src/api/deployment.rs` builds `BuildInfo` from `env!("CARGO_PKG_VERSION")`, `env!("PHOENIX_GIT_SHA")`, and `crate::hot_restart::{started_at, uptime_secs}`. The UI renders version, git SHA, started time, and uptime. |
+| **REQ-DEPLOY-003:** Report network binding and TLS configuration | Implemented | `DeploymentInfo.network` carries bind address, socket activation, and `TlsInfo`; `AboutDeploymentPage` renders plain HTTP explicitly when TLS is disabled and shows cert/key/CA/hosts when enabled. |
+| **REQ-DEPLOY-004:** Report live managed-resource and host usage | Implemented | `GET /api/about/resources` returns `AboutResourcesSnapshot` with host metrics (`logical_cpu_count`, memory totals, load averages, idle/user/system CPU fields) plus managed totals and category rows. API and Bash are attributed by PID; Browser, tmux/terminal, and MCP are explicit unavailable categories with reasons. Managed totals include both `process_count` and `deduplicated_pid_count`. |
+| **REQ-DEPLOY-004A:** Poll live resource data while the page is visible | Implemented | `ui/src/pages/AboutDeploymentPage.tsx` polls with `RESOURCE_POLL_MS = 1_000`, skips timed refreshes while `document.visibilityState !== 'visible'`, triggers an immediate fetch on `visibilitychange` back to visible, and guards overlap with `resourcesInFlightRef`. |
+| **REQ-DEPLOY-004B:** Maintain bounded rolling history and rollups | Implemented | The UI keeps up to five minutes of good samples via `appendResourceHistory` and `RESOURCE_HISTORY_RETENTION_MS = 5 * 60 * 1_000`, then derives current/average/peak CPU and memory rollups with `computeResourceRollups`. Charts and summary cards read from that bounded client-side history. |
+| **REQ-DEPLOY-004C:** Preserve last-good semantics across refresh failures | Implemented | On fetch failure, `fetchResources` leaves `sample` and `history` intact, marks `stale: true` when a prior sample exists, and surfaces the error as `Live data stale — …`. When no sample exists yet, the page shows the error without fabricating data. |
+| **REQ-DEPLOY-004D:** Keep deployment facts and live resource monitoring separate | Implemented | `GET /api/deployment`, `GET /api/about/resources`, and `GET /api/deployment/disk` are separate endpoints in `crates/phoenix-ide/src/api/handlers.rs`; the page refresh buttons can refresh resources or disk independently. |
+| **REQ-DEPLOY-005:** Report on-disk locations and their sizes | Implemented | `GET /api/deployment/disk` returns `DeploymentDiskInfo` with typed `DiskSize` variants, aggregate managed-worktree sizing, and per-worktree rows with typed disposition. The UI keeps disk loading/error state separate from the live resource monitor. |
+| **REQ-DEPLOY-006:** Surface the log sinks, never the contents | Implemented | `LogInfo` reports independent stdout/file sinks from the logger configuration, and the page renders sink facts only — never log contents. |
+| **REQ-DEPLOY-007:** Freshness of sampled values | Implemented | `DeploymentInfo`, `DeploymentDiskInfo`, and `AboutResourcesSnapshot` all carry `sampled_at`; the UI distinguishes general refresh, disk refresh, and continuous resource sampling rather than serving one cached omnibus snapshot. |
+| **REQ-DEPLOY-008:** Safely clean up leftover managed worktrees | Implemented | `POST /api/deployment/disk/managed-worktrees/cleanup` revalidates DB ownership, Phoenix path shape, live-conversation ownership, and mode semantics before removal; the UI offers cleanup only for typed leftover rows whose disposition allows it. |
 
 ## Behavioural Specification
 
-No Allium spec accompanies this feature. It has no state machine, no lifecycle
-with preconditions, and no multi-step operation with partial-failure ordering —
-it is a read-only snapshot endpoint plus a render. Per AGENTS.md, spEARS alone is
-sufficient here; the wire shape in `design.md` and the requirements above are the
-normative contract.
+No Allium spec accompanies this feature. The page composes read-only endpoint
+fetches plus a narrowly scoped cleanup action, but it does not introduce a new
+state machine or lifecycle whose invariants would benefit from an Allium layer.
+The normative artifacts here are `requirements.md` plus the Rust/TS wire types
+exported from `crates/phoenix-ide/src/api/deployment.rs` into `ui/src/generated/`.
 
 ## Cross-Spec Cross-References
 
-- `specs/api/`: `GET /api/deployment` is registered in the same router and behind
-  the same auth middleware as the other `/api/*` JSON endpoints.
-- `specs/auth/`: the `/api/deployment` endpoint is gated by the password
-  middleware and is not on the auth-exempt list. The `/about` SPA route is
-  exempt (like other top-level SPA routes) so the shell loads on a
-  password-protected hard refresh; only the static shell is exempt, not the data.
+- `specs/api/`: the deployment endpoints are registered in the shared router:
+  `GET /api/deployment`, `GET /api/about/resources`, `GET /api/deployment/disk`,
+  and `POST /api/deployment/disk/managed-worktrees/cleanup`.
+- `specs/auth/`: the deployment data endpoints are behind the password
+  middleware; the SPA route can load the shell, but data fetches remain gated.
 - `specs/conversation-ui/`: the "About this deployment" entry lives in the
   settings dropdown mounted in the conversation-list chrome.
+- `specs/process-inspector/`: bash resource attribution reuses the shared
+  process-sampling machinery for CPU/process-count/PSS-style memory sampling.

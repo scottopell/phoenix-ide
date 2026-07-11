@@ -121,31 +121,151 @@ the socket), which is worth knowing when the bind address looks surprising.
 
 ---
 
-### REQ-DEPLOY-004: Report live process and system resource usage
+### REQ-DEPLOY-004: Report live managed-resource and host usage
 
-THE SYSTEM SHALL display the current process resource usage:
+THE SYSTEM SHALL provide a dedicated managed-resource endpoint distinct from the
+general deployment snapshot and the disk-sizing endpoint.
 
-- Resident memory (RSS)
-- CPU utilization
+THE SYSTEM SHALL display host-wide resource usage including:
 
-THE SYSTEM SHALL display the machine totals for context:
-
-- Total and available system memory
 - Logical CPU count
+- CPU busy/idle state derived from sampled CPU percentages
+- CPU user and system percentages when available
+- Total, available, and used system memory
+- Load averages over one, five, and fifteen minutes
 
-THE SYSTEM SHALL measure these on both macOS and Linux
+THE SYSTEM SHALL display Phoenix-managed resource usage as a separate aggregate
+including:
 
-WHEN a resource value cannot be sampled on the host platform
-THE SYSTEM SHALL indicate the value is unavailable rather than reporting a
-misleading zero
+- Current total CPU utilization across attributed managed processes
+- Current total memory across attributed managed processes
+- Total managed process row count
+- Deduplicated managed PID count
 
-**Rationale:** A raw "RSS = 800 MB" is not actionable without the machine's total
-— 800 MB is fine on a 64 GB box and alarming on a 1 GB box. Pairing process
-figures with system totals makes the number self-interpreting. Both macOS and
-Linux are first-class (the same binary is developed and run on both), so the
-measurement cannot be Linux-only `/proc` scraping. The explicit unavailable
-state preserves the correctness principle that silent zero is indistinguishable
-from a bug.
+THE SYSTEM SHALL attribute managed usage by category, with explicit categories
+for:
+
+- API
+- Bash
+- Browser
+- tmux/terminal
+- MCP
+
+THE SYSTEM SHALL treat API and Bash as attributable categories when native
+process identity is available.
+
+THE SYSTEM SHALL deduplicate shared PIDs before reporting the managed aggregate
+so the same native process is not double-counted across categories.
+
+THE SYSTEM SHALL treat Browser, tmux/terminal, and MCP as explicit categories
+EVEN WHEN native process identity is unavailable, and SHALL report them as
+unavailable with a reason rather than silently omitting them.
+
+THE SYSTEM SHALL provide per-process rows for every attributed managed PID,
+including:
+
+- Process name
+- Category
+- PID
+- CPU percent
+- Memory bytes
+- Thread count
+- CPU time seconds
+
+WHEN a per-process metric cannot be sampled on the host platform or for that
+process, THE SYSTEM SHALL report that field as unavailable (`null` on the wire)
+rather than a misleading zero.
+
+THE SYSTEM SHALL measure resource values on both macOS and Linux.
+
+**Rationale:** The operator question is broader than "what is the Phoenix server
+process using?" — the deployment page now answers "what resources are Phoenix
+and the processes it manages using, and how busy is the host around them?"
+Host memory, idle/busy state, and load make the machine context
+self-interpreting; category attribution shows whether pressure comes from the
+API process, spawned bash work, or a capability gap Phoenix cannot yet assign.
+PID deduplication is load-bearing because one native process must not inflate the
+managed total simply by appearing in more than one attribution path. Nullable
+per-process fields preserve the difference between "zero" and "not observable on
+this host or for this process."
+
+---
+
+### REQ-DEPLOY-004A: Poll live resource data while the page is visible
+
+THE SYSTEM SHALL refresh the managed-resource endpoint approximately once per
+second while the deployment page is visible.
+
+THE SYSTEM SHALL suspend periodic polling while the document is hidden.
+
+WHEN the page becomes visible after being hidden
+THE SYSTEM SHALL promptly request a fresh managed-resource sample.
+
+THE SYSTEM SHALL avoid overlapping managed-resource requests.
+
+**Rationale:** Resource monitoring is useful only when it stays fresh, but
+continuous background polling for a hidden tab wastes work and distorts the
+operator's mental model of "what I'm actively watching." Roughly one-second
+polling keeps the page live without claiming hard real-time semantics, and the
+no-overlap rule prevents stacked requests from turning temporary slowness into a
+self-inflicted load spike.
+
+---
+
+### REQ-DEPLOY-004B: Maintain bounded rolling history and rollups
+
+THE SYSTEM SHALL maintain a bounded client-side history of recent good
+managed-resource samples covering at most five minutes.
+
+THE SYSTEM SHALL derive rolling summaries from that bounded history,
+including current, average, and peak values for:
+
+- Managed CPU utilization
+- Managed memory usage
+
+THE SYSTEM SHALL present the bounded history as recent-over-time data rather than
+as an unbounded historical archive.
+
+**Rationale:** Operators need short-horizon trend context — "is this spike new or
+sustained?" — without turning the deployment page into a durable monitoring
+system. Five minutes is enough to distinguish a blip from a pattern while keeping
+storage bounded and semantics local to the open page.
+
+---
+
+### REQ-DEPLOY-004C: Preserve last-good semantics across refresh failures
+
+WHEN a managed-resource refresh fails after at least one good sample has been
+captured
+THE SYSTEM SHALL retain the last good sample and bounded history instead of
+clearing them.
+
+WHEN the page is showing retained data after a failed refresh
+THE SYSTEM SHALL mark that resource display as stale and surface the refresh
+error.
+
+WHEN no good sample has been captured yet and a refresh fails
+THE SYSTEM SHALL report the failure without fabricating resource data.
+
+**Rationale:** A transient backend or transport failure should not erase the last
+known-good picture the operator was using. Marking that picture stale preserves
+honesty: the page remains useful while clearly distinguishing retained data from
+a newly confirmed sample.
+
+---
+
+### REQ-DEPLOY-004D: Keep deployment facts and live resource monitoring separate
+
+THE SYSTEM SHALL keep the managed-resource endpoint and refresh cycle separate
+from the general deployment snapshot and from disk sizing.
+
+THE SYSTEM SHALL allow live resource refresh without requiring build, network,
+log, or disk facts to reload.
+
+**Rationale:** Build identity, TLS posture, and on-disk layout are relatively
+static compared with live resource data. Splitting the live monitor into its own
+endpoint avoids coupling a fast-refresh surface to slower or unrelated data
+fetches.
 
 ---
 
@@ -213,7 +333,7 @@ managed worktree path that still exists on disk is still Phoenix-created disk
 usage. The attachment store is listed even while attachments live inline in the
 database, so the row is a stable home for the file-based attachment directory
 once that storage mode is active — the reader always finds attachment storage in
-the same place, whether it currently resolves to a directory or to "inline in the
+the same place, whether it resolves to a directory or to "inline in the
 database."
 
 ---
@@ -247,22 +367,22 @@ the report and the wiring share one source of truth and cannot disagree.
 
 ### REQ-DEPLOY-007: Freshness of sampled values
 
-THE SYSTEM SHALL reflect that resource usage and on-disk sizes are point-in-time
-samples taken when the page data was requested
+THE SYSTEM SHALL identify deployment snapshots, managed-resource samples, and
+disk samples as point-in-time measurements.
 
-WHEN the user requests a refresh
-THE SYSTEM SHALL re-sample the live values rather than serving a cached snapshot
+WHEN the user requests a general refresh
+THE SYSTEM SHALL re-sample the general deployment snapshot and SHALL trigger a
+fresh managed-resource sample rather than serving cached values.
 
 WHEN the user requests a disk-only refresh
 THE SYSTEM SHALL re-sample disk values without requiring the general deployment
-facts to reload
+snapshot to reload.
 
 **Rationale:** Memory, CPU, and disk sizes drift continuously. A value with no
-notion of when it was taken invites the reader to trust a stale number. Making
-the sample explicitly point-in-time, with a way to re-sample, keeps the page
-honest about what it is: a snapshot, not a live stream. (A live-streaming gauge
-is deliberately out of scope — the operator question is "what is it now," not
-"chart it over time.")
+notion of when it was taken invites the reader to trust a stale number. Sampled
+attribution and timestamps keep each surface honest about whether it is a fresh
+measurement, retained last-good data, or a separate disk sample taken on its own
+cadence.
 
 ---
 
