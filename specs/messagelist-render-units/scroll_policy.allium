@@ -54,10 +54,12 @@ entity ScrollPolicy {
         reading -> following
         reading -> navigating
         reading -> returning_to_tail
+        navigating -> following
         navigating -> reading
         navigating -> returning_to_tail
         returning_to_tail -> following
         returning_to_tail -> reading
+        returning_to_tail -> navigating
     }
 
     transitions gesture_mode {
@@ -371,6 +373,15 @@ rule TailAdvanceWhileReadingShowsUnread {
     ensures: ScrollEffect.created(policy: policy, kind: show_unread)
 }
 
+rule TailAdvanceWhileNavigatingShowsUnread {
+    when: TailContentAdvanced(policy)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    ensures: policy.unread = true
+    ensures: ScrollEffect.created(policy: policy, kind: show_unread)
+    ensures: not ScrollEffect.created(policy: policy, kind: schedule_tail_follow)
+}
+
 rule TailAdvanceWhileFollowingKeepsUnreadClear {
     when: TailContentAdvanced(policy)
     requires: policy.lifecycle = live
@@ -403,6 +414,19 @@ rule ReadingTailGrowthShowsUnreadWithoutScrolling {
     ensures: ScrollEffect.created(policy: policy, kind: show_unread)
 }
 
+rule NavigatingTailGrowthShowsUnreadWithoutScrolling {
+    when: HeightChanged(policy, total_height, unit_count, cause)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: unit_count > 0
+    requires: cause = tail_activity
+    requires: total_height > policy.previous_total_height
+    ensures: policy.previous_total_height = total_height
+    ensures: policy.unread = true
+    ensures: ScrollEffect.created(policy: policy, kind: show_unread)
+    ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
+}
+
 rule ReadingUnrelatedGrowthDoesNotChangeUnreadOrScroll {
     when: HeightChanged(policy, total_height, unit_count, cause)
     requires: policy.lifecycle = live
@@ -410,6 +434,16 @@ rule ReadingUnrelatedGrowthDoesNotChangeUnreadOrScroll {
     requires: unit_count > 0
     requires: cause = unrelated_layout
     ensures: policy.previous_total_height = total_height
+}
+
+rule NavigatingUnrelatedGrowthDoesNotChangeUnreadOrScroll {
+    when: HeightChanged(policy, total_height, unit_count, cause)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: unit_count > 0
+    requires: cause = unrelated_layout
+    ensures: policy.previous_total_height = total_height
+    ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
 }
 
 rule MountHeightChangeSchedulesBottomCorrection {
