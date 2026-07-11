@@ -34,6 +34,7 @@ import {
   type PhoenixFileAnnotationMeta,
   type PhoenixFileItem,
 } from './pierreFileMapping';
+import type { FileSearchMatchTarget } from '../viewer-find';
 
 export interface PhoenixFileCodeViewProps {
   filePath: string;
@@ -50,17 +51,20 @@ export interface PhoenixFileCodeViewProps {
   scrollKey: string;
   /** Open the annotation dialog for a line, quoting its source text. */
   onAnnotateLine: (lineNumber: number, lineContent: string) => void;
+  findMatches?: readonly FileSearchMatchTarget[] | undefined;
+  activeFindMatch?: FileSearchMatchTarget | null | undefined;
 }
 
 export interface PhoenixFileCodeViewHandle {
   scrollToLine: (lineNumber: number) => void;
+  scrollToFindTarget: (target: FileSearchMatchTarget) => void;
 }
 
 type Meta = PhoenixFileAnnotationMeta;
 
 export const PhoenixFileCodeView = forwardRef<PhoenixFileCodeViewHandle, PhoenixFileCodeViewProps>(
   function PhoenixFileCodeView(
-    { filePath, content, notes, modifiedLines, highlightedLine, firstModifiedLine, scrollKey, onAnnotateLine },
+    { filePath, content, notes, modifiedLines, highlightedLine, firstModifiedLine, scrollKey, onAnnotateLine, findMatches = [], activeFindMatch = null },
     ref,
   ) {
     const { theme } = useTheme();
@@ -102,7 +106,7 @@ export const PhoenixFileCodeView = forwardRef<PhoenixFileCodeViewHandle, Phoenix
         themeType: theme,
         stickyHeaders: true,
         enableGutterUtility: true,
-        unsafeCSS: lineDecorationCSS(modifiedLines, highlightedLine),
+        unsafeCSS: fileFindDecorationCSS(modifiedLines, highlightedLine, findMatches, activeFindMatch),
         // Items are always file items here; narrow on context.type and cast
         // through `unknown` to satisfy the file+diff overload intersection
         // without re-stating both shapes (see PhoenixDiffCodeView).
@@ -116,7 +120,7 @@ export const PhoenixFileCodeView = forwardRef<PhoenixFileCodeViewHandle, Phoenix
           annotate(props.lineNumber);
         }) as unknown as NonNullable<CodeViewOptions<Meta>['onLineClick']>,
       }),
-      [theme, modifiedLines, highlightedLine, annotate],
+      [theme, modifiedLines, highlightedLine, annotate, findMatches, activeFindMatch],
     );
 
     // Touch long-press → annotate the line under the finger (Pierre fires
@@ -215,6 +219,15 @@ export const PhoenixFileCodeView = forwardRef<PhoenixFileCodeViewHandle, Phoenix
             behavior: 'smooth',
           });
         },
+        scrollToFindTarget: (target: FileSearchMatchTarget) => {
+          codeViewRef.current?.scrollTo({
+            type: 'line',
+            id: fileItemId(filePath),
+            lineNumber: target.lineNumber,
+            align: 'center',
+            behavior: 'smooth',
+          });
+        },
       }),
       [filePath],
     );
@@ -278,3 +291,23 @@ export const PhoenixFileCodeView = forwardRef<PhoenixFileCodeViewHandle, Phoenix
     );
   },
 );
+
+function fileFindDecorationCSS(
+  modifiedLines: ReadonlySet<number>,
+  highlightedLine: number | null,
+  findMatches: readonly FileSearchMatchTarget[],
+  activeFindMatch: FileSearchMatchTarget | null,
+): string {
+  const base = lineDecorationCSS(modifiedLines, highlightedLine);
+  const matchedLines = [...new Set(findMatches.map((match) => match.lineNumber))]
+    .filter((lineNumber) => lineNumber !== highlightedLine)
+    .sort((a, b) => a - b);
+  const rules = [base].filter((rule) => rule.length > 0);
+  if (matchedLines.length > 0) {
+    rules.push(`${matchedLines.map((lineNumber) => `[data-line="${lineNumber}"]`).join(',')}{outline:1px solid var(--viewer-find-match-outline, rgba(240, 180, 41, 0.8));outline-offset:-1px;}`);
+  }
+  if (activeFindMatch) {
+    rules.push(`[data-line="${activeFindMatch.lineNumber}"]{background:var(--viewer-highlight-line-bg);outline:2px solid var(--viewer-find-active-outline, rgba(255, 215, 64, 0.95));outline-offset:-2px;}`);
+  }
+  return rules.join('\n');
+}

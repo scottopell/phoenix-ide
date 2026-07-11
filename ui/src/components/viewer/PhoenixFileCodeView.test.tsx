@@ -73,4 +73,23 @@ describe('PhoenixFileCodeView (Pierre file wiring)', () => {
       expect.objectContaining({ type: 'line', id: ITEM_ID, lineNumber: 2 }),
     );
   });
+
+  it('scrolls find navigation through the typed file target and decorates matched lines', () => {
+    const { ref } = renderView({
+      findMatches: [
+        { kind: 'file-line', lineNumber: 1, startColumn: 0, endColumn: 4 },
+        { kind: 'file-line', lineNumber: 2, startColumn: 0, endColumn: 4 },
+      ],
+      activeFindMatch: { kind: 'file-line', lineNumber: 2, startColumn: 0, endColumn: 4 },
+    });
+
+    ref.current?.scrollToFindTarget({ kind: 'file-line', lineNumber: 2, startColumn: 0, endColumn: 4 });
+
+    expect(codeViewMockState.scrollToCalls).toContainEqual(
+      expect.objectContaining({ type: 'line', id: ITEM_ID, lineNumber: 2 }),
+    );
+    expect(codeViewMockState.lastUnsafeCss).toContain('[data-line="1"]');
+    expect(codeViewMockState.lastUnsafeCss).toContain('[data-line="2"]');
+    expect(codeViewMockState.lastUnsafeCss).toContain('viewer-find-active-outline');
+  });
 });

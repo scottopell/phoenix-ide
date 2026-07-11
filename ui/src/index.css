@@ -11572,6 +11572,16 @@ html * {
  * ============================================================ */
 
 /* ViewerShell overlay/inline + chrome */
+.viewer-find-match {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  color: inherit;
+}
+
+.viewer-find-match--active {
+  background: color-mix(in srgb, var(--accent) 48%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--accent) 72%, transparent);
+}
+
 .viewer-shell--overlay {
   position: fixed;
   inset: 0;

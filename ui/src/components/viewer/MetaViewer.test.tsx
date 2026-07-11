@@ -132,6 +132,39 @@ describe('MetaViewer payload routing', () => {
     expect(container.querySelector('.viewer-text')).toBeNull();
   });
 
+  it('opens shared find for Pierre-backed files and restores focus to the opener on Escape', async () => {
+    renderViewer({ ...textCommon, kind: 'text', content: 'alpha\nbeta alpha' });
+
+    const findButton = screen.getByRole('button', { name: 'Find in file' });
+    findButton.focus();
+    fireEvent.click(findButton);
+
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(findButton).toHaveFocus();
+  });
+
+  it('highlights and counts exact occurrences in large text fallback DOM source', async () => {
+    renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: '<p>alpha</p>\n<p>beta alpha</p>',
+      renderMode: 'plainLargeText',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+    expect(document.querySelectorAll('[data-find-occurrence]').length).toBe(2);
+    expect(document.querySelector('.viewer-find-match--active')).toHaveTextContent('alpha');
+  });
+
   it('lets a large HTML file still toggle to the sandboxed preview (fallback only gates source)', () => {
     const largeHtml = `${'<p>line</p>\n'.repeat(2_001)}<p>tail</p>`;
     const { container } = renderViewer({
@@ -251,6 +284,44 @@ describe('MetaViewer payload routing', () => {
     // Security: sandbox must stay allow-same-origin only (no allow-scripts).
     expect(iframe).toHaveAttribute('sandbox', 'allow-same-origin');
     expect(iframe).toHaveAttribute('src', '/preview/tmp/project/thing');
+  });
+
+  it('keeps image payloads out of file find and does not show false counts', () => {
+    renderViewer({
+      ...common,
+      kind: 'image',
+      url: '/preview/tmp/project/thing.png',
+      mimeType: 'image/png',
+      fileName: 'thing.png',
+    });
+
+    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
+    expect(screen.queryByText(/of \d+/)).toBeNull();
+  });
+
+  it('marks html preview as find-ineligible without false counts', () => {
+    render(
+      <ReviewNotesProvider>
+        <MetaViewer
+          payload={{
+            ...textCommon,
+            kind: 'html',
+            language: 'html',
+            content: '<p>alpha</p>',
+            previewUrl: '/preview/tmp/project/thing',
+          }}
+        />
+      </ReviewNotesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+
+    expect(screen.getByTitle('Find in file')).toBeInTheDocument();
+    expect(screen.getByText('0 results')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Previous' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
   });
 });
 

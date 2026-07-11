@@ -8,6 +8,9 @@ interface ViewerShellProps {
   /** When false, shell-level Escape handling stands down so an inner surface
    *  (for example viewer find) can consume Escape first. */
   closeOnEscape?: boolean | undefined;
+  /** When true, suppresses the close button's default mousedown focus transfer so
+   *  nested affordances can restore focus to their own opener instead. */
+  suppressCloseButtonFocus?: boolean | undefined;
   mode: ViewerMode;
   /** ARIA label for the dialog/region — used by screen readers and
    *  test queries (e.g. `getByRole('dialog', { name: 'Worktree diff' })`). */
@@ -80,6 +83,7 @@ export function ViewerShell({
   confirm,
   bodyScroll = 'shell',
   closeOnEscape = true,
+  suppressCloseButtonFocus = false,
 }: ViewerShellProps) {
   // Esc closes (deferring to caller — they may guard with a confirm).
   // Registered in capture phase with stopPropagation so this shell
@@ -115,6 +119,7 @@ export function ViewerShell({
       <div className="viewer-shell-header">
         <button
           className="viewer-shell-btn"
+          onMouseDown={suppressCloseButtonFocus ? (event) => event.preventDefault() : undefined}
           onClick={onClose}
           aria-label="Close viewer"
         >

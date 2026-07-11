@@ -83,4 +83,6 @@ export interface ViewerBodyProps {
   highlightedLine: number | null;
   onAnnotate: (lineNumber: number, lineContent: string) => void;
   registerLineRef: (lineNumber: number, el: HTMLElement | null) => void;
+  findQuery?: string | undefined;
+  activeFindOccurrence?: number | null | undefined;
 }
