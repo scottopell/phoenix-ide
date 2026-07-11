@@ -381,6 +381,10 @@ pub fn create_router(state: AppState) -> Router {
         // About this deployment diagnostics
         .route("/api/deployment", get(super::deployment::deployment_info))
         .route(
+            "/api/about/resources",
+            get(super::deployment::about_resources),
+        )
+        .route(
             "/api/deployment/disk",
             get(super::deployment::deployment_disk),
         )

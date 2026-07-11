@@ -377,6 +377,20 @@ impl BashHandleRegistry {
         out
     }
 
+    pub async fn snapshot_live_member_pids(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        let map = self.inner.read().await;
+        for entry in map.values() {
+            let scope_handles = entry.read().await;
+            for h in scope_handles.all() {
+                if let Some(pid) = h.live_pid().await {
+                    out.push(pid);
+                }
+            }
+        }
+        out
+    }
+
     /// Remove a `WorkScope`'s handle table outright. Used by the
     /// hard-delete cascade (REQ-BASH-006). Returns the removed entry so
     /// the caller can SIGKILL its live process groups synchronously.

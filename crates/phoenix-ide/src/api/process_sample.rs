@@ -30,6 +30,48 @@
 //! meaningful rather than `0`.
 
 use phoenix_core::domain::process_inspection::ResourceSample;
+use std::collections::BTreeSet;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampledProcesses {
+    pub cpu_pct: Option<f32>,
+    pub memory_bytes: Option<u64>,
+    pub process_count: Option<u32>,
+}
+
+impl SampledProcesses {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            cpu_pct: Some(0.0),
+            memory_bytes: Some(0),
+            process_count: Some(0),
+        }
+    }
+}
+
+pub async fn sample_processes(pids: &BTreeSet<u32>) -> SampledProcesses {
+    if pids.is_empty() {
+        return SampledProcesses::empty();
+    }
+    let pid_vec: Vec<u32> = pids.iter().copied().collect();
+    let process_count = u32::try_from(pid_vec.len()).ok();
+    let memory_bytes = group_pss_bytes(&pid_vec);
+    let cpu_pct = if pid_vec.is_empty() {
+        Some(0.0)
+    } else {
+        group_cpu_percent(&pid_vec).await
+    };
+    SampledProcesses {
+        cpu_pct,
+        memory_bytes,
+        process_count,
+    }
+}
+
+pub fn process_pss_bytes(pid: u32) -> Option<u64> {
+    process_pss_bytes_impl(pid)
+}
 
 /// Sample the resource trio over the process group identified by `pgid`.
 ///
@@ -147,7 +189,7 @@ fn group_pss_bytes(pids: &[u32]) -> Option<u64> {
     let mut total: u64 = 0;
     let mut any = false;
     for &pid in pids {
-        if let Some(pss) = proc_pss_bytes(pid) {
+        if let Some(pss) = process_pss_bytes_impl(pid) {
             total = total.saturating_add(pss);
             any = true;
         }
@@ -165,7 +207,7 @@ fn group_pss_bytes(pids: &[u32]) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn proc_pss_bytes(pid: u32) -> Option<u64> {
+fn process_pss_bytes_impl(pid: u32) -> Option<u64> {
     let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
     for line in rollup.lines() {
         if let Some(rest) = line.strip_prefix("Pss:") {
@@ -290,6 +332,11 @@ fn proc_phys_footprint(pid: u32) -> Option<u64> {
     Some(info.ri_phys_footprint)
 }
 
+#[cfg(target_os = "macos")]
+fn process_pss_bytes_impl(pid: u32) -> Option<u64> {
+    proc_phys_footprint(pid)
+}
+
 // ===========================================================================
 // Fallback: any other target. Every metric is a capability gap.
 // ===========================================================================
@@ -311,6 +358,14 @@ fn group_pss_bytes(_pids: &[u32]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn sample_processes_empty_set_reports_zeroes() {
+        let pids = BTreeSet::new();
+        let sample = sample_processes(&pids).await;
+        assert_eq!(sample, SampledProcesses::empty());
+    }
 
     /// On the host platform (macOS in CI here, Linux on the cross-compiled
     /// target), sampling this test process's own process group must yield a
@@ -352,4 +407,11 @@ mod tests {
         // none) on both platforms; memory is null (no members to sum).
         assert!(sample.memory_bytes.is_none() || sample.memory_bytes == Some(0));
     }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_pss_bytes_impl(pid: u32) -> Option<u64> {
+    let _ = pid;
+    tracing::debug!("process-inspector: per-process memory_bytes unsupported on this host");
+    None
 }
