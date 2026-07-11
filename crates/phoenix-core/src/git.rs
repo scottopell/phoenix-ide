@@ -313,7 +313,7 @@ mod tests {
             .current_dir(path)
             .status()
             .expect("git runs");
-        assert!(status.success(), "git {:?} failed", args);
+        assert!(status.success(), "git {args:?} failed");
     }
 
     fn git_out(path: &std::path::Path, args: &[&str]) -> String {
@@ -322,7 +322,7 @@ mod tests {
             .current_dir(path)
             .output()
             .expect("git runs");
-        assert!(output.status.success(), "git {:?} failed", args);
+        assert!(output.status.success(), "git {args:?} failed");
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
