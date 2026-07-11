@@ -612,6 +612,55 @@ async fn provision_conversation(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(generate_slug);
 
+    checkpoint_creation_stage(
+        manager,
+        job,
+        &claim,
+        phoenix_core::domain::creation_protocol::CreationStage::FinalizeAttachments,
+    )
+    .await?;
+    let seeded_empty = (intent.seed_parent_id.is_some() || intent.seed_label.is_some())
+        && intent.text.trim().is_empty()
+        && images.is_empty()
+        && files.is_empty();
+    let expanded_initial_message = if seeded_empty {
+        None
+    } else {
+        let expanded = if intent.expansion_preflighted {
+            (
+                intent.text.clone(),
+                intent.llm_text.clone(),
+                intent.skill_invocation.clone(),
+            )
+        } else {
+            let resolution_root =
+                crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
+            let expanded = crate::message_expander::expand(&intent.text, &resolution_root)
+                .map_err(|e| {
+                    (
+                        format!("{} ({})", e, e.error_type()),
+                        ErrorKind::InvalidRequest,
+                    )
+                })?;
+            let llm_text =
+                (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+            (expanded.display_text, llm_text, expanded.skill_invocation)
+        };
+        checkpoint_creation_stage(
+            manager,
+            job,
+            &claim,
+            phoenix_core::domain::creation_protocol::CreationStage::ExpandInitialMessage,
+        )
+        .await?;
+        Some(expanded)
+    };
+    let metadata_expected_stage = if seeded_empty {
+        phoenix_core::domain::creation_protocol::CreationStage::FinalizeAttachments
+    } else {
+        phoenix_core::domain::creation_protocol::CreationStage::ExpandInitialMessage
+    };
+
     let metadata_outcome = manager
         .db()
         .update_conversation_creation_metadata_and_mode(
@@ -627,7 +676,7 @@ async fn provision_conversation(
             },
             &conv_mode,
             &resolved_model,
-            phoenix_core::domain::creation_protocol::CreationStage::ExpandInitialMessage,
+            metadata_expected_stage,
             phoenix_core::domain::creation_protocol::CreationStage::CommitMetadata,
         )
         .await
@@ -686,11 +735,6 @@ async fn provision_conversation(
         });
     }
 
-    let seeded_empty = (intent.seed_parent_id.is_some() || intent.seed_label.is_some())
-        && intent.text.trim().is_empty()
-        && images.is_empty()
-        && files.is_empty();
-
     if seeded_empty {
         let outcome = manager
             .db()
@@ -728,24 +772,12 @@ async fn provision_conversation(
         return Ok(ProvisionOutcome::SeededEmpty);
     }
 
-    let (display_text, llm_text, skill_invocation) = if intent.expansion_preflighted {
+    let (display_text, llm_text, skill_invocation) = expanded_initial_message.ok_or_else(|| {
         (
-            intent.text.clone(),
-            intent.llm_text.clone(),
-            intent.skill_invocation.clone(),
+            "initial message expansion was missing".to_string(),
+            ErrorKind::ServerError,
         )
-    } else {
-        let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
-        let expanded =
-            crate::message_expander::expand(&intent.text, &resolution_root).map_err(|e| {
-                (
-                    format!("{} ({})", e, e.error_type()),
-                    ErrorKind::InvalidRequest,
-                )
-            })?;
-        let llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
-        (expanded.display_text, llm_text, expanded.skill_invocation)
-    };
+    })?;
     let message_id = job.message_id.clone().ok_or_else(|| {
         (
             "creation job missing initial message_id".to_string(),

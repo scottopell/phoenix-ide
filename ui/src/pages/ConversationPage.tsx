@@ -1320,7 +1320,7 @@ function ConversationPageContent() {
     ? (convStateForChildren.prompt ?? conversation?.creation_prompt ?? localCreateIntent?.prompt ?? null)
     : null;
   const creationFailedDraft = convStateForChildren.type === 'creation_failed' || convStateForChildren.type === 'creation_cancelled'
-    ? (localCreateIntent?.prompt ?? conversation?.creation_prompt ?? null)
+    ? (localCreateIntent?.prompt ?? convStateForChildren.prompt ?? conversation?.creation_prompt ?? null)
     : null;
   const handleStartOverFromFailedCreation = useCallback(() => {
     const prompt = creationFailedDraft;

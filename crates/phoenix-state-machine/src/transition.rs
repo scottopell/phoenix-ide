@@ -489,7 +489,7 @@ pub fn transition(
                 event: "CreationProvisioned",
             });
         }
-        return transition(
+        let mut result = transition(
             &ConvState::Idle,
             context,
             Event::UserMessage {
@@ -501,7 +501,13 @@ pub fn transition(
                 user_agent: initial_message.user_agent,
                 skill_invocation: initial_message.skill_invocation,
             },
-        );
+        )?;
+        for effect in &mut result.effects {
+            if let Effect::PersistMessage { idempotent, .. } = effect {
+                *idempotent = true;
+            }
+        }
+        return Ok(result);
     }
     if context.is_sub_agent {
         let sub_state = SubAgentState::try_from(state.clone()).map_err(|e| {
@@ -4181,17 +4187,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(from_provisioning.new_state, from_idle.new_state);
-        let provisioning_effects: Vec<String> = from_provisioning
-            .effects
-            .iter()
-            .map(|effect| format!("{effect:?}"))
-            .collect();
-        let idle_effects: Vec<String> = from_idle
-            .effects
-            .iter()
-            .map(|effect| format!("{effect:?}"))
-            .collect();
-        assert_eq!(provisioning_effects, idle_effects);
+        assert_eq!(from_provisioning.effects.len(), from_idle.effects.len());
+        for (provisioning, idle) in from_provisioning.effects.iter().zip(&from_idle.effects) {
+            match (provisioning, idle) {
+                (
+                    Effect::PersistMessage {
+                        idempotent: true, ..
+                    },
+                    Effect::PersistMessage {
+                        idempotent: false, ..
+                    },
+                ) => {}
+                _ => assert_eq!(format!("{provisioning:?}"), format!("{idle:?}")),
+            }
+        }
+        assert!(from_provisioning.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PersistMessage {
+                idempotent: true,
+                ..
+            }
+        )));
     }
 
     #[test]
