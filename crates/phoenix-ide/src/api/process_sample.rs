@@ -30,7 +30,7 @@
 //! meaningful rather than `0`.
 
 use phoenix_core::domain::process_inspection::ResourceSample;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessObservation {
@@ -82,6 +82,7 @@ pub async fn sample_processes(pids: &BTreeSet<u32>) -> SampledProcesses {
     }
 }
 
+#[allow(dead_code)]
 pub fn process_pss_bytes(pid: u32) -> Option<u64> {
     process_pss_bytes_impl(pid)
 }
@@ -98,20 +99,33 @@ pub async fn sample_process_observations(pids: &BTreeSet<u32>) -> Vec<ProcessObs
         RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
     );
     sys.refresh_processes(ProcessesToUpdate::Some(&sys_pids), true);
+    let first_identities = observed_process_identities(&sys, pids);
     tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
     sys.refresh_processes(ProcessesToUpdate::Some(&sys_pids), true);
 
+    let stable_identities = retain_matching_process_identities(
+        &first_identities,
+        &observed_process_identities(&sys, pids),
+    );
+    if stable_identities.is_empty() {
+        return Vec::new();
+    }
+
     let mut rows = Vec::new();
     for pid in pids {
+        let Some(expected_identity) = stable_identities.get(pid).copied() else {
+            continue;
+        };
         let sys_pid = Pid::from_u32(*pid);
         let Some(process) = sys.process(sys_pid) else {
             continue;
         };
+        let memory_bytes = stable_process_memory_bytes(*pid, expected_identity);
         rows.push(ProcessObservation {
             pid: *pid,
             name: process.name().to_string_lossy().into_owned(),
             cpu_percent: Some(process.cpu_usage()),
-            memory_bytes: process_pss_bytes(*pid),
+            memory_bytes,
             thread_count: process
                 .tasks()
                 .map(|tasks| u32::try_from(tasks.len()).unwrap_or(u32::MAX)),
@@ -123,6 +137,74 @@ pub async fn sample_process_observations(pids: &BTreeSet<u32>) -> Vec<ProcessObs
 
 pub fn group_member_pids_for_sampling(pgid: i32) -> Option<Vec<u32>> {
     group_member_pids(pgid)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: u32,
+    start_time: u64,
+}
+
+fn observed_process_identities(
+    sys: &sysinfo::System,
+    pids: &BTreeSet<u32>,
+) -> BTreeMap<u32, ProcessIdentity> {
+    pids.iter()
+        .filter_map(|pid| {
+            let process = sys.process(sysinfo::Pid::from_u32(*pid))?;
+            Some((
+                *pid,
+                ProcessIdentity {
+                    pid: *pid,
+                    start_time: process.start_time(),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn retain_matching_process_identities(
+    first: &BTreeMap<u32, ProcessIdentity>,
+    second: &BTreeMap<u32, ProcessIdentity>,
+) -> BTreeMap<u32, ProcessIdentity> {
+    first
+        .iter()
+        .filter_map(|(pid, identity)| match second.get(pid) {
+            Some(second_identity) if second_identity == identity => Some((*pid, *identity)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn stable_process_memory_bytes(pid: u32, expected_identity: ProcessIdentity) -> Option<u64> {
+    let before = current_process_identity(pid)?;
+    if before != expected_identity {
+        return None;
+    }
+    let memory_bytes = process_pss_bytes_impl(pid)?;
+    let after = current_process_identity(pid)?;
+    (after == expected_identity).then_some(memory_bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn current_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    Some(ProcessIdentity {
+        pid,
+        start_time: proc_start_time(pid)?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn current_process_identity(pid: u32) -> Option<ProcessIdentity> {
+    Some(ProcessIdentity {
+        pid,
+        start_time: proc_start_time(pid)?,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn current_process_identity(_pid: u32) -> Option<ProcessIdentity> {
+    None
 }
 
 /// Sample the resource trio over the process group identified by `pgid`.
@@ -233,6 +315,14 @@ fn proc_pgrp(pid: u32) -> Option<i32> {
     pgrp.parse::<i32>().ok()
 }
 
+#[cfg(target_os = "linux")]
+fn proc_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let tail = stat.get(close + 1..)?;
+    tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
 /// Sum `/proc/<pid>/smaps_rollup` `Pss:` (in kB, converted to bytes) over the
 /// group. `None` when no member exposed a `Pss` line (e.g. an old kernel
 /// without `smaps_rollup`, or every member exited mid-read).
@@ -338,6 +428,30 @@ fn proc_pgid(pid: i32) -> Option<i32> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn proc_start_time(pid: u32) -> Option<u64> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: proc_pidinfo writes a `proc_bsdinfo` for the PROC_PIDTBSDINFO
+    // flavor into the provided, correctly-sized buffer. A full write returns
+    // exactly `size`.
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if rc == size {
+        Some(info.pbi_start_tvsec as u64)
+    } else {
+        None
+    }
+}
+
 /// Sum `proc_pid_rusage(pid, RUSAGE_INFO_V2)`'s `ri_phys_footprint` over the
 /// group — the proportional, shared-aware footprint macOS attributes to each
 /// process. `None` when no member's rusage could be read.
@@ -418,6 +532,60 @@ mod tests {
         let pids = BTreeSet::new();
         let sample = sample_processes(&pids).await;
         assert_eq!(sample, SampledProcesses::empty());
+    }
+
+    #[test]
+    fn retain_matching_process_identities_drops_pid_reuse_and_missing_refreshes() {
+        let first = BTreeMap::from([
+            (
+                10,
+                ProcessIdentity {
+                    pid: 10,
+                    start_time: 100,
+                },
+            ),
+            (
+                20,
+                ProcessIdentity {
+                    pid: 20,
+                    start_time: 200,
+                },
+            ),
+            (
+                30,
+                ProcessIdentity {
+                    pid: 30,
+                    start_time: 300,
+                },
+            ),
+        ]);
+        let second = BTreeMap::from([
+            (
+                10,
+                ProcessIdentity {
+                    pid: 10,
+                    start_time: 100,
+                },
+            ),
+            (
+                20,
+                ProcessIdentity {
+                    pid: 20,
+                    start_time: 999,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            retain_matching_process_identities(&first, &second),
+            BTreeMap::from([(
+                10,
+                ProcessIdentity {
+                    pid: 10,
+                    start_time: 100,
+                },
+            )])
+        );
     }
 
     /// On the host platform (macOS in CI here, Linux on the cross-compiled
