@@ -151,14 +151,9 @@ fn observed_process_identities(
 ) -> BTreeMap<u32, ProcessIdentity> {
     pids.iter()
         .filter_map(|pid| {
-            let process = sys.process(sysinfo::Pid::from_u32(*pid))?;
-            Some((
-                *pid,
-                ProcessIdentity {
-                    pid: *pid,
-                    start_time: process.start_time(),
-                },
-            ))
+            sys.process(sysinfo::Pid::from_u32(*pid))?;
+            let identity = current_process_identity(*pid)?;
+            Some((*pid, identity))
         })
         .collect()
 }
@@ -521,8 +516,8 @@ fn group_pss_bytes(_pids: &[u32]) -> Option<u64> {
     None
 }
 
-#[allow(dead_code)]
 #[cfg(test)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
@@ -613,6 +608,27 @@ mod tests {
         assert!(
             sample.cpu_pct.is_some(),
             "cpu_pct must be a real (possibly 0.0) sample, not null, for a live group"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn current_process_observation_reports_memory_when_smaps_rollup_is_readable() {
+        let pid = std::process::id();
+        if process_pss_bytes_impl(pid).is_none() {
+            return;
+        }
+
+        let observations = sample_process_observations(&BTreeSet::from([pid])).await;
+        let observation = observations
+            .iter()
+            .find(|observation| observation.pid == pid)
+            .expect("current process should be observed when sysinfo sees it");
+
+        assert!(
+            observation.memory_bytes.is_some_and(|m| m > 0),
+            "current process must report proportional memory when smaps_rollup is readable: {:?}",
+            observation.memory_bytes
         );
     }
 
