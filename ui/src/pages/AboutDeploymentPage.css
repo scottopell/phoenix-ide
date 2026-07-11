@@ -14,7 +14,7 @@
 .about-resources-chart-card {
   border: 1px solid var(--border-color);
   border-radius: 10px;
-  background: var(--panel-bg, rgba(255, 255, 255, 0.03));
+  background: var(--panel-bg, rgb(255 255 255 / 3%));
   padding: 14px;
 }
 

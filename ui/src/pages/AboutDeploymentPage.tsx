@@ -147,6 +147,8 @@ function maxOf(values: Array<number | null>): number | null {
   return Math.max(...present);
 }
 
+// Exported for deterministic history-window tests.
+// eslint-disable-next-line react-refresh/only-export-components
 export function appendResourceHistory(
   history: ResourceHistoryPoint[],
   snapshot: AboutResourcesSnapshot,
@@ -168,6 +170,8 @@ export function appendResourceHistory(
   return next;
 }
 
+// Exported for deterministic rollup tests.
+// eslint-disable-next-line react-refresh/only-export-components
 export function computeResourceRollups(history: ResourceHistoryPoint[]): ResourceRollups {
   const current = history.at(-1) ?? null;
   return {
