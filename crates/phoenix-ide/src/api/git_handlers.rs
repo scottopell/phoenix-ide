@@ -657,13 +657,12 @@ async fn attach_pr_feedback_freshness(
         match feedback {
             Ok(feedback) => {
                 let coverage_health = crate::api::pr_monitoring::coverage_health(&feedback);
+                response.feedback_status = feedback.feedback_status.or(previous_feedback_status);
                 if let Some(fetched_status) = feedback.feedback_status {
-                    let (effective_feedback_status, should_update_cache) =
-                        effective_feedback_status_for_cache(
-                            previous_feedback_status,
-                            fetched_status,
-                        );
-                    response.feedback_status = effective_feedback_status;
+                    let (_, should_update_cache) = effective_feedback_status_for_cache(
+                        previous_feedback_status,
+                        fetched_status,
+                    );
                     if should_update_cache {
                         db.update_work_scope_pr_feedback_status(
                             work_scope,
@@ -1003,6 +1002,22 @@ mod tests {
             ),
             (Some(PrFeedbackStatus::Approved), false)
         );
+    }
+
+    #[test]
+    fn unavailable_root_status_falls_back_to_cached_response_status() {
+        let previous = Some(PrFeedbackStatus::InProgress);
+        let fetched = None;
+
+        assert_eq!(fetched.or(previous), Some(PrFeedbackStatus::InProgress));
+    }
+
+    #[test]
+    fn successful_open_root_status_overrides_cached_response_status() {
+        let previous = Some(PrFeedbackStatus::InProgress);
+        let fetched = Some(PrFeedbackStatus::Open);
+
+        assert_eq!(fetched.or(previous), Some(PrFeedbackStatus::Open));
     }
 
     fn conversation_with_mode(
