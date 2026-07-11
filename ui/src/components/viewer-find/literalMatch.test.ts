@@ -16,8 +16,29 @@ describe('findLiteralMatches', () => {
     ]);
   });
 
-  it('stays case-sensitive and returns no matches for an empty query', () => {
-    expect(findLiteralMatches('Alpha alpha', 'alpha').matches).toEqual([{ start: 6, end: 11 }]);
+  it('is case-insensitive by default', () => {
+    expect(findLiteralMatches('Alpha alpha ALPHA', 'alpha').matches).toEqual([
+      { start: 0, end: 5 },
+      { start: 6, end: 11 },
+      { start: 12, end: 17 },
+    ]);
+  });
+
+  it('uses unicode-friendly locale folding', () => {
+    expect(findLiteralMatches('CAFÉ café CaFé', 'café').matches).toEqual([
+      { start: 0, end: 4 },
+      { start: 5, end: 9 },
+      { start: 10, end: 14 },
+    ]);
+  });
+
+  it('returns source offsets even when folding changes query width', () => {
+    expect(findLiteralMatches('Straße STRASSE', 'strasse').matches).toEqual([
+      { start: 7, end: 14 },
+    ]);
+  });
+
+  it('returns no matches for an empty query', () => {
     expect(findLiteralMatches('Alpha alpha', '').matches).toEqual([]);
   });
 });

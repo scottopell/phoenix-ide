@@ -1,6 +1,23 @@
 export { FindBar, type FindBarProps } from './FindBar';
 export { findLiteralMatches, type ViewerFindMatch, type ViewerFindResult } from './literalMatch';
 export {
+  buildConversationSearchProjection,
+  buildDiffSearchProjection,
+  buildFileSearchProjection,
+  type ConversationSearchMatchTarget,
+  type ConversationSearchProjection,
+  type ConversationSearchSource,
+  type DiffSearchMatchTarget,
+  type DiffSearchProjection,
+  type DiffSearchSource,
+  type FileSearchMatchTarget,
+  type FileSearchProjection,
+  type FileSearchSource,
+  type SearchableSource,
+  type SearchableSourceMatch,
+  type SearchableSourceProjection,
+} from './searchProjections';
+export {
   useViewerFind,
   type UseViewerFindOptions,
   type UseViewerFindReturn,
