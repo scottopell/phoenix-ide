@@ -50,6 +50,11 @@ type ResourceState = {
   error: string | null;
 };
 
+type ActiveResourceRequest = {
+  controller: AbortController;
+  abort: () => void;
+};
+
 const EMPTY_RESOURCES: ResourceState = {
   sample: null,
   history: [],
@@ -564,6 +569,7 @@ export function AboutDeploymentPage() {
   const resourcesTimerRef = useRef<number | null>(null);
   const resourcesMountedRef = useRef(false);
   const resourcesGenerationRef = useRef(0);
+  const activeResourceRequestRef = useRef<ActiveResourceRequest | null>(null);
 
   const handleReveal = useCallback((path: string) => {
     setRevealError(null);
@@ -583,10 +589,17 @@ export function AboutDeploymentPage() {
   }, []);
 
   const fetchResources = useCallback(() => {
-    if (resourcesInFlightRef.current) return undefined;
+    if (resourcesInFlightRef.current) return;
     resourcesInFlightRef.current = true;
     const generation = resourcesGenerationRef.current;
     const controller = new AbortController();
+    const activeRequest: ActiveResourceRequest = {
+      controller,
+      abort: () => {
+        controller.abort();
+      },
+    };
+    activeResourceRequestRef.current = activeRequest;
     if (resourcesMountedRef.current) {
       setResources((current) => ({ ...current, loading: true, error: current.sample ? current.error : null }));
     }
@@ -616,29 +629,27 @@ export function AboutDeploymentPage() {
         if (generation === resourcesGenerationRef.current) {
           resourcesInFlightRef.current = false;
         }
+        if (activeResourceRequestRef.current === activeRequest) {
+          activeResourceRequestRef.current = null;
+        }
       });
-
-    return () => {
-      controller.abort();
-    };
   }, []);
 
   useEffect(() => {
     resourcesMountedRef.current = true;
-    let abortCurrentFetch: (() => void) | undefined;
 
     const schedule = () => {
       if (resourcesTimerRef.current !== null) window.clearTimeout(resourcesTimerRef.current);
       resourcesTimerRef.current = window.setTimeout(() => {
         if (document.visibilityState === 'visible') {
-          abortCurrentFetch = fetchResources();
+          fetchResources();
         }
         if (resourcesMountedRef.current) schedule();
       }, RESOURCE_POLL_MS);
     };
 
     if (document.visibilityState === 'visible') {
-      abortCurrentFetch = fetchResources();
+      fetchResources();
     } else {
       setResources((current) => ({ ...current, loading: false }));
     }
@@ -646,16 +657,19 @@ export function AboutDeploymentPage() {
 
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        abortCurrentFetch = fetchResources();
+        fetchResources();
+        return;
       }
+      activeResourceRequestRef.current?.abort();
     };
 
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       resourcesMountedRef.current = false;
       resourcesGenerationRef.current += 1;
-      abortCurrentFetch?.();
+      activeResourceRequestRef.current?.abort();
       resourcesInFlightRef.current = false;
+      activeResourceRequestRef.current = null;
       if (resourcesTimerRef.current !== null) window.clearTimeout(resourcesTimerRef.current);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };

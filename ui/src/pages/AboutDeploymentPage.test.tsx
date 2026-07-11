@@ -350,6 +350,60 @@ describe('AboutDeploymentPage disk usage health', () => {
     consoleError.mockRestore();
   });
 
+  it('keeps the first pending request across a skipped poll, then aborts it on hidden and unmount without state updates', async () => {
+    vi.useFakeTimers();
+    const abortedSignals: AbortSignal[] = [];
+    let resolveFirst: ((value: AboutResourcesSnapshot) => void) | undefined;
+    apiMock.deploymentInfo.mockResolvedValue(deployment());
+    apiMock.deploymentDiskInfo.mockResolvedValue(deploymentDisk());
+    apiMock.deploymentResources.mockImplementationOnce(({ signal }: { signal: AbortSignal }) => {
+      abortedSignals.push(signal);
+      return new Promise<AboutResourcesSnapshot>((resolve, reject) => {
+        resolveFirst = resolve;
+        signal.addEventListener('abort', () => {
+          reject(new DOMException('Aborted', 'AbortError'));
+        }, { once: true });
+      });
+    });
+
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const view = render(
+      <MemoryRouter>
+        <AboutDeploymentPage />
+      </MemoryRouter>,
+    );
+
+    expect(apiMock.deploymentResources).toHaveBeenCalledTimes(1);
+    expect(abortedSignals).toHaveLength(1);
+    expect(abortedSignals[0]?.aborted).toBe(false);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(apiMock.deploymentResources).toHaveBeenCalledTimes(1);
+    expect(abortedSignals[0]?.aborted).toBe(false);
+
+    Object.defineProperty(document, 'visibilityState', { configurable: true, writable: true, value: 'hidden' });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+    });
+    expect(abortedSignals[0]?.aborted).toBe(true);
+
+    const firstResolve = resolveFirst;
+    if (!firstResolve) throw new Error('expected first resource request to be pending');
+    await act(async () => {
+      firstResolve(resourcesSnapshot());
+      await Promise.resolve();
+    });
+    expect(consoleError).not.toHaveBeenCalled();
+    expect(screen.queryByText('Host mostly idle')).not.toBeInTheDocument();
+
+    view.unmount();
+    expect(abortedSignals[0]?.aborted).toBe(true);
+    consoleError.mockRestore();
+  });
+
   it('highlights managed worktrees when they are the largest measured category', async () => {
     renderPage(deployment(), deploymentDisk({
       disk: [
