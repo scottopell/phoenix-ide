@@ -78,21 +78,23 @@ export function DiffView({
   const codeViewRef = useRef<PhoenixDiffCodeViewHandle>(null);
 
   const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
+  const find = useViewerFind({ text: '' });
+  const findSearchActive = find.isOpen || find.query.length > 0;
   const findSourcesProjection = useMemo(
-    () => buildDiffSearchProjection(committedDiff, uncommittedDiff, ''),
-    [committedDiff, uncommittedDiff],
+    () => (findSearchActive ? buildDiffSearchProjection(committedDiff, uncommittedDiff, '') : { sources: [], matches: [] }),
+    [committedDiff, uncommittedDiff, findSearchActive],
   );
-  const find = useViewerFind({
-    text: findSourcesProjection.sources.map((source) => source.text).join('\n'),
-  });
   const findProjection = useMemo(
-    () => buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query),
-    [committedDiff, uncommittedDiff, find.query],
+    () => (findSearchActive ? buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query) : { sources: [], matches: [] }),
+    [committedDiff, uncommittedDiff, find.query, findSearchActive],
   );
   useViewerFindKeyboardShortcut({ scopeId: 'diff-viewer', onOpen: find.open });
 
-  const activeFindMatchTarget = find.activeIndex >= 0 ? findProjection.matches[find.activeIndex]?.target ?? null : null;
-  const findMatchTargets = useMemo(() => findProjection.matches.map((match) => match.target), [findProjection.matches]);
+  const activeFindMatchTarget = find.isOpen && find.activeIndex >= 0 ? findProjection.matches[find.activeIndex]?.target ?? null : null;
+  const findMatchTargets = useMemo(
+    () => (find.isOpen ? findProjection.matches.map((match) => match.target) : []),
+    [find.isOpen, findProjection.matches],
+  );
 
   const toggleDiffStyle = useCallback(() => {
     setDiffStyle((prev) => {
@@ -189,7 +191,7 @@ export function DiffView({
           onNext={handleFindNext}
           onPrevious={handleFindPrevious}
           onClose={find.close}
-          autoFocus={false}
+          autoFocus
         />
       ) : undefined}
       noteCount={diffNotes.length}

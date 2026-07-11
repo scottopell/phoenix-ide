@@ -1,4 +1,5 @@
 import type { ContentBlock, Message, ToolResultContent } from '../../api';
+import type { StreamingBuffer } from '../../conversation/atom';
 import type { DiffSection } from '../../contexts/ReviewNotesContext';
 import type { QueuedMessage } from '../../hooks/useMessageQueue';
 import type { RenderUnit } from '../../conversation/renderUnits';
@@ -159,46 +160,53 @@ export function buildDiffSearchProjection(
         },
       });
 
-      const seenContext = new Set<string>();
       for (const hunk of item.fileDiff.hunks) {
+        const seenAdditionLines = new Set<number>();
+        const seenDeletionLines = new Set<number>();
         const maxRows = Math.max(hunk.additionCount, hunk.deletionCount);
         for (let offset = 0; offset < maxRows; offset++) {
           const additionLine = hunk.additionStart + offset;
           const deletionLine = hunk.deletionStart + offset;
           const additionText = diffLineTextAt(item.fileDiff, 'additions', additionLine);
           const deletionText = diffLineTextAt(item.fileDiff, 'deletions', deletionLine);
-          if (additionText !== undefined && deletionText !== undefined && additionText === deletionText) {
-            const contextId = `${item.id}:context:${hunk.additionStart}:${hunk.deletionStart}:${offset}`;
-            if (!seenContext.has(contextId)) {
-              seenContext.add(contextId);
-              sources.push({
-                id: contextId,
-                kind: 'line',
+          if (
+            additionText !== undefined
+            && deletionText !== undefined
+            && additionText === deletionText
+            && !seenAdditionLines.has(additionLine)
+            && !seenDeletionLines.has(deletionLine)
+          ) {
+            seenAdditionLines.add(additionLine);
+            seenDeletionLines.add(deletionLine);
+            sources.push({
+              id: `${item.id}:context:${additionLine}:${deletionLine}`,
+              kind: 'line',
+              section,
+              filePath,
+              itemId: item.id,
+              order: order++,
+              side: 'additions',
+              lineNumber: additionLine,
+              text: additionText,
+              target: {
+                kind: 'diff-line',
                 section,
                 filePath,
                 itemId: item.id,
-                order: order++,
                 side: 'additions',
                 lineNumber: additionLine,
-                text: additionText,
-                target: {
-                  kind: 'diff-line',
-                  section,
-                  filePath,
-                  itemId: item.id,
-                  side: 'additions',
-                  lineNumber: additionLine,
-                  startColumn: 0,
-                  endColumn: 0,
-                },
-              });
-            }
+                startColumn: 0,
+                endColumn: 0,
+              },
+            });
             continue;
           }
-          if (deletionText !== undefined) {
+          if (deletionText !== undefined && !seenDeletionLines.has(deletionLine)) {
+            seenDeletionLines.add(deletionLine);
             sources.push(makeDiffLineSource(item.id, section, filePath, order++, 'deletions', deletionLine, deletionText));
           }
-          if (additionText !== undefined) {
+          if (additionText !== undefined && !seenAdditionLines.has(additionLine)) {
+            seenAdditionLines.add(additionLine);
             sources.push(makeDiffLineSource(item.id, section, filePath, order++, 'additions', additionLine, additionText));
           }
         }
@@ -285,7 +293,17 @@ export function buildBlockSearchProjection(
   };
 }
 
-export function buildConversationSearchProjection(units: readonly RenderUnit[], query: string): ConversationSearchProjection {
+export interface ConversationProjectionOptions {
+  density?: 'full' | 'compact';
+  streamingBuffer?: StreamingBuffer | null;
+}
+
+export function buildConversationSearchProjection(
+  units: readonly RenderUnit[],
+  query: string,
+  options: ConversationProjectionOptions = {},
+): ConversationSearchProjection {
+  const density = options.density ?? 'full';
   const sources: ConversationSearchSource[] = [];
   units.forEach((unit, unitIndex) => {
     switch (unit.kind) {
@@ -299,14 +317,17 @@ export function buildConversationSearchProjection(units: readonly RenderUnit[], 
         addConversationSource(sources, unitIndex, unit.kind, unit.key, 'skill-message', userMessageText(unit.message));
         break;
       case 'system':
-        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'system-message', userMessageText(unit.message));
+        if (!isHiddenSystemMessage(unit.message)) {
+          addConversationSource(sources, unitIndex, unit.kind, unit.key, 'system-message', userMessageText(unit.message));
+        }
         break;
       case 'agent_turn':
         for (const source of agentTurnSources(unit.agent, unit.toolResultsByUseId)) {
-          addConversationSource(sources, unitIndex, unit.kind, unit.key, source.role, source.text);
+          addConversationSource(sources, unitIndex, unit.kind, unit.key, source.role, visibleConversationText(source.text, density));
         }
         break;
       case 'streaming_agent':
+        addConversationSource(sources, unitIndex, unit.kind, unit.key, 'streaming-agent', visibleStreamingText(options.streamingBuffer));
         break;
       case 'sub_agent_status':
         addConversationSource(
@@ -390,6 +411,37 @@ function userMessageText(message: Message): string {
 function queuedMessageText(message: QueuedMessage): string {
   const parts = [message.text, ...(message.files ?? []).map((file) => file.original_name)];
   return parts.filter((part) => part.length > 0).join('\n');
+}
+
+function isHiddenSystemMessage(message: Message): boolean {
+  const displayData = message.display_data as { hidden?: boolean } | null | undefined;
+  return displayData?.hidden === true;
+}
+
+function visibleConversationText(text: string, density: 'full' | 'compact'): string {
+  if (density !== 'compact' || !shouldCollapseCompactText(text)) return text;
+  return firstLineSummary(text);
+}
+
+function visibleStreamingText(buffer: StreamingBuffer | null | undefined): string {
+  return buffer?.text ?? '';
+}
+
+function firstLineSummary(text: string, maxLen = 140): string {
+  const firstLine = text.split('\n').find((l) => l.trim()) ?? text;
+  const flat = firstLine.replace(/\s+/g, ' ').trim();
+  return flat.length > maxLen ? `${flat.slice(0, maxLen - 1)}…` : flat;
+}
+
+function shouldCollapseCompactText(text: string): boolean {
+  const nonEmptyLines = text.split('\n').filter((line) => line.trim());
+  const firstLineFlat = (nonEmptyLines[0] ?? '').replace(/\s+/g, ' ').trim();
+  const fullFlat = text.replace(/\s+/g, ' ').trim();
+  const significantThreshold = 280;
+  if (text.length >= significantThreshold) return false;
+  const hidesAdditionalLines = nonEmptyLines.length > 1 && firstLineFlat !== fullFlat;
+  const truncatesFirstLine = firstLineFlat.length > 140;
+  return hidesAdditionalLines || truncatesFirstLine;
 }
 
 function toolResultText(result: Message | undefined): string {

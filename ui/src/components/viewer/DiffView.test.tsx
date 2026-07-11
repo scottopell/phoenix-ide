@@ -84,7 +84,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     });
   });
 
-  it('decorates matched diff lines with unsafeCSS and highlights the active header match through Phoenix header slots', () => {
+  it('decorates matched diff lines with unsafeCSS and clears decorations when the find bar closes', () => {
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
     fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
     const input = screen.getByRole('textbox', { name: 'Find in viewer' });
@@ -93,9 +93,8 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(codeViewMockState.lastUnsafeCss).toContain('[data-item-id="committed:foo.txt"] [data-additions=""] [data-line="1"]');
 
     fireEvent.change(input, { target: { value: 'bar' } });
-    expect(within(screen.getByTestId('mock-header-uncommitted:bar.txt')).getByRole('button', { name: 'Add file-level note to bar.txt' })).toHaveClass(
-      'phoenix-diff-file-note-btn--find-active',
-    );
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(codeViewMockState.lastUnsafeCss).toBe('');
   });
 
   it('lets find Escape close the find bar before the shell closes the viewer', () => {

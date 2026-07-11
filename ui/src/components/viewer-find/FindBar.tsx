@@ -42,9 +42,14 @@ export function FindBar({
           ref={inputRef}
           type="text"
           value={query}
+          data-viewer-find-input="true"
           onChange={(event) => onQueryChange(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === 'Enter') {
+            if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
+              event.preventDefault();
+              inputRef.current?.focus();
+              inputRef.current?.select();
+            } else if (event.key === 'Enter') {
               event.preventDefault();
               if (event.shiftKey) onPrevious();
               else onNext();

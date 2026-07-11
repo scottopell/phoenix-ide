@@ -4,11 +4,13 @@ import { buildFileSearchProjection } from '../viewer-find';
 
 /** Plain <pre> body for large source-like payloads that bypass rich rendering. */
 export function TextViewerBody({ content, findQuery, activeFindOccurrence }: ViewerBodyProps) {
+  const hasActiveQuery = (findQuery ?? '').length > 0;
   const findProjection = useMemo(
-    () => buildFileSearchProjection(content, findQuery ?? ''),
-    [content, findQuery],
+    () => (hasActiveQuery ? buildFileSearchProjection(content, findQuery ?? '') : { sources: [], matches: [] }),
+    [content, findQuery, hasActiveQuery],
   );
   const lineFragments = useMemo(() => {
+    if (!hasActiveQuery) return null;
     const matchesByLine = new Map<number, Array<{ start: number; end: number; occurrenceIndex: number }>>();
     findProjection.matches.forEach((match, occurrenceIndex) => {
       const matches = matchesByLine.get(match.target.lineNumber) ?? [];
@@ -20,12 +22,12 @@ export function TextViewerBody({ content, findQuery, activeFindOccurrence }: Vie
       lineNumber: source.lineNumber,
       fragments: renderFragments(source.text, matchesByLine.get(source.lineNumber) ?? [], activeFindOccurrence ?? -1),
     }));
-  }, [activeFindOccurrence, findProjection.matches, findProjection.sources]);
+  }, [activeFindOccurrence, findProjection.matches, findProjection.sources, hasActiveQuery]);
 
   return (
     <div className="viewer-text" data-testid="viewer-large-text-fallback">
       <pre className="viewer-large-text-pre">
-        {lineFragments.map(({ lineNumber, fragments }) => (
+        {!hasActiveQuery || !lineFragments ? content : lineFragments.map(({ lineNumber, fragments }) => (
           <span key={lineNumber} data-find-line={lineNumber}>
             {fragments}
             {lineNumber < lineFragments.length ? '\n' : ''}
@@ -45,17 +47,21 @@ function renderFragments(
   const fragments: React.ReactNode[] = [];
   let cursor = 0;
   matches.forEach((match) => {
-    if (match.start > cursor) fragments.push(text.slice(cursor, match.start));
-    fragments.push(
-      <mark
-        key={`${match.start}-${match.end}-${match.occurrenceIndex}`}
-        className={match.occurrenceIndex === activeOccurrence ? 'viewer-find-match viewer-find-match--active' : 'viewer-find-match'}
-        data-find-occurrence={match.occurrenceIndex}
-      >
-        {text.slice(match.start, match.end)}
-      </mark>,
-    );
-    cursor = match.end;
+    const start = Math.max(match.start, cursor);
+    const end = Math.max(match.end, start);
+    if (start > cursor) fragments.push(text.slice(cursor, start));
+    if (end > start) {
+      fragments.push(
+        <mark
+          key={`${match.start}-${match.end}-${match.occurrenceIndex}`}
+          className={match.occurrenceIndex === activeOccurrence ? 'viewer-find-match viewer-find-match--active' : 'viewer-find-match'}
+          data-find-occurrence={match.occurrenceIndex}
+        >
+          {text.slice(start, end)}
+        </mark>,
+      );
+    }
+    cursor = Math.max(cursor, end);
   });
   if (cursor < text.length) fragments.push(text.slice(cursor));
   return fragments;

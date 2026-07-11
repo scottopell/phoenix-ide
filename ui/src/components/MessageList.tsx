@@ -1,4 +1,5 @@
 import { memo, useState, useRef, useCallback, useMemo, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { useDensity } from '../hooks/useDensity';
 import { FindBar, buildConversationSearchProjection, useViewerFindKeyboardShortcut } from './viewer-find';
 import { useFocusScope, useRegisterFocusScope } from '../hooks/useFocusScope';
 import { Virtuoso, type VirtuosoHandle, type VirtuosoProps, type ListRange } from 'react-virtuoso';
@@ -321,6 +322,7 @@ function MessageListImpl({
   const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
   useRegisterFocusScope(findScopeId);
   const { activeScope } = useFocusScope();
+  const { density } = useDensity();
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
   const [findActiveIndex, setFindActiveIndex] = useState(0);
@@ -365,8 +367,10 @@ function MessageListImpl({
   );
 
   const findProjection = useMemo(
-    () => buildConversationSearchProjection(allUnits, findQuery),
-    [allUnits, findQuery],
+    () => (findOpen || findQuery.length > 0
+      ? buildConversationSearchProjection(allUnits, findQuery, { density, streamingBuffer: null })
+      : { sources: [], matches: [] }),
+    [allUnits, density, findOpen, findQuery],
   );
   const findMatches = findProjection.matches;
   const normalizedFindIndex = findMatches.length === 0 ? -1 : Math.min(findActiveIndex, findMatches.length - 1);
@@ -739,6 +743,8 @@ function MessageListImpl({
   useImperativeHandle(ref, () => ({ scrollToUnitIndex, scrollToMessageId }), [scrollToMessageId, scrollToUnitIndex]);
 
   useEffect(() => {
+    scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+      .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
     if (!findOpen || normalizedFindIndex < 0) return undefined;
     const match = findMatches[normalizedFindIndex];
     if (!match) return undefined;

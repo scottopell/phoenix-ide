@@ -84,6 +84,10 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
     const committed = useMemo(() => buildSectionItems('committed', committedDiff), [committedDiff]);
     const uncommitted = useMemo(() => buildSectionItems('uncommitted', uncommittedDiff), [uncommittedDiff]);
 
+    const activeFindHeaderKey = activeFindMatch?.kind === 'diff-file-header'
+      ? `${activeFindMatch.itemId}:${activeFindMatch.startColumn}:${activeFindMatch.endColumn}`
+      : null;
+
     const items = useMemo<PhoenixDiffItem[]>(() => {
       const vmap = itemVersions.current;
       const attach = (built: PhoenixDiffItem[]): PhoenixDiffItem[] =>
@@ -94,19 +98,16 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           // Bump the controlled-item version whenever this item's rendered
           // content changes, so Pierre reconciles instead of keeping a stale
           // annotation/flash/header-count record.
-          const sig = itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId);
+          const sig = `${itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId)}|find:${activeFindHeaderKey?.startsWith(`${it.id}:`) ? activeFindHeaderKey : ''}`;
           const prev = vmap.get(it.id);
           const version = prev && prev.sig === sig ? prev.version : (prev?.version ?? 0) + 1;
           if (!prev || prev.sig !== sig) vmap.set(it.id, { sig, version });
           return anns.length > 0 ? { ...it, annotations: anns, version } : { ...it, version };
         });
       return [...attach(committed.items), ...attach(uncommitted.items)];
-    }, [committed.items, uncommitted.items, notes, highlightedNoteId]);
+    }, [committed.items, uncommitted.items, notes, highlightedNoteId, activeFindHeaderKey]);
 
     const findLineDecorationCss = useMemo(() => diffFindDecorationCSS(findMatches, activeFindMatch), [findMatches, activeFindMatch]);
-    const activeFindHeaderKey = activeFindMatch?.kind === 'diff-file-header'
-      ? `${activeFindMatch.itemId}:${activeFindMatch.startColumn}:${activeFindMatch.endColumn}`
-      : null;
 
     const annotateLine = useCallback(
       (section: DiffSection, fileDiff: FileDiffMetadata, side: AnnotationSide, lineNumber: number) => {

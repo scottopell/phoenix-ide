@@ -231,12 +231,10 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
 
   const findEligible = payload.kind === 'code'
     || payload.kind === 'text'
-    || payload.kind === 'markdown'
-    || (payload.kind === 'html' && htmlViewMode === 'source')
     || largeFallback;
   const findSourceText = findEligible ? content : '';
   const find = useViewerFind({ text: findSourceText });
-  useViewerFindKeyboardShortcut({ scopeId: 'file-viewer', onOpen: find.open });
+  useViewerFindKeyboardShortcut({ scopeId: 'file-viewer', onOpen: find.open, enabled: findEligible });
   const findProjection = useMemo<FileSearchProjection>(
     () => (findEligible ? buildFileSearchProjection(findSourceText, find.query) : { sources: [], matches: [] }),
     [findEligible, findSourceText, find.query],
@@ -296,16 +294,18 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
 
   const headerExtras: ReactNode = textLike ? (
     <>
-      <button
-        ref={findButtonRef}
-        type="button"
-        className="viewer-shell-btn"
-        onClick={find.open}
-        aria-label="Find in file"
-        title="Find in file"
-      >
-        Find
-      </button>
+      {findEligible && (
+        <button
+          ref={findButtonRef}
+          type="button"
+          className="viewer-shell-btn"
+          onClick={find.open}
+          aria-label="Find in file"
+          title="Find in file"
+        >
+          Find
+        </button>
+      )}
       <CopyButton text={content} className="viewer-shell-copy-btn" title="Copy file contents" />
       {payload.kind === 'html' && (
         <>
@@ -381,7 +381,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       onNext={handleFindNext}
       onPrevious={handleFindPrevious}
       onClose={closeFind}
-      autoFocus={false}
+      autoFocus
     />
   ) : viewerBanner ?? (findIneligibleReason ? <span>{findIneligibleReason}</span> : null);
 

@@ -299,8 +299,8 @@ describe('MetaViewer payload routing', () => {
     expect(screen.queryByText(/of \d+/)).toBeNull();
   });
 
-  it('marks html preview as find-ineligible without false counts', () => {
-    render(
+  it('keeps HTML source and markdown find ineligible so unrevealable matches are not counted', () => {
+    const { unmount } = render(
       <ReviewNotesProvider>
         <MetaViewer
           payload={{
@@ -314,14 +314,19 @@ describe('MetaViewer payload routing', () => {
       </ReviewNotesProvider>,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Find in file' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
 
-    expect(screen.getByTitle('Find in file')).toBeInTheDocument();
-    expect(screen.getByText('0 results')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Previous' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
+    unmount();
+    const { rerender } = render(
+      <ReviewNotesProvider>
+        <MetaViewer payload={{ ...textCommon, kind: 'markdown', content: '# alpha' }} />
+      </ReviewNotesProvider>,
+    );
+    expect(screen.queryByRole('button', { name: 'Find in file' })).toBeNull();
+    rerender(<ReviewNotesProvider><MetaViewer payload={{ ...textCommon, kind: 'text', content: 'alpha' }} /></ReviewNotesProvider>);
+    expect(screen.getByRole('button', { name: 'Find in file' })).toBeInTheDocument();
   });
 });
 

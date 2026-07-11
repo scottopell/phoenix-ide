@@ -270,19 +270,12 @@ export function TaskApprovalReader({
     ? getTaskApprovalContextRecommendation(contextUsage)
     : null;
 
+  const [findablePlanBlocks, setFindablePlanBlocks] = useState<Array<{ id: string; lineNumber: number; text: string }>>([]);
   const find = useViewerFind({ text: plan });
   useViewerFindKeyboardShortcut({ scopeId: 'task-approval', onOpen: find.open });
-  const planBlocks = useMemo(() => {
-    const rawLines = plan.split('\n');
-    return rawLines.map((text, index) => ({
-      id: `line:${index + 1}`,
-      lineNumber: index + 1,
-      text,
-    }));
-  }, [plan]);
   const findProjection = useMemo(
-    () => buildBlockSearchProjection(planBlocks, find.query),
-    [planBlocks, find.query]
+    () => buildBlockSearchProjection(findablePlanBlocks, find.query),
+    [findablePlanBlocks, find.query]
   );
 
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
@@ -333,19 +326,20 @@ export function TaskApprovalReader({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        if (find.isOpen) {
-          e.preventDefault();
-          e.stopPropagation();
-          find.close();
-          queueMicrotask(() => findButtonRef.current?.focus());
-          return;
-        }
         e.preventDefault();
         e.stopPropagation();
         if (annotatingLine) {
           setAnnotatingLine(null);
-        } else if (discardConfirmOpen) {
+          return;
+        }
+        if (discardConfirmOpen) {
           setDiscardConfirmOpen(false);
+          return;
+        }
+        if (find.isOpen) {
+          find.close();
+          queueMicrotask(() => findButtonRef.current?.focus());
+          return;
         }
         return;
       }
@@ -391,12 +385,12 @@ export function TaskApprovalReader({
 
   const handleFindQueryChange = useCallback((query: string) => {
     find.setQuery(query);
-    const target = buildBlockSearchProjection(planBlocks, query).matches[0]?.target;
+    const target = buildBlockSearchProjection(findablePlanBlocks, query).matches[0]?.target;
     if (!target) return;
     queueMicrotask(() => {
       blockRefs.current.get(target.blockId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     });
-  }, [find, planBlocks]);
+  }, [find, findablePlanBlocks]);
 
   const handleFindNext = useCallback(() => {
     find.nextMatch();
@@ -449,6 +443,7 @@ export function TaskApprovalReader({
   // Render plan as markdown with annotatable blocks.
   const renderPlanMarkdown = useMemo(() => {
     const rawLines = plan.split('\n');
+    const nextFindableBlocks: Array<{ id: string; lineNumber: number; text: string }> = [];
     const matchesByLine = new Map<number, Array<{ start: number; end: number; occurrenceIndex: number }>>();
     findProjection.matches.forEach((match, occurrenceIndex) => {
       const lineMatches = matchesByLine.get(match.target.lineNumber) ?? [];
@@ -490,6 +485,9 @@ export function TaskApprovalReader({
           : Array.isArray(children) && children.every((child) => typeof child === 'string')
             ? children.join('')
             : null;
+        if (ln > 0 && childText !== null && childText.trim().length > 0) {
+          nextFindableBlocks.push({ id: blockId, lineNumber: ln, text: childText });
+        }
         const shouldDecorateChildren =
           lineMatches.length > 0
           && childText !== null
@@ -519,6 +517,18 @@ export function TaskApprovalReader({
           </AnnotatableBlock>
         );
       };
+
+    queueMicrotask(() => {
+      setFindablePlanBlocks((prev) => {
+        if (
+          prev.length === nextFindableBlocks.length
+          && prev.every((block, index) => block.id === nextFindableBlocks[index]?.id && block.text === nextFindableBlocks[index]?.text)
+        ) {
+          return prev;
+        }
+        return nextFindableBlocks;
+      });
+    });
 
     return (
       <ReactMarkdown
@@ -634,7 +644,7 @@ export function TaskApprovalReader({
           onNext={handleFindNext}
           onPrevious={handleFindPrevious}
           onClose={closeFind}
-          autoFocus={false}
+          autoFocus
         />
       )}
 

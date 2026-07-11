@@ -49,15 +49,19 @@ export function viewerFindReducer(state: ViewerFindState, action: ViewerFindActi
       };
     case 'set-active-index':
       return { ...state, activeIndex: action.index };
-    case 'next-match':
-      return { ...state, activeIndex: wrapIndex(state.activeIndex + 1, action.matchCount) };
-    case 'previous-match':
+    case 'next-match': {
+      const normalized = normalizeActiveIndex(state.activeIndex, action.matchCount);
+      return { ...state, activeIndex: wrapIndex(normalized + 1, action.matchCount) };
+    }
+    case 'previous-match': {
+      const normalized = normalizeActiveIndex(state.activeIndex, action.matchCount);
       return {
         ...state,
-        activeIndex: state.activeIndex === -1
+        activeIndex: normalized === -1
           ? normalizeActiveIndex(action.matchCount - 1, action.matchCount)
-          : wrapIndex(state.activeIndex - 1, action.matchCount),
+          : wrapIndex(normalized - 1, action.matchCount),
       };
+    }
     default:
       return state;
   }

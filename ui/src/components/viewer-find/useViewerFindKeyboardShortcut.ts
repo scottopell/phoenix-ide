@@ -4,19 +4,22 @@ import { useFocusScope } from '../../hooks/useFocusScope';
 interface UseViewerFindKeyboardShortcutOptions {
   scopeId: string;
   onOpen: () => void;
+  enabled?: boolean;
 }
 
 function isEditableTarget(target: EventTarget | null): boolean {
   const element = target as HTMLElement | null;
-  if (!element) return false;
+  if (!element || !(element instanceof HTMLElement)) return false;
+  if (element.dataset.viewerFindInput === 'true') return false;
   const tag = element.tagName;
   return tag === 'INPUT' || tag === 'TEXTAREA' || element.isContentEditable;
 }
 
-export function useViewerFindKeyboardShortcut({ scopeId, onOpen }: UseViewerFindKeyboardShortcutOptions) {
+export function useViewerFindKeyboardShortcut({ scopeId, onOpen, enabled = true }: UseViewerFindKeyboardShortcutOptions) {
   const { activeScope } = useFocusScope();
 
   useEffect(() => {
+    if (!enabled) return undefined;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'f') return;
       if (activeScope !== scopeId) return;
@@ -27,5 +30,5 @@ export function useViewerFindKeyboardShortcut({ scopeId, onOpen }: UseViewerFind
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeScope, onOpen, scopeId]);
+  }, [activeScope, enabled, onOpen, scopeId]);
 }
