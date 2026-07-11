@@ -174,7 +174,8 @@ final class AppModel {
                 // Open sessions already drain via their own triggers.
                 continue
             }
-            guard let entries = DiskStore.load([OutboxEntry].self, name: name),
+            guard let entries = DiskStore.loadVersioned(
+                [OutboxEntry].self, name: name, version: Outbox.schemaVersion),
                   entries.contains(where: { $0.status == .pending && !$0.acceptedByServer })
             else { continue }
             let drainSession: ConversationSession

@@ -194,12 +194,22 @@ struct OutboxEntryView: View {
         VStack(alignment: .trailing, spacing: 3) {
             HStack {
                 Spacer(minLength: 40)
-                Text(entry.text)
-                    .font(.body)
-                    .padding(10)
-                    .background(bubbleColor)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                VStack(alignment: .trailing, spacing: 4) {
+                    if !entry.text.isEmpty {
+                        Text(entry.text)
+                            .font(.body)
+                    }
+                    if !entry.images.isEmpty {
+                        Label(
+                            "\(entry.images.count) image\(entry.images.count == 1 ? "" : "s") attached",
+                            systemImage: "photo")
+                            .font(.caption2)
+                    }
+                }
+                .padding(10)
+                .background(bubbleColor)
+                .foregroundStyle(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
             }
             statusLine
         }

@@ -128,10 +128,7 @@ struct UserMessageView: View {
                     .foregroundStyle(.white)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 if let images = content["images"]?.arrayValue, !images.isEmpty {
-                    Label("\(images.count) image\(images.count == 1 ? "" : "s")",
-                          systemImage: "photo")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    ImageStrip(images: images, maxHeight: 140)
                 }
                 // File attachments exist on the record even though this
                 // client can't open them — hiding them would silently
@@ -304,6 +301,11 @@ struct GenericToolResultCard: View {
                 }
             }
             .buttonStyle(.plain)
+            // Typed image payloads (screenshots, read_image) render even
+            // while collapsed — the image usually IS the result.
+            if let images = content["images"]?.arrayValue, !images.isEmpty {
+                ImageStrip(images: images)
+            }
             if expanded {
                 ScrollView([.horizontal, .vertical]) {
                     Text(output.isEmpty ? "(no output)" : output)

@@ -13,6 +13,7 @@ final class ConversationListStore {
     private(set) var lastError: String?
 
     private static let cacheName = "conversations"
+    private static let schemaVersion = 1
 
     private struct Cache: Codable {
         var conversations: [Conversation]
@@ -29,7 +30,8 @@ final class ConversationListStore {
     private var exclusionsDuringRefresh: Set<String> = []
 
     init() {
-        if let cache = DiskStore.load(Cache.self, name: Self.cacheName) {
+        if let cache = DiskStore.loadVersioned(
+            Cache.self, name: Self.cacheName, version: Self.schemaVersion) {
             conversations = cache.conversations
             lastRefreshed = cache.lastRefreshed
         }
@@ -142,8 +144,9 @@ final class ConversationListStore {
 
     private func persistCache() {
         guard let lastRefreshed else { return }
-        DiskStore.save(
+        DiskStore.saveVersioned(
             Cache(conversations: conversations, lastRefreshed: lastRefreshed),
-            name: Self.cacheName)
+            name: Self.cacheName,
+            version: Self.schemaVersion)
     }
 }

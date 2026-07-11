@@ -408,3 +408,60 @@ make away from the desk. The no-optimistic-state rule matters because
 approval is multi-client: the server 400s a decision on an
 already-decided plan, which surfaces as an explanatory error instead of a
 silent double-apply.
+
+---
+
+### REQ-IOS-014: Versioned Persistence
+
+WHEN a durable store (outbox, conversation snapshot, conversation list)
+is written
+THE SYSTEM SHALL wrap the payload in an envelope carrying a schema version
+
+WHEN loading a store whose version matches
+THE SYSTEM SHALL decode it directly
+
+WHEN loading an older version
+THE SYSTEM SHALL route through that store's migration hook
+
+WHEN loading a NEWER version (downgraded app)
+THE SYSTEM SHALL treat the file as absent rather than misparse it
+AND SHALL NOT delete it
+
+WHEN loading a pre-envelope legacy file
+THE SYSTEM SHALL decode the bare payload as version zero
+
+Changing any persisted struct requires either a version bump plus a
+migration branch, or a field-level note that the change is
+additive-optional (old files decode it as nil/default).
+
+**Rationale:** Without an envelope, any shape change makes old files
+undecodable and lenient decoding silently discards them — for the outbox
+that is queued-message loss, the exact failure the app exists to prevent.
+The version makes "old data" distinguishable from "corrupt data" and
+makes forgetting a migration a reviewable event instead of a silent wipe.
+
+---
+
+### REQ-IOS-015: Image Attachments
+
+WHEN a message or tool result carries typed image payloads
+THE SYSTEM SHALL render them inline (tool-result images render even while
+the output is collapsed)
+AND an undecodable image SHALL render a labeled placeholder, never nothing
+
+WHEN the user attaches photos to a message
+THE SYSTEM SHALL downscale to a bounded long edge and recompress before
+staging
+AND queue them through the same outbox entry as the text (same
+durability, same idempotent delivery)
+AND surface any photo that failed to load rather than dropping it from
+the send
+
+WHEN a queued entry carries images
+THE SYSTEM SHALL indicate the attachment count on the optimistic bubble
+
+**Rationale:** Images flow through one typed path in both directions
+(mirrors the web's single-source-of-truth rule for ToolContent.images).
+Client-side downscaling keeps multi-megapixel photos from bloating outbox
+files and chat POSTs; the visible-failure rules are the transcript-wide
+omission-is-data-loss principle applied to media.

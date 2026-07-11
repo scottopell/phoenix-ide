@@ -69,6 +69,10 @@ final class ConversationSession {
 
     private var snapshotName: String { "conv-\(conversationId)" }
 
+    /// Bump when Snapshot's persisted shape changes incompatibly (DiskStore
+    /// versioning rule). Additive-optional fields (syncedAt) need no bump.
+    private static let snapshotSchemaVersion = 1
+
     private struct Snapshot: Codable {
         var conversation: Conversation?
         var messages: [Message]
@@ -98,7 +102,9 @@ final class ConversationSession {
         self.outbox = Outbox(conversationId: conversationId)
 
         // Cached snapshot renders immediately; the stream refreshes it.
-        if let snap = DiskStore.load(Snapshot.self, name: snapshotName) {
+        if let snap = DiskStore.loadVersioned(
+            Snapshot.self, name: snapshotName, version: Self.snapshotSchemaVersion)
+        {
             conversation = snap.conversation
             messages = snap.messages
             durableMessageSequenceCeiling = snap.messages.map(\.sequence_id).max() ?? 0
@@ -221,7 +227,7 @@ final class ConversationSession {
     private func persistSnapshot(authoritative: Bool = false) -> Bool {
         guard !isHardDeleted else { return false }
         let syncedAt = authoritative ? Date() : snapshotSyncedAt
-        let didSave = DiskStore.save(
+        let didSave = DiskStore.saveVersioned(
             Snapshot(
                 conversation: conversation,
                 messages: Self.durableMessages(
@@ -229,7 +235,7 @@ final class ConversationSession {
                 lastSequenceId: lastSequenceId,
                 transcriptGeneration: transcriptGeneration,
                 syncedAt: syncedAt),
-            name: snapshotName)
+            name: snapshotName, version: Self.snapshotSchemaVersion)
         if didSave, authoritative {
             snapshotSyncedAt = syncedAt
         }
@@ -240,14 +246,17 @@ final class ConversationSession {
 
     /// Optimistic enqueue-then-send. The entry is persisted before the POST
     /// leaves the device; if the network is down the send is deferred, not
-    /// failed.
+    /// failed. Images ride the same outbox path as text — same durability,
+    /// same idempotent delivery.
     @discardableResult
-    func send(text: String) -> Bool {
+    func send(text: String, images: [ImagePayload] = []) -> Bool {
         guard !isHardDeleted else { return false }
         guard ClientOperation.chat.policy == .outboxed else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, acceptsChatMessage else { return false }
-        guard outbox.enqueue(text: trimmed) != nil else {
+        guard (!trimmed.isEmpty || !images.isEmpty), acceptsChatMessage else {
+            return false
+        }
+        guard outbox.enqueue(text: trimmed, images: images) != nil else {
             lastErrorToast = "Message could not be saved on this device. Free storage and try again."
             return false
         }
