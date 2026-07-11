@@ -1152,6 +1152,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, w
                   onOpenFile={onOpenFile}
                   workScopeKey={workScopeKey}
                   knownResultIds={knownResultIds}
+                  filePathRootDir={filePathRootDir}
                   toolStartedAtMs={toolStartedAtMs}
                   showMissingResult={showMissingResult}
                 />
@@ -1219,6 +1220,7 @@ interface ToolUseBlockProps {
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
   workScopeKey?: string | undefined;
   knownResultIds?: readonly string[] | undefined;
+  filePathRootDir?: string | undefined;
   /** Server-clock unix ms when the runtime began dispatching this
    *  tool — sourced from the parent assistant message's
    *  `display_data.tool_starts[block.id]` (REQ-WPV-002). When present
@@ -1721,9 +1723,12 @@ function buildReadFileCopyText(_request: ReadFileRequest, parsed: ReadFileParseR
   return parsed.lines.map((line) => `${line.lineNumber}\t${line.content}`).join('\n');
 }
 
-function canOpenReadFilePath(path: string): boolean {
-  if (!path || path.startsWith('/')) return false;
-  return !path.split(/[\\/]+/).includes('..');
+function canOpenReadFilePath(path: string, rootDir: string | undefined): boolean {
+  if (!path || path.split(/[\\/]+/).includes('..')) return false;
+  if (!path.startsWith('/')) return true;
+  if (!rootDir?.startsWith('/')) return false;
+  const normalizedRoot = rootDir.replace(/\/+$/, '');
+  return path === normalizedRoot || path.startsWith(`${normalizedRoot}/`);
 }
 
 function ReadFileResultView({
@@ -1731,11 +1736,13 @@ function ReadFileResultView({
   rawText,
   metadata,
   onOpenFile,
+  filePathRootDir,
 }: {
   input: Record<string, unknown>;
   rawText: string;
   metadata: ReadFileDisplayData;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
+  filePathRootDir: string | undefined;
 }) {
   const request = useMemo(() => parseReadFileRequest(input), [input]);
   const parsed = useMemo(() => parseReadFileOutput(rawText), [rawText]);
@@ -1775,7 +1782,7 @@ function ReadFileResultView({
           <span className="read-file-result-summary">requested {metadata.requested_limit}</span>
         </div>
         <div className="read-file-result-actions">
-          {onOpenFile && canOpenReadFilePath(request.path) && (
+          {onOpenFile && canOpenReadFilePath(request.path, filePathRootDir) && (
             <button
               type="button"
               className="read-file-result-open"
@@ -2056,7 +2063,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, filePathRootDir, knownResultIds, toolStartedAtMs, showMissingResult }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -2284,6 +2291,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
               rawText={resultText}
               metadata={readFileMetadata}
               onOpenFile={onOpenFile}
+              filePathRootDir={filePathRootDir}
             />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse

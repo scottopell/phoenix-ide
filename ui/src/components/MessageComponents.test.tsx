@@ -1494,6 +1494,7 @@ describe('read_file structured result view', () => {
           ])}
           toolResults={new Map([['tool-read-absolute', toolMessage('tool-read-absolute', '     1\toutside', 2, { ...metadata, path: '/tmp/outside.txt' })]])}
           onOpenFile={vi.fn()}
+          filePathRootDir="/repo"
         />
       </MemoryRouter>,
     );
@@ -1511,6 +1512,20 @@ describe('read_file structured result view', () => {
       </MemoryRouter>,
     );
     expect(screen.queryByRole('button', { name: 'View full file' })).not.toBeInTheDocument();
+
+    rerender(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-read-in-root', [
+            { type: 'tool_use', id: 'tool-read-in-root', name: 'read_file', input: { path: '/repo/src/in-root.txt' } },
+          ])}
+          toolResults={new Map([['tool-read-in-root', toolMessage('tool-read-in-root', '     1\tinside', 2, { ...metadata, path: '/repo/src/in-root.txt' })]])}
+          onOpenFile={vi.fn()}
+          filePathRootDir="/repo"
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole('button', { name: 'View full file' })).toBeInTheDocument();
   });
 
   it('renders empty and malformed fallback states', () => {
