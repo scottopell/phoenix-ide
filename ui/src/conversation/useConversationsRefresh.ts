@@ -1,7 +1,8 @@
 import { useCallback, useContext, useEffect, useRef } from 'react';
 import { ConversationContext } from './ConversationContext';
 import { DraftContext } from './DraftContext';
-import type { ConversationStore } from './ConversationStore';
+import type { ConversationStore, ReconciledRemoval } from './ConversationStore';
+import type { DraftStore } from './DraftStore';
 import { api } from '../api';
 import { cacheDB } from '../cache';
 import { clearLastViewer } from '../storage/lastViewerStorage';
@@ -9,6 +10,56 @@ import { clearTerminalPaneStorage } from '../storage/terminalPaneStorage';
 import { clearDraftStorage } from '../hooks/useDraft';
 
 const POLL_INTERVAL_MS = 5000;
+
+function cleanupSlugState(slug: string, draftStore: DraftStore): void {
+  clearLastViewer(slug);
+  clearTerminalPaneStorage(slug);
+  draftStore.remove(slug);
+}
+
+function notifyLocalConversationDeleted(conversationId: string): void {
+  window.dispatchEvent(
+    new CustomEvent('phoenix:conversation-locally-deleted', {
+      detail: { conversationId },
+    }),
+  );
+}
+
+function cleanupDeletedConversation(conversationId: string, slugs: readonly string[], draftStore: DraftStore): void {
+  for (const slug of slugs) cleanupSlugState(slug, draftStore);
+  clearDraftStorage(conversationId);
+  notifyLocalConversationDeleted(conversationId);
+}
+
+function cleanupReconciledRemoval(removal: ReconciledRemoval, draftStore: DraftStore): void {
+  for (const slug of removal.slugs) cleanupSlugState(slug, draftStore);
+  if (removal.reason === 'deleted') {
+    clearDraftStorage(removal.conversation.id);
+  }
+}
+
+async function confirmDeletedConversationIds(
+  store: ConversationStore,
+  authoritativeIds: ReadonlySet<string>,
+): Promise<Set<string>> {
+  const candidates = store
+    .listSnapshots()
+    .filter((conversation) => (
+      !authoritativeIds.has(conversation.id)
+      && !conversation.parent_conversation_id
+      && conversation.user_initiated !== false
+    ));
+  const confirmed = new Set<string>();
+  await Promise.all(candidates.map(async (conversation) => {
+    try {
+      const slug = await api.getConversationSlug(conversation.id);
+      if (slug === null) confirmed.add(conversation.id);
+    } catch {
+      // A failed confirmation must not become destructive pruning.
+    }
+  }));
+  return confirmed;
+}
 
 /**
  * Pure refresh implementation. Reconciles the store with the cache and
@@ -40,7 +91,7 @@ const POLL_INTERVAL_MS = 5000;
  * trailing fire ran. (Today no caller awaits, but the contract should
  * hold by default.)
  */
-async function refreshOnce(store: ConversationStore): Promise<void> {
+async function refreshOnce(store: ConversationStore, draftStore: DraftStore): Promise<void> {
   // Flags live on the store so they're shared across every consumer
   // that might trigger a refresh (the driver, post-mutation pokes from
   // ConversationListPage handlers, the onConversationCreated callback
@@ -78,10 +129,15 @@ async function refreshOnce(store: ConversationStore): Promise<void> {
       api.listConversations(),
       api.listArchivedConversations(),
     ]);
-    store.upsertSnapshots(freshActive, { allowEqualTimestampSlugMove: true });
-    store.upsertSnapshots(freshArchived, { allowEqualTimestampSlugMove: true });
+    const freshRows = [...freshActive, ...freshArchived];
+    const authoritativeIds = new Set(freshRows.map((row) => row.id));
+    const confirmedDeletedIds = await confirmDeletedConversationIds(store, authoritativeIds);
+    const { removed } = store.reconcileSnapshots(freshRows, { confirmedDeletedIds });
+    for (const removal of removed) {
+      cleanupReconciledRemoval(removal, draftStore);
+    }
     try {
-      await cacheDB.syncConversations([...freshActive, ...freshArchived]);
+      await cacheDB.syncConversations(freshRows);
     } catch {
       // Cache write failures are non-fatal.
     }
@@ -102,7 +158,7 @@ async function refreshOnce(store: ConversationStore): Promise<void> {
       // not when it starts. A failed trailing fire still resolves (the
       // outer try/catch swallows network errors), so awaiters never
       // hang on a transient outage.
-      void refreshOnce(store).then(() => pendingResolve?.());
+      void refreshOnce(store, draftStore).then(() => pendingResolve?.());
     }
   }
 }
@@ -115,6 +171,14 @@ function useStoreFromContext(label: string): ConversationStore {
   const store = useContext(ConversationContext);
   if (!store) throw new Error(`${label} must be used within ConversationProvider`);
   return store;
+}
+
+function useDraftStoreFromContext(label: string): DraftStore {
+  const draftStore = useContext(DraftContext);
+  if (!draftStore) {
+    throw new Error(`${label} must be used within ConversationProvider (DraftContext missing)`);
+  }
+  return draftStore;
 }
 
 /**
@@ -132,7 +196,8 @@ export function useConversationsRefresh(): {
   refresh: () => Promise<void>;
 } {
   const store = useStoreFromContext('useConversationsRefresh');
-  const refresh = useCallback(() => refreshOnce(store), [store]);
+  const draftStore = useDraftStoreFromContext('useConversationsRefresh');
+  const refresh = useCallback(() => refreshOnce(store, draftStore), [store, draftStore]);
   return { refresh };
 }
 
@@ -149,14 +214,9 @@ export function useConversationsRefresh(): {
  */
 export function useConversationsRefreshDriver(): void {
   const store = useStoreFromContext('useConversationsRefreshDriver');
-  const draftStore = useContext(DraftContext);
-  if (!draftStore) {
-    throw new Error(
-      'useConversationsRefreshDriver must be used within ConversationProvider (DraftContext missing)',
-    );
-  }
+  const draftStore = useDraftStoreFromContext('useConversationsRefreshDriver');
   // Stable refresh function for use inside effects.
-  const refresh = useCallback(() => refreshOnce(store), [store]);
+  const refresh = useCallback(() => refreshOnce(store, draftStore), [store, draftStore]);
   // Ref so listeners don't re-bind every render.
   const refreshRef = useRef(refresh);
   refreshRef.current = refresh;
@@ -181,16 +241,7 @@ export function useConversationsRefreshDriver(): void {
       const detail = (e as CustomEvent<{ conversationId?: string }>).detail;
       if (!detail?.conversationId) return;
       const removedSlugs = store.removeByConversationId(detail.conversationId);
-      for (const slug of removedSlugs) {
-        // REQ-VS-014: drop all per-slug state so a future conversation
-        // that reuses this slug doesn't inherit any of it.
-        clearLastViewer(slug);
-        clearTerminalPaneStorage(slug);
-        draftStore.remove(slug);
-      }
-      // localStorage drafts are keyed by conversationId, not slug — clear
-      // by id regardless of whether we still hold an atom for the slug.
-      clearDraftStorage(detail.conversationId);
+      cleanupDeletedConversation(detail.conversationId, removedSlugs, draftStore);
       // Always re-poll — the deleted row may have been part of a chain
       // whose other members' counts are now stale.
       void refreshRef.current();

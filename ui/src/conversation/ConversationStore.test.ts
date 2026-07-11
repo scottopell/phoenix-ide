@@ -734,6 +734,126 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(store.listSnapshots().map((c) => c.id)).toEqual(['conv-other']);
   });
 
+  it('reconcileSnapshots removes rows absent from an authoritative server refresh', () => {
+    const store = new ConversationStore();
+    const active = makeConv('alpha');
+    const archived = makeConv('beta', { archived: true });
+    const deleted = makeConv('gamma');
+    store.upsertSnapshots([active, archived, deleted]);
+
+    const { changed, removed } = store.reconcileSnapshots([active, archived]);
+
+    expect(changed).toEqual(['gamma']);
+    expect(removed).toEqual([{ reason: 'deleted', conversation: deleted, slugs: ['gamma'] }]);
+    expect(store.listSnapshots().map((c) => c.slug).sort()).toEqual(['alpha', 'beta']);
+    expect(store.slugForId(deleted.id)).toBeUndefined();
+    expect(store.getSnapshot('gamma').conversation).toBeNull();
+  });
+
+  it('reconcileSnapshots preserves child conversations absent from sidebar refreshes', () => {
+    const store = new ConversationStore();
+    const child = makeConv('child', { parent_conversation_id: 'conv-parent' });
+    const parent = makeConv('parent');
+    store.upsertSnapshots([child, parent]);
+
+    const { changed, removed } = store.reconcileSnapshots([parent]);
+
+    expect(changed).toEqual([]);
+    expect(removed).toEqual([]);
+    expect(store.getSnapshot('child').conversation).toBe(child);
+    expect(store.slugForId(child.id)).toBe('child');
+  });
+
+  it('reconcileSnapshots keeps subscribed renamed atoms live for route replacement', () => {
+    const store = new ConversationStore();
+    const oldSlug = makeConv('old-slug', { id: 'conv-rename' });
+    const newSlug = makeConv('new-slug', {
+      id: 'conv-rename',
+      updated_at: '2024-06-02T00:00:00Z',
+    });
+    store.upsertSnapshot('old-slug', oldSlug);
+    const unsubscribe = store.subscribe('old-slug', () => {});
+
+    const { changed, removed } = store.reconcileSnapshots([newSlug]);
+
+    expect(changed).toEqual(['new-slug', 'old-slug']);
+    expect(removed).toEqual([]);
+    expect(store.getSnapshot('old-slug').conversation).toBe(newSlug);
+    expect(store.getSnapshot('new-slug').conversation).toBe(newSlug);
+    expect(store.slugForId('conv-rename')).toBe('new-slug');
+    unsubscribe();
+  });
+
+  it('reconcileSnapshots removes inactive renamed aliases', () => {
+    const store = new ConversationStore();
+    const oldSlug = makeConv('old-slug', { id: 'conv-rename' });
+    const newSlug = makeConv('new-slug', {
+      id: 'conv-rename',
+      updated_at: '2024-06-02T00:00:00Z',
+    });
+    store.upsertSnapshot('old-slug', oldSlug);
+
+    const { changed, removed } = store.reconcileSnapshots([newSlug]);
+
+    expect(changed).toEqual(['old-slug', 'new-slug']);
+    expect(removed).toEqual([
+      { reason: 'renamed', conversation: oldSlug, authoritativeSlug: 'new-slug', slugs: ['old-slug'] },
+    ]);
+    expect(store.getSnapshot('old-slug').conversation).toBeNull();
+    expect(store.getSnapshot('new-slug').conversation).toBe(newSlug);
+  });
+
+  it('reconcileSnapshots reports confirmed deletes before a slug-reuse upsert overwrites them', () => {
+    const store = new ConversationStore();
+    const deleted = makeConv('reused', { id: 'conv-deleted' });
+    const replacement = makeConv('reused', {
+      id: 'conv-replacement',
+      updated_at: '2024-06-02T00:00:00Z',
+    });
+    store.upsertSnapshot('reused', deleted);
+
+    const { changed, removed } = store.reconcileSnapshots([replacement], {
+      confirmedDeletedIds: new Set(['conv-deleted']),
+    });
+
+    expect(changed).toEqual(['reused', 'reused']);
+    expect(removed).toEqual([{ reason: 'deleted', conversation: deleted, slugs: ['reused'] }]);
+    expect(store.getSnapshot('reused').conversation).toBe(replacement);
+    expect(store.slugForId('conv-deleted')).toBeUndefined();
+    expect(store.slugForId('conv-replacement')).toBe('reused');
+  });
+
+  it('reconcileSnapshots preserves newer local renames over stale authoritative rows', () => {
+    const store = new ConversationStore();
+    const newerLocal = makeConv('new-local', {
+      id: 'conv-rename',
+      updated_at: '2024-06-03T00:00:00Z',
+    });
+    const staleAuthoritative = makeConv('old-server', {
+      id: 'conv-rename',
+      updated_at: '2024-06-02T00:00:00Z',
+    });
+    store.upsertSnapshot('new-local', newerLocal);
+
+    const { changed, removed } = store.reconcileSnapshots([staleAuthoritative]);
+
+    expect(changed).toEqual([]);
+    expect(removed).toEqual([]);
+    expect(store.getSnapshot('new-local').conversation).toBe(newerLocal);
+    expect(store.getSnapshot('old-server').conversation).toBeNull();
+    expect(store.slugForId('conv-rename')).toBe('new-local');
+  });
+
+  it('reconcileSnapshots still applies monotonic upserts for present rows', () => {
+    const store = new ConversationStore();
+    const a = makeConv('alpha', { updated_at: '2024-06-01T00:00:00Z', cwd: '/old' });
+    const aPrime = makeConv('alpha', { updated_at: '2024-06-02T00:00:00Z', cwd: '/new' });
+    store.upsertSnapshot('alpha', a);
+
+    expect(store.reconcileSnapshots([aPrime]).changed).toEqual(['alpha']);
+    expect(store.getSnapshot('alpha').conversation?.cwd).toBe('/new');
+  });
+
   it('listSnapshots returns every conversation currently held', () => {
     const store = new ConversationStore();
     store.upsertSnapshot('alpha', makeConv('alpha'));

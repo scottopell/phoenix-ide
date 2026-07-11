@@ -21,6 +21,19 @@ interface SnapshotUpsertOptions {
   allowEqualTimestampSlugMove?: boolean;
 }
 
+export type ReconciledRemoval =
+  | { reason: 'deleted'; conversation: Conversation; slugs: string[] }
+  | { reason: 'renamed'; conversation: Conversation; authoritativeSlug: string; slugs: string[] };
+
+export interface ReconcileSnapshotOptions {
+  confirmedDeletedIds?: ReadonlySet<string>;
+}
+
+export interface ReconciledSnapshots {
+  changed: string[];
+  removed: ReconciledRemoval[];
+}
+
 /**
  * Per-slug conversation atoms.
  *
@@ -176,6 +189,19 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     return this.setAtom(slug, { ...destination, conversation });
   }
 
+  private refreshSubscribedAliasSnapshot(
+    slug: string,
+    conversation: Conversation,
+    destination: ConversationAtom,
+  ): boolean {
+    const overwrittenId = destination.conversation?.id;
+    if (overwrittenId && overwrittenId !== conversation.id && this.slugByConvId.get(overwrittenId) === slug) {
+      this.slugByConvId.delete(overwrittenId);
+    }
+    notifyConversationSnapshotChange(conversation);
+    return this.setAtom(slug, { ...destination, conversation });
+  }
+
   private withCachedPr(
     conversation: Conversation,
     cachedPr: CachedPrSummary | null | undefined,
@@ -261,6 +287,83 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
     if (candidate.slug === indexedSlug && existing.slug !== indexedSlug) return true;
     if (existing.slug === indexedSlug && candidate.slug !== indexedSlug) return false;
     return candidate.slug > existing.slug;
+  }
+
+  /**
+   * Reconcile against an authoritative active+archived sidebar list from
+   * the server. Rows that are present are upserted with the same monotonic
+   * snapshot rules as {@link upsertSnapshots}; sidebar-domain snapshot atoms
+   * absent from the server result are removed as deletes, and atoms whose
+   * conversation id is present under a different authoritative slug are
+   * removed as renames. A subscribed renamed atom is kept alive with the
+   * authoritative snapshot so its mounted page can redirect without falling
+   * through to an empty loading state.
+   *
+   * Sub-agent/child conversations are outside the sidebar endpoint domain
+   * and are preserved even when absent from this list.
+   *
+   * Cache hydration must not call this: a stale cache is not authoritative
+   * and must not prune live rows before the network response arrives.
+   */
+  reconcileSnapshots(rows: readonly Conversation[], options: ReconcileSnapshotOptions = {}): ReconciledSnapshots {
+    const changed: string[] = [];
+    const removed: ReconciledRemoval[] = [];
+    const authoritativeById = new Map(rows.map((row) => [row.id, row]));
+    const reportedRenamedSlugs = new Set<string>();
+    const deletedIds = new Set<string>();
+
+    if (options.confirmedDeletedIds) {
+      for (const [, atom] of [...this.entries()]) {
+        const conv = atom.conversation;
+        if (!conv || conv.parent_conversation_id || conv.user_initiated === false) continue;
+        if (!options.confirmedDeletedIds.has(conv.id) || deletedIds.has(conv.id)) continue;
+        deletedIds.add(conv.id);
+        const removedSlugs = this.removeByConversationId(conv.id);
+        if (removedSlugs.length === 0) continue;
+        changed.push(...removedSlugs);
+        removed.push({ reason: 'deleted', conversation: conv, slugs: removedSlugs });
+      }
+    }
+
+    for (const [slug, atom] of [...this.entries()]) {
+      const conv = atom.conversation;
+      if (!conv || conv.parent_conversation_id || conv.user_initiated === false) continue;
+      const authoritative = authoritativeById.get(conv.id);
+      if (!authoritative || authoritative.slug === slug || authoritative.updated_at < conv.updated_at) continue;
+      if (this.hasSubscribers(slug)) continue;
+      if (this.removeAtom(slug)) {
+        changed.push(slug);
+        reportedRenamedSlugs.add(slug);
+        removed.push({ reason: 'renamed', conversation: conv, authoritativeSlug: authoritative.slug, slugs: [slug] });
+      }
+    }
+
+    changed.push(...this.upsertSnapshots(rows, { allowEqualTimestampSlugMove: true }));
+
+    for (const [slug, atom] of [...this.entries()]) {
+      const conv = atom.conversation;
+      if (!conv || conv.parent_conversation_id || conv.user_initiated === false) continue;
+      const authoritative = authoritativeById.get(conv.id);
+      if (!authoritative) {
+        if (options.confirmedDeletedIds && !options.confirmedDeletedIds.has(conv.id)) continue;
+        if (deletedIds.has(conv.id)) continue;
+        deletedIds.add(conv.id);
+        const removedSlugs = this.removeByConversationId(conv.id);
+        if (removedSlugs.length === 0) continue;
+        changed.push(...removedSlugs);
+        removed.push({ reason: 'deleted', conversation: conv, slugs: removedSlugs });
+      } else if (authoritative.slug !== slug && authoritative.updated_at >= conv.updated_at) {
+        if (this.hasSubscribers(slug)) {
+          if (this.refreshSubscribedAliasSnapshot(slug, authoritative, atom)) {
+            changed.push(slug);
+          }
+        } else if (!reportedRenamedSlugs.has(slug) && this.removeAtom(slug)) {
+          changed.push(slug);
+          removed.push({ reason: 'renamed', conversation: conv, authoritativeSlug: authoritative.slug, slugs: [slug] });
+        }
+      }
+    }
+    return { changed, removed };
   }
 
   /**

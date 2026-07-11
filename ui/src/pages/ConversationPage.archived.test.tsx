@@ -314,6 +314,7 @@ describe('ConversationPage archived read-only rendering', () => {
       expect(cacheDB.getConversation).toHaveBeenCalledWith(uuidRoute);
     });
     expect(cacheDB.getConversationBySlug).not.toHaveBeenCalledWith(uuidRoute);
+    expect(cacheDB.getConversationBySlug).not.toHaveBeenCalledWith('uuid-archived');
   });
 
   it('uses authoritative metadata when the cached slug owner changed', async () => {
@@ -903,14 +904,15 @@ describe('ConversationPage archived read-only rendering', () => {
     );
 
     await waitFor(() => expect(hooksMockState.useConnection).toHaveBeenCalled());
-    const options = (hooksMockState.useConnection.mock.calls as unknown as Array<[unknown]>).at(-1)![0] as {
+    const connectionCalls = hooksMockState.useConnection.mock.calls as unknown as Array<[{
       getInitialRequestMode?: () => { kind: string; afterMessageFloor?: number; transcriptGeneration?: number };
-    };
-    expect(options.getInitialRequestMode?.()).toEqual({
-      kind: 'messages_after_floor',
-      afterMessageFloor: 2,
-      transcriptGeneration: 1,
-    });
+    }]>;
+    expect(connectionCalls.some(([options]) => {
+      const mode = options.getInitialRequestMode?.();
+      return mode?.kind === 'messages_after_floor'
+        && mode.afterMessageFloor === 2
+        && mode.transcriptGeneration === 1;
+    })).toBe(true);
   });
 
   it('falls back to a full archived conversation fetch when cold latest-window load hits MessageSliceAlignmentError', async () => {

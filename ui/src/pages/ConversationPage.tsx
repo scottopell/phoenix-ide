@@ -266,6 +266,23 @@ function ConversationPageContent() {
   // Derived from atom
   const conversationId = atom.conversationId ?? undefined;
   const conversation = atom.conversation;
+  useEffect(() => {
+    if (!conversationId) return;
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ conversationId?: string }>).detail;
+      if (detail?.conversationId === conversationId) {
+        navigate('/', { replace: true });
+      }
+    };
+    window.addEventListener('phoenix:conversation-locally-deleted', handler);
+    return () => window.removeEventListener('phoenix:conversation-locally-deleted', handler);
+  }, [conversationId, navigate]);
+
+  useEffect(() => {
+    if (!slug || isUuidRouteSegment(slug) || !conversation?.slug || conversation.slug === slug) return;
+    navigate(`/c/${conversation.slug}${location.search}${location.hash}`, { replace: true });
+  }, [conversation?.slug, location.hash, location.search, navigate, slug]);
+
   const [archiveStatusConfirmedConversationId, setArchiveStatusConfirmedConversationId] = useState<string | null>(null);
   const archiveStatusConfirmed =
     conversationId !== undefined && archiveStatusConfirmedConversationId === conversationId;

@@ -12,7 +12,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, act, waitFor } from '@testing-library/react';
 import {
-  ConversationProvider,
   ConversationStore,
   useConversationsList,
 } from './';
@@ -83,6 +82,15 @@ function Consumer({ onStore }: { onStore: (store: ConversationStore) => void }) 
   );
 }
 
+function renderWithStore(onStore: (store: ConversationStore) => void) {
+  const store = new ConversationStore();
+  return render(
+    <ConversationContext.Provider value={store}>
+      <Consumer onStore={onStore} />
+    </ConversationContext.Provider>,
+  );
+}
+
 describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
   it('SSE-driven update on non-active conversation reflects in the list immediately', async () => {
     let store: ConversationStore | undefined;
@@ -90,12 +98,7 @@ describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
       store = s;
     };
 
-    render(
-      <ConversationProvider>
-        <Consumer onStore={captureStore} />
-      </ConversationProvider>,
-    );
-    expect(store).toBeDefined();
+    renderWithStore(captureStore);
 
     // Seed two conversations into the store as if a refresh had landed.
     act(() => {
@@ -140,11 +143,7 @@ describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
       store = s;
     };
 
-    render(
-      <ConversationProvider>
-        <Consumer onStore={captureStore} />
-      </ConversationProvider>,
-    );
+    renderWithStore(captureStore);
 
     act(() => {
       store!.upsertSnapshot('alpha', makeConv('alpha', { updated_at: '2024-06-01T00:00:00Z' }));
@@ -181,11 +180,7 @@ describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
       store = s;
     };
 
-    render(
-      <ConversationProvider>
-        <Consumer onStore={captureStore} />
-      </ConversationProvider>,
-    );
+    renderWithStore(captureStore);
 
     act(() => {
       // Initial: SSE-driven row at updated_at=2024-06-02.
@@ -217,11 +212,7 @@ describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
       store = s;
     };
 
-    render(
-      <ConversationProvider>
-        <Consumer onStore={captureStore} />
-      </ConversationProvider>,
-    );
+    renderWithStore(captureStore);
 
     act(() => {
       store!.dispatch('old-slug', {
@@ -265,11 +256,7 @@ describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
       store = s;
     };
 
-    render(
-      <ConversationProvider>
-        <Consumer onStore={captureStore} />
-      </ConversationProvider>,
-    );
+    renderWithStore(captureStore);
 
     act(() => {
       store!.upsertSnapshot('top-level', makeConv('top-level'));
