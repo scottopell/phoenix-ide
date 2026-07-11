@@ -82,6 +82,22 @@ export type ConversationSearchProjection = SearchableSourceProjection<
   ConversationSearchSource
 >;
 
+export interface BlockSearchMatchTarget {
+  kind: 'block';
+  blockId: string;
+  lineNumber: number;
+  startOffset: number;
+  endOffset: number;
+}
+
+export interface BlockSearchSource extends SearchableSource<BlockSearchMatchTarget> {
+  kind: 'block';
+  blockId: string;
+  lineNumber: number;
+}
+
+export type BlockSearchProjection = SearchableSourceProjection<BlockSearchMatchTarget, BlockSearchSource>;
+
 export function buildFileSearchProjection(content: string, query: string): FileSearchProjection {
   const sources: FileSearchSource[] = [];
   let lineStart = 0;
@@ -234,6 +250,39 @@ function makeDiffLineSource(
 
 function headerText(fileDiff: { name: string; prevName?: string }): string {
   return fileDiff.prevName && fileDiff.prevName !== '' ? `${fileDiff.prevName} → ${fileDiff.name}` : fileDiff.name;
+}
+
+export function buildBlockSearchProjection(
+  blocks: readonly { id: string; lineNumber: number; text: string }[],
+  query: string,
+): BlockSearchProjection {
+  const sources: BlockSearchSource[] = blocks
+    .filter((block) => block.text.length > 0)
+    .map((block) => ({
+      id: block.id,
+      kind: 'block',
+      blockId: block.id,
+      lineNumber: block.lineNumber,
+      text: block.text,
+      target: {
+        kind: 'block',
+        blockId: block.id,
+        lineNumber: block.lineNumber,
+        startOffset: 0,
+        endOffset: 0,
+      },
+    }));
+
+  return {
+    sources,
+    matches: projectMatches(sources, query, (source, match) => ({
+      kind: 'block',
+      blockId: source.blockId,
+      lineNumber: source.lineNumber,
+      startOffset: match.start,
+      endOffset: match.end,
+    })),
+  };
 }
 
 export function buildConversationSearchProjection(units: readonly RenderUnit[], query: string): ConversationSearchProjection {

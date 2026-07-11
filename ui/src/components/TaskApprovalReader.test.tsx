@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { TaskApprovalReader } from './TaskApprovalReader';
 import type { TaskApprovalReaderProps } from './TaskApprovalReader';
@@ -160,5 +160,45 @@ describe('TaskApprovalReader feedback action emphasis', () => {
     expect(screen.queryByText('Approving...')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve and start here' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Approve and start a new continuation conversation' })).toBeEnabled();
+  });
+});
+
+
+describe('TaskApprovalReader shared find integration', () => {
+  it('opens shared find and restores focus to the opener on Escape', async () => {
+    renderTaskApprovalReader('# Plan\n\nalpha\nbeta alpha');
+
+    const findButton = screen.getByRole('button', { name: 'Find in task approval' });
+    findButton.focus();
+    fireEvent.click(findButton);
+
+    const input = screen.getByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha' } });
+
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+    expect(findButton).toHaveFocus();
+  });
+
+  it('lets find Escape close the find bar without dismissing the approval reader or note dialog precedence', () => {
+    renderTaskApprovalReader('# Plan\n\nalpha');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /add note to line 1/i }));
+    expect(screen.getByPlaceholderText('Add your note...')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Add your note...')).toBeInTheDocument();
+    expect(screen.getByText('Review task')).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(screen.queryByPlaceholderText('Add your note...')).not.toBeInTheDocument();
+    expect(screen.getByText('Review task')).toBeInTheDocument();
   });
 });

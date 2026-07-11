@@ -22,6 +22,12 @@ import { generateUUID } from '../utils/uuid';
 import type { TaskApprovalHandoff } from '../api';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
 import {
+  FindBar,
+  buildBlockSearchProjection,
+  useViewerFind,
+  useViewerFindKeyboardShortcut,
+} from './viewer-find';
+import {
   X,
   MessageSquare,
   MessageSquarePlus,
@@ -162,6 +168,7 @@ function AnnotatableBlock({
   children,
   ...rest
 }: AnnotatableBlockProps) {
+  
   const { start, move, end } = useLongPress(onAnnotate);
   const cls = [
     'annotatable',
@@ -201,6 +208,31 @@ function AnnotatableBlock({
   );
 }
 
+function renderFindFragments(
+  text: string,
+  matches: readonly { start: number; end: number; occurrenceIndex: number }[],
+  activeOccurrence: number,
+): React.ReactNode[] {
+  if (matches.length === 0) return [text];
+  const fragments: React.ReactNode[] = [];
+  let cursor = 0;
+  matches.forEach((match) => {
+    if (match.start > cursor) fragments.push(text.slice(cursor, match.start));
+    fragments.push(
+      <mark
+        key={`${match.start}-${match.end}-${match.occurrenceIndex}`}
+        className={match.occurrenceIndex === activeOccurrence ? 'viewer-find-match viewer-find-match--active' : 'viewer-find-match'}
+        data-find-occurrence={match.occurrenceIndex}
+      >
+        {text.slice(match.start, match.end)}
+      </mark>
+    );
+    cursor = match.end;
+  });
+  if (cursor < text.length) fragments.push(text.slice(cursor));
+  return fragments;
+}
+
 export function TaskApprovalReader({
   title,
   priority,
@@ -238,8 +270,25 @@ export function TaskApprovalReader({
     ? getTaskApprovalContextRecommendation(contextUsage)
     : null;
 
+  const find = useViewerFind({ text: plan });
+  useViewerFindKeyboardShortcut({ scopeId: 'task-approval', onOpen: find.open });
+  const planBlocks = useMemo(() => {
+    const rawLines = plan.split('\n');
+    return rawLines.map((text, index) => ({
+      id: `line:${index + 1}`,
+      lineNumber: index + 1,
+      text,
+    }));
+  }, [plan]);
+  const findProjection = useMemo(
+    () => buildBlockSearchProjection(planBlocks, find.query),
+    [planBlocks, find.query]
+  );
+
   const noteInputRef = useRef<HTMLTextAreaElement>(null);
+  const findButtonRef = useRef<HTMLButtonElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
+  const blockRefs = useRef<Map<string, HTMLElement>>(new Map());
 
   // Focus note input when dialog opens
   useEffect(() => {
@@ -279,10 +328,18 @@ export function TaskApprovalReader({
     setNoteInput('');
   }, [annotatingLine, noteInput]);
 
-  // Block Escape from closing — only allow it to dismiss annotation dialog or discard confirm
+  // Block Escape from closing — note/dialog/discard/find each get precedence, but
+  // the approval reader itself still cannot be dismissed by Escape.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        if (find.isOpen) {
+          e.preventDefault();
+          e.stopPropagation();
+          find.close();
+          queueMicrotask(() => findButtonRef.current?.focus());
+          return;
+        }
         e.preventDefault();
         e.stopPropagation();
         if (annotatingLine) {
@@ -290,16 +347,16 @@ export function TaskApprovalReader({
         } else if (discardConfirmOpen) {
           setDiscardConfirmOpen(false);
         }
-        // Otherwise: do nothing. Cannot close the approval reader via Escape.
+        return;
       }
       if (annotatingLine && (e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         handleAddNote();
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown, true); // capture phase
+    window.addEventListener('keydown', handleKeyDown, true);
     return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [annotatingLine, discardConfirmOpen, handleAddNote]);
+  }, [annotatingLine, discardConfirmOpen, find, handleAddNote]);
 
   const handleLongPress = useCallback(
     (lineNumber: number, lineContent: string) => {
@@ -326,6 +383,28 @@ export function TaskApprovalReader({
     }
     setShowNotesPanel(false);
   }, []);
+
+  const closeFind = useCallback(() => {
+    find.close();
+    queueMicrotask(() => findButtonRef.current?.focus());
+  }, [find]);
+
+  const handleFindQueryChange = useCallback((query: string) => {
+    find.setQuery(query);
+    const target = buildBlockSearchProjection(planBlocks, query).matches[0]?.target;
+    if (!target) return;
+    queueMicrotask(() => {
+      blockRefs.current.get(target.blockId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }, [find, planBlocks]);
+
+  const handleFindNext = useCallback(() => {
+    find.nextMatch();
+  }, [find]);
+
+  const handleFindPrevious = useCallback(() => {
+    find.previousMatch();
+  }, [find]);
 
   // Format and send notes (REQ-PF-009 format)
   const handleSendFeedback = useCallback(() => {
@@ -354,14 +433,32 @@ export function TaskApprovalReader({
     [onApprove]
   );
 
+  useEffect(() => {
+    if (!find.isOpen || find.activeIndex < 0) return;
+    const target = findProjection.matches[find.activeIndex]?.target;
+    if (!target) return;
+    blockRefs.current.get(target.blockId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (target.lineNumber > 0) setHighlightedLine(target.lineNumber);
+  }, [find.activeIndex, find.isOpen, findProjection.matches]);
+
   const confirmDiscard = useCallback(() => {
     setDiscardConfirmOpen(false);
     onReject();
   }, [onReject]);
 
-  // Render plan as markdown with annotatable blocks
+  // Render plan as markdown with annotatable blocks.
   const renderPlanMarkdown = useMemo(() => {
     const rawLines = plan.split('\n');
+    const matchesByLine = new Map<number, Array<{ start: number; end: number; occurrenceIndex: number }>>();
+    findProjection.matches.forEach((match, occurrenceIndex) => {
+      const lineMatches = matchesByLine.get(match.target.lineNumber) ?? [];
+      lineMatches.push({
+        start: match.target.startOffset,
+        end: match.target.endOffset,
+        occurrenceIndex,
+      });
+      matchesByLine.set(match.target.lineNumber, lineMatches);
+    });
 
     const annotatable = (Tag: React.ElementType) =>
       ({
@@ -385,6 +482,18 @@ export function TaskApprovalReader({
           .slice(startLine, endLine + 1)
           .join(' ')
           .slice(0, 200);
+        const blockId = `line:${ln}`;
+        const lineText = rawLines[ln - 1] ?? '';
+        const lineMatches = matchesByLine.get(ln) ?? [];
+        const childText = typeof children === 'string'
+          ? children
+          : Array.isArray(children) && children.every((child) => typeof child === 'string')
+            ? children.join('')
+            : null;
+        const shouldDecorateChildren =
+          lineMatches.length > 0
+          && childText !== null
+          && childText === lineText;
         return (
           <AnnotatableBlock
             as={Tag}
@@ -394,11 +503,19 @@ export function TaskApprovalReader({
             className="viewer-markdown-block"
             isHighlighted={highlightedLine === ln}
             lineRef={(el) => {
-              if (el) lineRefs.current.set(ln, el);
+              if (el) {
+                lineRefs.current.set(ln, el);
+                blockRefs.current.set(blockId, el);
+              } else {
+                lineRefs.current.delete(ln);
+                blockRefs.current.delete(blockId);
+              }
             }}
             {...props}
           >
-            {children}
+            {shouldDecorateChildren
+              ? renderFindFragments(childText ?? lineText, lineMatches, find.activeIndex)
+              : children}
           </AnnotatableBlock>
         );
       };
@@ -453,7 +570,7 @@ export function TaskApprovalReader({
         {plan}
       </ReactMarkdown>
     );
-  }, [plan, highlightedLine, handleLongPress]);
+  }, [plan, highlightedLine, handleLongPress, findProjection.matches, find.activeIndex]);
 
   return (
     <div className="task-approval-reader">
@@ -477,6 +594,27 @@ export function TaskApprovalReader({
             </>
           )}
           <button
+            ref={findButtonRef}
+            className="task-approval-badge"
+            onClick={find.open}
+            aria-label="Find in task approval"
+            title="Find in task approval"
+          >
+            Find
+          </button>
+          {notes.length > 0 && (
+            <>
+              <button
+                className="task-approval-badge"
+                onClick={() => setShowNotesPanel(!showNotesPanel)}
+                aria-label={`${notes.length} notes`}
+              >
+                <MessageSquare size={18} />
+                <span>{notes.length}</span>
+              </button>
+            </>
+          )}
+          <button
             className="task-approval-header-discard"
             onClick={handleDiscard}
             aria-label="Discard task"
@@ -486,6 +624,19 @@ export function TaskApprovalReader({
           </button>
         </div>
       </div>
+
+      {find.isOpen && (
+        <FindBar
+          query={find.query}
+          activeIndex={find.activeIndex}
+          matchCount={find.matchCount}
+          onQueryChange={handleFindQueryChange}
+          onNext={handleFindNext}
+          onPrevious={handleFindPrevious}
+          onClose={closeFind}
+          autoFocus={false}
+        />
+      )}
 
       {/* Plan content */}
       <div className="task-approval-content">

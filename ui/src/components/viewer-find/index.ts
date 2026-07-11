@@ -1,9 +1,13 @@
 export { FindBar, type FindBarProps } from './FindBar';
 export { findLiteralMatches, type ViewerFindMatch, type ViewerFindResult } from './literalMatch';
 export {
+  buildBlockSearchProjection,
   buildConversationSearchProjection,
   buildDiffSearchProjection,
   buildFileSearchProjection,
+  type BlockSearchMatchTarget,
+  type BlockSearchProjection,
+  type BlockSearchSource,
   type ConversationSearchMatchTarget,
   type ConversationSearchProjection,
   type ConversationSearchSource,
