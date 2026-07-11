@@ -723,9 +723,8 @@ export function AboutDeploymentPage() {
         .catch((e) => setError(e instanceof Error ? e.message : String(e)))
         .finally(() => setLoading(false)),
       loadDisk(),
-      fetchResources(),
     ]);
-  }, [fetchResources, loadDisk]);
+  }, [loadDisk]);
 
   useEffect(() => {
     let cancelled = false;
