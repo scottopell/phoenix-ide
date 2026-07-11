@@ -15,7 +15,7 @@ import {
   type ModelInfo,
   type PrStatusResponse,
 } from "../api";
-import type { ConversationPrStatusState } from "../hooks/useConversationPrStatus";
+import type { ConversationPrStatusHandle } from "../hooks/useConversationPrStatus";
 import type { ConnectionState } from "../hooks";
 import { useIsMobile } from "../hooks";
 import { getStateDescription, isAgentWorking } from "../utils";
@@ -130,7 +130,7 @@ interface StateBarProps {
    *  assigns `undefined` from a ternary, which the strict mode rejects
    *  without this annotation. */
   onOpenFiles?: (() => void) | undefined;
-  prStatusState?: ConversationPrStatusState;
+  prStatusHandle?: ConversationPrStatusHandle;
 }
 
 /** Format a context window size in tokens for compact display (e.g. 200k, 1M). */
@@ -230,6 +230,96 @@ function StateBarPrBadge({ pr }: { pr: PrStatusResponse }) {
   );
 }
 
+function ActivePrSelector({ handle }: { handle: ConversationPrStatusHandle }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLSpanElement>(null);
+  const selection = handle.activeSelection;
+  const activePr = handle.activePrSummary;
+  const actionablePrs = selection?.associated_prs.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft') ?? [];
+  const ambiguous = handle.ambiguous;
+  const activeLabel = activePr ? `#${activePr.pr_number}` : 'Choose PR';
+  const provenance = selection?.active_pr?.provenance;
+  const pinned = provenance === 'pinned';
+  const canResume = provenance === 'pinned';
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [open]);
+
+  if (actionablePrs.length === 0 && !activePr && !ambiguous) return null;
+
+  return (
+    <span className="active-pr-selector" ref={rootRef}>
+      <button
+        type="button"
+        className={`active-pr-selector-trigger${ambiguous ? ' active-pr-selector-trigger--ambiguous' : ''}`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={ambiguous ? 'Select active pull request' : `Active pull request ${activeLabel}`}
+        data-testid="active-pr-selector-trigger"
+        onClick={(event) => {
+          event.stopPropagation();
+          setOpen((value) => !value);
+        }}
+      >
+        <span className="active-pr-selector-label">{ambiguous ? 'PR ?' : activeLabel}</span>
+        {pinned && <span className="active-pr-selector-badge" data-testid="active-pr-pinned-indicator">Pinned</span>}
+        {!pinned && activePr && provenance === 'inferred' && <span className="active-pr-selector-badge">Auto</span>}
+      </button>
+      {open && (
+        <div className="active-pr-selector-menu" role="menu" aria-label="Active pull request choices">
+          {ambiguous && (
+            <div className="active-pr-selector-note" data-testid="active-pr-ambiguity-label">
+              Multiple actionable PRs — choose one.
+            </div>
+          )}
+          {actionablePrs.map((pr) => {
+            const isActive = activePr?.pr_number === pr.pr_number;
+            return (
+              <button
+                key={`${pr.repo_owner}/${pr.repo_name}#${pr.pr_number}`}
+                type="button"
+                role="menuitem"
+                className={`active-pr-selector-item${isActive ? ' active-pr-selector-item--active' : ''}`}
+                data-testid={`active-pr-choice-${pr.pr_number}`}
+                onClick={async (event) => {
+                  event.stopPropagation();
+                  await handle.pinActivePr?.({ repo_owner: pr.repo_owner, repo_name: pr.repo_name, pr_number: pr.pr_number });
+                  setOpen(false);
+                }}
+              >
+                <span className="active-pr-selector-item-label">#{pr.pr_number}</span>
+                <span className="active-pr-selector-item-title">{pr.title}</span>
+                {isActive && <span className="active-pr-selector-item-state">Active</span>}
+              </button>
+            );
+          })}
+          {canResume && (
+            <button
+              type="button"
+              role="menuitem"
+              className="active-pr-selector-item active-pr-selector-item--resume"
+              data-testid="active-pr-resume-inference"
+              onClick={async (event) => {
+                event.stopPropagation();
+                await handle.resumeInference?.();
+                setOpen(false);
+              }}
+            >
+              Resume automatic inference
+            </button>
+          )}
+        </div>
+      )}
+    </span>
+  );
+}
+
 /** Format elapsed seconds as a compact duration string.
  *  < 60s  -> "4s"
  *  >= 60s -> "1m 4s" (seconds part omitted when 0: "2m")
@@ -266,7 +356,7 @@ export function StateBar({
   firstByteRequestId,
   turnRetryContext,
   onOpenFiles,
-  prStatusState,
+  prStatusHandle,
 }: StateBarProps) {
   // `toolExecutingStartedAt` is kept on the prop type for the
   // tool-widget header (which still reads it from the atom). The
@@ -696,8 +786,8 @@ export function StateBar({
   const branchName = conversation?.branch_name;
   const taskTitle = conversation?.task_title;
   const prStatus =
-    prStatusState?.status === "ready" ? prStatusState.prStatus : null;
-  const prLoading = prStatusState?.status === "loading";
+    prStatusHandle?.state.status === "ready" ? prStatusHandle.state.prStatus : null;
+  const prLoading = prStatusHandle?.state.status === "loading";
   const prHint =
     prStatus && !prStatus.found
       ? unavailablePrHint(prStatus.unavailable_reason)
@@ -709,7 +799,8 @@ export function StateBar({
 
   const prStatusContent = (
     <>
-      {prStatus?.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
+      {(prStatusHandle?.activePrSummary || !prStatusHandle?.activeSelection) && prStatus && prStatus.found && prStatus.url && <StateBarPrBadge pr={prStatus} />}
+      {prStatusHandle && <ActivePrSelector handle={prStatusHandle} />}
       {prHint && !prLoading && (
         <span
           className="pr-hint"
@@ -1110,17 +1201,7 @@ export function StateBar({
                       <span className="git-base">{baseBranch}</span>
                       <span className="git-arrow">&larr;</span>
                       <span className="git-branch">{branchName}</span>
-                      {prStatus?.found && prStatus.url && (
-                        <StateBarPrBadge pr={prStatus} />
-                      )}
-                      {prHint && !prLoading && (
-                        <span
-                          className="pr-hint"
-                          title="Install and authenticate GitHub CLI to enable PR tracking"
-                        >
-                          {prHint}
-                        </span>
-                      )}
+                      {prStatusContent}
                     </span>
                   )}
                   {branchName && !baseBranch && (
@@ -1129,17 +1210,7 @@ export function StateBar({
                       title={`Branch: ${branchName}`}
                     >
                       {branchName}
-                      {prStatus?.found && prStatus.url && (
-                        <StateBarPrBadge pr={prStatus} />
-                      )}
-                      {prHint && !prLoading && (
-                        <span
-                          className="pr-hint"
-                          title="Install and authenticate GitHub CLI to enable PR tracking"
-                        >
-                          {prHint}
-                        </span>
-                      )}
+                      {prStatusContent}
                     </span>
                   )}
                   {projectName && (

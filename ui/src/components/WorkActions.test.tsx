@@ -596,7 +596,7 @@ describe('WorkControlBar — View Diff (View Browser gone)', () => {
 
     expect(slot).toEqual({ kind: 'none' });
     fireEvent.click(screen.getByTestId('view-diff-button'));
-    expect(slot).toEqual({ kind: 'diff', presentation: 'fullscreen' });
+    expect(slot).toEqual({ kind: 'diff', presentation: 'fullscreen', target: 'workspace' });
     expect(api.getConversationDiff).not.toHaveBeenCalled();
   });
 });

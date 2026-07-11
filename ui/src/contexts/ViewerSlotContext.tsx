@@ -34,10 +34,12 @@ export interface ProseFile {
   focusLine?: number | undefined;
 }
 
+export type DiffTarget = 'workspace' | 'active_pr';
+
 export type ViewerSlot =
   | { kind: 'none' }
   | { kind: 'prose'; file: ProseFile; patchContext: PatchContext | null }
-  | { kind: 'diff'; presentation: DiffPresentation }
+  | { kind: 'diff'; presentation: DiffPresentation; target: DiffTarget }
   | { kind: 'browser' }
   | { kind: 'inspect'; scopeKey: string; handleId: string }
   | { kind: 'message'; sequenceId: number };
@@ -47,8 +49,8 @@ export type ViewerSlot =
  *  re-render when the open viewer or the session flag changes. */
 export interface ViewerSlotCommands {
   openProse: (path: string, rootDir: string, options?: OpenFileOptions) => void;
-  openDiff: (presentation: DiffPresentation) => void;
-  openDiffFullscreen: () => void;
+  openDiff: (presentation: DiffPresentation, target?: DiffTarget) => void;
+  openDiffFullscreen: (target?: DiffTarget) => void;
   openBrowser: () => void;
   /** Open the process inspector on a single bash handle, addressed by its
    *  `(scope_key, handle_id)` pair (REQ-PINSP-007). */
@@ -75,6 +77,7 @@ const ViewerSlotBrowserActiveContext = createContext<boolean | null>(null);
 
 const VIEWER_PARAM = 'viewer';
 const DIFF_PRESENTATION_PARAM = 'presentation';
+const DIFF_TARGET_PARAM = 'target';
 const FILE_PARAM = 'file';
 const ROOT_PARAM = 'root';
 const LINE_PARAM = 'line';
@@ -88,6 +91,7 @@ const MESSAGE_PARAM = 'message';
 const SLOT_PARAMS = [
   VIEWER_PARAM,
   DIFF_PRESENTATION_PARAM,
+  DIFF_TARGET_PARAM,
   FILE_PARAM,
   ROOT_PARAM,
   LINE_PARAM,
@@ -117,6 +121,7 @@ function deriveSlot(
 ): DerivedSlot {
   const viewer = searchParams.get(VIEWER_PARAM);
   const presentation = searchParams.get(DIFF_PRESENTATION_PARAM);
+  const target = searchParams.get(DIFF_TARGET_PARAM);
   const file = searchParams.get(FILE_PARAM);
   const root = searchParams.get(ROOT_PARAM);
 
@@ -131,11 +136,15 @@ function deriveSlot(
       const focusLine = parseFocusLineParam(searchParams.get(LINE_PARAM));
       return { slot: { kind: 'prose', file: { path: file, rootDir: root, focusLine }, patchContext }, malformed: false };
     }
-    case 'diff':
+    case 'diff': {
       if (presentation !== 'fullscreen' && presentation !== 'pane') {
         return { slot: { kind: 'none' }, malformed: true };
       }
-      return { slot: { kind: 'diff', presentation }, malformed: false };
+      if (target !== null && target !== 'workspace' && target !== 'active_pr') {
+        return { slot: { kind: 'none' }, malformed: true };
+      }
+      return { slot: { kind: 'diff', presentation, target: target ?? 'workspace' }, malformed: false };
+    }
     case 'browser':
       return { slot: { kind: 'browser' }, malformed: false };
     case 'inspect': {
@@ -226,16 +235,17 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     [setPatchContext, writeUrl],
   );
 
-  const openDiff = useCallback((presentation: DiffPresentation) => {
+  const openDiff = useCallback((presentation: DiffPresentation, target: DiffTarget = 'workspace') => {
     setPatchContext(null);
     writeUrl((next) => {
       clearSlotParams(next);
       next.set(VIEWER_PARAM, 'diff');
       next.set(DIFF_PRESENTATION_PARAM, presentation);
+      next.set(DIFF_TARGET_PARAM, target);
     });
   }, [setPatchContext, writeUrl]);
 
-  const openDiffFullscreen = useCallback(() => openDiff('fullscreen'), [openDiff]);
+  const openDiffFullscreen = useCallback((target: DiffTarget = 'workspace') => openDiff('fullscreen', target), [openDiff]);
 
   const openBrowser = useCallback(() => {
     setPatchContext(null);
@@ -314,7 +324,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     if (!isEntry) return;
     if (!scopeKey) return;
     if (location.key === 'default') return;
-    if (searchParams.has(VIEWER_PARAM) || searchParams.has(FILE_PARAM) || searchParams.has(ROOT_PARAM) || searchParams.has(DIFF_PRESENTATION_PARAM)) return;
+    if (searchParams.has(VIEWER_PARAM) || searchParams.has(FILE_PARAM) || searchParams.has(ROOT_PARAM) || searchParams.has(DIFF_PRESENTATION_PARAM) || searchParams.has(DIFF_TARGET_PARAM)) return;
     const stored = getLastViewer(scopeKey);
     if (!stored) return;
     setSearchParams(new URLSearchParams(stored), { replace: true });

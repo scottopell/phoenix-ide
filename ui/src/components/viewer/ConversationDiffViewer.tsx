@@ -68,7 +68,7 @@ export function ConversationDiffViewer({
       <DiffView
         open
         comparator={p.comparator}
-        label={p.label}
+        label={p.label ?? (target === 'active_pr' ? 'PR Diff' : 'Workspace Diff')}
         commitLog={p.commit_log}
         committedDiff={p.committed_diff}
         committedTruncatedKib={p.committed_truncated_kib}

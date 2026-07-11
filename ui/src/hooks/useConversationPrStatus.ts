@@ -19,11 +19,11 @@ type InternalConversationPrStatusState = ConversationPrStatusState & { scopeKey:
 export interface ConversationPrStatusHandle {
   state: ConversationPrStatusState;
   refresh: () => Promise<void>;
-  activeSelection: AssociatedPrStatusEnvelope | null;
-  activePrSummary: AssociatedPrSummaryResponse | null;
-  ambiguous: boolean;
-  pinActivePr: (request: PinAssociatedPrRequest) => Promise<void>;
-  resumeInference: () => Promise<void>;
+  activeSelection?: AssociatedPrStatusEnvelope | null;
+  activePrSummary?: AssociatedPrSummaryResponse | null;
+  ambiguous?: boolean;
+  pinActivePr?: (request: PinAssociatedPrRequest) => Promise<void>;
+  resumeInference?: () => Promise<void>;
 }
 
 function displayStateToGhState(displayState: CachedPrSummary['display_state']): string {

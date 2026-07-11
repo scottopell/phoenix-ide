@@ -245,7 +245,9 @@ function ConversationPageContent() {
   const viewerSlot = useViewerSlot();
   const slotKind = viewerSlot.slot.kind;
   const rawDiffPresentation = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.presentation : null;
+  const rawDiffTarget = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.target : 'workspace';
   const diffPresentation = isArchived ? null : rawDiffPresentation;
+  const diffTarget = isArchived ? 'workspace' : rawDiffTarget;
   const fullscreenDiffOpen = diffPresentation === 'fullscreen';
   const paneDiffOpen = diffPresentation === 'pane';
   const browserOpen = slotKind === 'browser';
@@ -1438,6 +1440,7 @@ function ConversationPageContent() {
           <Suspense fallback={null}>
             <ConversationDiffViewer
               conversationId={conversationId}
+              target={diffTarget}
               onClose={handleCloseDiff}
               onSendNotes={handleSendNotes}
               inline
@@ -2037,7 +2040,7 @@ function ConversationPageContent() {
         firstByteRequestId={atom.firstByteRequestId}
         turnRetryContext={atom.turnRetryContext}
         onOpenFiles={isDesktop || !fileRootPath ? undefined : handleOpenFiles}
-        prStatusState={prStatusHandle.state}
+        prStatusHandle={prStatusHandle}
       />
       </RenderProfiler>
       </div>
@@ -2119,6 +2122,7 @@ function ConversationPageContent() {
         <Suspense fallback={null}>
           <ConversationDiffViewer
             conversationId={conversationId}
+            target={diffTarget}
             onClose={handleCloseDiff}
             onSendNotes={handleSendNotes}
             takeover
@@ -2129,6 +2133,7 @@ function ConversationPageContent() {
         <Suspense fallback={null}>
           <ConversationDiffViewer
             conversationId={conversationId}
+            target={diffTarget}
             onClose={handleCloseDiff}
             onSendNotes={handleSendNotes}
           />
@@ -2211,6 +2216,7 @@ function ConversationPageContent() {
               {paneDiffOpen && conversationId ? (
                 <ConversationDiffViewer
                   conversationId={conversationId}
+                  target={diffTarget}
                   onClose={handleCloseDiff}
                   onSendNotes={handleSendNotes}
                   inline

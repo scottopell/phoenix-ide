@@ -119,10 +119,14 @@ export function WorkControlBar({
   const prLoading = prStatusHandle.state.status === 'loading';
   const prStatus = prStatusHandle.state.status === 'ready' ? prStatusHandle.state.prStatus : null;
   const activePr = prStatusHandle.activePrSummary;
-  const activePrNumber = activePr?.pr_number ?? prStatus?.number ?? prStatus?.pr?.number ?? null;
+  const legacyActivePrNumber = !prStatusHandle.activeSelection && prStatus?.found
+    ? (prStatus.number ?? prStatus.pr?.number ?? null)
+    : null;
+  const activePrNumber = activePr?.pr_number ?? legacyActivePrNumber;
   const activePrLabel = activePrNumber ? `PR #${activePrNumber}` : 'PR';
   const selection = prStatusHandle.activeSelection;
-  const canShowPrDiff = !!activePr;
+  const prSpecificActionsEnabled = activePrNumber !== null && !prStatusHandle.ambiguous;
+  const canShowPrDiff = !!activePr && prSpecificActionsEnabled;
   const diffLabel = useMemo(
     () => (canShowPrDiff ? `${activePrLabel} Diff` : 'Workspace Diff'),
     [activePrLabel, canShowPrDiff],
@@ -170,7 +174,7 @@ export function WorkControlBar({
         <button
           className={`work-actions-btn work-actions-view-diff${primaryClass('review')}`}
           data-testid="view-diff-button"
-          onClick={() => openDiffFullscreen()}
+          onClick={() => openDiffFullscreen('workspace')}
         >
           Workspace Diff
         </button>
@@ -178,7 +182,7 @@ export function WorkControlBar({
           <button
             className="work-actions-btn work-actions-view-diff"
             data-testid="view-active-pr-diff-button"
-            onClick={() => openDiffFullscreen()}
+            onClick={() => openDiffFullscreen('active_pr')}
           >
             {diffLabel}
           </button>
@@ -188,7 +192,7 @@ export function WorkControlBar({
       {/* RESOLVE zone — only when the disposition pushes forward (idle). */}
       {disposition.primary === 'resolve' && disposition.resolve && (
         <div className="work-actions-zone work-actions-zone--resolve">
-          {disposition.resolve.kind === 'address_feedback' && (
+          {disposition.resolve.kind === 'address_feedback' && prSpecificActionsEnabled && (
             <button
               type="button"
               className={`work-actions-btn work-actions-address${primaryClass('resolve')}`}

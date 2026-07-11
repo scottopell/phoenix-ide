@@ -56,7 +56,7 @@ describe('ViewerSlot — open/close transitions', () => {
     expect(h.search()).toContain('viewer=prose');
 
     act(() => { h.get().openDiff('pane'); });
-    expect(h.get().slot).toEqual({ kind: 'diff', presentation: 'pane' });
+    expect(h.get().slot).toEqual({ kind: 'diff', presentation: 'pane', target: 'workspace' });
     expect(h.search()).toContain('viewer=diff');
     expect(h.search()).toContain('presentation=pane');
 
@@ -160,7 +160,7 @@ describe('ViewerSlot — structural single-slot mutex', () => {
     expect(h.search()).toContain('file=');
 
     act(() => { h.get().openDiffFullscreen(); });
-    expect(h.get().slot).toEqual({ kind: 'diff', presentation: 'fullscreen' });
+    expect(h.get().slot).toEqual({ kind: 'diff', presentation: 'fullscreen', target: 'workspace' });
     expect(h.search()).toContain('viewer=diff');
     expect(h.search()).toContain('presentation=fullscreen');
     expect(h.search()).not.toContain('file=');
@@ -210,7 +210,7 @@ describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
 
   it('parses fullscreen diff URLs and normalizes missing diff presentation to none', async () => {
     const fullscreen = renderSlot('/c/conv-A?viewer=diff&presentation=fullscreen');
-    expect(fullscreen.get().slot).toEqual({ kind: 'diff', presentation: 'fullscreen' });
+    expect(fullscreen.get().slot).toEqual({ kind: 'diff', presentation: 'fullscreen', target: 'workspace' });
 
     const malformed = renderSlot('/c/conv-A?viewer=diff');
     expect(malformed.get().slot.kind).toBe('none');
@@ -218,6 +218,15 @@ describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
       expect(malformed.search()).not.toContain('viewer=');
       expect(malformed.search()).not.toContain('presentation=');
     });
+  });
+
+  it('parses active PR diff URLs and writes diff target explicitly', () => {
+    const activePr = renderSlot('/c/conv-A?viewer=diff&presentation=fullscreen&target=active_pr');
+    expect(activePr.get().slot).toEqual({ kind: 'diff', presentation: 'fullscreen', target: 'active_pr' });
+
+    const h = renderSlot();
+    act(() => { h.get().openDiffFullscreen('active_pr'); });
+    expect(h.search()).toContain('target=active_pr');
   });
 
   it('removes the diff presentation param when opening prose or browser', () => {

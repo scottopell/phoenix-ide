@@ -3,7 +3,7 @@ import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { StateBar } from './StateBar';
-import { api, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
+import { api, type AssociatedPrStatusEnvelope, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
@@ -128,7 +128,7 @@ function renderStateBar({
     props.continuation = continuation;
   }
   if (prStatus) {
-    props.prStatusState = { status: 'ready', prStatus };
+    props.prStatusHandle = makePrStatusHandle(prStatus, prStatus.selection ?? null);
   }
   if (phaseStateUpdatedAt !== undefined) {
     props.phaseStateUpdatedAt = phaseStateUpdatedAt;
@@ -171,6 +171,45 @@ const pickerModels: ModelInfo[] = [
   { id: 'claude-sonnet-4-6', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: false },
   { id: 'claude-opus-4-7', provider: 'anthropic', description: '', context_window: 1_000_000, recommended: true },
 ];
+
+function makeSelection(overrides: Partial<AssociatedPrStatusEnvelope> = {}): AssociatedPrStatusEnvelope {
+  return {
+    associated_prs: [
+      {
+        repo_owner: 'o',
+        repo_name: 'r',
+        pr_number: 12,
+        title: 'Fix CI',
+        url: 'https://github.com/scottopell/phoenix-ide/pull/12',
+        state: 'OPEN',
+        draft: false,
+        display_state: 'open',
+        base: 'main',
+        head: 'task-123-pr-status',
+        feedback_status: 'open',
+      },
+    ],
+    active_pr: {
+      pr: { repo_owner: 'o', repo_name: 'r', pr_number: 12 },
+      provenance: 'inferred',
+    },
+    ...overrides,
+  };
+}
+
+function makePrStatusHandle(prStatus: PrStatusResponse, selection: ReturnType<typeof makeSelection> | null = makeSelection()) {
+  return {
+    state: { status: 'ready' as const, prStatus: selection ? { ...prStatus, selection } : prStatus },
+    refresh: vi.fn().mockResolvedValue(undefined),
+    activeSelection: selection,
+    activePrSummary: selection?.active_pr
+      ? selection.associated_prs.find((pr) => pr.pr_number === selection.active_pr?.pr.pr_number) ?? null
+      : null,
+    ambiguous: !!selection && !selection.active_pr && selection.associated_prs.filter((pr) => pr.display_state === 'open' || pr.display_state === 'draft').length > 1,
+    pinActivePr: vi.fn().mockResolvedValue(undefined),
+    resumeInference: vi.fn().mockResolvedValue(undefined),
+  };
+}
 
 function mockPrStatus(status: Partial<PrStatusResponse>): PrStatusResponse {
   return {
@@ -270,6 +309,60 @@ describe('StateBar PR badge', () => {
     expect(screen.queryByRole('dialog', { name: /PR CI monitoring/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Auto-fix CI & address comments/i })).not.toBeInTheDocument();
     expect(api.createPrAutoFixContext).not.toHaveBeenCalled();
+  });
+  it('shows pinned selector choice and can resume automatic inference', async () => {
+    const selection = makeSelection({ active_pr: { pr: { repo_owner: 'o', repo_name: 'r', pr_number: 12 }, provenance: 'pinned' } });
+    const handle = makePrStatusHandle(mockPrStatus({ found: true, number: 12, url: 'https://github.com/scottopell/phoenix-ide/pull/12', display_state: 'open' }), selection);
+    render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId('active-pr-pinned-indicator')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
+    fireEvent.click(screen.getByTestId('active-pr-resume-inference'));
+    await waitFor(() => expect(handle.resumeInference).toHaveBeenCalled());
+  });
+
+  it('shows ambiguity explicitly and does not render an unrelated PR badge', async () => {
+    const selection = makeSelection({
+      associated_prs: [
+        { repo_owner: 'o', repo_name: 'r', pr_number: 12, title: 'Fix CI', url: 'https://github.com/scottopell/phoenix-ide/pull/12', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'a', feedback_status: 'open' },
+        { repo_owner: 'o', repo_name: 'r', pr_number: 34, title: 'Stacked follow-up', url: 'https://github.com/scottopell/phoenix-ide/pull/34', state: 'OPEN', draft: false, display_state: 'open', base: 'main', head: 'b', feedback_status: 'open' },
+      ],
+    });
+    delete selection.active_pr;
+    const handle = makePrStatusHandle(mockPrStatus({ found: false }), selection);
+    render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'idle' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          prStatusHandle={handle}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByRole('link', { name: /^#12/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('active-pr-selector-trigger'));
+    expect(screen.getByTestId('active-pr-ambiguity-label')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('active-pr-choice-34'));
+    await waitFor(() => expect(handle.pinActivePr).toHaveBeenCalledWith({ repo_owner: 'o', repo_name: 'r', pr_number: 34 }));
   });
 });
 
