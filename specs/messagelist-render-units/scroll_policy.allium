@@ -29,6 +29,7 @@ entity ScrollPolicy {
     follow_mode: FollowMode
     gesture_mode: GestureMode
     mode_before_gesture: FollowMode
+    navigation_departed_bottom: Boolean
     gesture_departed_bottom: Boolean
     at_bottom: Boolean
     unread: Boolean
@@ -173,6 +174,7 @@ rule NavigationFromLiveTakesDurableOwnership {
     when: NavigationJumped(policy)
     requires: policy.lifecycle = live
     ensures: policy.follow_mode = navigating
+    ensures: policy.navigation_departed_bottom = false
 }
 
 rule NavigationExitsMountRescueIntoReading {
@@ -180,6 +182,7 @@ rule NavigationExitsMountRescueIntoReading {
     requires: policy.lifecycle = mount_rescue
     ensures: policy.lifecycle = live
     ensures: policy.follow_mode = navigating
+    ensures: policy.navigation_departed_bottom = false
     ensures: ScrollEffect.created(policy: policy, kind: stop_settle_watch)
 }
 
@@ -188,6 +191,7 @@ rule NavigationOwnershipSurvivesBottomConfirmation {
     requires: policy.lifecycle = live
     requires: policy.follow_mode = navigating
     requires: policy.gesture_mode = idle
+    requires: policy.navigation_departed_bottom = false
     ensures: policy.follow_mode = navigating
     ensures: not ScrollEffect.created(policy: policy, kind: snap_to_last_index)
     ensures: not ScrollEffect.created(policy: policy, kind: schedule_tail_follow)
@@ -297,6 +301,13 @@ rule LeavingBottomWhileIdleUpdatesGeometry {
     ensures: policy.at_bottom = false
 }
 
+rule NavigationLeavingBottomEnablesManualReturn {
+    when: ViewportPinnedChanged(policy, false)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    ensures: policy.navigation_departed_bottom = true
+}
+
 rule LeavingBottomDuringTouchIsRemembered {
     when: ViewportPinnedChanged(policy, at_bottom)
     requires: at_bottom = false
@@ -325,6 +336,19 @@ rule LiveIdleBottomConfirmationRestoresFollowing {
     requires: at_bottom = true
     requires: policy.gesture_mode = idle
     requires: policy.lifecycle = live
+    requires: policy.follow_mode != navigating
+    ensures: policy.at_bottom = true
+    ensures: policy.follow_mode = following
+    ensures: policy.unread = false
+    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
+}
+
+rule NavigationManualReturnRestoresFollowing {
+    when: ViewportPinnedChanged(policy, true)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: policy.navigation_departed_bottom = true
+    requires: policy.gesture_mode = idle
     ensures: policy.at_bottom = true
     ensures: policy.follow_mode = following
     ensures: policy.unread = false

@@ -13,7 +13,7 @@ export type TailActivity = 'none' | 'active';
 export type FollowMode =
   | { kind: 'following' }
   | { kind: 'reading' }
-  | { kind: 'navigating' }
+  | { kind: 'navigating'; departedBottom: boolean }
   | { kind: 'returning-to-tail' };
 
 export type Gesture =
@@ -99,7 +99,7 @@ interface Reduction {
 const IDLE: Gesture = { kind: 'idle' };
 const FOLLOWING: FollowMode = { kind: 'following' };
 const READING: FollowMode = { kind: 'reading' };
-const NAVIGATING: FollowMode = { kind: 'navigating' };
+const NAVIGATING: FollowMode = { kind: 'navigating', departedBottom: false };
 const RETURNING: FollowMode = { kind: 'returning-to-tail' };
 
 function isReady(state: ScrollMachineState): state is ReadySession {
@@ -329,18 +329,25 @@ export function reduceScrollMachine(
 
     case 'viewportPinnedChanged': {
       if (!isReady(state)) return { state, effects: [] };
-      const next = {
-        ...state,
-        geometry: { ...state.geometry, atBottom: event.atBottom },
-        gesture: state.gesture.kind === 'touch' && !event.atBottom
-          ? { ...state.gesture, departedBottom: true }
-          : state.gesture,
-      };
+      const geometry = { ...state.geometry, atBottom: event.atBottom };
+      const gesture = state.gesture.kind === 'touch' && !event.atBottom
+        ? { ...state.gesture, departedBottom: true }
+        : state.gesture;
+      const next: ReadySession = state.kind === 'live'
+        ? {
+            ...state,
+            geometry,
+            gesture,
+            follow: state.follow.kind === 'navigating' && !event.atBottom
+              ? { ...state.follow, departedBottom: true }
+              : state.follow,
+          }
+        : { ...state, geometry, gesture };
       if (!event.atBottom || next.kind === 'mount-rescue') {
         return { state: next, effects: [] };
       }
       if (
-        (next.kind === 'live' && next.follow.kind === 'navigating') ||
+        (next.kind === 'live' && next.follow.kind === 'navigating' && !next.follow.departedBottom) ||
         (next.gesture.kind === 'touch' && next.gesture.moved)
       ) {
         return { state: next, effects: [] };

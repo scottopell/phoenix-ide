@@ -406,6 +406,7 @@ function MessageListImpl({
         machine.kind === 'live' &&
         machine.conversationId === conversationIdAtSchedule &&
         machine.follow.kind !== 'reading' &&
+        machine.follow.kind !== 'navigating' &&
         !(machine.gesture.kind === 'touch' && machine.gesture.moved);
       if (authorized) {
         virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });

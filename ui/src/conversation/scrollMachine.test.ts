@@ -216,13 +216,22 @@ describe('scrollMachine durable follow policy', () => {
     expectLiveMode(result.state, 'navigating');
     expect(result.effects).toEqual([]);
 
-    result = reduceScrollMachine(result.state, {
-      type: 'heightChanged',
-      totalHeight: 1_200,
-      unitCount: 5,
-      snapshot: snap(1_200, 250, 400),
-      tailActivity: 'active',
-    });
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: false });
+    expectLiveMode(result.state, 'navigating');
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'following');
+    expect(result.effects).toEqual([]);
+
+    result = reduceScrollMachine(
+      reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' }).state,
+      {
+        type: 'heightChanged',
+        totalHeight: 1_200,
+        unitCount: 5,
+        snapshot: snap(1_200, 250, 400),
+        tailActivity: 'active',
+      },
+    );
     expectLiveMode(result.state, 'navigating');
     expect(result.effects).toEqual([{ type: 'showUnread' }]);
   });
