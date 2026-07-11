@@ -1627,6 +1627,30 @@ type ReadFileParseResult = {
   malformed: boolean;
 };
 
+type ReadFileDisplayData = {
+  type: 'read_file';
+  path: string;
+  requested_offset: number;
+  requested_limit: number;
+  returned_start_line: number | null;
+  returned_end_line: number | null;
+  returned_line_count: number;
+  total_line_count: number;
+  remaining_line_count: number;
+};
+
+function parseReadFileDisplayData(value: unknown): ReadFileDisplayData | null {
+  if (!value || typeof value !== 'object') return null;
+  const data = value as Record<string, unknown>;
+  if (data['type'] !== 'read_file' || typeof data['path'] !== 'string') return null;
+  const numericKeys = ['requested_offset', 'requested_limit', 'returned_line_count', 'total_line_count', 'remaining_line_count'] as const;
+  if (numericKeys.some((key) => !Number.isInteger(data[key]) || (data[key] as number) < 0)) return null;
+  const validLine = (key: 'returned_start_line' | 'returned_end_line') =>
+    data[key] === null || (Number.isInteger(data[key]) && (data[key] as number) > 0);
+  if (!validLine('returned_start_line') || !validLine('returned_end_line')) return null;
+  return data as ReadFileDisplayData;
+}
+
 const READ_FILE_PREVIEW_MIN_LINES = 12;
 const READ_FILE_PREVIEW_MAX_LINES = 20;
 
@@ -1700,10 +1724,12 @@ function buildReadFileCopyText(_request: ReadFileRequest, parsed: ReadFileParseR
 function ReadFileResultView({
   input,
   rawText,
+  metadata,
   onOpenFile,
 }: {
   input: Record<string, unknown>;
   rawText: string;
+  metadata: ReadFileDisplayData;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number, focusEndLine?: number) => void) | undefined;
 }) {
   const request = useMemo(() => parseReadFileRequest(input), [input]);
@@ -1714,8 +1740,8 @@ function ReadFileResultView({
   }, [parsed.lines]);
   const visibleLines = previewLines;
   const hasMore = visibleLines.length < parsed.lines.length;
-  const firstVisibleLine = parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
-  const lastVisibleLine = parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
+  const firstVisibleLine = metadata.returned_start_line ?? parsed.lines[0]?.lineNumber ?? request.offset ?? 0;
+  const lastVisibleLine = metadata.returned_end_line ?? parsed.lines.at(-1)?.lineNumber ?? firstVisibleLine;
 
   if (parsed.lines.length === 0) {
     return (
@@ -1734,7 +1760,6 @@ function ReadFileResultView({
     );
   }
 
-  const totalCount = parsed.lines.length;
   const rangeLabel = formatReadFileRange(request, parsed);
   const copyText = buildReadFileCopyText(request, parsed, rawText);
 
@@ -1743,10 +1768,11 @@ function ReadFileResultView({
       <div className="read-file-result-meta">
         <div className="read-file-result-meta-main">
           <span className="read-file-result-path">{request.path || '(unknown path)'}</span>
-          <span className="read-file-result-summary">{totalCount} line{totalCount === 1 ? '' : 's'} • {rangeLabel}</span>
-          {request.limit !== null && (
-            <span className="read-file-result-summary">requested {request.limit}</span>
-          )}
+          <span className="read-file-result-summary">
+            {metadata.returned_line_count} line{metadata.returned_line_count === 1 ? '' : 's'} • {rangeLabel}
+          </span>
+          <span className="read-file-result-summary">of {metadata.total_line_count} total</span>
+          <span className="read-file-result-summary">requested {metadata.requested_limit}</span>
         </div>
         <div className="read-file-result-actions">
           {onOpenFile && request.path && (
@@ -1770,13 +1796,13 @@ function ReadFileResultView({
           </div>
         ))}
       </div>
-      {hasMore && (
+      {(hasMore || metadata.remaining_line_count > 0) && (
         <div className="read-file-result-more">
-          {parsed.lines.length - visibleLines.length} more returned lines · view the complete current file for full context
+          {hasMore && `${parsed.lines.length - visibleLines.length} more returned lines`}
+          {hasMore && metadata.remaining_line_count > 0 && ' · '}
+          {metadata.remaining_line_count > 0 && `${metadata.remaining_line_count} file lines not returned`}
+          {' · view the complete current file for full context'}
         </div>
-      )}
-      {parsed.malformed && parsed.notes.length > 0 && (
-        <div className="read-file-result-note">Ignored {parsed.notes.length} non-numbered line{parsed.notes.length === 1 ? '' : 's'}.</div>
       )}
     </div>
   );
@@ -2116,6 +2142,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
     imageResult = parseImageResult(resultText);
   }
 
+  const readFileMetadata = name === 'read_file'
+    ? parseReadFileDisplayData(result?.display_data)
+    : null;
+
   // Trivial patch detection: a single-patch call whose diff has ≤3 total
   // changed lines is cheaper to read inline than click-through. We auto-expand
   // it and suppress the (redundant) PatchFileSummary below.
@@ -2248,8 +2278,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile, workScopeKey, knownResult
             <SearchResultsView rawText={resultText} onOpenFile={onOpenFile} />
           ) : name === 'keyword_search' && !isError ? (
             <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} />
-          ) : name === 'read_file' && !isError ? (
-            <ReadFileResultView input={input as Record<string, unknown>} rawText={resultText} onOpenFile={onOpenFile} />
+          ) : name === 'read_file' && !isError && readFileMetadata ? (
+            <ReadFileResultView
+              input={input as Record<string, unknown>}
+              rawText={resultText}
+              metadata={readFileMetadata}
+              onOpenFile={onOpenFile}
+            />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">

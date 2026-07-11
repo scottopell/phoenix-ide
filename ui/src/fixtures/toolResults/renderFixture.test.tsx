@@ -63,7 +63,8 @@ describe('ToolResultsFixture', () => {
     expect(screen.getByText(/12 lines • lines 1-12/)).toBeInTheDocument();
     expect(screen.getByText(/4 more returned lines/)).toBeInTheDocument();
     expect(screen.getByText('(empty file)')).toBeInTheDocument();
-    expect(screen.getByText(/Ignored 1 non-numbered line/)).toBeInTheDocument();
+    expect(screen.queryByText(/Ignored .* non-numbered line/)).not.toBeInTheDocument();
+    expect(screen.getByText(/76 file lines not returned/)).toBeInTheDocument();
 
     rerender(<ToolResultsFixture scenario={getToolResultsScenario('media-full')} />);
     await screen.findByText('scenario=media-full');

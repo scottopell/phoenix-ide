@@ -165,6 +165,12 @@ describe('tool results fixture scenarios', () => {
       'discover-read-long-lines': 'wrap me please',
       'discover-read-malformed': 'valid line',
     });
+    expect(resultFor(messages, 'discover-read-long')?.message.display_data).toMatchObject({
+      type: 'read_file',
+      returned_line_count: 24,
+      total_line_count: 100,
+      remaining_line_count: 76,
+    });
     expect(resultFor(messages, 'discover-read-empty')?.content.content).toBe('');
     expect(resultFor(messages, 'discover-read-error')?.content.is_error).toBe(true);
   });

@@ -75,14 +75,14 @@ function LocationProbe() {
 }
 
 
-function toolMessage(toolUseId: string, content: string, sequenceId = 2): Message {
+function toolMessage(toolUseId: string, content: string, sequenceId = 2, displayData?: Record<string, unknown>): Message {
   return {
     message_id: `tool-${toolUseId}`,
     sequence_id: sequenceId,
     conversation_id: 'agent-1',
     message_type: 'tool',
     content: { tool_use_id: toolUseId, content, is_error: false },
-    display_data: null,
+    display_data: displayData ?? null,
     created_at: '2026-01-01T00:00:01Z',
   };
 }
@@ -257,7 +257,8 @@ describe('inline tool timers', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText('Malformed read_file output')).toBeInTheDocument();
+    expect(screen.getByText('read_file')).toBeInTheDocument();
+    expect(screen.getByText(/# README/)).toBeInTheDocument();
     expect(document.querySelector('.tool-block-elapsed')).toBeNull();
     expect(screen.getByText('• 1.2s')).toBeInTheDocument();
 
@@ -1450,7 +1451,11 @@ describe('read_file structured result view', () => {
           message={agentMessage('agent-read-structured', [
             { type: 'tool_use', id: 'tool-read-structured', name: 'read_file', input: { path: 'src/lib.rs', offset: 40, limit: 25 } },
           ])}
-          toolResults={new Map([['tool-read-structured', toolMessage('tool-read-structured', lines)]])}
+          toolResults={new Map([['tool-read-structured', toolMessage('tool-read-structured', lines, 2, {
+              type: 'read_file', path: 'src/lib.rs', requested_offset: 40, requested_limit: 25,
+              returned_start_line: 40, returned_end_line: 64, returned_line_count: 25,
+              total_line_count: 100, remaining_line_count: 36,
+            })]])}
           onOpenFile={onOpenFile}
         />
       </MemoryRouter>,
@@ -1482,7 +1487,11 @@ describe('read_file structured result view', () => {
           message={agentMessage('agent-read-empty', [
             { type: 'tool_use', id: 'tool-read-empty', name: 'read_file', input: { path: 'empty.txt' } },
           ])}
-          toolResults={new Map([['tool-read-empty', toolMessage('tool-read-empty', '')]])}
+          toolResults={new Map([['tool-read-empty', toolMessage('tool-read-empty', '', 2, {
+              type: 'read_file', path: 'empty.txt', requested_offset: 1, requested_limit: 2000,
+              returned_start_line: null, returned_end_line: null, returned_line_count: 0,
+              total_line_count: 0, remaining_line_count: 0,
+            })]])}
           onOpenFile={vi.fn()}
         />
       </MemoryRouter>,
@@ -1503,9 +1512,9 @@ describe('read_file structured result view', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText('broken.txt')).toBeInTheDocument();
-    expect(screen.getByText(/Ignored 1 non-numbered line/)).toBeInTheDocument();
-    expect(screen.getByText('valid line')).toBeInTheDocument();
+    expect(screen.getByText(/broken\.txt:10-12/)).toBeInTheDocument();
+    expect(screen.queryByText(/Ignored .* non-numbered line/)).not.toBeInTheDocument();
+    expect(screen.getByText(/oops/)).toBeInTheDocument();
   });
 });
 

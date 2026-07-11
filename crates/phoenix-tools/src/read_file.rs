@@ -5,6 +5,7 @@
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -19,6 +20,19 @@ struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadFileDisplayData {
+    r#type: &'static str,
+    path: String,
+    requested_offset: usize,
+    requested_limit: usize,
+    returned_start_line: Option<usize>,
+    returned_end_line: Option<usize>,
+    returned_line_count: usize,
+    total_line_count: usize,
+    remaining_line_count: usize,
 }
 
 /// Resolve a path relative to `working_dir`. Absolute paths are used as-is;
@@ -143,7 +157,20 @@ impl Tool for ReadFileTool {
             output = "(empty file)".to_string();
         }
 
-        ToolOutput::success(output)
+        let display_data = serde_json::to_value(ReadFileDisplayData {
+            r#type: "read_file",
+            path: input.path,
+            requested_offset: offset,
+            requested_limit: limit,
+            returned_start_line: (start_idx < end_idx).then_some(start_idx + 1),
+            returned_end_line: (start_idx < end_idx).then_some(end_idx),
+            returned_line_count: end_idx - start_idx,
+            total_line_count: total_lines,
+            remaining_line_count: remaining,
+        })
+        .expect("read_file display metadata is serializable");
+
+        ToolOutput::success(output).with_display(display_data)
     }
 }
 
@@ -229,6 +256,34 @@ mod tests {
             result.output()
         );
         assert!(result.output().contains("reachable"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_attaches_typed_range_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.txt"), "a\nb\nc\nd\ne\n").unwrap();
+
+        let result = ReadFileTool
+            .run(
+                json!({"path": "test.txt", "offset": 2, "limit": 2}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+
+        assert_eq!(
+            result.display_data(),
+            Some(&json!({
+                "type": "read_file",
+                "path": "test.txt",
+                "requested_offset": 2,
+                "requested_limit": 2,
+                "returned_start_line": 2,
+                "returned_end_line": 3,
+                "returned_line_count": 2,
+                "total_line_count": 5,
+                "remaining_line_count": 2,
+            }))
+        );
     }
 
     #[tokio::test]

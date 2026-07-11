@@ -139,7 +139,9 @@ const shellMessages: Message[] = [
   toolMessage(7, 'shell-key', 'Enter dispatched with ctrl modifier.', { display_data: { duration_ms: 22 } }),
   toolMessage(8, 'shell-resize', 'Viewport resized to 390 × 844.', { display_data: { duration_ms: 19 } }),
   toolMessage(9, 'shell-question', 'Selected Execution.', { display_data: { duration_ms: 2_100 } }),
-  toolMessage(10, 'shell-truncated', overLimitFileText, { display_data: { duration_ms: 35 } }),
+  toolMessage(10, 'shell-truncated', overLimitFileText, {
+    display_data: { ...readFileDisplayData('ui/src/fixtures/toolResults/oversized-fixture.ts', 1, 140, 1, 140, 140, 140), duration_ms: 35 },
+  }),
   toolMessage(11, 'shell-proposal', 'Task fork proposal prepared for review.', {
     display_data: { duration_ms: 28, fork_proposal_id: 'fixture-fork-proposal' },
   }),
@@ -250,6 +252,28 @@ const executionMessages: Message[] = [
   ]),
 ];
 
+function readFileDisplayData(
+  path: string,
+  requestedOffset: number,
+  requestedLimit: number,
+  returnedStartLine: number | null,
+  returnedEndLine: number | null,
+  returnedLineCount: number,
+  totalLineCount: number,
+) {
+  return {
+    type: 'read_file',
+    path,
+    requested_offset: requestedOffset,
+    requested_limit: requestedLimit,
+    returned_start_line: returnedStartLine,
+    returned_end_line: returnedEndLine,
+    returned_line_count: returnedLineCount,
+    total_line_count: totalLineCount,
+    remaining_line_count: returnedEndLine === null ? totalLineCount : Math.max(0, totalLineCount - returnedEndLine),
+  };
+}
+
 const discoveryMessages: Message[] = [
   userMessage(1, 'Show search-style discovery results, including empty and raw fallbacks.'),
   agentMessage(2, [
@@ -288,16 +312,16 @@ const discoveryMessages: Message[] = [
     'ui/src/components/BrowserProfileResponseView.tsx-22-export const STRUCTURED_PROFILE_ACTIONS = new Set([',
     'ui/src/components/BrowserProfileResponseView.tsx:23:  "run_scenario",',
   ].join('\n')),
-  toolMessage(9, 'discover-read-short', Array.from({ length: 12 }, (_, index) => `${index + 1}\tconst deterministicFixtureLine${index + 1} = true;`).join('\n')),
-  toolMessage(10, 'discover-read-long', Array.from({ length: 24 }, (_, index) => `${index + 1}\tfixture long line ${index + 1}`).join('\n')),
-  toolMessage(11, 'discover-read-range', Array.from({ length: 16 }, (_, index) => `${711 + index}\tMessageComponents excerpt ${711 + index}`).join('\n')),
-  toolMessage(12, 'discover-read-eof', Array.from({ length: 4 }, (_, index) => `${498 + index}\tEOF excerpt ${498 + index}`).join('\n')),
+  toolMessage(9, 'discover-read-short', Array.from({ length: 12 }, (_, index) => `${index + 1}\tconst deterministicFixtureLine${index + 1} = true;`).join('\n'), { display_data: readFileDisplayData('ui/src/fixtures/toolResults/scenarios.ts', 1, 12, 1, 12, 12, 30) }),
+  toolMessage(10, 'discover-read-long', `${Array.from({ length: 24 }, (_, index) => `${index + 1}\tfixture long line ${index + 1}`).join('\n')}\n\n[76 more lines not shown (total: 100 lines)]`, { display_data: readFileDisplayData('ui/src/fixtures/toolResults/oversized-fixture.ts', 1, 24, 1, 24, 24, 100) }),
+  toolMessage(11, 'discover-read-range', Array.from({ length: 16 }, (_, index) => `${711 + index}\tMessageComponents excerpt ${711 + index}`).join('\n'), { display_data: readFileDisplayData('ui/src/components/MessageComponents.tsx', 711, 16, 711, 726, 16, 2762) }),
+  toolMessage(12, 'discover-read-eof', Array.from({ length: 4 }, (_, index) => `${498 + index}\tEOF excerpt ${498 + index}`).join('\n'), { display_data: readFileDisplayData('tasks/example.md', 498, 20, 498, 501, 4, 501) }),
   toolMessage(13, 'discover-read-long-lines', [
     `1\t${'x'.repeat(120)}`,
     `2\t${'very long content '.repeat(12)}`,
     '3\twrap me please',
-  ].join('\n')),
-  toolMessage(14, 'discover-read-empty', ''),
+  ].join('\n'), { display_data: readFileDisplayData('docs/very-long-line.txt', 1, 3, 1, 3, 3, 3) }),
+  toolMessage(14, 'discover-read-empty', '', { display_data: readFileDisplayData('empty.txt', 1, 20, null, null, 0, 0) }),
   toolMessage(15, 'discover-read-error', 'Error: file not found', { is_error: true }),
   toolMessage(16, 'discover-read-malformed', 'oops\n12\tvalid line'),
   agentMessage(17, [
