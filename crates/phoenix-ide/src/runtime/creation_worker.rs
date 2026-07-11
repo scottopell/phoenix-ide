@@ -206,16 +206,8 @@ async fn process_job(
             return Ok(());
         }
         if matches!(conversation.state, ConvState::LlmRequesting { .. }) {
-            tracing::info!(job_id = %job.id, message_id = ?job.message_id, "resuming creation LLM request before completing job");
-            let handle = manager.get_or_create(&conv_id).await?;
-            handle
-                .event_tx
-                .send(Event::CreationRequestResume {
-                    job_id: job.id.clone(),
-                    claim: claim.clone(),
-                })
-                .await
-                .map_err(|error| format!("failed to resume creation request: {error}"))?;
+            tracing::info!(job_id = %job.id, message_id = ?job.message_id, "starting creation runtime to resume the persisted LLM request");
+            let _ = manager.get_or_create(&conv_id).await?;
             return Ok(());
         }
         tracing::info!(job_id = %job.id, message_id = ?job.message_id, "replaying creation bootstrap after message persisted without state advancement");
@@ -391,6 +383,7 @@ async fn provision_conversation(
             let info = tokio::task::spawn_blocking(move || {
                 let _lock = RepositoryMutationLock::acquire(&repo_for_blocking)?;
                 if reconcile_owned_worktree_path(&repo_for_blocking, &path_for_blocking)? {
+                    validate_worktree_branch(&path_for_blocking, &branch_name)?;
                     let worktree_path = path_for_blocking.to_string_lossy().to_string();
                     let default_branch = crate::git_ops::run_git(
                         Path::new(&repo_for_blocking),
@@ -1083,6 +1076,25 @@ mod worktree_repository_ownership_tests {
     use super::*;
 
     #[test]
+    fn existing_worktree_must_match_requested_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["config", "user.email", "test@example.com"])
+            .unwrap();
+        crate::git_ops::run_git(repo.path(), &["config", "user.name", "Test User"]).unwrap();
+        std::fs::write(repo.path().join("README"), "test").unwrap();
+        crate::git_ops::run_git(repo.path(), &["add", "README"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["commit", "-m", "initial"]).unwrap();
+        crate::git_ops::run_git(repo.path(), &["checkout", "-b", "actual"]).unwrap();
+
+        let error = validate_worktree_branch(repo.path(), "expected")
+            .expect_err("wrong branch must not be adopted");
+        assert_eq!(error.1, ErrorKind::InvalidRequest);
+        assert!(error.0.contains("actual"));
+        assert!(error.0.contains("expected"));
+    }
+
+    #[test]
     fn standalone_checkout_is_not_adopted_for_reserved_repository() {
         let expected = tempfile::tempdir().unwrap();
         let foreign = tempfile::tempdir().unwrap();
@@ -1368,6 +1380,22 @@ fn reconcile_owned_worktree_path(
     })?;
     let _ = crate::git_ops::run_git(Path::new(repo_root), &["worktree", "prune"]);
     Ok(false)
+}
+
+fn validate_worktree_branch(path: &Path, expected_branch: &str) -> Result<(), (String, ErrorKind)> {
+    let actual_branch = crate::git_ops::run_git(path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map_err(|error| (error, ErrorKind::InvalidRequest))?;
+    let actual_branch = actual_branch.trim();
+    if actual_branch == expected_branch {
+        return Ok(());
+    }
+    Err((
+        format!(
+            "Existing worktree {} is on branch '{actual_branch}', expected '{expected_branch}'",
+            path.display()
+        ),
+        ErrorKind::InvalidRequest,
+    ))
 }
 
 fn validate_worktree_belongs_to_repository(

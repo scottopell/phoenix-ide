@@ -2635,6 +2635,13 @@ fn can_omit_db_messages_for_stream(
             .is_some_and(|after_event_sequence| after_event_sequence >= last_sequence_id)
 }
 
+fn stream_state_starts_runtime(state: &ConvState) -> bool {
+    !matches!(
+        state,
+        ConvState::CreationFailed { .. } | ConvState::CreationCancelled { .. }
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 async fn stream_conversation(
     State(state): State<AppState>,
@@ -2652,8 +2659,18 @@ async fn stream_conversation(
     // read messages last. If a persisted message races stream-open, it is
     // therefore either included in the final DB snapshot or has a sequence_id
     // above the init floor and survives the client's live-event replay guard.
-    let (broadcast_tx, broadcast_rx) = match state.runtime.get_or_create(&id).await {
-        Ok(handle) => {
+    let runtime_handle = if stream_state_starts_runtime(&conversation.state) {
+        Some(state.runtime.get_or_create(&id).await)
+    } else {
+        None
+    };
+    let (broadcast_tx, broadcast_rx) = match runtime_handle {
+        None => {
+            let broadcaster = state.runtime.conversation_broadcaster(&id).await;
+            let broadcast_rx = broadcaster.subscribe();
+            (broadcaster, broadcast_rx)
+        }
+        Some(Ok(handle)) => {
             tracing::debug!(
                 conv_id = %id,
                 receivers_before = handle.broadcast_tx.receiver_count(),
@@ -2662,13 +2679,13 @@ async fn stream_conversation(
             let broadcast_rx = handle.broadcast_tx.subscribe();
             (handle.broadcast_tx, broadcast_rx)
         }
-        Err(e) if is_invalid_runtime_cwd_error(&e) => {
+        Some(Err(e)) if is_invalid_runtime_cwd_error(&e) => {
             tracing::warn!(conv_id = %id, error = %e, "Serving static SSE transcript without starting runtime because persisted cwd is invalid");
             let broadcaster = state.runtime.conversation_broadcaster(&id).await;
             let broadcast_rx = broadcaster.subscribe();
             (broadcaster, broadcast_rx)
         }
-        Err(e) => return Err(AppError::Internal(e)),
+        Some(Err(e)) => return Err(AppError::Internal(e)),
     };
 
     let last_sequence_id = state
@@ -6564,6 +6581,21 @@ mod conversation_cwd_validation_tests {
             "got: {:?}",
             response.error
         );
+    }
+
+    #[test]
+    fn creation_recovery_shell_stream_does_not_start_runtime() {
+        assert!(!stream_state_starts_runtime(&ConvState::CreationFailed {
+            job_id: "job".to_string(),
+            error: "failed".to_string(),
+            error_kind: crate::db::ErrorKind::ServerError,
+        }));
+        assert!(!stream_state_starts_runtime(
+            &ConvState::CreationCancelled {
+                job_id: "job".to_string(),
+            }
+        ));
+        assert!(stream_state_starts_runtime(&ConvState::Idle));
     }
 
     #[tokio::test]

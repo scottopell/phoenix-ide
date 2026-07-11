@@ -1613,6 +1613,10 @@ where
     /// persisted `Conversation.state_updated_at` and the SSE-carried value
     /// are identical — no clock drift between the two.
     state_updated_at: DateTime<Utc>,
+    startup_creation_completion: Option<(
+        String,
+        phoenix_core::domain::creation_protocol::CreationClaim,
+    )>,
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
@@ -1878,6 +1882,7 @@ where
             context,
             state,
             state_updated_at: Utc::now(),
+            startup_creation_completion: None,
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor,
@@ -1925,6 +1930,15 @@ where
             fork_cmd_tx: None,
             state_watcher: None,
         }
+    }
+
+    pub fn with_startup_creation_completion(
+        mut self,
+        job_id: String,
+        claim: phoenix_core::domain::creation_protocol::CreationClaim,
+    ) -> Self {
+        self.startup_creation_completion = Some((job_id, claim));
+        self
     }
 
     /// Provide the fork-resolution consumer sender used to retire still-pending
@@ -2034,6 +2048,10 @@ where
                         "resume the LLM request",
                     ),
                 });
+            } else if let Some((job_id, claim)) = self.startup_creation_completion.take() {
+                let _ = self
+                    .execute_effect(Effect::CompleteCreation { job_id, claim })
+                    .await;
             }
         }
 

@@ -2379,6 +2379,21 @@ impl RuntimeManager {
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
         let (initial_state, initial_state_updated_at, needs_auto_continue) =
             self.determine_resume_state(conversation_id).await?;
+        let startup_creation_completion =
+            if matches!(initial_state, ConvState::LlmRequesting { .. }) {
+                self.db
+                    .get_conversation_creation_job_for_conversation(conversation_id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .and_then(|job| match job.protocol.status {
+                        phoenix_core::domain::creation_protocol::CreationStatus::Claimed(claim) => {
+                            Some((job.id, claim))
+                        }
+                        _ => None,
+                    })
+            } else {
+                None
+            };
 
         // Seed the executor's in-memory steering queue from the normalized
         // steering_messages tables.
@@ -2418,6 +2433,11 @@ impl RuntimeManager {
             runtime
         } else {
             runtime.with_fork_command_sender(self.fork_cmd_tx.clone())
+        };
+        let runtime = if let Some((job_id, claim)) = startup_creation_completion {
+            runtime.with_startup_creation_completion(job_id, claim)
+        } else {
+            runtime
         };
 
         // Create the live-state watch channel seeded with the initial state.
