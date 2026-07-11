@@ -1844,6 +1844,7 @@ async fn create_conversation_with_id(
                     &mut conversation_json,
                 )
                 .await;
+                state.runtime.kick_creation_worker();
                 return Ok(Json(ConversationResponse {
                     conversation: conversation_json,
                 }));
@@ -1879,6 +1880,7 @@ async fn create_conversation_with_id(
                     &mut conversation_json,
                 )
                 .await;
+                state.runtime.kick_creation_worker();
                 return Ok(Json(ConversationResponse {
                     conversation: conversation_json,
                 }));
