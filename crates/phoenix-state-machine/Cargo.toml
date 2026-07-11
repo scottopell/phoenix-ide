@@ -2,7 +2,7 @@
 name = "phoenix-state-machine"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Pure conversation state machine for Phoenix IDE: Elm-architecture reducer over the shared domain vocabulary. Two pure entry points (transition, handle_outcome) plus effect/outcome types. No I/O, HTTP, or persistence glue."
 
 [lib]

@@ -38,10 +38,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Longer timeout for initialize + tools/list during server connection.
 /// Five minutes gives OAuth flows (mcp-remote prompts, browser redirect) time to complete.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
+const CONNECT_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Upper bound for an HTTP reload request applying changed existing configs.
-const RELOAD_RESTART_TIMEOUT: Duration = Duration::from_secs(60);
+const RELOAD_RESTART_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Timeout for a fire-and-forget JSON-RPC notification; notifications never
 /// legitimately take as long as a tool call.
@@ -1390,7 +1390,7 @@ async fn run_loopback_redirect(
     listeners: Vec<tokio::net::TcpListener>,
     target_base: String,
 ) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(5);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

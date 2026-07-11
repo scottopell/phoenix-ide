@@ -2,7 +2,7 @@
 name = "phoenix-tls"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Local TLS certificate authority and leaf-cert issuance for Phoenix IDE."
 
 [lib]

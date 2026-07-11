@@ -2,7 +2,7 @@
 name = "phoenix-mcp"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "MCP (Model Context Protocol) client engine for Phoenix IDE: the JSON-RPC protocol layer, stdio and Streamable HTTP transports, OAuth (DCR, PKCE), and the multi-server client manager. Transport-agnostic and Tool-trait-free — the thin `Tool` wrapper lives in phoenix-tools."
 
 [lib]

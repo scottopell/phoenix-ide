@@ -125,10 +125,7 @@ impl WorkScopeHandles {
         let now = SystemTime::now();
         for h in self.handles.values() {
             if h.state().await.is_live() {
-                let age_seconds = now
-                    .duration_since(h.started_at)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let age_seconds = now.duration_since(h.started_at).map_or(0, |d| d.as_secs());
                 out.push(LiveHandleSummary {
                     handle: h.handle_id.clone(),
                     cmd: h.cmd.clone(),

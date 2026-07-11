@@ -2,7 +2,7 @@
 name = "phoenix-agents"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Named sub-agent discovery and metadata for Phoenix IDE: filesystem agent definitions (.claude/agents, .agents/agents), frontmatter parsing, and persona resolution. Core-only — no axum/HTTP glue."
 
 [lib]

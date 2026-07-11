@@ -2,7 +2,7 @@
 name = "phoenix-tools"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Tool implementations for Phoenix IDE: bash, patch, browser, tmux, search, keyword search, skills, and sub-agent coordination. The Tool trait, ToolContext, and ToolRegistry live here. Core-only — no axum/HTTP glue."
 
 [lib]

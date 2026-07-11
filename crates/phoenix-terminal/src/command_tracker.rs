@@ -165,8 +165,7 @@ impl CommandTracker {
         let duration_ms = state
             .started_at
             .elapsed()
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
         let output = self.finalize_output();
         self.output_buffer.clear();

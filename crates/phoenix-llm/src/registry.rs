@@ -755,9 +755,7 @@ impl ModelRegistry {
     ) -> Option<Arc<dyn LlmService>> {
         // Mock provider: opt-in only via PHOENIX_ENABLE_MOCK_MODEL=1
         if spec.backend == ModelBackend::Mock {
-            let enabled = std::env::var("PHOENIX_ENABLE_MOCK_MODEL")
-                .map(|v| v == "1")
-                .unwrap_or(false);
+            let enabled = std::env::var("PHOENIX_ENABLE_MOCK_MODEL").is_ok_and(|v| v == "1");
             if !enabled {
                 return None;
             }
@@ -942,10 +940,7 @@ impl ModelRegistry {
 
     /// Check if any models are available
     pub fn has_models(&self) -> bool {
-        self.services
-            .read()
-            .map(|map| !map.is_empty())
-            .unwrap_or(false)
+        self.services.read().is_ok_and(|map| !map.is_empty())
     }
 
     /// Path the **currently-loaded** Codex/ChatGPT credential was constructed

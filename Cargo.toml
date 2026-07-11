@@ -14,6 +14,12 @@ mod_module_files = "deny"
 string_slice = "deny"
 wildcard_enum_match_arm = "deny"
 match_wildcard_for_single_variants = "deny"
+duration_suboptimal_units = "allow"
+map_unwrap_or = "allow"
+collapsible_match = "allow"
+unnecessary_trailing_comma = "allow"
+question_mark = "allow"
+unnecessary_sort_by = "allow"
 
 [workspace.lints.rust]
 unused_extern_crates = "deny"

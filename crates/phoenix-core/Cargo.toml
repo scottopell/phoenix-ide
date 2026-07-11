@@ -2,7 +2,7 @@
 name = "phoenix-core"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Shared domain vocabulary for Phoenix IDE: serializable types with no business logic. The acyclic base every other phoenix-ide crate depends on."
 
 [lib]

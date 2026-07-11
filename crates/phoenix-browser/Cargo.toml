@@ -2,7 +2,7 @@
 name = "phoenix-browser"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Headless-browser engine for Phoenix IDE: the chromiumoxide/CDP driver, per-WorkScope session manager, console/profiling capture, and live-view screencast broker. Tool-free — the Tool-trait glue lives in phoenix-tools."
 
 [lib]

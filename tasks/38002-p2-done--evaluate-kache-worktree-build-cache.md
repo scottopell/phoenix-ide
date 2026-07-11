@@ -76,3 +76,32 @@ If measurements do not show a worthwhile improvement, retain only useful explici
 - The benchmark includes an incremental-edit regression check, and Phoenix is upgraded to Rust 1.95 when that remains a routine pin/compatibility update; otherwise the report records why an isolated/prebuilt kache installation was used.
 - `./dev.py check` passes.
 - Product-level integration is either backed by a normative spec update and evidence, or explicitly deferred with the measured reason.
+
+## Results
+
+Environment: macOS arm64 on APFS (`/System/Volumes/Data`), Rust/Cargo 1.95.0, kache 0.9.0 built from the supplied checkout, and sccache 0.15.0. Measurements used `cargo check -p phoenix-core --locked`, `CARGO_INCREMENTAL=0`, sequential execution, isolated backend caches, and empty target directories. Cross-worktree samples used a different absolute source and target path for every run.
+
+### Cross-worktree empty-target samples
+
+| Backend | Run 1 | Run 2 | Run 3 | Median | Final cache |
+|---|---:|---:|---:|---:|---:|
+| none | 19.616s | 19.620s | 18.880s | 19.616s | — |
+| sccache | 25.336s | 21.040s | 19.979s | 21.040s | 170.7 MiB apparent |
+| kache | 26.344s | 22.503s | 19.295s | 22.503s | 314.5 MiB apparent |
+
+Each target directory was approximately 284 MiB apparent. kache reported 56.2% hits (342 local, 6 duplicate, 261 misses), 49.2% weighted by compile cost, 311.3 MiB physical blobs, and 2.6% deduplication savings. Its daemon remained offline, so this measured the local wrapper/store path only. sccache reported 0% Rust hits across changed absolute paths in this workload (573 Rust misses); its reported hits were C/C++ and assembler compilations.
+
+### Same-path clean and edit-cycle probe
+
+| Backend | Cold population | Empty same-path target | Touch workspace crate |
+|---|---:|---:|---:|
+| none | 19.233s | 23.168s | 1.904s |
+| kache | 53.866s | 17.650s | 0.642s |
+
+This small probe confirms that kache can reuse Rust outputs and materially improve a populated-cache rebuild, but cache population overhead is substantial. The cross-worktree median was slower than no wrapper and the three samples trend downward with OS/filesystem warming, so the result is directional rather than statistically conclusive.
+
+### Decision
+
+Keep kache as an explicit `dev.py check --compiler-cache kache` / `PHOENIX_COMPILER_CACHE=kache` opt-in. Preserve sccache-first behavior for `auto`; use kache automatically only when sccache is absent. Do not add Phoenix product-level worktree configuration or expand REQ-PROJ-005A: these local measurements do not show a consistent cross-worktree wall-time or disk-efficiency win sufficient to justify managing another external tool. The existing APFS copy-on-write prewarm remains complementary and intentionally limited to allowlisted JS caches rather than mutable Cargo target trees.
+
+Phoenix was upgraded routinely to Rust 1.95.0 with no source compatibility changes required.

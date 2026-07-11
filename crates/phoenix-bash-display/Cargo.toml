@@ -2,7 +2,7 @@
 name = "phoenix-bash-display"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Bash command display simplification for Phoenix IDE: strips boilerplate `cd` prefixes from scripts for UI display. Pure brush-parser leaf — no phoenix-core/crate dependencies."
 
 [lib]

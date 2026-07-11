@@ -431,7 +431,7 @@ mod tests {
     use tokio::time::timeout;
 
     const TICK: Duration = Duration::from_secs(5);
-    const LONG_TTL: Duration = Duration::from_secs(3600);
+    const LONG_TTL: Duration = Duration::from_hours(1);
 
     fn helper(cmd: &str, ttl: Duration) -> Arc<CredentialHelper> {
         CredentialHelper::new(cmd.to_string(), ttl)

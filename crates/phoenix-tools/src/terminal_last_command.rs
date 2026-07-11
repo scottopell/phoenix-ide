@@ -65,8 +65,7 @@ impl Tool for TerminalLastCommandTool {
         let started_secs = rec
             .started_at
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         ToolOutput::success(
             json!({

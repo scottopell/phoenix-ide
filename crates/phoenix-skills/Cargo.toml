@@ -2,7 +2,7 @@
 name = "phoenix-skills"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Skill discovery, metadata, and invocation for Phoenix IDE: filesystem and built-in skills, frontmatter parsing, and argument substitution. Core-only — no axum/HTTP glue."
 
 [lib]

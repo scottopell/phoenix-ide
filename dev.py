@@ -3855,7 +3855,48 @@ def _append_git_config_override(key, value, environ=None):
         env["GIT_CONFIG_COUNT"] = str(count)
 
 
-def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False):
+_COMPILER_CACHE_BACKENDS = ("auto", "kache", "sccache", "none")
+
+
+def _configure_compiler_cache(requested: str | None = None) -> str:
+    """Configure the compiler cache without overriding an explicit wrapper."""
+    if "RUSTC_WRAPPER" in os.environ:
+        return "explicit"
+
+    backend = requested or os.environ.get("PHOENIX_COMPILER_CACHE", "auto")
+    if backend not in _COMPILER_CACHE_BACKENDS:
+        choices = ", ".join(_COMPILER_CACHE_BACKENDS)
+        raise SystemExit(
+            f"invalid compiler cache {backend!r}; choose one of: {choices}"
+        )
+
+    if backend == "none":
+        return "none"
+
+    if backend == "auto":
+        if shutil.which("sccache"):
+            backend = "sccache"
+        elif shutil.which("kache"):
+            backend = "kache"
+        else:
+            return "none"
+    elif not shutil.which(backend):
+        raise SystemExit(
+            f"requested compiler cache {backend!r} is not installed or not on PATH"
+        )
+
+    os.environ["RUSTC_WRAPPER"] = backend
+    if backend == "sccache":
+        os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
+    return backend
+
+
+def cmd_check(
+    gate: bool = True,
+    lanes: str | None = None,
+    pretty: bool = False,
+    compiler_cache: str | None = None,
+):
     """Run lint, format check, tests, and task validation in parallel.
 
     `lanes` is an optional comma-separated lane subset (CI splits the check
@@ -4490,16 +4531,10 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
     if ui_active:
         ensure_ui_deps()
 
-    # Enable sccache (if installed) as the rustc wrapper so deps' object files
-    # are shared across worktrees / `cargo clean` cycles. Honored by every
-    # cargo invocation below because the env is inherited by run_step's
-    # subprocesses. Skip cleanly if sccache isn't on PATH or the user has
-    # explicitly set RUSTC_WRAPPER already. Only relevant when a cargo lane runs.
-    if cargo_active and shutil.which("sccache") and "RUSTC_WRAPPER" not in os.environ:
-        os.environ["RUSTC_WRAPPER"] = "sccache"
-        # Default cache dir + 20G cap. Devs can override via SCCACHE_DIR /
-        # SCCACHE_CACHE_SIZE before invoking dev.py.
-        os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
+    # Share compiler outputs across worktrees and independent target dirs.
+    # The selected wrapper is inherited by every cargo subprocess below.
+    if cargo_active:
+        _configure_compiler_cache(compiler_cache)
 
     # Environment classification and Git subprocess safety only matter when a
     # cargo lane runs.
@@ -8410,6 +8445,10 @@ def main():
         "--pretty", action="store_true", default=False,
         help="Render lanes as a live table instead of line-per-step output",
     )
+    check_parser.add_argument(
+        "--compiler-cache", choices=_COMPILER_CACHE_BACKENDS, default=None,
+        help="Rust compiler cache (default: PHOENIX_COMPILER_CACHE or auto)",
+    )
 
     check_plan_parser = sub.add_parser(
         "check-plan",
@@ -8594,7 +8633,12 @@ def main():
     elif args.command == "status":
         cmd_status()
     elif args.command == "check":
-        cmd_check(gate=not args.check_all, lanes=args.lanes, pretty=pretty)
+        cmd_check(
+            gate=not args.check_all,
+            lanes=args.lanes,
+            pretty=pretty,
+            compiler_cache=args.compiler_cache,
+        )
     elif args.command == "check-plan":
         cmd_check_plan(gate=not args.check_all, lanes=args.lanes, fmt=args.format)
     elif args.command == "codegen":
