@@ -63,7 +63,7 @@ pub struct DriveTurnResult {
 }
 
 /// Database lifetime recorded in the output without inventing a path for memory mode.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DatabaseResult {
     Memory,
@@ -109,6 +109,39 @@ impl DriveTurnRequest {
     }
 }
 
+fn extract_builtin_skills(runtime_env: &PhoenixRuntimeEnvironment) {
+    let skills_dir = runtime_env.builtin_skills_dir();
+    if let Err(error) = crate::skills::builtin::extract_to(&skills_dir) {
+        tracing::warn!(error = %error, "Failed to extract built-in skills");
+    }
+}
+
+async fn project_id_for_cwd(
+    db: &Database,
+    cwd: &std::path::Path,
+) -> Result<Option<String>, DriveTurnError> {
+    let Some(repo_root) = phoenix_core::git::detect_git_repo_root(cwd) else {
+        return Ok(None);
+    };
+    db.find_or_create_project(&repo_root)
+        .await
+        .map(|project| Some(project.id))
+        .map_err(|error| DriveTurnError::Database(error.to_string()))
+}
+
+async fn configure_mcp_manager(db: &Database) -> Arc<crate::tools::mcp::McpClientManager> {
+    let manager = Arc::new(crate::tools::mcp::McpClientManager::new());
+    manager.set_oauth_store(Arc::new(crate::mcp_oauth_store::DbOAuthStore::new(
+        db.clone(),
+    )));
+    match db.get_disabled_mcp_servers().await {
+        Ok(disabled) => manager.set_disabled_servers(disabled).await,
+        Err(error) => tracing::warn!(error = %error, "Failed to load disabled MCP servers"),
+    }
+    manager.start_background_discovery();
+    manager
+}
+
 /// Drive one user turn through the same runtime, provider adapters, and tool
 /// registry used by the Phoenix server.
 ///
@@ -122,6 +155,7 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
 
     let started = std::time::Instant::now();
     let runtime_env = Arc::new(PhoenixRuntimeEnvironment::detect());
+    extract_builtin_skills(&runtime_env);
     let (db, database_result) = open_database(&request.database, &runtime_env).await?;
 
     let llm_config = LlmConfig::from_env(runtime_env);
@@ -134,6 +168,14 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         });
     }
 
+    let project_id = project_id_for_cwd(&db, &cwd).await?;
+    let default_language = db.get_default_llm_language().await.unwrap_or_else(|error| {
+        tracing::warn!(
+            error = %error,
+            "Failed to read default LLM language; falling back to default"
+        );
+        phoenix_core::llm_language::LlmLanguage::default()
+    });
     let conversation_id = uuid::Uuid::new_v4().to_string();
     db.create_conversation_with_project(
         &conversation_id,
@@ -142,35 +184,57 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
         true,
         None,
         Some(&request.model),
-        None,
+        project_id.as_deref(),
         &ConvMode::Direct,
         None,
         None,
         None,
-        phoenix_core::llm_language::LlmLanguage::default(),
+        default_language,
     )
     .await
     .map_err(|error| DriveTurnError::Database(error.to_string()))?;
 
+    let mcp_manager = configure_mcp_manager(&db).await;
     let manager = Arc::new(RuntimeManager::new(
         db.clone(),
         llm_registry,
         crate::platform::PlatformCapability::detect(),
-        Arc::new(crate::tools::mcp::McpClientManager::new()),
+        mcp_manager,
         credential_helper,
     ));
     manager.start_sub_agent_handler().await;
 
+    let result = drive_conversation(
+        &request,
+        &db,
+        &database_result,
+        &manager,
+        &conversation_id,
+        started,
+    )
+    .await;
+    crate::tools::bash::shutdown_kill_tree(manager.bash_handles()).await;
+    result
+}
+
+async fn drive_conversation(
+    request: &DriveTurnRequest,
+    db: &Database,
+    database_result: &DatabaseResult,
+    manager: &Arc<RuntimeManager>,
+    conversation_id: &str,
+    started: std::time::Instant,
+) -> Result<DriveTurnResult, DriveTurnError> {
     let mut state_rx = manager
-        .subscribe_state(&conversation_id)
+        .subscribe_state(conversation_id)
         .await
         .map_err(DriveTurnError::Runtime)?;
     let message_id = uuid::Uuid::new_v4().to_string();
     manager
         .send_event(
-            &conversation_id,
+            conversation_id,
             Event::UserMessage {
-                text: request.prompt,
+                text: request.prompt.clone(),
                 llm_text: None,
                 images: Vec::new(),
                 files: Vec::new(),
@@ -184,27 +248,27 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
 
     let outcome = if let Ok(result) = tokio::time::timeout(
         request.timeout,
-        wait_for_stable_turn(&db, &conversation_id, &mut state_rx),
+        wait_for_stable_turn(db, conversation_id, &mut state_rx),
     )
     .await
     {
         result?
     } else {
-        cancel_timed_out_turn(&manager, &conversation_id, &mut state_rx).await?;
+        cancel_timed_out_turn(manager, conversation_id, &mut state_rx).await?;
         return Err(DriveTurnError::Timeout(request.timeout));
     };
     let messages = db
-        .get_messages(&conversation_id)
+        .get_messages(conversation_id)
         .await
         .map_err(|error| DriveTurnError::Database(error.to_string()))?;
 
     Ok(DriveTurnResult {
-        conversation_id,
+        conversation_id: conversation_id.to_string(),
         git_sha: option_env!("PHOENIX_GIT_SHA")
             .unwrap_or("unknown")
             .to_string(),
-        model: request.model,
-        database: database_result,
+        model: request.model.clone(),
+        database: database_result.clone(),
         outcome,
         elapsed_ms: started.elapsed().as_millis(),
         messages,
@@ -216,6 +280,7 @@ async fn cancel_timed_out_turn(
     conversation_id: &str,
     state_rx: &mut tokio::sync::watch::Receiver<ConvState>,
 ) -> Result<(), DriveTurnError> {
+    state_rx.borrow_and_update();
     manager
         .send_event(
             conversation_id,
@@ -229,13 +294,16 @@ async fn cancel_timed_out_turn(
             DriveTurnError::Runtime(format!("timeout cancellation failed: {error}"))
         })?;
 
-    tokio::time::timeout(Duration::from_secs(10), wait_for_stable_state(state_rx))
-        .await
-        .map_err(|_| {
-            DriveTurnError::Runtime(
-                "timed-out turn did not reach a stable state after cancellation".into(),
-            )
-        })??;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        wait_for_post_cancel_stable_state(state_rx),
+    )
+    .await
+    .map_err(|_| {
+        DriveTurnError::Runtime(
+            "timed-out turn did not reach a stable state after cancellation".into(),
+        )
+    })??;
     Ok(())
 }
 
@@ -305,9 +373,13 @@ async fn wait_for_stable_turn(
     }
 }
 
-async fn wait_for_stable_state(
+async fn wait_for_post_cancel_stable_state(
     state_rx: &mut tokio::sync::watch::Receiver<ConvState>,
 ) -> Result<StableOutcome, DriveTurnError> {
+    state_rx
+        .changed()
+        .await
+        .map_err(|_| DriveTurnError::Runtime("runtime state channel closed".into()))?;
     loop {
         if let Some(outcome) = stable_outcome(&state_rx.borrow()) {
             return Ok(outcome);
@@ -374,6 +446,19 @@ mod tests {
             stable_outcome(&ConvState::LlmRequesting { attempt: 1 }),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn post_cancel_waiter_requires_a_new_state_observation() {
+        let (tx, mut rx) = tokio::sync::watch::channel(ConvState::Idle);
+        rx.borrow_and_update();
+        let waiter = tokio::spawn(async move { wait_for_post_cancel_stable_state(&mut rx).await });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        tx.send(ConvState::Terminal).unwrap();
+
+        assert_eq!(waiter.await.unwrap().unwrap(), StableOutcome::Terminal);
     }
 
     #[test]

@@ -292,6 +292,7 @@ rule StoreToClipboardFromOldText {
 rule IdentifyFailedAnchorPatch {
     when: BuildEdit(planner, patch, original)
     requires: patch.operation in {replace, insert_before, insert_after}
+    requires: patch.replace_all = false
     requires: patch.old_text != null
     requires: find_unique_match(original, patch.old_text) in {not_found, not_unique}
     ensures: AnchorFailure(position_of(patch), patch.operation)
