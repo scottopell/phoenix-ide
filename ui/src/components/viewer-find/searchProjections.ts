@@ -315,7 +315,10 @@ export function buildConversationSearchProjection(units: readonly RenderUnit[], 
           unit.kind,
           unit.key,
           'sub-agent-status',
-          unit.state.agents.map((agent) => `${agent.status} ${agent.prompt}`).join('\n'),
+          [
+            ...unit.state.pending.map((agent) => `pending ${agent.task}`),
+            ...unit.state.completed_results.map((agent) => `completed ${agent.task} ${subAgentOutcomeText(agent.outcome)}`),
+          ].join('\n'),
         );
         break;
       default:
@@ -335,6 +338,14 @@ export function buildConversationSearchProjection(units: readonly RenderUnit[], 
       end: match.end,
     })),
   };
+}
+
+function subAgentOutcomeText(outcome: { type: 'success'; result?: string } | { type: 'failure'; error?: string; error_kind?: string } | { type: 'timed_out' }): string {
+  switch (outcome.type) {
+    case 'success': return outcome.result ?? 'success';
+    case 'failure': return outcome.error ?? outcome.error_kind ?? 'failure';
+    case 'timed_out': return 'timed out';
+  }
 }
 
 function addConversationSource(
@@ -405,7 +416,6 @@ function agentTurnSources(
       out.push({ role: `tool-use-result-${index}`, text: toolResultText(toolResultsByUseId.get(block.id ?? '')) });
       return;
     }
-    block satisfies never;
   });
   return out;
 }

@@ -63,13 +63,13 @@ function skillMsg(id: string, text: string): Message {
   } as Message;
 }
 
-function queued(localId: string, text: string, files?: Array<{ original_name: string }>): QueuedMessage {
+function queued(localId: string, text: string, files?: QueuedMessage['files']): QueuedMessage {
   return {
     localId,
     conversationId: 'c1',
     text,
     images: [],
-    files,
+    ...(files ? { files } : {}),
     timestamp: 0,
     status: 'pending',
   };
@@ -172,16 +172,14 @@ describe('buildDiffSearchProjection', () => {
 
 describe('buildConversationSearchProjection', () => {
   it('projects canonical typed content across available render units exhaustively', () => {
-    const awaiting: ConversationState = {
+    const awaiting: Extract<ConversationState, { type: 'awaiting_sub_agents' }> = {
       type: 'awaiting_sub_agents',
-      agents: [
-        { id: 'sa1', prompt: 'inspect alpha path', status: 'running', output: null },
-        { id: 'sa2', prompt: 'summarize beta path', status: 'success', output: 'done' },
-      ],
+      pending: [{ agent_id: 'sa1', task: 'inspect alpha path' }],
+      completed_results: [{ agent_id: 'sa2', task: 'summarize beta path', outcome: { type: 'success', result: 'done' } }],
     };
     const units: RenderUnit[] = [
       { kind: 'user', key: 'u1', message: userMsg('u1', 'User alpha', [{ original_name: 'alpha.txt' }]) },
-      { kind: 'pending_user', key: 'p1', message: queued('p1', 'Pending alpha', [{ original_name: 'queued-alpha.md' }]) },
+      { kind: 'pending_user', key: 'p1', message: queued('p1', 'Pending alpha', [{ original_name: 'queued-alpha.md', media_type: 'text/markdown', size_bytes: 12, stored_path: '/tmp/queued-alpha.md' }]) },
       { kind: 'skill', key: 's1', message: skillMsg('s1', 'Skill alpha') },
       { kind: 'system', key: 'sys1', message: systemMsg('sys1', 'System alpha') },
       {
@@ -209,7 +207,7 @@ describe('buildConversationSearchProjection', () => {
       ['agent_turn', 'tool-use-display-1', 'search alpha'],
       ['agent_turn', 'tool-use-input-1', '{\n  "path": "src",\n  "pattern": "alpha"\n}'],
       ['agent_turn', 'tool-use-result-1', 'Tool alpha result'],
-      ['sub_agent_status', 'sub-agent-status', 'running inspect alpha path\nsuccess summarize beta path'],
+      ['sub_agent_status', 'sub-agent-status', 'pending inspect alpha path\ncompleted summarize beta path done'],
     ]);
     expect(projection.matches.map((match) => match.target.unitKind)).toEqual([
       'user',

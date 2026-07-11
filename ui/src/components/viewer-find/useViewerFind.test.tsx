@@ -8,7 +8,7 @@ function Harness({ text, onReady, onNavigate }: {
   onReady: (api: ReturnType<typeof useViewerFind>) => void;
   onNavigate?: Parameters<typeof useViewerFind>[0]['onNavigate'];
 }) {
-  const api = useViewerFind({ text, onNavigate });
+  const api = useViewerFind(onNavigate ? { text, onNavigate } : { text });
   useEffect(() => { onReady(api); }, [api, onReady]);
   return (
     <div>

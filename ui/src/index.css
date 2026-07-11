@@ -13765,3 +13765,13 @@ button.keyword-search-filepath:hover {
 .conversation-panel-fixture-sidebar {
   height: 100vh;
 }
+
+.viewer-find-row-match {
+  outline: 1px solid color-mix(in srgb, var(--accent, #58a6ff) 55%, transparent);
+  outline-offset: 2px;
+}
+
+.viewer-find-row-match--active {
+  background: color-mix(in srgb, #ffd33d 18%, transparent);
+  outline-width: 2px;
+}

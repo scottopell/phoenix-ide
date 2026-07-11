@@ -1,4 +1,6 @@
 import { memo, useState, useRef, useCallback, useMemo, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { FindBar, buildConversationSearchProjection, useViewerFindKeyboardShortcut } from './viewer-find';
+import { useFocusScope, useRegisterFocusScope } from '../hooks/useFocusScope';
 import { Virtuoso, type VirtuosoHandle, type VirtuosoProps, type ListRange } from 'react-virtuoso';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
@@ -316,6 +318,13 @@ function MessageListImpl({
   onChaptersChange,
   targetMessageId,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
+  const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
+  useRegisterFocusScope(findScopeId);
+  const { activeScope } = useFocusScope();
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  const [findActiveIndex, setFindActiveIndex] = useState(0);
+  const findPreviousFocusRef = useRef<HTMLElement | null>(null);
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
@@ -354,6 +363,37 @@ function MessageListImpl({
     () => [...historicalUnits, ...tailUnits],
     [historicalUnits, tailUnits],
   );
+
+  const findProjection = useMemo(
+    () => buildConversationSearchProjection(allUnits, findQuery),
+    [allUnits, findQuery],
+  );
+  const findMatches = findProjection.matches;
+  const normalizedFindIndex = findMatches.length === 0 ? -1 : Math.min(findActiveIndex, findMatches.length - 1);
+  const openFind = useCallback(() => {
+    findPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setFindOpen(true);
+  }, []);
+  const closeFind = useCallback(() => {
+    setFindOpen(false);
+    requestAnimationFrame(() => findPreviousFocusRef.current?.focus());
+  }, []);
+  useViewerFindKeyboardShortcut({ scopeId: findScopeId, onOpen: openFind });
+  useEffect(() => {
+    setFindOpen(false);
+    setFindQuery('');
+    setFindActiveIndex(0);
+  }, [conversationId]);
+  const changeFindQuery = useCallback((query: string) => {
+    setFindQuery(query);
+    setFindActiveIndex(0);
+  }, []);
+  const nextFindMatch = useCallback(() => {
+    setFindActiveIndex((index) => findMatches.length === 0 ? 0 : (index + 1) % findMatches.length);
+  }, [findMatches.length]);
+  const previousFindMatch = useCallback(() => {
+    setFindActiveIndex((index) => findMatches.length === 0 ? 0 : (index - 1 + findMatches.length) % findMatches.length);
+  }, [findMatches.length]);
 
   // Chapters are derived here, not in a parent, so they share the exact
   // `historicalUnits` array virtuoso renders — a chapter's `unitIndex` is
@@ -695,6 +735,29 @@ function MessageListImpl({
 
   useImperativeHandle(ref, () => ({ scrollToUnitIndex, scrollToMessageId }), [scrollToMessageId, scrollToUnitIndex]);
 
+  useEffect(() => {
+    if (!findOpen || normalizedFindIndex < 0) return undefined;
+    const match = findMatches[normalizedFindIndex];
+    if (!match) return undefined;
+    dispatchScrollEvent({ type: 'navigationJumped' });
+    virtuosoRef.current?.scrollToIndex({ index: match.target.unitIndex, align: 'center', behavior: 'smooth' });
+    const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
+      const row = findRowByKey(match.target.unitKey);
+      if (!row) return;
+      scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+        .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+      row.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
+      row.scrollIntoView({ block: 'center' });
+    }, delay));
+    return () => timers.forEach(clearTimeout);
+  }, [dispatchScrollEvent, findMatches, findOpen, findRowByKey, normalizedFindIndex]);
+
+  useEffect(() => {
+    if (findOpen || activeScope !== findScopeId) return;
+    scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+      .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+  }, [activeScope, findOpen, findScopeId]);
+
   const handleRangeChanged = useCallback((range: ListRange) => {
     onVisibleRangeChange?.(range);
   }, [onVisibleRangeChange]);
@@ -739,6 +802,17 @@ function MessageListImpl({
 
   return (
     <main id="main-area" className="chat-main-area">
+      {findOpen && (
+        <FindBar
+          query={findQuery}
+          activeIndex={normalizedFindIndex}
+          matchCount={findMatches.length}
+          onQueryChange={changeFindQuery}
+          onNext={nextFindMatch}
+          onPrevious={previousFindMatch}
+          onClose={closeFind}
+        />
+      )}
       <section id="chat-view" className="view active">
         <Virtuoso
           key={conversationId ?? '__empty__'}
