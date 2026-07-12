@@ -637,7 +637,7 @@ export function TaskApprovalReader({
         {plan}
       </ReactMarkdown>
     );
-  }, [plan, highlightedLine, handleLongPress, findProjection.matches, activeFindIndex]);
+  }, [plan, highlightedLine, handleLongPress, findProjection.matches, activeFindIndex, registerBlockRef]);
 
   return (
     <div className="task-approval-reader">
