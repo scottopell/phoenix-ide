@@ -72,6 +72,57 @@ fn active_pr_selection_response(
     }
 }
 
+fn github_repo_identifier_from_worktree(path: &FsPath) -> Option<String> {
+    crate::runtime::pr_status_poll::github_repo_identifier(path)
+}
+
+fn active_pr_diff_repo_mismatch_reason(
+    worktree_repo_identity: Option<&str>,
+    selected_repo_identity: &str,
+) -> Option<String> {
+    match worktree_repo_identity {
+        Some(repo) if repo == selected_repo_identity => None,
+        Some(repo) => Some(format!(
+            "PR-specific diff unavailable for selected repository {selected_repo_identity}; local worktree is attached to {repo}"
+        )),
+        None => Some(format!(
+            "PR-specific diff unavailable for selected repository {selected_repo_identity}; local worktree origin is not a GitHub repository"
+        )),
+    }
+}
+
+fn capture_active_pr_diff(
+    worktree_path: &FsPath,
+    active_pr: &crate::db::WorkScopePrAssociation,
+    max_diff_bytes: usize,
+) -> Result<crate::git_ops::CapturedDiff, AppError> {
+    capture_active_pr_diff_for_repo_identity(
+        worktree_path,
+        github_repo_identifier_from_worktree(worktree_path).as_deref(),
+        active_pr,
+        max_diff_bytes,
+    )
+}
+
+fn capture_active_pr_diff_for_repo_identity(
+    worktree_path: &FsPath,
+    worktree_repo_identity: Option<&str>,
+    active_pr: &crate::db::WorkScopePrAssociation,
+    max_diff_bytes: usize,
+) -> Result<crate::git_ops::CapturedDiff, AppError> {
+    let selected_repo_identity = format!("{}/{}", active_pr.repo_owner, active_pr.repo_name);
+    if let Some(reason) =
+        active_pr_diff_repo_mismatch_reason(worktree_repo_identity, &selected_repo_identity)
+    {
+        return Err(AppError::BadRequest(reason));
+    }
+    Ok(capture_branch_diff(
+        worktree_path,
+        &active_pr.base,
+        max_diff_bytes,
+    ))
+}
+
 fn associated_pr_summary_response(
     pr: crate::db::WorkScopePrAssociation,
 ) -> AssociatedPrSummaryResponse {
@@ -1372,7 +1423,6 @@ pub(crate) async fn get_active_pr_diff(
                 "PR-specific diff unavailable until an active PR is selected".to_string(),
             )
         })?;
-    let base_branch = active_pr.base.clone();
     let pr_number = active_pr.pr_number;
 
     tokio::task::spawn_blocking(move || {
@@ -1383,7 +1433,7 @@ pub(crate) async fn get_active_pr_diff(
             )));
         }
 
-        let captured = capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES);
+        let captured = capture_active_pr_diff(&wt, &active_pr, MAX_DIFF_BYTES)?;
         Ok(build_diff_response(
             captured,
             format!("PR #{pr_number} Diff"),
@@ -2028,6 +2078,89 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(selected.pr_number, 22);
+    }
+
+    #[test]
+    fn active_pr_diff_rejects_cross_repo_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        init_repo(temp.path());
+        run_git(
+            temp.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/repo.git",
+            ],
+        )
+        .unwrap();
+        let selected = crate::db::WorkScopePrAssociation {
+            work_scope_id: 1,
+            repo_owner: "fork".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            title: "fork change".to_string(),
+            url: "https://example.test/fork/repo/42".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: crate::api::types::PrDisplayState::Open,
+            base: "main".to_string(),
+            head: "feature/fork".to_string(),
+            github_updated_at: None,
+            feedback_status: phoenix_core::domain::pr_feedback_status::PrFeedbackStatus::Open,
+            first_seen_at: "2024-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let err = capture_active_pr_diff(temp.path(), &selected, 256 * 1024)
+            .err()
+            .expect("cross-repo selection should be rejected");
+        match err {
+            AppError::BadRequest(message) => {
+                assert!(message.contains("selected repository fork/repo"));
+                assert!(message.contains("attached to acme/repo"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_pr_diff_same_repo_uses_selected_pr_base_for_stacked_diff() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature/base"]).unwrap();
+        commit_file(repo.path(), "base.txt", "base", "base commit");
+        run_git(repo.path(), &["checkout", "-q", "-b", "feature/top"]).unwrap();
+        commit_file(repo.path(), "top.txt", "top", "top commit");
+
+        let selected = crate::db::WorkScopePrAssociation {
+            work_scope_id: 1,
+            repo_owner: "acme".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 77,
+            title: "stacked".to_string(),
+            url: "https://example.test/acme/repo/77".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: crate::api::types::PrDisplayState::Open,
+            base: "feature/base".to_string(),
+            head: "feature/top".to_string(),
+            github_updated_at: None,
+            feedback_status: phoenix_core::domain::pr_feedback_status::PrFeedbackStatus::Open,
+            first_seen_at: "2024-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let captured = capture_active_pr_diff_for_repo_identity(
+            repo.path(),
+            Some("acme/repo"),
+            &selected,
+            256 * 1024,
+        )
+        .unwrap();
+        assert_eq!(captured.comparator, "feature/base");
+        assert!(captured.commit_log.contains("top commit"));
+        assert!(!captured.commit_log.contains("base commit"));
     }
 
     #[test]

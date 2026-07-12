@@ -51,6 +51,10 @@ pub(crate) fn github_repo_identifier(path: &Path) -> Option<String> {
         .then(|| format!("{owner}/{repo}"))
 }
 
+pub(crate) fn repository_identity_is_structurally_local_path(identity: &str) -> bool {
+    Path::new(identity).is_absolute()
+}
+
 fn candidate_for_conv_branch(conv: &crate::db::Conversation) -> Option<PrBranchCandidate> {
     let branch_name = conv.conv_mode.branch_name()?;
     let worktree_path = conv.conv_mode.worktree_path()?;
@@ -62,13 +66,22 @@ fn candidate_for_conv_branch(conv: &crate::db::Conversation) -> Option<PrBranchC
     })
 }
 
-fn filter_candidate_for_repo(
+fn normalize_candidate_for_target_repo(
     repository_identity: Option<&str>,
     candidate: PrBranchCandidate,
 ) -> Option<PrBranchCandidate> {
     match repository_identity {
-        Some(repo) if repo != candidate.repository_identity => None,
-        _ => Some(candidate),
+        Some(repo) if candidate.repository_identity == repo => Some(candidate),
+        Some(repo)
+            if repository_identity_is_structurally_local_path(&candidate.repository_identity) =>
+        {
+            Some(PrBranchCandidate {
+                repository_identity: repo.to_string(),
+                branch_name: candidate.branch_name,
+            })
+        }
+        Some(_) => None,
+        None => Some(candidate),
     }
 }
 
@@ -167,7 +180,7 @@ async fn collect_targets(db: &Database) -> Result<Vec<PollTarget>, String> {
             .await
             .map_err(|err| err.to_string())?
         {
-            if let Some(candidate) = filter_candidate_for_repo(
+            if let Some(candidate) = normalize_candidate_for_target_repo(
                 repository_identity.as_deref(),
                 PrBranchCandidate {
                     repository_identity: observed.repository_identity,
@@ -180,7 +193,7 @@ async fn collect_targets(db: &Database) -> Result<Vec<PollTarget>, String> {
             }
         }
         if let Some(candidate) = candidate_for_conv_branch(&conv).and_then(|candidate| {
-            filter_candidate_for_repo(repository_identity.as_deref(), candidate)
+            normalize_candidate_for_target_repo(repository_identity.as_deref(), candidate)
         }) {
             if seen_branches.insert(candidate.clone()) {
                 branches.push(candidate);
@@ -318,8 +331,8 @@ mod selection_tests {
     use super::*;
 
     #[test]
-    fn filter_candidate_for_repo_rejects_cross_repo_branch() {
-        let kept = filter_candidate_for_repo(
+    fn normalize_candidate_for_target_repo_rejects_cross_repo_branch() {
+        let kept = normalize_candidate_for_target_repo(
             Some("acme/repo"),
             PrBranchCandidate {
                 repository_identity: "fork/repo".to_string(),
@@ -327,6 +340,20 @@ mod selection_tests {
             },
         );
         assert!(kept.is_none());
+    }
+
+    #[test]
+    fn normalize_candidate_for_target_repo_maps_local_path_identity_to_github_slug() {
+        let kept = normalize_candidate_for_target_repo(
+            Some("acme/repo"),
+            PrBranchCandidate {
+                repository_identity: "/tmp/local/repo".to_string(),
+                branch_name: "feature".to_string(),
+            },
+        )
+        .expect("candidate");
+        assert_eq!(kept.repository_identity, "acme/repo");
+        assert_eq!(kept.branch_name, "feature");
     }
 
     #[test]

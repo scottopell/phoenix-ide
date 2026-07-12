@@ -581,7 +581,8 @@ fn infer_active_pr_selection(
         {
             return Some(active_pr_identity_from_association(actionable[0]));
         }
-    } else if actionable.len() == 1 {
+    }
+    if actionable.len() == 1 {
         return Some(active_pr_identity_from_association(actionable[0]));
     }
 
@@ -9627,7 +9628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_pr_does_not_singleton_fallback_for_non_path_conflicting_slug_identity() {
+    async fn active_pr_conflicting_slug_still_uses_sole_actionable_fallback() {
         let db = Database::open_in_memory().await.unwrap();
         let scope = phoenix_core::work_scope::WorkScope::Worktree(
             "/tmp/ws-active-local-slug-conflict".to_string(),
@@ -9661,9 +9662,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            state.selection.is_none(),
-            "non-path slug identities must not singleton-fallback across conflicting owner/repo"
+        assert_eq!(
+            state
+                .selection
+                .as_ref()
+                .map(|selection| selection.pr.pr_number),
+            Some(2),
+            "a conflicting branch identity must not block the sole-actionable fallback"
         );
     }
 
@@ -9844,6 +9849,91 @@ mod tests {
                 &scope,
                 &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
                     latest_observed_branch: None,
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn active_pr_unmatched_branch_falls_through_to_sole_actionable_pr() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+            "/tmp/ws-active-unmatched-sole".to_string(),
+        );
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[pr_observation(
+                "owner",
+                "repo",
+                7,
+                phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                "feature/real",
+            )],
+        )
+        .await
+        .unwrap();
+
+        let state = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: Some(
+                        phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                            repository_identity: "owner/repo".to_string(),
+                            branch_name: "main".to_string(),
+                        },
+                    ),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.selection.unwrap().pr.pr_number, 7);
+    }
+
+    #[tokio::test]
+    async fn active_pr_unmatched_branch_keeps_multiple_actionable_prs_ambiguous() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = phoenix_core::work_scope::WorkScope::Worktree(
+            "/tmp/ws-active-unmatched-many".to_string(),
+        );
+        db.upsert_work_scope_pr_observations(
+            &scope,
+            &[
+                pr_observation(
+                    "owner",
+                    "repo",
+                    1,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Open,
+                    "feature/a",
+                ),
+                pr_observation(
+                    "owner",
+                    "repo",
+                    2,
+                    phoenix_core::domain::pr_display_state::PrDisplayState::Draft,
+                    "feature/b",
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let state = db
+            .derive_active_work_scope_pr_selection(
+                &scope,
+                &phoenix_core::domain::active_pr_selection::ActivePrInferenceInput {
+                    latest_observed_branch: Some(
+                        phoenix_core::domain::active_pr_selection::ActivePrBranchContext {
+                            repository_identity: "owner/repo".to_string(),
+                            branch_name: "main".to_string(),
+                        },
+                    ),
                 },
                 None,
             )
