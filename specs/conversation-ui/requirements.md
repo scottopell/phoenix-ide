@@ -67,10 +67,15 @@ AND visually distinguish user messages from agent messages
 AND group tool calls with their results
 AND auto-scroll to newest content
 
+WHEN opening a conversation with history beyond the initial view
+THE SYSTEM SHALL display the newest messages without waiting for the complete transcript
+AND offer an explicit action to load the complete earlier history
+AND preserve chronological order without gaps or duplicates across loaded pages
+
 WHEN agent message contains markdown
 THE SYSTEM SHALL render basic markdown (code blocks, bold, italic, paragraphs)
 
-**Rationale:** Users need to read the conversation history and understand tool execution.
+**Rationale:** Users need to read the conversation history and understand tool execution. Long transcripts must not delay access to the newest activity; users incur complete-history loading only when they request it or follow a message deep link.
 
 ---
 
@@ -494,7 +499,8 @@ experience is never degraded mid-generation.
 ### REQ-CONV-023: Conversation Navigation
 
 THE SYSTEM SHALL display a persistent conversation navigation strip in the top horizontal slot above the message list
-AND populate it with whole-conversation chapters in conversation order
+AND populate it with chapters from the available conversation history in conversation order
+AND extend the strip as older history becomes available
 AND assign the strip a single fixed role that does not change between cold load and streaming
 
 THE SYSTEM SHALL treat as a chapter every user prompt, and every assistant text block at or above the significance threshold (REQ-CONV-022)
@@ -502,7 +508,7 @@ AND render each chapter as a type-styled pill distinguishing a user prompt from 
 AND label each pill with the truncated prompt or the first line of the prose
 
 WHEN a chapter pill is clicked
-THE SYSTEM SHALL issue one virtualizer-owned positioning command to that chapter's message, including when the target is outside the rendered window
+THE SYSTEM SHALL issue one virtualizer-owned positioning command to that chapter's message, including when the loaded target is outside the rendered window
 AND SHALL give the reader durable scroll ownership so later tail growth does not displace the selected chapter
 AND SHALL briefly highlight the selected message once its row is rendered
 AND SHALL NOT use delayed DOM scroll-position corrections to land or highlight the target

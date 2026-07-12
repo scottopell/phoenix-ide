@@ -1,0 +1,43 @@
+id: ConversationPage-demand-driven-history
+status: success
+verdict: approved
+target: ui/src/pages/ConversationPage.tsx:ConversationPageContent
+technique: demand-driven-history
+scenario:
+  name: conversation-switch-cold
+  file: skills/phoenix-perf-find-target/resources/scenarios/conversation-switch-cold.yaml
+  runs: 20
+  warmup: 3
+  throttle_rate: 2
+metrics:
+  wall_ms:
+    baseline: "445.9 ± 58.4"
+    optimized: "192.7 ± 30.1"
+    change: "-56.78%"
+    p_value: 1.34e-16
+  script_ms:
+    baseline: "200.4 ± 41.8"
+    optimized: "0 ± 0"
+    change: "-100.00%"
+    p_value: 8.855e-15
+  long_tasks:
+    baseline: "2.85 ± 0.587"
+    optimized: "0 ± 0"
+    change: "-100.00%"
+    p_value: 7.145e-15
+  react_actual_ms:
+    baseline: "87.36 ± 18.5"
+    optimized: "85.73 ± 20.9"
+    change: "-1.85%"
+    p_value: 0.7963
+review:
+  duplicate_hunter: approved
+  skeptic: approved
+  conservative: approved
+  react_expert: approved
+  greybeard: approved
+notes:
+  - Cold navigation fetches metadata plus the latest 50 messages rather than the complete transcript.
+  - Complete earlier history is fetched only through an explicit user action or a message deep link.
+  - The automatic prepend prototype was rejected before landing because of scroll anchoring and stale-request hazards.
+  - Full project checks passed.

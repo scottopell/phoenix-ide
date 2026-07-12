@@ -1,0 +1,42 @@
+# SPA switch into an already-hydrated production-shaped conversation.
+name: conversation-switch-warm
+covers:
+  - ui/src/pages/ConversationPage.tsx
+  - ui/src/components/MessageList.tsx
+  - ui/src/conversation/ConversationStore.ts
+
+params:
+  base_url: "{UI_URL}"
+  source: "fixture-turn-one"
+  fixture: "fixture-heavy-prod-shape"
+
+runs: 20
+warmup: 3
+throttle_rate: 2
+
+reset:
+  url: "{base_url}/c/{fixture}"
+
+steps:
+  - eval: >
+      (() => {
+        history.pushState({}, '', '/c/{source}');
+        window.dispatchEvent(new PopStateEvent('popstate'));
+      })()
+  - wait-for-eval-predicate:
+      expr: >
+        location.pathname.endsWith('/{source}')
+        && document.body.textContent.includes('Fixture agent turn 23')
+        && !document.querySelector('.skeleton-messages')
+      timeout_ms: 60000
+  - eval: >
+      (() => {
+        history.pushState({}, '', '/c/{fixture}');
+        window.dispatchEvent(new PopStateEvent('popstate'));
+      })()
+  - wait-for-eval-predicate:
+      expr: >
+        location.pathname.endsWith('/{fixture}')
+        && document.body.textContent.includes('Heavy fixture agent step 232')
+        && !document.querySelector('.skeleton-messages')
+      timeout_ms: 60000

@@ -249,6 +249,8 @@ function ConversationPageContent() {
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
   const [deletingConversation, setDeletingConversation] = useState(false);
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
 
   // File explorer context (shared with desktop panel) — a projection of the
   // unified viewer slot below.
@@ -512,6 +514,9 @@ function ConversationPageContent() {
 
     setError(null);
     setArchiveStatusConfirmedConversationId(null);
+    setHasOlderMessages(false);
+    setLoadingOlderMessages(false);
+
     const hadAtomData = !!atomRef.current.conversationId;
 
     let cancelled = false;
@@ -648,23 +653,13 @@ function ConversationPageContent() {
 
           try {
             const snapshotStartedAtEventSeq = eventCursorRef.current;
-            const result = await (async () => {
-              if (isUuidRouteSegment(slug)) {
-                try {
-                  return await api.getConversation(slug);
-                } catch (err) {
-                  if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-                  return api.getConversationBySlug(slug);
-                }
-              }
-              try {
-                return await api.getConversationBySlug(slug);
-              } catch (err) {
-                if (!(err instanceof Error) || err.message !== 'Conversation not found') throw err;
-                return api.getConversation(slug);
-              }
-            })();
+            const metadata = await api.getConversationMetaBySlug(slug);
+            if (cancelled) return;
+            const latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
+            const result = { ...metadata, messages: latestWindow.messages };
             if (!cancelled) {
+              const oldestSequence = result.messages[0]?.sequence_id ?? null;
+              setHasOlderMessages(oldestSequence !== null && oldestSequence > 0);
               const replacesDifferentConversation = atomRef.current.conversationId !== null
                 && atomRef.current.conversationId !== result.conversation.id;
               dispatch({
@@ -722,6 +717,46 @@ function ConversationPageContent() {
       cancelled = true;
     };
   }, [slug, navigate, dispatch, eventCursorRef]);
+
+  const loadOlderMessages = useCallback(async () => {
+    if (!slug || !conversationId || loadingOlderMessages) return;
+    const requestedConversationId = conversationId;
+    setLoadingOlderMessages(true);
+    try {
+      const snapshotStartedAtEventSeq = eventCursorRef.current;
+      const result = await api.getConversationBySlug(slug);
+      if (atomRef.current.conversationId !== requestedConversationId) return;
+      dispatch({
+        type: 'merge_conversation_data',
+        conversationId: requestedConversationId,
+        conversation: result.conversation,
+        messages: result.messages,
+        phase: result.conversation.state
+          ? parseConversationState(result.conversation.state)
+          : result.presentation_mode === 'working'
+            ? { type: 'awaiting_llm' }
+            : { type: 'idle' },
+        contextWindow: { used: result.context_window_size || 0 },
+        transcriptGeneration: result.conversation.transcript_generation ?? 1,
+        eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
+        snapshotStartedAtEventSeq,
+      });
+      setHasOlderMessages(false);
+      await cacheDB.putMessages(result.messages);
+    } catch (err) {
+      console.warn('Failed to load earlier conversation history:', err);
+    } finally {
+      if (atomRef.current.conversationId === requestedConversationId) {
+        setLoadingOlderMessages(false);
+      }
+    }
+  }, [slug, conversationId, loadingOlderMessages, dispatch, eventCursorRef]);
+
+  useEffect(() => {
+    if (targetMessageId && hasOlderMessages && !loadingOlderMessages) {
+      void loadOlderMessages();
+    }
+  }, [targetMessageId, hasOlderMessages, loadingOlderMessages, loadOlderMessages]);
 
   useEffect(() => {
     if (!slug || !conversationId || archiveStatusConfirmed || !isConnected) return;
@@ -1663,6 +1698,9 @@ function ConversationPageContent() {
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}
         targetMessageId={targetMessageId}
+        hasOlderMessages={hasOlderMessages}
+        onLoadOlderMessages={loadOlderMessages}
+        loadingOlderMessages={loadingOlderMessages}
       />
       </RenderProfiler>
       {atom.uiError && (

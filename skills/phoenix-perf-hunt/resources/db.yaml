@@ -1,4 +1,11 @@
 entries:
+  - id: ConversationPage-demand-driven-history
+    target: ui/src/pages/ConversationPage.tsx:ConversationPageContent
+    technique: demand-driven-history
+    scenario: conversation-switch-cold
+    status: success
+    verdict: approved
+    file: resources/db/ConversationPage-demand-driven-history.yaml
   - id: MessageComponents-deferred-code-highlighting
     target: ui/src/components/MessageComponents.tsx:AgentMessage
     technique: defer-finalized-code-fence-highlighting

@@ -79,6 +79,9 @@ interface MessageListProps {
    *  no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
   targetMessageId?: string | undefined;
+  hasOlderMessages?: boolean | undefined;
+  onLoadOlderMessages?: (() => void) | undefined;
+  loadingOlderMessages?: boolean | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
@@ -328,6 +331,9 @@ function MessageListImpl({
   onVisibleRangeChange,
   onChaptersChange,
   targetMessageId,
+  hasOlderMessages = false,
+  onLoadOlderMessages,
+  loadingOlderMessages = false,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
   const { activeScope } = useFocusScope();
@@ -904,6 +910,16 @@ function MessageListImpl({
         </>
       )}
       <section id="chat-view" className="view active">
+        {hasOlderMessages && onLoadOlderMessages && (
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={loadingOlderMessages}
+            onClick={onLoadOlderMessages}
+          >
+            {loadingOlderMessages ? 'Loading earlier history…' : 'Load earlier history'}
+          </button>
+        )}
         <Virtuoso
           key={conversationId ?? '__empty__'}
           ref={virtuosoRef}

@@ -1,0 +1,37 @@
+# SPA switch away from a hydrated production-shaped conversation.
+name: conversation-switch-away
+covers:
+  - ui/src/pages/ConversationPage.tsx
+  - ui/src/components/MessageList.tsx
+  - ui/src/conversation/ConversationStore.ts
+
+params:
+  base_url: "{UI_URL}"
+  source: "fixture-heavy-prod-shape"
+  target: "fixture-turn-one"
+
+runs: 20
+warmup: 3
+throttle_rate: 2
+
+reset:
+  url: "{base_url}/c/{source}"
+  wait_app_ready:
+    expr: >
+      location.pathname.endsWith('/{source}')
+      && document.body.textContent.includes('Heavy fixture agent step 232')
+      && !document.querySelector('.skeleton-messages')
+    timeout_ms: 60000
+
+steps:
+  - eval: >
+      (() => {
+        history.pushState({}, '', '/c/{target}');
+        window.dispatchEvent(new PopStateEvent('popstate'));
+      })()
+  - wait-for-eval-predicate:
+      expr: >
+        location.pathname.endsWith('/{target}')
+        && document.body.textContent.includes('Fixture agent turn 23')
+        && !document.querySelector('.skeleton-messages')
+      timeout_ms: 60000
