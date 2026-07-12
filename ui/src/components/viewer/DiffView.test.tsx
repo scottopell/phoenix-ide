@@ -139,6 +139,16 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
   });
 
+  it('keeps diff find inert until open with a non-empty query', () => {
+    renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
+
+    expect(screen.queryByText('1 of 1')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toHaveValue('');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'bar' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+  });
+
   it('opens shared viewer find for diff-viewer scope and navigates header then line matches via typed scroll targets', () => {
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
 

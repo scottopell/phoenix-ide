@@ -293,6 +293,50 @@ describe('MessageList', () => {
     expect(screen.getByText('1 of 1')).toBeInTheDocument();
   });
 
+  it('reveals and highlights the expanded system prompt header match instead of scrolling to a row', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1)]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-system-prompt-target"
+        systemPrompt="alpha directive\nsecond line"
+      />,
+    ));
+
+    fireEvent.click(document.querySelector('.system-prompt-header') as HTMLElement);
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    const input = await screen.findByRole('textbox', { name: 'Find in viewer' });
+    fireEvent.change(input, { target: { value: 'alpha directive' } });
+
+    const header = document.querySelector('.system-prompt-content') as HTMLElement;
+    await waitFor(() => expect(header).toHaveClass('viewer-find-row-match--active'));
+  });
+
+  it('does not build transcript matches while find is closed or queryless', async () => {
+    render(withConvContext(
+      <MessageList
+        messages={[makeMessage(1)]}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-lazy-find"
+        systemPrompt="alpha directive"
+      />,
+    ));
+
+    fireEvent.click(document.querySelector('.system-prompt-header') as HTMLElement);
+    fireEvent.keyDown(window, { key: 'f', metaKey: true });
+    expect(screen.getByRole('textbox', { name: 'Find in viewer' })).toHaveValue('');
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(screen.queryByRole('textbox', { name: 'Find in viewer' })).toBeNull());
+  });
+
   it('renders overlay scope without opening transcript find shortcuts', () => {
     render(withConvContext(
       <PushScopeOnMount scopeId="overlay-scope">

@@ -100,8 +100,10 @@ export function DiffView({
     dialogOpen: notes.annotating !== null,
   });
   const findProjection = useMemo(
-    () => buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query, commitLog),
-    [commitLog, committedDiff, uncommittedDiff, find.query],
+    () => (find.isOpen && find.query.length > 0
+      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, find.query, commitLog)
+      : { sources: [], matches: [] }),
+    [commitLog, committedDiff, find.isOpen, uncommittedDiff, find.query],
   );
   const activeFindIndex = findProjection.matches.length === 0
     ? -1
@@ -147,7 +149,9 @@ export function DiffView({
 
   const handleFindQueryChange = useCallback((query: string) => {
     find.setQuery(query);
-    const nextProjection = buildDiffSearchProjection(committedDiff, uncommittedDiff, query, commitLog);
+    const nextProjection = query.length > 0
+      ? buildDiffSearchProjection(committedDiff, uncommittedDiff, query, commitLog)
+      : { sources: [], matches: [] };
     const target = nextProjection.matches[0]?.target;
     if (target) navigateFindTarget(target);
   }, [find, commitLog, committedDiff, navigateFindTarget, uncommittedDiff]);

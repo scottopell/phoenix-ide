@@ -262,4 +262,35 @@ describe('TaskApprovalReader shared find integration', () => {
     expect(screen.getByText('const')).toBeInTheDocument();
     expect(screen.getByText('true')).toBeInTheDocument();
   });
+
+  it('drives task find counts and active navigation from projected markdown blocks', async () => {
+    renderTaskApprovalReader([
+      '# Plan',
+      '',
+      'Use **alpha** in prose.',
+      '',
+      '```ts',
+      'const alpha = true;',
+      '```',
+    ].join('\n'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in task approval' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'alpha' } });
+
+    await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
+  });
+
+  it('renders only one notes badge when notes exist', () => {
+    renderTaskApprovalReader('# Plan\n\nAdd the thing.');
+
+    fireEvent.click(screen.getByRole('button', { name: /add note to line 1/i }));
+    fireEvent.change(screen.getByPlaceholderText('Add your note...'), {
+      target: { value: 'Please adjust this plan.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
+
+    expect(screen.getAllByRole('button', { name: '1 notes' })).toHaveLength(1);
+  });
 });

@@ -395,6 +395,9 @@ export function TaskApprovalReader({
     () => (find.isOpen ? buildBlockSearchProjection(findablePlanBlocks, find.query) : { sources: [], matches: [] }),
     [find.isOpen, findablePlanBlocks, find.query]
   );
+  const activeFindIndex = findProjection.matches.length === 0
+    ? -1
+    : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
 
   const handleFindQueryChange = useCallback((query: string) => {
     find.setQuery(query);
@@ -406,12 +409,22 @@ export function TaskApprovalReader({
   }, [find, findablePlanBlocks]);
 
   const handleFindNext = useCallback(() => {
-    find.nextMatch();
-  }, [find]);
+    const nextIndex = findProjection.matches.length === 0
+      ? -1
+      : activeFindIndex < 0
+        ? 0
+        : (activeFindIndex + 1) % findProjection.matches.length;
+    find.setActiveIndex(nextIndex);
+  }, [activeFindIndex, find, findProjection.matches.length]);
 
   const handleFindPrevious = useCallback(() => {
-    find.previousMatch();
-  }, [find]);
+    const nextIndex = findProjection.matches.length === 0
+      ? -1
+      : activeFindIndex < 0
+        ? Math.max(findProjection.matches.length - 1, 0)
+        : (activeFindIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
+    find.setActiveIndex(nextIndex);
+  }, [activeFindIndex, find, findProjection.matches.length]);
 
   // Format and send notes (REQ-PF-009 format)
   const handleSendFeedback = useCallback(() => {
@@ -441,12 +454,12 @@ export function TaskApprovalReader({
   );
 
   useEffect(() => {
-    if (!find.isOpen || find.activeIndex < 0) return;
-    const target = findProjection.matches[find.activeIndex]?.target;
+    if (!find.isOpen || activeFindIndex < 0) return;
+    const target = findProjection.matches[activeFindIndex]?.target;
     if (!target) return;
     blockRefs.current.get(target.blockId)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     if (target.lineNumber > 0) setHighlightedLine(target.lineNumber);
-  }, [find.activeIndex, find.isOpen, findProjection.matches]);
+  }, [activeFindIndex, find.isOpen, findProjection.matches]);
 
   const confirmDiscard = useCallback(() => {
     setDiscardConfirmOpen(false);
@@ -533,7 +546,7 @@ export function TaskApprovalReader({
             {...props}
           >
             {shouldDecorateChildren
-              ? renderFindFragments(childText ?? lineText, lineMatches, find.activeIndex)
+              ? renderFindFragments(childText ?? lineText, lineMatches, activeFindIndex)
               : children}
           </AnnotatableBlock>
         );
@@ -615,7 +628,7 @@ export function TaskApprovalReader({
         {plan}
       </ReactMarkdown>
     );
-  }, [plan, highlightedLine, handleLongPress, findProjection.matches, find.activeIndex]);
+  }, [plan, highlightedLine, handleLongPress, findProjection.matches, activeFindIndex]);
 
   return (
     <div className="task-approval-reader">
@@ -627,16 +640,14 @@ export function TaskApprovalReader({
         </div>
         <div className="task-approval-header-actions">
           {notes.length > 0 && (
-            <>
-              <button
-                className="task-approval-badge"
-                onClick={() => setShowNotesPanel(!showNotesPanel)}
-                aria-label={`${notes.length} notes`}
-              >
-                <MessageSquare size={18} />
-                <span>{notes.length}</span>
-              </button>
-            </>
+            <button
+              className="task-approval-badge"
+              onClick={() => setShowNotesPanel(!showNotesPanel)}
+              aria-label={`${notes.length} notes`}
+            >
+              <MessageSquare size={18} />
+              <span>{notes.length}</span>
+            </button>
           )}
           <button
             ref={findButtonRef}
@@ -647,18 +658,6 @@ export function TaskApprovalReader({
           >
             Find
           </button>
-          {notes.length > 0 && (
-            <>
-              <button
-                className="task-approval-badge"
-                onClick={() => setShowNotesPanel(!showNotesPanel)}
-                aria-label={`${notes.length} notes`}
-              >
-                <MessageSquare size={18} />
-                <span>{notes.length}</span>
-              </button>
-            </>
-          )}
           <button
             className="task-approval-header-discard"
             onClick={handleDiscard}
@@ -673,7 +672,7 @@ export function TaskApprovalReader({
       {find.isOpen && (
         <FindBar
           query={find.query}
-          activeIndex={find.activeIndex}
+          activeIndex={activeFindIndex}
           matchCount={findProjection.matches.length}
           focusVersion={find.focusVersion}
           onQueryChange={handleFindQueryChange}

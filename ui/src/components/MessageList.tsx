@@ -232,12 +232,14 @@ interface SystemPromptHeaderProps {
   systemPrompt: string;
   expanded: boolean;
   onToggle: () => void;
+  contentRef: React.RefObject<HTMLPreElement | null>;
 }
 
 const SystemPromptHeader = memo(function SystemPromptHeader({
   systemPrompt,
   expanded,
   onToggle,
+  contentRef,
 }: SystemPromptHeaderProps) {
   return (
     <div className="virtuoso-row">
@@ -249,7 +251,7 @@ const SystemPromptHeader = memo(function SystemPromptHeader({
             {expanded ? ' hide' : ' show'}
           </span>
         </div>
-        {expanded && <pre className="system-prompt-content">{systemPrompt}</pre>}
+        {expanded && <pre ref={contentRef} className="system-prompt-content">{systemPrompt}</pre>}
       </div>
     </div>
   );
@@ -262,6 +264,7 @@ interface MessageListContext {
   systemPrompt: string | undefined;
   systemPromptExpanded: boolean;
   toggleSystemPrompt: () => void;
+  systemPromptRef: React.RefObject<HTMLPreElement | null>;
 }
 
 // Virtuoso slot component types are defined once at module scope so their
@@ -278,6 +281,7 @@ function VirtuosoHeaderSlot({ context }: { context?: MessageListContext }) {
       systemPrompt={context.systemPrompt}
       expanded={context.systemPromptExpanded}
       onToggle={context.toggleSystemPrompt}
+      contentRef={context.systemPromptRef}
     />
   );
 }
@@ -336,6 +340,7 @@ function MessageListImpl({
   const [findStreamingBuffer, setFindStreamingBuffer] = useState<import('../conversation/atom').StreamingBuffer | null>(null);
   const findPreviousFocusRef = useRef<HTMLElement | null>(null);
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
+  const systemPromptRef = useRef<HTMLPreElement | null>(null);
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
@@ -375,7 +380,7 @@ function MessageListImpl({
   );
 
   const findProjection = useMemo(
-    () => (findOpen || findQuery.length > 0
+    () => (findOpen && findQuery.length > 0
       ? buildConversationSearchProjection(allUnits, findQuery, {
           density,
           streamingBuffer: findStreamingBuffer,
@@ -788,6 +793,17 @@ function MessageListImpl({
     const match = findMatches[normalizedFindIndex];
     if (!match) return undefined;
     dispatchScrollEvent({ type: 'navigationJumped' });
+    if (match.target.kind === 'header-text') {
+      const timers = [0, 80, 220].map((delay) => window.setTimeout(() => {
+        const header = systemPromptRef.current;
+        if (!header) return;
+        scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
+          .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
+        header.classList.add('viewer-find-row-match', 'viewer-find-row-match--active');
+        header.scrollIntoView({ block: 'center' });
+      }, delay));
+      return () => timers.forEach(clearTimeout);
+    }
     virtuosoRef.current?.scrollToIndex({ index: match.target.unitIndex, align: 'center', behavior: 'smooth' });
     const timers = [80, 220, 500].map((delay) => window.setTimeout(() => {
       const row = findRowByKey(match.target.unitKey);
@@ -818,7 +834,7 @@ function MessageListImpl({
   // (`VIRTUOSO_COMPONENTS`). Only its *reference* changes when expansion
   // toggles — the slot types do not, so no slot remount / list-height recompute.
   const virtuosoContext = useMemo<MessageListContext>(
-    () => ({ systemPrompt, systemPromptExpanded, toggleSystemPrompt }),
+    () => ({ systemPrompt, systemPromptExpanded, toggleSystemPrompt, systemPromptRef }),
     [systemPrompt, systemPromptExpanded, toggleSystemPrompt],
   );
 

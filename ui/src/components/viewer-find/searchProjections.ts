@@ -60,7 +60,7 @@ export interface DiffSearchSource extends SearchableSource<DiffSearchMatchTarget
 
 export type DiffSearchProjection = SearchableSourceProjection<DiffSearchMatchTarget, DiffSearchSource>;
 
-export interface ConversationSearchMatchTarget {
+export interface ConversationUnitSearchMatchTarget {
   kind: 'unit-text';
   unitKey: string;
   unitKind: RenderUnit['kind'];
@@ -69,6 +69,18 @@ export interface ConversationSearchMatchTarget {
   start: number;
   end: number;
 }
+
+export interface ConversationHeaderSearchMatchTarget {
+  kind: 'header-text';
+  headerKey: 'system-prompt';
+  sourceId: string;
+  start: number;
+  end: number;
+}
+
+export type ConversationSearchMatchTarget =
+  | ConversationUnitSearchMatchTarget
+  | ConversationHeaderSearchMatchTarget;
 
 export interface ConversationSearchSource extends SearchableSource<ConversationSearchMatchTarget> {
   kind: 'unit-text';
@@ -355,7 +367,7 @@ export function buildConversationSearchProjection(
   const density = options.density ?? 'full';
   const sources: ConversationSearchSource[] = [];
   if (options.systemPromptExpanded && options.systemPrompt) {
-    addConversationSource(sources, -1, 'system', 'system-prompt-header', 'system-prompt', options.systemPrompt);
+    addConversationHeaderSource(sources, 'system-prompt', options.systemPrompt);
   }
 
   units.forEach((unit, unitIndex) => {
@@ -409,15 +421,23 @@ export function buildConversationSearchProjection(
 
   return {
     sources,
-    matches: projectMatches(sources, query, (source, match) => ({
-      kind: 'unit-text',
-      unitKey: source.unitKey,
-      unitKind: source.unitKind,
-      unitIndex: source.unitIndex,
-      sourceId: source.id,
-      start: match.start,
-      end: match.end,
-    })),
+    matches: projectMatches(sources, query, (source, match) => source.target.kind === 'header-text'
+      ? {
+          kind: 'header-text',
+          headerKey: source.target.headerKey,
+          sourceId: source.id,
+          start: match.start,
+          end: match.end,
+        }
+      : {
+          kind: 'unit-text',
+          unitKey: source.unitKey,
+          unitKind: source.unitKind,
+          unitIndex: source.unitIndex,
+          sourceId: source.id,
+          start: match.start,
+          end: match.end,
+        }),
   };
 }
 
@@ -427,6 +447,30 @@ function subAgentOutcomeText(outcome: { type: 'success'; result?: string } | { t
     case 'failure': return outcome.error ?? outcome.error_kind ?? 'failure';
     case 'timed_out': return 'timed out';
   }
+}
+
+function addConversationHeaderSource(
+  out: ConversationSearchSource[],
+  headerKey: 'system-prompt',
+  text: string,
+): void {
+  if (text.length === 0) return;
+  out.push({
+    id: `${headerKey}:${out.length}`,
+    kind: 'unit-text',
+    unitKey: `${headerKey}-header`,
+    unitKind: 'system',
+    unitIndex: -1,
+    role: headerKey,
+    text,
+    target: {
+      kind: 'header-text',
+      headerKey,
+      sourceId: `${headerKey}:${out.length}`,
+      start: 0,
+      end: 0,
+    },
+  });
 }
 
 function addConversationSource(
@@ -506,9 +550,10 @@ function isHiddenSystemMessage(message: Message): boolean {
 function visibleConversationText(
   text: string,
   density: 'full' | 'compact',
-  options: { forceExpanded?: boolean | undefined } = {},
+  options: { forceExpanded?: boolean | undefined; previewOnly?: boolean | undefined } = {},
 ): string {
   if (options.forceExpanded) return text;
+  if (options.previewOnly) return previewText(text);
   if (density !== 'compact' || !shouldCollapseCompactText(text)) return text;
   return firstLineSummary(text);
 }
@@ -521,6 +566,10 @@ function firstLineSummary(text: string, maxLen = 140): string {
   const firstLine = text.split('\n').find((l) => l.trim()) ?? text;
   const flat = firstLine.replace(/\s+/g, ' ').trim();
   return flat.length > maxLen ? `${flat.slice(0, maxLen - 1)}…` : flat;
+}
+
+function previewText(text: string, maxLines = 3): string {
+  return text.split('\n').slice(0, maxLines).join('\n');
 }
 
 function shouldCollapseCompactText(text: string): boolean {
@@ -557,9 +606,11 @@ function agentTurnSources(
     if (block.type === 'tool_use') {
       out.push({ role: `tool-use-name-${index}`, text: block.name ?? '' });
       out.push({ role: `tool-use-display-${index}`, text: block.display ?? '' });
+      const inputText = stableJson(block.input);
+      const resultText = toolResultText(toolResultsByUseId.get(block.id ?? ''));
       if (densityToolDetailsVisible(block.name, density)) {
-        out.push({ role: `tool-use-input-${index}`, text: stableJson(block.input) });
-        out.push({ role: `tool-use-result-${index}`, text: toolResultText(toolResultsByUseId.get(block.id ?? '')) });
+        out.push({ role: `tool-use-input-${index}`, text: visibleConversationText(inputText, density, { previewOnly: shouldProjectToolPreviewOnly(block.name, inputText) }) });
+        out.push({ role: `tool-use-result-${index}`, text: visibleConversationText(resultText, density, { previewOnly: shouldProjectToolPreviewOnly(block.name, resultText) }) });
       }
       return;
     }
@@ -570,6 +621,11 @@ function agentTurnSources(
 function densityToolDetailsVisible(toolName: string | undefined, density: 'full' | 'compact'): boolean {
   if (toolName === 'think') return true;
   return density === 'full';
+}
+
+function shouldProjectToolPreviewOnly(toolName: string | undefined, text: string): boolean {
+  if (toolName === 'think' || toolName === 'read_file' || text.length === 0) return false;
+  return text.length >= 200 || text.split('\n').length > 3;
 }
 
 function containsMermaidFence(text: string): boolean {

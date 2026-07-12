@@ -233,6 +233,28 @@ describe('buildConversationSearchProjection', () => {
     expect(thinkProjection.matches[0]?.target.sourceId).toContain('tool-use-result-2');
   });
 
+  it('projects only the visible preview for collapsed long full-density tool result output', () => {
+    const units: RenderUnit[] = [
+      {
+        kind: 'agent_turn',
+        key: 'a1',
+        isFirstInTurn: true,
+        agent: agentMsg('a1', [
+          { type: 'tool_use', id: 'tool-1', name: 'bash', display: 'bash run', input: { script: 'short command' } },
+        ]),
+        toolResultsByUseId: new Map([
+          ['tool-1', toolMsg('t1', 'tool-1', { result: ['first visible line', 'second visible line', 'third visible line', 'hidden tail marker'].join('\n') })],
+        ]),
+      },
+    ];
+
+    const previewProjection = buildConversationSearchProjection(units, 'third visible line', { density: 'full' });
+    expect(previewProjection.matches).toHaveLength(1);
+
+    const hiddenProjection = buildConversationSearchProjection(units, 'hidden tail marker', { density: 'full' });
+    expect(hiddenProjection.matches).toHaveLength(0);
+  });
+
   it('indexes full-density non-think tool details while compact still excludes them', () => {
     const units: RenderUnit[] = [
       {
@@ -285,6 +307,7 @@ describe('buildConversationSearchProjection', () => {
     expect(projection.matches).toHaveLength(1);
     expect(projection.sources[0]?.role).toBe('system-prompt');
     expect(projection.sources[0]?.text).toBe('alpha directive\nsecondary line');
+    expect(projection.matches[0]?.target.kind).toBe('header-text');
   });
   it('projects canonical typed content across available render units exhaustively', () => {
     const awaiting: Extract<ConversationState, { type: 'awaiting_sub_agents' }> = {
@@ -334,7 +357,7 @@ describe('buildConversationSearchProjection', () => {
       ['agent_turn', 'agent-text-0', 'Agent alpha'],
       ['agent_turn', 'tool-use-name-1', 'search'],
       ['agent_turn', 'tool-use-display-1', 'search alpha'],
-      ['agent_turn', 'tool-use-input-1', '{\n  "path": "src",\n  "pattern": "alpha"\n}'],
+      ['agent_turn', 'tool-use-input-1', '{\n  "path": "src",\n  "pattern": "alpha"'],
       ['agent_turn', 'tool-use-result-1', 'Tool alpha result'],
       ['sub_agent_status', 'sub-agent-status', 'completed summarize beta path done\npending inspect alpha path'],
     ]);
