@@ -369,6 +369,7 @@ pub trait WorkflowProfile {
     type Receipt: Clone + Eq + std::fmt::Debug;
     type ReceiptReducerEvent: Clone + Eq + std::fmt::Debug;
     type BarrierEvent: Clone + Eq + std::fmt::Debug;
+    type OwedAcceptanceEvent: Clone + Eq + std::fmt::Debug;
     type ManualPayload: Clone + Eq + std::fmt::Debug;
 
     fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool;
@@ -435,7 +436,7 @@ pub struct TransitionPlan<P: WorkflowProfile> {
     pub barriers: Vec<BarrierDecl>,
     pub barrier_members: Vec<BarrierMemberDecl>,
     pub invalidations: Vec<EffectInvalidationDecl>,
-    pub owed_acceptances: Option<Vec<OwedAcceptanceDecl<P::BarrierEvent>>>,
+    pub owed_acceptances: Option<Vec<OwedAcceptanceDecl<P::OwedAcceptanceEvent>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -551,7 +552,7 @@ pub struct AtomicInboxConsumeResult<P: WorkflowProfile> {
 pub struct RuntimeAcceptanceResult<P: WorkflowProfile> {
     pub outcome: CommitOutcome,
     pub transition: Option<WorkflowTransition<P::Event>>,
-    pub owed_acceptance: Option<OwedAcceptanceRecord<P::BarrierEvent>>,
+    pub owed_acceptance: Option<OwedAcceptanceRecord<P::OwedAcceptanceEvent>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -598,6 +599,7 @@ where
     pub evidence: Vec<ObservationRecord<P::Observation>>,
     pub permitted_choices: Vec<ManualChoice<P>>,
     pub accepted_choice: Option<ManualChoice<P>>,
+    pub resolved_by: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -606,6 +608,12 @@ pub struct ManualResolutionCommit<P: WorkflowProfile> {
     pub transition_event: P::Event,
     pub receipt: P::Receipt,
     pub receipt_event: P::ReceiptReducerEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancellationOutcome {
+    pub outcome: AuthorityOutcome,
+    pub preserved_winner: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -658,6 +666,15 @@ pub struct DrainProof {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowComparisonEvidence {
+    pub profile_detail_kind: String,
+    pub expected_codec: Option<CodecRef>,
+    pub expected_payload: Option<String>,
+    pub actual_codec: Option<CodecRef>,
+    pub actual_payload: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowDivergenceRecord {
     pub id: ShadowDivergenceId,
     pub shadow_workflow_id: WorkflowId,
@@ -666,6 +683,11 @@ pub struct ShadowDivergenceRecord {
     pub severity: DivergenceSeverity,
     pub action: DivergenceAction,
     pub evidence_identity: String,
+    pub profile_detail_kind: String,
+    pub expected_codec: Option<CodecRef>,
+    pub expected_payload: Option<String>,
+    pub actual_codec: Option<CodecRef>,
+    pub actual_payload: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -703,7 +725,7 @@ pub struct WorkflowState<P: WorkflowProfile> {
     pub effects: BTreeMap<EffectId, EffectState<P>>,
     pub barriers: BTreeMap<BarrierId, BarrierState<P>>,
     pub reducer_inbox: BTreeMap<ReducerInboxId, ReducerInboxEvent<P>>,
-    pub owed_acceptances: BTreeMap<OwedAcceptanceId, OwedAcceptanceRecord<P::BarrierEvent>>,
+    pub owed_acceptances: BTreeMap<OwedAcceptanceId, OwedAcceptanceRecord<P::OwedAcceptanceEvent>>,
     pub manual_resolutions: BTreeMap<ManualResolutionId, ManualResolutionRecord<P>>,
     pub transition_log: Vec<WorkflowTransition<P::Event>>,
     pub shadow_divergences: Vec<ShadowDivergenceRecord>,
@@ -808,6 +830,7 @@ fn clone_manual_resolution<P: WorkflowProfile>(
             .map(clone_manual_choice)
             .collect(),
         accepted_choice: resolution.accepted_choice.as_ref().map(clone_manual_choice),
+        resolved_by: resolution.resolved_by,
     }
 }
 

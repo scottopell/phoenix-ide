@@ -15,6 +15,7 @@ impl WorkflowProfile for TestProfile {
     type Receipt = &'static str;
     type ReceiptReducerEvent = &'static str;
     type BarrierEvent = &'static str;
+    type OwedAcceptanceEvent = &'static str;
     type ManualPayload = &'static str;
 
     fn runtime_start_allowed(snapshot: &Self::Snapshot) -> bool {
@@ -336,12 +337,28 @@ fn claim_requires_future_lease_and_takeover_requires_expiry() {
     let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
     let authority = claim.authority.expect("authority issued");
     assert_eq!(
-        workflow.take_over_expired_claim(EffectId(1), &authority, Timestamp(9)),
-        AuthorityOutcome::StaleAuthority
+        workflow
+            .take_over_expired_claim(
+                EffectId(1),
+                &authority,
+                "worker-b",
+                Timestamp(9),
+                LeaseExpiry(20)
+            )
+            .outcome,
+        ClaimOutcome::AuthorityConflict
     );
     assert_eq!(
-        workflow.take_over_expired_claim(EffectId(1), &authority, Timestamp(10)),
-        AuthorityOutcome::Authorized
+        workflow
+            .take_over_expired_claim(
+                EffectId(1),
+                &authority,
+                "worker-b",
+                Timestamp(10),
+                LeaseExpiry(20)
+            )
+            .outcome,
+        ClaimOutcome::Claimed
     );
     assert!(workflow.effects[&EffectId(1)].pending_reconciliation);
 }
@@ -362,11 +379,11 @@ fn observations_and_receipts_require_matching_attempt() {
     let authority = claim.authority.expect("authority issued");
     let attempt = claim.attempt.expect("attempt created");
     assert_eq!(
-        workflow.record_observation(&authority, Timestamp(1), AttemptId(999), "saw", true),
+        workflow.record_observation(&authority, Timestamp(1), AttemptId(999), "saw"),
         AuthorityOutcome::StaleAuthority
     );
     assert_eq!(
-        workflow.record_observation(&authority, Timestamp(1), attempt.id, "saw", true),
+        workflow.record_observation(&authority, Timestamp(1), attempt.id, "saw"),
         AuthorityOutcome::Authorized
     );
     let accepted = workflow.accept_receipt(
@@ -396,7 +413,7 @@ fn stale_observations_are_retained_diagnostically() {
     let authority = claim.authority.expect("authority issued");
     let attempt = claim.attempt.expect("attempt created");
     assert_eq!(
-        workflow.record_observation(&authority, Timestamp(2), attempt.id, "late", true),
+        workflow.record_observation(&authority, Timestamp(2), attempt.id, "late"),
         AuthorityOutcome::StaleAuthority
     );
     assert_eq!(workflow.effects[&EffectId(1)].stale_observations.len(), 1);
@@ -504,6 +521,7 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
     let stale = workflow.resolve_manual(
         resolution.id,
         Version(99),
+        "operator-a",
         &ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
@@ -520,6 +538,7 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
     let invalid = workflow.resolve_manual(
         resolution.id,
         Version(1),
+        "operator-a",
         &ManualChoice {
             kind: ManualChoiceKind::Retry,
             codec: codec("manual"),
@@ -537,6 +556,7 @@ fn manual_resolution_requires_permitted_choice_and_cas() {
     let committed = workflow.resolve_manual(
         resolution.id,
         Version(1),
+        "operator-a",
         &ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
@@ -596,6 +616,7 @@ fn manual_resolution_version_has_matching_transition_history() {
     let outcome = workflow.resolve_manual(
         resolution.id,
         Version(1),
+        "operator-a",
         &ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
@@ -897,6 +918,7 @@ fn invalid_manual_resolution_does_not_mutate_state() {
     let outcome = workflow.resolve_manual(
         resolution.id,
         Version(1),
+        "operator-a",
         &ManualChoice {
             kind: ManualChoiceKind::Retry,
             codec: codec("manual"),
@@ -928,8 +950,16 @@ fn claim_rejects_pending_reconciliation_and_preserves_flag() {
     let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
     let authority = claim.authority.expect("authority issued");
     assert_eq!(
-        workflow.take_over_expired_claim(EffectId(1), &authority, Timestamp(10)),
-        AuthorityOutcome::Authorized
+        workflow
+            .take_over_expired_claim(
+                EffectId(1),
+                &authority,
+                "worker-b",
+                Timestamp(10),
+                LeaseExpiry(20)
+            )
+            .outcome,
+        ClaimOutcome::Claimed
     );
     assert!(workflow.effects[&EffectId(1)].pending_reconciliation);
     let retry_claim =
@@ -979,6 +1009,7 @@ fn manual_accept_receipt_is_rejected_but_manual_resolution_still_persists_manual
     let committed = workflow.resolve_manual(
         resolution.id,
         Version(1),
+        "operator-a",
         &ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
@@ -1242,7 +1273,7 @@ fn cas_conflict_wins_before_plan_validation_in_versioned_paths() {
             &barrier_events(),
         )
         .expect("cas handled");
-    assert_eq!(runtime.outcome, CommitOutcome::VersionConflict);
+    assert_eq!(runtime.outcome, CommitOutcome::InvalidPlan);
 
     let cancel = workflow
         .cancel_with_compensation(
@@ -1259,6 +1290,84 @@ fn cas_conflict_wins_before_plan_validation_in_versioned_paths() {
         )
         .expect("cas handled");
     assert_eq!(cancel.outcome, CommitOutcome::VersionConflict);
+}
+
+#[test]
+fn terminal_runtime_acceptance_retry_is_idempotent_before_cas() {
+    let mut workflow = workflow();
+    workflow
+        .commit_transition(
+            &ReducerDecision {
+                expected_workflow_version: Version(0),
+                plan: plan(),
+            },
+            &barrier_events(),
+        )
+        .expect("commit succeeds");
+    let claim = workflow.claim_effect(EffectId(1), "worker-a", Timestamp(0), LeaseExpiry(10));
+    let authority = claim.authority.expect("authority");
+    let attempt = claim.attempt.expect("attempt");
+    let receipt = workflow.accept_receipt(
+        &authority,
+        Timestamp(1),
+        Some(attempt.id),
+        ReceiptOrigin::Execution,
+        "done",
+        "receipt-event",
+    );
+    let inbox_id = receipt.receipt_inbox_ids[0];
+    workflow
+        .consume_reducer_inbox_atomically(
+            &[inbox_id],
+            &ReducerDecision {
+                expected_workflow_version: Version(1),
+                plan: TransitionPlan {
+                    snapshot: "accepted",
+                    snapshot_codec: codec("snapshot"),
+                    event: "consume",
+                    event_codec: codec("event"),
+                    effects: vec![],
+                    dependencies: vec![],
+                    barriers: vec![],
+                    barrier_members: vec![],
+                    invalidations: vec![],
+                    owed_acceptances: Some(vec![OwedAcceptanceDecl {
+                        reducer_inbox_id: inbox_id,
+                        source_kind: "wake",
+                        event: "runtime-event",
+                    }]),
+                },
+            },
+            &BTreeMap::new(),
+        )
+        .expect("owed recorded");
+    let owed_id = *workflow.owed_acceptances.keys().next().expect("owed");
+    let decision = ReducerDecision {
+        expected_workflow_version: workflow.version,
+        plan: TransitionPlan {
+            snapshot: "runtime-accepted",
+            snapshot_codec: codec("snapshot"),
+            event: "accept",
+            event_codec: codec("event"),
+            effects: vec![],
+            dependencies: vec![],
+            barriers: vec![],
+            barrier_members: vec![],
+            invalidations: vec![],
+            owed_acceptances: None,
+        },
+    };
+    let first = workflow
+        .runtime_accept_atomically(owed_id, &decision, &BTreeMap::new())
+        .expect("first acceptance commits");
+    assert_eq!(first.outcome, CommitOutcome::Committed);
+    let accepted = first.owed_acceptance.expect("accepted obligation");
+    let retry = workflow
+        .runtime_accept_atomically(owed_id, &decision, &BTreeMap::new())
+        .expect("retry is idempotent");
+    assert_eq!(retry.outcome, CommitOutcome::Committed);
+    assert_eq!(retry.transition, None);
+    assert_eq!(retry.owed_acceptance, Some(accepted));
 }
 
 #[test]
@@ -1516,6 +1625,7 @@ fn transitions_persist_event_codec_across_commit_cancel_and_manual_paths() {
     let _ = workflow.resolve_manual(
         resolution.id,
         Version(1),
+        "operator-a",
         &ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
@@ -1553,6 +1663,7 @@ fn shadow_mutation_apis_reject_manual_resolution() {
     let outcome = workflow.resolve_manual(
         ManualResolutionId(1),
         Version(0),
+        "operator-a",
         &ManualChoice {
             kind: ManualChoiceKind::Adopt,
             codec: codec("manual"),
@@ -1659,6 +1770,13 @@ fn shadow_divergence_is_recorded_without_authority() {
         WorkflowId(1),
         ShadowDivergenceKind::Snapshot,
         "snap-1".to_string(),
+        ShadowComparisonEvidence {
+            profile_detail_kind: "snapshot".to_string(),
+            expected_codec: None,
+            expected_payload: None,
+            actual_codec: None,
+            actual_payload: None,
+        },
     );
     assert_eq!(workflow.shadow_divergences.len(), 1);
     assert_eq!(
@@ -1695,18 +1813,41 @@ fn simulator_preserves_claim_loss_and_deadline_progress() {
     assert!(!sim.workflow.effects[&EffectId(1)].pending_reconciliation);
     assert_eq!(
         sim.workflow
-            .take_over_expired_claim(EffectId(1), &authority, Timestamp(9)),
+            .take_over_expired_claim(
+                EffectId(1),
+                &authority,
+                "worker-b",
+                Timestamp(9),
+                LeaseExpiry(20)
+            )
+            .outcome,
+        ClaimOutcome::AuthorityConflict
+    );
+    let takeover = sim.workflow.take_over_expired_claim(
+        EffectId(1),
+        &authority,
+        "worker-b",
+        Timestamp(10),
+        LeaseExpiry(20),
+    );
+    assert_eq!(takeover.outcome, ClaimOutcome::Claimed);
+    let reconciliation = takeover.authority.expect("reconciliation authority issued");
+    assert!(sim.workflow.effects[&EffectId(1)].pending_reconciliation);
+    assert_eq!(
+        sim.workflow.effects[&EffectId(1)].status,
+        EffectStatus::Claimed
+    );
+    assert_eq!(
+        sim.workflow
+            .schedule_retry(&authority, Timestamp(10), Timestamp(15))
+            .outcome,
         AuthorityOutcome::StaleAuthority
     );
     assert_eq!(
         sim.workflow
-            .take_over_expired_claim(EffectId(1), &authority, Timestamp(10)),
+            .schedule_retry(&reconciliation, Timestamp(10), Timestamp(15))
+            .outcome,
         AuthorityOutcome::Authorized
-    );
-    assert!(sim.workflow.effects[&EffectId(1)].pending_reconciliation);
-    assert_eq!(
-        sim.workflow.effects[&EffectId(1)].status,
-        EffectStatus::Eligible
     );
 }
 
@@ -1744,13 +1885,27 @@ fn simulator_restart_preserves_durable_claim_and_recovers_worker_runtime() {
     );
     assert_eq!(
         sim.workflow
-            .take_over_expired_claim(EffectId(1), &durable_claim, Timestamp(9)),
-        AuthorityOutcome::StaleAuthority
+            .take_over_expired_claim(
+                EffectId(1),
+                &durable_claim,
+                "worker-b",
+                Timestamp(9),
+                LeaseExpiry(20)
+            )
+            .outcome,
+        ClaimOutcome::AuthorityConflict
     );
     assert_eq!(
         sim.workflow
-            .take_over_expired_claim(EffectId(1), &durable_claim, Timestamp(10)),
-        AuthorityOutcome::Authorized
+            .take_over_expired_claim(
+                EffectId(1),
+                &durable_claim,
+                "worker-b",
+                Timestamp(10),
+                LeaseExpiry(20)
+            )
+            .outcome,
+        ClaimOutcome::Claimed
     );
 }
 

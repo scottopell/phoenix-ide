@@ -91,13 +91,9 @@ impl<P: WorkflowProfile> Simulator<P> {
                 attempt_id,
                 observation,
             } => {
-                let _ = self.workflow.record_observation(
-                    &authority,
-                    self.now,
-                    attempt_id,
-                    observation,
-                    true,
-                );
+                let _ =
+                    self.workflow
+                        .record_observation(&authority, self.now, attempt_id, observation);
             }
             SimOp::Retry {
                 authority,

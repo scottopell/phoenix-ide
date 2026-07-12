@@ -9,13 +9,14 @@ use crate::{
     ExecutionMode, Generation, LeaseExpiry, ManualChoice, ManualResolutionCommit,
     ManualResolutionId, ManualResolutionOutcome, ManualResolutionRecord, ObservationId,
     ObservationRecord, OwedAcceptanceDisposition, OwedAcceptanceId, OwedAcceptanceRecord,
-    ProfileRef, ProtocolSelection, ReceiptAcceptance, ReceiptFamily, ReceiptId, ReceiptOrigin,
-    ReceiptRecord, ReconciliationDecision, ReconciliationOutcome, ReducerDecision,
+    PlanError, ProfileRef, ProtocolSelection, ReceiptAcceptance, ReceiptFamily, ReceiptId,
+    ReceiptOrigin, ReceiptRecord, ReconciliationDecision, ReconciliationOutcome, ReducerDecision,
     ReducerInboxEvent, ReducerInboxId, ReducerInboxKind, ReducerInboxPayload, ResolutionStatus,
-    ResourceLockGrant, RuntimeAcceptanceResult, SemanticAuthority, ShadowDivergenceId,
-    ShadowDivergenceKind, ShadowDivergenceRecord, ShadowWorkflow, StaleObservationRecord,
-    SuppressionReason, Timestamp, TransitionId, TransitionPlan, Version, WorkflowBinding,
-    WorkflowId, WorkflowProfile, WorkflowState, WorkflowStatus, WorkflowTransition,
+    ResourceLockGrant, RuntimeAcceptanceResult, SemanticAuthority, ShadowComparisonEvidence,
+    ShadowDivergenceId, ShadowDivergenceKind, ShadowDivergenceRecord, ShadowWorkflow,
+    StaleObservationRecord, SuppressionReason, Timestamp, TransitionId, TransitionPlan, Version,
+    WorkflowBinding, WorkflowId, WorkflowProfile, WorkflowState, WorkflowStatus,
+    WorkflowTransition,
 };
 
 impl<P: WorkflowProfile> WorkflowState<P> {
@@ -32,6 +33,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
     ) -> Result<Self, EngineError> {
         if !accepted_protocol.accepting {
             return Err(EngineError::ProtocolNotAccepting);
+        }
+        if *profile != accepted_protocol.profile {
+            return Err(EngineError::ProfileProtocolMismatch);
         }
         Ok(Self {
             binding: WorkflowBinding::Authoritative(AuthoritativeWorkflow {
@@ -82,6 +86,9 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         if !accepted_protocol.accepting {
             return Err(EngineError::ProtocolNotAccepting);
         }
+        if *profile != accepted_protocol.profile {
+            return Err(EngineError::ProfileProtocolMismatch);
+        }
         Ok(Self {
             binding: WorkflowBinding::Shadow(ShadowWorkflow {
                 workflow_id,
@@ -130,8 +137,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         if decision.expected_workflow_version != self.version {
             return Ok(version_conflict_result());
         }
-        self.validate_plan_against_state(&decision.plan, barrier_events)
-            .map_err(EngineError::InvalidPlan)?;
+        self.validate_plan_against_state(&decision.plan, barrier_events)?;
 
         let mut replacement = self.clone();
         let transition = replacement.begin_transition(decision);
@@ -249,25 +255,68 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         &mut self,
         effect_id: EffectId,
         expired_claim: &ClaimAuthority,
+        worker_id: &'static str,
         now: Timestamp,
-    ) -> AuthorityOutcome {
-        let Some(effect) = self.effects.get_mut(&effect_id) else {
-            return AuthorityOutcome::StaleAuthority;
+        lease_until: LeaseExpiry,
+    ) -> ClaimResult {
+        if !lease_until.is_live_at(now) || self.crashed_workers.contains(&worker_id) {
+            return denied_claim();
+        }
+        let Some(effect) = self.effects.get(&effect_id) else {
+            return ineligible_claim();
         };
         let Some(live_claim) = effect.claim.as_ref() else {
-            return AuthorityOutcome::StaleAuthority;
+            return ineligible_claim();
         };
         if live_claim != expired_claim || expired_claim.lease_until.is_live_at(now) {
-            return AuthorityOutcome::StaleAuthority;
+            return denied_claim();
         }
-        effect.claim = None;
-        effect.destructive_lock = None;
-        effect.status = EffectStatus::Eligible;
+        let Ok(ordinal_base) = u32::try_from(effect.attempts.len()) else {
+            return ineligible_claim();
+        };
+        let Some(ordinal) = ordinal_base.checked_add(1) else {
+            return ineligible_claim();
+        };
+        let claim_token = self.next_claim_token;
+        let Ok(resource_lock) =
+            self.lock_grant_for_claim(effect_id, worker_id, claim_token, now, lease_until)
+        else {
+            return denied_claim();
+        };
+        let authority = ClaimAuthority {
+            workflow_id: self.binding.workflow_id(),
+            declared_workflow_version: effect.declared_workflow_version,
+            generation: self.generation,
+            effect_id,
+            claim_token,
+            worker_id,
+            lease_until,
+            resource_lock: resource_lock.clone(),
+        };
+        let Some(effect) = self.effects.get_mut(&effect_id) else {
+            return ineligible_claim();
+        };
+        effect.destructive_lock = resource_lock;
+        effect.claim = Some(authority.clone());
+        effect.status = EffectStatus::Claimed;
         effect.pending_reconciliation = true;
         if let Some(last_attempt) = effect.attempts.last_mut() {
             last_attempt.status = AttemptStatus::AuthorityLost;
         }
-        AuthorityOutcome::Authorized
+        let attempt = AttemptRecord {
+            id: AttemptId(self.next_attempt_id),
+            ordinal,
+            authority: authority.clone(),
+            status: AttemptStatus::Begun,
+        };
+        self.next_attempt_id += 1;
+        self.next_claim_token += 1;
+        effect.attempts.push(attempt.clone());
+        ClaimResult {
+            outcome: ClaimOutcome::Claimed,
+            authority: Some(authority),
+            attempt: Some(attempt),
+        }
     }
 
     pub fn record_observation(
@@ -276,7 +325,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         now: Timestamp,
         attempt_id: AttemptId,
         observation: P::Observation,
-        authoritative: bool,
     ) -> AuthorityOutcome {
         let observation_id = ObservationId(self.next_observation_id);
         self.next_observation_id += 1;
@@ -293,7 +341,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 authority: authority.clone(),
                 attempt_id,
                 observation,
-                authoritative,
+                authoritative: true,
             });
             if let Some(attempt) = effect
                 .attempts
@@ -347,21 +395,30 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 reducer_events: Vec::new(),
             };
         }
-        if let Some(attempt_id) = attempt_id {
-            if !effect
-                .attempts
-                .iter()
-                .any(|attempt| attempt.id == attempt_id && attempt.authority == *authority)
-            {
-                return ReceiptAcceptance {
-                    outcome: AuthorityOutcome::StaleAuthority,
-                    receipt: None,
-                    receipt_inbox_ids: Vec::new(),
-                    reducer_events: Vec::new(),
-                };
-            }
+        let Some(attempt_id) = attempt_id else {
+            return ReceiptAcceptance {
+                outcome: AuthorityOutcome::StaleAuthority,
+                receipt: None,
+                receipt_inbox_ids: Vec::new(),
+                reducer_events: Vec::new(),
+            };
+        };
+        if !effect
+            .attempts
+            .iter()
+            .any(|attempt| attempt.id == attempt_id && attempt.authority == *authority)
+        {
+            return ReceiptAcceptance {
+                outcome: AuthorityOutcome::StaleAuthority,
+                receipt: None,
+                receipt_inbox_ids: Vec::new(),
+                reducer_events: Vec::new(),
+            };
         }
-        if origin == ReceiptOrigin::Manual {
+        if !matches!(
+            origin,
+            ReceiptOrigin::Execution | ReceiptOrigin::Adoption | ReceiptOrigin::Reconciliation
+        ) {
             return ReceiptAcceptance {
                 outcome: AuthorityOutcome::StaleAuthority,
                 receipt: None,
@@ -372,7 +429,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         let receipt_record = ReceiptRecord {
             id: receipt_id,
             authority: authority.clone(),
-            attempt_id,
+            attempt_id: Some(attempt_id),
             origin,
             receipt,
             generation,
@@ -382,14 +439,12 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         effect.destructive_lock = None;
         effect.status = EffectStatus::Receipted;
         effect.pending_reconciliation = false;
-        if let Some(attempt_id) = attempt_id {
-            if let Some(attempt) = effect
-                .attempts
-                .iter_mut()
-                .find(|attempt| attempt.id == attempt_id)
-            {
-                attempt.status = AttemptStatus::ReceiptAccepted;
-            }
+        if let Some(attempt) = effect
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        {
+            attempt.status = AttemptStatus::ReceiptAccepted;
         }
 
         let inbox_id = ReducerInboxId(self.next_inbox_id);
@@ -479,6 +534,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             evidence: effect.observations.clone(),
             permitted_choices,
             accepted_choice: None,
+            resolved_by: None,
         };
         effect.pending_reconciliation = true;
         self.next_manual_resolution_id += 1;
@@ -497,6 +553,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         &mut self,
         resolution_id: ManualResolutionId,
         expected_workflow_version: Version,
+        resolved_by: &'static str,
         choice: &ManualChoice<P>,
         commit: ManualResolutionCommit<P>,
     ) -> ManualResolutionOutcome<P> {
@@ -527,6 +584,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         let receipt_record = replacement.apply_manual_resolution(
             resolution_id,
             expected_workflow_version,
+            resolved_by,
             &existing,
             choice,
             commit,
@@ -575,8 +633,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 reducer_events: Vec::new(),
             });
         }
-        self.validate_plan_against_state(&decision.plan, barrier_events)
-            .map_err(EngineError::InvalidPlan)?;
+        self.validate_plan_against_state(&decision.plan, barrier_events)?;
         let mut replacement = self.clone();
         for inbox_id in inbox_ids {
             let Some(inbox) = replacement.reducer_inbox.get(inbox_id) else {
@@ -737,8 +794,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
                 reducer_events: Vec::new(),
             });
         }
-        self.validate_plan_against_state(&request.compensation_plan, barrier_events)
-            .map_err(EngineError::InvalidPlan)?;
+        self.validate_plan_against_state(&request.compensation_plan, barrier_events)?;
 
         let mut replacement = self.clone();
         replacement.enter_cancellation(request);
@@ -765,6 +821,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         authoritative_workflow_id: WorkflowId,
         kind: ShadowDivergenceKind,
         evidence_identity: String,
+        evidence: ShadowComparisonEvidence,
     ) {
         if self.binding.execution_mode() != ExecutionMode::Shadow {
             return;
@@ -773,11 +830,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             ShadowDivergenceKind::Snapshot
             | ShadowDivergenceKind::Transition
             | ShadowDivergenceKind::EffectPlan
+            | ShadowDivergenceKind::Observation
             | ShadowDivergenceKind::Receipt
             | ShadowDivergenceKind::ReducerEvent
             | ShadowDivergenceKind::Capability
             | ShadowDivergenceKind::UserProjection => DivergenceSeverity::Blocking,
-            ShadowDivergenceKind::Observation => DivergenceSeverity::Actionable,
         };
         let action = match severity {
             DivergenceSeverity::Blocking => DivergenceAction::HaltAcceptance,
@@ -794,6 +851,11 @@ impl<P: WorkflowProfile> WorkflowState<P> {
             severity,
             action,
             evidence_identity,
+            profile_detail_kind: evidence.profile_detail_kind,
+            expected_codec: evidence.expected_codec,
+            expected_payload: evidence.expected_payload,
+            actual_codec: evidence.actual_codec,
+            actual_payload: evidence.actual_payload,
         });
     }
 
@@ -1002,6 +1064,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         &mut self,
         resolution_id: ManualResolutionId,
         expected_workflow_version: Version,
+        resolved_by: &'static str,
         existing: &ManualResolutionRecord<P>,
         choice: &ManualChoice<P>,
         commit: ManualResolutionCommit<P>,
@@ -1069,6 +1132,7 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         updated.status = ResolutionStatus::Resolved;
         updated.workflow_version = self.version;
         updated.accepted_choice = Some(clone_manual_choice(choice));
+        updated.resolved_by = Some(resolved_by);
         self.manual_resolutions.insert(resolution_id, updated);
         self.refresh_eligibility(Timestamp(0));
         receipt_record
@@ -1167,15 +1231,6 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         disposition: OwedAcceptanceDisposition,
     ) -> Result<RuntimeAcceptanceResult<P>, EngineError> {
         self.ensure_executable()?;
-        if decision.expected_workflow_version != self.version {
-            return Ok(RuntimeAcceptanceResult {
-                outcome: CommitOutcome::VersionConflict,
-                transition: None,
-                owed_acceptance: None,
-            });
-        }
-        self.validate_plan_against_state(&decision.plan, barrier_events)
-            .map_err(EngineError::InvalidPlan)?;
         let Some(existing) = self.owed_acceptances.get(&owed_id).cloned() else {
             return Ok(RuntimeAcceptanceResult {
                 outcome: CommitOutcome::InvalidPlan,
@@ -1185,11 +1240,19 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         };
         if existing.disposition != OwedAcceptanceDisposition::Owed {
             return Ok(RuntimeAcceptanceResult {
-                outcome: CommitOutcome::InvalidPlan,
+                outcome: CommitOutcome::Committed,
                 transition: None,
                 owed_acceptance: Some(existing),
             });
         }
+        if decision.expected_workflow_version != self.version {
+            return Ok(RuntimeAcceptanceResult {
+                outcome: CommitOutcome::VersionConflict,
+                transition: None,
+                owed_acceptance: Some(existing),
+            });
+        }
+        self.validate_plan_against_state(&decision.plan, barrier_events)?;
         if matches!(disposition, OwedAcceptanceDisposition::Accepted { .. })
             && !P::runtime_start_allowed(&self.snapshot)
         {
@@ -1237,27 +1300,53 @@ impl<P: WorkflowProfile> WorkflowState<P> {
         &self,
         plan: &TransitionPlan<P>,
         barrier_events: &BTreeMap<BarrierId, P::BarrierEvent>,
-    ) -> Result<(), crate::PlanError> {
-        validate_plan(plan, barrier_events)?;
+    ) -> Result<(), EngineError> {
+        validate_plan(plan, barrier_events).map_err(EngineError::InvalidPlan)?;
         for effect in &plan.effects {
             if self.effects.contains_key(&effect.effect_id) {
-                return Err(crate::PlanError::EffectIdCollision(effect.effect_id));
+                return Err(EngineError::InvalidPlan(PlanError::EffectIdCollision(
+                    effect.effect_id,
+                )));
+            }
+            let expected_generation = if effect.role == crate::EffectRole::Compensation {
+                self.generation.next()
+            } else {
+                self.generation
+            };
+            if effect.generation != expected_generation {
+                return Err(EngineError::InvalidPlan(
+                    PlanError::EffectGenerationMismatch {
+                        effect_id: effect.effect_id,
+                        expected: expected_generation,
+                        actual: effect.generation,
+                    },
+                ));
             }
         }
         for barrier in &plan.barriers {
             if self.barriers.contains_key(&barrier.barrier_id) {
-                return Err(crate::PlanError::BarrierIdCollision(barrier.barrier_id));
+                return Err(EngineError::InvalidPlan(PlanError::BarrierIdCollision(
+                    barrier.barrier_id,
+                )));
             }
         }
         for invalidation in &plan.invalidations {
             let Some(effect) = self.effects.get(&invalidation.effect_id) else {
-                return Err(crate::PlanError::UnknownInvalidationTarget(
-                    invalidation.effect_id,
+                return Err(EngineError::InvalidPlan(
+                    PlanError::UnknownInvalidationTarget(invalidation.effect_id),
                 ));
             };
             if effect.status == EffectStatus::Receipted {
-                return Err(crate::PlanError::InvalidatesReceiptedEffect(
-                    invalidation.effect_id,
+                return Err(EngineError::InvalidPlan(
+                    PlanError::InvalidatesReceiptedEffect(invalidation.effect_id),
+                ));
+            }
+            if self.manual_resolutions.values().any(|resolution| {
+                resolution.effect_id == invalidation.effect_id
+                    && resolution.status == ResolutionStatus::Required
+            }) {
+                return Err(EngineError::InvalidPlan(
+                    PlanError::InvalidatesManualResolutionEffect(invalidation.effect_id),
                 ));
             }
         }
@@ -1402,6 +1491,7 @@ fn clone_manual_resolution<P: WorkflowProfile>(
             .map(clone_manual_choice)
             .collect(),
         accepted_choice: resolution.accepted_choice.as_ref().map(clone_manual_choice),
+        resolved_by: resolution.resolved_by,
     }
 }
 

@@ -14,10 +14,11 @@ use super::{
     registration_receipt, shadow_comparison, terminal_payload_from_evidence, transfer_continuation,
     BashResourceIdentity, BashTerminalEvidence, BashTerminalStatus, FenceStatus,
     ObserveHandleIntent, RuntimeAvailability, RuntimeAvailabilityProjection, TmuxResourceIdentity,
-    TmuxTerminalEvidence, TmuxTerminalStatus, WakeCancellationReason, WakeForgottenReason,
-    WakeManualPayload, WakeProfile, WakeRegistrationIntent, WakeRegistrationReceipt,
-    WakeResourceIdentity, WakeShadowComparisonKind, WakeTerminalEvidence, WakeTerminalPayload,
-    WorkScopeIdentity, WorkScopeKind, REGISTRATION_BARRIER_ID, REGISTRATION_EFFECT_ID,
+    TmuxTerminalEvidence, TmuxTerminalStatus, WakeCancellationOutcome, WakeCancellationReason,
+    WakeForgottenReason, WakeManualPayload, WakeProfile, WakeRegistrationIntent,
+    WakeRegistrationReceipt, WakeResourceIdentity, WakeShadowComparisonKind, WakeTerminalEvidence,
+    WakeTerminalPayload, WorkScopeIdentity, WorkScopeKind, REGISTRATION_BARRIER_ID,
+    REGISTRATION_EFFECT_ID,
 };
 
 fn scope() -> WorkScopeIdentity {
@@ -268,7 +269,10 @@ fn cancellation_invalidates_observation_and_uses_pure_cancelled_terminal_payload
         .commit_transition(&decision, &events)
         .expect("registration commit succeeds");
 
-    let request = cancellation_request(&workflow, Timestamp(12));
+    let WakeCancellationOutcome::Request(request) = cancellation_request(&workflow, Timestamp(12))
+    else {
+        panic!("pending observation is cancellable");
+    };
     assert_eq!(request.invalidations.len(), 1);
     assert!(request
         .invalidations
@@ -296,6 +300,56 @@ fn cancellation_invalidates_observation_and_uses_pure_cancelled_terminal_payload
     assert_eq!(
         workflow.effects[&REGISTRATION_EFFECT_ID].status,
         EffectStatus::Invalidated
+    );
+}
+
+#[test]
+fn cancellation_preserves_receipted_terminal_winner_before_snapshot_projection() {
+    let intent = registration_intent(bash_identity("seed"));
+    let mut workflow = workflow();
+    let (decision, barriers) = registration_decision(Version(0), &intent, Version(3));
+    workflow
+        .commit_transition(&decision, &barriers)
+        .expect("registration commit");
+    let claim = workflow.claim_effect(
+        REGISTRATION_EFFECT_ID,
+        "worker",
+        Timestamp(1),
+        LeaseExpiry(10),
+    );
+    let authority = claim.authority.expect("authority");
+    let attempt = claim.attempt.expect("attempt");
+    let terminal = terminal_payload_from_evidence(
+        intent.contract_id,
+        intent.resource,
+        WakeTerminalEvidence::Bash(BashTerminalEvidence {
+            identity: match intent.resource {
+                WakeResourceIdentity::Bash(identity) => identity,
+                WakeResourceIdentity::TmuxWindow(_) => unreachable!(),
+            },
+            status: BashTerminalStatus::Exited,
+            occurred_at: Timestamp(5),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+            signal_number: None,
+            kill_signal_sent: None,
+            final_tail: vec![],
+        }),
+        intent.expires_at,
+    )
+    .expect("matching terminal");
+    workflow.accept_receipt(
+        &authority,
+        Timestamp(5),
+        Some(attempt.id),
+        crate::ReceiptOrigin::Execution,
+        terminal.clone(),
+        terminal.clone(),
+    );
+    assert_eq!(workflow.snapshot.terminal, None);
+    assert_eq!(
+        cancellation_request(&workflow, Timestamp(6)),
+        WakeCancellationOutcome::AlreadyTerminal(terminal)
     );
 }
 
@@ -438,7 +492,6 @@ fn registration_barrier_receipt_round_trip_is_deterministic() {
                 duration_ms: Some(10),
                 final_tail: vec!["done"],
             }),
-            true,
         ),
         AuthorityOutcome::Authorized
     );
@@ -514,7 +567,7 @@ fn authoritative_observation_helper_and_acceptance_decl_are_typed() {
         final_tail: vec!["hung"],
     });
     assert_eq!(
-        workflow.record_observation(&authority, Timestamp(6), attempt.id, evidence, true),
+        workflow.record_observation(&authority, Timestamp(6), attempt.id, evidence),
         AuthorityOutcome::Authorized
     );
     let effect = &workflow.effects[&REGISTRATION_EFFECT_ID];
