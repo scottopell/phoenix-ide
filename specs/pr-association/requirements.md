@@ -8,10 +8,10 @@ which PR PR-specific actions target, and tell me when review feedback has arrive
 time it handed that feedback to the agent — so I can act on real review activity without Phoenix
 blocking ordinary work or guessing the wrong PR.
 
-Increment 1 of this spec introduces the normative plural-PR model Phoenix will build toward:
-WorkScope-owned branch observations feed durable PR association history, and one explicit active
-PR targets PR-specific surfaces. Existing singular implementations remain current reality until the
-follow-on increments land; `executive.md` tracks that implementation state.
+This spec describes Phoenix's WorkScope-owned plural-PR model: durable observed-branch history
+feeds durable PR association history, and one explicit active PR targets PR-specific surfaces.
+`executive.md` tracks which surfaces already implement that model and which compatibility paths
+remain.
 
 ## Scope
 
@@ -24,7 +24,7 @@ This spec **owns**:
 - **Active-PR selection** — explicit selection of the one PR PR-specific status/action surfaces
   target, including the distinction between an inferred selection and a user-pinned one.
 - **Compatibility projection** — a ranked singular PR projection retained only for compatibility
-  with surfaces that have not yet migrated to explicit active-PR targeting.
+  surfaces that consume a singular view while explicit active-PR targeting remains authoritative.
 - **PR status observation and refresh** — fresh / stale-not-found / unavailable refresh
   semantics for one explicit PR target, including refresh-by-number against durable PR identity so
   branch/HEAD drift does not strand the user.
@@ -53,23 +53,22 @@ This spec does **not** own:
 
 Two distinct surfaces consume this spec's PR identity, and they must not be conflated:
 
-Increment 1 changes the targeting contract from an implicit singular "primary PR" to an explicit
-active PR:
+This targeting contract uses an explicit active PR rather than a hidden singular "primary PR":
 
 - The **StateBar** and **work actions bar** must target the same explicit active PR when one is
   selected.
 - The active PR may be **inferred** from durable branch and association facts, or **pinned** by
   the user.
-- A compatibility primary-PR projection may remain for unmigrated surfaces, but it is not the
-  hidden authority for active multi-PR actions.
+- A compatibility primary-PR projection may exist for singular compatibility consumers, but it is
+  not the hidden authority for active multi-PR actions.
 
 - The **StateBar** renders the **PR badge / PR identity link** (`StateBarPrBadge`) — the PR
   number, title, and state. This is a StateBar concern.
 - The **work actions bar** renders the **Address-CI auto-fix affordance**
   (`WorkActions.tsx` → `PrRemediationActions`). The StateBar has no auto-fix logic.
 
-Both must target the **same** primary PR. The advisory freshness marker (REQ-PRA-001) lives
-next to the Address-CI action on the work actions bar, not on the StateBar PR badge.
+Both must target the **same** explicit active PR. The advisory freshness marker (REQ-PRA-001)
+lives next to the Address-CI action on the work actions bar, not on the StateBar PR badge.
 
 ---
 
@@ -159,19 +158,18 @@ interaction keeps multi-PR behavior understandable and testable.
 
 ### REQ-PRA-000c: Compatibility Primary Projection Is Non-Authoritative
 
-WHEN Phoenix maintains a singular primary-PR projection for compatibility with not-yet-migrated
-surfaces
+WHEN Phoenix maintains a singular primary-PR projection for compatibility surfaces that consume a
+singular view
 THE SYSTEM SHALL derive that projection from the associated-PR set as a compatibility view
 AND SHALL NOT let it silently override a valid explicit active-PR selection for PR-specific
   surfaces
 
-**Design:** Incremental migration needs a singular compatibility view, but leaving it as hidden
+**Design:** Some consumers still need a singular compatibility view, but leaving it as hidden
 runtime authority would preserve the original bug class under a new name. Compatibility is a
 projection, not ownership.
 
 ---
 
-### REQ-PRA-001: PR Feedback Freshness Indicator
 ### REQ-PRA-001: PR Feedback Freshness Indicator
 
 WHEN a Work or Branch conversation has an open associated pull request

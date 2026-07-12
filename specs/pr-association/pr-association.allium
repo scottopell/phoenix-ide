@@ -36,15 +36,14 @@
 --   explicit active PR whose provenance is either inferred or pinned; any
 --   singular primary-PR ranking that remains is compatibility projection only.
 --
--- Requirement traceability: REQ-PRA-000 through REQ-PRA-004. The plural
---   observed-branch, active-selection, and compatibility-projection rules
---   introduced in REQ-PRA-000..000c are specified as deferred behavioral work in
---   this increment; the implemented singular current reality remains described in
---   executive.md. REQ-PRA-001 through REQ-PRA-004 (PR feedback freshness
---   advisory, agent-facing context baseline, bounded refresh) are modelled as
---   deferred behavioural extensions at the foot of this file; the association,
---   active-target status, and auto-fix rules below carry the PR identity those
---   requirements build on.
+-- Requirement traceability: REQ-PRA-000 through REQ-PRA-004. The rules below
+--   model durable WorkScope-owned association, explicit active-PR targeting,
+--   compatibility projection, freshness-aware PR status, and the Address-CI
+--   auto-fix affordance. The feedback-freshness layer (REQ-PRA-001..004) is
+--   intentionally deferred at the foot of this file: the implementation exists,
+--   but this Allium file still names those obligations as location-scoped
+--   deferred behavioral coverage rather than restating the fetch/classification
+--   algorithm here.
 --
 -- Dependencies: specs/bedrock/bedrock.allium
 
@@ -162,11 +161,11 @@ contract WorkScopePrStatusContract {
 contract WorkScopePrAutoFixContract {
     create_context: (conversation: bedrock/Conversation) -> PrAutoFixContext
 
-    @invariant StatusAndActionUseSamePrimary
-        -- When a WorkScope has an associated primary PR, auto-fix targets that
-        -- PR by number. Branch-based discovery is only a fallback when no
-        -- associated primary exists. This is the same primary rendered by the
-        -- PR status surface.
+    @invariant StatusAndActionUseSameExplicitTarget
+        -- When a WorkScope has an explicit active PR selection, auto-fix targets
+        -- that PR by number. Branch-based discovery is only a fallback when no
+        -- associated active target exists. This is the same explicit active PR
+        -- rendered by the PR status surface.
 }
 
 contract WorkActionsPrAffordanceContract {
@@ -174,8 +173,8 @@ contract WorkActionsPrAffordanceContract {
 
     @invariant NotFoundStalePrimaryIsActionable
         -- A stale not_found refresh means branch discovery did not find the
-        -- associated PR. It does not make a persisted open primary unsafe for
-        -- auto-fix, because auto-fix refreshes that primary by PR number.
+        -- associated active PR. It does not make a persisted open target unsafe
+        -- for auto-fix, because auto-fix refreshes that target by PR number.
 
     @invariant UnavailableProviderIsNotActionable
         -- An unavailable refresh means the provider cannot currently refresh
@@ -357,18 +356,18 @@ config {
 --       Maps display_state to the primary-selection rank: open non-draft,
 --       draft, merged, then closed.
 --
---   primary_pr(scope: WorkScope) -> PrIdentity?
---       Selects the highest-ranked persisted PR for a scope, tie-breaking by
---       provider update time and then observation time. Returns null when the
---       scope has no persisted PR association.
+--   active_pr(scope: WorkScope) -> PrIdentity?
+--       Returns the explicit active PR selection for a scope when one exists.
+--       The implementation may derive it from durable association history and
+--       latest observed branch facts, or return a user-pinned selection.
 --
 --   refresh_branch_prs(conversation: bedrock/Conversation) -> result
 --       Performs provider branch discovery for the conversation's current head
 --       branch and returns observed PR facts plus explicit refresh metadata.
 --
 --   branch_primary(result: refresh result) -> PrIdentity?
---       Selects the primary PR from a single branch refresh result before the
---       result is combined with durable WorkScope history.
+--       Selects the actionable PR candidate from a single branch refresh result
+--       before the result is combined with durable WorkScope history.
 --
 --   provider_refresh_by_number(pr: PrIdentity) -> result
 --       Refreshes a persisted associated PR by number and returns the updated
@@ -472,20 +471,20 @@ rule RepeatedObservationPreservesFirstSeen {
         -- rank, and last_seen_at are updated on repeat observations.
 }
 
-rule PrimaryPrDerivedAfterObservation {
+rule ActivePrDerivedAfterObservation {
     when: PrFactsObserved(scope, fact)
 
     requires: exists WorkScopeRecord{scope: scope}
 
-    ensures: DerivePrimaryPr(scope)
+    ensures: DeriveActivePr(scope)
 
     @guidance
-        -- Primary derivation happens after observation persistence, so fresh
+        -- Active-PR derivation happens after observation persistence, so fresh
         -- branch discoveries and existing number-refreshed associations are
         -- compared in one WorkScope history before the response is selected.
 }
 
-rule PrStatusFreshResponseUsesDerivedPrimary {
+rule PrStatusFreshResponseUsesExplicitActivePr {
     when: PrStatusRequested(conversation)
 
     let scope = resolve_work_scope(conversation)
@@ -497,53 +496,53 @@ rule PrStatusFreshResponseUsesDerivedPrimary {
     ensures: PrStatusResult.created(
         conversation: conversation,
         scope: scope,
-        pr: primary_pr(scope),
+        pr: active_pr(scope),
         refresh: fresh_metadata(refresh.attempted_at)
     )
 }
 
-rule PrStatusStalePersistedPrimaryOnNotFound {
+rule PrStatusStalePersistedActivePrOnNotFound {
     when: PrStatusRequested(conversation)
 
     let scope = resolve_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
     requires: refresh.state = not_found
-    requires: exists primary_pr(scope)
+    requires: exists active_pr(scope)
 
     ensures: PrStatusResult.created(
         conversation: conversation,
         scope: scope,
-        pr: primary_pr(scope),
+        pr: active_pr(scope),
         refresh: stale_not_found_metadata(refresh.attempted_at)
     )
 }
 
-rule PrStatusUnavailableWithPersistedPrimary {
+rule PrStatusUnavailableWithPersistedActivePr {
     when: PrStatusRequested(conversation)
 
     let scope = resolve_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
     requires: refresh.state = unavailable
-    requires: exists primary_pr(scope)
+    requires: exists active_pr(scope)
 
     ensures: PrStatusResult.created(
         conversation: conversation,
         scope: scope,
-        pr: primary_pr(scope),
+        pr: active_pr(scope),
         refresh: stale_unavailable_metadata(refresh.attempted_at, refresh.reason)
     )
 }
 
-rule PrStatusUnavailableWithoutPrimary {
+rule PrStatusUnavailableWithoutActivePr {
     when: PrStatusRequested(conversation)
 
     let scope = resolve_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
 
     requires: refresh.state = unavailable
-    requires: not exists primary_pr(scope)
+    requires: not exists active_pr(scope)
 
     ensures: PrStatusResult.created(
         conversation: conversation,
@@ -553,11 +552,11 @@ rule PrStatusUnavailableWithoutPrimary {
     )
 }
 
-rule AssociatedAutoFixTargetsPrimaryByNumber {
+rule AssociatedAutoFixTargetsExplicitActivePrByNumber {
     when: PrAutoFixContextRequested(conversation)
 
     let scope = resolve_work_scope(conversation)
-    let target = primary_pr(scope)
+    let target = active_pr(scope)
     let refresh = provider_refresh_by_number(target)
 
     requires: exists target
@@ -573,7 +572,7 @@ rule AssociatedAutoFixTargetsPrimaryByNumber {
 
     @guidance
         -- A branch refresh returning not_found does not disable this path.
-        -- Once a WorkScope has a primary PR, auto-fix refreshes that PR by
+        -- Once a WorkScope has an explicit active PR, auto-fix refreshes that PR by
         -- number so branch/HEAD drift does not strand the user.
 }
 
@@ -581,7 +580,7 @@ rule AutoFixUnavailableWhenProviderUnavailable {
     when: PrAutoFixContextRequested(conversation)
 
     let scope = resolve_work_scope(conversation)
-    let target = primary_pr(scope)
+    let target = active_pr(scope)
     let refresh = provider_refresh_by_number(target)
 
     requires: exists target
@@ -591,14 +590,14 @@ rule AutoFixUnavailableWhenProviderUnavailable {
     ensures: UserInformedAutoFixUnavailable(refresh.reason)
 }
 
-rule BranchAutoFixFallbackWithoutAssociation {
+rule BranchAutoFixFallbackWithoutExplicitActivePr {
     when: PrAutoFixContextRequested(conversation)
 
     let scope = resolve_work_scope(conversation)
     let refresh = refresh_branch_prs(conversation)
     let target = branch_primary(refresh.facts)
 
-    requires: not exists primary_pr(scope)
+    requires: not exists active_pr(scope)
     requires: refresh.state = fresh
     requires: target.display_state = open
 
@@ -611,7 +610,7 @@ rule BranchAutoFixFallbackWithoutAssociation {
 }
 
 
-rule WorkActionsEnablesAutoFixForFreshOpenPrimary {
+rule WorkActionsEnablesAutoFixForFreshOpenActivePr {
     when: WorkActionsRendersPrStatus(status)
 
     requires: status.pr != null
@@ -624,7 +623,7 @@ rule WorkActionsEnablesAutoFixForFreshOpenPrimary {
     )
 }
 
-rule WorkActionsEnablesAutoFixForStaleNotFoundOpenPrimary {
+rule WorkActionsEnablesAutoFixForStaleNotFoundOpenActivePr {
     when: WorkActionsRendersPrStatus(status)
 
     requires: status.pr != null
@@ -640,7 +639,7 @@ rule WorkActionsEnablesAutoFixForStaleNotFoundOpenPrimary {
     @guidance
         -- The disabled copy must not tell the user to refresh branch status in
         -- this case: branch refresh has already said not_found. The available
-        -- action is number-based auto-fix against the persisted primary.
+        -- action is number-based auto-fix against the persisted active target.
 }
 
 rule WorkActionsDisablesAutoFixWhenRefreshUnavailable {
@@ -656,7 +655,7 @@ rule WorkActionsDisablesAutoFixWhenRefreshUnavailable {
     )
 }
 
-rule WorkActionsDisablesAutoFixForNonOpenPrimary {
+rule WorkActionsDisablesAutoFixForNonOpenActivePr {
     when: WorkActionsRendersPrStatus(status)
 
     requires: status.pr = null or status.pr.display_state != open
@@ -782,7 +781,8 @@ surface AbandonCleanup {
         -- but cleanup completion does not depend on PR provider success.
 }
 
-deferred WorkScopeObservedBranchHistory    -- see: persisted WorkScope observed-branch child rows + bash-triggered reconciliation
+deferred WorkScopeObservedBranchHistory
+    -- Location: `crates/phoenix-ide/src/runtime.rs` (`reconcile_work_scope_after_bash_terminal_inner`, `qualify_observed_branch_for_conversation`)
     -- REQ-PRA-000. Supported reconciliation boundaries record settled branch
     -- observations keyed by WorkScope and repository identity. Those observed
     -- branches form the candidate PR-head set. Phoenix does not infer branch
@@ -792,7 +792,8 @@ deferred WorkScopeObservedBranchHistory    -- see: persisted WorkScope observed-
     -- deletion.
 
 
-deferred ExplicitActivePrSelection    -- see: follow-on active-PR domain/API migration
+deferred ExplicitActivePrSelection
+    -- Location: `crates/phoenix-ide/src/runtime.rs` (`reconcile_work_scope_after_bash_terminal_inner` → `derive_active_work_scope_pr_selection`); `crates/phoenix-ide/src/api/git_handlers.rs` (`pin_active_pr_selection`, `resume_active_pr_selection`)
     -- REQ-PRA-000, REQ-PRA-000a, REQ-PRA-000b, REQ-PRA-000c. PR-specific
     -- surfaces target one explicit active PR, distinct from the associated-PR
     -- set, the currently checked-out branch, the owning task/worktree, and any
@@ -808,8 +809,6 @@ deferred ExplicitActivePrSelection    -- see: follow-on active-PR domain/API mig
 ------------------------------------------------------------
 -- Deferred Behavioural Extensions
 ------------------------------------------------------------
--- Deferred Behavioural Extensions
-------------------------------------------------------------
 --
 -- The rules above model the singular current-reality PR identity, freshness-
 -- aware PR status, the Address-CI auto-fix affordance, and abandon refresh.
@@ -821,7 +820,8 @@ deferred ExplicitActivePrSelection    -- see: follow-on active-PR domain/API mig
 -- renders a compact advisory near the Address-CI Work Action. It is named here
 -- so the traceability is explicit rather than silently absent.
 
-deferred PrFeedbackFreshnessAdvisory    -- see: ui/src/components/WorkActions.tsx
+deferred PrFeedbackFreshnessAdvisory
+    -- Location: `ui/src/components/WorkActions.tsx` (`PrRemediationActions`)
     -- REQ-PRA-001. WHEN a Work or Branch conversation has an open associated PR
     -- AND PR feedback changed since Phoenix last captured agent-facing PR
     -- remediation context, a compact advisory count marker (`{N} new` or
@@ -833,7 +833,8 @@ deferred PrFeedbackFreshnessAdvisory    -- see: ui/src/components/WorkActions.ts
     -- baseline captured by PrRemediationContextBaseline below.
     -- Location: ui/src/components/WorkActions.tsx (PrRemediationActions)
 
-deferred PrRemediationContextBaseline    -- see: crates/phoenix-ide/src/api/pr_monitoring.rs
+deferred PrRemediationContextBaseline
+    -- Location: `crates/phoenix-ide/src/api/pr_monitoring.rs`
     -- REQ-PRA-002. WHEN Phoenix successfully captures PR remediation context for
     -- an associated PR, that successful capture is recorded as the baseline for
     -- agent-facing PR feedback freshness, keyed by WorkScope and PR number:
@@ -845,7 +846,8 @@ deferred PrRemediationContextBaseline    -- see: crates/phoenix-ide/src/api/pr_m
     -- actually handed the agent, not what GitHub contained at an unrelated time.
     -- Location: crates/phoenix-ide/src/api/pr_monitoring.rs (WorkScope-keyed PR baseline persistence)
 
-deferred BoundedPrFeedbackRefresh    -- see: crates/phoenix-ide/src/api/pr_monitoring.rs
+deferred BoundedPrFeedbackRefresh
+    -- Location: `crates/phoenix-ide/src/api/pr_monitoring.rs`
     -- REQ-PRA-003. WHEN refreshing routine PR status, the poll stays lightweight
     -- and does NOT fetch all PR feedback surfaces unless gated by evidence that
     -- feedback may have changed — PR `github_updated_at` newer than the latest
@@ -858,7 +860,8 @@ deferred BoundedPrFeedbackRefresh    -- see: crates/phoenix-ide/src/api/pr_monit
     -- modelled in the status rules above.
     -- Location: crates/phoenix-ide/src/api/pr_monitoring.rs (pr-status handler, gated full fetch)
 
-deferred PrFeedbackCoverageHealthAdvisory    -- see: crates/phoenix-ide/src/api/pr_monitoring.rs
+deferred PrFeedbackCoverageHealthAdvisory
+    -- Location: `crates/phoenix-ide/src/api/pr_monitoring.rs` (`coverage_health`)
     -- REQ-PRA-004. WHEN classifying PR feedback freshness AND at least one
     -- feedback surface cannot be read, a coverage-health signal distinct from
     -- the freshness advisory identifies the unreadable surfaces, distinguishing

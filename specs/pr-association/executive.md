@@ -3,8 +3,8 @@
 ## What This Spec Covers
 
 PR association is the WorkScope-owned link between a Work or Branch conversation and the GitHub
-pull requests Phoenix has observed for it. Increment 1 broadens the normative model from a hidden
-singular-primary world to a plural association world with one explicit active PR. This spec owns:
+pull requests Phoenix has observed for it. Phoenix persists plural association history and one
+explicit active PR for PR-specific targeting. This spec owns:
 
 - **Observed-branch history** — durable WorkScope-keyed history of settled task-branch heads
   observed at supported reconciliation boundaries.
@@ -44,8 +44,8 @@ Two surfaces consume this spec's PR identity and must stay distinct:
 
 Both target the same explicit active PR when one is selected; the freshness advisory
 (REQ-PRA-001) lives next to the Address-CI action, not on the StateBar badge. A singular
-primary-PR view may remain as compatibility current reality during migration, but the normative
-owner for PR-specific targeting is the explicit active PR.
+primary-PR view may exist as a compatibility projection for singular consumers, but the
+authoritative owner for PR-specific targeting is the explicit active PR.
 
 ## User Need
 
@@ -72,20 +72,19 @@ freshness as branch health.
 
 | Requirement | Status | Surface |
 |-------------|--------|---------|
-| REQ-PRA-000 | Specified for increment 1; implementation pending | Normative change only in this increment |
-| REQ-PRA-000a | Specified for increment 1; implementation pending | Normative change only in this increment |
-| REQ-PRA-000b | Specified for increment 1; implementation pending | Normative change only in this increment |
-| REQ-PRA-000c | Specified for increment 1; implementation pending | Normative change only in this increment |
-| REQ-PRA-001 | Implemented for the singular current-reality flow | `ui/src/components/WorkActions.tsx` (`PrRemediationActions`); freshness advisory marker |
-| REQ-PRA-002 | Implemented for the singular current-reality flow | `crates/phoenix-ide/src/api/pr_monitoring.rs` (WorkScope-keyed baseline persistence) |
-| REQ-PRA-003 | Implemented for the singular current-reality flow | `crates/phoenix-ide/src/api/pr_monitoring.rs` (gated full-feedback fetch) |
-| REQ-PRA-004 | Implemented for the singular current-reality flow | `crates/phoenix-ide/src/api/pr_monitoring.rs` (coverage-health classification); `PrFeedbackCoverageHealth` in `api/types.rs` |
+| REQ-PRA-000 | Implemented | `crates/phoenix-ide/src/runtime.rs` (`reconcile_scope_pr_observations_after_terminal_edge`, `qualify_observed_branch_for_conversation`); `crates/phoenix-ide/src/api/git_handlers.rs` (`selection_envelope_for_scope` test coverage for plural associations and latest observed branch) |
+| REQ-PRA-000a | Implemented | `crates/phoenix-ide/src/runtime.rs` (`reconcile_scope_pr_observations_after_terminal_edge` → `derive_active_work_scope_pr_selection`); `crates/phoenix-ide/src/api/git_handlers.rs` (`resume_active_pr_selection`, `pin_active_pr_selection`, `active_selection_target_uses_explicit_selection_not_ranked_primary`) |
+| REQ-PRA-000b | Implemented | `crates/phoenix-ide/src/api/git_handlers.rs` (`get_pr_status`, `create_pr_auto_fix_context`, `get_active_pr_diff` all target `active_selection_target_for_scope`); `ui/src/components/WorkActions.test.tsx` (active PR interactions + diff targeting); `ui/src/components/StateBar.tsx` (active PR selector) |
+| REQ-PRA-000c | Implemented | `crates/phoenix-ide/src/api/git_handlers.rs` (`active_selection_target_for_scope`, `active_selection_target_uses_explicit_selection_not_ranked_primary`); compatibility projection remains non-authoritative |
+| REQ-PRA-001 | Implemented | `ui/src/components/WorkActions.tsx` (`PrRemediationActions`); `ui/src/components/WorkActions.test.tsx` (freshness marker scenarios) |
+| REQ-PRA-002 | Implemented | `crates/phoenix-ide/src/api/pr_monitoring.rs` (WorkScope-keyed baseline persistence and refresh classification) |
+| REQ-PRA-003 | Implemented | `crates/phoenix-ide/src/api/pr_monitoring.rs` (gated full-feedback fetch during status refresh) |
+| REQ-PRA-004 | Implemented | `crates/phoenix-ide/src/api/pr_monitoring.rs` (`coverage_health`); `crates/phoenix-ide/src/api/types.rs` (`PrFeedbackCoverageHealth`); `ui/src/components/WorkActions.test.tsx` (coverage marker scenarios) |
 
-Current reality is still primarily singular: one ranked primary PR drives the implemented status
-and action surfaces. This executive document records that mismatch explicitly. The normative spec
-now defines the increment-1 target model — observed branch history, plural association history,
-and explicit active-PR selection — so follow-on implementation work can migrate surfaces without
-leaving the singular-primary behavior as the only written contract.
+Phoenix now implements the plural-association and explicit-active-selection model across the PR
+selection envelope, terminal-edge observation reconciliation, active-selection mutation surfaces,
+and PR-specific targeting. Singular ranked-primary behavior remains only as a compatibility
+projection for consumers that still need a singular view.
 
 ## Provenance
 
@@ -96,8 +95,8 @@ PR-association requirements were previously expressed in two layers of project h
 2. The older singular-primary association model lived as current behavior and design material in
    the `projects` and `pr-association` artifacts.
 
-This increment keeps the renumbered freshness requirements and adds explicit plural-PR ownership
-for branch observation, active selection, and compatibility projection so PR identity, status,
+This spec keeps the renumbered freshness requirements and adds explicit plural-PR ownership for
+branch observation, active selection, and compatibility projection so PR identity, status,
 auto-fix targeting, and feedback freshness own a spec independent of project detection, mode
 selection, and worktree creation. The sibling `work-lifecycle` spec continues to own terminal
 actions and PR-merge-state-as-cleanup-gate behavior.

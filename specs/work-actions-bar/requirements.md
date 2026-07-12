@@ -129,15 +129,15 @@ reachable combination of phase, continuation, and PR state maps to exactly one r
 | 9 | idle, gh unavailable (no PR identity, refresh = unavailable) | `gh_unavailable` | **Clean up** (FINISH) | warning note; single click |
 
 The **Address feedback** affordance is enabled when Phoenix can post an auto-fix message to
+the conversation: the conversation has a live message channel and the PR is open
+(`PrAutoFixAffordance`, `pr-association`). A draft PR is never addressable. A degraded or
+stale refresh changes the secondary link-out from `Merge on GitHub` to `Open PR`; it does not
+replace the primary with a link under the user's pointer.
 
 Every PR-specific verb or marker the bar renders SHALL identify and target the same explicit
 active PR supplied by `pr-association`. The bar SHALL NOT silently choose among multiple
 associated actionable PRs on its own, and SHALL NOT treat any compatibility singular primary-PR
 projection as authority over an explicit pinned or inferred active selection.
-the conversation: the conversation has a live message channel and the PR is open
-(`PrAutoFixAffordance`, `pr-association`). A draft PR is never addressable. A degraded or
-stale refresh changes the secondary link-out from `Merge on GitHub` to `Open PR`; it does not
-replace the primary with a link under the user's pointer.
 
 The **FINISH sub-table** is a single shared selector (used by `stuck` and by the idle FINISH
 rows), total over PR state:

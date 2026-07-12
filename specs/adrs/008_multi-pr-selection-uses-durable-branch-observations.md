@@ -1,4 +1,4 @@
-# ADR-007: Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting
+# ADR-008: Multi-PR selection uses durable settled-branch observations plus explicit active-PR targeting
 
 - **Status:** Accepted
 - **Date:** 2025-08-08
