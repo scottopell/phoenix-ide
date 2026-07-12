@@ -2405,38 +2405,54 @@ impl Database {
         cwd: &str,
         model: Option<&str>,
     ) -> DbResult<Conversation> {
-        let mut tx = self.pool.begin().await?;
-        let existing: Option<String> =
-            sqlx::query_scalar("SELECT conversation_id FROM coordinator WHERE singleton = 1")
-                .fetch_optional(&mut *tx)
-                .await?;
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result: DbResult<String> = async {
+            if let Some(id) = sqlx::query_scalar(
+                "SELECT conversation_id FROM coordinator WHERE singleton = 1",
+            )
+            .fetch_optional(&mut *conn)
+            .await?
+            {
+                return Ok(id);
+            }
 
-        let conversation_id = if let Some(id) = existing {
-            id
-        } else {
             let id = uuid::Uuid::new_v4().to_string();
+            let slug = format!("coordinator-{}", id.get(..8).unwrap_or(&id));
             let now = Utc::now().to_rfc3339();
             let idle = serde_json::to_string(&ConvState::Idle)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             sqlx::query(
                 "INSERT INTO conversations (id, slug, title, cwd, user_initiated, state, state_updated_at, created_at, updated_at, archived, transcript_generation, model, llm_language, cm_kind)
-                 VALUES (?1, 'coordinator', 'Coordinator', ?2, 0, ?3, ?4, ?4, ?4, 0, 1, ?5, 'phoenix-native', 'explore')",
+                 VALUES (?1, ?2, 'Coordinator', ?3, 0, ?4, ?5, ?5, ?5, 0, 1, ?6, 'phoenix-native', 'explore')",
             )
             .bind(&id)
+            .bind(slug)
             .bind(cwd)
             .bind(idle)
             .bind(now)
             .bind(model)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
             sqlx::query("INSERT INTO coordinator (singleton, conversation_id) VALUES (1, ?1)")
                 .bind(&id)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
-            id
-        };
-        tx.commit().await?;
-        self.get_conversation(&conversation_id).await
+            Ok(id)
+        }
+        .await;
+
+        match result {
+            Ok(conversation_id) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                drop(conn);
+                self.get_conversation(&conversation_id).await
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
     }
 
     /// Return the Coordinator conversation id when the singleton has been created.
@@ -2560,7 +2576,8 @@ impl Database {
     pub async fn list_usage_limit_errors(&self) -> DbResult<Vec<(String, schema::ConvState)>> {
         let rows: Vec<(String, String)> = sqlx::query(
             "SELECT id, state FROM conversations
-             WHERE archived = 0 AND user_initiated = 1
+             WHERE archived = 0
+               AND (user_initiated = 1 OR id = (SELECT conversation_id FROM coordinator WHERE singleton = 1))
                AND json_extract(state, '$.type') = 'error'
                AND json_extract(state, '$.error_kind') = 'usage_limit_reached'
                AND json_extract(state, '$.resets_at') IS NOT NULL",
@@ -4733,6 +4750,14 @@ impl Database {
             // Parent vanished during the race. Surface as NotFound.
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
+
+        sqlx::query(
+            "UPDATE coordinator SET conversation_id = ?1 WHERE singleton = 1 AND conversation_id = ?2",
+        )
+        .bind(&new_id)
+        .bind(parent_id)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
 
@@ -11001,6 +11026,43 @@ mod tests {
         assert!(!columns.iter().any(|column| column == "conversation_kind"));
     }
 
+    #[tokio::test]
+    async fn coordinator_creation_handles_slug_collision_and_concurrent_first_access() {
+        let path = std::env::temp_dir().join(format!(
+            "phoenix-coordinator-race-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        db.create_conversation("ordinary", "coordinator", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let (left, right) = tokio::join!(
+            db.get_or_create_coordinator("/tmp/coordinator", Some("test-model")),
+            db.get_or_create_coordinator("/tmp/coordinator", Some("test-model")),
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(left.id, right.id);
+        assert_ne!(left.slug.as_deref(), Some("coordinator"));
+
+        let coordinator_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM coordinator")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let coordinator_conversation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversations WHERE id = (SELECT conversation_id FROM coordinator WHERE singleton = 1)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(coordinator_count, 1);
+        assert_eq!(coordinator_conversation_count, 1);
+        db.pool().close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The clear watermark write is structurally monotonic: a value below the
     /// persisted watermark is ignored, never regressing it (REQ-STR-007). A
     /// transient stale-low write (e.g. after a failed read re-planning from 0)
@@ -11088,12 +11150,20 @@ mod tests {
             .await
             .unwrap();
 
+        let coordinator = db
+            .get_or_create_coordinator("/tmp", Some("test-model"))
+            .await
+            .unwrap();
+        db.update_conversation_state(&coordinator.id, &usage_limit_err(Some(reset)))
+            .await
+            .unwrap();
+
         let got = db.list_usage_limit_errors().await.unwrap();
         let ids: Vec<&str> = got.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["ul"],
-            "only the top-level usage-limit error with a reset time"
+            vec!["ul", coordinator.id.as_str()],
+            "user-facing conversations include the singleton Coordinator"
         );
         assert!(matches!(
             got[0].1,
@@ -13152,6 +13222,43 @@ mod tests {
             Some("my-task-3"),
             "second continuation slug must be {{root_slug}}-3, not the parent slug appended"
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_relation_moves_to_continuation() {
+        let db = Database::open_in_memory().await.unwrap();
+        let coordinator = db
+            .get_or_create_coordinator("/tmp", Some("test-model"))
+            .await
+            .unwrap();
+        db.update_conversation_state(
+            &coordinator.id,
+            &ConvState::ContextExhausted {
+                summary: "summary".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let continuation = match db.continue_conversation(&coordinator.id).await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected created continuation, got {other:?}")
+            }
+        };
+        assert_eq!(
+            db.coordinator_conversation_id().await.unwrap().as_deref(),
+            Some(continuation.id.as_str())
+        );
+        assert!(!db
+            .is_coordinator_conversation(&coordinator.id)
+            .await
+            .unwrap());
+        assert!(db
+            .is_coordinator_conversation(&continuation.id)
+            .await
+            .unwrap());
     }
 
     // ------------------------------------------------------------------

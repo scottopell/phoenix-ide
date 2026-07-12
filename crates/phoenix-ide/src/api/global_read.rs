@@ -125,6 +125,12 @@ impl GlobalReadService {
         if query.is_empty() {
             return Err("query is required".to_string());
         }
+        if !self.message_retriever.index_reconciled() {
+            return Err(
+                "the global message index is still warming; try again after startup reconciliation completes"
+                    .to_string(),
+            );
+        }
         let hits = self
             .message_retriever
             .retrieve(query, RetrievalScope::Global, SEARCH_TOP_K)

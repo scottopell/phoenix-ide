@@ -142,6 +142,7 @@ pub struct TaskApprovalHandoffResponse {
 pub struct RuntimeManager {
     db: Database,
     llm_registry: Arc<ModelRegistry>,
+    message_retriever: Arc<dyn crate::db::MessageRetriever>,
     platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
     /// Per-process bash handle registry. Shared by every conversation's
@@ -1182,6 +1183,25 @@ impl RuntimeManager {
         mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
         credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     ) -> Self {
+        let message_retriever = Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        Self::new_with_message_retriever(
+            db,
+            llm_registry,
+            message_retriever,
+            platform,
+            mcp_manager,
+            credential_helper,
+        )
+    }
+
+    pub fn new_with_message_retriever(
+        db: Database,
+        llm_registry: Arc<ModelRegistry>,
+        message_retriever: Arc<dyn crate::db::MessageRetriever>,
+        platform: PlatformCapability,
+        mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
+        credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
+    ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
         let (handoff_tx, handoff_rx) = mpsc::channel(32);
@@ -1209,6 +1229,7 @@ impl RuntimeManager {
         Self {
             db,
             llm_registry,
+            message_retriever,
             platform,
             browser_sessions: BrowserSessionManager::with_lifecycle_sink(Some(
                 browser_lifecycle_tx,
@@ -2626,10 +2647,10 @@ impl RuntimeManager {
         } else {
             use crate::db::ConvMode;
             if is_coordinator {
-                let retriever: Arc<dyn crate::db::MessageRetriever> =
-                    Arc::new(crate::db::Fts5Retriever::new(self.db.pool().clone()));
-                let service =
-                    crate::api::global_read::GlobalReadService::new(self.db.clone(), retriever);
+                let service = crate::api::global_read::GlobalReadService::new(
+                    self.db.clone(),
+                    self.message_retriever.clone(),
+                );
                 ToolRegistryExecutor::builtin_only(
                     ToolRegistry::coordinator(crate::coordinator_tools::tools(service)),
                     agent_catalog.clone(),

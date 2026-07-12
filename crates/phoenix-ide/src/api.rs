@@ -110,9 +110,14 @@ impl AppState {
         runtime_env: Arc<PhoenixRuntimeEnvironment>,
         suggest_token: String,
     ) -> Self {
-        let runtime = Arc::new(RuntimeManager::new(
+        // Conversation-retrieval index: bring it in line with `messages` once
+        // at startup (REQ-RET-003) off the request path.
+        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        let message_retriever: Arc<dyn MessageRetriever> = retriever.clone();
+        let runtime = Arc::new(RuntimeManager::new_with_message_retriever(
             db.clone(),
             llm_registry.clone(),
+            message_retriever.clone(),
             platform.clone(),
             mcp_manager.clone(),
             credential_helper.clone(),
@@ -124,11 +129,8 @@ impl AppState {
         runtime.start_creation_worker().await;
         handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
-        // Conversation-retrieval index: bring it in line with `messages` once
-        // at startup (REQ-RET-003) off the request path — retrieval works on
-        // whatever is already indexed while the sweep runs, and reports
-        // `index_reconciled()` when complete.
-        let retriever = Arc::new(Fts5Retriever::new(db.pool().clone()));
+        // Retrieval works on existing index rows while this sweep runs and
+        // reports `index_reconciled()` when complete.
         {
             let retriever = retriever.clone();
             tokio::spawn(async move {
@@ -146,7 +148,6 @@ impl AppState {
                 }
             });
         }
-        let message_retriever: Arc<dyn MessageRetriever> = retriever;
         // Chain Q&A shares the same `Database`, `ModelRegistry`, and retrieval
         // seam. Its internal `ChainRuntimeRegistry` is owned by this `ChainQa`
         // value — chain SSE handlers reach into it via
