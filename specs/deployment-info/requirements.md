@@ -154,15 +154,12 @@ for:
 - tmux/terminal
 - MCP
 
-THE SYSTEM SHALL treat API and Bash as attributable categories when native
-process identity is available.
+THE SYSTEM SHALL treat API, Bash, and shell-mode terminal process groups as attributable categories when native process identity is available.
 
 THE SYSTEM SHALL deduplicate shared PIDs before reporting the managed aggregate
 so the same native process is not double-counted across categories.
 
-THE SYSTEM SHALL treat Browser, tmux/terminal, and MCP as explicit categories
-EVEN WHEN native process identity is unavailable, and SHALL report them as
-unavailable with a reason rather than silently omitting them.
+THE SYSTEM SHALL keep Browser, tmux/terminal, and MCP as explicit categories EVEN WHEN some or all native process identity is unavailable, and SHALL report the capability limitation with a reason rather than silently omitting it.
 
 THE SYSTEM SHALL provide per-process rows for every attributed managed PID,
 including:
@@ -178,6 +175,8 @@ including:
 WHEN a per-process metric cannot be sampled on the host platform or for that
 process, THE SYSTEM SHALL report that field as unavailable (`null` on the wire)
 rather than a misleading zero.
+
+THE SYSTEM SHALL log per-process metric sampling failures at debug level or above.
 
 THE SYSTEM SHALL measure resource values on both macOS and Linux.
 

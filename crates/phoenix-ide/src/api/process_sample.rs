@@ -87,25 +87,31 @@ pub fn process_pss_bytes(pid: u32) -> Option<u64> {
     process_pss_bytes_impl(pid)
 }
 
-pub async fn sample_process_observations(pids: &BTreeSet<u32>) -> Vec<ProcessObservation> {
+pub async fn sample_process_observations(
+    expected_identities: &BTreeMap<u32, ProcessIdentity>,
+) -> Vec<ProcessObservation> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
-    if pids.is_empty() {
+    if expected_identities.is_empty() {
         return Vec::new();
     }
 
+    let pids = expected_identities.keys().copied().collect::<BTreeSet<_>>();
     let sys_pids: Vec<Pid> = pids.iter().copied().map(Pid::from_u32).collect();
     let mut sys = System::new_with_specifics(
         RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
     );
     sys.refresh_processes(ProcessesToUpdate::Some(&sys_pids), true);
-    let first_identities = observed_process_identities(&sys, pids);
+    let first_identities = retain_matching_process_identities(
+        expected_identities,
+        &observed_process_identities(&sys, &pids),
+    );
     tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
     sys.refresh_processes(ProcessesToUpdate::Some(&sys_pids), true);
 
     let stable_identities = retain_matching_process_identities(
         &first_identities,
-        &observed_process_identities(&sys, pids),
+        &observed_process_identities(&sys, &pids),
     );
     if stable_identities.is_empty() {
         return Vec::new();
@@ -113,17 +119,17 @@ pub async fn sample_process_observations(pids: &BTreeSet<u32>) -> Vec<ProcessObs
 
     let mut rows = Vec::new();
     for pid in pids {
-        let Some(expected_identity) = stable_identities.get(pid).copied() else {
+        let Some(expected_identity) = stable_identities.get(&pid).copied() else {
             continue;
         };
-        let sys_pid = Pid::from_u32(*pid);
+        let sys_pid = Pid::from_u32(pid);
         let Some(process) = sys.process(sys_pid) else {
             continue;
         };
-        let memory_bytes = stable_process_memory_bytes(*pid, expected_identity);
-        let cpu_time_seconds = stable_process_cpu_time_seconds(*pid, expected_identity);
+        let memory_bytes = stable_process_memory_bytes(pid, expected_identity);
+        let cpu_time_seconds = stable_process_cpu_time_seconds(pid, expected_identity);
         rows.push(ProcessObservation {
-            pid: *pid,
+            pid,
             name: process.name().to_string_lossy().into_owned(),
             cpu_percent: Some(process.cpu_usage()),
             memory_bytes,
@@ -136,17 +142,29 @@ pub async fn sample_process_observations(pids: &BTreeSet<u32>) -> Vec<ProcessObs
     rows
 }
 
-pub fn group_member_pids_for_sampling(pgids: &BTreeSet<i32>) -> Option<Vec<u32>> {
+pub fn group_member_identities_for_sampling(
+    pgids: &BTreeSet<i32>,
+) -> Option<BTreeMap<u32, ProcessIdentity>> {
     if pgids.is_empty() {
-        return Some(Vec::new());
+        return Some(BTreeMap::new());
     }
-    group_member_pids(pgids)
+    let member_pids = group_member_pids(pgids)?;
+    Some(
+        member_pids
+            .into_iter()
+            .filter_map(|pid| current_process_identity(pid).map(|identity| (pid, identity)))
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProcessIdentity {
-    pid: u32,
-    start_time: u128,
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub start_time: u128,
+}
+
+pub fn process_identity_for_sampling(pid: u32) -> Option<ProcessIdentity> {
+    current_process_identity(pid)
 }
 
 fn observed_process_identities(
@@ -180,7 +198,10 @@ fn stable_process_memory_bytes(pid: u32, expected_identity: ProcessIdentity) -> 
     if before != expected_identity {
         return None;
     }
-    let memory_bytes = process_pss_bytes_impl(pid)?;
+    let Some(memory_bytes) = process_pss_bytes_impl(pid) else {
+        tracing::debug!(pid, "process proportional-memory sample unavailable");
+        return None;
+    };
     let after = current_process_identity(pid)?;
     (after == expected_identity).then_some(memory_bytes)
 }
@@ -597,8 +618,8 @@ mod tests {
     #[test]
     fn empty_process_group_snapshot_returns_no_members() {
         assert_eq!(
-            group_member_pids_for_sampling(&BTreeSet::new()),
-            Some(Vec::new())
+            group_member_identities_for_sampling(&BTreeSet::new()),
+            Some(BTreeMap::new())
         );
     }
 
@@ -692,7 +713,8 @@ mod tests {
             return;
         }
 
-        let observations = sample_process_observations(&BTreeSet::from([pid])).await;
+        let identity = process_identity_for_sampling(pid).expect("current process identity");
+        let observations = sample_process_observations(&BTreeMap::from([(pid, identity)])).await;
         let observation = observations
             .iter()
             .find(|observation| observation.pid == pid)
@@ -709,7 +731,8 @@ mod tests {
     #[tokio::test]
     async fn current_process_observation_reports_cpu_time() {
         let pid = std::process::id();
-        let observations = sample_process_observations(&BTreeSet::from([pid])).await;
+        let identity = process_identity_for_sampling(pid).expect("current process identity");
+        let observations = sample_process_observations(&BTreeMap::from([(pid, identity)])).await;
         let observation = observations
             .iter()
             .find(|observation| observation.pid == pid)

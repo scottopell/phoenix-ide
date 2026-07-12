@@ -70,6 +70,12 @@ impl Dims {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalChildKind {
+    Shell,
+    TmuxClient,
+}
+
 /// Owns the PTY master fd and child process.
 ///
 /// `Drop` closes `master_fd`, which causes the kernel to deliver `SIGHUP`
@@ -79,6 +85,7 @@ pub struct TerminalHandle {
     pub master_fd: OwnedFd,
     /// Child shell PID.  Reaped by the reader task on EIO.
     pub child_pid: Pid,
+    pub child_kind: TerminalChildKind,
     /// Command tracker — fed with every PTY output byte (REQ-TERM-010, REQ-TERM-021).
     pub tracker: Arc<Mutex<CommandTracker>>,
     /// Shell integration detection state.
@@ -131,6 +138,17 @@ impl ActiveTerminals {
     #[must_use]
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    #[must_use]
+    pub fn snapshot_shell_pgids(&self) -> Vec<i32> {
+        let map = self.0.lock().expect("terminal registry poisoned");
+        map.values()
+            .filter(|handle| handle.child_kind == TerminalChildKind::Shell)
+            .map(|handle| handle.child_pid.as_raw())
+            .collect()
     }
 
     /// Returns `true` if a terminal is currently active for `scope`.

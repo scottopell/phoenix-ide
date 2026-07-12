@@ -7,7 +7,7 @@
 //! two paths; only the argv differs.
 
 use super::command_tracker::CommandTracker;
-use super::session::{Dims, ShellIntegrationStatus, StopReason, TerminalHandle};
+use super::session::{Dims, ShellIntegrationStatus, StopReason, TerminalChildKind, TerminalHandle};
 use nix::{
     pty::openpty,
     unistd::{close, execve, fork, setsid, ForkResult},
@@ -76,6 +76,15 @@ pub enum PtyExecPlan {
     Shell,
 }
 
+impl PtyExecPlan {
+    fn child_kind(&self) -> TerminalChildKind {
+        match self {
+            Self::Shell => TerminalChildKind::Shell,
+            Self::Tmux { .. } => TerminalChildKind::TmuxClient,
+        }
+    }
+}
+
 /// Spawn a PTY-backed interactive shell in `cwd`.
 ///
 /// Returns a `TerminalHandle` on success. Must be called from a
@@ -98,6 +107,8 @@ pub fn spawn_pty(
     initial_dims: Dims,
     plan: PtyExecPlan,
 ) -> Result<TerminalHandle, String> {
+    let child_kind = plan.child_kind();
+
     // --- PTY creation --------------------------------------------------------
     let pty = openpty(None, None).map_err(|e| format!("openpty: {e}"))?;
 
@@ -261,6 +272,7 @@ pub fn spawn_pty(
             Ok(TerminalHandle {
                 master_fd,
                 child_pid: child,
+                child_kind,
                 tracker: Arc::new(Mutex::new(CommandTracker::new(session_id))),
                 shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
                 stop_tx,

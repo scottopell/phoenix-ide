@@ -30,7 +30,14 @@ fn arb_conv_scope() -> impl Strategy<Value = WorkScope> {
 
 /// Build a minimal `TerminalHandle` for registry tests.
 /// Uses /dev/null as a stand-in fd since these tests never do PTY I/O.
-fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
+fn dummy_handle(dims: Dims) -> super::session::TerminalHandle {
+    dummy_handle_kind(dims, super::session::TerminalChildKind::Shell)
+}
+
+fn dummy_handle_kind(
+    _dims: Dims,
+    child_kind: super::session::TerminalChildKind,
+) -> super::session::TerminalHandle {
     use crate::command_tracker::CommandTracker;
     use crate::session::{ShellIntegrationStatus, StopReason};
     use std::fs::OpenOptions;
@@ -51,6 +58,7 @@ fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
     super::session::TerminalHandle {
         master_fd: owned_fd,
         child_pid: nix::unistd::Pid::from_raw(1), // init — never reaped in tests
+        child_kind,
         tracker: std::sync::Arc::new(std::sync::Mutex::new(CommandTracker::new(
             "test-session".to_string(),
         ))),
@@ -69,6 +77,30 @@ fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
 /// treats that as a signal to reclaim the winner rather than reject —
 /// see task 24691 and `DuplicateConnectionReclaimsSession` in terminal.allium.
 /// This test covers only the registry-level atomicity used as the race guard.
+#[test]
+fn shell_pid_snapshot_excludes_tmux_clients() {
+    use crate::session::TerminalChildKind;
+
+    let registry = ActiveTerminals::new();
+    let shell_scope = WorkScope::Conversation("shell".to_string());
+    let tmux_scope = WorkScope::Conversation("tmux".to_string());
+    let dims = Dims::try_new(80, 24).expect("valid dimensions");
+    registry
+        .try_insert(
+            shell_scope,
+            dummy_handle_kind(dims, TerminalChildKind::Shell),
+        )
+        .expect("shell insert");
+    registry
+        .try_insert(
+            tmux_scope,
+            dummy_handle_kind(dims, TerminalChildKind::TmuxClient),
+        )
+        .expect("tmux insert");
+
+    assert_eq!(registry.snapshot_shell_pgids(), vec![1]);
+}
+
 #[test]
 fn try_insert_rejects_duplicate() {
     let registry = ActiveTerminals::new();

@@ -565,6 +565,7 @@ mod reclaim_tests {
         Arc::new(TerminalHandle {
             master_fd: owned_fd,
             child_pid: nix::unistd::Pid::from_raw(1),
+            child_kind: phoenix_terminal::TerminalChildKind::Shell,
             tracker: Arc::new(Mutex::new(CommandTracker::new("reclaim-test".to_string()))),
             shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
             stop_tx,

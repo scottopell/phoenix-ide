@@ -11,7 +11,8 @@
 
 use super::AppState;
 use crate::api::process_sample::{
-    group_member_pids_for_sampling, sample_process_observations, ProcessObservation,
+    group_member_identities_for_sampling, process_identity_for_sampling,
+    sample_process_observations, ProcessIdentity, ProcessObservation,
 };
 use axum::{
     extract::{ConnectInfo, State},
@@ -921,21 +922,31 @@ async fn sample_about_resources(state: &AppState) -> AboutResourcesSnapshot {
 }
 
 async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResourcesSnapshot {
-    let current_pid = sysinfo::get_current_pid().ok().map(sysinfo::Pid::as_u32);
-    let api_pids = current_pid.into_iter().collect::<BTreeSet<_>>();
+    let api_identities = sysinfo::get_current_pid()
+        .ok()
+        .map(sysinfo::Pid::as_u32)
+        .and_then(|pid| process_identity_for_sampling(pid).map(|identity| (pid, identity)))
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let api_pids = api_identities.keys().copied().collect::<BTreeSet<_>>();
     let bash_pid_snapshot = match state {
         Some(state) => snapshot_bash_pids(state).await,
-        None => BashPidSnapshot::Available(BTreeSet::new()),
+        None => BashPidSnapshot::Available(BTreeMap::new()),
     };
 
-    let mut all_pids = api_pids.clone();
-    if let BashPidSnapshot::Available(bash_pids) = &bash_pid_snapshot {
-        all_pids.extend(bash_pids.iter().copied());
+    let terminal_pid_snapshot = state.map(snapshot_terminal_pids);
+    let mut all_identities = api_identities;
+    if let BashPidSnapshot::Available(bash_identities) = &bash_pid_snapshot {
+        all_identities.extend(bash_identities);
     }
+    if let Some(BashPidSnapshot::Available(terminal_identities)) = &terminal_pid_snapshot {
+        all_identities.extend(terminal_identities);
+    }
+    let all_pids = all_identities.keys().copied().collect::<BTreeSet<_>>();
 
     let (host, observed_rows) = tokio::join!(
         sample_host_resources(),
-        sample_process_observations(&all_pids)
+        sample_process_observations(&all_identities)
     );
     let observed_rows_by_pid: BTreeMap<u32, ProcessObservation> = observed_rows
         .into_iter()
@@ -963,10 +974,11 @@ async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResource
             "Browser",
             "browser sessions do not currently expose native process identity",
         ));
-        categories.push(unavailable_category(
-            ManagedResourceCategoryKind::TmuxTerminal,
-            "tmux/terminal",
-            "tmux servers and terminal sessions do not currently expose enough native process identity for attribution",
+        categories.push(build_terminal_category(
+            terminal_pid_snapshot
+                .as_ref()
+                .expect("terminal snapshot exists with app state"),
+            &observed_rows_by_pid,
         ));
 
         let has_mcp = !state.mcp_manager.status().await.is_empty();
@@ -1017,7 +1029,7 @@ async fn sample_about_resources_inner(state: Option<&AppState>) -> AboutResource
 
 #[derive(Debug, PartialEq, Eq)]
 enum BashPidSnapshot {
-    Available(BTreeSet<u32>),
+    Available(BTreeMap<u32, ProcessIdentity>),
     Unavailable,
 }
 
@@ -1029,9 +1041,38 @@ async fn snapshot_bash_pids(state: &AppState) -> BashPidSnapshot {
         .await
         .into_iter()
         .collect::<BTreeSet<_>>();
-    match group_member_pids_for_sampling(&pgids) {
-        Some(member_pids) => BashPidSnapshot::Available(member_pids.into_iter().collect()),
+    match group_member_identities_for_sampling(&pgids) {
+        Some(member_identities) => BashPidSnapshot::Available(member_identities),
         None => BashPidSnapshot::Unavailable,
+    }
+}
+
+fn snapshot_terminal_pids(state: &AppState) -> BashPidSnapshot {
+    let pgids = state.terminals.snapshot_shell_pgids().into_iter().collect();
+    match group_member_identities_for_sampling(&pgids) {
+        Some(member_identities) => BashPidSnapshot::Available(member_identities),
+        None => BashPidSnapshot::Unavailable,
+    }
+}
+
+fn build_terminal_category(
+    snapshot: &BashPidSnapshot,
+    observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
+) -> ManagedResourceCategory {
+    match snapshot {
+        BashPidSnapshot::Available(identities) => build_category_from_observations(
+            ManagedResourceCategoryKind::TmuxTerminal,
+            "tmux/terminal",
+            ManagedResourceAttribution::Available,
+            Some("shell-mode terminals are attributed; tmux server identity remains unavailable".to_string()),
+            &identities.keys().copied().collect(),
+            observed_rows_by_pid,
+        ),
+        BashPidSnapshot::Unavailable => unavailable_category(
+            ManagedResourceCategoryKind::TmuxTerminal,
+            "tmux/terminal",
+            "shell terminals exist, but native process enumeration failed; tmux server identity remains unavailable",
+        ),
     }
 }
 
@@ -1040,12 +1081,12 @@ fn build_bash_category(
     observed_rows_by_pid: &BTreeMap<u32, ProcessObservation>,
 ) -> ManagedResourceCategory {
     match snapshot {
-        BashPidSnapshot::Available(pids) => build_category_from_observations(
+        BashPidSnapshot::Available(identities) => build_category_from_observations(
             ManagedResourceCategoryKind::Bash,
             "Bash",
             ManagedResourceAttribution::Available,
             None,
-            pids,
+            &identities.keys().copied().collect(),
             observed_rows_by_pid,
         ),
         BashPidSnapshot::Unavailable => unavailable_category(

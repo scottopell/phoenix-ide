@@ -35,8 +35,8 @@ the machine is it using right now?"
 - Rendering log file contents (path/sink only)
 - Durable server-side time-series retention or a general-purpose monitoring
   system
-- Attribution for Browser, tmux/terminal, or MCP native processes until those
-  subsystems surface process identity
+- Attribution for Browser, tmux server, or MCP native processes until those
+  subsystems surface process identity; shell-mode terminal process groups are attributed
 
 ## Why It Exists
 
@@ -56,7 +56,7 @@ staying safe to open because ordinary inspection changes nothing.
 | **REQ-DEPLOY-001:** Reach "About this deployment" from settings | Implemented | `ui/src/components/SettingsDropdown.tsx` links to the route rendered by `ui/src/pages/AboutDeploymentPage.tsx`. The page is read-only apart from typed leftover-worktree cleanup actions. |
 | **REQ-DEPLOY-002:** Report build identity and uptime | Implemented | `crates/phoenix-ide/src/api/deployment.rs` builds `BuildInfo` from `env!("CARGO_PKG_VERSION")`, `env!("PHOENIX_GIT_SHA")`, and `crate::hot_restart::{started_at, uptime_secs}`. The UI renders version, git SHA, started time, and uptime. |
 | **REQ-DEPLOY-003:** Report network binding and TLS configuration | Implemented | `DeploymentInfo.network` carries bind address, socket activation, and `TlsInfo`; `AboutDeploymentPage` renders plain HTTP explicitly when TLS is disabled and shows cert/key/CA/hosts when enabled. |
-| **REQ-DEPLOY-004:** Report live managed-resource and host usage | Implemented | `GET /api/about/resources` returns `AboutResourcesSnapshot` with host metrics (`logical_cpu_count`, memory totals, load averages, busy/idle CPU fields, and system CPU where available) plus managed totals and category rows. API and Bash are attributed by PID; Browser, tmux/terminal, and MCP are explicit unavailable categories with reasons. Managed totals include both `process_count` and `deduplicated_pid_count`. |
+| **REQ-DEPLOY-004:** Report live managed-resource and host usage | Implemented | `GET /api/about/resources` returns `AboutResourcesSnapshot` with host metrics plus managed totals and category rows. API, Bash process groups, and shell-mode terminal process groups are attributed with native PID/start identity; Browser, tmux-server, and MCP gaps remain explicit with reasons. Per-process proportional-memory failures are debug-logged, and managed totals include both `process_count` and `deduplicated_pid_count`. |
 | **REQ-DEPLOY-004A:** Poll live resource data while the page is visible | Implemented | `ui/src/pages/AboutDeploymentPage.tsx` polls with `RESOURCE_POLL_MS = 1_000`, skips initial, timed, and manual resource fetches while `document.visibilityState !== 'visible'`, triggers an immediate fetch on `visibilitychange` back to visible, skips overlapping automatic polls, lets an explicit user refresh supersede and abort an active sample, and ignores completions from unmounted or obsolete requests. |
 | **REQ-DEPLOY-004B:** Maintain bounded rolling history and rollups | Implemented | The UI keeps up to five minutes of good samples via `appendResourceHistory` and `RESOURCE_HISTORY_RETENTION_MS = 5 * 60 * 1_000`, then derives current/average/peak CPU and memory rollups with `computeResourceRollups`. Charts and summary cards read from that bounded client-side history. |
 | **REQ-DEPLOY-004C:** Preserve last-good semantics across refresh failures | Implemented | On fetch failure, `fetchResources` leaves `sample` and `history` intact, marks `stale: true` when a prior sample exists, and surfaces the error as `Live data stale — …`. When no sample exists yet, the page shows the error without fabricating data. |

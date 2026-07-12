@@ -30,3 +30,4 @@ mod proptests;
 pub use session::cascade_terminal_on_delete;
 pub use session::ActiveTerminals;
 pub use session::ShellIntegrationStatus;
+pub use session::TerminalChildKind;
