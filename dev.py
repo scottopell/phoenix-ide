@@ -3361,21 +3361,26 @@ _RUST_NONCRATE_FILES = ("Cargo.toml", "Cargo.lock")
 _workspace_metadata_memo: list = []
 
 
-def _workspace_metadata():
-    """Parsed `cargo metadata --format-version 1 --no-deps` for the workspace,
-    memoized for the lifetime of the invocation. Returns None on any failure
-    (callers fall back to full-workspace behaviour)."""
-    if not _workspace_metadata_memo:
-        try:
-            out = subprocess.run(
-                ["cargo", "metadata", "--format-version", "1", "--no-deps"],
-                cwd=ROOT, capture_output=True, text=True, timeout=60,
-            )
-            meta = json.loads(out.stdout) if out.returncode == 0 else None
-        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
-            meta = None
+def _workspace_metadata(env=None):
+    """Parsed `cargo metadata --format-version 1 --no-deps` for the workspace.
+
+    Ambient-environment calls are memoized for workspace checks. An explicit
+    environment bypasses that memo so Cargo configuration such as
+    `CARGO_TARGET_DIR` matches the command being prepared.
+    """
+    if env is None and _workspace_metadata_memo:
+        return _workspace_metadata_memo[0]
+    try:
+        out = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=ROOT, capture_output=True, text=True, timeout=60, env=env,
+        )
+        meta = json.loads(out.stdout) if out.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        meta = None
+    if env is None:
         _workspace_metadata_memo.append(meta)
-    return _workspace_metadata_memo[0]
+    return meta
 
 
 def _ts_export_crates():
@@ -5021,7 +5026,7 @@ def cmd_drive_turn(drive_turn_args: list[str]) -> None:
     if build.returncode != 0:
         sys.exit(build.returncode)
 
-    metadata = _workspace_metadata()
+    metadata = _workspace_metadata(env=env)
     if metadata is None:
         die("cargo metadata failed after building drive-turn")
     binary = Path(metadata["target_directory"]) / "debug" / "drive-turn"

@@ -211,6 +211,7 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
 
     let result = drive_conversation(
         &request,
+        &cwd,
         &db,
         &database_result,
         &manager,
@@ -238,14 +239,31 @@ pub async fn run(request: DriveTurnRequest) -> Result<DriveTurnResult, DriveTurn
     result
 }
 
+fn expand_prompt(
+    prompt: &str,
+    cwd: &std::path::Path,
+) -> Result<crate::message_expander::ExpandedMessage, DriveTurnError> {
+    let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(cwd);
+    crate::message_expander::expand(prompt, &resolution_root).map_err(|error| {
+        DriveTurnError::Runtime(format!(
+            "prompt expansion failed: {error} ({})",
+            error.error_type()
+        ))
+    })
+}
+
 async fn drive_conversation(
     request: &DriveTurnRequest,
+    cwd: &std::path::Path,
     db: &Database,
     database_result: &DatabaseResult,
     manager: &Arc<RuntimeManager>,
     conversation_id: &str,
     started: std::time::Instant,
 ) -> Result<DriveTurnResult, DriveTurnError> {
+    let expanded = expand_prompt(&request.prompt, cwd)?;
+    let llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+
     let mut state_rx = manager
         .subscribe_state(conversation_id)
         .await
@@ -255,13 +273,13 @@ async fn drive_conversation(
         .send_event(
             conversation_id,
             Event::UserMessage {
-                text: request.prompt.clone(),
-                llm_text: None,
+                text: expanded.display_text,
+                llm_text,
                 images: Vec::new(),
                 files: Vec::new(),
                 message_id,
                 user_agent: Some("drive-turn".into()),
-                skill_invocation: None,
+                skill_invocation: expanded.skill_invocation,
             },
         )
         .await
@@ -481,6 +499,24 @@ fn install_crypto_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_expansion_preserves_display_reference_and_expands_llm_text() {
+        let runtime_env = PhoenixRuntimeEnvironment::detect();
+        let directory = runtime_env
+            .tmp_subdir("drive-turn-tests")
+            .unwrap()
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("context.txt"), "EXPANSION_SECRET_7419\n").unwrap();
+
+        let prompt = "Read @context.txt and report the token.";
+        let expanded = expand_prompt(prompt, &directory).unwrap();
+
+        assert_eq!(expanded.display_text, prompt);
+        assert!(expanded.llm_text.contains("EXPANSION_SECRET_7419"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn persisted_user_input_distinguishes_completed_empty_turn_from_initial_idle() {

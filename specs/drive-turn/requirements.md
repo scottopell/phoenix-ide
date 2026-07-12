@@ -6,6 +6,8 @@ WHEN an operator submits one user prompt through drive-turn
 THE SYSTEM SHALL create and drive the conversation through the same Phoenix conversation runtime, state machine, LLM provider adapters, persistence layer, and built-in tool registry used by the server
 AND SHALL NOT inject synthetic tool results or implement a parallel agent loop
 AND SHALL complete initial MCP discovery before submitting the user message
+AND SHALL expand file references and skill invocations through the production message-expansion path before submitting the user message
+AND SHALL preserve the unexpanded text for display while sending expanded text to the model
 
 ## REQ-DRIVE-TURN-002: Stable Completion
 
