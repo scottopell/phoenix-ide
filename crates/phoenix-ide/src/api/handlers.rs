@@ -2333,6 +2333,7 @@ async fn align_slice_start_to_render_unit(
 
     let mut before_sequence = first.sequence_id;
     let mut scanned = 0i64;
+    let mut intervening_standalone = Vec::new();
     while scanned < RENDER_UNIT_BACKFILL_SCAN_LIMIT {
         let remaining = RENDER_UNIT_BACKFILL_SCAN_LIMIT - scanned;
         let chunk_limit = remaining.min(RENDER_UNIT_BACKFILL_CHUNK_SIZE);
@@ -2348,14 +2349,45 @@ async fn align_slice_start_to_render_unit(
         })?;
         let oldest_sequence = previous[0].sequence_id;
 
-        if let Some(owner) = previous.into_iter().rev().find(message_starts_render_unit) {
-            messages.insert(0, owner);
+        if let Some(owner_index) = previous.iter().rposition(message_starts_render_unit) {
+            let mut prefix = Vec::with_capacity(intervening_standalone.len() + 1);
+            prefix.push(previous[owner_index].clone());
+            prefix.extend(
+                previous
+                    .into_iter()
+                    .skip(owner_index + 1)
+                    .filter(|message| message.message_type != crate::db::MessageType::Tool),
+            );
+            prefix.append(&mut intervening_standalone);
+            prefix.append(messages);
+            *messages = prefix;
             break;
         }
 
+        let mut standalone = previous
+            .into_iter()
+            .filter(|message| message.message_type != crate::db::MessageType::Tool)
+            .collect::<Vec<_>>();
+        standalone.append(&mut intervening_standalone);
+        intervening_standalone = standalone;
         before_sequence = oldest_sequence;
     }
     Ok(())
+}
+
+async fn has_messages_before(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    messages: &[crate::db::Message],
+) -> Result<bool, AppError> {
+    let Some(first) = messages.first() else {
+        return Ok(false);
+    };
+    Ok(!db
+        .get_messages_before(conversation_id, first.sequence_id, 1)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .is_empty())
 }
 
 async fn get_latest_aligned_messages(
@@ -2369,11 +2401,11 @@ async fn get_latest_aligned_messages(
         .get_latest_messages(conversation_id, limit + 1)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let has_older_messages = messages.len() > requested_count;
-    if has_older_messages {
+    if messages.len() > requested_count {
         messages.remove(0);
     }
     align_slice_start_to_render_unit(db, conversation_id, &mut messages).await?;
+    let has_older_messages = has_messages_before(db, conversation_id, &messages).await?;
     Ok((messages, has_older_messages))
 }
 
@@ -2389,11 +2421,11 @@ async fn get_messages_before_aligned(
         .get_messages_before(conversation_id, before, limit + 1)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    let has_older_messages = messages.len() > requested_count;
-    if has_older_messages {
+    if messages.len() > requested_count {
         messages.remove(0);
     }
     align_slice_start_to_render_unit(db, conversation_id, &mut messages).await?;
+    let has_older_messages = has_messages_before(db, conversation_id, &messages).await?;
     Ok((messages, has_older_messages))
 }
 
@@ -7010,6 +7042,142 @@ pub(crate) mod hard_delete_cascade_tests {
             vec![3, 4]
         );
         assert!(latest.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn latest_message_slice_owner_backfill_reports_complete_when_owner_is_first() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-complete-owner",
+                "complete-owner",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+        state
+            .db
+            .add_message(
+                "complete-agent",
+                "conv-complete-owner",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-complete".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("agent");
+        state
+            .db
+            .add_message(
+                "complete-tool",
+                "conv-complete-owner",
+                &crate::db::MessageContent::tool("tool-complete", "output", false),
+                None,
+                None,
+            )
+            .await
+            .expect("tool");
+
+        let Json(latest) = get_conversation_messages_latest(
+            State(state),
+            Path("conv-complete-owner".to_string()),
+            Query(LatestMessagesQuery { limit: Some(1) }),
+        )
+        .await
+        .expect("latest");
+
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(!latest.has_older_messages);
+    }
+
+    #[tokio::test]
+    async fn latest_message_slice_preserves_standalone_rows_between_owner_and_tools() {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation(
+                "conv-standalone-owner",
+                "standalone-owner",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+        state
+            .db
+            .add_message(
+                "standalone-agent",
+                "conv-standalone-owner",
+                &crate::db::MessageContent::agent(vec![ContentBlock::ToolUse {
+                    id: "tool-standalone".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("agent");
+        state
+            .db
+            .add_message(
+                "standalone-system",
+                "conv-standalone-owner",
+                &crate::db::MessageContent::system("checkpoint"),
+                None,
+                None,
+            )
+            .await
+            .expect("system");
+        state
+            .db
+            .add_message(
+                "standalone-tool",
+                "conv-standalone-owner",
+                &crate::db::MessageContent::tool("tool-standalone", "output", false),
+                None,
+                None,
+            )
+            .await
+            .expect("tool");
+
+        let Json(latest) = get_conversation_messages_latest(
+            State(state),
+            Path("conv-standalone-owner".to_string()),
+            Query(LatestMessagesQuery { limit: Some(1) }),
+        )
+        .await
+        .expect("latest");
+
+        assert_eq!(
+            latest
+                .messages
+                .iter()
+                .map(|m| m.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[tokio::test]

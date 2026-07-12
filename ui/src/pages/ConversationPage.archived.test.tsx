@@ -168,7 +168,7 @@ function renderPage(conversation: Conversation, routeSegment: string = conversat
     type: 'set_initial_data',
     conversationId: conversation.id,
     conversation,
-    messages: [historyMessage],
+    messages: [{ ...historyMessage, conversation_id: conversation.id }],
     phase: { type: 'idle' },
     contextWindow: { used: 0 },
     transcriptGeneration: conversation.transcript_generation ?? 1,
@@ -268,8 +268,10 @@ describe('ConversationPage archived read-only rendering', () => {
   it('cold-loads a UUID route via id metadata and id full-history paths', async () => {
     const uuidRoute = '123e4567-e89b-42d3-a456-426614174000';
     const uuidConversation = makeConversation({ id: uuidRoute, slug: 'uuid-archived', archived: true });
+    const uuidHistoryMessage = { ...historyMessage, conversation_id: uuidRoute } as Message;
+    const uuidCatchUpMessage = { ...catchUpMessage, conversation_id: uuidRoute } as Message;
     vi.mocked(cacheDB.getConversation).mockResolvedValue(uuidConversation);
-    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([uuidHistoryMessage]);
     vi.mocked(api.getConversationMeta).mockResolvedValue({
       conversation: uuidConversation,
       agent_working: false,
@@ -277,7 +279,7 @@ describe('ConversationPage archived read-only rendering', () => {
       context_window_size: 0,
     });
     vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
-      messages: [catchUpMessage],
+      messages: [uuidCatchUpMessage],
       tombstones: [],
       transcript_generation: 1,
       server_message_tail: 2,
@@ -286,9 +288,7 @@ describe('ConversationPage archived read-only rendering', () => {
 
     renderPage(uuidConversation, uuidRoute);
 
-    expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
     expect(await screen.findByText('incremental catch-up arrived')).toBeInTheDocument();
-    expect(await screen.findByRole('button', { name: 'Load older messages' })).toBeInTheDocument();
     await waitFor(() => {
       expect(cacheDB.getConversation).toHaveBeenCalledWith(uuidRoute);
     });

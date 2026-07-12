@@ -634,7 +634,7 @@ function ConversationPageContent() {
                 phase: cached.state ? parseConversationState(cached.state) : { type: 'idle' },
                 contextWindow: { used: 0 },
                 transcriptGeneration: cached.transcript_generation ?? 1,
-                eventCursorFloor: latestMessageSequenceId(cachedMessages) ?? 0,
+                eventCursorFloor: eventCursorRef.current,
               });
             }
           }
@@ -747,7 +747,7 @@ function ConversationPageContent() {
                       : { type: 'idle' },
                     contextWindow: { used: metadata.context_window_size || 0 },
                     transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
-                    eventCursorFloor: contiguousTranscriptTail,
+                    eventCursorFloor: snapshotStartedAtEventSeq,
                     snapshotStartedAtEventSeq,
                   });
                 }
@@ -797,7 +797,7 @@ function ConversationPageContent() {
                   used: result.context_window_size || 0,
                 },
                 transcriptGeneration: metadataTranscriptGeneration,
-                eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
+                eventCursorFloor: snapshotStartedAtEventSeq,
                 snapshotStartedAtEventSeq,
               });
               setArchiveStatusConfirmedConversationId(result.conversation.id);
