@@ -454,7 +454,7 @@ function VirtualTranscriptInner<T>(
 
   useLayoutEffect(() => {
     onTotalExtentChange?.(totalPhysicalExtent(store));
-  }, [onTotalExtentChange, store.headerExtent, store.layout.totalExtent, store.revision]);
+  }, [onTotalExtentChange, store, store.headerExtent, store.layout.totalExtent, store.revision]);
 
   useLayoutEffect(() => {
     onPinnedChange?.(store.pinned);
