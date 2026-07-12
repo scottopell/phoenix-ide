@@ -9,6 +9,7 @@ export type ViewerFindAction =
   | { type: 'open' }
   | { type: 'close' }
   | { type: 'toggle' }
+  | { type: 'reset' }
   | { type: 'set-query'; query: string }
   | { type: 'set-active-index'; index: number }
   | { type: 'next-match'; matchCount: number }
@@ -44,6 +45,8 @@ export function viewerFindReducer(state: ViewerFindState, action: ViewerFindActi
       return state.isOpen ? { ...state, isOpen: false } : state;
     case 'toggle':
       return { ...state, isOpen: !state.isOpen };
+    case 'reset':
+      return initialViewerFindState;
     case 'set-query':
       return {
         ...state,

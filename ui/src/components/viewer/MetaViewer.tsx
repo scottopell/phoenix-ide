@@ -62,6 +62,10 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   const scrollKey = useMemo(() => `phoenix:prose-scroll:${absolutePath}`, [absolutePath]);
+  const findResetKey = useMemo(
+    () => (textLike ? `${absolutePath}\u0000${payload.kind}\u0000${content}` : absolutePath),
+    [absolutePath, content, payload.kind, textLike],
+  );
 
   const registerLineRef = useCallback((lineNumber: number, el: HTMLElement | null) => {
     if (el) lineRefs.current.set(lineNumber, el);
@@ -232,7 +236,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
 
   const findEligible = (textLike && !htmlPreview) || largeFallback;
   const findSourceText = findEligible ? content : '';
-  const find = useViewerFind({ text: findSourceText });
+  const find = useViewerFind({ text: findSourceText, resetKey: findResetKey });
   const shouldProjectFind = findEligible && find.isOpen && find.query.length > 0;
   const findProjection = useMemo<FileSearchProjection>(
     () => (shouldProjectFind ? buildFileSearchProjection(findSourceText, find.query) : { sources: [], matches: [] }),

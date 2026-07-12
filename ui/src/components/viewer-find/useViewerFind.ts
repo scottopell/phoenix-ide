@@ -11,10 +11,15 @@ export interface ViewerFindNavigateContext {
 export interface UseViewerFindOptions {
   text: string;
   onNavigate?: (context: ViewerFindNavigateContext) => void;
+  resetKey?: string;
 }
 
-export function useViewerFind({ text, onNavigate }: UseViewerFindOptions) {
+export function useViewerFind({ text, onNavigate, resetKey }: UseViewerFindOptions) {
   const [state, dispatch] = useReducer(viewerFindReducer, initialViewerFindState);
+
+  useEffect(() => {
+    dispatch({ type: 'reset' });
+  }, [resetKey]);
 
   const result = useMemo(() => findLiteralMatches(text, state.query), [text, state.query]);
   const matchCount = result.matches.length;
@@ -58,6 +63,10 @@ export function useViewerFind({ text, onNavigate }: UseViewerFindOptions) {
     dispatch({ type: 'set-active-index', index });
   }, []);
 
+  const reset = useCallback(() => {
+    dispatch({ type: 'reset' });
+  }, []);
+
   return {
     isOpen: state.isOpen,
     query: state.query,
@@ -71,6 +80,7 @@ export function useViewerFind({ text, onNavigate }: UseViewerFindOptions) {
     open,
     close,
     toggle,
+    reset,
     setQuery,
     nextMatch,
     previousMatch,

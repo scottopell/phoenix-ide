@@ -190,7 +190,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     });
   });
 
-  it('marks only the exact colon-containing diff header as active', () => {
+  it('marks non-active diff header matches distinctly while keeping the exact colon-containing header active', () => {
     const committed = [
       'diff --git a/foo b/foo',
       'index 0000000..1111111 100644',
@@ -212,16 +212,18 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     const fooBarVersionBefore = itemVersion('committed:foo:bar') ?? 0;
 
     fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'foo:bar' } });
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'foo' } });
 
     const fooHeader = screen.getByTestId('mock-header-committed:foo');
     const fooBarHeader = screen.getByTestId('mock-header-committed:foo:bar');
-    expect(fooHeader.querySelector('.phoenix-diff-section-badge--find-active')).toBeNull();
-    expect(fooHeader.querySelector('.phoenix-diff-file-note-btn--find-active')).toBeNull();
-    expect(fooBarHeader.querySelector('.phoenix-diff-section-badge--find-active')).not.toBeNull();
-    expect(fooBarHeader.querySelector('.phoenix-diff-file-note-btn--find-active')).not.toBeNull();
+    expect(fooHeader.querySelector('.phoenix-diff-section-badge--find-active')).not.toBeNull();
+    expect(fooHeader.querySelector('.phoenix-diff-file-note-btn--find-active')).not.toBeNull();
+    expect(fooBarHeader.querySelector('.phoenix-diff-section-badge--find-match')).not.toBeNull();
+    expect(fooBarHeader.querySelector('.phoenix-diff-file-note-btn--find-match')).not.toBeNull();
+    expect(fooBarHeader.querySelector('.phoenix-diff-section-badge--find-active')).toBeNull();
+    expect(fooBarHeader.querySelector('.phoenix-diff-file-note-btn--find-active')).toBeNull();
 
-    expect(itemVersion('committed:foo')).toBe(fooVersionBefore);
+    expect((itemVersion('committed:foo') ?? 0)).toBeGreaterThan(fooVersionBefore);
     expect((itemVersion('committed:foo:bar') ?? 0)).toBeGreaterThan(fooBarVersionBefore);
   });
 
