@@ -49,6 +49,7 @@ entity HistoryFailure {
     view: HistoryView
     kind: FailureKind
     message: String
+    target_message_id: String?
 }
 
 surface HistoryExpansionController {
@@ -113,7 +114,7 @@ rule ChangedDeepLinkClearsStaleFailure {
     when: DeepLinkTargetChanged(view, target_message_id)
     requires: view.failure != null
     requires: view.failure.kind = request_failed
-        or view.failure.kind = target_not_found and view.failure.message != target_message_id
+        or view.failure.kind = target_not_found and view.failure.target_message_id != target_message_id
     ensures: view.failure = null
 }
 
@@ -145,6 +146,8 @@ rule ManualExpansionStartsOneRequest {
     requires: view.coverage = tail
     requires: view.active_request = null
     requires: restore_basis in { reader_anchor, following_tail }
+    requires: restore_basis = following_tail
+        or anchor_message_id != null and viewport_start_offset != null
     ensures: view.active_request = HistoryRequest(
         view: view,
         token: request_token,
@@ -250,7 +253,12 @@ rule MissingDeepLinkTargetTerminatesAttempt {
     requires: target_present = false
     ensures: view.coverage = complete
     ensures: view.pending_command = null
-    ensures: view.failure = HistoryFailure(view: view, kind: target_not_found, message: "target not found")
+    ensures: view.failure = HistoryFailure(
+        view: view,
+        kind: target_not_found,
+        message: "target not found",
+        target_message_id: view.active_request.message_id
+    )
     ensures: view.active_request = null
 }
 
@@ -261,7 +269,12 @@ rule MatchingFailureLeavesTailUsable {
     requires: view_generation = view.view_generation
     ensures: view.coverage = tail
     ensures: view.pending_command = null
-    ensures: view.failure = HistoryFailure(view: view, kind: request_failed, message: message)
+    ensures: view.failure = HistoryFailure(
+        view: view,
+        kind: request_failed,
+        message: message,
+        target_message_id: view.active_request.message_id
+    )
     ensures: view.active_request = null
 }
 
