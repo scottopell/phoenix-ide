@@ -39,6 +39,7 @@ import {
   type ScrollSnapshot,
   type TailActivity,
 } from '../conversation/scrollMachine';
+import type { HistoryScrollCommand, RestoreBasis } from '../conversation/historyExpansion';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -78,12 +79,12 @@ interface MessageListProps {
    *  `unitIndex` values are guaranteed to be in virtuoso's coordinate space —
    *  no second `buildRenderUnits` pass to drift against. */
   onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
-  targetMessageId?: string | undefined;
   hasOlderMessages?: boolean | undefined;
-  onLoadOlderMessages?: (() => void) | undefined;
+  onLoadOlderMessages?: ((restoreBasis?: RestoreBasis) => void) | undefined;
   loadingOlderMessages?: boolean | undefined;
   olderHistoryError?: string | null | undefined;
-  preservedHistoryAnchorId?: string | null | undefined;
+  historyScrollCommand?: HistoryScrollCommand | null | undefined;
+  onHistoryScrollCommandHandled?: ((token: number, result: 'applied' | 'target_missing') => void) | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
@@ -94,7 +95,7 @@ export interface MessageListHandle {
    *  equals its virtuoso item index) into view and pulse it once mounted. */
   scrollToUnitIndex: (unitIndex: number) => void;
   scrollToMessageId: (messageId: string) => boolean;
-  getFirstVisibleMessageId: () => string | null;
+  captureHistoryRestoreBasis: () => RestoreBasis;
 }
 
 
@@ -333,12 +334,12 @@ function MessageListImpl({
   enableMessageSidepanel = true,
   onVisibleRangeChange,
   onChaptersChange,
-  targetMessageId,
   hasOlderMessages = false,
   onLoadOlderMessages,
   loadingOlderMessages = false,
   olderHistoryError,
-  preservedHistoryAnchorId,
+  historyScrollCommand,
+  onHistoryScrollCommandHandled,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
   const { activeScope } = useFocusScope();
@@ -354,6 +355,7 @@ function MessageListImpl({
   const systemPromptRef = useRef<HTMLPreElement | null>(null);
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
   const firstVisibleUnitIndexRef = useRef(0);
+  const continuityRestoreInFlightRef = useRef(false);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const scrollMachineRef = useRef(initialScrollMachineState(conversationId));
@@ -635,6 +637,7 @@ function MessageListImpl({
         if (e.deltaY < 0) dispatchScrollEvent({ type: 'upwardIntent' });
       };
       const onScroll = () => {
+        if (continuityRestoreInFlightRef.current) return;
         const snapshot = { scrollHeight: ref.scrollHeight, scrollTop: ref.scrollTop, clientHeight: ref.clientHeight };
         const machine = scrollMachineRef.current;
         const previousTop = machine.kind === 'live' || machine.kind === 'mount-rescue'
@@ -738,7 +741,6 @@ function MessageListImpl({
   // ref applies presentation-only highlighting without moving the scroller.
   const pendingPulseRef = useRef<{ conversationId: string | undefined; key: string } | null>(null);
   const highlightedTargetRef = useRef<Element | null>(null);
-  const jumpedTargetMessageIdRef = useRef<string | null>(null);
   const pulseTimerRef = useRef(0);
 
   const clearHighlight = useCallback(() => {
@@ -815,34 +817,50 @@ function MessageListImpl({
     return true;
   }, [findUnitIndexByMessageId, scrollToUnitIndex]);
 
-  useEffect(() => {
-    if (!targetMessageId) {
-      jumpedTargetMessageIdRef.current = null;
-      return;
+  const captureHistoryRestoreBasis = useCallback((): RestoreBasis => {
+    const machine = scrollMachineRef.current;
+    if (machine.kind === 'mount-rescue' || (machine.kind === 'live' && machine.follow.kind !== 'reading')) {
+      return { kind: 'following_tail' };
     }
-    if (jumpedTargetMessageIdRef.current === targetMessageId) return;
-    if (scrollToMessageId(targetMessageId)) {
-      jumpedTargetMessageIdRef.current = targetMessageId;
-    }
-  }, [scrollToMessageId, targetMessageId]);
-
-  const getFirstVisibleMessageId = useCallback(() => {
     const unit = historicalUnits[firstVisibleUnitIndexRef.current];
-    if (!unit) return null;
-    if (unit.kind === 'agent_turn') return unit.agent.message_id;
-    if ('message' in unit && 'message_id' in unit.message) return unit.message.message_id;
-    return null;
+    if (!unit) return { kind: 'following_tail' };
+    if (unit.kind === 'agent_turn') return { kind: 'reader_anchor', messageId: unit.agent.message_id };
+    if ('message' in unit && 'message_id' in unit.message) {
+      return { kind: 'reader_anchor', messageId: unit.message.message_id };
+    }
+    return { kind: 'following_tail' };
   }, [historicalUnits]);
 
   useImperativeHandle(
     ref,
-    () => ({ scrollToUnitIndex, scrollToMessageId, getFirstVisibleMessageId }),
-    [getFirstVisibleMessageId, scrollToMessageId, scrollToUnitIndex],
+    () => ({ scrollToUnitIndex, scrollToMessageId, captureHistoryRestoreBasis }),
+    [captureHistoryRestoreBasis, scrollToMessageId, scrollToUnitIndex],
   );
 
-  useLayoutEffect(() => {
-    if (preservedHistoryAnchorId) scrollToMessageId(preservedHistoryAnchorId);
-  }, [preservedHistoryAnchorId, scrollToMessageId]);
+  const handledHistoryCommandRef = useRef<number | null>(null);
+  const acknowledgedHistoryCommandRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!historyScrollCommand || handledHistoryCommandRef.current === historyScrollCommand.token) return;
+    handledHistoryCommandRef.current = historyScrollCommand.token;
+    acknowledgedHistoryCommandRef.current = null;
+    const messageId = historyScrollCommand.kind === 'restore_after_prefix_expansion'
+      ? historyScrollCommand.anchorMessageId
+      : historyScrollCommand.targetMessageId;
+    const index = findUnitIndexByMessageId(messageId);
+    if (index < 0) {
+      onHistoryScrollCommandHandled?.(historyScrollCommand.token, 'target_missing');
+      return;
+    }
+    if (historyScrollCommand.kind === 'jump_to_message') {
+      scrollToUnitIndex(index);
+    } else {
+      continuityRestoreInFlightRef.current = true;
+      virtuosoRef.current?.scrollToIndex({ index, align: 'start', behavior: 'auto' });
+      requestAnimationFrame(() => {
+        continuityRestoreInFlightRef.current = false;
+      });
+    }
+  }, [findUnitIndexByMessageId, historyScrollCommand, onHistoryScrollCommandHandled, scrollToUnitIndex]);
 
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
@@ -882,8 +900,23 @@ function MessageListImpl({
 
   const handleRangeChanged = useCallback((range: ListRange) => {
     firstVisibleUnitIndexRef.current = range.startIndex;
+    const command = historyScrollCommand;
+    if (command && handledHistoryCommandRef.current === command.token) {
+      const messageId = command.kind === 'restore_after_prefix_expansion'
+        ? command.anchorMessageId
+        : command.targetMessageId;
+      const targetIndex = findUnitIndexByMessageId(messageId);
+      if (
+        targetIndex >= range.startIndex
+        && targetIndex <= range.endIndex
+        && acknowledgedHistoryCommandRef.current !== command.token
+      ) {
+        acknowledgedHistoryCommandRef.current = command.token;
+        onHistoryScrollCommandHandled?.(command.token, 'applied');
+      }
+    }
     onVisibleRangeChange?.(range);
-  }, [onVisibleRangeChange]);
+  }, [findUnitIndexByMessageId, historyScrollCommand, onHistoryScrollCommandHandled, onVisibleRangeChange]);
 
   const toggleSystemPrompt = useCallback(() => {
     setSystemPromptExpanded((v) => !v);
@@ -939,7 +972,7 @@ function MessageListImpl({
               type="button"
               className="btn-secondary"
               disabled={loadingOlderMessages}
-              onClick={onLoadOlderMessages}
+              onClick={() => onLoadOlderMessages()}
             >
               {loadingOlderMessages
                 ? 'Loading earlier history…'

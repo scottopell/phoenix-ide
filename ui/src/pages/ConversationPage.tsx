@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
+import { lazy, Suspense, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, useReducer, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData, type Message } from '../api';
 import { refreshModels } from '../modelsPoller';
@@ -8,6 +8,11 @@ import { generateUUID } from '../utils/uuid';
 import { cacheDB } from '../cache';
 import { terminalPaneStorageKey } from '../storage/terminalPaneStorage';
 import { ConversationNavStack } from '../components/ConversationNavStack';
+import {
+  initialHistoryExpansionState,
+  reduceHistoryExpansion,
+  type RestoreBasis,
+} from '../conversation/historyExpansion';
 import { ConnectedInputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
 import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
@@ -249,9 +254,19 @@ function ConversationPageContent() {
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
   const [deletingConversation, setDeletingConversation] = useState(false);
-  const [hasOlderMessages, setHasOlderMessages] = useState(false);
-  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
-  const [olderHistoryError, setOlderHistoryError] = useState<string | null>(null);
+  const historyGenerationRef = useRef(0);
+  const historyRequestTokenRef = useRef(0);
+  const historyCommandTokenRef = useRef(0);
+  const historyViewRef = useRef({ conversationId: '', generation: 0, transcriptGeneration: 0 });
+  const [historyExpansion, dispatchHistoryExpansion] = useReducer(
+    reduceHistoryExpansion,
+    initialHistoryExpansionState(
+      { conversationId: '', generation: 0, transcriptGeneration: 0 },
+      false,
+    ),
+  );
+
+  historyViewRef.current = historyExpansion.view;
 
   // File explorer context (shared with desktop panel) — a projection of the
   // unified viewer slot below.
@@ -515,9 +530,16 @@ function ConversationPageContent() {
 
     setError(null);
     setArchiveStatusConfirmedConversationId(null);
-    setHasOlderMessages(false);
-    setLoadingOlderMessages(false);
-    setOlderHistoryError(null);
+    historyGenerationRef.current += 1;
+    dispatchHistoryExpansion({
+      type: 'view_changed',
+      view: {
+        conversationId: atomRef.current.conversationId ?? slug,
+        generation: historyGenerationRef.current,
+        transcriptGeneration: atomRef.current.conversation?.transcript_generation ?? 0,
+      },
+      hasEarlierHistory: false,
+    });
 
     const hadAtomData = !!atomRef.current.conversationId;
 
@@ -660,7 +682,15 @@ function ConversationPageContent() {
             const latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
             const result = { ...metadata, messages: latestWindow.messages };
             if (!cancelled) {
-              setHasOlderMessages(latestWindow.has_older_messages);
+              dispatchHistoryExpansion({
+                type: 'view_changed',
+                view: {
+                  conversationId: result.conversation.id,
+                  generation: historyGenerationRef.current,
+                  transcriptGeneration: result.conversation.transcript_generation ?? latestWindow.transcript_generation,
+                },
+                hasEarlierHistory: latestWindow.has_older_messages,
+              });
               const replacesDifferentConversation = atomRef.current.conversationId !== null
                 && atomRef.current.conversationId !== result.conversation.id;
               dispatch({
@@ -719,18 +749,27 @@ function ConversationPageContent() {
     };
   }, [slug, navigate, dispatch, eventCursorRef]);
 
-  const loadOlderMessages = useCallback(async () => {
-    if (!slug || !conversationId || loadingOlderMessages) return;
-    const requestedConversationId = conversationId;
-    setLoadingOlderMessages(true);
-    setOlderHistoryError(null);
+  const loadOlderMessages = useCallback(async (restoreBasis?: RestoreBasis) => {
+    if (!slug || !conversationId || historyExpansion.coverage !== 'tail' || historyExpansion.activeRequest) return;
+    const request = {
+      token: ++historyRequestTokenRef.current,
+      view: historyExpansion.view,
+      snapshotStartedAtEventSeq: eventCursorRef.current,
+      intent: targetMessageId
+        ? { kind: 'deep_link' as const, targetMessageId }
+        : { kind: 'manual_expansion' as const, restore: restoreBasis ?? { kind: 'following_tail' as const } },
+    };
+    dispatchHistoryExpansion({ type: 'request_started', request });
     try {
-      const snapshotStartedAtEventSeq = eventCursorRef.current;
       const result = await api.getConversationBySlug(slug);
-      if (atomRef.current.conversationId !== requestedConversationId) return;
+      const currentView = historyViewRef.current;
+      const requestIsCurrent = currentView.conversationId === request.view.conversationId
+        && currentView.generation === request.view.generation
+        && currentView.transcriptGeneration === request.view.transcriptGeneration;
+      if (!requestIsCurrent) return;
       dispatch({
         type: 'merge_conversation_data',
-        conversationId: requestedConversationId,
+        conversationId: request.view.conversationId,
         conversation: result.conversation,
         messages: result.messages,
         phase: result.conversation.state
@@ -741,27 +780,62 @@ function ConversationPageContent() {
         contextWindow: { used: result.context_window_size || 0 },
         transcriptGeneration: result.conversation.transcript_generation ?? 1,
         eventCursorFloor: latestMessageSequenceId(result.messages) ?? 0,
-        snapshotStartedAtEventSeq,
+        snapshotStartedAtEventSeq: request.snapshotStartedAtEventSeq,
       });
-      setHasOlderMessages(false);
+      dispatchHistoryExpansion({
+        type: 'history_loaded',
+        requestToken: request.token,
+        view: request.view,
+        targetPresent: request.intent.kind !== 'deep_link'
+          || result.messages.some((message) => message.message_id === request.intent.targetMessageId),
+        commandToken: ++historyCommandTokenRef.current,
+      });
       await cacheDB.putMessages(result.messages);
     } catch (err) {
       console.warn('Failed to load earlier conversation history:', err);
-      if (atomRef.current.conversationId === requestedConversationId) {
-        setOlderHistoryError(err instanceof Error ? err.message : 'Failed to load earlier history');
-      }
-    } finally {
-      if (atomRef.current.conversationId === requestedConversationId) {
-        setLoadingOlderMessages(false);
-      }
+      dispatchHistoryExpansion({
+        type: 'history_failed',
+        requestToken: request.token,
+        view: request.view,
+        message: err instanceof Error ? err.message : 'Failed to load earlier history',
+      });
     }
-  }, [slug, conversationId, loadingOlderMessages, dispatch, eventCursorRef]);
+  }, [slug, conversationId, historyExpansion, targetMessageId, dispatch, eventCursorRef]);
+
+  const requestedLoadedTargetRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!targetMessageId) {
+      requestedLoadedTargetRef.current = null;
+      return;
+    }
+    if (
+      historyExpansion.coverage === 'complete'
+      && !historyExpansion.pendingCommand
+      && requestedLoadedTargetRef.current !== targetMessageId
+    ) {
+      requestedLoadedTargetRef.current = targetMessageId;
+      dispatchHistoryExpansion({
+        type: 'loaded_target_requested',
+        targetMessageId,
+        commandToken: ++historyCommandTokenRef.current,
+      });
+    }
+  }, [targetMessageId, historyExpansion.coverage, historyExpansion.pendingCommand]);
 
   useEffect(() => {
-    if (targetMessageId && hasOlderMessages && !loadingOlderMessages) {
+    if (targetMessageId && historyExpansion.coverage === 'tail' && !historyExpansion.activeRequest && !historyExpansion.failure) {
       void loadOlderMessages();
     }
-  }, [targetMessageId, hasOlderMessages, loadingOlderMessages, loadOlderMessages]);
+  }, [targetMessageId, historyExpansion, loadOlderMessages]);
+
+  const handleHistoryScrollCommand = useCallback((token: number, result: 'applied' | 'target_missing') => {
+    dispatchHistoryExpansion({
+      type: 'command_acknowledged',
+      commandToken: token,
+      view: historyExpansion.view,
+      result,
+    });
+  }, [historyExpansion.view]);
 
   useEffect(() => {
     if (!slug || !conversationId || archiveStatusConfirmed || !isConnected) return;
@@ -1702,11 +1776,18 @@ function ConversationPageContent() {
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}
-        targetMessageId={targetMessageId}
-        hasOlderMessages={hasOlderMessages}
+        hasOlderMessages={historyExpansion.coverage === 'tail'}
         onLoadOlderMessages={loadOlderMessages}
-        loadingOlderMessages={loadingOlderMessages}
-        olderHistoryError={olderHistoryError}
+        loadingOlderMessages={historyExpansion.activeRequest !== null}
+        olderHistoryError={historyExpansion.failure?.kind === 'request_failed'
+          ? historyExpansion.failure.message
+          : historyExpansion.failure?.kind === 'target_not_found'
+            ? 'The requested message is not in this conversation.'
+            : historyExpansion.failure?.kind === 'anchor_not_found'
+              ? 'Could not preserve the previous reading position.'
+              : null}
+        historyScrollCommand={historyExpansion.pendingCommand}
+        onHistoryScrollCommandHandled={handleHistoryScrollCommand}
       />
       </RenderProfiler>
       {atom.uiError && (

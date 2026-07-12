@@ -1,0 +1,266 @@
+-- allium: 3
+-- Demand-driven conversation history expansion
+--
+-- Scope: coverage acquisition, asynchronous ownership, and the one-shot
+-- positioning obligation caused by expanding a loaded tail into complete
+-- history. Scroll physics and reader/follow ownership remain governed by
+-- scroll_policy.allium.
+
+use "./scroll_policy.allium" as scroll
+
+enum Coverage { tail complete }
+enum RequestIntent { manual_expand deep_link }
+enum RestoreBasis { reader_anchor following_tail target_message }
+enum CommandKind { restore_after_prefix jump_to_message }
+enum FailureKind { request_failed target_not_found anchor_not_found }
+enum CommandResult { applied target_missing superseded }
+
+entity HistoryView {
+    conversation_id: String
+    view_generation: Integer
+    transcript_generation: Integer
+    coverage: Coverage
+    active_request: HistoryRequest?
+    pending_command: ScrollCommand?
+    failure: HistoryFailure?
+}
+
+entity HistoryRequest {
+    view: HistoryView
+    token: String
+    intent: RequestIntent
+    restore_basis: RestoreBasis
+    message_id: String?
+    snapshot_started_at_event_seq: Integer
+}
+
+entity ScrollCommand {
+    view: HistoryView
+    token: String
+    request_token: String
+    kind: CommandKind
+    message_id: String
+    issued_view_generation: Integer
+}
+
+entity HistoryFailure {
+    view: HistoryView
+    kind: FailureKind
+    message: String
+}
+
+surface HistoryExpansionController {
+    facing view: HistoryView
+
+    exposes:
+        view.coverage
+        view.active_request
+        view.failure
+
+    provides:
+        ViewChanged(view, conversation_id, view_generation, transcript_generation)
+        ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, snapshot_event_seq)
+        DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
+        HistoryLoaded(view, request_token, view_generation, transcript_generation, target_present)
+        HistoryLoadFailed(view, request_token, view_generation, message)
+        ScrollCommandAcknowledged(view, command_token, view_generation, result)
+        ExplicitRetryRequested(view, request_token, snapshot_event_seq)
+        StreamingTailAdvanced(view)
+}
+
+surface ScrollCommandExecutor {
+    facing command: ScrollCommand
+
+    exposes:
+        command.token
+        command.kind
+        command.message_id
+        command.issued_view_generation
+}
+
+rule ViewChangeInvalidatesOutstandingWork {
+    when: ViewChanged(view, conversation_id, view_generation, transcript_generation)
+    requires: view_generation > view.view_generation
+    ensures: view.conversation_id = conversation_id
+    ensures: view.view_generation = view_generation
+    ensures: view.transcript_generation = transcript_generation
+    ensures: view.active_request = null
+    ensures: view.pending_command = null
+    ensures: view.failure = null
+}
+
+rule ManualExpansionStartsOneRequest {
+    when: ManualExpansionRequested(view, request_token, restore_basis, anchor_message_id, snapshot_event_seq)
+    requires: view.coverage = tail
+    requires: view.active_request = null
+    requires: restore_basis in { reader_anchor, following_tail }
+    ensures: view.active_request = HistoryRequest(
+        view: view,
+        token: request_token,
+        intent: manual_expand,
+        restore_basis: restore_basis,
+        message_id: anchor_message_id,
+        snapshot_started_at_event_seq: snapshot_event_seq
+    )
+    ensures: view.failure = null
+}
+
+rule DeepLinkStartsOneCoverageRequest {
+    when: DeepLinkRequested(view, request_token, target_message_id, snapshot_event_seq)
+    requires: view.coverage = tail
+    requires: view.active_request = null
+    ensures: view.active_request = HistoryRequest(
+        view: view,
+        token: request_token,
+        intent: deep_link,
+        restore_basis: target_message,
+        message_id: target_message_id,
+        snapshot_started_at_event_seq: snapshot_event_seq
+    )
+    ensures: view.failure = null
+}
+
+rule StaleHistorySuccessCannotMutateView {
+    when: HistoryLoaded(view, request_token, view_generation, transcript_generation, _)
+    requires: view.active_request = null
+        or request_token != view.active_request.token
+        or view_generation != view.view_generation
+        or transcript_generation != view.transcript_generation
+    ensures: view.coverage = view.coverage
+    ensures: view.pending_command = view.pending_command
+}
+
+rule ManualReaderExpansionCreatesContinuityCommand {
+    when: HistoryLoaded(view, request_token, view_generation, transcript_generation, _)
+    requires: view.active_request != null
+    requires: request_token = view.active_request.token
+    requires: view_generation = view.view_generation
+    requires: transcript_generation = view.transcript_generation
+    requires: view.active_request.intent = manual_expand
+    requires: view.active_request.restore_basis = reader_anchor
+    ensures: view.coverage = complete
+    ensures: view.pending_command = ScrollCommand(
+        view: view,
+        request_token: request_token,
+        kind: restore_after_prefix,
+        message_id: view.active_request.message_id,
+        issued_view_generation: view_generation
+    )
+    ensures: view.active_request = null
+}
+
+rule ManualFollowingExpansionCreatesNoPositionCommand {
+    when: HistoryLoaded(view, request_token, view_generation, transcript_generation, _)
+    requires: view.active_request != null
+    requires: request_token = view.active_request.token
+    requires: view_generation = view.view_generation
+    requires: transcript_generation = view.transcript_generation
+    requires: view.active_request.intent = manual_expand
+    requires: view.active_request.restore_basis = following_tail
+    ensures: view.coverage = complete
+    ensures: view.pending_command = null
+    ensures: view.active_request = null
+}
+
+rule DeepLinkExpansionCreatesNavigationCommand {
+    when: HistoryLoaded(view, request_token, view_generation, transcript_generation, target_present)
+    requires: view.active_request != null
+    requires: request_token = view.active_request.token
+    requires: view_generation = view.view_generation
+    requires: transcript_generation = view.transcript_generation
+    requires: view.active_request.intent = deep_link
+    requires: target_present = true
+    ensures: view.coverage = complete
+    ensures: view.pending_command = ScrollCommand(
+        view: view,
+        request_token: request_token,
+        kind: jump_to_message,
+        message_id: view.active_request.message_id,
+        issued_view_generation: view_generation
+    )
+    ensures: view.active_request = null
+}
+
+rule MissingDeepLinkTargetTerminatesAttempt {
+    when: HistoryLoaded(view, request_token, view_generation, transcript_generation, target_present)
+    requires: view.active_request != null
+    requires: request_token = view.active_request.token
+    requires: view_generation = view.view_generation
+    requires: transcript_generation = view.transcript_generation
+    requires: view.active_request.intent = deep_link
+    requires: target_present = false
+    ensures: view.coverage = complete
+    ensures: view.pending_command = null
+    ensures: view.failure = HistoryFailure(view: view, kind: target_not_found, message: "target not found")
+    ensures: view.active_request = null
+}
+
+rule MatchingFailureLeavesTailUsable {
+    when: HistoryLoadFailed(view, request_token, view_generation, message)
+    requires: view.active_request != null
+    requires: request_token = view.active_request.token
+    requires: view_generation = view.view_generation
+    ensures: view.coverage = tail
+    ensures: view.pending_command = null
+    ensures: view.failure = HistoryFailure(view: view, kind: request_failed, message: message)
+    ensures: view.active_request = null
+}
+
+rule MatchingAcknowledgementConsumesCommand {
+    when: ScrollCommandAcknowledged(view, command_token, view_generation, _)
+    requires: view.pending_command != null
+    requires: command_token = view.pending_command.token
+    requires: view_generation = view.view_generation
+    ensures: view.pending_command = null
+}
+
+rule StaleAcknowledgementCannotConsumeCommand {
+    when: ScrollCommandAcknowledged(view, command_token, view_generation, _)
+    requires: view.pending_command = null
+        or command_token != view.pending_command.token
+        or view_generation != view.view_generation
+    ensures: view.pending_command = view.pending_command
+}
+
+rule StreamingCannotCreateOrReplayHistoryWork {
+    when: StreamingTailAdvanced(view)
+    ensures: view.coverage = view.coverage
+    ensures: view.active_request = view.active_request
+    ensures: view.pending_command = view.pending_command
+}
+
+invariant ActiveRequestBelongsToView {
+    HistoryView.all(v => v.active_request = null or v.active_request.view = v)
+}
+
+invariant PendingCommandBelongsToView {
+    HistoryView.all(v => v.pending_command = null or v.pending_command.view = v)
+}
+
+contract HistoryExpansionSafety {
+    validate: (view: HistoryView) -> Boolean
+
+    @invariant ContinuityRestorationDoesNotAcquireNavigationOwnership
+        -- A restore_after_prefix command preserves the scroll policy's existing
+        -- reader or following ownership and never highlights a message.
+
+    @invariant FollowingTailExpansionEmitsNoPositioningCommand
+        -- Expanding complete history while following the tail leaves physical
+        -- positioning to the existing scroll policy.
+
+    @invariant ScrollCommandsExecuteAtMostOncePerToken
+        -- Each command token authorizes at most one physical positioning
+        -- operation and one terminal acknowledgement.
+
+    @invariant DeepLinkCoverageExpansionHasOneAutomaticAttempt
+        -- A deep-link target causes at most one automatic history request for a
+        -- view generation; failure requires explicit retry.
+
+    @invariant PrefixExpansionPreservesLoadedSuffixOrderAndIdentity
+        -- Complete-history expansion may add a prefix but cannot reorder,
+        -- duplicate, or replace the previously loaded suffix.
+
+    @invariant StaleResponsesAndAcknowledgementsHaveNoEffect
+        -- Results not matching the current view generation and active token
+        -- cannot mutate coverage, failure, or positioning obligations.
+}
