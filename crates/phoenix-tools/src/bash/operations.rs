@@ -1657,6 +1657,7 @@ mod tests {
     #[tokio::test]
     async fn kill_pending_emits_non_reconciling_phase_before_true_terminal() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let socket_dir = tempfile::tempdir().expect("socket dir");
         let registry =
             Arc::new(crate::bash::registry::BashHandleRegistry::with_lifecycle_sink(Some(tx)));
         let ctx = crate::ToolContext::new(
@@ -1668,7 +1669,7 @@ mod tests {
             Arc::new(crate::NoLlm),
             phoenix_terminal::ActiveTerminals::default(),
             Arc::new(crate::tmux::registry::TmuxRegistry::with_socket_dir(
-                std::env::temp_dir().join("phoenix-bash-ops-test"),
+                socket_dir.path().to_path_buf(),
             )),
             None,
         );

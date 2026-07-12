@@ -2385,7 +2385,7 @@ mod tests {
         let gh = FakeGh {
             prs: Ok(vec![pr(7, "OPEN", false, "2026-01-01")]),
             checks: Ok(vec![check("ok", "SUCCESS", "pass")]),
-            repo: Err(GhFailure::default()),
+            repo: Ok(repo()),
             ..FakeGh::default()
         };
         let status = get_pr_status_with_client(&gh, "branch");

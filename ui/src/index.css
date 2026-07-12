@@ -9250,6 +9250,7 @@ html * {
   align-items: center;
   gap: 6px;
 }
+
 .work-actions-address-copy {
   min-width: 0;
 }
@@ -9334,6 +9335,7 @@ html * {
 .work-actions-pr-note--warning {
   color: var(--accent-yellow, #eab308);
 }
+
 .work-actions-pr-note-button {
   border: 0;
   background: transparent;

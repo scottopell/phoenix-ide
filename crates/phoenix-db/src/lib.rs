@@ -9273,7 +9273,7 @@ mod tests {
 
     async fn open_test_db_pair() -> (tempfile::TempDir, Database, Database) {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("phoenix.db");
+        let db_path = dir.path().join("active-pr-cas.sqlite");
         let db_path = db_path.to_string_lossy().into_owned();
         let first = Database::open(&db_path).await.unwrap();
         migrations::run_pending_migrations(&first.pool)

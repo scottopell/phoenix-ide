@@ -97,15 +97,15 @@
   cursor: pointer;
 }
 
-.active-pr-selector-item:hover:not(:disabled),
-.active-pr-selector-item:focus-visible {
-  background: var(--bg-secondary);
-  outline: none;
-}
-
 .active-pr-selector-item:disabled {
   opacity: 0.6;
   cursor: progress;
+}
+
+.active-pr-selector-item:focus-visible,
+.active-pr-selector-item:hover:not(:disabled) {
+  background: var(--bg-secondary);
+  outline: none;
 }
 
 .active-pr-selector-item-main,
@@ -162,7 +162,7 @@
   background: color-mix(in srgb, var(--accent-blue) 12%, transparent);
 }
 
-@media (max-width: 768px) {
+@media (width <= 768px) {
   .active-pr-selector,
   .statebar-mobile-pr {
     width: 100%;
