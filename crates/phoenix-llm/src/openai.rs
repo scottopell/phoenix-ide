@@ -638,10 +638,10 @@ fn continuation_parts(
     Ok((value, input))
 }
 
-fn canonical_server_output(output: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+fn canonical_server_output(output: Vec<serde_json::Value>) -> Option<Vec<serde_json::Value>> {
     output
         .into_iter()
-        .filter_map(
+        .map(
             |item| match item.get("type").and_then(serde_json::Value::as_str) {
                 Some("message") => {
                     let text = item
@@ -659,7 +659,11 @@ fn canonical_server_output(output: Vec<serde_json::Value>) -> Vec<serde_json::Va
                     "name":item.get("name")?,
                     "arguments":item.get("arguments")?
                 })),
-                _ => None,
+                unsupported => {
+                    tracing::debug!(output_type = ?unsupported,
+                    "disabling Codex WebSocket continuation: server output is not representable");
+                    None
+                }
             },
         )
         .collect()
@@ -1017,11 +1021,19 @@ async fn complete_codex_websocket(
                 .lock()
                 .expect("cooldown mutex poisoned")
                 .reset();
-            let mut prefix = full_input;
-            prefix.extend(canonical_server_output(server_output));
-            session.response_id = Some(response_id);
-            session.compatibility = Some(compatibility);
-            session.prefix = prefix;
+            if let Some(canonical_output) = canonical_server_output(server_output) {
+                let mut prefix = full_input;
+                prefix.extend(canonical_output);
+                session.response_id = Some(response_id);
+                session.compatibility = Some(compatibility);
+                session.prefix = prefix;
+            } else {
+                // Keep the healthy socket, but a future create must be full:
+                // Phoenix cannot prove prefix equivalence for hidden output.
+                session.response_id = None;
+                session.compatibility = None;
+                session.prefix.clear();
+            }
             attempt.finish();
             Ok(response)
         }
@@ -2149,6 +2161,20 @@ mod tests {
                 }
                 let n = state.ws_requests.lock().await.len();
                 let answer = format!("answer-{n}");
+                if marker.contains("unsupported-output") {
+                    socket.send(AxumWsMessage::Text(serde_json::json!({
+                        "type":"response.completed",
+                        "response":{
+                            "id":format!("resp-{n}"),
+                            "usage":{"input_tokens":10,"output_tokens":1},
+                            "output":[
+                                {"type":"reasoning","id":"reasoning-1","summary":[]},
+                                {"type":"message","role":"assistant","content":[{"type":"output_text","text":answer}]}
+                            ]
+                        }
+                    }).to_string())).await.unwrap();
+                    continue;
+                }
                 if marker.contains("item-done-only") {
                     socket.send(AxumWsMessage::Text(serde_json::json!({
                         "type":"response.output_item.done",
@@ -2367,6 +2393,47 @@ mod tests {
         assert_eq!(err.kind, crate::LlmErrorKind::ContextWindowExceeded);
         assert_eq!(state.http_requests.load(Ordering::SeqCst), 1);
         assert_eq!(state.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn websocket_unsupported_output_disables_continuation_but_keeps_socket() {
+        let (url, state) = mock_server().await;
+        let sessions = Arc::new(Mutex::new(CodexWsSessions::default()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let call = |request: LlmRequest| {
+            let (url, sessions, tx) = (url.clone(), sessions.clone(), tx.clone());
+            async move {
+                complete_streaming(
+                    &codex_spec(),
+                    "secret",
+                    Some(&url),
+                    &[],
+                    &BTreeMap::new(),
+                    &request,
+                    &tx,
+                    true,
+                    Some(&sessions),
+                )
+                .await
+            }
+        };
+
+        call(request_with(&[("unsupported-output", MessageRole::User)]))
+            .await
+            .unwrap();
+        call(request_with(&[
+            ("unsupported-output", MessageRole::User),
+            ("answer-1", MessageRole::Assistant),
+            ("next", MessageRole::User),
+        ]))
+        .await
+        .unwrap();
+
+        assert_eq!(state.connections.load(Ordering::SeqCst), 1);
+        let requests = state.ws_requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].1.get("previous_response_id").is_none());
+        assert_eq!(requests[1].1["input"].as_array().unwrap().len(), 5);
     }
 
     #[tokio::test]
@@ -2708,7 +2775,7 @@ mod tests {
             serde_json::json!({"type":"message","content":[{"type":"output_text","text":"answer"}]}),
         ];
         assert_eq!(
-            canonical_server_output(output),
+            canonical_server_output(output).expect("supported output"),
             vec![serde_json::json!({"type":"message","role":"assistant","content":"answer"})]
         );
     }
