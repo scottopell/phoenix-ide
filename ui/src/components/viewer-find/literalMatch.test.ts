@@ -23,7 +23,22 @@ describe('findLiteralMatches', () => {
     ]);
   });
 
-  it('uses unicode-friendly locale folding', () => {
+  it('uses locale-independent ASCII folding', () => {
+    const original = String.prototype.toLocaleLowerCase;
+    String.prototype.toLocaleLowerCase = function mockedLocaleLowerCase() {
+      return String(this).replaceAll('I', 'ı').toLowerCase();
+    };
+    try {
+      expect(findLiteralMatches('INIT', 'i').matches).toEqual([
+        { start: 0, end: 1 },
+        { start: 2, end: 3 },
+      ]);
+    } finally {
+      String.prototype.toLocaleLowerCase = original;
+    }
+  });
+
+  it('uses Unicode-aware case folding', () => {
     expect(findLiteralMatches('CAFÉ café CaFé', 'café').matches).toEqual([
       { start: 0, end: 4 },
       { start: 5, end: 9 },

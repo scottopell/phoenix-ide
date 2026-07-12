@@ -25,7 +25,7 @@ function foldForLiteralSearch(text: string): FoldedString {
   for (let i = 0; i < text.length; ) {
     const sourceWidth = codeUnitWidthAt(text, i);
     const sourceSlice = text.slice(i, i + sourceWidth);
-    const foldedSlice = sourceSlice.toLocaleLowerCase();
+    const foldedSlice = sourceSlice.toLowerCase();
     foldedParts.push(foldedSlice);
     for (let j = 0; j < foldedSlice.length; j++) mapToSource.push(i);
     i += sourceWidth;
