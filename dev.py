@@ -3687,6 +3687,18 @@ def _make_reporter(pretty: bool, active: set, skipped: dict):
     return _PlainReporter()
 
 
+def _is_valid_git_config_key(key):
+    """Match Git's section[.subsection].name shape without restricting subsections."""
+    import re
+
+    first_dot = key.find(".")
+    last_dot = key.rfind(".")
+    if first_dot <= 0 or last_dot == len(key) - 1 or "\0" in key or "\n" in key:
+        return False
+    component = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
+    return bool(component.fullmatch(key[:first_dot]) and component.fullmatch(key[last_dot + 1:]))
+
+
 def _append_git_config_override(key, value, environ=None):
     """Append a complete process-level Git config entry, resetting malformed input."""
     env = os.environ if environ is None else environ
@@ -3695,12 +3707,10 @@ def _append_git_config_override(key, value, environ=None):
         count = int(env.get("GIT_CONFIG_COUNT", "0"))
         if count < 0:
             raise ValueError
-        import re
-        valid_key = re.compile(r"^[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*\.[A-Za-z][A-Za-z0-9-]*$")
         if any(
             f"GIT_CONFIG_KEY_{index}" not in env
             or f"GIT_CONFIG_VALUE_{index}" not in env
-            or not valid_key.fullmatch(env[f"GIT_CONFIG_KEY_{index}"])
+            or not _is_valid_git_config_key(env[f"GIT_CONFIG_KEY_{index}"])
             for index in range(count)
         ):
             raise ValueError

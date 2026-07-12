@@ -22,6 +22,31 @@ class CheckPlanTests(unittest.TestCase):
     def setUp(self):
         self.dev = load_devpy()
 
+    def test_git_config_key_validation_preserves_url_subsections(self):
+        for key in (
+            "url.https://github.com/.insteadOf",
+            "http.https://example.com.proxy",
+        ):
+            with self.subTest(key=key):
+                self.assertTrue(self.dev._is_valid_git_config_key(key))
+
+        for key in ("bad key", "nosection", "section.9name", "section.name\nother.value"):
+            with self.subTest(key=key):
+                self.assertFalse(self.dev._is_valid_git_config_key(key))
+
+    def test_git_config_override_preserves_url_subsection_entry(self):
+        env = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "url.https://github.com/.insteadOf",
+            "GIT_CONFIG_VALUE_0": "ssh://git@github.com/",
+        }
+
+        self.dev._append_git_config_override("commit.gpgsign", "false", env)
+
+        self.assertEqual("2", env["GIT_CONFIG_COUNT"])
+        self.assertEqual("url.https://github.com/.insteadOf", env["GIT_CONFIG_KEY_0"])
+        self.assertEqual("ssh://git@github.com/", env["GIT_CONFIG_VALUE_0"])
+
     def test_git_config_override_composes_with_complete_inherited_entries(self):
         env = {
             "GIT_CONFIG_COUNT": "1",
