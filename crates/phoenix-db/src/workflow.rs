@@ -247,6 +247,94 @@ pub struct DurableClaimTakeover {
     pub lease_until: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableObservationRecord {
+    pub observation_id: String,
+    pub authority: DurableClaimAuthority,
+    pub attempt_id: String,
+    pub payload: DurablePayload,
+    pub observed_at: DateTime<Utc>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableStaleObservationRecord {
+    pub observation_id: String,
+    pub authority: DurableClaimAuthority,
+    pub attempt_id: String,
+    pub payload: DurablePayload,
+    pub observed_at: DateTime<Utc>,
+    pub recorded_at: DateTime<Utc>,
+    pub stale_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordObservationResult {
+    Recorded {
+        observation: Box<DurableObservationRecord>,
+    },
+    StaleAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetainStaleObservationResult {
+    Recorded {
+        observation: Box<DurableStaleObservationRecord>,
+    },
+    AttemptMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableReceiptOrigin {
+    Execution,
+    Adoption,
+    Reconciliation,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableReceiptAcceptance {
+    pub receipt_id: String,
+    pub authority: DurableClaimAuthority,
+    pub attempt_id: String,
+    pub payload: DurablePayload,
+    pub origin: DurableReceiptOrigin,
+    pub accepted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableReducerInboxRecord {
+    pub reducer_inbox_id: String,
+    pub workflow_id: String,
+    pub receipt_id: String,
+    pub event: DurablePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptReceiptResult {
+    Accepted {
+        receipt: DurableReceiptAcceptance,
+        reducer_inbox: DurableReducerInboxRecord,
+    },
+    AlreadyReceipted {
+        receipt: DurableReceiptAcceptance,
+    },
+    Conflict,
+    StaleAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableAcceptReceiptRequest {
+    pub receipt_id: String,
+    pub reducer_inbox_id: String,
+    pub authority: DurableClaimAuthority,
+    pub now: DateTime<Utc>,
+    pub attempt_id: Option<String>,
+    pub origin: DurableReceiptOrigin,
+    pub receipt: DurablePayload,
+    pub reducer_event: DurablePayload,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowFailpoint {
     AfterWorkflowInsert,
@@ -255,6 +343,7 @@ pub enum WorkflowFailpoint {
     AfterTransitionInsert,
     AfterBarrierInsert,
     AfterInvalidations,
+    AfterReceiptInsert,
 }
 
 #[derive(Debug)]
@@ -271,6 +360,360 @@ impl WorkflowRepository {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Persist an authoritative observation only while the exact claim authority remains live.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction, row decoding, or insert/update fails.
+    pub async fn record_observation(
+        &self,
+        observation: &DurableObservationRecord,
+    ) -> WorkflowRepositoryResult<RecordObservationResult> {
+        let mut tx = self.pool.begin().await?;
+        let effect_live = update_effect_status_if_live_claim(
+            &mut tx,
+            &observation.authority,
+            observation.recorded_at,
+            "claimed",
+            "claimed",
+        )
+        .await?;
+        if effect_live != 1 {
+            tx.rollback().await?;
+            return Ok(RecordObservationResult::StaleAuthority);
+        }
+
+        let attempt_updated = sqlx::query(
+            "UPDATE workflow_attempts \
+             SET status = 'observation_recorded' \
+             WHERE id = ?1 AND effect_id = ?2 AND workflow_id = ?3 \
+               AND declared_workflow_version = ?4 AND generation = ?5 \
+               AND claim_token = ?6 AND claim_worker_id = ?7 \
+               AND claim_lease_until = ?8 AND claim_issued_at = ?9 \
+               AND status = 'begun'",
+        )
+        .bind(&observation.attempt_id)
+        .bind(&observation.authority.effect_id)
+        .bind(&observation.authority.workflow_id)
+        .bind(to_i64(
+            observation.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            observation.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&observation.authority.claim_token)
+        .bind(&observation.authority.worker_id)
+        .bind(observation.authority.lease_until.to_rfc3339())
+        .bind(observation.authority.issued_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        if attempt_updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(RecordObservationResult::StaleAuthority);
+        }
+
+        sqlx::query(
+            "INSERT INTO workflow_observations \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, \
+              claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, \
+              codec_version, payload, observed_at, recorded_at, authoritative) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1)",
+        )
+        .bind(&observation.observation_id)
+        .bind(&observation.authority.effect_id)
+        .bind(&observation.attempt_id)
+        .bind(&observation.authority.workflow_id)
+        .bind(to_i64(
+            observation.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            observation.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&observation.authority.claim_token)
+        .bind(&observation.authority.worker_id)
+        .bind(observation.authority.lease_until.to_rfc3339())
+        .bind(observation.authority.issued_at.to_rfc3339())
+        .bind(&observation.payload.codec.family)
+        .bind(i64::from(observation.payload.codec.version))
+        .bind(&observation.payload.payload)
+        .bind(observation.observed_at.to_rfc3339())
+        .bind(observation.recorded_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(RecordObservationResult::Recorded {
+            observation: Box::new(observation.clone()),
+        })
+    }
+
+    /// Persist a stale observation diagnostically using the supplied historical authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the insert or coherence checks fail.
+    pub async fn retain_stale_observation(
+        &self,
+        observation: &DurableStaleObservationRecord,
+    ) -> WorkflowRepositoryResult<RetainStaleObservationResult> {
+        let updated = sqlx::query(
+            "UPDATE workflow_attempts \
+             SET status = status \
+             WHERE id = ?1 AND effect_id = ?2 AND workflow_id = ?3 \
+               AND declared_workflow_version = ?4 AND generation = ?5 \
+               AND claim_token = ?6 AND claim_worker_id = ?7 \
+               AND claim_lease_until = ?8 AND claim_issued_at = ?9",
+        )
+        .bind(&observation.attempt_id)
+        .bind(&observation.authority.effect_id)
+        .bind(&observation.authority.workflow_id)
+        .bind(to_i64(
+            observation.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            observation.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&observation.authority.claim_token)
+        .bind(&observation.authority.worker_id)
+        .bind(observation.authority.lease_until.to_rfc3339())
+        .bind(observation.authority.issued_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Ok(RetainStaleObservationResult::AttemptMismatch);
+        }
+
+        sqlx::query(
+            "INSERT INTO workflow_stale_observations \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, \
+              claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, \
+              codec_version, payload, observed_at, recorded_at, stale_reason) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        )
+        .bind(&observation.observation_id)
+        .bind(&observation.authority.effect_id)
+        .bind(&observation.attempt_id)
+        .bind(&observation.authority.workflow_id)
+        .bind(to_i64(
+            observation.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            observation.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&observation.authority.claim_token)
+        .bind(&observation.authority.worker_id)
+        .bind(observation.authority.lease_until.to_rfc3339())
+        .bind(observation.authority.issued_at.to_rfc3339())
+        .bind(&observation.payload.codec.family)
+        .bind(i64::from(observation.payload.codec.version))
+        .bind(&observation.payload.payload)
+        .bind(observation.observed_at.to_rfc3339())
+        .bind(observation.recorded_at.to_rfc3339())
+        .bind(&observation.stale_reason)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(RetainStaleObservationResult::Recorded {
+            observation: Box::new(observation.clone()),
+        })
+    }
+
+    /// Accept a receipt exactly once, proving receipt/inbox/state atomicity.
+    /// Adoption and reconciliation use the same exact-attempt requirement as execution because the
+    /// current engine routes all worker-path receipts through a concrete begun attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction, failpoint, or DML fails.
+    pub async fn accept_receipt(
+        &self,
+        request: &DurableAcceptReceiptRequest,
+    ) -> WorkflowRepositoryResult<AcceptReceiptResult> {
+        self.accept_receipt_with_failpoint(request, None).await
+    }
+
+    /// Accept a receipt with an optional rollback failpoint after receipt insert and before state/inbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction, failpoint, or DML fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn accept_receipt_with_failpoint(
+        &self,
+        request: &DurableAcceptReceiptRequest,
+        failpoint: Option<WorkflowFailpoint>,
+    ) -> WorkflowRepositoryResult<AcceptReceiptResult> {
+        if let Some(existing) =
+            load_receipt_for_effect(&self.pool, &request.authority.effect_id).await?
+        {
+            return Ok(compare_existing_receipt(existing, request));
+        }
+        let Some(attempt_id) = request.attempt_id.as_ref() else {
+            return Ok(match request.origin {
+                DurableReceiptOrigin::Manual => AcceptReceiptResult::Conflict,
+                DurableReceiptOrigin::Execution
+                | DurableReceiptOrigin::Adoption
+                | DurableReceiptOrigin::Reconciliation => AcceptReceiptResult::StaleAuthority,
+            });
+        };
+        if request.origin == DurableReceiptOrigin::Manual {
+            return Ok(AcceptReceiptResult::Conflict);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        if let Some(existing) =
+            load_receipt_for_effect(&mut *tx, &request.authority.effect_id).await?
+        {
+            tx.rollback().await?;
+            return Ok(compare_existing_receipt(existing, request));
+        }
+
+        let effect_live = update_effect_status_if_live_claim(
+            &mut tx,
+            &request.authority,
+            request.now,
+            "claimed",
+            "receipted",
+        )
+        .await?;
+        if effect_live != 1 {
+            tx.rollback().await?;
+            return Ok(AcceptReceiptResult::StaleAuthority);
+        }
+
+        let attempt_updated = sqlx::query(
+            "UPDATE workflow_attempts \
+             SET status = 'receipt_accepted' \
+             WHERE id = ?1 AND effect_id = ?2 AND workflow_id = ?3 \
+               AND declared_workflow_version = ?4 AND generation = ?5 \
+               AND claim_token = ?6 AND claim_worker_id = ?7 \
+               AND claim_lease_until = ?8 AND claim_issued_at = ?9 \
+               AND status = 'begun'",
+        )
+        .bind(attempt_id)
+        .bind(&request.authority.effect_id)
+        .bind(&request.authority.workflow_id)
+        .bind(to_i64(
+            request.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            request.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&request.authority.claim_token)
+        .bind(&request.authority.worker_id)
+        .bind(request.authority.lease_until.to_rfc3339())
+        .bind(request.authority.issued_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        if attempt_updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(AcceptReceiptResult::StaleAuthority);
+        }
+
+        sqlx::query(
+            "INSERT INTO workflow_receipts \
+             (id, effect_id, attempt_id, workflow_id, declared_workflow_version, generation, \
+              claim_token, claim_worker_id, claim_lease_until, claim_issued_at, codec_family, \
+              codec_version, payload, origin, accepted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        )
+        .bind(&request.receipt_id)
+        .bind(&request.authority.effect_id)
+        .bind(attempt_id)
+        .bind(&request.authority.workflow_id)
+        .bind(to_i64(
+            request.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            request.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&request.authority.claim_token)
+        .bind(&request.authority.worker_id)
+        .bind(request.authority.lease_until.to_rfc3339())
+        .bind(request.authority.issued_at.to_rfc3339())
+        .bind(&request.receipt.codec.family)
+        .bind(i64::from(request.receipt.codec.version))
+        .bind(&request.receipt.payload)
+        .bind(receipt_origin_sql(request.origin))
+        .bind(request.now.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+
+        fail_if_configured(&mut tx, failpoint, WorkflowFailpoint::AfterReceiptInsert).await?;
+
+        let claim_deleted = sqlx::query(
+            "DELETE FROM workflow_claims \
+             WHERE effect_id = ?1 AND workflow_id = ?2 AND declared_workflow_version = ?3 \
+               AND generation = ?4 AND claim_token = ?5 AND worker_id = ?6 \
+               AND lease_until = ?7 AND issued_at = ?8",
+        )
+        .bind(&request.authority.effect_id)
+        .bind(&request.authority.workflow_id)
+        .bind(to_i64(
+            request.authority.declared_workflow_version,
+            WorkflowRepositoryError::VersionOutOfRange,
+        )?)
+        .bind(to_i64(
+            request.authority.generation,
+            WorkflowRepositoryError::GenerationOutOfRange,
+        )?)
+        .bind(&request.authority.claim_token)
+        .bind(&request.authority.worker_id)
+        .bind(request.authority.lease_until.to_rfc3339())
+        .bind(request.authority.issued_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        if claim_deleted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(AcceptReceiptResult::StaleAuthority);
+        }
+
+        sqlx::query(
+            "INSERT INTO workflow_reducer_inbox \
+             (id, workflow_id, receipt_id, barrier_id, event_codec_family, event_codec_version, \
+              event_payload, delivery_status, consumed_by_transition_id) \
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 'pending', NULL)",
+        )
+        .bind(&request.reducer_inbox_id)
+        .bind(&request.authority.workflow_id)
+        .bind(&request.receipt_id)
+        .bind(&request.reducer_event.codec.family)
+        .bind(i64::from(request.reducer_event.codec.version))
+        .bind(&request.reducer_event.payload)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(AcceptReceiptResult::Accepted {
+            receipt: DurableReceiptAcceptance {
+                receipt_id: request.receipt_id.clone(),
+                authority: request.authority.clone(),
+                attempt_id: attempt_id.clone(),
+                payload: request.receipt.clone(),
+                origin: request.origin,
+                accepted_at: request.now,
+            },
+            reducer_inbox: DurableReducerInboxRecord {
+                reducer_inbox_id: request.reducer_inbox_id.clone(),
+                workflow_id: request.authority.workflow_id.clone(),
+                receipt_id: request.receipt_id.clone(),
+                event: request.reducer_event.clone(),
+            },
+        })
     }
 
     /// Persist a protocol selection plus its supported codecs and executors in one transaction.
@@ -1388,6 +1831,146 @@ async fn load_claim_authority(
     }))
 }
 
+async fn load_receipt_for_effect<'e, E>(
+    executor: E,
+    effect_id: &str,
+) -> WorkflowRepositoryResult<Option<DurableReceiptAcceptance>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query(
+        "SELECT id, workflow_id, declared_workflow_version, generation, effect_id, claim_token, \
+                claim_worker_id, claim_lease_until, claim_issued_at, attempt_id, codec_family, \
+                codec_version, payload, origin, accepted_at \
+         FROM workflow_receipts WHERE effect_id = ?1",
+    )
+    .bind(effect_id)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row.map(|row| DurableReceiptAcceptance {
+        receipt_id: row.get("id"),
+        authority: DurableClaimAuthority {
+            workflow_id: row.get("workflow_id"),
+            declared_workflow_version: row
+                .get::<i64, _>("declared_workflow_version")
+                .try_into()
+                .expect("declared workflow version fits u64"),
+            generation: row
+                .get::<i64, _>("generation")
+                .try_into()
+                .expect("generation fits u64"),
+            effect_id: row.get("effect_id"),
+            claim_token: row
+                .get::<Option<String>, _>("claim_token")
+                .unwrap_or_default(),
+            worker_id: row
+                .get::<Option<String>, _>("claim_worker_id")
+                .unwrap_or_default(),
+            lease_until: row
+                .get::<Option<String>, _>("claim_lease_until")
+                .map_or_else(epoch_utc, |value| {
+                    DateTime::parse_from_rfc3339(&value)
+                        .expect("claim lease_until is valid RFC3339")
+                        .with_timezone(&Utc)
+                }),
+            issued_at: row.get::<Option<String>, _>("claim_issued_at").map_or_else(
+                epoch_utc,
+                |value| {
+                    DateTime::parse_from_rfc3339(&value)
+                        .expect("claim issued_at is valid RFC3339")
+                        .with_timezone(&Utc)
+                },
+            ),
+        },
+        attempt_id: row
+            .get::<Option<String>, _>("attempt_id")
+            .unwrap_or_default(),
+        payload: DurablePayload {
+            codec: DurableCodecRef {
+                family: row.get("codec_family"),
+                version: row
+                    .get::<i64, _>("codec_version")
+                    .try_into()
+                    .expect("codec version fits u32"),
+            },
+            payload: row.get("payload"),
+        },
+        origin: parse_receipt_origin_sql(row.get::<String, _>("origin").as_str())
+            .expect("workflow_receipts.origin is constrained to known values"),
+        accepted_at: DateTime::parse_from_rfc3339(&row.get::<String, _>("accepted_at"))
+            .expect("accepted_at is valid RFC3339")
+            .with_timezone(&Utc),
+    }))
+}
+
+fn compare_existing_receipt(
+    existing: DurableReceiptAcceptance,
+    request: &DurableAcceptReceiptRequest,
+) -> AcceptReceiptResult {
+    if existing.origin == request.origin
+        && existing.payload == request.receipt
+        && existing.attempt_id == request.attempt_id.clone().unwrap_or_default()
+    {
+        AcceptReceiptResult::AlreadyReceipted { receipt: existing }
+    } else {
+        AcceptReceiptResult::Conflict
+    }
+}
+
+async fn update_effect_status_if_live_claim(
+    tx: &mut SqliteConnection,
+    authority: &DurableClaimAuthority,
+    now: DateTime<Utc>,
+    expected_status: &str,
+    next_status: &str,
+) -> WorkflowRepositoryResult<u64> {
+    let updated = sqlx::query(
+        "UPDATE workflow_effects \
+         SET status = ?1 \
+         WHERE id = ?2 AND workflow_id = ?3 AND declared_workflow_version = ?4 \
+           AND generation = ?5 AND status = ?6 \
+           AND EXISTS (\
+               SELECT 1 FROM workflow_claims c \
+               JOIN workflows w ON w.id = workflow_effects.workflow_id \
+               WHERE c.effect_id = workflow_effects.id AND c.workflow_id = workflow_effects.workflow_id \
+                 AND c.declared_workflow_version = workflow_effects.declared_workflow_version \
+                 AND c.generation = workflow_effects.generation \
+                 AND c.claim_token = ?7 AND c.worker_id = ?8 \
+                 AND c.lease_until = ?9 AND c.issued_at = ?10 \
+                 AND c.lease_until > ?11 \
+                 AND w.authority = 'engine_protocol' AND w.execution_mode = 'authoritative' \
+                 AND w.status = 'active' AND w.generation = workflow_effects.generation\
+           )",
+    )
+    .bind(next_status)
+    .bind(&authority.effect_id)
+    .bind(&authority.workflow_id)
+    .bind(to_i64(
+        authority.declared_workflow_version,
+        WorkflowRepositoryError::VersionOutOfRange,
+    )?)
+    .bind(to_i64(
+        authority.generation,
+        WorkflowRepositoryError::GenerationOutOfRange,
+    )?)
+    .bind(expected_status)
+    .bind(&authority.claim_token)
+    .bind(&authority.worker_id)
+    .bind(authority.lease_until.to_rfc3339())
+    .bind(authority.issued_at.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .execute(&mut *tx)
+    .await?;
+    Ok(updated.rows_affected())
+}
+
+fn epoch_utc() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+        .expect("epoch timestamp is valid RFC3339")
+        .with_timezone(&Utc)
+}
+
 async fn insert_attempt_for_claim(
     tx: &mut SqliteConnection,
     authority: &DurableClaimAuthority,
@@ -1737,6 +2320,25 @@ fn receipt_family_sql(family: ReceiptFamily) -> &'static str {
     }
 }
 
+fn receipt_origin_sql(origin: DurableReceiptOrigin) -> &'static str {
+    match origin {
+        DurableReceiptOrigin::Execution => "execution",
+        DurableReceiptOrigin::Adoption => "adoption",
+        DurableReceiptOrigin::Reconciliation => "reconciliation",
+        DurableReceiptOrigin::Manual => "manual",
+    }
+}
+
+fn parse_receipt_origin_sql(origin: &str) -> Option<DurableReceiptOrigin> {
+    match origin {
+        "execution" => Some(DurableReceiptOrigin::Execution),
+        "adoption" => Some(DurableReceiptOrigin::Adoption),
+        "reconciliation" => Some(DurableReceiptOrigin::Reconciliation),
+        "manual" => Some(DurableReceiptOrigin::Manual),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1965,6 +2567,78 @@ mod tests {
             worker_id: "worker-1".to_owned(),
             lease_until,
             now,
+        }
+    }
+
+    fn observation(
+        authority: &DurableClaimAuthority,
+        attempt_id: &str,
+        now: DateTime<Utc>,
+    ) -> DurableObservationRecord {
+        DurableObservationRecord {
+            observation_id: "obs-1".to_owned(),
+            authority: authority.clone(),
+            attempt_id: attempt_id.to_owned(),
+            payload: DurablePayload {
+                codec: DurableCodecRef {
+                    family: "event".to_owned(),
+                    version: 1,
+                },
+                payload: "observed".to_owned(),
+            },
+            observed_at: now,
+            recorded_at: now,
+        }
+    }
+
+    fn stale_observation(
+        authority: &DurableClaimAuthority,
+        attempt_id: &str,
+        now: DateTime<Utc>,
+    ) -> DurableStaleObservationRecord {
+        DurableStaleObservationRecord {
+            observation_id: "stale-obs-1".to_owned(),
+            authority: authority.clone(),
+            attempt_id: attempt_id.to_owned(),
+            payload: DurablePayload {
+                codec: DurableCodecRef {
+                    family: "event".to_owned(),
+                    version: 1,
+                },
+                payload: "observed-stale".to_owned(),
+            },
+            observed_at: now,
+            recorded_at: now,
+            stale_reason: "claim_stale".to_owned(),
+        }
+    }
+
+    fn receipt_request(
+        authority: &DurableClaimAuthority,
+        attempt_id: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> DurableAcceptReceiptRequest {
+        DurableAcceptReceiptRequest {
+            receipt_id: "receipt-1".to_owned(),
+            reducer_inbox_id: "inbox-receipt-1".to_owned(),
+            authority: authority.clone(),
+            now,
+            attempt_id: attempt_id.map(ToOwned::to_owned),
+            origin: DurableReceiptOrigin::Execution,
+            receipt: DurablePayload {
+                codec: DurableCodecRef {
+                    family: "event".to_owned(),
+                    version: 1,
+                },
+                payload: "receipt-payload".to_owned(),
+            },
+            reducer_event: DurablePayload {
+                codec: DurableCodecRef {
+                    family: "event".to_owned(),
+                    version: 1,
+                },
+                payload: "receipt-event".to_owned(),
+            },
         }
     }
 
@@ -2283,6 +2957,325 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(last_attempt_status, "authority_lost");
+    }
+
+    #[tokio::test]
+    async fn record_observation_requires_live_exact_authority_and_attempt() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let (authority, attempt) = match claim {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claimed, got {other:?}")
+            }
+        };
+
+        let mismatch = repo
+            .record_observation(&observation(
+                &authority,
+                "attempt-999",
+                now + chrono::Duration::seconds(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mismatch, RecordObservationResult::StaleAuthority);
+
+        let recorded = repo
+            .record_observation(&observation(
+                &authority,
+                &attempt.attempt_id,
+                now + chrono::Duration::seconds(1),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(recorded, RecordObservationResult::Recorded { .. }));
+
+        let observation_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_observations WHERE effect_id = 'eff-1' AND authoritative = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let attempt_status: String =
+            sqlx::query_scalar("SELECT status FROM workflow_attempts WHERE id = ?1")
+                .bind(&attempt.attempt_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(observation_count, 1);
+        assert_eq!(attempt_status, "observation_recorded");
+    }
+
+    #[tokio::test]
+    async fn retain_stale_observation_verifies_attempt_and_does_not_mutate_effect_or_claim() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(1)))
+            .await
+            .unwrap();
+        let (authority, attempt) = match claim {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claimed, got {other:?}")
+            }
+        };
+
+        let mismatch = repo
+            .retain_stale_observation(&stale_observation(
+                &authority,
+                "attempt-999",
+                now + chrono::Duration::seconds(2),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mismatch, RetainStaleObservationResult::AttemptMismatch);
+
+        let retained = repo
+            .retain_stale_observation(&stale_observation(
+                &authority,
+                &attempt.attempt_id,
+                now + chrono::Duration::seconds(2),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            retained,
+            RetainStaleObservationResult::Recorded { .. }
+        ));
+
+        let stale_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_stale_observations WHERE effect_id = 'eff-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let effect = sqlx::query(
+            "SELECT status, pending_reconciliation FROM workflow_effects WHERE id = 'eff-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_claims WHERE effect_id = 'eff-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stale_count, 1);
+        assert_eq!(effect.get::<String, _>("status"), "claimed");
+        assert_eq!(effect.get::<i64, _>("pending_reconciliation"), 0);
+        assert_eq!(claim_count, 1);
+    }
+
+    #[tokio::test]
+    async fn old_worker_after_takeover_cannot_observe_or_receipt_and_exact_expiry_is_stale() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let (old_authority, old_attempt) = match claim {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claimed, got {other:?}")
+            }
+        };
+        let takeover_now = old_authority.lease_until;
+        let takeover = repo
+            .take_over_expired_claim(&DurableClaimTakeover {
+                authority: old_authority.clone(),
+                replacement_claim_token: "claim-2".to_owned(),
+                replacement_worker_id: "worker-2".to_owned(),
+                now: takeover_now,
+                lease_until: takeover_now + chrono::Duration::seconds(30),
+            })
+            .await
+            .unwrap();
+        let (new_authority, new_attempt) = match takeover {
+            TakeOverExpiredClaimResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (TakeOverExpiredClaimResult::Ineligible
+            | TakeOverExpiredClaimResult::StaleAuthority) => {
+                panic!("expected takeover claim, got {other:?}")
+            }
+        };
+
+        let stale_at_expiry = repo
+            .record_observation(&observation(
+                &new_authority,
+                &new_attempt.attempt_id,
+                new_authority.lease_until,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale_at_expiry, RecordObservationResult::StaleAuthority);
+
+        let stale_old_observation = repo
+            .record_observation(&observation(
+                &old_authority,
+                &old_attempt.attempt_id,
+                takeover_now,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_old_observation,
+            RecordObservationResult::StaleAuthority
+        );
+
+        let stale_old_receipt = repo
+            .accept_receipt(&receipt_request(
+                &old_authority,
+                Some(&old_attempt.attempt_id),
+                takeover_now,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale_old_receipt, AcceptReceiptResult::StaleAuthority);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn accept_receipt_handles_duplicate_conflict_and_failpoint_rollback() {
+        let pool = test_pool().await;
+        let repo = WorkflowRepository::new(pool.clone());
+        seed_claimable_effect(&repo).await;
+
+        let now = Utc::now();
+        let claim = repo
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let (authority, attempt) = match claim {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claimed, got {other:?}")
+            }
+        };
+
+        let accepted = repo
+            .accept_receipt(&receipt_request(
+                &authority,
+                Some(&attempt.attempt_id),
+                now + chrono::Duration::seconds(1),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(accepted, AcceptReceiptResult::Accepted { .. }));
+
+        let duplicate = repo
+            .accept_receipt(&receipt_request(
+                &authority,
+                Some(&attempt.attempt_id),
+                now + chrono::Duration::seconds(1),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            duplicate,
+            AcceptReceiptResult::AlreadyReceipted { .. }
+        ));
+
+        let mut conflicting = receipt_request(
+            &authority,
+            Some(&attempt.attempt_id),
+            now + chrono::Duration::seconds(1),
+        );
+        conflicting.receipt.payload = "other".to_owned();
+        let conflict = repo.accept_receipt(&conflicting).await.unwrap();
+        assert_eq!(conflict, AcceptReceiptResult::Conflict);
+
+        let attempt_status: String =
+            sqlx::query_scalar("SELECT status FROM workflow_attempts WHERE id = ?1")
+                .bind(&attempt.attempt_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let effect = sqlx::query("SELECT status FROM workflow_effects WHERE id = 'eff-1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let claim_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_claims WHERE effect_id = 'eff-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let inbox_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_reducer_inbox WHERE receipt_id = 'receipt-1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempt_status, "receipt_accepted");
+        assert_eq!(effect.get::<String, _>("status"), "receipted");
+        assert_eq!(claim_count, 0);
+        assert_eq!(inbox_count, 1);
+
+        let pool2 = test_pool().await;
+        let repo2 = WorkflowRepository::new(pool2.clone());
+        seed_claimable_effect(&repo2).await;
+        let claim2 = repo2
+            .claim_effect(&claim_request(now, now + chrono::Duration::seconds(30)))
+            .await
+            .unwrap();
+        let (authority2, attempt2) = match claim2 {
+            ClaimEffectResult::Claimed { authority, attempt } => (authority, attempt),
+            other @ (ClaimEffectResult::Ineligible | ClaimEffectResult::Contended) => {
+                panic!("expected claimed, got {other:?}")
+            }
+        };
+        let err = repo2
+            .accept_receipt_with_failpoint(
+                &receipt_request(
+                    &authority2,
+                    Some(&attempt2.attempt_id),
+                    now + chrono::Duration::seconds(1),
+                ),
+                Some(WorkflowFailpoint::AfterReceiptInsert),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            WorkflowRepositoryError::Failpoint(WorkflowFailpoint::AfterReceiptInsert)
+        ));
+        let rollback_receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_receipts WHERE effect_id = 'eff-1'")
+                .fetch_one(&pool2)
+                .await
+                .unwrap();
+        let rollback_inbox: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_reducer_inbox WHERE workflow_id = 'wf-1' AND receipt_id = 'receipt-1'",
+        )
+        .fetch_one(&pool2)
+        .await
+        .unwrap();
+        let rollback_effect = sqlx::query("SELECT status FROM workflow_effects WHERE id = 'eff-1'")
+            .fetch_one(&pool2)
+            .await
+            .unwrap();
+        let rollback_claims: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_claims WHERE effect_id = 'eff-1'")
+                .fetch_one(&pool2)
+                .await
+                .unwrap();
+        assert_eq!(rollback_receipts, 0);
+        assert_eq!(rollback_inbox, 0);
+        assert_eq!(rollback_effect.get::<String, _>("status"), "claimed");
+        assert_eq!(rollback_claims, 1);
     }
 
     #[tokio::test]
