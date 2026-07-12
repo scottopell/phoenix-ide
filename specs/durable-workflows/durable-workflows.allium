@@ -1,0 +1,897 @@
+-- allium: 3
+-- Durable Workflow Engine: Behavioural Specification
+--
+-- Scope: the profile-neutral execution, authority, recovery, and acceptance core.
+-- Profiles own typed product state, codecs, adapters, locks, compensation meaning,
+-- reducer mapping, and projections. Wake and creation behavior remains in their
+-- respective profile specifications.
+--
+-- Requirement traceability: REQ-DWF-001 through REQ-DWF-018.
+
+------------------------------------------------------------
+-- Types
+------------------------------------------------------------
+
+enum SemanticAuthority { legacy_protocol | engine_protocol | shadow }
+enum WorkflowStatus { active | cancelling | cancelled | deletion_pending | completed | failed }
+enum EffectRole { required | optional | compensation }
+enum AmbiguityPolicy {
+    observable_reconciliation
+    | external_idempotency
+    | safe_repeatability
+    | manual_resolution
+}
+enum EffectStatus {
+    blocked | eligible | claimed | retry_wait | ambiguity_wait
+    | receipted | invalidated
+}
+enum AttemptStatus { begun | observation_recorded | receipt_accepted | authority_lost }
+enum ReceiptOrigin { execution | adoption | reconciliation | manual }
+enum BarrierStatus { waiting | satisfied }
+enum InboxStatus { owed | accepted | suppressed }
+enum ResolutionStatus { required | resolved }
+enum ShadowDivergenceKind {
+    snapshot | transition | effect_plan | observation | receipt | reducer_event | projection
+}
+enum Capability {
+    compose | runtime_start | cancel | retry | delete
+    | lifecycle_transition | manual_resolve
+}
+enum CommitOutcome { committed | version_conflict | unsupported_codec | invalid_plan }
+enum ClaimOutcome { claimed | ineligible | authority_conflict | unsupported_codec }
+enum AuthorityOutcome { authorized | stale_authority }
+enum ReconciliationDecision {
+    perform | adopt | repair | compensate | durable_conflict
+    | request_manual_resolution | retry_infrastructure | stop_authority_lost
+}
+
+value ProfileRef {
+    profile_id: String
+    protocol_version: Integer
+}
+
+value CodecRef {
+    family: String
+    version: Integer
+}
+
+value ClaimAuthority {
+    workflow_id: String
+    declared_workflow_version: Integer
+    generation: Integer
+    effect_id: String
+    claim_token: String
+    worker_id: String
+    lease_until: Timestamp
+}
+
+value EffectDeclaration {
+    effect_id: String
+    family: String
+    kind: String
+    codec: CodecRef
+    generation: Integer
+    role: EffectRole
+    ambiguity_policy: AmbiguityPolicy
+    intent: String
+    next_eligible_at: Timestamp?
+    destructive_resource: String?
+}
+
+value DependencyDeclaration {
+    effect_id: String
+    depends_on_effect_id: String
+}
+
+value BarrierDeclaration {
+    barrier_id: String
+    required_effect_ids: String
+}
+
+value TransitionPlan {
+    snapshot_codec: CodecRef
+    snapshot_payload: String
+    event_codec: CodecRef
+    event_payload: String
+    effects: EffectDeclaration
+    dependencies: DependencyDeclaration
+    barriers: BarrierDeclaration
+    invalidated_effect_ids: String
+    owed_acceptance_payloads: String
+}
+
+value ReducerDecision {
+    expected_workflow_version: Integer
+    plan: TransitionPlan
+}
+
+value ManualChoice {
+    choice_codec: CodecRef
+    choice_payload: String
+}
+
+------------------------------------------------------------
+-- Actors
+------------------------------------------------------------
+
+actor WorkflowClient {}
+actor ProductReducer {}
+actor EffectWorker {}
+actor Scheduler {}
+actor RuntimeConsumer {}
+actor ResolutionOperator {}
+actor ShadowMirror {}
+actor ProfileRegistry {}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+entity Workflow {
+    id: String
+    profile: ProfileRef
+    authority: SemanticAuthority
+    version: Integer
+    generation: Integer
+    status: WorkflowStatus
+    snapshot_codec: CodecRef
+    snapshot_payload: String
+    accepted_at: Timestamp
+
+    transitions status {
+        active -> cancelling
+        active -> deletion_pending
+        active -> completed
+        active -> failed
+        cancelling -> cancelled
+        cancelling -> deletion_pending
+        deletion_pending -> completed
+        terminal: cancelled, completed, failed
+    }
+
+    invariant VersionNonnegative { version >= 0 }
+    invariant GenerationNonnegative { generation >= 0 }
+}
+
+entity Transition {
+    id: String
+    workflow: Workflow
+    from_version: Integer
+    to_version: Integer
+    generation: Integer
+    event_codec: CodecRef
+    event_payload: String
+    committed_at: Timestamp
+
+    invariant AdvancesOneVersion { to_version = from_version + 1 }
+}
+
+entity Effect {
+    id: String
+    workflow: Workflow
+    declaring_transition: Transition
+    declared_workflow_version: Integer
+    generation: Integer
+    family: String
+    kind: String
+    codec: CodecRef
+    role: EffectRole
+    ambiguity_policy: AmbiguityPolicy
+    intent: String
+    status: EffectStatus
+    next_eligible_at: Timestamp?
+    destructive_resource: String?
+
+    transitions status {
+        blocked -> eligible
+        blocked -> invalidated
+        eligible -> claimed
+        eligible -> invalidated
+        claimed -> retry_wait
+        claimed -> ambiguity_wait
+        claimed -> receipted
+        claimed -> invalidated
+        retry_wait -> eligible
+        retry_wait -> invalidated
+        ambiguity_wait -> receipted
+        ambiguity_wait -> invalidated
+        terminal: receipted, invalidated
+    }
+}
+
+entity EffectDependency {
+    effect: Effect
+    dependency: Effect
+}
+
+entity Claim {
+    effect: Effect
+    authority: ClaimAuthority
+    issued_at: Timestamp
+    revoked_at: Timestamp?
+}
+
+entity Attempt {
+    id: String
+    effect: Effect
+    claim: Claim
+    ordinal: Integer
+    status: AttemptStatus
+    begun_at: Timestamp
+}
+
+entity Observation {
+    id: String
+    effect: Effect
+    attempt: Attempt
+    codec: CodecRef
+    payload: String
+    observed_at: Timestamp
+    recorded_at: Timestamp
+    authoritative: Boolean
+}
+
+entity Receipt {
+    id: String
+    effect: Effect
+    attempt: Attempt?
+    codec: CodecRef
+    payload: String
+    origin: ReceiptOrigin
+    accepted_at: Timestamp
+    generation: Integer
+}
+
+entity Barrier {
+    id: String
+    workflow: Workflow
+    declaring_transition: Transition
+    status: BarrierStatus
+    satisfied_at: Timestamp?
+
+    transitions status {
+        waiting -> satisfied
+        terminal: satisfied
+    }
+}
+
+entity BarrierMember {
+    barrier: Barrier
+    effect: Effect
+}
+
+entity ReducerInbox {
+    id: String
+    workflow: Workflow
+    receipt: Receipt?
+    barrier: Barrier?
+    event_codec: CodecRef
+    event_payload: String
+    delivered_at: Timestamp?
+}
+
+entity OwedAcceptance {
+    id: String
+    workflow: Workflow
+    reducer_inbox: ReducerInbox
+    status: InboxStatus
+    accepting_transition: Transition? when status = accepted
+    terminal_reason: String? when status = suppressed
+
+    transitions status {
+        owed -> accepted
+        owed -> suppressed
+        terminal: accepted, suppressed
+    }
+}
+
+entity ManualResolution {
+    id: String
+    workflow: Workflow
+    effect: Effect
+    status: ResolutionStatus
+    evidence: String
+    permitted_choices: String
+    choice: ManualChoice? when status = resolved
+    resolved_by: ResolutionOperator? when status = resolved
+
+    transitions status {
+        required -> resolved
+        terminal: resolved
+    }
+}
+
+entity ShadowDivergence {
+    id: String
+    shadow_workflow: Workflow
+    authoritative_workflow_id: String
+    kind: ShadowDivergenceKind
+    expected_codec: CodecRef
+    expected_payload: String
+    actual_codec: CodecRef
+    actual_payload: String
+    recorded_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- Each helper is pure unless its name denotes an emitted request or persisted fact.
+-- next_workflow_id(), next_transition_id(), next_attempt_id(), next_observation_id()
+-- next_receipt_id(), next_reducer_inbox_id(), next_manual_resolution_id()
+-- next_shadow_divergence_id(), opaque_claim_token()
+-- profile_registered(profile), profile_accepting_new_work(profile)
+-- profile_has_lossless_decoder(profile, codec), profile_executor_available(profile)
+-- plan_codecs_supported(profile, plan), plan_is_complete(plan)
+-- plan_effect_ids_unique(plan), plan_barrier_ids_unique(plan)
+-- plan_references_only_declared_effects(plan), plan_dependency_graph_acyclic(plan)
+-- plan_barriers_have_only_required_members(plan)
+-- transition_count_for_version(workflow, version)
+-- transition_plan_rows_exist_atomically(transition)
+-- no_rows_from_rejected_plan(workflow, expected_version, plan)
+-- effect_dependencies_compatible(effect), compatible_terminal_receipt(effect)
+-- all_barrier_members_compatibly_receipted(barrier)
+-- effect_family_policy_registered_exactly_once(effect)
+-- live_matching_authority(effect, authority)
+-- physical_resource_lock_held(effect, authority)
+-- claimed_external_operation(operation)
+-- stale_evidence_is_diagnostic_only(effect, authority)
+-- accepted_receipt_count(effect), reducer_event_for_receipt(receipt)
+-- reducer_event_for_barrier(barrier), reducer_decision_is_product_authoritative(decision)
+-- capabilities_for(workflow), capability_allowed(workflow, capability)
+-- earliest_durable_deadline(), due_or_abandoned_effects(now)
+-- retry_deadline_for(effect, decision), claim_is_expired(claim)
+-- ambiguity_recovery_allowed(effect, decision)
+-- cancellation_plan_complete(workflow, plan), deletion_plan_complete(workflow, plan)
+-- prior_generation_claims_revoked(workflow), incompatible_effects_invalidated(workflow)
+-- compensation_effects_follow_core_contracts(workflow)
+-- dependency_path_stopped(effect), manual_choice_permitted(resolution, choice)
+-- runtime_acceptance_state_persisted(workflow, inbox)
+-- duplicate_acceptance_starts_no_product_action(owed)
+-- shadow_matches_authoritative_input(shadow, authoritative_workflow_id)
+-- shadow_has_no_execution_authority(workflow)
+-- no_authoritative_work_remains(profile)
+-- kicks_are_optimization_only, durable_rows_suffice_after_restart
+
+------------------------------------------------------------
+-- Acceptance and transition rules
+------------------------------------------------------------
+
+rule AcceptWorkflow {
+    when: WorkflowAcceptanceRequested(profile, authority, snapshot_codec, snapshot_payload)
+
+    requires: authority in {legacy_protocol, engine_protocol, shadow}
+    requires: profile_registered(profile)
+    requires: profile_accepting_new_work(profile)
+    requires: profile_has_lossless_decoder(profile, snapshot_codec)
+    requires: profile_executor_available(profile)
+
+    ensures: Workflow.created(
+        id: next_workflow_id(),
+        profile: profile,
+        authority: authority,
+        version: 0,
+        generation: 0,
+        status: active,
+        snapshot_codec: snapshot_codec,
+        snapshot_payload: snapshot_payload,
+        accepted_at: now()
+    )
+    ensures: AcceptanceOutcome(accepted)
+}
+
+rule RejectUnsupportedWorkflowCodec {
+    when: WorkflowAcceptanceRequested(profile, authority, snapshot_codec, snapshot_payload)
+    requires: not profile_has_lossless_decoder(profile, snapshot_codec)
+             or not profile_executor_available(profile)
+    ensures: AcceptanceOutcome(unsupported_codec)
+    ensures: not Workflow.created(profile: profile, snapshot_codec: snapshot_codec)
+}
+
+rule CommitReducerPlan {
+    when: ReducerPlanCommitRequested(reducer, workflow, decision)
+
+    requires: workflow.authority = engine_protocol
+    requires: decision.expected_workflow_version = workflow.version
+    requires: reducer_decision_is_product_authoritative(decision)
+    requires: plan_codecs_supported(workflow.profile, decision.plan)
+    requires: plan_is_complete(decision.plan)
+    requires: plan_effect_ids_unique(decision.plan)
+    requires: plan_barrier_ids_unique(decision.plan)
+    requires: plan_references_only_declared_effects(decision.plan)
+    requires: plan_dependency_graph_acyclic(decision.plan)
+    requires: plan_barriers_have_only_required_members(decision.plan)
+
+    let transition_id = next_transition_id()
+    let next_version = workflow.version + 1
+
+    ensures: workflow.version = next_version
+    ensures: workflow.snapshot_codec = decision.plan.snapshot_codec
+    ensures: workflow.snapshot_payload = decision.plan.snapshot_payload
+    ensures: Transition.created(
+        id: transition_id,
+        workflow: workflow,
+        from_version: decision.expected_workflow_version,
+        to_version: next_version,
+        generation: workflow.generation,
+        event_codec: decision.plan.event_codec,
+        event_payload: decision.plan.event_payload,
+        committed_at: now()
+    )
+    ensures: CompleteEffectDagPersisted(workflow, transition_id, decision.plan)
+    ensures: CompleteBarriersPersisted(workflow, transition_id, decision.plan)
+    ensures: DeclaredInvalidationsPersisted(workflow, decision.plan)
+    ensures: OwedAcceptancesPersistedWhenDeclared(workflow, decision.plan)
+    ensures: transition_plan_rows_exist_atomically(Transition{id: transition_id})
+    ensures: ReducerPlanCommitOutcome(committed)
+}
+
+rule RejectStaleReducerPlan {
+    when: ReducerPlanCommitRequested(reducer, workflow, decision)
+    requires: decision.expected_workflow_version != workflow.version
+    ensures: ReducerPlanCommitOutcome(version_conflict)
+    ensures: no_rows_from_rejected_plan(workflow, decision.expected_workflow_version, decision.plan)
+}
+
+rule RejectInvalidReducerPlan {
+    when: ReducerPlanCommitRequested(reducer, workflow, decision)
+    requires: not plan_codecs_supported(workflow.profile, decision.plan)
+        or not plan_is_complete(decision.plan)
+        or not plan_effect_ids_unique(decision.plan)
+        or not plan_barrier_ids_unique(decision.plan)
+        or not plan_references_only_declared_effects(decision.plan)
+        or not plan_dependency_graph_acyclic(decision.plan)
+        or not plan_barriers_have_only_required_members(decision.plan)
+    ensures: ReducerPlanCommitOutcome(invalid_plan)
+    ensures: no_rows_from_rejected_plan(workflow, decision.expected_workflow_version, decision.plan)
+}
+
+------------------------------------------------------------
+-- Eligibility, claims, attempts, evidence, and receipts
+------------------------------------------------------------
+
+rule DependenciesMakeEffectEligible {
+    when: DependencyEligibilityEvaluated(effect)
+    requires: effect.status in {blocked, retry_wait}
+    requires: effect.generation = effect.workflow.generation
+    requires: effect.next_eligible_at = null or effect.next_eligible_at <= now()
+    requires: effect_dependencies_compatible(effect)
+    ensures: effect.status = eligible
+}
+
+rule ClaimEligibleEffect {
+    when: EffectClaimRequested(worker, effect, lease_until)
+    requires: effect.workflow.authority = engine_protocol
+    requires: effect.status = eligible
+    requires: effect.generation = effect.workflow.generation
+    requires: lease_until > now()
+    requires: effect_family_policy_registered_exactly_once(effect)
+    requires: profile_has_lossless_decoder(effect.workflow.profile, effect.codec)
+
+    let authority = ClaimAuthority{
+        workflow_id: effect.workflow.id,
+        declared_workflow_version: effect.declared_workflow_version,
+        generation: effect.generation,
+        effect_id: effect.id,
+        claim_token: opaque_claim_token(),
+        worker_id: worker,
+        lease_until: lease_until
+    }
+
+    ensures: Claim.created(effect: effect, authority: authority, issued_at: now())
+    ensures: effect.status = claimed
+    ensures: EffectClaimOutcome(claimed, authority)
+}
+
+rule RejectIneligibleClaim {
+    when: EffectClaimRequested(worker, effect, lease_until)
+    requires: effect.status != eligible
+        or effect.generation != effect.workflow.generation
+        or effect.workflow.authority != engine_protocol
+    ensures: EffectClaimOutcome(ineligible)
+    ensures: not Claim.created(effect: effect, issued_at: now())
+}
+
+rule RenewLiveClaim {
+    when: ClaimRenewalRequested(worker, effect, authority, new_lease_until)
+    requires: live_matching_authority(effect, authority)
+    requires: authority.worker_id = worker
+    requires: new_lease_until > authority.lease_until
+    ensures: Claim{effect: effect}.authority.lease_until = new_lease_until
+    ensures: ClaimRenewalOutcome(authorized)
+}
+
+rule RejectStaleClaimRenewal {
+    when: ClaimRenewalRequested(worker, effect, authority, new_lease_until)
+    requires: not live_matching_authority(effect, authority)
+    ensures: ClaimRenewalOutcome(stale_authority)
+}
+
+rule BeginEffectAttempt {
+    when: EffectAttemptBegins(worker, effect, authority)
+    requires: live_matching_authority(effect, authority)
+    requires: not claimed_external_operation(execute)
+        or effect.destructive_resource = null
+        or physical_resource_lock_held(effect, authority)
+    ensures: Attempt.created(
+        id: next_attempt_id(),
+        effect: effect,
+        claim: Claim{effect: effect},
+        ordinal: accepted_attempt_count(effect) + 1,
+        status: begun,
+        begun_at: now()
+    )
+    ensures: ExternalExecutionAuthorized(effect, authority)
+}
+
+rule RecordAuthoritativeObservation {
+    when: EffectObservationReported(worker, effect, attempt, authority, codec, payload, observed_at)
+    requires: live_matching_authority(effect, authority)
+    requires: attempt.effect = effect
+    requires: profile_has_lossless_decoder(effect.workflow.profile, codec)
+    ensures: Observation.created(
+        id: next_observation_id(), effect: effect, attempt: attempt,
+        codec: codec, payload: payload, observed_at: observed_at,
+        recorded_at: now(), authoritative: true
+    )
+    ensures: attempt.status = observation_recorded
+}
+
+rule RetainStaleObservationAsDiagnostic {
+    when: EffectObservationReported(worker, effect, attempt, authority, codec, payload, observed_at)
+    requires: not live_matching_authority(effect, authority)
+    ensures: StaleObservationEvidenceRetainedWhenUseful(effect, codec, payload, observed_at)
+    ensures: stale_evidence_is_diagnostic_only(effect, authority)
+}
+
+rule AcceptTerminalReceipt {
+    when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
+    requires: live_matching_authority(effect, authority)
+    requires: accepted_receipt_count(effect) = 0
+    requires: profile_has_lossless_decoder(effect.workflow.profile, codec)
+    requires: origin in {execution, adoption, reconciliation}
+    ensures: Receipt.created(
+        id: next_receipt_id(), effect: effect, attempt: attempt,
+        codec: codec, payload: payload, origin: origin,
+        accepted_at: now(), generation: effect.generation
+    )
+    ensures: effect.status = receipted
+    ensures: attempt.status = receipt_accepted
+    ensures: ReducerInbox.created(
+        id: next_reducer_inbox_id(), workflow: effect.workflow,
+        receipt: Receipt{effect: effect}, event_codec: codec,
+        event_payload: reducer_event_for_receipt(Receipt{effect: effect})
+    )
+}
+
+rule RejectDuplicateOrStaleReceipt {
+    when: TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
+    requires: not live_matching_authority(effect, authority)
+        or accepted_receipt_count(effect) = 1
+    ensures: TerminalReceiptOutcome(stale_or_duplicate)
+    ensures: accepted_receipt_count(effect) <= 1
+}
+
+rule ScheduleRetryDurably {
+    when: ReconciliationDecisionReported(worker, effect, authority, retry_infrastructure)
+    requires: live_matching_authority(effect, authority)
+    requires: ambiguity_recovery_allowed(effect, retry_infrastructure)
+    ensures: effect.status = retry_wait
+    ensures: effect.next_eligible_at = retry_deadline_for(effect, retry_infrastructure)
+    ensures: DurableDeadlineScheduled(effect, effect.next_eligible_at)
+}
+
+rule RequireManualResolution {
+    when: ReconciliationDecisionReported(worker, effect, authority, request_manual_resolution)
+    requires: live_matching_authority(effect, authority)
+    ensures: effect.status = ambiguity_wait
+    ensures: ManualResolution.created(
+        id: next_manual_resolution_id(), workflow: effect.workflow,
+        effect: effect, status: required,
+        evidence: evidence_for(effect), permitted_choices: permitted_choices_for(effect)
+    )
+    ensures: dependency_path_stopped(effect)
+}
+
+------------------------------------------------------------
+-- Scheduling, takeover, cancellation, and resolution
+------------------------------------------------------------
+
+rule SchedulerDiscoversDurableWork {
+    when: SchedulerTick(now)
+    ensures: SchedulerConsiders(due_or_abandoned_effects(now))
+    ensures: SchedulerNextWakeSetTo(earliest_durable_deadline())
+    ensures: kicks_are_optimization_only
+    ensures: durable_rows_suffice_after_restart
+}
+
+rule ExpiredClaimPermitsTakeover {
+    when: EffectTakeoverRequested(worker, effect, expired_claim, lease_until)
+    requires: effect.status = claimed
+    requires: claim_is_expired(expired_claim)
+    requires: effect.generation = effect.workflow.generation
+    requires: lease_until > now()
+    ensures: expired_claim.revoked_at = now()
+    ensures: effect.status = eligible
+    ensures: TakeoverMustReconcileBeforeReplay(effect, effect.ambiguity_policy)
+}
+
+rule CancelWorkflow {
+    when: WorkflowCancellationRequested(client, workflow, decision)
+    requires: workflow.status = active
+    requires: decision.expected_workflow_version = workflow.version
+    requires: cancellation_plan_complete(workflow, decision.plan)
+    ensures: workflow.generation = workflow.generation + 1
+    ensures: workflow.status = cancelling
+    ensures: prior_generation_claims_revoked(workflow)
+    ensures: incompatible_effects_invalidated(workflow)
+    ensures: CancellationReducerPlanCommittedAtomically(workflow, decision)
+    ensures: compensation_effects_follow_core_contracts(workflow)
+}
+
+rule DeleteWorkflow {
+    when: WorkflowDeletionRequested(client, workflow, decision)
+    requires: workflow.status in {active, cancelling, cancelled, failed}
+    requires: decision.expected_workflow_version = workflow.version
+    requires: deletion_plan_complete(workflow, decision.plan)
+    ensures: workflow.generation = workflow.generation + 1
+    ensures: workflow.status = deletion_pending
+    ensures: prior_generation_claims_revoked(workflow)
+    ensures: incompatible_effects_invalidated(workflow)
+    ensures: DeletionReducerPlanCommittedAtomically(workflow, decision)
+    ensures: compensation_effects_follow_core_contracts(workflow)
+}
+
+rule CommitManualResolution {
+    when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
+    requires: resolution.status = required
+    requires: manual_choice_permitted(resolution, choice)
+    requires: expected_workflow_version = resolution.workflow.version
+    requires: resolution.effect.generation = resolution.workflow.generation
+    requires: profile_has_lossless_decoder(resolution.workflow.profile, choice.choice_codec)
+    requires: accepted_receipt_count(resolution.effect) = 0
+    ensures: resolution.status = resolved
+    ensures: resolution.choice = choice
+    ensures: resolution.resolved_by = operator
+    ensures: Receipt.created(
+        id: next_receipt_id(), effect: resolution.effect,
+        codec: choice.choice_codec, payload: choice.choice_payload,
+        origin: manual, accepted_at: now(),
+        generation: resolution.workflow.generation
+    )
+    ensures: resolution.effect.status = receipted
+    ensures: ManualResolutionAudited(resolution)
+}
+
+rule RejectStaleManualResolution {
+    when: ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
+    requires: expected_workflow_version != resolution.workflow.version
+        or resolution.effect.generation != resolution.workflow.generation
+    ensures: ManualResolutionOutcome(version_conflict)
+    ensures: resolution.status = required
+}
+
+------------------------------------------------------------
+-- Barriers, reducer acceptance, capabilities, and shadow
+------------------------------------------------------------
+
+rule SatisfyCompletionBarrier {
+    when: BarrierEvaluated(barrier)
+    requires: barrier.status = waiting
+    requires: all_barrier_members_compatibly_receipted(barrier)
+    ensures: barrier.status = satisfied
+    ensures: barrier.satisfied_at = now()
+    ensures: ReducerInbox.created(
+        id: next_reducer_inbox_id(), workflow: barrier.workflow,
+        barrier: barrier, event_codec: barrier_event_codec(barrier),
+        event_payload: reducer_event_for_barrier(barrier)
+    )
+    ensures: not ProductCompletionPublishedByEngine(barrier.workflow)
+}
+
+rule ReducerAcceptsInboxEvent {
+    when: ReducerInboxAcceptanceRequested(reducer, inbox, decision)
+    requires: inbox.workflow.authority = engine_protocol
+    requires: inbox.delivered_at = null
+    requires: decision.expected_workflow_version = inbox.workflow.version
+    requires: reducer_decision_is_product_authoritative(decision)
+    ensures: ReducerPlanCommitRequested(reducer, inbox.workflow, decision)
+    ensures: inbox.delivered_at = now()
+}
+
+rule RuntimeAcceptsOwedAcceptance {
+    when: RuntimeAcceptanceRequested(runtime, owed, decision)
+    requires: owed.status = owed
+    requires: decision.expected_workflow_version = owed.workflow.version
+    requires: capability_allowed(owed.workflow, runtime_start)
+    ensures: RuntimeProductStateAndReducerPlanPersistedAtomically(owed.workflow, decision)
+    ensures: runtime_acceptance_state_persisted(owed.workflow, owed.reducer_inbox)
+    ensures: owed.status = accepted
+    ensures: owed.accepting_transition = latest_transition(owed.workflow)
+}
+
+rule DuplicateRuntimeAcceptanceIsIdempotent {
+    when: RuntimeAcceptanceRequested(runtime, owed, decision)
+    requires: owed.status in {accepted, suppressed}
+    ensures: duplicate_acceptance_starts_no_product_action(owed)
+}
+
+rule EnforceDerivedCapability {
+    when: CapabilityActionRequested(client, workflow, capability)
+    requires: capability in capabilities_for(workflow)
+    ensures: CapabilityActionAuthorized(workflow, capability)
+}
+
+rule RejectAbsentCapability {
+    when: CapabilityActionRequested(client, workflow, capability)
+    requires: capability not in capabilities_for(workflow)
+    ensures: CapabilityActionRejected(workflow, capability)
+}
+
+rule MirrorAuthoritativeFactIntoShadow {
+    when: ShadowMirrorRequested(mirror, shadow, authoritative_workflow_id, fact_codec, fact_payload)
+    requires: shadow.authority = shadow
+    requires: shadow_matches_authoritative_input(shadow, authoritative_workflow_id)
+    requires: profile_has_lossless_decoder(shadow.profile, fact_codec)
+    ensures: ShadowFactMirrored(shadow, authoritative_workflow_id, fact_codec, fact_payload)
+    ensures: shadow_has_no_execution_authority(shadow)
+}
+
+rule RecordShadowDivergence {
+    when: ShadowComparisonCompleted(shadow, authoritative_workflow_id, kind,
+                                    expected_codec, expected_payload,
+                                    actual_codec, actual_payload)
+    requires: shadow.authority = shadow
+    requires: expected_payload != actual_payload or expected_codec != actual_codec
+    ensures: ShadowDivergence.created(
+        id: next_shadow_divergence_id(), shadow_workflow: shadow,
+        authoritative_workflow_id: authoritative_workflow_id, kind: kind,
+        expected_codec: expected_codec, expected_payload: expected_payload,
+        actual_codec: actual_codec, actual_payload: actual_payload,
+        recorded_at: now()
+    )
+    ensures: shadow_has_no_execution_authority(shadow)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface WorkflowAcceptanceSurface {
+    facing user: WorkflowClient
+    provides:
+        WorkflowAcceptanceRequested(profile, authority, snapshot_codec, snapshot_payload)
+}
+
+surface ReducerCommitSurface {
+    facing user: ProductReducer
+    context workflow: Workflow
+    provides:
+        ReducerPlanCommitRequested(reducer, workflow, decision)
+        ReducerInboxAcceptanceRequested(reducer, inbox, decision)
+            when inbox.workflow = workflow
+}
+
+surface EffectClaimSurface {
+    facing user: EffectWorker
+    context effect: Effect
+    provides:
+        EffectClaimRequested(worker, effect, lease_until)
+        ClaimRenewalRequested(worker, effect, authority, new_lease_until)
+        EffectTakeoverRequested(worker, effect, expired_claim, lease_until)
+}
+
+surface EffectExecutionSurface {
+    facing user: EffectWorker
+    context effect: Effect
+    provides:
+        EffectAttemptBegins(worker, effect, authority)
+        EffectObservationReported(worker, effect, attempt, authority, codec, payload, observed_at)
+        TerminalReceiptReported(worker, effect, attempt, authority, codec, payload, origin)
+        ReconciliationDecisionReported(worker, effect, authority, decision)
+}
+
+surface SchedulerSurface {
+    facing user: Scheduler
+    provides:
+        SchedulerTick(now)
+        DependencyEligibilityEvaluated(effect)
+        BarrierEvaluated(barrier)
+}
+
+surface WorkflowLifecycleSurface {
+    facing user: WorkflowClient
+    context workflow: Workflow
+    provides:
+        WorkflowCancellationRequested(client, workflow, decision)
+        WorkflowDeletionRequested(client, workflow, decision)
+        CapabilityActionRequested(client, workflow, capability)
+}
+
+surface ManualResolutionSurface {
+    facing user: ResolutionOperator
+    context resolution: ManualResolution
+    exposes:
+        resolution.evidence
+        resolution.permitted_choices
+    provides:
+        ManualResolutionChosen(operator, resolution, choice, expected_workflow_version)
+}
+
+surface RuntimeAcceptanceSurface {
+    facing user: RuntimeConsumer
+    context owed: OwedAcceptance
+    provides:
+        RuntimeAcceptanceRequested(runtime, owed, decision)
+}
+
+surface ShadowMirrorSurface {
+    facing user: ShadowMirror
+    context shadow: Workflow
+    provides:
+        ShadowMirrorRequested(mirror, shadow, authoritative_workflow_id, fact_codec, fact_payload)
+        ShadowComparisonCompleted(shadow, authoritative_workflow_id, kind,
+                                  expected_codec, expected_payload,
+                                  actual_codec, actual_payload)
+}
+
+surface ProfileRegistrationSurface {
+    facing user: ProfileRegistry
+    provides:
+        ProfileRegistrationRequested(profile, supported_codecs, ambiguity_policies, executor)
+        ProfileDrainRequested(profile)
+}
+
+------------------------------------------------------------
+-- Global invariants
+------------------------------------------------------------
+
+invariant OneTransitionPerCommittedVersion {
+    every_committed_workflow_version_has_exactly_one_transition
+}
+
+invariant EffectGraphIsAcyclic {
+    -- The dependency relation for each workflow is a directed acyclic graph.
+    every_workflow_dependency_graph_is_acyclic
+}
+
+invariant EveryClaimCarriesLiveLeaseAuthority {
+    every_effect_in_claimed_status_has_live_matching_claim_authority
+}
+
+invariant ClaimedExternalWorkRequiresAuthority {
+    every_claimed_external_operation_has_live_matching_authority
+}
+
+invariant AtMostOneAcceptedReceiptPerEffect {
+    every_effect_has_at_most_one_accepted_receipt
+}
+
+invariant BarrierUsesExactlyDeclaredRequiredMembers {
+    every_satisfied_barrier_has_compatible_receipts_for_exactly_its_declared_required_members
+}
+
+invariant AmbiguityPolicyIsStructuralAndSingular {
+    every_effect_family_has_exactly_one_structural_ambiguity_policy
+}
+
+invariant CapabilitiesAreDerivedNotPersisted {
+    all_capabilities_equal_profile_reducer_projection
+}
+
+invariant AcceptedProtocolRemainsExecutable {
+    every_accepted_workflow_retains_its_executor_and_lossless_decoders
+}
+
+invariant OneSemanticAuthorityPerWorkflow {
+    every_workflow_has_exactly_one_semantic_authority
+}
+
+invariant ShadowCannotActAuthoritatively {
+    every_shadow_is_unable_to_claim_execute_reduce_or_publish
+}
+
+invariant ProtocolDrainPreservesAuthority {
+    profile_retirement_requires_no_authoritative_work_and_no_owed_acceptance
+}
