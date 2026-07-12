@@ -402,6 +402,11 @@ function MessageListImpl({
   const findMatches = findProjection.matches;
   const normalizedFindIndex = findMatches.length === 0 ? -1 : Math.min(findActiveIndex, findMatches.length - 1);
   const activeFindMatch = findOpen && normalizedFindIndex >= 0 ? findMatches[normalizedFindIndex] ?? null : null;
+  const activeFindMatchRef = useRef(activeFindMatch);
+  activeFindMatchRef.current = activeFindMatch;
+  const activeFindMatchKey = activeFindMatch
+    ? `${activeFindMatch.target.kind}:${activeFindMatch.target.sourceId}:${activeFindMatch.start}:${activeFindMatch.end}`
+    : null;
   const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
     if (!scroller) return null;
@@ -808,8 +813,8 @@ function MessageListImpl({
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
       .forEach((element) => element.classList.remove('viewer-find-row-match', 'viewer-find-row-match--active'));
-    if (!activeFindMatch) return undefined;
-    const match = activeFindMatch;
+    const match = activeFindMatchRef.current;
+    if (!match) return undefined;
     dispatchScrollEvent({ type: 'navigationJumped' });
     if (match.target.kind === 'header-text') {
       const timers = [0, 80, 220].map((delay) => window.setTimeout(() => {
@@ -833,7 +838,7 @@ function MessageListImpl({
       row.scrollIntoView({ block: 'center' });
     }, delay));
     return () => timers.forEach(clearTimeout);
-  }, [activeFindMatch, dispatchScrollEvent, findRowByKey]);
+  }, [activeFindMatchKey, dispatchScrollEvent, findRowByKey]);
 
   useEffect(() => {
     if (findOpen || activeScope !== findScopeId) return;

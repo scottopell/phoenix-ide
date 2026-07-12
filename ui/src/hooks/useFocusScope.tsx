@@ -74,9 +74,10 @@ export function useFocusScopeCommands(): FocusScopeCommands {
 }
 
 /** Hook that registers a focus scope on mount and unregisters on unmount */
-export function useRegisterFocusScope(id: string) {
+export function useRegisterFocusScope(id: string | null) {
   const { pushScope, popScope } = useFocusScopeCommands();
   useEffect(() => {
+    if (id === null) return undefined;
     pushScope(id);
     return () => popScope(id);
   }, [id, pushScope, popScope]);
