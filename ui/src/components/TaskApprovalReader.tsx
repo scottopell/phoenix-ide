@@ -279,6 +279,10 @@ export function TaskApprovalReader({
   const findButtonRef = useRef<HTMLButtonElement>(null);
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const blockRefs = useRef<Map<string, HTMLElement>>(new Map());
+  const registerBlockRef = useCallback((blockId: string, element: HTMLElement | null) => {
+    if (element) blockRefs.current.set(blockId, element);
+    else blockRefs.current.delete(blockId);
+  }, []);
   const findPreviousFocusRef = useRef<HTMLElement | null>(null);
 
   // Focus note input when dialog opens
@@ -600,21 +604,27 @@ export function TaskApprovalReader({
               const lineNumber = node?.position?.start?.line ?? 0;
               if (inline) {
                 registerFindableBlock(lineNumber, codeText, `line:${lineNumber}:inline-code:${nextFindableBlocks.length}`);
-              } else {
-                registerFindableBlock(lineNumber, codeText, `line:${lineNumber}:code-block`);
               }
+              const codeBlockId = `line:${lineNumber}:code-block`;
+              if (!inline) registerFindableBlock(lineNumber, codeText, codeBlockId);
               if (!inline && language === 'mermaid') {
-                return <MermaidDiagram code={String(children)} />;
+                return (
+                  <div ref={(element) => registerBlockRef(codeBlockId, element)}>
+                    <MermaidDiagram code={String(children)} />
+                  </div>
+                );
               }
               return !inline && match ? (
-                <SyntaxHighlighter
-                  style={oneDark}
-                  language={match[1]}
-                  PreTag="div"
-                  {...props}
-                >
-                  {codeText}
-                </SyntaxHighlighter>
+                <div ref={(element) => registerBlockRef(codeBlockId, element)}>
+                  <SyntaxHighlighter
+                    style={oneDark}
+                    language={match[1]}
+                    PreTag="div"
+                    {...props}
+                  >
+                    {codeText}
+                  </SyntaxHighlighter>
+                </div>
               ) : (
                 <code className={className} {...props}>
                   {children}

@@ -264,6 +264,10 @@ describe('TaskApprovalReader shared find integration', () => {
   });
 
   it('drives task find counts and active navigation from projected markdown blocks', async () => {
+    const originalScrollIntoView = HTMLElement.prototype.scrollIntoView;
+    const scrollIntoView = vi.fn();
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    try {
     renderTaskApprovalReader([
       '# Plan',
       '',
@@ -280,6 +284,10 @@ describe('TaskApprovalReader shared find integration', () => {
     await waitFor(() => expect(screen.getByText('1 of 2')).toBeInTheDocument());
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText('2 of 2')).toBeInTheDocument();
+    await waitFor(() => expect(scrollIntoView).toHaveBeenCalled());
+    } finally {
+      HTMLElement.prototype.scrollIntoView = originalScrollIntoView;
+    }
   });
 
   it('preserves exact spacing offsets between projected task text and rendered highlights', async () => {
