@@ -714,7 +714,19 @@ function ConversationPageContent() {
                 setArchiveStatusConfirmedConversationId(authoritativeConversation.id);
                 await cacheDB.putConversation(authoritativeConversation);
 
-                if (!atomRef.current.conversation || atomRef.current.conversation.slug === slug) {
+                if (
+                  atomRef.current.conversationId === null
+                  || atomRef.current.conversationId === authoritativeConversation.id
+                ) {
+                  dispatchHistoryExpansion({
+                    type: 'view_changed',
+                    view: {
+                      conversationId: authoritativeConversation.id,
+                      generation: historyGenerationRef.current,
+                      transcriptGeneration: authoritativeConversation.transcript_generation ?? latestTranscriptGeneration,
+                    },
+                    hasEarlierHistory: latestWindow.has_older_messages,
+                  });
                   dispatch({
                     type: 'merge_conversation_data',
                     conversationId: authoritativeConversation.id,
@@ -832,7 +844,8 @@ function ConversationPageContent() {
       const currentView = historyViewRef.current;
       const authoritativeTranscriptGeneration = atomRef.current.transcriptGeneration;
       const responseTranscriptGeneration = result.conversation.transcript_generation ?? 1;
-      const requestIsCurrent = currentView.conversationId === request.view.conversationId
+      const requestIsCurrent = result.conversation.id === request.view.conversationId
+        && currentView.conversationId === request.view.conversationId
         && currentView.generation === request.view.generation
         && currentView.transcriptGeneration === request.view.transcriptGeneration
         && authoritativeTranscriptGeneration === request.view.transcriptGeneration

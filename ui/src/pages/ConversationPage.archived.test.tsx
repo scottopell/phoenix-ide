@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ConversationPage } from './ConversationPage';
 import { DesktopLayout } from '../components/DesktopLayout';
@@ -280,6 +280,8 @@ describe('ConversationPage archived read-only rendering', () => {
     renderPage(uuidConversation, uuidRoute);
 
     expect(await screen.findByText('keep this history visible')).toBeInTheDocument();
+    expect(await screen.findByText('incremental catch-up arrived')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Load older messages' })).toBeInTheDocument();
     await waitFor(() => {
       expect(cacheDB.getConversation).toHaveBeenCalledWith(uuidRoute);
     });
@@ -471,6 +473,54 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(screen.queryByText('stale latest-window message')).not.toBeInTheDocument();
     expect(cacheDB.putMessages).not.toHaveBeenCalledWith([staleLatestWindowMessage]);
     expect(cacheDB.putReplicaMeta).not.toHaveBeenCalled();
+  });
+
+  it('rejects full-history responses when a slug resolves to a different conversation', async () => {
+    const cachedConversation = makeConversation({ transcript_generation: 1 });
+    const replacementConversation = makeConversation({ id: 'replacement-conversation', transcript_generation: 1 });
+    const replacementMessage = {
+      ...catchUpMessage,
+      message_id: 'replacement-message',
+      conversation_id: replacementConversation.id,
+      content: [{ type: 'text', text: 'wrong conversation history' }],
+    } as Message;
+
+    vi.mocked(cacheDB.getConversationBySlug).mockResolvedValue(cachedConversation);
+    vi.mocked(cacheDB.getMessages).mockResolvedValue([historyMessage]);
+    vi.mocked(api.getConversationMessagesAfter).mockResolvedValue({
+      messages: [],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 1,
+      has_older_messages: true,
+    });
+    vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
+      messages: [historyMessage],
+      tombstones: [],
+      transcript_generation: 1,
+      server_message_tail: 1,
+      has_older_messages: true,
+    });
+    vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
+      conversation: cachedConversation,
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+    vi.mocked(api.getConversationBySlug).mockResolvedValue({
+      conversation: replacementConversation,
+      messages: [replacementMessage],
+      agent_working: false,
+      presentation_mode: 'idle',
+      context_window_size: 0,
+    });
+
+    renderPage(cachedConversation);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Load older messages' }));
+    await waitFor(() => expect(api.getConversationBySlug).toHaveBeenCalledWith(slug));
+    expect(screen.queryByText('wrong conversation history')).not.toBeInTheDocument();
+    expect(screen.getByText('keep this history visible')).toBeInTheDocument();
   });
 
   it('renders cached messages immediately and incrementally catches up newer messages without a full fetch', async () => {
