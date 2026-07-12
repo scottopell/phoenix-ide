@@ -241,7 +241,7 @@ describe('MessageList', () => {
   });
 
   it('steps from the normalized transcript match index after results shrink', async () => {
-    const initialMessages = [
+    const initialMessages: Message[] = [
       { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha one' }] },
       { ...makeMessage(2, 'agent'), content: [{ type: 'text', text: 'alpha two' }] },
       { ...makeMessage(3, 'agent'), content: [{ type: 'text', text: 'alpha three' }] },

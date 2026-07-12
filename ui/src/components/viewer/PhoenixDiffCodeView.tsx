@@ -87,7 +87,10 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
     const activeFindHeaderMatch = activeFindMatch?.kind === 'diff-file-header'
       ? activeFindMatch
       : null;
-    const isActiveFindHeaderItem = (itemId: string) => activeFindHeaderMatch?.itemId === itemId;
+    const isActiveFindHeaderItem = useCallback(
+      (itemId: string) => activeFindHeaderMatch?.itemId === itemId,
+      [activeFindHeaderMatch],
+    );
     const activeFindHeaderKey = activeFindHeaderMatch
       ? `${activeFindHeaderMatch.itemId}:${activeFindHeaderMatch.startColumn}:${activeFindHeaderMatch.endColumn}`
       : null;
@@ -109,7 +112,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           return anns.length > 0 ? { ...it, annotations: anns, version } : { ...it, version };
         });
       return [...attach(committed.items), ...attach(uncommitted.items)];
-    }, [committed.items, uncommitted.items, notes, highlightedNoteId, activeFindHeaderKey]);
+    }, [committed.items, uncommitted.items, notes, highlightedNoteId, activeFindHeaderKey, isActiveFindHeaderItem]);
 
     const findLineDecorationCss = useMemo(() => diffFindDecorationCSS(findMatches, activeFindMatch), [findMatches, activeFindMatch]);
 
