@@ -178,3 +178,10 @@ Define an exhaustive reducer-owned typed capability projection contract. The pur
 ## Follow-up dependency
 
 The next task is **Persist Atomic Workflow Transitions and Effect DAGs**.
+
+
+## Umbrella authority and dependency
+
+Task 47003 is the sole authority for shared-engine ownership, sequencing, migration gates, and release criteria. This task preserves its historical design context and narrower acceptance detail, but any conflicting creation-first, wake-only, bespoke-scheduler, or rollout direction is superseded. Implementations SHALL follow `specs/durable-workflows/requirements.md` and ADR-010 through ADR-012.
+
+This task is blocked on task 47003 Milestone 1 and is a child of the pure-engine or atomic-persistence milestone respectively.

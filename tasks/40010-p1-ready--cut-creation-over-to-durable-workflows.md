@@ -117,3 +117,10 @@ Only after all legacy creation jobs are drained and rollback policy permits:
 ## Follow-up dependency
 
 The next initiative task is **Adopt Durable Workflows Across the Runtime**.
+
+
+## Umbrella authority and dependency
+
+Task 47003 is the sole authority for shared-engine ownership, sequencing, migration gates, and release criteria. This task preserves its historical design context and narrower acceptance detail, but any conflicting creation-first, wake-only, bespoke-scheduler, or rollout direction is superseded. Implementations SHALL follow `specs/durable-workflows/requirements.md` and ADR-010 through ADR-012.
+
+This task is blocked on engine-backed wake adoption and then serves the creation shadow or cutover milestone respectively.

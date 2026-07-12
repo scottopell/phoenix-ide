@@ -264,3 +264,10 @@ Commit completed milestones as separate logical units. Do not mark this task don
 - force-delete with pending waits.
 
 When sub-agent wake integration is designed, its pending delivery obligations transfer to a continuation successor under the same rule as bash/tmux, while child handle identity remains unchanged. WorkScope ownership for sub-agents requires its own cross-spec decision rather than being smuggled into wake delivery.
+
+
+## Umbrella authority and dependency
+
+Task 47003 is the sole authority for shared-engine ownership, sequencing, migration gates, and release criteria. This task preserves its historical design context and narrower acceptance detail, but any conflicting creation-first, wake-only, bespoke-scheduler, or rollout direction is superseded. Implementations SHALL follow `specs/durable-workflows/requirements.md` and ADR-010 through ADR-012.
+
+Completion is redefined as engine-backed wake adoption under task 47003; the existing wake implementation is a normative profile input, not a permanent independent scheduler.

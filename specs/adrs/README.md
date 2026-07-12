@@ -21,6 +21,9 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [007](007_conversation-creation-uses-fenced-reconciliation.md) | Conversation creation uses fenced reconciliation | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-004, REQ-CCR-005, REQ-CCR-007, REQ-CCR-008, REQ-CCR-010 |
 | [008](008_wake-plane-core-uses-registration-receipts-and-durable-runtime-observations.md) | Wake-plane core uses registration receipts and durable runtime observations | Accepted | REQ-WAKE-001, REQ-WAKE-002, REQ-WAKE-003, REQ-WAKE-004, REQ-WAKE-006, REQ-WAKE-008, REQ-WAKE-009, REQ-WAKE-012, REQ-WAKE-013, REQ-WAKE-016, REQ-WAKE-017, REQ-WAKE-018 |
 | [009](009_wake-resume-scheduling-uses-a-durable-acceptance-outbox.md) | Wake-resume scheduling uses a durable acceptance outbox | Accepted | REQ-WAKE-004, REQ-WAKE-005, REQ-WAKE-008, REQ-WAKE-012 |
+| [010](010_durable-workflows-use-normalized-core-and-typed-profiles.md) | Durable workflows use an engine-owned normalized core and typed profiles | Accepted | REQ-DWF-001–003, REQ-DWF-013, REQ-DWF-015–016, wake and creation profiles |
+| [011](011_workflow-cas-and-leased-effect-authority.md) | Workflow transitions use CAS and every claimed effect uses leased authority | Accepted | REQ-DWF-004–012, REQ-DWF-018 |
+| [012](012_observation-receipt-and-runtime-acceptance-are-distinct.md) | Observation, receipt, and runtime acceptance are distinct durable facts | Accepted | REQ-DWF-001–002, REQ-DWF-007, REQ-DWF-012, REQ-DWF-017, profile acceptance |
 
 ## For agents: which decisions bind your task
 
@@ -37,7 +40,10 @@ Consult the relevant ADRs before starting work of each kind.
 | Specifying inline-terminal history commit, per-command rounds, or user-origin attribution | 004 |
 | Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
 | Specifying wake contracts, async terminal waits, or sub-agent terminal wake delivery | 006, 008, 009 |
-| Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007 |
+| Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007, 010, 011, 012 |
+| Specifying the shared durable workflow engine, profiles, migration, or drain | 010, 011, 012 |
+| Specifying workflow CAS, effect claims, leases, ambiguity, or compensation | 011 |
+| Specifying observations, receipts, reducer delivery, or runtime acceptance | 012 |
 
 ## Decision dependencies
 
@@ -53,6 +59,9 @@ ADR-000 (adopt spEARS v2 for new work)
       │   └── ADR-008 (Wake-plane core uses registration receipts and durable runtime observations)
       │       └── ADR-009 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-007 (Conversation creation uses fenced reconciliation)
+          └── ADR-010 (Durable workflows use normalized core and typed profiles)
+              ├── ADR-011 (Workflow CAS and leased effect authority)
+              └── ADR-012 (Observation, receipt, and runtime acceptance are distinct)
 ```
 
 ## Conventions

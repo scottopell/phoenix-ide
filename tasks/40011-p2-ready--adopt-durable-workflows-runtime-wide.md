@@ -119,3 +119,10 @@ For each child migration:
 - [ ] Full project checks and independent review pass.
 
 Initiative completion requires all selected runtime workflows to use the shared engine or have an explicit documented reason they are ineligible.
+
+
+## Umbrella authority and dependency
+
+Task 47003 is the sole authority for shared-engine ownership, sequencing, migration gates, and release criteria. This task preserves its historical design context and narrower acceptance detail, but any conflicting creation-first, wake-only, bespoke-scheduler, or rollout direction is superseded. Implementations SHALL follow `specs/durable-workflows/requirements.md` and ADR-010 through ADR-012.
+
+This task remains blocked until engine-backed creation cutover and legacy drain complete.
