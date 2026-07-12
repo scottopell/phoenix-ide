@@ -1,0 +1,128 @@
+-- allium: 3
+-- Platform-neutral physical transcript positioning
+
+use "../messagelist-render-units/scroll_policy.allium" as scroll
+
+enum ViewportOwner { system reader }
+enum TransactionKind { preserve_anchor navigate follow_tail initial_tail }
+config {
+    conformance_tolerance: Integer = 2
+}
+
+entity TranscriptView {
+    generation: Integer
+    owner: ViewportOwner
+    ordered_keys: Set<String>
+    measured_keys: Set<String>
+    rendered_start: Integer
+    rendered_end: Integer
+    active_transaction: PositionTransaction?
+}
+
+entity PhysicalAnchor {
+    unit_key: String
+    viewport_start_offset: Integer
+}
+
+entity PositionTransaction {
+    view: TranscriptView
+    token: String
+    generation: Integer
+    kind: TransactionKind
+    anchor: PhysicalAnchor?
+    target_key: String?
+}
+
+surface VirtualTranscript {
+    facing view: TranscriptView
+
+    provides:
+        ViewReplaced(view, generation, ordered_keys)
+        ReaderAnchorCaptured(view, unit_key, viewport_start_offset)
+        PrefixInserted(view, ordered_keys)
+        PositionRequested(view, token, generation, kind, unit_key, viewport_start_offset)
+        UnitMeasured(view, unit_key, extent)
+        GeometryObserved(view, unit_key, viewport_start_offset)
+        TransactionSuperseded(view, token)
+
+    exposes:
+        view.rendered_start
+        view.rendered_end
+        view.active_transaction
+}
+
+rule ViewReplacementDiscardsPhysicalState {
+    when: ViewReplaced(view, generation, ordered_keys)
+    requires: generation > view.generation
+    ensures: view.generation = generation
+    ensures: view.ordered_keys = ordered_keys
+    ensures: view.measured_keys = {}
+    ensures: view.active_transaction = null
+}
+
+rule ReaderCaptureIncludesIdentityAndGeometry {
+    when: ReaderAnchorCaptured(view, unit_key, viewport_start_offset)
+    requires: view.owner = reader
+    requires: view.ordered_keys.contains(unit_key)
+    ensures: PhysicalAnchor(unit_key: unit_key, viewport_start_offset: viewport_start_offset).created()
+}
+
+rule PositionRequestOwnsOneTransaction {
+    when: PositionRequested(view, token, generation, kind, unit_key, viewport_start_offset)
+    requires: generation = view.generation
+    ensures: view.active_transaction = PositionTransaction(
+        view: view,
+        token: token,
+        generation: generation,
+        kind: kind,
+        anchor: PhysicalAnchor(unit_key: unit_key, viewport_start_offset: viewport_start_offset),
+        target_key: unit_key
+    )
+}
+
+rule NewPositionRequestSupersedesPriorTransaction {
+    when: PositionRequested(view, token, generation, kind, unit_key, viewport_start_offset)
+    requires: view.active_transaction != null
+    requires: token != view.active_transaction.token
+    requires: generation = view.generation
+    ensures: view.active_transaction.token = token
+}
+
+rule MeasurementUpdatesAuthoritativeLayout {
+    when: UnitMeasured(view, unit_key, extent)
+    requires: view.ordered_keys.contains(unit_key)
+    requires: extent > 0
+    ensures: view.measured_keys.contains(unit_key)
+}
+
+rule AnchorGeometryCompletesTransaction {
+    when: GeometryObserved(view, unit_key, viewport_start_offset)
+    requires: view.active_transaction != null
+    requires: view.active_transaction.target_key = unit_key
+    requires: absolute(viewport_start_offset - view.active_transaction.anchor.viewport_start_offset)
+        <= config.conformance_tolerance
+    ensures: view.active_transaction = null
+}
+
+rule StaleGeometryCannotCompleteTransaction {
+    when: GeometryObserved(view, unit_key, _)
+    requires: view.active_transaction = null
+        or view.active_transaction.target_key != unit_key
+        or view.active_transaction.generation != view.generation
+    ensures: view.active_transaction = view.active_transaction
+}
+
+rule ExplicitSupersessionTerminatesOwnership {
+    when: TransactionSuperseded(view, token)
+    requires: view.active_transaction != null
+    requires: view.active_transaction.token = token
+    ensures: view.active_transaction = null
+}
+
+invariant RenderedWindowIsContiguous {
+    view.rendered_start <= view.rendered_end
+}
+
+invariant ActiveTransactionBelongsToCurrentView {
+    view.active_transaction != null implies view.active_transaction.generation = view.generation
+}
