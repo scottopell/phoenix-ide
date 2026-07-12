@@ -65,6 +65,7 @@ export function useViewerFind({ text, onNavigate }: UseViewerFindOptions) {
     matches: result.matches,
     matchCount,
     activeIndex,
+    requestedActiveIndex: state.activeIndex,
     activeMatch,
     focusVersion: state.focusVersion,
     open,

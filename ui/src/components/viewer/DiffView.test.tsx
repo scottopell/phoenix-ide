@@ -81,15 +81,17 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     const input = screen.getByRole('textbox', { name: 'Find in viewer' });
     fireEvent.change(input, { target: { value: 'hello' } });
 
-    expect(screen.getByText('0 of 2')).toBeInTheDocument();
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
 
+    const commitLine = document.getElementById('commit-log:0');
+    const scrollIntoView = vi.fn();
+    if (commitLine) commitLine.scrollIntoView = scrollIntoView;
+
+    fireEvent.click(screen.getByRole('button', { name: 'Previous' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
-    expect(codeViewMockState.scrollToCalls.at(-1)).toEqual({
-      type: 'item',
-      id: 'commit-log:0',
-      align: 'start',
-      behavior: 'smooth',
-    });
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'center', behavior: 'smooth' });
   });
 
   it('opens shared viewer find for diff-viewer scope and navigates header then line matches via typed scroll targets', () => {

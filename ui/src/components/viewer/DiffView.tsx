@@ -85,7 +85,12 @@ export function DiffView({
   );
   useViewerFindKeyboardShortcut({ scopeId: 'diff-viewer', onOpen: find.open });
 
-  const activeFindMatchTarget = find.isOpen && find.activeIndex >= 0 ? findProjection.matches[find.activeIndex]?.target ?? null : null;
+  const activeFindIndex = findProjection.matches.length === 0
+    ? -1
+    : Math.min(Math.max(find.requestedActiveIndex, 0), findProjection.matches.length - 1);
+  const activeFindMatchTarget = find.isOpen && activeFindIndex >= 0
+    ? findProjection.matches[activeFindIndex]?.target ?? null
+    : null;
   const findMatchTargets = useMemo(
     () => (find.isOpen ? findProjection.matches.map((match) => match.target) : []),
     [find.isOpen, findProjection.matches],
@@ -114,34 +119,42 @@ export function DiffView({
     [highlight, closePanel],
   );
 
+  const navigateFindTarget = useCallback((target: (typeof findProjection.matches)[number]['target']) => {
+    if (target.kind === 'commit-log-line') {
+      document.getElementById(target.itemId)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return;
+    }
+    codeViewRef.current?.scrollToFindTarget(target);
+  }, []);
+
   const handleFindQueryChange = useCallback((query: string) => {
     find.setQuery(query);
     const nextProjection = buildDiffSearchProjection(committedDiff, uncommittedDiff, query, commitLog);
     const target = nextProjection.matches[0]?.target;
-    if (target) codeViewRef.current?.scrollToFindTarget(target);
-  }, [find, commitLog, committedDiff, uncommittedDiff]);
+    if (target) navigateFindTarget(target);
+  }, [find, commitLog, committedDiff, navigateFindTarget, uncommittedDiff]);
 
   const handleFindNext = useCallback(() => {
-    find.nextMatch();
     const nextIndex = findProjection.matches.length === 0
       ? -1
-      : find.activeIndex < 0
+      : find.requestedActiveIndex < 0
         ? 0
-        : (find.activeIndex + 1) % findProjection.matches.length;
+        : (find.requestedActiveIndex + 1) % findProjection.matches.length;
+    find.setActiveIndex(nextIndex);
     const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
-    if (target) codeViewRef.current?.scrollToFindTarget(target);
-  }, [find, findProjection.matches]);
+    if (target) navigateFindTarget(target);
+  }, [find, findProjection.matches, navigateFindTarget]);
 
   const handleFindPrevious = useCallback(() => {
-    find.previousMatch();
     const nextIndex = findProjection.matches.length === 0
       ? -1
-      : find.activeIndex < 0
+      : find.requestedActiveIndex < 0
         ? Math.max(findProjection.matches.length - 1, 0)
-        : (find.activeIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
+        : (find.requestedActiveIndex - 1 + findProjection.matches.length) % findProjection.matches.length;
+    find.setActiveIndex(nextIndex);
     const target = nextIndex >= 0 ? findProjection.matches[nextIndex]?.target : null;
-    if (target) codeViewRef.current?.scrollToFindTarget(target);
-  }, [find, findProjection.matches]);
+    if (target) navigateFindTarget(target);
+  }, [find, findProjection.matches, navigateFindTarget]);
 
   if (!open) return null;
 
@@ -182,7 +195,7 @@ export function DiffView({
       banner={find.isOpen ? (
         <FindBar
           query={find.query}
-          activeIndex={find.activeIndex}
+          activeIndex={activeFindIndex}
           matchCount={findProjection.matches.length}
           focusVersion={find.focusVersion}
           onQueryChange={handleFindQueryChange}
@@ -265,7 +278,7 @@ function CommitLogSection({ commitLog }: { commitLog: string }) {
       <h3 className="diff-section-title">Commits</h3>
       <div className="diff-pre diff-pre-log">
         {commitLog.split('\n').map((line, i) => (
-          <div key={i} className="diff-line">
+          <div id={`commit-log:${i}`} key={i} className="diff-line">
             {line || ' '}
           </div>
         ))}

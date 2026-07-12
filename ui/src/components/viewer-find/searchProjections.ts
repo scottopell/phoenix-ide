@@ -38,7 +38,7 @@ export interface FileSearchSource extends SearchableSource<FileSearchMatchTarget
 export type FileSearchProjection = SearchableSourceProjection<FileSearchMatchTarget, FileSearchSource>;
 
 export interface DiffSearchMatchTarget {
-  kind: 'diff-file-header' | 'diff-line';
+  kind: 'commit-log-line' | 'diff-file-header' | 'diff-line';
   section: DiffSection;
   filePath: string;
   itemId: string;
@@ -150,7 +150,7 @@ export function buildDiffSearchProjection(
       order: order++,
       text: commitLogLines[lineIndex] ?? '',
       target: {
-        kind: 'diff-file-header',
+        kind: 'commit-log-line',
         section: 'committed',
         filePath: '',
         itemId: `commit-log:${lineIndex}`,
