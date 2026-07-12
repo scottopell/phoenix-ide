@@ -18,6 +18,7 @@ mod recovery;
 pub mod traits;
 pub mod usage_limit_sweep;
 pub mod user_facing_error;
+pub(crate) mod wake;
 
 #[cfg(test)]
 pub mod testing;
@@ -226,6 +227,31 @@ pub struct RuntimeManager {
     work_scope_browser_rx: RwLock<Option<mpsc::UnboundedReceiver<WorkScope>>>,
     creation_kick_tx: tokio::sync::watch::Sender<u64>,
     creation_kick_rx: RwLock<Option<tokio::sync::watch::Receiver<u64>>>,
+    /// Per-conversation wake dispatcher claims. A claim spans live-state
+    /// validation, atomic inbox persistence, and event enqueue so overlapping
+    /// dispatcher invocations cannot schedule the same conversation together.
+    wake_dispatch_claims:
+        Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+pub(crate) struct WakeDispatchClaim {
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    key: String,
+    claim: Arc<tokio::sync::Mutex<()>>,
+    claims: Arc<std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+impl Drop for WakeDispatchClaim {
+    fn drop(&mut self) {
+        self.guard.take();
+        let mut claims = self.claims.lock().expect("wake claims mutex poisoned");
+        let should_remove = claims.get(&self.key).is_some_and(|entry| {
+            entry.ptr_eq(&Arc::downgrade(&self.claim)) && entry.strong_count() == 1
+        });
+        if should_remove {
+            claims.remove(&self.key);
+        }
+    }
 }
 
 /// Handle to interact with a running conversation
@@ -972,6 +998,11 @@ pub enum SseEvent {
         /// repopulate the in-flight UI.
         pending_truncated: bool,
     },
+    /// Best-effort private edge proving a wake registration is durably committed.
+    WakeContractRegistered {
+        sequence_id: i64,
+        registration: phoenix_core::domain::wake_contracts::WakeContractRegistered,
+    },
     /// A newly-persisted message joins the conversation. Uses `message.sequence_id`
     /// as its envelope `sequence_id` — no separate field needed because
     /// `message.sequence_id` is already the DB-allocated id and, thanks to
@@ -1135,6 +1166,13 @@ pub enum SseEvent {
     },
 }
 
+impl SseEvent {
+    /// Events carrying authenticated conversation-operational data.
+    pub(crate) fn is_private(&self) -> bool {
+        matches!(self, Self::WakeContractRegistered { .. })
+    }
+}
+
 /// Pick the tool registry for a sub-agent runtime on (re-)creation from
 /// its persisted `conv_mode`.
 ///
@@ -1221,7 +1259,54 @@ impl RuntimeManager {
             work_scope_browser_rx: RwLock::new(Some(work_scope_browser_rx)),
             creation_kick_tx,
             creation_kick_rx: RwLock::new(Some(creation_kick_rx)),
+            wake_dispatch_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Reconcile durable wakes before starting the periodic observer/dispatcher.
+    pub async fn start_wake_plane(self: &Arc<Self>) {
+        wake::reconcile_pending(self, true).await;
+        wake::dispatch_pending(self, true).await;
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                wake::reconcile_pending(&manager, false).await;
+                wake::dispatch_pending(&manager, false).await;
+            }
+        });
+    }
+
+    /// Try to claim this conversation for one wake dispatch without waiting.
+    pub(crate) fn try_claim_wake_dispatch(
+        &self,
+        conversation_id: &str,
+    ) -> Option<WakeDispatchClaim> {
+        let claim = {
+            let mut claims = self
+                .wake_dispatch_claims
+                .lock()
+                .expect("wake claims mutex poisoned");
+            if let Some(claim) = claims
+                .get(conversation_id)
+                .and_then(std::sync::Weak::upgrade)
+            {
+                claim
+            } else {
+                let claim = Arc::new(tokio::sync::Mutex::new(()));
+                claims.insert(conversation_id.to_string(), Arc::downgrade(&claim));
+                claim
+            }
+        };
+        let guard = Arc::clone(&claim).try_lock_owned().ok()?;
+        Some(WakeDispatchClaim {
+            guard: Some(guard),
+            key: conversation_id.to_string(),
+            claim,
+            claims: Arc::clone(&self.wake_dispatch_claims),
+        })
     }
 
     /// Get the detected platform capability
@@ -2055,6 +2140,9 @@ impl RuntimeManager {
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
+        let runtime = runtime.with_wake_registrar(Arc::new(
+            wake::DbWakeRegistrar::with_broadcaster(self.db.clone(), broadcaster.clone()),
+        ));
 
         // Live-state watch channel for sub-agent (seeded Idle; transitions publish updates).
         let (sub_state_tx, sub_state_rx) = watch::channel(ConvState::Idle);
@@ -2424,6 +2512,9 @@ impl RuntimeManager {
         .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone())
         .with_agent_catalog(agent_catalog);
+        let runtime = runtime.with_wake_registrar(Arc::new(
+            wake::DbWakeRegistrar::with_broadcaster(self.db.clone(), broadcaster.clone()),
+        ));
 
         // Fork proposals are bound to top-level (parent) origins; sub-agents
         // never hold any. Give parent runtimes the fork-resolution consumer
@@ -2557,6 +2648,23 @@ impl RuntimeManager {
             let mut rx = event_rx;
             while rx.recv().await.is_some() {}
         });
+        let (_state_tx, state_rx) = watch::channel(live_state);
+        self.runtimes.write().await.insert(
+            conv_id.to_string(),
+            ConversationHandle {
+                event_tx,
+                turn_trigger: TurnTriggerSlot::default(),
+                broadcast_tx: SseBroadcaster::new(SSE_BROADCAST_CAPACITY, 0),
+                identity: Arc::new(()),
+                state_rx,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inject_closed_handle_for_test(&self, conv_id: &str, live_state: ConvState) {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        drop(event_rx);
         let (_state_tx, state_rx) = watch::channel(live_state);
         self.runtimes.write().await.insert(
             conv_id.to_string(),
@@ -2782,6 +2890,28 @@ impl RuntimeManager {
             .remove(conversation_id)
     }
 
+    async fn creation_job_owns_llm_requesting(
+        &self,
+        conversation_id: &str,
+    ) -> Result<bool, String> {
+        self.db
+            .get_conversation_creation_job_for_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())
+            .map(|job| {
+                job.is_some_and(|job| {
+                    matches!(
+                        job.protocol.status,
+                        phoenix_core::domain::creation_protocol::CreationStatus::Accepted
+                            | phoenix_core::domain::creation_protocol::CreationStatus::Claimed(_)
+                            | phoenix_core::domain::creation_protocol::CreationStatus::RetryScheduled {
+                                ..
+                            }
+                    )
+                })
+            })
+    }
+
     /// Determine the resume state for a conversation.
     ///
     /// Delegates to `recovery::should_auto_continue` for the actual logic.
@@ -2812,20 +2942,8 @@ impl RuntimeManager {
 
         if matches!(conv.state, ConvState::LlmRequesting { .. })
             && self
-                .db
-                .get_conversation_creation_job_for_conversation(conversation_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .is_some_and(|job| {
-                    matches!(
-                        job.protocol.status,
-                        phoenix_core::domain::creation_protocol::CreationStatus::Accepted
-                            | phoenix_core::domain::creation_protocol::CreationStatus::Claimed(_)
-                            | phoenix_core::domain::creation_protocol::CreationStatus::RetryScheduled {
-                                ..
-                            }
-                    )
-                })
+                .creation_job_owns_llm_requesting(conversation_id)
+                .await?
         {
             return Ok((conv.state, row_state_updated_at, false));
         }
@@ -2876,7 +2994,22 @@ impl RuntimeManager {
             .await
             .map_err(|e| e.to_string())?;
 
-        let decision = recovery::should_auto_continue(&messages);
+        let mut decision = recovery::should_auto_continue(&messages);
+        if decision.needs_auto_continue {
+            let trailing_tool_ids = recovery::trailing_tool_round_ids(&messages);
+            if self
+                .db
+                .has_pending_wake_registration(conversation_id, &trailing_tool_ids)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                decision = recovery::RecoveryDecision {
+                    state: ConvState::Idle,
+                    needs_auto_continue: false,
+                    reason: recovery::RecoveryReason::ParkedWakeRound,
+                };
+            }
+        }
 
         tracing::debug!(
             conv_id = %conversation_id,
@@ -3245,6 +3378,25 @@ mod broadcaster_tests {
             SseEvent::Token { sequence_id, ref text, .. } if sequence_id == second_seq + 1 && text == "queued"
         ));
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn dropping_failed_or_idempotent_reservation_releases_queued_broadcasts() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let b = SseBroadcaster::new(16, 0);
+        let mut rx = b.subscribe();
+
+        for expected_text in ["after-db-failure", "after-idempotent-existing"] {
+            let (guard, _) = b.reserve_next_persisted_message_range(1);
+            let _ = b.send_seq(|seq| token_event(seq, expected_text));
+            assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+            drop(guard);
+            assert!(matches!(
+                rx.try_recv().expect("queued event released"),
+                SseEvent::Token { ref text, .. } if text == expected_text
+            ));
+        }
     }
 
     /// `observe_seq` is idempotent when the broadcaster's counter is
@@ -3715,7 +3867,7 @@ mod scope_liveness_tests {
     use crate::tools::mcp::McpClientManager;
     use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
     use phoenix_core::domain::sm_state::ConvState;
-    use phoenix_llm::ModelRegistry;
+    use phoenix_llm::{ContentBlock, ModelRegistry};
 
     fn work_mode(worktree_path: &str) -> ConvMode {
         ConvMode::Work {
@@ -3889,6 +4041,77 @@ mod scope_liveness_tests {
             "usage-limit Error must be restored on recreate, got {state:?}"
         );
         assert!(!needs_auto_continue);
+    }
+
+    #[tokio::test]
+    async fn determine_resume_state_parks_checkpointed_wake_round_after_restart() {
+        use crate::db::{MessageContent, ToolContent};
+        use crate::runtime::wake::DbWakeRegistrar;
+        use phoenix_core::work_scope::WorkScope;
+        use phoenix_tools::{WakeRegistrar, WakeRegistration, WakeRegistrationTarget};
+
+        let mgr = test_manager().await;
+        mgr.db()
+            .create_conversation("wake-restart", "slug", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let registrar = DbWakeRegistrar::new(mgr.db().clone());
+        registrar
+            .register(
+                WakeRegistration {
+                    conversation_id: "wake-restart".to_string(),
+                    tool_use_id: "wait-restart".to_string(),
+                    work_scope: WorkScope::Conversation("wake-restart".to_string()),
+                    target: WakeRegistrationTarget::Bash {
+                        handle_id: "bash-restart".to_string(),
+                        initial_terminal_evidence: None,
+                    },
+                    max_wait_seconds: 60,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("registration");
+        mgr.db()
+            .add_message(
+                "agent-wake-restart",
+                "wake-restart",
+                &MessageContent::Agent(vec![ContentBlock::ToolUse {
+                    id: "wait-restart".to_string(),
+                    name: "wait_until".to_string(),
+                    input: serde_json::json!({}),
+                }]),
+                None,
+                None,
+            )
+            .await
+            .expect("assistant checkpoint row");
+        mgr.db()
+            .add_message(
+                "tool-result-wake-restart",
+                "wake-restart",
+                &MessageContent::Tool(ToolContent {
+                    tool_use_id: "wait-restart".to_string(),
+                    content: "registered".to_string(),
+                    is_error: false,
+                    images: vec![],
+                }),
+                None,
+                None,
+            )
+            .await
+            .expect("tool checkpoint row");
+
+        let (state, _ts, needs_auto_continue) = mgr
+            .determine_resume_state("wake-restart")
+            .await
+            .expect("resume decision");
+
+        assert_eq!(state, ConvState::Idle);
+        assert!(
+            !needs_auto_continue,
+            "durable wake round must remain parked"
+        );
     }
 
     #[tokio::test]

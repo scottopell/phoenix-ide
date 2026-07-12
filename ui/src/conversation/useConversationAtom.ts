@@ -62,6 +62,7 @@ export type ConversationPageView = Pick<
   | 'phaseStateUpdatedAt'
   | 'firstByteRequestId'
   | 'turnRetryContext'
+  | 'wakeStatus'
 >;
 
 const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
@@ -76,6 +77,7 @@ const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
   'phaseStateUpdatedAt',
   'firstByteRequestId',
   'turnRetryContext',
+  'wakeStatus',
 ];
 
 function pageViewsEqual(a: ConversationPageView, b: ConversationPageView): boolean {
@@ -122,6 +124,7 @@ export function useConversationView(
       phaseStateUpdatedAt: a.phaseStateUpdatedAt,
       firstByteRequestId: a.firstByteRequestId,
       turnRetryContext: a.turnRetryContext,
+      wakeStatus: a.wakeStatus,
     };
     const prev = lastRef.current;
     if (prev && pageViewsEqual(prev, next)) return prev;

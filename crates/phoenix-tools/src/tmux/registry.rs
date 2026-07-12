@@ -33,12 +33,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
+use chrono::{DateTime, Utc};
 use phoenix_core::runtime_env::PhoenixRuntimeEnvironment;
 use phoenix_core::work_scope::WorkScope;
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{OnceCell, RwLock};
 
 use super::probe::{probe, ProbeResult};
@@ -57,6 +61,9 @@ const PANE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// The leading underscore avoids collision with the `conv-<id>.sock`
 /// socket-file naming pattern.
 const SERVER_CONFIG_FILENAME: &str = "_phoenix.tmux.conf";
+const TERMINAL_EVIDENCE_DIR: &str = "_terminal-evidence";
+const TERMINAL_EVIDENCE_VERSION: u8 = 2;
+const SERVER_GENERATION_VAR: &str = "PHOENIX_TMUX_GENERATION";
 
 /// Embedded Phoenix tmux server config. Source-of-truth lives in
 /// `src/tools/tmux/server.conf`; the file is written into the socket
@@ -98,6 +105,16 @@ pub enum TmuxError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("tmux terminal evidence I/O failed at {path}: {source}")]
+    EvidenceIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("tmux terminal evidence at {path} is invalid: {reason}")]
+    InvalidEvidence { path: PathBuf, reason: String },
 }
 
 /// Lifecycle state of a per-`WorkScope` tmux server.
@@ -136,6 +153,8 @@ pub struct TmuxServer {
     #[allow(dead_code)]
     pub work_scope: WorkScope,
     pub socket_path: PathBuf,
+    /// Identity of the tmux server process currently bound to `socket_path`.
+    pub generation: Option<String>,
     pub status: ServerStatus,
 }
 
@@ -144,9 +163,20 @@ impl TmuxServer {
         Self {
             work_scope,
             socket_path,
+            generation: None,
             status: ServerStatus::NotProbed,
         }
     }
+}
+
+const TMUX_RUN_EXIT_MARKER_PREFIX: &str = "[phoenix] process exited with code ";
+
+fn parse_tmux_run_exit_marker(output: &str) -> Option<i32> {
+    output.lines().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix(TMUX_RUN_EXIT_MARKER_PREFIX)
+            .and_then(|code| code.parse().ok())
+    })
 }
 
 /// Compute the deterministic socket path for a worktree-scoped session
@@ -209,6 +239,86 @@ pub struct TmuxLifecycleEvent {
 /// path. Mirrors [`super::super::bash::registry::BashLifecycleSink`].
 pub type TmuxLifecycleSink = tokio::sync::mpsc::UnboundedSender<TmuxLifecycleEvent>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TmuxTerminalStatus {
+    Exited,
+    Killed,
+}
+
+#[derive(Debug, Clone)]
+pub struct TmuxTerminalEvidence {
+    pub observed_at: SystemTime,
+    pub exit_code: Option<i32>,
+    pub status: TmuxTerminalStatus,
+    pub duration_ms: u64,
+    pub tail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DurableEvidenceStatus {
+    Exited,
+    KillPending,
+    Killed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableTerminalEvidence {
+    version: u8,
+    socket_identity: String,
+    generation: String,
+    window_id: String,
+    observed_at: DateTime<Utc>,
+    status: DurableEvidenceStatus,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    tail: String,
+}
+
+impl DurableTerminalEvidence {
+    fn terminal_evidence(&self) -> Option<TmuxTerminalEvidence> {
+        let status = match self.status {
+            DurableEvidenceStatus::Exited => TmuxTerminalStatus::Exited,
+            DurableEvidenceStatus::Killed => TmuxTerminalStatus::Killed,
+            DurableEvidenceStatus::KillPending => return None,
+        };
+        Some(TmuxTerminalEvidence {
+            observed_at: self.observed_at.into(),
+            exit_code: self.exit_code,
+            status,
+            duration_ms: self.duration_ms,
+            tail: self.tail.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TmuxWindowInspection {
+    Missing,
+    Live,
+    Terminal(TmuxTerminalEvidence),
+}
+
+/// Stable identity for one `tmux_run` invocation. It survives a `WorkScope` rekey.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TmuxWindowRunId(String);
+
+#[derive(Debug, Clone)]
+struct TmuxWindowRun {
+    scope: WorkScope,
+    window_id: String,
+    generation: String,
+    close_after_completion: bool,
+    observer_claimed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TmuxWindowStart {
+    started_at: Instant,
+}
+
 /// Top-level registry: maps `WorkScope::stable_key()` → per-scope tmux
 /// server. One registry instance per Phoenix process.
 #[derive(Debug)]
@@ -217,6 +327,9 @@ pub struct TmuxRegistry {
     /// members share an entry, and Worktree vs Conversation namespaces
     /// stay disjoint.
     inner: RwLock<HashMap<String, Arc<RwLock<TmuxServer>>>>,
+    window_starts: RwLock<HashMap<(WorkScope, String), TmuxWindowStart>>,
+    terminal_evidence: RwLock<HashMap<(WorkScope, String), TmuxTerminalEvidence>>,
+    window_runs: std::sync::Mutex<HashMap<TmuxWindowRunId, TmuxWindowRun>>,
     socket_dir: PathBuf,
     binary_available: bool,
     /// Bootstrap of the socket dir + 0700 perms + Phoenix server config
@@ -251,6 +364,9 @@ impl TmuxRegistry {
         let binary_available = which::which("tmux").is_ok();
         Self {
             inner: RwLock::new(HashMap::new()),
+            window_starts: RwLock::new(HashMap::new()),
+            terminal_evidence: RwLock::new(HashMap::new()),
+            window_runs: std::sync::Mutex::new(HashMap::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -300,6 +416,9 @@ impl TmuxRegistry {
     pub fn with_socket_dir_and_binary(socket_dir: PathBuf, binary_available: bool) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
+            window_starts: RwLock::new(HashMap::new()),
+            terminal_evidence: RwLock::new(HashMap::new()),
+            window_runs: std::sync::Mutex::new(HashMap::new()),
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
@@ -324,6 +443,9 @@ impl TmuxRegistry {
             binary_available,
             runtime_assets: OnceCell::new(),
             lifecycle_sink: sink,
+            window_starts: RwLock::new(HashMap::new()),
+            terminal_evidence: RwLock::new(HashMap::new()),
+            window_runs: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -483,11 +605,14 @@ impl TmuxRegistry {
         let mut reused_live = false;
         match probe_result {
             ProbeResult::Live => {
+                server.generation = Some(recover_or_install_generation(&server.socket_path).await?);
                 server.status = ServerStatus::Live;
                 reused_live = true;
             }
             ProbeResult::NoSocket => {
-                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                let generation = uuid::Uuid::new_v4().to_string();
+                spawn_session(&server.socket_path, &self.config_path(), cwd, &generation).await?;
+                server.generation = Some(generation);
                 server.status = ServerStatus::Live;
             }
             ProbeResult::DeadSocket => {
@@ -499,7 +624,9 @@ impl TmuxRegistry {
                     "tmux: stale socket detected, unlinking and respawning"
                 );
                 let _ = tokio::fs::remove_file(&server.socket_path).await;
-                spawn_session(&server.socket_path, &self.config_path(), cwd).await?;
+                let generation = uuid::Uuid::new_v4().to_string();
+                spawn_session(&server.socket_path, &self.config_path(), cwd, &generation).await?;
+                server.generation = Some(generation);
                 server.status = ServerStatus::Live;
             }
         }
@@ -564,6 +691,834 @@ impl TmuxRegistry {
         (entry, true)
     }
 
+    #[cfg(test)]
+    pub async fn install_generation_for_test(&self, work_scope: &WorkScope, generation: &str) {
+        let socket = self.derived_socket_path(work_scope);
+        let (entry, _) = self.get_or_insert(work_scope, socket).await;
+        entry.write().await.generation = Some(generation.to_string());
+    }
+
+    /// Register a newly-created window and clear stale evidence for a reused id.
+    ///
+    /// # Errors
+    /// Returns an error if no generated live server owns the window or stale
+    /// evidence cannot be removed.
+    pub async fn register_window_start(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+    ) -> Result<TmuxWindowRunId, TmuxError> {
+        let entry =
+            self.get_existing(work_scope)
+                .await
+                .ok_or_else(|| TmuxError::InvalidEvidence {
+                    path: self.evidence_path(work_scope, window_id),
+                    reason: "window registered without a live tmux server".to_string(),
+                })?;
+        let generation =
+            entry
+                .read()
+                .await
+                .generation
+                .clone()
+                .ok_or_else(|| TmuxError::InvalidEvidence {
+                    path: self.evidence_path(work_scope, window_id),
+                    reason: "live tmux server has no generation".to_string(),
+                })?;
+        let key = (work_scope.clone(), window_id.to_string());
+        self.window_starts.write().await.insert(
+            key.clone(),
+            TmuxWindowStart {
+                started_at: Instant::now(),
+            },
+        );
+        self.terminal_evidence.write().await.remove(&key);
+        self.remove_evidence_file(work_scope, window_id).await?;
+        let id = TmuxWindowRunId(uuid::Uuid::new_v4().to_string());
+        self.window_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                id.clone(),
+                TmuxWindowRun {
+                    scope: work_scope.clone(),
+                    window_id: window_id.to_string(),
+                    generation,
+                    close_after_completion: false,
+                    observer_claimed: false,
+                },
+            );
+        Ok(id)
+    }
+
+    pub fn claim_terminal_observer(
+        &self,
+        id: &TmuxWindowRunId,
+        close_after_completion: bool,
+    ) -> bool {
+        let mut runs = self
+            .window_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(run) = runs.get_mut(id) else {
+            return false;
+        };
+        if run.observer_claimed {
+            return false;
+        }
+        run.observer_claimed = true;
+        run.close_after_completion = close_after_completion;
+        true
+    }
+
+    pub fn release_terminal_observer(&self, id: &TmuxWindowRunId) {
+        self.window_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    fn resolve_window_run(&self, id: &TmuxWindowRunId) -> Option<TmuxWindowRun> {
+        self.window_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+    }
+
+    /// Persist terminal evidence using the run's current scope alias.
+    ///
+    /// # Errors
+    /// Returns an error when the identity is unknown, its generation changed,
+    /// or the durable write fails.
+    pub async fn record_run_terminal(
+        &self,
+        id: &TmuxWindowRunId,
+        exit_code: Option<i32>,
+        tail: String,
+    ) -> Result<TmuxTerminalEvidence, TmuxError> {
+        let run = self
+            .resolve_window_run(id)
+            .ok_or_else(|| TmuxError::InvalidEvidence {
+                path: self.socket_dir.clone(),
+                reason: "unknown tmux window run identity".to_string(),
+            })?;
+        self.record_window_terminal_for_generation(
+            &run.scope,
+            &run.window_id,
+            &run.generation,
+            exit_code,
+            TmuxTerminalStatus::Exited,
+            tail,
+        )
+        .await
+    }
+
+    /// Kill the run's pane only while its original server generation is current.
+    ///
+    /// # Errors
+    /// Returns an error when the identity/scope is unavailable or tmux cannot be
+    /// invoked.
+    pub async fn cleanup_run_window(&self, id: &TmuxWindowRunId) -> Result<(), TmuxError> {
+        let run = self
+            .resolve_window_run(id)
+            .ok_or_else(|| TmuxError::InvalidEvidence {
+                path: self.socket_dir.clone(),
+                reason: "unknown tmux window run identity".to_string(),
+            })?;
+        let entry =
+            self.get_existing(&run.scope)
+                .await
+                .ok_or_else(|| TmuxError::InvalidEvidence {
+                    path: self.socket_dir.clone(),
+                    reason: "tmux run scope retired without replacement".to_string(),
+                })?;
+        let server = entry.read().await;
+        if server.generation.as_deref() != Some(&run.generation) {
+            return Ok(());
+        }
+        let output = tokio::process::Command::new("tmux")
+            .args([
+                "-S",
+                &server.socket_path.to_string_lossy(),
+                "kill-window",
+                "-t",
+                &run.window_id,
+            ])
+            .env_remove("TMUX")
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        if let Err(source) = output {
+            return Err(TmuxError::ProbeFailed {
+                socket_path: server.socket_path.clone(),
+                source,
+            });
+        }
+        Ok(())
+    }
+
+    fn digest_prefix_hex(digest: &[u8]) -> String {
+        use std::fmt::Write as _;
+        digest[..16]
+            .iter()
+            .fold(String::with_capacity(32), |mut encoded, byte| {
+                write!(encoded, "{byte:02x}").expect("writing to String is infallible");
+                encoded
+            })
+    }
+
+    fn evidence_scope_dir(&self, work_scope: &WorkScope) -> PathBuf {
+        let mut hash = Sha256::new();
+        hash.update(work_scope.stable_key().as_bytes());
+        let digest = hash.finalize();
+        self.socket_dir
+            .join(TERMINAL_EVIDENCE_DIR)
+            .join(format!("scope-{}", Self::digest_prefix_hex(&digest)))
+    }
+
+    fn evidence_path(&self, work_scope: &WorkScope, window_id: &str) -> PathBuf {
+        let mut hash = Sha256::new();
+        hash.update(window_id.as_bytes());
+        let digest = hash.finalize();
+        self.evidence_scope_dir(work_scope)
+            .join(format!("window-{}.json", Self::digest_prefix_hex(&digest)))
+    }
+
+    fn durable_record(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+        generation: &str,
+        evidence: &TmuxTerminalEvidence,
+        status: DurableEvidenceStatus,
+    ) -> DurableTerminalEvidence {
+        DurableTerminalEvidence {
+            version: TERMINAL_EVIDENCE_VERSION,
+            socket_identity: self
+                .derived_socket_path(work_scope)
+                .to_string_lossy()
+                .into_owned(),
+            generation: generation.to_string(),
+            window_id: window_id.to_string(),
+            observed_at: evidence.observed_at.into(),
+            status,
+            exit_code: evidence.exit_code,
+            duration_ms: evidence.duration_ms,
+            tail: evidence.tail.clone(),
+        }
+    }
+
+    async fn write_durable_evidence(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+        record: &DurableTerminalEvidence,
+    ) -> Result<(), TmuxError> {
+        self.ensure_runtime_assets().await?;
+        let path = self.evidence_path(work_scope, window_id);
+        let parent = path.parent().expect("evidence path always has a parent");
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|source| TmuxError::EvidenceIo {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        #[cfg(unix)]
+        tokio::fs::set_permissions(parent, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .await
+            .map_err(|source| TmuxError::EvidenceIo {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+
+        let bytes = serde_json::to_vec(record).map_err(|source| TmuxError::InvalidEvidence {
+            path: path.clone(),
+            reason: source.to_string(),
+        })?;
+        let temp_path = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&temp_path)
+            .await
+            .map_err(|source| TmuxError::EvidenceIo {
+                path: temp_path.clone(),
+                source,
+            })?;
+        let write_result = async {
+            file.write_all(&bytes).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&temp_path, &path).await?;
+            let parent = parent.to_path_buf();
+            tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all())
+                .await
+                .map_err(std::io::Error::other)??;
+            Ok(())
+        }
+        .await;
+        if let Err(source) = write_result {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(TmuxError::EvidenceIo { path, source });
+        }
+        Ok(())
+    }
+
+    async fn load_durable_evidence(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+    ) -> Result<Option<DurableTerminalEvidence>, TmuxError> {
+        let path = self.evidence_path(work_scope, window_id);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(TmuxError::EvidenceIo { path, source }),
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|source| TmuxError::InvalidEvidence {
+                path: path.clone(),
+                reason: source.to_string(),
+            })?;
+        if value.get("version").and_then(serde_json::Value::as_u64)
+            != Some(u64::from(TERMINAL_EVIDENCE_VERSION))
+        {
+            self.remove_evidence_file(work_scope, window_id).await?;
+            return Ok(None);
+        }
+        let record: DurableTerminalEvidence =
+            serde_json::from_value(value).map_err(|source| TmuxError::InvalidEvidence {
+                path: path.clone(),
+                reason: source.to_string(),
+            })?;
+        if record.window_id != window_id {
+            return Err(TmuxError::InvalidEvidence {
+                path,
+                reason: "window identity mismatch".to_string(),
+            });
+        }
+        let current_generation = self.current_generation(work_scope).await;
+        if current_generation.as_deref() != Some(&record.generation) {
+            self.remove_evidence_file(work_scope, window_id).await?;
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
+    async fn current_generation(&self, work_scope: &WorkScope) -> Option<String> {
+        let entry = self.get_existing(work_scope).await?;
+        let generation = entry.read().await.generation.clone();
+        generation
+    }
+
+    async fn remove_evidence_file(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+    ) -> Result<(), TmuxError> {
+        let path = self.evidence_path(work_scope, window_id);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(TmuxError::EvidenceIo { path, source }),
+        }
+    }
+
+    fn terminal_evidence(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+        exit_code: Option<i32>,
+        status: TmuxTerminalStatus,
+        tail: String,
+    ) -> TmuxTerminalEvidence {
+        let key = (work_scope.clone(), window_id.to_string());
+        let duration_ms = self
+            .window_starts
+            .try_read()
+            .ok()
+            .and_then(|starts| starts.get(&key).cloned())
+            .map_or(0, |start| {
+                u64::try_from(start.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+            });
+        TmuxTerminalEvidence {
+            observed_at: SystemTime::now(),
+            exit_code,
+            status,
+            duration_ms,
+            tail,
+        }
+    }
+
+    /// Persist terminal evidence before publishing it to process memory.
+    ///
+    /// # Errors
+    /// Returns an error when runtime assets, serialization, or the atomic
+    /// sidecar write cannot complete.
+    pub async fn record_window_terminal(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+        exit_code: Option<i32>,
+        status: TmuxTerminalStatus,
+        tail: String,
+    ) -> Result<TmuxTerminalEvidence, TmuxError> {
+        let generation = self.current_generation(work_scope).await.ok_or_else(|| {
+            TmuxError::InvalidEvidence {
+                path: self.evidence_path(work_scope, window_id),
+                reason: "terminal evidence has no current server generation".to_string(),
+            }
+        })?;
+        self.record_window_terminal_for_generation(
+            work_scope,
+            window_id,
+            &generation,
+            exit_code,
+            status,
+            tail,
+        )
+        .await
+    }
+
+    async fn record_window_terminal_for_generation(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+        generation: &str,
+        exit_code: Option<i32>,
+        status: TmuxTerminalStatus,
+        tail: String,
+    ) -> Result<TmuxTerminalEvidence, TmuxError> {
+        if self.current_generation(work_scope).await.as_deref() != Some(generation) {
+            return Err(TmuxError::InvalidEvidence {
+                path: self.evidence_path(work_scope, window_id),
+                reason: "tmux server generation changed before evidence commit".to_string(),
+            });
+        }
+        let key = (work_scope.clone(), window_id.to_string());
+        if status == TmuxTerminalStatus::Killed {
+            if let Some(existing) = self.terminal_evidence.read().await.get(&key).cloned() {
+                if existing.status == TmuxTerminalStatus::Exited {
+                    return Ok(existing);
+                }
+            }
+            if let Some(record) = self.load_durable_evidence(work_scope, window_id).await? {
+                if record.status == DurableEvidenceStatus::Exited {
+                    if let Some(existing) = record.terminal_evidence() {
+                        self.terminal_evidence
+                            .write()
+                            .await
+                            .insert(key, existing.clone());
+                        return Ok(existing);
+                    }
+                }
+            }
+        }
+        let duration_ms = self
+            .window_starts
+            .read()
+            .await
+            .get(&key)
+            .map_or(0, |start| {
+                u64::try_from(start.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+            });
+        let evidence = TmuxTerminalEvidence {
+            observed_at: SystemTime::now(),
+            exit_code,
+            status,
+            duration_ms,
+            tail,
+        };
+        let durable_status = match status {
+            TmuxTerminalStatus::Exited => DurableEvidenceStatus::Exited,
+            TmuxTerminalStatus::Killed => DurableEvidenceStatus::Killed,
+        };
+        let record =
+            self.durable_record(work_scope, window_id, generation, &evidence, durable_status);
+        self.write_durable_evidence(work_scope, window_id, &record)
+            .await?;
+        self.terminal_evidence
+            .write()
+            .await
+            .insert(key, evidence.clone());
+        Ok(evidence)
+    }
+
+    /// Persist a non-terminal kill intent before invoking `kill-window`.
+    ///
+    /// # Errors
+    /// Returns an error when the durable intent cannot be written atomically.
+    pub async fn prepare_window_kill(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+        tail: String,
+    ) -> Result<(), TmuxError> {
+        let evidence = self.terminal_evidence(
+            work_scope,
+            window_id,
+            None,
+            TmuxTerminalStatus::Killed,
+            tail,
+        );
+        let generation = self.current_generation(work_scope).await.ok_or_else(|| {
+            TmuxError::InvalidEvidence {
+                path: self.evidence_path(work_scope, window_id),
+                reason: "kill intent has no current server generation".to_string(),
+            }
+        })?;
+        let record = self.durable_record(
+            work_scope,
+            window_id,
+            &generation,
+            &evidence,
+            DurableEvidenceStatus::KillPending,
+        );
+        self.write_durable_evidence(work_scope, window_id, &record)
+            .await
+    }
+
+    /// Clear a failed kill's pending intent, restoring prior terminal evidence.
+    ///
+    /// # Errors
+    /// Returns an error when evidence cannot be read, restored, or removed.
+    pub async fn abort_window_kill(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+    ) -> Result<(), TmuxError> {
+        let Some(record) = self.load_durable_evidence(work_scope, window_id).await? else {
+            return Ok(());
+        };
+        if record.status != DurableEvidenceStatus::KillPending {
+            return Ok(());
+        }
+        let key = (work_scope.clone(), window_id.to_string());
+        if let Some(evidence) = self.terminal_evidence.read().await.get(&key).cloned() {
+            let status = match evidence.status {
+                TmuxTerminalStatus::Exited => DurableEvidenceStatus::Exited,
+                TmuxTerminalStatus::Killed => DurableEvidenceStatus::Killed,
+            };
+            let generation = self.current_generation(work_scope).await.ok_or_else(|| {
+                TmuxError::InvalidEvidence {
+                    path: self.evidence_path(work_scope, window_id),
+                    reason: "kill abort has no current server generation".to_string(),
+                }
+            })?;
+            let record = self.durable_record(work_scope, window_id, &generation, &evidence, status);
+            return self
+                .write_durable_evidence(work_scope, window_id, &record)
+                .await;
+        }
+        let path = self.evidence_path(work_scope, window_id);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(TmuxError::EvidenceIo { path, source }),
+        }
+    }
+
+    async fn recover_live_entry_for_inspection(
+        &self,
+        work_scope: &WorkScope,
+    ) -> Result<(), TmuxError> {
+        if self.get_existing(work_scope).await.is_some() || !self.binary_available {
+            return Ok(());
+        }
+        let socket = self.derived_socket_path(work_scope);
+        if probe(&socket)
+            .await
+            .map_err(|source| TmuxError::ProbeFailed {
+                socket_path: socket.clone(),
+                source,
+            })?
+            != ProbeResult::Live
+        {
+            return Ok(());
+        }
+        let generation = recover_or_install_generation(&socket).await?;
+        let (entry, _) = self.get_or_insert(work_scope, socket).await;
+        let mut server = entry.write().await;
+        server.generation = Some(generation);
+        server.status = ServerStatus::Live;
+        Ok(())
+    }
+
+    /// Inspect memory, then validated durable evidence, then the pane. A pending
+    /// kill plus an absent pane is finalized as Killed, closing the crash window
+    /// between a successful `kill-window` and its confirmation write.
+    ///
+    /// # Errors
+    /// Returns an error when a sidecar is corrupt, mismatched, unreadable, or a
+    /// newly discovered terminal marker cannot be persisted.
+    pub async fn inspect_window(
+        &self,
+        work_scope: &WorkScope,
+        window_id: &str,
+    ) -> Result<TmuxWindowInspection, TmuxError> {
+        self.recover_live_entry_for_inspection(work_scope).await?;
+        let key = (work_scope.clone(), window_id.to_string());
+        if let Some(evidence) = self.terminal_evidence.read().await.get(&key).cloned() {
+            return Ok(TmuxWindowInspection::Terminal(evidence));
+        }
+        let durable = self.load_durable_evidence(work_scope, window_id).await?;
+        if let Some(evidence) = durable
+            .as_ref()
+            .and_then(DurableTerminalEvidence::terminal_evidence)
+        {
+            self.terminal_evidence
+                .write()
+                .await
+                .insert(key, evidence.clone());
+            return Ok(TmuxWindowInspection::Terminal(evidence));
+        }
+        if !self.binary_available {
+            return Ok(TmuxWindowInspection::Missing);
+        }
+        // A rekeyed entry retains the conversation-scoped socket on which the
+        // server was created. Prefer that stored identity; deriving from the new
+        // worktree scope would probe a different server and falsely report Missing.
+        let socket_path = if let Some(entry) = self.get_existing(work_scope).await {
+            entry.read().await.socket_path.clone()
+        } else if let Some(record) = durable.as_ref() {
+            PathBuf::from(&record.socket_identity)
+        } else {
+            self.derived_socket_path(work_scope)
+        };
+        let output = tokio::process::Command::new("tmux")
+            .args([
+                "-S",
+                &socket_path.to_string_lossy(),
+                "capture-pane",
+                "-p",
+                "-t",
+                window_id,
+                "-S",
+                "-2000",
+            ])
+            .env_remove("TMUX")
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        let pane_missing = !matches!(&output, Ok(output) if output.status.success());
+        if pane_missing {
+            if let Some(pending) =
+                durable.filter(|record| record.status == DurableEvidenceStatus::KillPending)
+            {
+                let evidence = self
+                    .record_window_terminal(
+                        work_scope,
+                        window_id,
+                        None,
+                        TmuxTerminalStatus::Killed,
+                        pending.tail,
+                    )
+                    .await?;
+                return Ok(TmuxWindowInspection::Terminal(evidence));
+            }
+            return Ok(TmuxWindowInspection::Missing);
+        }
+        let Ok(output) = output else {
+            unreachable!("pane_missing handled the subprocess error")
+        };
+        let tail = String::from_utf8_lossy(&output.stdout).into_owned();
+        if let Some(exit_code) = parse_tmux_run_exit_marker(&tail) {
+            let evidence = self
+                .record_window_terminal(
+                    work_scope,
+                    window_id,
+                    Some(exit_code),
+                    TmuxTerminalStatus::Exited,
+                    tail,
+                )
+                .await?;
+            Ok(TmuxWindowInspection::Terminal(evidence))
+        } else {
+            Ok(TmuxWindowInspection::Live)
+        }
+    }
+
+    /// Verify registry and durable-evidence destinations before approval starts
+    /// publishing aliases. This method does not mutate either store.
+    ///
+    /// # Errors
+    /// Returns an evidence I/O or destination-collision error.
+    pub async fn preflight_rekey_scope(
+        &self,
+        old: &WorkScope,
+        new: &WorkScope,
+    ) -> Result<(), TmuxError> {
+        if old == new {
+            return Ok(());
+        }
+        {
+            let map = self.inner.read().await;
+            if let (Some(old_entry), Some(new_entry)) =
+                (map.get(&old.stable_key()), map.get(&new.stable_key()))
+            {
+                if !Arc::ptr_eq(old_entry, new_entry) {
+                    return Err(TmuxError::InvalidEvidence {
+                        path: self.evidence_scope_dir(new),
+                        reason: "destination tmux scope already occupied".to_string(),
+                    });
+                }
+            }
+        }
+        let old_dir = self.evidence_scope_dir(old);
+        let new_dir = self.evidence_scope_dir(new);
+        let old_exists =
+            tokio::fs::try_exists(&old_dir)
+                .await
+                .map_err(|source| TmuxError::EvidenceIo {
+                    path: old_dir,
+                    source,
+                })?;
+        let new_exists =
+            tokio::fs::try_exists(&new_dir)
+                .await
+                .map_err(|source| TmuxError::EvidenceIo {
+                    path: new_dir.clone(),
+                    source,
+                })?;
+        if old_exists && new_exists {
+            return Err(TmuxError::InvalidEvidence {
+                path: new_dir,
+                reason: "destination evidence scope already exists".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Remove a destination alias only when it still aliases `old`.
+    pub async fn rollback_alias_scope(&self, old: &WorkScope, new: &WorkScope) {
+        if old == new {
+            return;
+        }
+        let mut map = self.inner.write().await;
+        let old_key = old.stable_key();
+        let new_key = new.stable_key();
+        let should_remove = match (map.get(&old_key), map.get(&new_key)) {
+            (Some(old_entry), Some(new_entry)) => Arc::ptr_eq(old_entry, new_entry),
+            _ => false,
+        };
+        if should_remove {
+            map.remove(&new_key);
+        }
+    }
+
+    /// Add `new` as an alias of `old`, preserving the stored socket identity.
+    /// Concurrent inspectors can therefore use either scope throughout the
+    /// durable wake-contract update.
+    pub async fn alias_scope(&self, old: &WorkScope, new: &WorkScope) -> bool {
+        if old == new {
+            return true;
+        }
+        let old_key = old.stable_key();
+        let new_key = new.stable_key();
+        let mut map = self.inner.write().await;
+        let Some(entry) = map.get(&old_key).cloned() else {
+            return true;
+        };
+        if let Some(destination) = map.get(&new_key) {
+            return Arc::ptr_eq(destination, &entry);
+        }
+        map.insert(new_key, entry);
+        true
+    }
+
+    /// Move durable and in-memory per-window identity to the destination alias.
+    /// This runs while both server lookup aliases exist, so an observer using
+    /// either contract scope still reaches the same socket.
+    ///
+    /// # Errors
+    /// Returns an error when durable evidence cannot be moved or the destination
+    /// already contains evidence for a different resource identity.
+    pub async fn rekey_window_evidence(
+        &self,
+        old: &WorkScope,
+        new: &WorkScope,
+    ) -> Result<(), TmuxError> {
+        if old == new {
+            return Ok(());
+        }
+        let old_dir = self.evidence_scope_dir(old);
+        let new_dir = self.evidence_scope_dir(new);
+        if tokio::fs::try_exists(&old_dir)
+            .await
+            .map_err(|source| TmuxError::EvidenceIo {
+                path: old_dir.clone(),
+                source,
+            })?
+        {
+            if tokio::fs::try_exists(&new_dir)
+                .await
+                .map_err(|source| TmuxError::EvidenceIo {
+                    path: new_dir.clone(),
+                    source,
+                })?
+            {
+                return Err(TmuxError::InvalidEvidence {
+                    path: new_dir,
+                    reason: "destination evidence scope already exists".to_string(),
+                });
+            }
+            tokio::fs::rename(&old_dir, &new_dir)
+                .await
+                .map_err(|source| TmuxError::EvidenceIo {
+                    path: old_dir,
+                    source,
+                })?;
+        }
+        {
+            let mut runs = self
+                .window_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for run in runs.values_mut().filter(|run| &run.scope == old) {
+                run.scope = new.clone();
+            }
+        }
+        let mut evidence = self.terminal_evidence.write().await;
+        let moved: Vec<_> = evidence
+            .iter()
+            .filter(|((scope, _), _)| scope == old)
+            .map(|((_, window), value)| (window.clone(), value.clone()))
+            .collect();
+        for (window, value) in moved {
+            evidence.remove(&(old.clone(), window.clone()));
+            evidence.insert((new.clone(), window), value);
+        }
+        drop(evidence);
+        let mut starts = self.window_starts.write().await;
+        let windows: Vec<_> = starts
+            .keys()
+            .filter(|(scope, _)| scope == old)
+            .map(|(_, window)| window.clone())
+            .collect();
+        for window in windows {
+            if let Some(value) = starts.remove(&(old.clone(), window.clone())) {
+                starts.insert((new.clone(), window), value);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reverse a completed evidence rekey. Used when the durable approval
+    /// transaction fails after aliases and evidence have been published.
+    ///
+    /// # Errors
+    /// Returns an error if the evidence cannot be restored to the old scope.
+    pub async fn rollback_window_evidence(
+        &self,
+        old: &WorkScope,
+        new: &WorkScope,
+    ) -> Result<(), TmuxError> {
+        self.rekey_window_evidence(new, old).await
+    }
+
     /// Move a `WorkScope`'s tmux server entry from `old` to `new`.
     ///
     /// Used at an Explore→Work approval, where the conversation's scope flips
@@ -592,14 +1547,19 @@ impl TmuxRegistry {
         let old_key = old.stable_key();
         let new_key = new.stable_key();
         let mut map = self.inner.write().await;
-        if map.contains_key(&new_key) {
-            if map.contains_key(&old_key) {
-                tracing::warn!(
-                    old = %old,
-                    new = %new,
-                    "tmux: refusing to rekey server entry — destination scope already occupied; leaving both entries in place"
-                );
+        if let (Some(old_entry), Some(new_entry)) = (map.get(&old_key), map.get(&new_key)) {
+            if Arc::ptr_eq(old_entry, new_entry) {
+                let Some(entry) = map.remove(&old_key) else {
+                    return false;
+                };
+                entry.write().await.work_scope = new.clone();
+                return true;
             }
+            tracing::warn!(
+                old = %old,
+                new = %new,
+                "tmux: refusing to rekey server entry — destination scope already occupied; leaving both entries in place"
+            );
             return false;
         }
         let Some(entry) = map.remove(&old_key) else {
@@ -698,6 +1658,31 @@ impl TmuxRegistry {
                 unlink_error: None,
             };
         }
+
+        let evidence_dir = self.evidence_scope_dir(work_scope);
+        if let Err(error) = tokio::fs::remove_dir_all(&evidence_dir).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::error!(
+                    work_scope = %work_scope,
+                    path = %evidence_dir.display(),
+                    %error,
+                    "tmux: failed to remove durable terminal evidence during scope cleanup"
+                );
+            }
+        }
+        self.window_starts
+            .write()
+            .await
+            .retain(|(scope, _), _| scope != work_scope);
+        self.terminal_evidence
+            .write()
+            .await
+            .retain(|(scope, _), _| scope != work_scope);
+
+        self.window_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, run| &run.scope != work_scope);
 
         let key = work_scope.stable_key();
         let entry = {
@@ -860,6 +1845,40 @@ async fn tmux_global_env(socket_path: &Path, var: &str) -> Option<String> {
         .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
 }
 
+async fn recover_or_install_generation(socket_path: &Path) -> Result<String, TmuxError> {
+    if let Some(generation) = tmux_global_env(socket_path, SERVER_GENERATION_VAR).await {
+        return Ok(generation);
+    }
+    let generation = uuid::Uuid::new_v4().to_string();
+    let output = tokio::process::Command::new("tmux")
+        .args([
+            "-S",
+            &socket_path.to_string_lossy(),
+            "set-environment",
+            "-g",
+            SERVER_GENERATION_VAR,
+            &generation,
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|source| TmuxError::ProbeFailed {
+            socket_path: socket_path.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(TmuxError::SpawnFailed {
+            socket_path: socket_path.to_path_buf(),
+            reason: format!(
+                "failed to install server generation: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    Ok(generation)
+}
+
 /// Bring a reused tmux server up to the current companion version,
 /// non-destructively. Gated on the version stamp, so a current server is a
 /// no-op. A pre-feature/older live server otherwise reuses panes whose
@@ -962,6 +1981,7 @@ pub async fn spawn_session(
     socket_path: &Path,
     config_path: &Path,
     cwd: &Path,
+    generation: &str,
 ) -> Result<(), TmuxError> {
     let mut cmd = tokio::process::Command::new("tmux");
     cmd.args([
@@ -982,6 +2002,7 @@ pub async fn spawn_session(
     // pane and diverge from the direct-shell path. env_clear also drops TMUX, so
     // an outer-tmux invocation does not trip tmux's nesting refusal.
     set_tmux_server_env(&mut cmd);
+    cmd.env(SERVER_GENERATION_VAR, generation);
     let output = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1276,6 +2297,18 @@ mod tests {
             .await;
     }
 
+    async fn live_registry(tmp: &TempDir, scope: &WorkScope) -> TmuxRegistry {
+        let registry = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        registry.ensure_live(scope, tmp.path()).await.unwrap();
+        registry
+    }
+
+    async fn install_test_generation(registry: &TmuxRegistry, scope: &WorkScope, generation: &str) {
+        registry
+            .install_generation_for_test(scope, generation)
+            .await;
+    }
+
     /// `emit_lifecycle` with no sink wired is a no-op (no panic). Mirrors the
     /// bash registry's `emit_lifecycle_without_sink_is_no_op`.
     #[tokio::test]
@@ -1427,6 +2460,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preflight_rejects_evidence_collision_without_publishing_alias() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let old = WorkScope::Conversation("preflight-old".into());
+        let new = WorkScope::Worktree("/tmp/preflight-new".into());
+        let socket = socket_path_for(tmp.path(), "preflight-old");
+        registry.get_or_insert(&old, socket).await;
+        tokio::fs::create_dir_all(registry.evidence_scope_dir(&old))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(registry.evidence_scope_dir(&new))
+            .await
+            .unwrap();
+
+        assert!(registry.preflight_rekey_scope(&old, &new).await.is_err());
+        assert!(registry.get_existing(&old).await.is_some());
+        assert!(registry.get_existing(&new).await.is_none());
+        assert!(tokio::fs::try_exists(registry.evidence_scope_dir(&old))
+            .await
+            .unwrap());
+        assert!(tokio::fs::try_exists(registry.evidence_scope_dir(&new))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn evidence_and_alias_rollback_restores_old_only_scope() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let old = WorkScope::Conversation("rollback-old".into());
+        let new = WorkScope::Worktree("/tmp/rollback-new".into());
+        let socket = socket_path_for(tmp.path(), "rollback-old");
+        registry.get_or_insert(&old, socket).await;
+        tokio::fs::create_dir_all(registry.evidence_scope_dir(&old))
+            .await
+            .unwrap();
+
+        assert!(registry.alias_scope(&old, &new).await);
+        registry.rekey_window_evidence(&old, &new).await.unwrap();
+        registry.rollback_window_evidence(&old, &new).await.unwrap();
+        registry.rollback_alias_scope(&old, &new).await;
+
+        assert!(registry.get_existing(&old).await.is_some());
+        assert!(registry.get_existing(&new).await.is_none());
+        assert!(tokio::fs::try_exists(registry.evidence_scope_dir(&old))
+            .await
+            .unwrap());
+        assert!(!tokio::fs::try_exists(registry.evidence_scope_dir(&new))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn active_run_identity_follows_rekey_for_evidence_and_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let old = WorkScope::Conversation("pre-approval".into());
+        let new = WorkScope::Worktree("/tmp/approved".into());
+        install_test_generation(&registry, &old, "generation-a").await;
+        let run = registry.register_window_start(&old, "@9").await.unwrap();
+        assert!(registry.claim_terminal_observer(&run, true));
+
+        assert!(registry.alias_scope(&old, &new).await);
+        registry.rekey_window_evidence(&old, &new).await.unwrap();
+        assert!(registry.rekey_scope(&old, &new).await);
+        registry
+            .record_run_terminal(&run, Some(0), "after approval".into())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(registry.inspect_window(&new, "@9").await, Ok(TmuxWindowInspection::Terminal(ref evidence)) if evidence.status == TmuxTerminalStatus::Exited)
+        );
+        assert!(
+            registry.get_existing(&old).await.is_none(),
+            "old scope alias is retired"
+        );
+        registry.cleanup_run_window(&run).await.unwrap();
+        assert!(
+            matches!(
+                registry.inspect_window(&new, "@9").await,
+                Ok(TmuxWindowInspection::Terminal(_))
+            ),
+            "cleanup cannot erase durable new-scope evidence"
+        );
+        registry.release_terminal_observer(&run);
+    }
+
+    #[tokio::test]
     async fn rekey_scope_no_entry_is_noop() {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
@@ -1460,6 +2582,281 @@ mod tests {
         let new_after = reg.get_existing(&new).await.expect("new entry preserved");
         assert!(Arc::ptr_eq(&old_arc, &old_after));
         assert!(Arc::ptr_eq(&new_arc, &new_after));
+    }
+
+    #[tokio::test]
+    async fn terminal_and_killed_evidence_survive_restart_without_tmux() {
+        let tmp = TempDir::new().unwrap();
+        let scope = WorkScope::Conversation("durable-evidence".to_string());
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        install_test_generation(&registry, &scope, "test-generation").await;
+
+        registry
+            .record_window_terminal(
+                &scope,
+                "@../escaped",
+                Some(7),
+                TmuxTerminalStatus::Exited,
+                "final tail".to_string(),
+            )
+            .await
+            .unwrap();
+        registry
+            .record_window_terminal(
+                &scope,
+                "@killed",
+                None,
+                TmuxTerminalStatus::Killed,
+                "killed tail".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let restarted = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        install_test_generation(&restarted, &scope, "test-generation").await;
+        let Ok(TmuxWindowInspection::Terminal(exited)) =
+            restarted.inspect_window(&scope, "@../escaped").await
+        else {
+            panic!("exited evidence must survive restart with no pane capability");
+        };
+        assert_eq!(exited.status, TmuxTerminalStatus::Exited);
+        assert_eq!(exited.exit_code, Some(7));
+        assert_eq!(exited.tail, "final tail");
+        let Ok(TmuxWindowInspection::Terminal(killed)) =
+            restarted.inspect_window(&scope, "@killed").await
+        else {
+            panic!("killed evidence must survive restart with no pane capability");
+        };
+        assert_eq!(killed.status, TmuxTerminalStatus::Killed);
+
+        let files: Vec<_> = std::fs::read_dir(restarted.evidence_scope_dir(&scope))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(files.iter().all(|name| {
+            name.starts_with("window-")
+                && Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        }));
+        assert!(!tmp.path().join("escaped").exists());
+        #[cfg(unix)]
+        for file in files {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(restarted.evidence_scope_dir(&scope).join(file))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn phoenix_restart_recovers_generation_and_accepts_evidence() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let scope = WorkScope::Conversation("generation-restart".into());
+        let registry = live_registry(&tmp, &scope).await;
+        let generation = registry.current_generation(&scope).await.unwrap();
+        registry.register_window_start(&scope, "@77").await.unwrap();
+        registry
+            .record_window_terminal(
+                &scope,
+                "@77",
+                Some(0),
+                TmuxTerminalStatus::Exited,
+                "done".into(),
+            )
+            .await
+            .unwrap();
+
+        let restarted = TmuxRegistry::with_socket_dir(tmp.path().to_path_buf());
+        assert!(matches!(
+            restarted.inspect_window(&scope, "@77").await,
+            Ok(TmuxWindowInspection::Terminal(_))
+        ));
+        assert_eq!(
+            restarted.current_generation(&scope).await.as_deref(),
+            Some(generation.as_str())
+        );
+        kill_socket(&socket_path_for(tmp.path(), "generation-restart")).await;
+    }
+
+    #[tokio::test]
+    async fn stale_v1_and_generation_mismatch_are_cache_misses() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let scope = WorkScope::Conversation("stale-generation".into());
+        let registry = live_registry(&tmp, &scope).await;
+        let path = registry.evidence_path(&scope, "@missing");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"version":1}"#).unwrap();
+        assert!(matches!(
+            registry.inspect_window(&scope, "@missing").await,
+            Ok(TmuxWindowInspection::Missing)
+        ));
+        assert!(!path.exists());
+
+        let evidence = registry.terminal_evidence(
+            &scope,
+            "@missing",
+            None,
+            TmuxTerminalStatus::Killed,
+            "pending".into(),
+        );
+        let stale = registry.durable_record(
+            &scope,
+            "@missing",
+            "different-generation",
+            &evidence,
+            DurableEvidenceStatus::KillPending,
+        );
+        registry
+            .write_durable_evidence(&scope, "@missing", &stale)
+            .await
+            .unwrap();
+        assert!(matches!(
+            registry.inspect_window(&scope, "@missing").await,
+            Ok(TmuxWindowInspection::Missing)
+        ));
+        assert!(!path.exists(), "mismatched KillPending must not finalize");
+        kill_socket(&socket_path_for(tmp.path(), "stale-generation")).await;
+    }
+
+    #[tokio::test]
+    async fn register_reused_window_clears_current_generation_evidence() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let scope = WorkScope::Conversation("reuse-window".into());
+        let registry = live_registry(&tmp, &scope).await;
+        registry
+            .record_window_terminal(
+                &scope,
+                "@1",
+                Some(9),
+                TmuxTerminalStatus::Exited,
+                "old".into(),
+            )
+            .await
+            .unwrap();
+        assert!(registry.evidence_path(&scope, "@1").exists());
+        registry.register_window_start(&scope, "@1").await.unwrap();
+        assert!(!registry.evidence_path(&scope, "@1").exists());
+        assert!(!registry
+            .terminal_evidence
+            .read()
+            .await
+            .contains_key(&(scope.clone(), "@1".into())));
+        kill_socket(&socket_path_for(tmp.path(), "reuse-window")).await;
+    }
+
+    #[tokio::test]
+    async fn exited_evidence_is_monotonic_over_cleanup_killed() {
+        let tmp = TempDir::new().unwrap();
+        let scope = WorkScope::Conversation("monotonic-evidence".to_string());
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        install_test_generation(&registry, &scope, "test-generation").await;
+        registry
+            .record_window_terminal(
+                &scope,
+                "@1",
+                Some(3),
+                TmuxTerminalStatus::Exited,
+                "authentic exit tail".to_string(),
+            )
+            .await
+            .unwrap();
+        let evidence = registry
+            .record_window_terminal(
+                &scope,
+                "@1",
+                None,
+                TmuxTerminalStatus::Killed,
+                "cleanup replacement".to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.status, TmuxTerminalStatus::Exited);
+        assert_eq!(evidence.exit_code, Some(3));
+        assert_eq!(evidence.tail, "authentic exit tail");
+    }
+
+    #[tokio::test]
+    async fn evidence_write_failure_is_surfaced_and_not_published_in_memory() {
+        let tmp = TempDir::new().unwrap();
+        let blocked = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked, b"blocked").unwrap();
+        let scope = WorkScope::Conversation("write-failure".to_string());
+        let registry = TmuxRegistry::with_socket_dir_and_binary(blocked, false);
+
+        assert!(registry
+            .record_window_terminal(
+                &scope,
+                "@1",
+                Some(0),
+                TmuxTerminalStatus::Exited,
+                "must not publish".to_string(),
+            )
+            .await
+            .is_err());
+        assert!(registry.terminal_evidence.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_evidence_is_a_capability_error_not_missing() {
+        let tmp = TempDir::new().unwrap();
+        let scope = WorkScope::Conversation("corrupt-evidence".to_string());
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        registry.ensure_runtime_assets().await.unwrap();
+        let path = registry.evidence_path(&scope, "@1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not-json").unwrap();
+
+        assert!(matches!(
+            registry.inspect_window(&scope, "@1").await,
+            Err(TmuxError::InvalidEvidence { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_evidence_but_same_scope_continuation_preserves_it() {
+        let tmp = TempDir::new().unwrap();
+        let scope = WorkScope::Worktree("/tmp/durable-scope".to_string());
+        let registry = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        install_test_generation(&registry, &scope, "test-generation").await;
+        registry
+            .record_window_terminal(
+                &scope,
+                "@1",
+                Some(0),
+                TmuxTerminalStatus::Exited,
+                "done".to_string(),
+            )
+            .await
+            .unwrap();
+        let evidence_dir = registry.evidence_scope_dir(&scope);
+        assert!(evidence_dir.exists());
+
+        registry.cascade_on_delete(&scope, Some(&scope)).await;
+        assert!(evidence_dir.exists(), "continuation must preserve evidence");
+        assert!(matches!(
+            registry.inspect_window(&scope, "@1").await,
+            Ok(TmuxWindowInspection::Terminal(_))
+        ));
+
+        registry.cascade_on_delete(&scope, None).await;
+        assert!(!evidence_dir.exists(), "hard cleanup must delete evidence");
+        assert!(matches!(
+            registry.inspect_window(&scope, "@1").await,
+            Ok(TmuxWindowInspection::Missing)
+        ));
     }
 
     #[tokio::test]

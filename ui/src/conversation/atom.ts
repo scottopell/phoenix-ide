@@ -2,6 +2,7 @@ import * as v from 'valibot';
 import type { ConversationState, Message, Conversation } from '../api';
 import type { ErrorPresentation } from '../errorPresentation';
 import type { WorkScopeInventory } from '../generated/sse';
+import type { WakeStatusSnapshot } from '../generated/WakeStatusSnapshot';
 import {
   SseTokenDataSchema,
   SseStateChangeDataSchema,
@@ -15,6 +16,7 @@ import {
   SseSteerMessageQueuedDataSchema,
   SseRateLimitSnapshotDataSchema,
   SseWorkScopeUpdateDataSchema,
+  SseWakeStatusUpdateDataSchema,
   SseErrorDataSchema,
 } from '../sseSchemas';
 import { parseConversationState } from '../utils';
@@ -160,6 +162,9 @@ export interface ConversationAtom {
    *  (REQ-WSUI-007), so the reducer replaces this field wholesale rather than
    *  merging — there is no partial state to reconcile. */
   workScope: WorkScopeInventory | null;
+  /** Server-authoritative full wake-contract snapshot. Replaced wholesale on
+   * each wake_status_update; null until the stream's initial wake event lands. */
+  wakeStatus: WakeStatusSnapshot | null;
 }
 
 export interface InitPayload {
@@ -276,6 +281,11 @@ export type SSEAction =
       inventory: WorkScopeInventory;
       epoch?: number;
     }
+  | {
+      type: 'sse_wake_status_update';
+      snapshot: WakeStatusSnapshot;
+      epoch?: number;
+    }
   // `sequenceId` is present when the error originated on the wire (server's
   // monotonic counter) and absent when it was synthesized client-side for a
   // schema / parse violation in useConnection.ts. Wire-originated errors are
@@ -381,6 +391,7 @@ export function createInitialAtom(): ConversationAtom {
     connectionEpoch: null,
     connectionState: 'connecting',
     workScope: null,
+    wakeStatus: null,
   };
 }
 
@@ -772,6 +783,10 @@ function isStaleEpoch(atom: ConversationAtom, action: SSEAction): boolean {
   // monotonic check.
   if (action.type === 'connection_opened') return false;
   if (!('epoch' in action) || action.epoch === undefined) return false;
+  // Wake snapshots are conversation-scoped rather than sequence-ordered. Accept
+  // the initial snapshot before an SSE generation is established; once a
+  // generation exists, the normal stale-connection guard applies.
+  if (action.type === 'sse_wake_status_update' && atom.connectionEpoch === null) return false;
   if (atom.connectionEpoch !== null && action.epoch === atom.connectionEpoch) return false;
   if (import.meta.env.DEV) {
     console.debug('[sse] dropping stale-epoch action', {
@@ -951,6 +966,19 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_browser_session_state',
         sequenceId: res.output.sequence_id,
         active: res.output.active,
+      });
+    }
+    case 'wake_status_update': {
+      const res = v.safeParse(SseWakeStatusUpdateDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending wake_status_update entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_wake_status_update',
+        snapshot: res.output.snapshot,
       });
     }
     case 'work_scope_update': {
@@ -1178,6 +1206,17 @@ export function conversationReducer(
     case 'sse_token':
     case 'sse_conversation_update':
     case 'sse_browser_session_state':
+      return applyContiguousWireAction(atom, action);
+
+    case 'sse_wake_status_update':
+      if (
+        atom.conversationId !== null &&
+        action.snapshot.conversation_id !== atom.conversationId
+      ) {
+        return atom;
+      }
+      return { ...atom, wakeStatus: action.snapshot };
+
     case 'sse_work_scope_update':
       return applyContiguousWireAction(atom, action);
 

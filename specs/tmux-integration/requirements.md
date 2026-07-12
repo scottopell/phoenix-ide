@@ -107,9 +107,10 @@ description that explains it is unavailable)
 AND any agent invocation SHALL return `error: "tmux_binary_unavailable"`
 with a clear message
 
-THE SYSTEM SHALL NOT parse, rewrite, or whitelist subcommands inside `args`
-beyond prepending `-S <conv-sock>`. The only Phoenix-injected flag is the
-socket selector.
+THE SYSTEM SHALL parse only enough of `args` to identify the initial tmux
+command after global options and enforce the destructive-command and
+command-sequence fence in REQ-TMUX-011. All command arguments SHALL otherwise
+remain unchanged. The only Phoenix-injected flag is the socket selector.
 
 **Rationale:** The LLM already knows tmux from training data. A
 pass-through tool surface costs nothing to maintain; a verb wrapper would
@@ -274,17 +275,20 @@ THE `tmux` tool's description SHALL state explicitly:
   isolation from other conversations.
 - Processes started inside this tmux server survive Phoenix process
   restarts (but not system reboots).
-- The full tmux CLI is available; common subcommands include
-  `new-window`, `capture-pane`, `send-keys`, `list-windows`,
-  `kill-window`.
+- Non-destructive tmux CLI commands are available; common subcommands include
+  `new-window`, `capture-pane`, `send-keys`, and `list-windows`.
+- Destructive window/session/server commands, their aliases, and tmux command
+  sequences are rejected with an actionable error because Phoenix-owned
+  termination must use the typed lifecycle path.
 - Use `tmux_run` for starting dev servers, watchers, REPLs, or other
   inspectable shell commands. It chooses the current project/worktree
   directory, wraps the command with `bash -lc`, prints a visible exit marker,
   and keeps the pane inspectable after exit by default.
-- Use raw `tmux` for detailed tmux operations such as `capture-pane`,
-  `send-keys`, `list-windows`, and `kill-window`. Raw tmux is pass-through
-  except for Phoenix's socket/config injection; it does not enforce a cwd for
-  newly-created windows or panes.
+- Use raw `tmux` for non-destructive detailed tmux operations such as
+  `capture-pane`, `send-keys`, and `list-windows`. Apart from destructive-command
+  and command-sequence fencing, raw tmux passes arguments through after
+  Phoenix's socket/config injection; it does not enforce a cwd for newly-created
+  windows or panes.
 - Use `bash` for one-shot non-interactive commands.
 
 **Rationale:** The agent must know when to reach for which tool. A pit-of-
@@ -321,6 +325,31 @@ non-interactive — no human is at the other end to type the detach key.
 ---
 
 ### REQ-TMUX-011: Tool Surface Hardening — Phoenix-Injected Flag Authority
+
+WHEN the initial command position in generic `tmux` arguments contains
+`kill-pane`, `kill-window`, `kill-session`, or `kill-server`, an alias of one of
+those commands, or any unambiguous abbreviation of one accepted by tmux
+(including `kill-w`, `kill-ser`, and `kill-ses`)
+THE SYSTEM SHALL reject the call before server resolution with
+`tmux_destructive_command_forbidden`
+AND SHALL direct Phoenix-owned termination through the typed lifecycle path
+
+WHEN a tmux command separator occurs at a command boundary
+THE SYSTEM SHALL reject the generic multi-command invocation with
+`tmux_destructive_command_forbidden`
+
+WHEN `kill-window`, `;`, or text containing either value occurs in an argument
+position of a free-form command such as `send-keys`, `run-shell`, or
+`display-message`
+THE SYSTEM SHALL treat that value as command data and SHALL NOT reparse it as a
+tmux command or command sequence
+
+Examples:
+- `["send-keys", "-t", "@1", "kill-window", "Enter"]` is allowed.
+- `["send-keys", "-t", "@1", ";", "Enter"]` is allowed because `;` is a literal key argument at that position.
+- `["send-keys", "-t", "@1", "echo kill-window; true", "Enter"]` is allowed.
+- `["kill-window", "-t", "@1"]` is rejected.
+- `["list-windows", ";", "kill-window", "-t", "@1"]` is rejected.
 
 THE SYSTEM SHALL inject `-S <conv-sock>` as the first arguments to tmux,
 ahead of the agent's `args`
@@ -398,6 +427,8 @@ conversation-delete.
 ---
 
 ### REQ-TMUX-014: `tmux_run` Agent Tool — Inspectable Shell Commands
+Wake-contract terminal waits for tmux-backed work are specified in `specs/wake-contracts/`. This spec defines the tmux window identity, authorization boundary, and durable terminal evidence that wake observation consumes; it does not restate wake registration, receipts, inbox delivery, or continuation-resume mechanics.
+
 
 THE SYSTEM SHALL register an agent tool named `tmux_run` whose schema accepts:
 - `cmd` (required string): shell command to run via `bash -lc`
@@ -424,10 +455,23 @@ AND SHALL search the raw tmux pane capture for readiness text and exit markers
 before truncating the snippet returned to the agent
 AND SHALL keep the pane inspectable after exit by default
 
-WHEN `keep_open_on_exit = false` and readiness waiting is requested
-THE SYSTEM SHALL keep the window available until the final readiness / exit
-observation is captured
-AND THEN SHALL close the window after observing command completion
+WHEN `keep_open_on_exit = false`
+THE SYSTEM SHALL keep the window available until the exit marker is captured
+and terminal evidence is durably committed
+AND THEN SHALL let the terminal observer close the completed window
+AND SHALL preserve the command's `Exited` evidence when removing the completed
+window; cleanup SHALL NOT relabel terminal evidence as `Killed`
+AND an evidence persistence failure SHALL leave the pane available for retry
+
+WHEN Phoenix restarts before retained-pane evidence is observed
+THE SYSTEM SHALL allow later inspection to capture and durably commit the exit
+evidence from the surviving tmux pane
+
+WHEN `tmux_run` returns while its command is still live
+THE SYSTEM SHALL launch exactly one background terminal observer for the stable
+window identity
+AND that observer SHALL durably persist the later exit marker and lifecycle
+transition
 
 WHEN `name` contains `:`, `|`, newline, or carriage return
 THE SYSTEM SHALL reject the input with `invalid_window_name` before creating a
@@ -452,8 +496,14 @@ THE `tmux_run` tool SHALL return responses with this shape:
 ```
 
 THE `window_id` field SHALL be a unique tmux target for the created window.
-Agents SHOULD use `window_id` for later raw tmux `capture-pane`, `send-keys`,
-or `kill-window` operations; `window_name` is human-readable but not unique.
+Agents SHOULD use `window_id` for later raw tmux `capture-pane` or `send-keys`
+operations; `window_name` is human-readable but not unique. Phoenix-owned
+termination uses the typed lifecycle path rather than generic raw tmux.
+
+WHEN a wake contract is registered against tmux-backed work
+THE SYSTEM SHALL use that stable `window_id` as the watched `TmuxWindow` handle identity in `specs/wake-contracts/`
+AND SHALL authorize the registration according to the same `WorkScope` ownership model that governs the conversation's tmux server
+AND SHALL treat the `tmux_run` exit marker, exit code, duration facts, and final captured pane tail as the authoritative durable terminal evidence surface for later wake delivery
 
 THE `captured_output.truncated` field SHALL describe only the bounded snippet
 returned by that single tool call. It SHALL NOT imply that the tmux pane or
@@ -486,6 +536,9 @@ Phoenix MUST key tmux server ownership by `WorkScope`, derived from the persiste
 ### REQ-TMUX-WS-002: Continuation Sharing Within Worktree Scope
 
 Managed/Branch continuations that share a worktree MUST share the same tmux socket/session. Direct-mode conversations continue to use the conversation fallback scope.
+
+WHEN in-place Explore→Work approval changes a tmux server's owning `WorkScope`
+THE SYSTEM SHALL transfer the registry lookup by alias without changing the running server's stored socket path, SHALL inspect through that stored socket path whenever an entry exists, and SHALL migrate durable per-window evidence so the destination scope remains discoverable after Phoenix restarts. Deterministic socket derivation or probing is a fallback only when no registry entry or durable socket identity exists.
 
 The cleanup cascade MUST decide preservation by whether the scope is still owned by a live conversation other than the one being torn down: skip the kill/unlink iff `inheritor_scope == Some(work_scope)`, where `inheritor_scope` is `Some(work_scope)` iff a live conversation other than the deleted one resolves to that scope — a continuation that inherits it, or a live sibling such as a Work-mode sub-agent that shares its parent's scope. A live conversation here is one that is BOTH non-terminal in state AND not `archived`, determined from the persisted conversation rows in the DATABASE — NOT from the set of live runtime handles. A non-terminal conversation with no runtime handle (after a server restart or runtime eviction) is still a live owner; enumerating handles would tear down a scope whose surviving owner is handle-less. An archived conversation does not count as a live owner even while its state row still reads non-terminal, because archiving a chain archives earlier members before the leaf's cascade runs — counting one as live would preserve the scope and leak the tmux server. The deleted conversation is excluded from that enumeration: the cascade runs before its terminal-state write, so it still reads non-terminal, and excluding it is what lets the server tear down when it is the last live owner. Conversation-scope continuations always resolve to a different scope (their own conversation id), so the rule subsumes the "Direct continuations cannot inherit" case structurally without per-kind case-analysis.
 

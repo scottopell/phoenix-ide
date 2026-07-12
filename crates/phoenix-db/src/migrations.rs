@@ -216,6 +216,36 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_creation_cleanup_claims",
         sql: MIGRATION_040,
     },
+    Migration {
+        version: 41,
+        name: "create_wake_plane_tables",
+        sql: MIGRATION_041,
+    },
+    Migration {
+        version: 42,
+        name: "add_wake_registration_fence",
+        sql: MIGRATION_042,
+    },
+    Migration {
+        version: 43,
+        name: "add_wake_registration_work_scope",
+        sql: MIGRATION_043,
+    },
+    Migration {
+        version: 44,
+        name: "create_wake_resume_outbox",
+        sql: MIGRATION_044,
+    },
+    Migration {
+        version: 45,
+        name: "add_wake_resume_suppression",
+        sql: MIGRATION_045,
+    },
+    Migration {
+        version: 46,
+        name: "index_wake_pending_admission",
+        sql: MIGRATION_046,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -1004,6 +1034,30 @@ const MIGRATION_030: &str = r"
 ALTER TABLE conversations ADD COLUMN clear_watermark INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// Durable one-way lifecycle fence for wake registration. Existing conversations
+/// remain eligible until a lifecycle operation acquires the fence; the CHECK keeps
+/// the `SQLite` boolean representation canonical.
+const MIGRATION_042: &str = r"
+ALTER TABLE conversations ADD COLUMN wake_registration_open INTEGER NOT NULL DEFAULT 1
+    CHECK (wake_registration_open IN (0, 1));
+";
+
+/// Immutable resource scope captured when a wake is registered. Delivery may move
+/// to a continuation conversation, but handle observation must remain bound to
+/// the scope that owned the handle at registration time.
+const MIGRATION_043: &str = r"
+ALTER TABLE wake_contracts ADD COLUMN registration_scope_key TEXT NOT NULL DEFAULT 'global:'
+    CHECK (
+        registration_scope_key = 'global:'
+        OR (registration_scope_key LIKE 'worktree:%' AND length(registration_scope_key) > length('worktree:'))
+        OR (registration_scope_key LIKE 'conversation:%' AND length(registration_scope_key) > length('conversation:'))
+    );
+
+UPDATE wake_contracts
+SET registration_scope_key = 'conversation:' || current_conversation_id
+WHERE registration_scope_key = 'global:';
+";
+
 const MIGRATION_032: &str = r"
 ALTER TABLE work_scope_pr_associations ADD COLUMN feedback_status TEXT NOT NULL DEFAULT 'open';
 ";
@@ -1193,6 +1247,132 @@ CREATE INDEX idx_creation_cleanup_due
     ON conversation_creation_jobs(status, cleanup_lease_until, updated_at);
 ";
 
+const MIGRATION_041: &str = r"
+CREATE TABLE IF NOT EXISTS wake_contracts (
+    id TEXT PRIMARY KEY,
+    current_conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    handle_kind TEXT NOT NULL CHECK (handle_kind IN ('bash', 'tmux_window')),
+    handle_id TEXT NOT NULL,
+    registering_tool_use_id TEXT,
+    registered_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'fired', 'cancelled', 'expired', 'forgotten')),
+    terminal_cause TEXT CHECK (terminal_cause IN ('fired', 'cancelled', 'expired', 'forgotten')),
+    forgotten_reason TEXT CHECK (forgotten_reason IN ('handle_missing', 'runtime_unrecoverable_after_restart')),
+    terminal_payload_json TEXT,
+    resolved_at TEXT,
+    CHECK ((status = 'pending' AND terminal_cause IS NULL AND forgotten_reason IS NULL AND terminal_payload_json IS NULL AND resolved_at IS NULL)
+        OR (status = 'fired' AND terminal_cause = 'fired' AND forgotten_reason IS NULL AND terminal_payload_json IS NOT NULL AND resolved_at IS NOT NULL)
+        OR (status = 'cancelled' AND terminal_cause = 'cancelled' AND forgotten_reason IS NULL AND terminal_payload_json IS NULL AND resolved_at IS NOT NULL)
+        OR (status = 'expired' AND terminal_cause = 'expired' AND forgotten_reason IS NULL AND terminal_payload_json IS NULL AND resolved_at IS NOT NULL)
+        OR (status = 'forgotten' AND terminal_cause = 'forgotten' AND forgotten_reason IS NOT NULL AND terminal_payload_json IS NULL AND resolved_at IS NOT NULL)),
+    CHECK (terminal_payload_json IS NULL OR json_valid(terminal_payload_json)),
+    CHECK (terminal_payload_json IS NULL
+        OR ((handle_kind = 'bash') AND json_extract(terminal_payload_json, '$.kind') = 'bash' AND json_type(terminal_payload_json, '$.bash') = 'object' AND json_type(terminal_payload_json, '$.tmux_window') IS NULL)
+        OR ((handle_kind = 'tmux_window') AND json_extract(terminal_payload_json, '$.kind') = 'tmux_window' AND json_type(terminal_payload_json, '$.tmux_window') = 'object' AND json_type(terminal_payload_json, '$.bash') IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_wake_contracts_status_registered
+    ON wake_contracts(status, registered_at, id);
+CREATE INDEX IF NOT EXISTS idx_wake_contracts_conversation_registered
+    ON wake_contracts(current_conversation_id, registered_at, id);
+CREATE INDEX IF NOT EXISTS idx_wake_contracts_kind_handle
+    ON wake_contracts(handle_kind, handle_id);
+
+CREATE TABLE IF NOT EXISTS wake_contract_tails (
+    contract_id TEXT NOT NULL REFERENCES wake_contracts(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    line TEXT NOT NULL,
+    PRIMARY KEY (contract_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS wake_inbox (
+    inbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contract_id TEXT NOT NULL UNIQUE REFERENCES wake_contracts(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    handle_kind TEXT NOT NULL CHECK (handle_kind IN ('bash', 'tmux_window')),
+    handle_id TEXT NOT NULL,
+    registering_tool_use_id TEXT,
+    expires_at TEXT NOT NULL,
+    cause TEXT NOT NULL CHECK (cause IN ('fired', 'cancelled', 'expired', 'forgotten')),
+    forgotten_reason TEXT CHECK (forgotten_reason IN ('handle_missing', 'runtime_unrecoverable_after_restart')),
+    terminal_payload_json TEXT,
+    auto_resume INTEGER NOT NULL CHECK (auto_resume IN (0, 1)),
+    delivered_at TEXT,
+    consumed_at TEXT,
+    CHECK (terminal_payload_json IS NULL OR json_valid(terminal_payload_json)),
+    CHECK ((cause = 'fired' AND terminal_payload_json IS NOT NULL AND forgotten_reason IS NULL)
+        OR (cause = 'cancelled' AND terminal_payload_json IS NULL AND forgotten_reason IS NULL)
+        OR (cause = 'expired' AND terminal_payload_json IS NULL AND forgotten_reason IS NULL)
+        OR (cause = 'forgotten' AND terminal_payload_json IS NULL AND forgotten_reason IS NOT NULL)),
+    CHECK ((cause = 'cancelled' AND auto_resume = 0)
+        OR (cause IN ('fired', 'expired', 'forgotten') AND auto_resume = 1)),
+    CHECK (terminal_payload_json IS NULL
+        OR ((handle_kind = 'bash') AND json_extract(terminal_payload_json, '$.kind') = 'bash' AND json_type(terminal_payload_json, '$.bash') = 'object' AND json_type(terminal_payload_json, '$.tmux_window') IS NULL)
+        OR ((handle_kind = 'tmux_window') AND json_extract(terminal_payload_json, '$.kind') = 'tmux_window' AND json_type(terminal_payload_json, '$.tmux_window') = 'object' AND json_type(terminal_payload_json, '$.bash') IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_wake_inbox_pending
+    ON wake_inbox(conversation_id, delivered_at, consumed_at, inbox_id);
+CREATE INDEX IF NOT EXISTS idx_wake_inbox_auto_resume_pending
+    ON wake_inbox(conversation_id, auto_resume, delivered_at, consumed_at, inbox_id);
+";
+
+const MIGRATION_044: &str = r"
+CREATE TABLE wake_resume_outbox (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id) ON DELETE CASCADE,
+    snapshot_max_inbox_id INTEGER NOT NULL CHECK (snapshot_max_inbox_id > 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'accepted')),
+    created_at TEXT NOT NULL,
+    accepted_at TEXT,
+    PRIMARY KEY (conversation_id, snapshot_max_inbox_id),
+    CHECK ((status = 'pending' AND accepted_at IS NULL)
+        OR (status = 'accepted' AND accepted_at IS NOT NULL))
+);
+
+CREATE INDEX idx_wake_resume_outbox_pending
+    ON wake_resume_outbox(status, created_at, conversation_id);
+";
+
+const MIGRATION_045: &str = r"
+ALTER TABLE wake_resume_outbox RENAME TO wake_resume_outbox_old;
+
+CREATE TABLE wake_resume_outbox (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL UNIQUE REFERENCES messages(message_id) ON DELETE CASCADE,
+    snapshot_max_inbox_id INTEGER NOT NULL CHECK (snapshot_max_inbox_id > 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'suppressed')),
+    created_at TEXT NOT NULL,
+    accepted_at TEXT,
+    suppressed_at TEXT,
+    suppression_reason TEXT,
+    PRIMARY KEY (conversation_id, snapshot_max_inbox_id),
+    CHECK ((status = 'pending' AND accepted_at IS NULL AND suppressed_at IS NULL AND suppression_reason IS NULL)
+        OR (status = 'accepted' AND accepted_at IS NOT NULL AND suppressed_at IS NULL AND suppression_reason IS NULL)
+        OR (status = 'suppressed' AND accepted_at IS NULL AND suppressed_at IS NOT NULL AND suppression_reason IS NOT NULL))
+);
+
+INSERT INTO wake_resume_outbox (
+    conversation_id, message_id, snapshot_max_inbox_id, status, created_at, accepted_at
+)
+SELECT conversation_id, message_id, snapshot_max_inbox_id, status, created_at, accepted_at
+FROM wake_resume_outbox_old;
+
+DROP TABLE wake_resume_outbox_old;
+CREATE INDEX idx_wake_resume_outbox_pending
+    ON wake_resume_outbox(status, created_at, conversation_id);
+";
+
+const MIGRATION_046: &str = r"
+CREATE INDEX idx_wake_contracts_pending_round
+    ON wake_contracts(current_conversation_id, registering_tool_use_id)
+    WHERE status = 'pending';
+CREATE INDEX idx_wake_inbox_pending_auto_resume
+    ON wake_inbox(conversation_id, inbox_id)
+    WHERE auto_resume = 1 AND delivered_at IS NULL AND consumed_at IS NULL;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -1359,6 +1539,7 @@ mod tests {
 
         let first = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(first as usize, MIGRATIONS.len());
+        assert_eq!(first, 46);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -1394,9 +1575,11 @@ mod tests {
             .await
             .unwrap();
 
-        // Every version except the stamped 29 must run.
+        // Every version except the stamped 29 must run: 1–28 below the stamp
+        // and 30–46 above it.
         let applied = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(applied as usize, MIGRATIONS.len() - 1);
+        assert_eq!(applied, 45);
 
         // Migration 005's effects must be present.
         let cols: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
@@ -1417,6 +1600,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(chain_qa_exists.as_deref(), Some("chain_qa"));
+
+        let wake_tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name IN ('wake_contracts', 'wake_contract_tails', 'wake_inbox')
+             ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            wake_tables,
+            vec!["wake_contract_tails", "wake_contracts", "wake_inbox"]
+        );
 
         // Re-running is a no-op now that the ledger is complete.
         let again = run_pending_migrations(&pool).await.unwrap();
@@ -2695,6 +2891,76 @@ mod tests {
             dup.is_err(),
             "second token row for one server must violate the primary key"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_034_wake_registration_fence_defaults_open_and_checks_boolean() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        run_pending_migrations(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO conversations
+             (id, state, cwd, user_initiated, state_updated_at, created_at, updated_at,
+              cm_kind)
+             VALUES ('fresh', '{\"type\":\"idle\"}', '/tmp', 1,
+                     '2025-01-01', '2025-01-01', '2025-01-01', 'direct')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let open: i64 = sqlx::query_scalar(
+            "SELECT wake_registration_open FROM conversations WHERE id = 'fresh'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(open, 1);
+
+        let invalid =
+            sqlx::query("UPDATE conversations SET wake_registration_open = 2 WHERE id = 'fresh'")
+                .execute(&pool)
+                .await;
+        assert!(invalid.is_err(), "fence must accept only SQLite booleans");
+    }
+
+    #[tokio::test]
+    async fn migration_035_backfills_and_validates_wake_registration_scope() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO conversations
+             (id, state, cwd, user_initiated, state_updated_at, created_at, updated_at)
+             VALUES ('scope-conv', '{\"type\":\"idle\"}', '/tmp', 1,
+                     '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_041).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO wake_contracts
+             (id, current_conversation_id, handle_kind, handle_id, registered_at, expires_at, status)
+             VALUES ('wake-scope', 'scope-conv', 'bash', 'b-1', '2025-01-01', '2025-01-02', 'pending')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_043).execute(&pool).await.unwrap();
+        let key: String = sqlx::query_scalar(
+            "SELECT registration_scope_key FROM wake_contracts WHERE id = 'wake-scope'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(key, "conversation:scope-conv");
+        assert!(sqlx::query(
+            "UPDATE wake_contracts SET registration_scope_key = 'conversation:' WHERE id = 'wake-scope'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
     }
 
     #[tokio::test]

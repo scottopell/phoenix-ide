@@ -208,6 +208,55 @@ describe('conversation message history clients', () => {
   });
 });
 
+describe('api.cancelConversation', () => {
+  beforeEach(() => vi.stubGlobal('fetch', vi.fn()));
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('surfaces the server cancellation error detail', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({ error: 'Conversation cancellation was rejected' }),
+    } as Response);
+
+    await expect(api.cancelConversation('conv-1')).rejects.toThrow(
+      'Conversation cancellation was rejected',
+    );
+  });
+});
+
+describe('api.cancelWake', () => {
+  beforeEach(() => vi.stubGlobal('fetch', vi.fn()));
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('POSTs the encoded conversation and contract ids', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ outcome: 'cancelled', contract_id: 'wake/1' }),
+    } as Response);
+
+    await expect(api.cancelWake('conv/1', 'wake/1')).resolves.toEqual({
+      outcome: 'cancelled', contract_id: 'wake/1',
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/conversations/conv%2F1/wakes/wake%2F1/cancel',
+      { method: 'POST' },
+    );
+  });
+
+  it('surfaces the server cancellation error', async () => {
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({ error: 'Wake contract no longer belongs to this conversation' }),
+    } as Response);
+    await expect(api.cancelWake('conv-1', 'wake-1')).rejects.toThrow(
+      'Wake contract no longer belongs to this conversation',
+    );
+  });
+});
+
 describe('api.regenerateConversationName', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());

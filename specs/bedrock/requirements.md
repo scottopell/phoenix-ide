@@ -70,8 +70,15 @@ THE SYSTEM SHALL execute tools serially in the order requested
 AND complete each tool before starting the next
 
 WHEN all tools complete
+AND none of the completed tool results is a wake-contract registration receipt as defined by `specs/wake-contracts/`
 THE SYSTEM SHALL transition to awaiting LLM response
 AND send all tool results to LLM
+
+WHEN one or more tools in the completed round return wake-contract registration receipts as defined by `specs/wake-contracts/`
+THE SYSTEM SHALL persist the complete tool round before changing the runtime state or consuming its wake-registration commit markers
+AND only after successful checkpoint persistence transition to idle without an immediate follow-up LLM request
+AND on checkpoint failure retain the pre-transition runtime state and registration markers so the same transition can be retried
+AND leave later wake delivery to the queued runtime-observation / inbox flow defined by `specs/wake-contracts/`
 
 WHEN any tool fails
 THE SYSTEM SHALL include the error in results sent to LLM
@@ -684,6 +691,7 @@ THE SYSTEM SHALL create a new conversation that inherits:
   - the parent's worktree, if any (Work, Branch, and Explore modes all have worktrees — see REQ-PROJ-028 for Explore worktree creation on first message), via ownership transfer rather than destroy-and-recreate
   - any uncommitted changes in that worktree
   - for Work mode, the parent's task_id and associated task file
+  - any pending wake-contract delivery obligations and unconsumed wake observations, transferred according to `specs/wake-contracts/` independently of resource ownership inheritance
 
 WHEN the parent has a worktree
 THE SYSTEM SHALL transfer worktree ownership atomically in a single database transaction:

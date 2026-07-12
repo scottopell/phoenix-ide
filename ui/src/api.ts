@@ -3,6 +3,7 @@ import type { ErrorKind } from './generated/ErrorKind';
 import type { DeploymentInfo } from './generated/DeploymentInfo';
 import type { DeploymentDiskInfo } from './generated/DeploymentDiskInfo';
 import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktreeCleanupResponse';
+import type { WakeStatus } from './generated/WakeStatus';
 import type { FileViewerKind } from './generated/FileViewerKind';
 import type { UsageOverview } from './generated/UsageOverview';
 import type { ConversationUsageDetail } from './generated/ConversationUsageDetail';
@@ -1666,7 +1667,40 @@ export const api = {
     const resp = await fetch(`/api/conversations/${convId}/cancel`, {
       method: 'POST',
     });
-    if (!resp.ok) throw new Error('Failed to cancel');
+    if (!resp.ok) {
+      let message = 'Failed to cancel';
+      try {
+        const body = (await resp.json()) as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        // Preserve the actionable fallback when the server sends no JSON body.
+      }
+      throw new Error(message);
+    }
+    return resp.json();
+  },
+
+  async cancelWake(
+    convId: string,
+    contractId: string,
+  ): Promise<
+    | { outcome: 'cancelled'; contract_id: string }
+    | { outcome: 'already_terminal'; contract_id: string; status: WakeStatus }
+  > {
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(convId)}/wakes/${encodeURIComponent(contractId)}/cancel`,
+      { method: 'POST' },
+    );
+    if (!resp.ok) {
+      let message = 'Failed to cancel wake';
+      try {
+        const body = (await resp.json()) as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        // Preserve the actionable fallback when the server sends no JSON body.
+      }
+      throw new Error(message);
+    }
     return resp.json();
   },
 

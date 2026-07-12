@@ -16,6 +16,7 @@ use phoenix_core::domain::creation_protocol::{
 use phoenix_core::domain::db_schema as schema;
 
 pub use migrations::run_pending_migrations;
+pub use phoenix_core::domain::wake_contracts::*;
 pub use retrieval::{
     Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalScope, RetrievedChunk,
 };
@@ -26,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -123,6 +124,16 @@ pub enum DbError {
     /// from the idempotent no-op case (same child id), which returns `Ok`.
     #[error("Fork proposal conflict: {0}")]
     ForkProposalConflict(String),
+    #[error("Wake contract conflict: {0}")]
+    WakeContractConflict(String),
+    #[error("Wake contract validation error: {0}")]
+    WakeContractValidation(String),
+    #[error("Wake registration is closed for conversation: {0}")]
+    WakeRegistrationClosed(String),
+    #[error("Conversation is not lifecycle-eligible for wake registration: {0}")]
+    WakeRegistrationIneligible(String),
+    #[error("Archived conversation is not eligible for wake resume: {0}")]
+    WakeResumeArchived(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -189,13 +200,89 @@ pub enum ContinueOutcome {
     /// The transaction applied: a new conversation was created and the
     /// parent's `continued_in_conv_id` now points at it.
     Created(Conversation),
-    /// The parent already had a continuation. The transaction did not run;
-    /// the returned conversation is the pre-existing continuation (the
-    /// endpoint returns this idempotently rather than rejecting).
+    /// The parent already had a continuation. The returned conversation is the
+    /// pre-existing continuation; pending wake obligations are idempotently
+    /// transferred to it before this outcome is returned.
     AlreadyContinued(Conversation),
     /// The parent exists but is not in `ContextExhausted` state. The
     /// transaction did not run.
     ParentNotContextExhausted { state_variant: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeResolutionInput {
+    pub contract_id: String,
+    pub outcome: WakeTerminalOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeResolutionOutcome {
+    Resolved(WakeContractStatus),
+    AlreadyTerminal(WakeContractStatus),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeCancelOutcome {
+    Resolved,
+    AlreadyTerminal(WakeContractStatus),
+    NotOwnedOrMissing,
+}
+
+/// Result of compensating a wake registration whose tool was cancelled after
+/// the registration transaction committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeRegistrationSuppressionOutcome {
+    /// Cancellation removed every automatic-resume obligation created by this
+    /// registration. The caller may truthfully report tool cancellation.
+    CancellationWon,
+    /// Delivery was already materialized/accepted, or the contract was no
+    /// longer owned by this conversation. The committed receipt remains the
+    /// truthful result.
+    RegistrationWon(WakeContractStatus),
+}
+
+/// Result of atomically acquiring the durable lifecycle fence. Acquiring an
+/// already-closed fence is idempotent so a lifecycle operation can retry after
+/// cleanup or its final durable mutation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeLifecycleFenceOutcome {
+    Acquired,
+    PendingContracts { count: i64 },
+}
+
+/// Result of acquiring one lifecycle fence over an exact conversation set.
+/// Refusal leaves every member's registration fence unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeLifecycleGroupFenceOutcome {
+    Acquired,
+    MissingConversations {
+        ids: Vec<String>,
+    },
+    PendingContracts {
+        conversation_ids: Vec<String>,
+        count: i64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeInboxSnapshot {
+    pub max_inbox_id: i64,
+    pub items: Vec<WakeInboxItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WakeInboxMessageOutcome {
+    pub message: Message,
+    pub items: Vec<WakeInboxItem>,
+    pub message_inserted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWakeResume {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub snapshot_max_inbox_id: i64,
+    pub text: String,
 }
 
 /// One `mcp_oauth_registrations` row: the OAuth client identity for an
@@ -3418,6 +3505,65 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically commit the durable half of an in-place approval scope transfer:
+    /// conversation mode/cwd and exact pending wake-registration provenance.
+    ///
+    /// # Errors
+    /// Returns an error without changing any row when any statement fails.
+    pub async fn commit_approval_scope_transfer(
+        &self,
+        id: &str,
+        mode: &ConvMode,
+        cwd: &str,
+        old_scope: &phoenix_core::work_scope::WorkScope,
+        new_scope: &phoenix_core::work_scope::WorkScope,
+    ) -> DbResult<u64> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now().to_rfc3339();
+        let cm = conv_mode_columns(mode);
+        let result = sqlx::query(
+            "UPDATE conversations
+             SET cm_kind = ?1, cm_branch_name = ?2, cm_worktree_path = ?3, cm_base_branch = ?4,
+                 cm_task_id = ?5, cm_task_title = ?6, cm_next_taskmd_id_hint = ?7,
+                 cwd = ?8, updated_at = ?9
+             WHERE id = ?10",
+        )
+        .bind(cm.kind)
+        .bind(cm.branch_name)
+        .bind(cm.worktree_path)
+        .bind(cm.base_branch)
+        .bind(cm.task_id)
+        .bind(cm.task_title)
+        .bind(cm.next_taskmd_id_hint)
+        .bind(cwd)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        }
+        let wakes = if old_scope == new_scope {
+            0
+        } else {
+            sqlx::query(
+                "UPDATE wake_contracts
+                 SET registration_scope_key = ?1
+                 WHERE current_conversation_id = ?2
+                   AND registration_scope_key = ?3
+                   AND status = 'pending'",
+            )
+            .bind(new_scope.stable_key())
+            .bind(id)
+            .bind(old_scope.stable_key())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        };
+        tx.commit().await?;
+        Ok(wakes)
+    }
+
     /// Check if any non-archived conversation for a project is in Work mode
     ///
     /// # Errors
@@ -3835,6 +3981,10 @@ impl Database {
                 "continue_conversation: idempotent return of existing continuation",
             );
             let existing = self.get_conversation(existing_id).await?;
+            let mut tx = self.pool.begin().await?;
+            close_wake_registration_tx(&mut tx, parent_id).await?;
+            transfer_wake_contracts_tx(&mut tx, parent_id, existing_id).await?;
+            tx.commit().await?;
             return Ok(ContinueOutcome::AlreadyContinued(existing));
         }
 
@@ -3927,7 +4077,8 @@ impl Database {
         // caller raced us between the SELECT above and this UPDATE, the
         // rows_affected will be 0 and we roll back.
         let updated = sqlx::query(
-            "UPDATE conversations SET continued_in_conv_id = ?1, updated_at = ?2 \
+            "UPDATE conversations
+             SET continued_in_conv_id = ?1, wake_registration_open = 0, updated_at = ?2
              WHERE id = ?3 AND continued_in_conv_id IS NULL",
         )
         .bind(&new_id)
@@ -3944,6 +4095,10 @@ impl Database {
             let refetched = self.get_conversation(parent_id).await?;
             if let Some(ref existing_id) = refetched.continued_in_conv_id {
                 let existing = self.get_conversation(existing_id).await?;
+                let mut transfer_tx = self.pool.begin().await?;
+                close_wake_registration_tx(&mut transfer_tx, parent_id).await?;
+                transfer_wake_contracts_tx(&mut transfer_tx, parent_id, existing_id).await?;
+                transfer_tx.commit().await?;
                 tracing::info!(
                     parent_id = %parent_id,
                     existing_continuation = %existing_id,
@@ -3955,6 +4110,7 @@ impl Database {
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
 
+        transfer_wake_contracts_tx(&mut tx, parent_id, &new_id).await?;
         tx.commit().await?;
 
         let title_str = schema::title_from_slug(&actual_slug);
@@ -4930,6 +5086,922 @@ impl Database {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns a database or wake-contract validation error.
+    pub async fn insert_wake_contract(&self, contract: &WakeContract) -> DbResult<()> {
+        if contract.status != WakeContractStatus::Pending {
+            return Err(DbError::WakeContractValidation(
+                "inserted wake contract must be pending".to_string(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        require_wake_registration_open_tx(&mut tx, &contract.current_conversation_id).await?;
+        insert_wake_contract_tx(&mut tx, contract).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Register a pending wake contract and optionally terminalize it from
+    /// evidence observed during registration. Contract, tails, and inbox row
+    /// commit as one unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contract is not pending, the terminal evidence
+    /// does not match its handle, or any database write fails.
+    pub async fn register_wake_contract(
+        &self,
+        contract: &WakeContract,
+        terminal_outcome: Option<&WakeTerminalOutcome>,
+    ) -> DbResult<()> {
+        if contract.status != WakeContractStatus::Pending {
+            return Err(DbError::WakeContractValidation(
+                "registered wake contract must be pending".to_string(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        require_wake_registration_open_tx(&mut tx, &contract.current_conversation_id).await?;
+        insert_wake_contract_tx(&mut tx, contract).await?;
+        if let Some(terminal_outcome) = terminal_outcome {
+            resolve_terminal_wake_contract_tx(
+                &mut tx,
+                &WakeResolutionInput {
+                    contract_id: contract.id.clone(),
+                    outcome: terminal_outcome.clone(),
+                },
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically close wake registration iff no pending contract exists.
+    /// Closure is durable lifecycle intent: once acquired it stays closed, and
+    /// subsequent calls are idempotently acquired to permit lifecycle retries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the conversation does not exist or `SQLite` fails.
+    pub async fn acquire_wake_lifecycle_fence(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<WakeLifecycleFenceOutcome> {
+        let mut tx = self.pool.begin().await?;
+        // This guarded UPDATE is the transaction's first statement. SQLite
+        // serializes it with registration's guarded UPDATE, making the fence
+        // decision and pending-contract predicate one durable write order.
+        let updated = sqlx::query(
+            "UPDATE conversations SET wake_registration_open = 0
+             WHERE id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM wake_contracts
+                   WHERE current_conversation_id = ?1 AND status = 'pending'
+               )",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 1 {
+            tx.commit().await?;
+            return Ok(WakeLifecycleFenceOutcome::Acquired);
+        }
+
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)")
+                .bind(conversation_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+        }
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wake_contracts
+             WHERE current_conversation_id = ?1 AND status = 'pending'",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        Ok(WakeLifecycleFenceOutcome::PendingContracts { count: pending })
+    }
+
+    /// Atomically close wake registration for an exact conversation set iff
+    /// every member exists and the set has no pending wake contracts.
+    ///
+    /// Registration and this admission decision serialize on `SQLite`'s writer
+    /// lock. Any missing member or pending contract leaves every fence open.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot acquire the writer transaction or
+    /// query/update the exact member set.
+    pub async fn acquire_wake_lifecycle_fences(
+        &self,
+        conversation_ids: &[String],
+    ) -> DbResult<WakeLifecycleGroupFenceOutcome> {
+        let mut tx = self.pool.begin().await?;
+        // Acquire the writer lock before observing membership or pending wakes.
+        sqlx::query(
+            "UPDATE conversations SET wake_registration_open = wake_registration_open WHERE 0",
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        let mut existing_query =
+            sqlx::QueryBuilder::new("SELECT id FROM conversations WHERE id IN (");
+        let mut separated = existing_query.separated(", ");
+        for id in conversation_ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        let existing: Vec<String> = existing_query
+            .build_query_scalar()
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut missing: Vec<String> = conversation_ids
+            .iter()
+            .filter(|id| !existing.contains(id))
+            .cloned()
+            .collect();
+        missing.sort();
+        missing.dedup();
+        if !missing.is_empty() {
+            return Ok(WakeLifecycleGroupFenceOutcome::MissingConversations { ids: missing });
+        }
+
+        let mut pending_query = sqlx::QueryBuilder::new(
+            "SELECT current_conversation_id FROM wake_contracts WHERE status = 'pending' AND current_conversation_id IN (",
+        );
+        let mut separated = pending_query.separated(", ");
+        for id in conversation_ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(") ORDER BY current_conversation_id");
+        let pending_ids: Vec<String> = pending_query
+            .build_query_scalar()
+            .fetch_all(&mut *tx)
+            .await?;
+        if !pending_ids.is_empty() {
+            let count = i64::try_from(pending_ids.len()).unwrap_or(i64::MAX);
+            let mut conversation_ids = pending_ids;
+            conversation_ids.dedup();
+            return Ok(WakeLifecycleGroupFenceOutcome::PendingContracts {
+                conversation_ids,
+                count,
+            });
+        }
+
+        if !conversation_ids.is_empty() {
+            let mut update = sqlx::QueryBuilder::new(
+                "UPDATE conversations SET wake_registration_open = 0 WHERE id IN (",
+            );
+            let mut separated = update.separated(", ");
+            for id in conversation_ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            update.build().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(WakeLifecycleGroupFenceOutcome::Acquired)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the persisted contract cannot be queried or decoded.
+    pub async fn get_wake_contract(&self, contract_id: &str) -> DbResult<Option<WakeContract>> {
+        sqlx::query(
+            "SELECT id, current_conversation_id, registration_scope_key, handle_kind, handle_id, registering_tool_use_id,
+                    registered_at, expires_at, status, terminal_cause, forgotten_reason,
+                    terminal_payload_json, resolved_at
+             FROM wake_contracts WHERE id = ?1",
+        )
+        .bind(contract_id)
+        .try_map(parse_wake_contract_row)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if persisted contracts cannot be queried or decoded.
+    pub async fn list_wake_contracts(&self) -> DbResult<Vec<WakeContract>> {
+        sqlx::query(
+            "SELECT id, current_conversation_id, registration_scope_key, handle_kind, handle_id, registering_tool_use_id,
+                    registered_at, expires_at, status, terminal_cause, forgotten_reason,
+                    terminal_payload_json, resolved_at
+             FROM wake_contracts ORDER BY registered_at, id",
+        )
+        .try_map(parse_wake_contract_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if conversation-scoped contracts cannot be queried or decoded.
+    pub async fn list_wake_contracts_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Vec<WakeContract>> {
+        sqlx::query(
+            "SELECT id, current_conversation_id, registration_scope_key, handle_kind, handle_id, registering_tool_use_id,
+                    registered_at, expires_at, status, terminal_cause, forgotten_reason,
+                    terminal_payload_json, resolved_at
+             FROM wake_contracts WHERE current_conversation_id = ?1
+             ORDER BY registered_at, id",
+        )
+        .bind(conversation_id)
+        .try_map(parse_wake_contract_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if pending contracts cannot be queried or decoded.
+    pub async fn list_pending_wake_contracts(&self) -> DbResult<Vec<WakeContract>> {
+        sqlx::query(
+            "SELECT id, current_conversation_id, registration_scope_key, handle_kind, handle_id, registering_tool_use_id,
+                    registered_at, expires_at, status, terminal_cause, forgotten_reason,
+                    terminal_payload_json, resolved_at
+             FROM wake_contracts WHERE status = 'pending' ORDER BY registered_at, id",
+        )
+        .try_map(parse_wake_contract_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if pending contracts cannot be queried or decoded.
+    pub async fn list_pending_wake_contracts_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Vec<WakeContract>> {
+        sqlx::query(
+            "SELECT id, current_conversation_id, registration_scope_key, handle_kind, handle_id, registering_tool_use_id,
+                    registered_at, expires_at, status, terminal_cause, forgotten_reason,
+                    terminal_payload_json, resolved_at
+             FROM wake_contracts WHERE current_conversation_id = ?1 AND status = 'pending'
+             ORDER BY registered_at, id",
+        )
+        .bind(conversation_id)
+        .try_map(parse_wake_contract_row)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// Returns whether at least one pending contract belongs to the specified
+    /// conversation and registering tool round. This intentionally projects only
+    /// existence; terminal history and payloads are not decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pending-registration query fails.
+    pub async fn has_pending_wake_registration(
+        &self,
+        conversation_id: &str,
+        tool_use_ids: &[String],
+    ) -> DbResult<bool> {
+        if tool_use_ids.is_empty() {
+            return Ok(false);
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT EXISTS(SELECT 1 FROM wake_contracts WHERE current_conversation_id = ",
+        );
+        query.push_bind(conversation_id);
+        query.push(" AND status = 'pending' AND registering_tool_use_id IN (");
+        let mut ids = query.separated(", ");
+        for id in tool_use_ids {
+            ids.push_bind(id);
+        }
+        ids.push_unseparated(") LIMIT 1)");
+        query
+            .build_query_scalar()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(DbError::Sqlx)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if pending contracts cannot be counted.
+    pub async fn count_pending_wake_contracts(&self) -> DbResult<i64> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM wake_contracts WHERE status = 'pending'")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if pending contracts cannot be counted.
+    pub async fn count_pending_wake_contracts_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM wake_contracts
+             WHERE current_conversation_id = ?1 AND status = 'pending'",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the contract cannot be terminalized atomically.
+    pub async fn cancel_wake_contract(&self, contract_id: &str) -> DbResult<WakeCancelOutcome> {
+        let Some(contract) = self.get_wake_contract(contract_id).await? else {
+            return Ok(WakeCancelOutcome::NotOwnedOrMissing);
+        };
+        self.cancel_wake_contract_for_conversation(contract_id, &contract.current_conversation_id)
+            .await
+    }
+
+    /// Atomically cancels a pending wake only while it belongs to `conversation_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contract cannot be terminalized atomically.
+    pub async fn cancel_wake_contract_for_conversation(
+        &self,
+        contract_id: &str,
+        conversation_id: &str,
+    ) -> DbResult<WakeCancelOutcome> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE wake_contracts SET id = id WHERE id = ?1")
+            .bind(contract_id)
+            .execute(&mut *tx)
+            .await?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT current_conversation_id, status FROM wake_contracts WHERE id = ?1",
+        )
+        .bind(contract_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((owner, status)) = row else {
+            tx.commit().await?;
+            return Ok(WakeCancelOutcome::NotOwnedOrMissing);
+        };
+        if owner != conversation_id {
+            tx.commit().await?;
+            return Ok(WakeCancelOutcome::NotOwnedOrMissing);
+        }
+        let status =
+            WakeContractStatus::from_db(&status).map_err(DbError::WakeContractValidation)?;
+        if status != WakeContractStatus::Pending {
+            tx.commit().await?;
+            return Ok(WakeCancelOutcome::AlreadyTerminal(status));
+        }
+        let resolution = resolve_terminal_wake_contract_tx(
+            &mut tx,
+            &WakeResolutionInput {
+                contract_id: contract_id.to_string(),
+                outcome: WakeTerminalOutcome::Cancelled {
+                    resolved_at: Utc::now(),
+                },
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        match resolution {
+            WakeResolutionOutcome::Resolved(WakeContractStatus::Cancelled) => {
+                Ok(WakeCancelOutcome::Resolved)
+            }
+            WakeResolutionOutcome::AlreadyTerminal(status)
+            | WakeResolutionOutcome::Resolved(status) => {
+                Ok(WakeCancelOutcome::AlreadyTerminal(status))
+            }
+        }
+    }
+
+    /// Compensate cancellation observed after registration committed.
+    ///
+    /// The writer transaction decides whether cancellation can still suppress
+    /// delivery. A pending contract becomes cancelled normally. An immediate
+    /// terminal observation is converted to a non-resuming cancellation only
+    /// while its inbox row is still unmaterialized. Once delivery is visible,
+    /// the committed registration wins and its receipt must be returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contract cannot be inspected or updated atomically.
+    pub async fn suppress_registration_after_tool_cancel(
+        &self,
+        contract_id: &str,
+        conversation_id: &str,
+    ) -> DbResult<WakeRegistrationSuppressionOutcome> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE wake_contracts SET id = id WHERE id = ?1")
+            .bind(contract_id)
+            .execute(&mut *tx)
+            .await?;
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT current_conversation_id, status FROM wake_contracts WHERE id = ?1",
+        )
+        .bind(contract_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((owner, status)) = row else {
+            tx.commit().await?;
+            return Ok(WakeRegistrationSuppressionOutcome::RegistrationWon(
+                WakeContractStatus::Cancelled,
+            ));
+        };
+        let status =
+            WakeContractStatus::from_db(&status).map_err(DbError::WakeContractValidation)?;
+        if owner != conversation_id {
+            tx.commit().await?;
+            return Ok(WakeRegistrationSuppressionOutcome::RegistrationWon(status));
+        }
+        if status == WakeContractStatus::Pending {
+            resolve_terminal_wake_contract_tx(
+                &mut tx,
+                &WakeResolutionInput {
+                    contract_id: contract_id.to_string(),
+                    outcome: WakeTerminalOutcome::Cancelled {
+                        resolved_at: Utc::now(),
+                    },
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(WakeRegistrationSuppressionOutcome::CancellationWon);
+        }
+
+        let suppressible: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM wake_inbox
+                 WHERE contract_id = ?1 AND conversation_id = ?2
+                   AND delivered_at IS NULL AND consumed_at IS NULL
+             )",
+        )
+        .bind(contract_id)
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !suppressible || status == WakeContractStatus::Cancelled {
+            tx.commit().await?;
+            return Ok(if status == WakeContractStatus::Cancelled {
+                WakeRegistrationSuppressionOutcome::CancellationWon
+            } else {
+                WakeRegistrationSuppressionOutcome::RegistrationWon(status)
+            });
+        }
+
+        sqlx::query("DELETE FROM wake_contract_tails WHERE contract_id = ?1")
+            .bind(contract_id)
+            .execute(&mut *tx)
+            .await?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE wake_contracts
+             SET status = 'cancelled', terminal_cause = 'cancelled',
+                 forgotten_reason = NULL, terminal_payload_json = NULL, resolved_at = ?1
+             WHERE id = ?2",
+        )
+        .bind(&now)
+        .bind(contract_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE wake_inbox
+             SET cause = 'cancelled', forgotten_reason = NULL,
+                 terminal_payload_json = NULL, auto_resume = 0
+             WHERE contract_id = ?1 AND delivered_at IS NULL AND consumed_at IS NULL",
+        )
+        .bind(contract_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(WakeRegistrationSuppressionOutcome::CancellationWon)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the outcome is invalid or cannot be persisted atomically.
+    pub async fn resolve_terminal_wake_contract(
+        &self,
+        input: &WakeResolutionInput,
+    ) -> DbResult<WakeResolutionOutcome> {
+        let mut tx = self.pool.begin().await?;
+        let outcome = resolve_terminal_wake_contract_tx(&mut tx, input).await?;
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if inbox items cannot be queried or decoded.
+    pub async fn list_wake_inbox_items(&self) -> DbResult<Vec<WakeInboxItem>> {
+        load_all_wake_inbox_items(&self.pool).await
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if inbox items cannot be queried or decoded.
+    pub async fn list_wake_inbox_items_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<Vec<WakeInboxItem>> {
+        load_wake_inbox_items_for_conversation(&self.pool, conversation_id).await
+    }
+
+    /// Lists conversations with an undelivered, unconsumed auto-resume item.
+    /// Admission does not load payload JSON or tails; those are materialized only
+    /// after the dispatcher establishes that the conversation is idle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dispatcher admission cannot be queried.
+    pub async fn list_pending_wake_auto_resume_conversations(&self) -> DbResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT conversation_id FROM wake_inbox
+             WHERE auto_resume = 1 AND delivered_at IS NULL AND consumed_at IS NULL
+             ORDER BY conversation_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DbError::Sqlx)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if pending inbox items cannot be counted.
+    pub async fn count_pending_wake_inbox_items(&self) -> DbResult<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM wake_inbox WHERE delivered_at IS NULL AND consumed_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the conversation-scoped snapshot cannot be read.
+    pub async fn snapshot_pending_wake_inbox(
+        &self,
+        conversation_id: &str,
+    ) -> DbResult<WakeInboxSnapshot> {
+        let mut tx = self.pool.begin().await?;
+        let (max_inbox_id,): (Option<i64>,) = sqlx::query_as(
+            "SELECT MAX(inbox_id) FROM wake_inbox
+             WHERE conversation_id = ?1 AND delivered_at IS NULL AND consumed_at IS NULL",
+        )
+        .bind(conversation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let Some(max_inbox_id) = max_inbox_id else {
+            tx.commit().await?;
+            return Ok(WakeInboxSnapshot {
+                max_inbox_id: 0,
+                items: Vec::new(),
+            });
+        };
+        let items =
+            load_pending_wake_inbox_snapshot(&mut tx, conversation_id, max_inbox_id).await?;
+        tx.commit().await?;
+        Ok(WakeInboxSnapshot {
+            max_inbox_id,
+            items,
+        })
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the bounded snapshot cannot be read and consumed atomically.
+    pub async fn consume_wake_inbox_snapshot(
+        &self,
+        conversation_id: &str,
+        max_inbox_id: i64,
+    ) -> DbResult<Vec<WakeInboxItem>> {
+        let mut tx = self.pool.begin().await?;
+        let items =
+            load_pending_wake_inbox_snapshot(&mut tx, conversation_id, max_inbox_id).await?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE wake_inbox
+             SET delivered_at = COALESCE(delivered_at, ?1), consumed_at = ?1
+             WHERE conversation_id = ?2 AND delivered_at IS NULL AND consumed_at IS NULL AND inbox_id <= ?3",
+        )
+        .bind(&now)
+        .bind(conversation_id)
+        .bind(max_inbox_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(items)
+    }
+
+    /// Persist a deterministic wake meta-message and consume exactly the still-pending
+    /// rows in its bounded inbox snapshot in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot cannot be read, the message cannot be
+    /// inserted idempotently, or the inbox rows cannot be consumed.
+    #[allow(clippy::too_many_lines)]
+    pub async fn persist_wake_inbox_snapshot_message(
+        &self,
+        conversation_id: &str,
+        max_inbox_id: i64,
+        message_id: &str,
+        sequence_id: i64,
+        content: MessageContent,
+    ) -> DbResult<WakeInboxMessageOutcome> {
+        if !matches!(&content, MessageContent::User(user) if user.is_meta) {
+            return Err(DbError::WakeContractValidation(
+                "wake inbox message must be meta-user content".to_string(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let eligible = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at
+             WHERE id = ?1 AND archived = 0",
+        )
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if eligible.rows_affected() == 0 {
+            let archived: Option<bool> =
+                sqlx::query_scalar("SELECT archived FROM conversations WHERE id = ?1")
+                    .bind(conversation_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            return match archived {
+                Some(true) => Err(DbError::WakeResumeArchived(conversation_id.to_string())),
+                Some(false) => unreachable!("eligible update must match a live conversation"),
+                None => Err(DbError::ConversationNotFound(conversation_id.to_string())),
+            };
+        }
+        let items =
+            load_pending_wake_inbox_snapshot(&mut tx, conversation_id, max_inbox_id).await?;
+        let existing = load_message_by_id_tx(&mut tx, message_id).await?;
+        let (message, message_inserted) = if let Some(existing) = existing {
+            if existing.conversation_id != conversation_id || existing.content != content {
+                return Err(DbError::WakeContractConflict(format!(
+                    "wake inbox message {message_id} exists with different content or conversation"
+                )));
+            }
+            let existing_boundary: Option<i64> = sqlx::query_scalar(
+                "SELECT snapshot_max_inbox_id FROM wake_resume_outbox
+                 WHERE conversation_id = ?1 AND message_id = ?2",
+            )
+            .bind(conversation_id)
+            .bind(message_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if existing_boundary != Some(max_inbox_id) {
+                return Err(DbError::WakeContractConflict(format!(
+                    "wake inbox message {message_id} exists with a different resume boundary"
+                )));
+            }
+            if !items.is_empty() {
+                return Err(DbError::WakeContractConflict(format!(
+                    "wake inbox message {message_id} already exists while snapshot still has pending items"
+                )));
+            }
+            (existing, false)
+        } else {
+            let now = Utc::now();
+            let message = Message {
+                message_id: message_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                sequence_id,
+                message_type: content.message_type(),
+                content,
+                display_data: None,
+                usage_data: None,
+                created_at: now,
+            };
+            insert_message_tx(&mut tx, &message).await?;
+            sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+                .bind(now.to_rfc3339())
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await?;
+            (message, true)
+        };
+
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT OR IGNORE INTO wake_resume_outbox (
+                 conversation_id, message_id, snapshot_max_inbox_id, status, created_at
+             ) VALUES (?1, ?2, ?3, 'pending', ?4)",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .bind(max_inbox_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        let matching_outbox: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wake_resume_outbox
+             WHERE conversation_id = ?1 AND message_id = ?2 AND snapshot_max_inbox_id = ?3",
+        )
+        .bind(conversation_id)
+        .bind(message_id)
+        .bind(max_inbox_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if matching_outbox != 1 {
+            return Err(DbError::WakeContractConflict(format!(
+                "wake resume boundary {max_inbox_id} conflicts with message {message_id}"
+            )));
+        }
+        sqlx::query(
+            "UPDATE wake_inbox
+             SET delivered_at = COALESCE(delivered_at, ?1), consumed_at = ?1
+             WHERE conversation_id = ?2 AND delivered_at IS NULL
+                   AND consumed_at IS NULL AND inbox_id <= ?3",
+        )
+        .bind(&now)
+        .bind(conversation_id)
+        .bind(max_inbox_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(WakeInboxMessageOutcome {
+            message,
+            items,
+            message_inserted,
+        })
+    }
+
+    /// List durable resume requests that have not yet committed an accepting state transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if pending outbox rows or their deterministic messages cannot be decoded.
+    pub async fn list_pending_wake_resumes(&self) -> DbResult<Vec<PendingWakeResume>> {
+        let rows = sqlx::query(
+            "SELECT o.conversation_id AS outbox_conversation_id,
+                    o.message_id AS outbox_message_id, o.snapshot_max_inbox_id,
+                    m.message_id, m.conversation_id, m.sequence_id, m.message_type,
+                    m.content, m.display_data, m.usage_data, m.created_at
+             FROM wake_resume_outbox o
+             JOIN messages m ON m.message_id = o.message_id
+             WHERE o.status = 'pending'
+             ORDER BY o.created_at, o.conversation_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let conversation_id: String = row.try_get("outbox_conversation_id")?;
+                let message_id: String = row.try_get("outbox_message_id")?;
+                let snapshot_max_inbox_id: i64 = row.try_get("snapshot_max_inbox_id")?;
+                let message = parse_message_row(row)?;
+                let text = match message.content {
+                    MessageContent::User(user) if user.is_meta => user.text,
+                    MessageContent::User(_)
+                    | MessageContent::Agent(_)
+                    | MessageContent::Tool(_)
+                    | MessageContent::System(_)
+                    | MessageContent::Error(_)
+                    | MessageContent::Continuation(_)
+                    | MessageContent::Skill(_) => {
+                        return Err(DbError::WakeContractConflict(format!(
+                            "wake resume message {message_id} is not meta-user content"
+                        )));
+                    }
+                };
+                Ok(PendingWakeResume {
+                    conversation_id,
+                    message_id,
+                    snapshot_max_inbox_id,
+                    text,
+                })
+            })
+            .collect()
+    }
+
+    /// Atomically persist an accepting runtime state and acknowledge its wake outbox row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the message is not a matching pending outbox request, the
+    /// state is not `LlmRequesting`, or either write cannot commit.
+    pub async fn accept_wake_resume_state(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        if !matches!(state, ConvState::LlmRequesting { .. }) {
+            return Err(DbError::WakeContractValidation(
+                "wake resume can only persist LlmRequesting".to_string(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        let state_json = serde_json::to_string(state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let state_result = sqlx::query(
+            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?3
+             WHERE id = ?4 AND archived = 0",
+        )
+        .bind(state_json)
+        .bind(state_updated_at.to_rfc3339())
+        .bind(&now)
+        .bind(conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if state_result.rows_affected() == 0 {
+            let archived: Option<bool> =
+                sqlx::query_scalar("SELECT archived FROM conversations WHERE id = ?1")
+                    .bind(conversation_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            return match archived {
+                Some(true) => Err(DbError::WakeResumeArchived(conversation_id.to_string())),
+                Some(false) => unreachable!("live conversation state update must match"),
+                None => Err(DbError::ConversationNotFound(conversation_id.to_string())),
+            };
+        }
+        let outbox_result = sqlx::query(
+            "UPDATE wake_resume_outbox SET status = 'accepted', accepted_at = ?1
+             WHERE conversation_id = ?2 AND message_id = ?3 AND status = 'pending'",
+        )
+        .bind(&now)
+        .bind(conversation_id)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+        if outbox_result.rows_affected() != 1 {
+            return Err(DbError::WakeContractConflict(format!(
+                "wake resume {message_id} is not pending for {conversation_id}"
+            )));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if pending contracts and unconsumed inbox items cannot be transferred.
+    pub async fn transfer_wake_contracts(
+        &self,
+        predecessor_conversation_id: &str,
+        successor_conversation_id: &str,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        transfer_wake_contracts_tx(
+            &mut tx,
+            predecessor_conversation_id,
+            successor_conversation_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Rekey resource lookup provenance for pending wake contracts owned by one
+    /// conversation during an in-place Explore→Work approval. Terminal rows are
+    /// immutable evidence and are deliberately excluded.
+    ///
+    /// The old scope predicate is exact, making retries idempotent and preventing
+    /// an approval from moving registrations belonging to another resource scope.
+    ///
+    /// # Errors
+    /// Returns an error if the update cannot be persisted.
+    pub async fn rekey_pending_wake_registration_scope(
+        &self,
+        conversation_id: &str,
+        old_scope: &phoenix_core::work_scope::WorkScope,
+        new_scope: &phoenix_core::work_scope::WorkScope,
+    ) -> DbResult<u64> {
+        if old_scope == new_scope {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "UPDATE wake_contracts
+             SET registration_scope_key = ?1
+             WHERE current_conversation_id = ?2
+               AND registration_scope_key = ?3
+               AND status = 'pending'",
+        )
+        .bind(new_scope.stable_key())
+        .bind(conversation_id)
+        .bind(old_scope.stable_key())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Get all non-archived Work/Branch conversations (for startup worktree reconciliation).
     ///
     /// # Errors
@@ -4959,18 +6031,28 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn archive_conversation(&self, id: &str) -> DbResult<()> {
-        let now = Utc::now();
-
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
         let result =
             sqlx::query("UPDATE conversations SET archived = 1, updated_at = ?1 WHERE id = ?2")
-                .bind(now.to_rfc3339())
+                .bind(&now)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        sqlx::query(
+            "UPDATE wake_resume_outbox
+             SET status = 'suppressed', suppressed_at = ?1, suppression_reason = 'conversation_archived'
+             WHERE conversation_id = ?2 AND status = 'pending'",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -6694,6 +7776,611 @@ fn parse_fork_proposal_row(row: SqliteRow) -> Result<ForkProposal, sqlx::Error> 
     })
 }
 
+async fn require_wake_registration_open_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+) -> DbResult<()> {
+    // The guarded write acquires SQLite's transaction-wide writer lock before
+    // eligibility is observed. Registration and lifecycle fence acquisition
+    // therefore have a single durable ordering across processes.
+    let eligible = sqlx::query(
+        "UPDATE conversations
+         SET wake_registration_open = wake_registration_open
+         WHERE id = ?1
+           AND wake_registration_open = 1
+           AND archived = 0
+           AND json_extract(state, '$.type') <> 'terminal'",
+    )
+    .bind(conversation_id)
+    .execute(&mut **tx)
+    .await?;
+    if eligible.rows_affected() == 1 {
+        return Ok(());
+    }
+
+    let row = sqlx::query(
+        "SELECT wake_registration_open, archived,
+                json_extract(state, '$.type') AS state_type
+         FROM conversations WHERE id = ?1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+    };
+    if !row.get::<bool, _>("wake_registration_open") {
+        return Err(DbError::WakeRegistrationClosed(conversation_id.to_string()));
+    }
+    Err(DbError::WakeRegistrationIneligible(format!(
+        "{conversation_id} (archived={}, state={})",
+        row.get::<bool, _>("archived"),
+        row.get::<String, _>("state_type")
+    )))
+}
+
+async fn close_wake_registration_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conversation_id: &str,
+) -> DbResult<()> {
+    let updated = sqlx::query("UPDATE conversations SET wake_registration_open = 0 WHERE id = ?1")
+        .bind(conversation_id)
+        .execute(&mut **tx)
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Err(DbError::ConversationNotFound(conversation_id.to_string()));
+    }
+    Ok(())
+}
+
+async fn insert_wake_contract_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    contract: &WakeContract,
+) -> DbResult<()> {
+    validate_wake_contract(contract)?;
+    let result = sqlx::query(
+        "INSERT INTO wake_contracts (
+            id, current_conversation_id, registration_scope_key, handle_kind, handle_id,
+            registering_tool_use_id, registered_at, expires_at, status, terminal_cause,
+            forgotten_reason, terminal_payload_json, resolved_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+    )
+    .bind(&contract.id)
+    .bind(&contract.current_conversation_id)
+    .bind(contract.registration_work_scope.stable_key())
+    .bind(contract.handle.kind().as_str())
+    .bind(contract.handle.handle_id())
+    .bind(&contract.registering_tool_use_id)
+    .bind(contract.registered_at.to_rfc3339())
+    .bind(contract.expires_at.to_rfc3339())
+    .bind(contract.status.as_str())
+    .bind(contract.terminal_cause.map(WakeTerminalCause::as_str))
+    .bind(contract.forgotten_reason.map(WakeForgottenReason::as_str))
+    .bind(serialize_terminal_payload(
+        contract.terminal_payload.as_ref(),
+    )?)
+    .bind(contract.resolved_at.map(|ts| ts.to_rfc3339()))
+    .execute(&mut **tx)
+    .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => Err(
+            DbError::WakeContractConflict(format!("wake contract {} already exists", contract.id)),
+        ),
+        Err(e) => Err(DbError::Sqlx(e)),
+    }
+}
+
+async fn resolve_terminal_wake_contract_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: &WakeResolutionInput,
+) -> DbResult<WakeResolutionOutcome> {
+    // Acquire SQLite's writer lock before reading status. Without this first
+    // write, two deferred transactions can both observe `pending`; the loser
+    // then fails with a lock upgrade instead of returning `AlreadyTerminal`.
+    sqlx::query("UPDATE wake_contracts SET id = id WHERE id = ?1")
+        .bind(&input.contract_id)
+        .execute(&mut **tx)
+        .await?;
+    let row = sqlx::query(
+        "SELECT current_conversation_id, handle_kind, handle_id, registering_tool_use_id,
+                expires_at, status
+         FROM wake_contracts WHERE id = ?1",
+    )
+    .bind(&input.contract_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Err(DbError::ConversationNotFound(format!(
+            "wake contract {}",
+            input.contract_id
+        )));
+    };
+
+    let status = WakeContractStatus::from_db(row.get::<String, _>("status").as_str())
+        .map_err(DbError::WakeContractValidation)?;
+    if status != WakeContractStatus::Pending {
+        return Ok(WakeResolutionOutcome::AlreadyTerminal(status));
+    }
+    let handle_kind = WakeContractHandleKind::from_db(row.get::<String, _>("handle_kind").as_str())
+        .map_err(DbError::WakeContractValidation)?;
+    validate_terminal_outcome_for_handle(handle_kind, &input.outcome)?;
+    let terminal_cause = input.outcome.terminal_cause();
+    let forgotten_reason = input
+        .outcome
+        .forgotten_reason()
+        .map(WakeForgottenReason::as_str);
+    let terminal_payload_json = serialize_terminal_payload(input.outcome.terminal_payload())?;
+    let updated = sqlx::query(
+        "UPDATE wake_contracts
+         SET status = ?2, terminal_cause = ?3, forgotten_reason = ?4,
+             terminal_payload_json = ?5, resolved_at = ?6
+         WHERE id = ?1 AND status = 'pending'",
+    )
+    .bind(&input.contract_id)
+    .bind(input.outcome.status().as_str())
+    .bind(terminal_cause.as_str())
+    .bind(forgotten_reason)
+    .bind(&terminal_payload_json)
+    .bind(input.outcome.resolved_at().to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(WakeResolutionOutcome::AlreadyTerminal(status));
+    }
+
+    for tail in input.outcome.tails() {
+        sqlx::query(
+            "INSERT INTO wake_contract_tails (contract_id, ordinal, line)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(&input.contract_id)
+        .bind(tail.ordinal)
+        .bind(&tail.line)
+        .execute(&mut **tx)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO wake_inbox (
+            contract_id, conversation_id, handle_kind, handle_id, registering_tool_use_id,
+            expires_at, cause, forgotten_reason, terminal_payload_json, auto_resume,
+            delivered_at, consumed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL)",
+    )
+    .bind(&input.contract_id)
+    .bind(row.get::<String, _>("current_conversation_id"))
+    .bind(handle_kind.as_str())
+    .bind(row.get::<String, _>("handle_id"))
+    .bind(row.get::<Option<String>, _>("registering_tool_use_id"))
+    .bind(row.get::<String, _>("expires_at"))
+    .bind(terminal_cause.as_str())
+    .bind(forgotten_reason)
+    .bind(terminal_payload_json)
+    .bind(input.outcome.auto_resume())
+    .execute(&mut **tx)
+    .await?;
+    Ok(WakeResolutionOutcome::Resolved(input.outcome.status()))
+}
+
+async fn transfer_wake_contracts_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    predecessor_conversation_id: &str,
+    successor_conversation_id: &str,
+) -> DbResult<()> {
+    // Delivery ownership follows every unconsumed inbox observation, including
+    // terminal contracts. Move those contract FKs before moving inbox rows so
+    // deleting the predecessor cannot cascade an observation now owed to the
+    // successor. Pending contracts without observations move as before.
+    sqlx::query(
+        "UPDATE wake_contracts
+         SET current_conversation_id = ?1
+         WHERE current_conversation_id = ?2
+           AND (status = 'pending' OR id IN (
+               SELECT contract_id FROM wake_inbox
+               WHERE conversation_id = ?2 AND consumed_at IS NULL
+           ))",
+    )
+    .bind(successor_conversation_id)
+    .bind(predecessor_conversation_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE wake_inbox
+         SET conversation_id = ?1
+         WHERE conversation_id = ?2 AND consumed_at IS NULL",
+    )
+    .bind(successor_conversation_id)
+    .bind(predecessor_conversation_id)
+    .execute(&mut **tx)
+    .await?;
+    let pending_resumes = sqlx::query(
+        "SELECT o.message_id, o.snapshot_max_inbox_id, m.content, m.message_type,
+                m.display_data, m.usage_data
+         FROM wake_resume_outbox o
+         JOIN messages m ON m.message_id = o.message_id
+         WHERE o.conversation_id = ?1 AND o.status = 'pending'
+         ORDER BY o.created_at, o.snapshot_max_inbox_id",
+    )
+    .bind(predecessor_conversation_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in pending_resumes {
+        let predecessor_message_id: String = row.try_get("message_id")?;
+        let snapshot_max_inbox_id: i64 = row.try_get("snapshot_max_inbox_id")?;
+        let successor_message_id =
+            format!("wake-inbox-{successor_conversation_id}-{snapshot_max_inbox_id}");
+        let sequence_id: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
+        )
+        .bind(successor_conversation_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT OR IGNORE INTO messages (
+                 message_id, conversation_id, sequence_id, message_type, content,
+                 display_data, usage_data, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(&successor_message_id)
+        .bind(successor_conversation_id)
+        .bind(sequence_id)
+        .bind(row.get::<String, _>("message_type"))
+        .bind(row.get::<String, _>("content"))
+        .bind(row.get::<Option<String>, _>("display_data"))
+        .bind(row.get::<Option<String>, _>("usage_data"))
+        .bind(&now)
+        .execute(&mut **tx)
+        .await?;
+        let matching_successor_message: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages
+             WHERE message_id = ?1 AND conversation_id = ?2
+                   AND content = ?3 AND message_type = ?4",
+        )
+        .bind(&successor_message_id)
+        .bind(successor_conversation_id)
+        .bind(row.get::<String, _>("content"))
+        .bind(row.get::<String, _>("message_type"))
+        .fetch_one(&mut **tx)
+        .await?;
+        if matching_successor_message != 1 {
+            return Err(DbError::WakeContractConflict(format!(
+                "successor wake message {successor_message_id} conflicts with transferred observation"
+            )));
+        }
+        sqlx::query(
+            "UPDATE wake_resume_outbox
+             SET conversation_id = ?1, message_id = ?2
+             WHERE conversation_id = ?3 AND message_id = ?4 AND status = 'pending'",
+        )
+        .bind(successor_conversation_id)
+        .bind(&successor_message_id)
+        .bind(predecessor_conversation_id)
+        .bind(&predecessor_message_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
+fn parse_wake_contract_row(row: SqliteRow) -> Result<WakeContract, sqlx::Error> {
+    let handle_kind = WakeContractHandleKind::from_db(row.get::<String, _>("handle_kind").as_str())
+        .map_err(|e| sqlx::Error::Decode(e.into()))?;
+    let status = WakeContractStatus::from_db(row.get::<String, _>("status").as_str())
+        .map_err(|e| sqlx::Error::Decode(e.into()))?;
+    let terminal_cause = row
+        .get::<Option<String>, _>("terminal_cause")
+        .map(|value| WakeTerminalCause::from_db(value.as_str()))
+        .transpose()
+        .map_err(|e| sqlx::Error::Decode(e.into()))?;
+    let forgotten_reason = row
+        .get::<Option<String>, _>("forgotten_reason")
+        .map(|value| WakeForgottenReason::from_db(value.as_str()))
+        .transpose()
+        .map_err(|e| sqlx::Error::Decode(e.into()))?;
+    let terminal_payload = deserialize_terminal_payload(
+        row.get::<Option<String>, _>("terminal_payload_json")
+            .as_deref(),
+    )
+    .map_err(|e| sqlx::Error::Decode(e.into()))?;
+    let handle_id: String = row.get("handle_id");
+    let handle = match handle_kind {
+        WakeContractHandleKind::Bash => WakeContractHandle::Bash { handle_id },
+        WakeContractHandleKind::TmuxWindow => WakeContractHandle::TmuxWindow { handle_id },
+    };
+    let registered_at =
+        DateTime::parse_from_rfc3339(row.get::<String, _>("registered_at").as_str())
+            .map_err(|e| sqlx::Error::Decode(e.into()))?
+            .with_timezone(&Utc);
+    let expires_at = DateTime::parse_from_rfc3339(row.get::<String, _>("expires_at").as_str())
+        .map_err(|e| sqlx::Error::Decode(e.into()))?
+        .with_timezone(&Utc);
+    let resolved_at = row
+        .get::<Option<String>, _>("resolved_at")
+        .map(|ts| DateTime::parse_from_rfc3339(ts.as_str()))
+        .transpose()
+        .map_err(|e| sqlx::Error::Decode(e.into()))?
+        .map(|ts| ts.with_timezone(&Utc));
+    Ok(WakeContract {
+        id: row.get("id"),
+        current_conversation_id: row.get("current_conversation_id"),
+        registration_work_scope: phoenix_core::work_scope::WorkScope::from_stable_key(
+            row.get::<String, _>("registration_scope_key").as_str(),
+        )
+        .ok_or_else(|| sqlx::Error::Decode("invalid wake registration scope key".into()))?,
+        handle,
+        registering_tool_use_id: row.get("registering_tool_use_id"),
+        registered_at,
+        expires_at,
+        status,
+        terminal_cause,
+        forgotten_reason,
+        terminal_payload,
+        resolved_at,
+    })
+}
+
+async fn load_all_wake_inbox_items(pool: &SqlitePool) -> DbResult<Vec<WakeInboxItem>> {
+    let rows = sqlx::query(
+        "SELECT i.inbox_id, i.contract_id, i.conversation_id, i.handle_kind, i.handle_id,
+                i.registering_tool_use_id, i.expires_at, i.cause, i.forgotten_reason,
+                i.terminal_payload_json, i.auto_resume, i.delivered_at, i.consumed_at,
+                t.ordinal AS tail_ordinal, t.line AS tail_line
+         FROM wake_inbox i
+         LEFT JOIN wake_contract_tails t ON t.contract_id = i.contract_id
+         ORDER BY i.inbox_id, t.ordinal",
+    )
+    .fetch_all(pool)
+    .await?;
+    parse_wake_inbox_rows(rows)
+}
+
+async fn load_wake_inbox_items_for_conversation(
+    pool: &SqlitePool,
+    conversation_id: &str,
+) -> DbResult<Vec<WakeInboxItem>> {
+    let rows = sqlx::query(
+        "SELECT i.inbox_id, i.contract_id, i.conversation_id, i.handle_kind, i.handle_id,
+                i.registering_tool_use_id, i.expires_at, i.cause, i.forgotten_reason,
+                i.terminal_payload_json, i.auto_resume, i.delivered_at, i.consumed_at,
+                t.ordinal AS tail_ordinal, t.line AS tail_line
+         FROM wake_inbox i
+         LEFT JOIN wake_contract_tails t ON t.contract_id = i.contract_id
+         WHERE i.conversation_id = ?1
+         ORDER BY i.inbox_id, t.ordinal",
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await?;
+    parse_wake_inbox_rows(rows)
+}
+
+async fn load_pending_wake_inbox_snapshot(
+    connection: &mut SqliteConnection,
+    conversation_id: &str,
+    max_inbox_id: i64,
+) -> DbResult<Vec<WakeInboxItem>> {
+    let rows = sqlx::query(
+        "SELECT i.inbox_id, i.contract_id, i.conversation_id, i.handle_kind, i.handle_id,
+                i.registering_tool_use_id, i.expires_at, i.cause, i.forgotten_reason,
+                i.terminal_payload_json, i.auto_resume, i.delivered_at, i.consumed_at,
+                t.ordinal AS tail_ordinal, t.line AS tail_line
+         FROM wake_inbox i
+         LEFT JOIN wake_contract_tails t ON t.contract_id = i.contract_id
+         WHERE i.conversation_id = ?1 AND i.delivered_at IS NULL
+               AND i.consumed_at IS NULL AND i.inbox_id <= ?2
+         ORDER BY i.inbox_id, t.ordinal",
+    )
+    .bind(conversation_id)
+    .bind(max_inbox_id)
+    .fetch_all(connection)
+    .await?;
+    parse_wake_inbox_rows(rows)
+}
+
+fn parse_wake_inbox_rows(rows: Vec<SqliteRow>) -> DbResult<Vec<WakeInboxItem>> {
+    let rows_with_tails = group_wake_inbox_rows(rows);
+    let mut items = Vec::with_capacity(rows_with_tails.len());
+    for (row, tails) in rows_with_tails {
+        let contract_id: String = row.get("contract_id");
+        let handle_kind =
+            WakeContractHandleKind::from_db(row.get::<String, _>("handle_kind").as_str())
+                .map_err(DbError::Serialization)?;
+        let handle_id: String = row.get("handle_id");
+        let cause = WakeTerminalCause::from_db(row.get::<String, _>("cause").as_str())
+            .map_err(DbError::Serialization)?;
+        let auto_resume: bool = row.get("auto_resume");
+        let delivered_at = row
+            .get::<Option<String>, _>("delivered_at")
+            .map(|ts| DateTime::parse_from_rfc3339(ts.as_str()))
+            .transpose()
+            .map_err(|e| DbError::Serialization(e.to_string()))?
+            .map(|ts| ts.with_timezone(&Utc));
+        let consumed_at = row
+            .get::<Option<String>, _>("consumed_at")
+            .map(|ts| DateTime::parse_from_rfc3339(ts.as_str()))
+            .transpose()
+            .map_err(|e| DbError::Serialization(e.to_string()))?
+            .map(|ts| ts.with_timezone(&Utc));
+        let terminal_payload = deserialize_terminal_payload(
+            row.get::<Option<String>, _>("terminal_payload_json")
+                .as_deref(),
+        )?;
+        let forgotten_reason = row
+            .get::<Option<String>, _>("forgotten_reason")
+            .map(|value| WakeForgottenReason::from_db(value.as_str()))
+            .transpose()
+            .map_err(DbError::Serialization)?;
+        let receipt = WakeRegistrationReceipt {
+            contract_id: contract_id.clone(),
+            handle: match handle_kind {
+                WakeContractHandleKind::Bash => WakeContractHandle::Bash { handle_id },
+                WakeContractHandleKind::TmuxWindow => WakeContractHandle::TmuxWindow { handle_id },
+            },
+            expires_at: DateTime::parse_from_rfc3339(row.get::<String, _>("expires_at").as_str())
+                .map_err(|e| DbError::Serialization(e.to_string()))?
+                .with_timezone(&Utc),
+            registering_tool_use_id: row.get("registering_tool_use_id"),
+        };
+        let wake_cause = match cause {
+            WakeTerminalCause::Fired => WakeInboxCause::Fired {
+                terminal_payload: terminal_payload.ok_or_else(|| {
+                    DbError::Serialization("fired inbox row missing terminal payload".to_string())
+                })?,
+                tails,
+                auto_resume,
+            },
+            WakeTerminalCause::Cancelled => WakeInboxCause::Cancelled { auto_resume },
+            WakeTerminalCause::Expired => WakeInboxCause::Expired { auto_resume },
+            WakeTerminalCause::Forgotten => WakeInboxCause::Forgotten {
+                forgotten_reason: forgotten_reason.ok_or_else(|| {
+                    DbError::Serialization(
+                        "forgotten inbox row missing forgotten_reason".to_string(),
+                    )
+                })?,
+                auto_resume,
+            },
+        };
+        items.push(WakeInboxItem {
+            inbox_id: row.get("inbox_id"),
+            contract_id,
+            conversation_id: row.get("conversation_id"),
+            receipt,
+            cause: wake_cause,
+            delivered_at,
+            consumed_at,
+        });
+    }
+    Ok(items)
+}
+
+fn group_wake_inbox_rows(rows: Vec<SqliteRow>) -> Vec<(SqliteRow, Vec<WakeTail>)> {
+    let mut out: Vec<(SqliteRow, Vec<WakeTail>)> = Vec::new();
+    for row in rows {
+        let inbox_id: i64 = row.get("inbox_id");
+        let tail_ordinal: Option<i64> = row.get("tail_ordinal");
+        let tail_line: Option<String> = row.get("tail_line");
+        if let Some((prev_row, tails)) = out.last_mut() {
+            let prev_id: i64 = prev_row.get("inbox_id");
+            if prev_id == inbox_id {
+                if let (Some(ordinal), Some(line)) = (tail_ordinal, tail_line) {
+                    tails.push(WakeTail { ordinal, line });
+                }
+                continue;
+            }
+        }
+        let mut tails = Vec::new();
+        if let (Some(ordinal), Some(line)) = (tail_ordinal, tail_line) {
+            tails.push(WakeTail { ordinal, line });
+        }
+        out.push((row, tails));
+    }
+    out
+}
+
+fn validate_wake_contract(contract: &WakeContract) -> DbResult<()> {
+    if contract.status.is_terminal() != contract.resolved_at.is_some() {
+        return Err(DbError::WakeContractValidation(
+            "resolved_at must be present iff status is terminal".to_string(),
+        ));
+    }
+    match contract.status {
+        WakeContractStatus::Pending => {
+            if contract.terminal_cause.is_some()
+                || contract.forgotten_reason.is_some()
+                || contract.terminal_payload.is_some()
+            {
+                return Err(DbError::WakeContractValidation(
+                    "pending contract cannot carry terminal data".to_string(),
+                ));
+            }
+        }
+        WakeContractStatus::Fired => {
+            if contract.terminal_cause != Some(WakeTerminalCause::Fired)
+                || contract.terminal_payload.is_none()
+                || contract.forgotten_reason.is_some()
+            {
+                return Err(DbError::WakeContractValidation(
+                    "fired contract must carry only fired terminal data".to_string(),
+                ));
+            }
+            validate_payload_kind_matches_handle(
+                contract.handle.kind(),
+                contract.terminal_payload.as_ref(),
+            )?;
+        }
+        WakeContractStatus::Cancelled => {
+            if contract.terminal_cause != Some(WakeTerminalCause::Cancelled)
+                || contract.terminal_payload.is_some()
+                || contract.forgotten_reason.is_some()
+            {
+                return Err(DbError::WakeContractValidation(
+                    "cancelled contract must not carry payload or forgotten reason".to_string(),
+                ));
+            }
+        }
+        WakeContractStatus::Expired => {
+            if contract.terminal_cause != Some(WakeTerminalCause::Expired)
+                || contract.terminal_payload.is_some()
+                || contract.forgotten_reason.is_some()
+            {
+                return Err(DbError::WakeContractValidation(
+                    "expired contract must not carry payload or forgotten reason".to_string(),
+                ));
+            }
+        }
+        WakeContractStatus::Forgotten => {
+            if contract.terminal_cause != Some(WakeTerminalCause::Forgotten)
+                || contract.terminal_payload.is_some()
+                || contract.forgotten_reason.is_none()
+            {
+                return Err(DbError::WakeContractValidation(
+                    "forgotten contract must carry only forgotten reason".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_terminal_outcome_for_handle(
+    handle_kind: WakeContractHandleKind,
+    outcome: &WakeTerminalOutcome,
+) -> DbResult<()> {
+    validate_payload_kind_matches_handle(handle_kind, outcome.terminal_payload())
+}
+
+fn validate_payload_kind_matches_handle(
+    handle_kind: WakeContractHandleKind,
+    payload: Option<&WakeTerminalPayload>,
+) -> DbResult<()> {
+    if let Some(payload) = payload {
+        if payload.kind() != handle_kind {
+            return Err(DbError::WakeContractValidation(
+                "terminal payload kind must match watched handle kind".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn serialize_terminal_payload(payload: Option<&WakeTerminalPayload>) -> DbResult<Option<String>> {
+    payload
+        .map(|payload| {
+            serde_json::to_string(payload).map_err(|e| DbError::Serialization(e.to_string()))
+        })
+        .transpose()
+}
+
+fn deserialize_terminal_payload(
+    payload_json: Option<&str>,
+) -> DbResult<Option<WakeTerminalPayload>> {
+    payload_json
+        .map(|raw| serde_json::from_str(raw).map_err(|e| DbError::Serialization(e.to_string())))
+        .transpose()
+}
+
 /// Insert a fully-formed `Conversation` row inside a transaction, writing every
 /// persisted column (including `spawned_from_conversation_id`). Idempotent on
 /// the PRIMARY KEY ONLY via `ON CONFLICT(id) DO NOTHING`, so a crash-retry that
@@ -7201,6 +8888,22 @@ fn build_materialized_tool_round(
     (agent_msg, tool_msgs)
 }
 
+async fn load_message_by_id_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: &str,
+) -> DbResult<Option<Message>> {
+    sqlx::query(
+        "SELECT message_id, conversation_id, sequence_id, message_type, content,
+                display_data, usage_data, created_at
+         FROM messages WHERE message_id = ?1",
+    )
+    .bind(message_id)
+    .try_map(parse_message_row)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(DbError::Sqlx)
+}
+
 async fn insert_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     msg: &Message,
@@ -7412,6 +9115,13 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phoenix_core::domain::db_schema::{ConvState, Conversation};
+    use phoenix_core::domain::kill_signal::KillSignal;
+    use phoenix_core::domain::wake_contracts::{
+        WakeBashFiredPayload, WakeBashObservedStatus, WakeContract, WakeContractHandle,
+        WakeContractStatus, WakeForgottenReason, WakeInboxCause, WakeTail, WakeTerminalOutcome,
+        WakeTerminalPayload, WakeTmuxFiredPayload, WakeTmuxObservedStatus,
+    };
     use phoenix_core::llm_language::LlmLanguage;
 
     async fn insert_test_creation_job(db: &Database, job_id: &str, conversation_id: &str) {
@@ -8314,6 +10024,104 @@ mod tests {
             .expect("post-migration database must reopen");
         drop(reopened);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn wake_test_conversation(id: &str) -> Conversation {
+        let now = Utc::now();
+        Conversation {
+            id: id.to_string(),
+            slug: Some(id.to_string()),
+            title: Some(id.to_string()),
+            cwd: "/tmp".to_string(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Idle,
+            state_updated_at: now,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            model: None,
+            project_id: None,
+            conv_mode: ConvMode::Direct,
+            desired_base_branch: None,
+            message_count: 0,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            chain_name: None,
+            llm_language: LlmLanguage::default(),
+            spawned_from_conversation_id: None,
+            transcript_generation: 0,
+        }
+    }
+
+    async fn seed_wake_conversation(db: &Database, id: &str) {
+        let mut tx = db.pool.begin().await.unwrap();
+        insert_conversation_tx(&mut tx, &wake_test_conversation(id))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    fn wake_contract(id: &str, conversation_id: &str, handle: WakeContractHandle) -> WakeContract {
+        WakeContract {
+            id: id.to_string(),
+            current_conversation_id: conversation_id.to_string(),
+            registration_work_scope: phoenix_core::work_scope::WorkScope::Conversation(
+                conversation_id.to_string(),
+            ),
+            handle,
+            registering_tool_use_id: Some(format!("tool-{id}")),
+            registered_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::seconds(30),
+            status: WakeContractStatus::Pending,
+            terminal_cause: None,
+            forgotten_reason: None,
+            terminal_payload: None,
+            resolved_at: None,
+        }
+    }
+
+    fn bash_fired_outcome() -> WakeTerminalOutcome {
+        WakeTerminalOutcome::Fired {
+            terminal_payload: WakeTerminalPayload::Bash {
+                bash: WakeBashFiredPayload {
+                    status: WakeBashObservedStatus::Exited,
+                    exit_code: Some(0),
+                    duration_ms: Some(123),
+                    signal_number: None,
+                    kill_signal_sent: Some(KillSignal::Term),
+                },
+            },
+            tails: vec![
+                WakeTail {
+                    ordinal: 0,
+                    line: "first".to_string(),
+                },
+                WakeTail {
+                    ordinal: 1,
+                    line: "second".to_string(),
+                },
+            ],
+            resolved_at: Utc::now(),
+        }
+    }
+
+    fn tmux_fired_outcome() -> WakeTerminalOutcome {
+        WakeTerminalOutcome::Fired {
+            terminal_payload: WakeTerminalPayload::TmuxWindow {
+                tmux_window: WakeTmuxFiredPayload {
+                    status: WakeTmuxObservedStatus::ExitMarkerObserved,
+                    exit_code: Some(17),
+                    duration_ms: Some(456),
+                },
+            },
+            tails: vec![WakeTail {
+                ordinal: 0,
+                line: "pane line".to_string(),
+            }],
+            resolved_at: Utc::now(),
+        }
     }
 
     #[cfg(unix)]
@@ -10778,6 +12586,186 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn continue_conversation_transfers_wakes_on_created_and_already_continued() {
+        let db = Database::open_in_memory().await.unwrap();
+        setup_exhausted_parent(&db, "wake-parent", "wake-parent", "/tmp", &ConvMode::Direct).await;
+        let pending = wake_contract(
+            "wake-before-continue",
+            "wake-parent",
+            WakeContractHandle::Bash {
+                handle_id: "b-before".to_string(),
+            },
+        );
+        db.insert_wake_contract(&pending).await.unwrap();
+        let terminal = wake_contract(
+            "wake-inbox-before-continue",
+            "wake-parent",
+            WakeContractHandle::Bash {
+                handle_id: "b-terminal".to_string(),
+            },
+        );
+        db.register_wake_contract(&terminal, Some(&bash_fired_outcome()))
+            .await
+            .unwrap();
+
+        let successor = match db.continue_conversation("wake-parent").await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
+        };
+        assert_eq!(
+            db.get_wake_contract("wake-before-continue")
+                .await
+                .unwrap()
+                .unwrap()
+                .current_conversation_id,
+            successor.id
+        );
+        assert_eq!(
+            db.list_wake_inbox_items_for_conversation(&successor.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let predecessor_registration = wake_contract(
+            "wake-after-created",
+            "wake-parent",
+            WakeContractHandle::TmuxWindow {
+                handle_id: "tmux-after".to_string(),
+            },
+        );
+        assert!(matches!(
+            db.register_wake_contract(
+                &predecessor_registration,
+                Some(&tmux_fired_outcome())
+            )
+            .await,
+            Err(DbError::WakeRegistrationClosed(id)) if id == "wake-parent"
+        ));
+
+        let successor_registration = WakeContract {
+            current_conversation_id: successor.id.clone(),
+            registration_work_scope: phoenix_core::work_scope::WorkScope::Conversation(
+                successor.id.clone(),
+            ),
+            ..predecessor_registration
+        };
+        db.register_wake_contract(&successor_registration, Some(&tmux_fired_outcome()))
+            .await
+            .expect("successor registration remains open");
+        match db.continue_conversation("wake-parent").await.unwrap() {
+            ContinueOutcome::AlreadyContinued(conversation) => {
+                assert_eq!(conversation.id, successor.id);
+            }
+            other @ (ContinueOutcome::Created(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected AlreadyContinued, got {other:?}")
+            }
+        }
+        let inbox = db
+            .list_wake_inbox_items_for_conversation(&successor.id)
+            .await
+            .unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert!(inbox
+            .iter()
+            .any(|item| item.contract_id == "wake-after-created"));
+    }
+
+    #[tokio::test]
+    async fn continuation_moves_terminal_contracts_with_unconsumed_observations_only() {
+        let db = Database::open_in_memory().await.unwrap();
+        setup_exhausted_parent(
+            &db,
+            "terminal-owner",
+            "terminal-owner",
+            "/tmp",
+            &ConvMode::Direct,
+        )
+        .await;
+        for id in ["consumed-fired", "unconsumed-fired"] {
+            let contract = wake_contract(
+                id,
+                "terminal-owner",
+                WakeContractHandle::Bash {
+                    handle_id: format!("bash-{id}"),
+                },
+            );
+            db.register_wake_contract(&contract, Some(&bash_fired_outcome()))
+                .await
+                .unwrap();
+        }
+        let snapshot = db
+            .snapshot_pending_wake_inbox("terminal-owner")
+            .await
+            .unwrap();
+        // Consume only the first inbox row; the later fired observation remains owed.
+        db.consume_wake_inbox_snapshot("terminal-owner", snapshot.items[0].inbox_id)
+            .await
+            .unwrap();
+        let cancelled = wake_contract(
+            "unconsumed-cancelled",
+            "terminal-owner",
+            WakeContractHandle::Bash {
+                handle_id: "bash-cancelled".to_string(),
+            },
+        );
+        db.register_wake_contract(&cancelled, None).await.unwrap();
+        db.cancel_wake_contract("unconsumed-cancelled")
+            .await
+            .unwrap();
+
+        let successor = match db.continue_conversation("terminal-owner").await.unwrap() {
+            ContinueOutcome::Created(conversation) => conversation,
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
+        };
+        assert_eq!(
+            db.get_wake_contract("unconsumed-fired")
+                .await
+                .unwrap()
+                .unwrap()
+                .current_conversation_id,
+            successor.id
+        );
+        assert_eq!(
+            db.get_wake_contract("unconsumed-cancelled")
+                .await
+                .unwrap()
+                .unwrap()
+                .current_conversation_id,
+            successor.id
+        );
+        assert_eq!(
+            db.get_wake_contract("consumed-fired")
+                .await
+                .unwrap()
+                .unwrap()
+                .current_conversation_id,
+            "terminal-owner"
+        );
+        let successor_items = db
+            .list_wake_inbox_items_for_conversation(&successor.id)
+            .await
+            .unwrap();
+        assert_eq!(successor_items.len(), 2);
+
+        match db.continue_conversation("terminal-owner").await.unwrap() {
+            ContinueOutcome::AlreadyContinued(existing) => assert_eq!(existing.id, successor.id),
+            other @ (ContinueOutcome::Created(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected AlreadyContinued, got {other:?}")
+            }
+        }
+    }
+
     /// Parent not in `ContextExhausted` state: transaction does not run;
     /// parent state is unchanged.
     #[tokio::test]
@@ -12232,8 +14220,1286 @@ mod tests {
         assert!(p.refinement_conversation_id.is_none());
     }
 
-    /// Task 02667: a fresh DB's `conversations` table must not carry the
-    /// dead `state_data` column (SCHEMA no longer creates it).
+    #[tokio::test]
+    async fn wake_registration_requires_open_eligible_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "closed").await;
+        assert_eq!(
+            db.acquire_wake_lifecycle_fence("closed").await.unwrap(),
+            WakeLifecycleFenceOutcome::Acquired
+        );
+        let err = db
+            .register_wake_contract(
+                &wake_contract(
+                    "late",
+                    "closed",
+                    WakeContractHandle::Bash {
+                        handle_id: "b-late".to_string(),
+                    },
+                ),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::WakeRegistrationClosed(_)), "{err:?}");
+
+        seed_wake_conversation(&db, "archived").await;
+        db.archive_conversation("archived").await.unwrap();
+        let err = db
+            .register_wake_contract(
+                &wake_contract(
+                    "archived-wake",
+                    "archived",
+                    WakeContractHandle::Bash {
+                        handle_id: "b-archived".to_string(),
+                    },
+                ),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DbError::WakeRegistrationIneligible(_)),
+            "{err:?}"
+        );
+
+        seed_wake_conversation(&db, "terminal").await;
+        db.update_conversation_state("terminal", &ConvState::Terminal)
+            .await
+            .unwrap();
+        let err = db
+            .register_wake_contract(
+                &wake_contract(
+                    "terminal-wake",
+                    "terminal",
+                    WakeContractHandle::Bash {
+                        handle_id: "b-terminal".to_string(),
+                    },
+                ),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DbError::WakeRegistrationIneligible(_)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_commit_cancel_suppresses_immediate_terminal_auto_resume() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "cancel-immediate").await;
+        let contract = wake_contract(
+            "cancel-immediate-contract",
+            "cancel-immediate",
+            WakeContractHandle::Bash {
+                handle_id: "bash-done".to_string(),
+            },
+        );
+        db.register_wake_contract(&contract, Some(&bash_fired_outcome()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.suppress_registration_after_tool_cancel(
+                "cancel-immediate-contract",
+                "cancel-immediate"
+            )
+            .await
+            .unwrap(),
+            WakeRegistrationSuppressionOutcome::CancellationWon
+        );
+        let persisted = db
+            .get_wake_contract("cancel-immediate-contract")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, WakeContractStatus::Cancelled);
+        let inbox = db
+            .list_wake_inbox_items_for_conversation("cancel-immediate")
+            .await
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert!(matches!(
+            inbox[0].cause,
+            WakeInboxCause::Cancelled { auto_resume: false }
+        ));
+        assert!(db
+            .list_pending_wake_auto_resume_conversations()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_commit_cancel_returns_registration_won_after_materialization() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "cancel-materialized").await;
+        let contract = wake_contract(
+            "cancel-materialized-contract",
+            "cancel-materialized",
+            WakeContractHandle::Bash {
+                handle_id: "bash-done".to_string(),
+            },
+        );
+        db.register_wake_contract(&contract, Some(&bash_fired_outcome()))
+            .await
+            .unwrap();
+        let snapshot = db
+            .snapshot_pending_wake_inbox("cancel-materialized")
+            .await
+            .unwrap();
+        db.consume_wake_inbox_snapshot("cancel-materialized", snapshot.max_inbox_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.suppress_registration_after_tool_cancel(
+                "cancel-materialized-contract",
+                "cancel-materialized"
+            )
+            .await
+            .unwrap(),
+            WakeRegistrationSuppressionOutcome::RegistrationWon(WakeContractStatus::Fired)
+        );
+        assert_eq!(
+            db.get_wake_contract("cancel-materialized-contract")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            WakeContractStatus::Fired
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_fence_with_pending_contract_conflicts_and_stays_open() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "guarded").await;
+        let contract = wake_contract(
+            "guarded-wake",
+            "guarded",
+            WakeContractHandle::Bash {
+                handle_id: "b-guarded".to_string(),
+            },
+        );
+        db.register_wake_contract(&contract, None).await.unwrap();
+
+        assert_eq!(
+            db.acquire_wake_lifecycle_fence("guarded").await.unwrap(),
+            WakeLifecycleFenceOutcome::PendingContracts { count: 1 }
+        );
+        db.cancel_wake_contract("guarded-wake").await.unwrap();
+        let second = wake_contract(
+            "guarded-wake-2",
+            "guarded",
+            WakeContractHandle::Bash {
+                handle_id: "b-guarded-2".to_string(),
+            },
+        );
+        db.register_wake_contract(&second, None)
+            .await
+            .expect("pending conflict leaves registration open");
+    }
+
+    #[tokio::test]
+    async fn group_lifecycle_fence_refusal_changes_no_member_fences() {
+        let db = Database::open_in_memory().await.unwrap();
+        for id in ["group-a", "group-b", "group-c"] {
+            seed_wake_conversation(&db, id).await;
+        }
+        db.register_wake_contract(
+            &wake_contract(
+                "group-wake",
+                "group-c",
+                WakeContractHandle::Bash {
+                    handle_id: "bash-group".to_string(),
+                },
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.acquire_wake_lifecycle_fences(&[
+                "group-a".to_string(),
+                "group-b".to_string(),
+                "group-c".to_string(),
+            ])
+            .await
+            .unwrap(),
+            WakeLifecycleGroupFenceOutcome::PendingContracts {
+                conversation_ids: vec!["group-c".to_string()],
+                count: 1,
+            }
+        );
+        for id in ["group-a", "group-b", "group-c"] {
+            let open: bool = sqlx::query_scalar(
+                "SELECT wake_registration_open FROM conversations WHERE id = ?1",
+            )
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert!(open, "refusal partially closed {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_racing_group_lifecycle_fence_is_all_or_nothing() {
+        for iteration in 0..20 {
+            let db = Database::open_in_memory().await.unwrap();
+            for id in ["race-a", "race-b", "race-c"] {
+                seed_wake_conversation(&db, id).await;
+            }
+            let contract = wake_contract(
+                &format!("group-race-{iteration}"),
+                "race-c",
+                WakeContractHandle::Bash {
+                    handle_id: format!("bash-group-race-{iteration}"),
+                },
+            );
+            let register_db = db.clone();
+            let fence_db = db.clone();
+            let member_ids = vec![
+                "race-a".to_string(),
+                "race-b".to_string(),
+                "race-c".to_string(),
+            ];
+            let (registration, fence) = tokio::join!(
+                register_db.register_wake_contract(&contract, None),
+                fence_db.acquire_wake_lifecycle_fences(&member_ids),
+            );
+
+            if registration.is_ok() {
+                assert_eq!(
+                    fence.unwrap(),
+                    WakeLifecycleGroupFenceOutcome::PendingContracts {
+                        conversation_ids: vec!["race-c".to_string()],
+                        count: 1,
+                    }
+                );
+            } else {
+                assert!(matches!(
+                    registration,
+                    Err(DbError::WakeRegistrationClosed(_))
+                ));
+                assert_eq!(fence.unwrap(), WakeLifecycleGroupFenceOutcome::Acquired);
+            }
+            let fences: Vec<bool> =
+                sqlx::query_scalar("SELECT wake_registration_open FROM conversations ORDER BY id")
+                    .fetch_all(&db.pool)
+                    .await
+                    .unwrap();
+            assert!(
+                fences.iter().all(|open| *open) || fences.iter().all(|open| !*open),
+                "group fence was partially applied: {fences:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_racing_each_lifecycle_fence_has_no_split_brain_success() {
+        for action in ["archive", "hard-delete", "abandon", "mark-merged"] {
+            let db = Database::open_in_memory().await.unwrap();
+            seed_wake_conversation(&db, action).await;
+            let contract = wake_contract(
+                &format!("wake-{action}"),
+                action,
+                WakeContractHandle::Bash {
+                    handle_id: format!("bash-{action}"),
+                },
+            );
+            let register_db = db.clone();
+            let fence_db = db.clone();
+            let (registration, fence) = tokio::join!(
+                register_db.register_wake_contract(&contract, None),
+                fence_db.acquire_wake_lifecycle_fence(action),
+            );
+
+            let registration_succeeded = registration.is_ok();
+            let fence_acquired = matches!(fence, Ok(WakeLifecycleFenceOutcome::Acquired));
+            assert!(
+                !(registration_succeeded && fence_acquired),
+                "{action}: registration and lifecycle fence both succeeded"
+            );
+            if registration_succeeded {
+                assert_eq!(
+                    fence.unwrap(),
+                    WakeLifecycleFenceOutcome::PendingContracts { count: 1 },
+                    "{action} must observe the committed pending contract"
+                );
+            } else {
+                assert!(
+                    matches!(registration, Err(DbError::WakeRegistrationClosed(_))),
+                    "{action}: fence winner must close later registration: {registration:?}"
+                );
+                assert!(fence_acquired);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_contract_roundtrip_and_list_pending_count() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        seed_wake_conversation(&db, "conv-b").await;
+
+        let bash = wake_contract(
+            "wake-bash",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-1".to_string(),
+            },
+        );
+        let tmux = wake_contract(
+            "wake-tmux",
+            "conv-b",
+            WakeContractHandle::TmuxWindow {
+                handle_id: "tmux-1".to_string(),
+            },
+        );
+        db.insert_wake_contract(&bash).await.unwrap();
+        db.insert_wake_contract(&tmux).await.unwrap();
+
+        assert_eq!(db.count_pending_wake_contracts().await.unwrap(), 2);
+        assert_eq!(
+            db.count_pending_wake_contracts_for_conversation("conv-a")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.list_pending_wake_contracts().await.unwrap().len(), 2);
+        assert_eq!(
+            db.list_pending_wake_contracts_for_conversation("conv-a")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.list_wake_contracts().await.unwrap().len(), 2);
+        assert_eq!(
+            db.list_wake_contracts_for_conversation("conv-a")
+                .await
+                .unwrap(),
+            vec![bash.clone()]
+        );
+        assert_eq!(db.get_wake_contract("wake-bash").await.unwrap(), Some(bash));
+    }
+
+    #[tokio::test]
+    async fn wake_contract_schema_constraints_reject_bad_combinations() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        let now = Utc::now().to_rfc3339();
+        let payload = serde_json::to_string(&WakeTerminalPayload::Bash {
+            bash: WakeBashFiredPayload {
+                status: WakeBashObservedStatus::Exited,
+                exit_code: Some(0),
+                duration_ms: None,
+                signal_number: None,
+                kill_signal_sent: None,
+            },
+        })
+        .unwrap();
+
+        let err = sqlx::query(
+            "INSERT INTO wake_contracts (
+                id, current_conversation_id, handle_kind, handle_id, registered_at, expires_at,
+                status, terminal_cause, forgotten_reason, terminal_payload_json, resolved_at
+            ) VALUES ('bad-kind', 'conv-a', 'tmux_window', 'tw-1', ?1, ?1, 'fired', 'fired', NULL, ?2, ?1)",
+        )
+        .bind(&now)
+        .bind(&payload)
+        .execute(db.pool())
+        .await;
+        assert!(err.is_err());
+
+        let err = sqlx::query(
+            "INSERT INTO wake_inbox (
+                contract_id, conversation_id, handle_kind, handle_id, expires_at, cause,
+                forgotten_reason, terminal_payload_json, auto_resume
+            ) VALUES ('orphan', 'conv-a', 'bash', 'b-1', ?1, 'cancelled', NULL, NULL, 1)",
+        )
+        .bind(&now)
+        .execute(db.pool())
+        .await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_insert_rejects_terminal_contract_without_persisting_it() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        let mut terminal = wake_contract(
+            "wake-terminal-direct",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-1".to_string(),
+            },
+        );
+        terminal.status = WakeContractStatus::Cancelled;
+        terminal.terminal_cause = Some(WakeTerminalCause::Cancelled);
+        terminal.resolved_at = Some(Utc::now());
+
+        assert!(matches!(
+            db.insert_wake_contract(&terminal).await,
+            Err(DbError::WakeContractValidation(_))
+        ));
+        assert!(db
+            .get_wake_contract("wake-terminal-direct")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db.list_wake_inbox_items().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_wake_contract_rolls_back_contract_on_invalid_initial_tails() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        let contract = wake_contract(
+            "wake-invalid-tail",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-1".to_string(),
+            },
+        );
+        let mut outcome = bash_fired_outcome();
+        let WakeTerminalOutcome::Fired { tails, .. } = &mut outcome else {
+            unreachable!()
+        };
+        tails[1].ordinal = tails[0].ordinal;
+
+        assert!(db
+            .register_wake_contract(&contract, Some(&outcome))
+            .await
+            .is_err());
+        assert_eq!(
+            db.get_wake_contract("wake-invalid-tail").await.unwrap(),
+            None
+        );
+        assert!(db.list_wake_inbox_items().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wake_contract_duplicate_resolver_race_only_one_wins() {
+        let path =
+            std::env::temp_dir().join(format!("phoenix-wake-race-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open(path.to_str().unwrap()).await.unwrap();
+        migrations::run_pending_migrations(db.pool()).await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        let contract = wake_contract(
+            "wake-race",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-1".to_string(),
+            },
+        );
+        db.insert_wake_contract(&contract).await.unwrap();
+
+        let input = WakeResolutionInput {
+            contract_id: "wake-race".to_string(),
+            outcome: bash_fired_outcome(),
+        };
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let db_a = db.clone();
+        let db_b = db.clone();
+        let input_a = input.clone();
+        let input_b = input.clone();
+        let barrier_a = barrier.clone();
+        let barrier_b = barrier.clone();
+        let first = tokio::spawn(async move {
+            barrier_a.wait().await;
+            db_a.resolve_terminal_wake_contract(&input_a).await
+        });
+        let second = tokio::spawn(async move {
+            barrier_b.wait().await;
+            db_b.resolve_terminal_wake_contract(&input_b).await
+        });
+        barrier.wait().await;
+        let (first, second) = tokio::join!(first, second);
+        let mut outcomes = vec![first.unwrap().unwrap(), second.unwrap().unwrap()];
+        outcomes
+            .sort_by_key(|outcome| matches!(outcome, WakeResolutionOutcome::AlreadyTerminal(_)));
+        assert_eq!(
+            outcomes,
+            vec![
+                WakeResolutionOutcome::Resolved(WakeContractStatus::Fired),
+                WakeResolutionOutcome::AlreadyTerminal(WakeContractStatus::Fired),
+            ]
+        );
+        assert_eq!(db.list_wake_inbox_items().await.unwrap().len(), 1);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn wake_contract_cancel_terminalizes_with_inbox_and_auto_resume_false() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        let contract = wake_contract(
+            "wake-cancel",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-1".to_string(),
+            },
+        );
+        db.insert_wake_contract(&contract).await.unwrap();
+
+        assert_eq!(
+            db.cancel_wake_contract("wake-cancel").await.unwrap(),
+            WakeCancelOutcome::Resolved
+        );
+        assert_eq!(
+            db.cancel_wake_contract("wake-cancel").await.unwrap(),
+            WakeCancelOutcome::AlreadyTerminal(WakeContractStatus::Cancelled)
+        );
+        let items = db
+            .list_wake_inbox_items_for_conversation("conv-a")
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            items[0].cause,
+            WakeInboxCause::Cancelled { auto_resume: false }
+        ));
+    }
+
+    #[tokio::test]
+    async fn wake_contract_records_expired_and_forgotten_with_auto_resume_true() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        let expired = wake_contract(
+            "wake-expired",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-expired".to_string(),
+            },
+        );
+        let forgotten = wake_contract(
+            "wake-forgotten",
+            "conv-a",
+            WakeContractHandle::TmuxWindow {
+                handle_id: "tw-forgotten".to_string(),
+            },
+        );
+        db.insert_wake_contract(&expired).await.unwrap();
+        db.insert_wake_contract(&forgotten).await.unwrap();
+
+        db.resolve_terminal_wake_contract(&WakeResolutionInput {
+            contract_id: "wake-expired".to_string(),
+            outcome: WakeTerminalOutcome::Expired {
+                resolved_at: Utc::now(),
+            },
+        })
+        .await
+        .unwrap();
+        db.resolve_terminal_wake_contract(&WakeResolutionInput {
+            contract_id: "wake-forgotten".to_string(),
+            outcome: WakeTerminalOutcome::Forgotten {
+                forgotten_reason: WakeForgottenReason::HandleMissing,
+                resolved_at: Utc::now(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let items = db
+            .list_wake_inbox_items_for_conversation("conv-a")
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(
+            items[0].cause,
+            WakeInboxCause::Expired { auto_resume: true }
+        ));
+        assert!(matches!(
+            items[1].cause,
+            WakeInboxCause::Forgotten {
+                forgotten_reason: WakeForgottenReason::HandleMissing,
+                auto_resume: true
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn wake_contract_transfer_moves_pending_and_unconsumed_only() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "pred").await;
+        seed_wake_conversation(&db, "succ").await;
+        let pending = wake_contract(
+            "wake-pending",
+            "pred",
+            WakeContractHandle::TmuxWindow {
+                handle_id: "tmux-1".to_string(),
+            },
+        );
+        let fired = wake_contract(
+            "wake-fired",
+            "pred",
+            WakeContractHandle::Bash {
+                handle_id: "b-2".to_string(),
+            },
+        );
+        db.insert_wake_contract(&pending).await.unwrap();
+        db.insert_wake_contract(&fired).await.unwrap();
+        db.resolve_terminal_wake_contract(&WakeResolutionInput {
+            contract_id: "wake-fired".to_string(),
+            outcome: bash_fired_outcome(),
+        })
+        .await
+        .unwrap();
+        let snap = db.snapshot_pending_wake_inbox("pred").await.unwrap();
+        db.consume_wake_inbox_snapshot("pred", snap.max_inbox_id)
+            .await
+            .unwrap();
+
+        let pending2 = wake_contract(
+            "wake-pending2",
+            "pred",
+            WakeContractHandle::TmuxWindow {
+                handle_id: "tw-9".to_string(),
+            },
+        );
+        db.insert_wake_contract(&pending2).await.unwrap();
+        db.resolve_terminal_wake_contract(&WakeResolutionInput {
+            contract_id: "wake-pending2".to_string(),
+            outcome: tmux_fired_outcome(),
+        })
+        .await
+        .unwrap();
+
+        db.transfer_wake_contracts("pred", "succ").await.unwrap();
+        assert_eq!(
+            db.get_wake_contract("wake-pending")
+                .await
+                .unwrap()
+                .unwrap()
+                .current_conversation_id,
+            "succ"
+        );
+        assert_eq!(
+            db.get_wake_contract("wake-fired")
+                .await
+                .unwrap()
+                .unwrap()
+                .current_conversation_id,
+            "pred"
+        );
+        let succ_items = db
+            .list_wake_inbox_items_for_conversation("succ")
+            .await
+            .unwrap();
+        assert_eq!(succ_items.len(), 1);
+        assert_eq!(succ_items[0].contract_id, "wake-pending2");
+    }
+
+    #[tokio::test]
+    async fn approval_rekeys_only_exact_pending_wake_scope_for_owner() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "owner").await;
+        seed_wake_conversation(&db, "other").await;
+        let old = phoenix_core::work_scope::WorkScope::Conversation("owner".to_string());
+        let new = phoenix_core::work_scope::WorkScope::Worktree("/tmp/work".to_string());
+        let mut pending = wake_contract(
+            "pending-rekey",
+            "owner",
+            WakeContractHandle::Bash {
+                handle_id: "b".into(),
+            },
+        );
+        pending.registration_work_scope = old.clone();
+        let mut terminal = wake_contract(
+            "terminal-provenance",
+            "owner",
+            WakeContractHandle::Bash {
+                handle_id: "done".into(),
+            },
+        );
+        terminal.registration_work_scope = old.clone();
+        let mut other = wake_contract(
+            "other-owner",
+            "other",
+            WakeContractHandle::Bash {
+                handle_id: "other".into(),
+            },
+        );
+        other.registration_work_scope = old.clone();
+        db.insert_wake_contract(&pending).await.unwrap();
+        db.insert_wake_contract(&terminal).await.unwrap();
+        db.resolve_terminal_wake_contract(&WakeResolutionInput {
+            contract_id: terminal.id.clone(),
+            outcome: bash_fired_outcome(),
+        })
+        .await
+        .unwrap();
+        db.insert_wake_contract(&other).await.unwrap();
+
+        assert_eq!(
+            db.rekey_pending_wake_registration_scope("owner", &old, &new)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.rekey_pending_wake_registration_scope("owner", &old, &new)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.get_wake_contract("pending-rekey")
+                .await
+                .unwrap()
+                .unwrap()
+                .registration_work_scope,
+            new
+        );
+        assert_eq!(
+            db.get_wake_contract("terminal-provenance")
+                .await
+                .unwrap()
+                .unwrap()
+                .registration_work_scope,
+            old
+        );
+        assert_eq!(
+            db.get_wake_contract("other-owner")
+                .await
+                .unwrap()
+                .unwrap()
+                .registration_work_scope,
+            old
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_inbox_snapshot_consumes_deterministically_without_future_items() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        for (id, handle) in [("wake-1", "b-1"), ("wake-2", "b-2")] {
+            let contract = wake_contract(
+                id,
+                "conv-a",
+                WakeContractHandle::Bash {
+                    handle_id: handle.to_string(),
+                },
+            );
+            db.insert_wake_contract(&contract).await.unwrap();
+            db.resolve_terminal_wake_contract(&WakeResolutionInput {
+                contract_id: id.to_string(),
+                outcome: bash_fired_outcome(),
+            })
+            .await
+            .unwrap();
+        }
+        let snap = db.snapshot_pending_wake_inbox("conv-a").await.unwrap();
+        assert_eq!(snap.items.len(), 2);
+
+        let late = wake_contract(
+            "wake-late",
+            "conv-a",
+            WakeContractHandle::TmuxWindow {
+                handle_id: "t-1".to_string(),
+            },
+        );
+        db.insert_wake_contract(&late).await.unwrap();
+        db.resolve_terminal_wake_contract(&WakeResolutionInput {
+            contract_id: "wake-late".to_string(),
+            outcome: tmux_fired_outcome(),
+        })
+        .await
+        .unwrap();
+
+        let consumed = db
+            .consume_wake_inbox_snapshot("conv-a", snap.max_inbox_id)
+            .await
+            .unwrap();
+        assert_eq!(consumed.len(), 2);
+        assert_eq!(db.count_pending_wake_inbox_items().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn wake_snapshot_message_is_atomic_idempotent_and_excludes_later_rows() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+
+        let cancelled = wake_contract(
+            "wake-cancelled-snapshot",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-cancel".to_string(),
+            },
+        );
+        db.register_wake_contract(
+            &cancelled,
+            Some(&WakeTerminalOutcome::Cancelled {
+                resolved_at: Utc::now(),
+            }),
+        )
+        .await
+        .unwrap();
+        let fired = wake_contract(
+            "wake-fired-snapshot",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-fire".to_string(),
+            },
+        );
+        db.register_wake_contract(&fired, Some(&bash_fired_outcome()))
+            .await
+            .unwrap();
+        let snapshot = db.snapshot_pending_wake_inbox("conv-a").await.unwrap();
+
+        let late = wake_contract(
+            "wake-late-message",
+            "conv-a",
+            WakeContractHandle::TmuxWindow {
+                handle_id: "tmux-late".to_string(),
+            },
+        );
+        db.register_wake_contract(&late, Some(&tmux_fired_outcome()))
+            .await
+            .unwrap();
+
+        let content = MessageContent::User(UserContent::meta("wake snapshot"));
+        let first = db
+            .persist_wake_inbox_snapshot_message(
+                "conv-a",
+                snapshot.max_inbox_id,
+                "wake-message-1",
+                41,
+                content.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(first.message_inserted);
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(first.message.sequence_id, 41);
+        assert!(first
+            .items
+            .iter()
+            .any(|item| matches!(item.cause, WakeInboxCause::Cancelled { auto_resume: false })));
+        assert_eq!(db.count_pending_wake_inbox_items().await.unwrap(), 1);
+
+        let retry = db
+            .persist_wake_inbox_snapshot_message(
+                "conv-a",
+                snapshot.max_inbox_id,
+                "wake-message-1",
+                99,
+                content,
+            )
+            .await
+            .unwrap();
+        assert!(!retry.message_inserted);
+        assert!(retry.items.is_empty());
+        assert_eq!(retry.message.message_id, first.message.message_id);
+        assert_eq!(retry.message.sequence_id, 41);
+        assert_eq!(db.get_messages("conv-a").await.unwrap().len(), 1);
+        let late_items = db
+            .list_wake_inbox_items_for_conversation("conv-a")
+            .await
+            .unwrap();
+        let late_item = late_items
+            .iter()
+            .find(|item| item.contract_id == "wake-late-message")
+            .unwrap();
+        assert!(late_item.consumed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn old_owner_cannot_cancel_after_wake_transfer_wins() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "cancel-predecessor").await;
+        seed_wake_conversation(&db, "cancel-successor").await;
+        db.insert_wake_contract(&wake_contract(
+            "wake-owner-race",
+            "cancel-predecessor",
+            WakeContractHandle::Bash {
+                handle_id: "b-owner-race".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+
+        db.transfer_wake_contracts("cancel-predecessor", "cancel-successor")
+            .await
+            .unwrap();
+        let old_owner = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.cancel_wake_contract_for_conversation("wake-owner-race", "cancel-predecessor")
+                    .await
+                    .unwrap()
+            })
+        };
+        let new_owner = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.cancel_wake_contract_for_conversation("wake-owner-race", "cancel-successor")
+                    .await
+                    .unwrap()
+            })
+        };
+
+        assert_eq!(
+            old_owner.await.unwrap(),
+            WakeCancelOutcome::NotOwnedOrMissing
+        );
+        assert_eq!(new_owner.await.unwrap(), WakeCancelOutcome::Resolved);
+        let contract = db
+            .get_wake_contract("wake-owner-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(contract.current_conversation_id, "cancel-successor");
+        assert_eq!(contract.status, WakeContractStatus::Cancelled);
+        let inbox = db
+            .list_wake_inbox_items_for_conversation("cancel-successor")
+            .await
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].contract_id, "wake-owner-race");
+        assert!(db
+            .list_wake_inbox_items_for_conversation("cancel-predecessor")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_wake_resume_transfer_copies_observation_into_successor_history() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "wake-predecessor").await;
+        seed_wake_conversation(&db, "wake-successor").await;
+        let fired = wake_contract(
+            "wake-transfer-outbox",
+            "wake-predecessor",
+            WakeContractHandle::Bash {
+                handle_id: "b-transfer".to_string(),
+            },
+        );
+        db.register_wake_contract(&fired, Some(&bash_fired_outcome()))
+            .await
+            .unwrap();
+        let snapshot = db
+            .snapshot_pending_wake_inbox("wake-predecessor")
+            .await
+            .unwrap();
+        let content = MessageContent::User(UserContent::meta("exact wake observation"));
+        let predecessor_message_id =
+            format!("wake-inbox-wake-predecessor-{}", snapshot.max_inbox_id);
+        db.persist_wake_inbox_snapshot_message(
+            "wake-predecessor",
+            snapshot.max_inbox_id,
+            &predecessor_message_id,
+            42,
+            content.clone(),
+        )
+        .await
+        .unwrap();
+
+        db.transfer_wake_contracts("wake-predecessor", "wake-successor")
+            .await
+            .unwrap();
+
+        let pending = db.list_pending_wake_resumes().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].conversation_id, "wake-successor");
+        assert_eq!(pending[0].text, "exact wake observation");
+        assert_eq!(
+            pending[0].message_id,
+            format!("wake-inbox-wake-successor-{}", snapshot.max_inbox_id)
+        );
+        let predecessor_messages = db.get_messages("wake-predecessor").await.unwrap();
+        let successor_messages = db.get_messages("wake-successor").await.unwrap();
+        assert_eq!(predecessor_messages.len(), 1);
+        assert_eq!(successor_messages.len(), 1);
+        assert_eq!(predecessor_messages[0].content, content);
+        assert_eq!(successor_messages[0].content, content);
+        assert_ne!(
+            predecessor_messages[0].message_id,
+            successor_messages[0].message_id
+        );
+
+        db.transfer_wake_contracts("wake-predecessor", "wake-successor")
+            .await
+            .unwrap();
+        assert_eq!(db.get_messages("wake-successor").await.unwrap().len(), 1);
+        assert_eq!(db.list_pending_wake_resumes().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepting_wake_resume_atomically_persists_requesting_and_removes_pending() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "wake-accept").await;
+        let fired = wake_contract(
+            "wake-accept-contract",
+            "wake-accept",
+            WakeContractHandle::Bash {
+                handle_id: "b-accept".to_string(),
+            },
+        );
+        db.register_wake_contract(&fired, Some(&bash_fired_outcome()))
+            .await
+            .unwrap();
+        let snapshot = db.snapshot_pending_wake_inbox("wake-accept").await.unwrap();
+        let message_id = format!("wake-inbox-wake-accept-{}", snapshot.max_inbox_id);
+        db.persist_wake_inbox_snapshot_message(
+            "wake-accept",
+            snapshot.max_inbox_id,
+            &message_id,
+            43,
+            MessageContent::User(UserContent::meta("wake accept")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.list_pending_wake_resumes().await.unwrap().len(), 1);
+
+        db.accept_wake_resume_state(
+            "wake-accept",
+            &message_id,
+            &ConvState::LlmRequesting { attempt: 1 },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.get_conversation("wake-accept").await.unwrap().state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(db.list_pending_wake_resumes().await.unwrap().is_empty());
+        assert!(matches!(
+            db.accept_wake_resume_state(
+                "wake-accept",
+                &message_id,
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await,
+            Err(DbError::WakeContractConflict(_))
+        ));
+        assert!(matches!(
+            db.get_conversation("wake-accept").await.unwrap().state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn archived_conversation_cannot_materialize_or_accept_wake_resume() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "wake-archived").await;
+        let fired = wake_contract(
+            "wake-archived-contract",
+            "wake-archived",
+            WakeContractHandle::Bash {
+                handle_id: "b-archived".to_string(),
+            },
+        );
+        db.register_wake_contract(&fired, Some(&bash_fired_outcome()))
+            .await
+            .unwrap();
+        let snapshot = db
+            .snapshot_pending_wake_inbox("wake-archived")
+            .await
+            .unwrap();
+        db.archive_conversation("wake-archived").await.unwrap();
+        assert!(matches!(
+            db.persist_wake_inbox_snapshot_message(
+                "wake-archived",
+                snapshot.max_inbox_id,
+                "wake-archived-message",
+                46,
+                MessageContent::User(UserContent::meta("wake archived")),
+            )
+            .await,
+            Err(DbError::WakeResumeArchived(_))
+        ));
+        assert!(db.get_messages("wake-archived").await.unwrap().is_empty());
+        assert_eq!(db.count_pending_wake_inbox_items().await.unwrap(), 1);
+
+        seed_wake_conversation(&db, "wake-suppress").await;
+        let fired = wake_contract(
+            "wake-suppress-contract",
+            "wake-suppress",
+            WakeContractHandle::Bash {
+                handle_id: "b-suppress".to_string(),
+            },
+        );
+        db.register_wake_contract(&fired, Some(&bash_fired_outcome()))
+            .await
+            .unwrap();
+        let snapshot = db
+            .snapshot_pending_wake_inbox("wake-suppress")
+            .await
+            .unwrap();
+        let message_id = "wake-suppress-message";
+        db.persist_wake_inbox_snapshot_message(
+            "wake-suppress",
+            snapshot.max_inbox_id,
+            message_id,
+            47,
+            MessageContent::User(UserContent::meta("wake suppress")),
+        )
+        .await
+        .unwrap();
+        db.archive_conversation("wake-suppress").await.unwrap();
+        assert!(db.list_pending_wake_resumes().await.unwrap().is_empty());
+        assert!(matches!(
+            db.accept_wake_resume_state(
+                "wake-suppress",
+                message_id,
+                &ConvState::LlmRequesting { attempt: 1 },
+                Utc::now(),
+            )
+            .await,
+            Err(DbError::WakeResumeArchived(_))
+        ));
+        assert!(matches!(
+            db.get_conversation("wake-suppress").await.unwrap().state,
+            ConvState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn existing_wake_message_conflicts_with_reused_id_for_new_snapshot() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        seed_wake_conversation(&db, "conv-predecessor").await;
+        let first = wake_contract(
+            "wake-first-reuse",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-first".to_string(),
+            },
+        );
+        db.register_wake_contract(&first, Some(&bash_fired_outcome()))
+            .await
+            .unwrap();
+        let first_snapshot = db.snapshot_pending_wake_inbox("conv-a").await.unwrap();
+        let content = MessageContent::User(UserContent::meta("wake snapshot"));
+        db.persist_wake_inbox_snapshot_message(
+            "conv-a",
+            first_snapshot.max_inbox_id,
+            "wake-message-reused",
+            44,
+            content.clone(),
+        )
+        .await
+        .unwrap();
+
+        let later = wake_contract(
+            "wake-later-reuse",
+            "conv-predecessor",
+            WakeContractHandle::Bash {
+                handle_id: "b-later".to_string(),
+            },
+        );
+        db.register_wake_contract(&later, Some(&bash_fired_outcome()))
+            .await
+            .unwrap();
+        db.transfer_wake_contracts("conv-predecessor", "conv-a")
+            .await
+            .unwrap();
+        let later_snapshot = db.snapshot_pending_wake_inbox("conv-a").await.unwrap();
+        assert!(!later_snapshot.items.is_empty());
+        assert!(matches!(
+            db.persist_wake_inbox_snapshot_message(
+                "conv-a",
+                later_snapshot.max_inbox_id,
+                "wake-message-reused",
+                45,
+                content,
+            )
+            .await,
+            Err(DbError::WakeContractConflict(_))
+        ));
+        assert_eq!(db.count_pending_wake_inbox_items().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn wake_resolution_writes_tails_and_inbox_atomically() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        let contract = wake_contract(
+            "wake-tail",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-1".to_string(),
+            },
+        );
+        db.insert_wake_contract(&contract).await.unwrap();
+        db.resolve_terminal_wake_contract(&WakeResolutionInput {
+            contract_id: "wake-tail".to_string(),
+            outcome: bash_fired_outcome(),
+        })
+        .await
+        .unwrap();
+
+        let items = db.list_wake_inbox_items().await.unwrap();
+        assert_eq!(items.len(), 1);
+        match &items[0].cause {
+            WakeInboxCause::Fired {
+                terminal_payload,
+                tails,
+                auto_resume,
+            } => {
+                assert!(*auto_resume);
+                assert_eq!(tails.len(), 2);
+                assert!(matches!(terminal_payload, WakeTerminalPayload::Bash { .. }));
+            }
+            other @ (WakeInboxCause::Cancelled { .. }
+            | WakeInboxCause::Expired { .. }
+            | WakeInboxCause::Forgotten { .. }) => {
+                panic!("expected fired cause, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_pending_count_and_listing_exclude_terminal_rows() {
+        let db = Database::open_in_memory().await.unwrap();
+        seed_wake_conversation(&db, "conv-a").await;
+        let pending = wake_contract(
+            "wake-p1",
+            "conv-a",
+            WakeContractHandle::Bash {
+                handle_id: "b-1".to_string(),
+            },
+        );
+        let cancel = wake_contract(
+            "wake-c1",
+            "conv-a",
+            WakeContractHandle::TmuxWindow {
+                handle_id: "t-1".to_string(),
+            },
+        );
+        db.insert_wake_contract(&pending).await.unwrap();
+        db.insert_wake_contract(&cancel).await.unwrap();
+        db.cancel_wake_contract("wake-c1").await.unwrap();
+
+        let pending_rows = db
+            .list_pending_wake_contracts_for_conversation("conv-a")
+            .await
+            .unwrap();
+        assert_eq!(pending_rows.len(), 1);
+        assert_eq!(pending_rows[0].id, "wake-p1");
+        assert_eq!(
+            db.count_pending_wake_contracts_for_conversation("conv-a")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn fresh_db_has_no_state_data_column() {
         let db = Database::open_in_memory().await.unwrap();

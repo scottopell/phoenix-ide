@@ -21,12 +21,14 @@ mod terminal_command_history;
 mod terminal_last_command;
 mod think;
 pub mod tmux;
+mod wait_until;
 pub mod work_scope_inventory;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
-    BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecycleSink, BashOp, BashTool,
-    BashToolInput, SandboxedBashTool, WorkScopeHandles as BashWorkScopeHandles,
+    BashHandleError, BashHandleInspection, BashHandleRegistry, BashLifecycleEvent,
+    BashLifecycleSink, BashOp, BashTool, BashToolInput, SandboxedBashTool,
+    WorkScopeHandles as BashWorkScopeHandles,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -48,7 +50,12 @@ pub use terminal_last_command::TerminalLastCommandTool;
 pub use think::ThinkTool;
 pub use tmux::{
     TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxRunTool, TmuxServer,
-    TmuxTool,
+    TmuxTerminalEvidence, TmuxTerminalStatus, TmuxTool, TmuxWindowInspection,
+};
+pub use wait_until::{
+    DisabledWakeRegistrar, WaitUntilTarget, WaitUntilTool, WakeBashInitialTerminalEvidence,
+    WakeRegistrar, WakeRegistrarError, WakeRegistration, WakeRegistrationReceipt,
+    WakeRegistrationTarget, WakeTmuxInitialTerminalEvidence,
 };
 
 use async_trait::async_trait;
@@ -287,6 +294,13 @@ pub struct ToolContext {
     /// survive context-exhaustion continuations; Direct conversations fall
     /// back to the conversation id.
     pub work_scope: WorkScope,
+
+    /// Tool-use identity used as the durable wake registration owner.
+    pub tool_use_id: Option<String>,
+
+    /// Runtime-provided persistence capability. Disabled by default so tool
+    /// tests and embedders that do not support wakes remain source-compatible.
+    wake_registrar: Arc<dyn WakeRegistrar>,
 }
 
 impl ToolContext {
@@ -315,7 +329,25 @@ impl ToolContext {
             tmux_registry,
             worktree_path,
             work_scope,
+            tool_use_id: None,
+            wake_registrar: Arc::new(DisabledWakeRegistrar),
         }
+    }
+
+    #[must_use]
+    pub fn with_wake_capability(
+        mut self,
+        tool_use_id: impl Into<String>,
+        registrar: Arc<dyn WakeRegistrar>,
+    ) -> Self {
+        self.tool_use_id = Some(tool_use_id.into());
+        self.wake_registrar = registrar;
+        self
+    }
+
+    #[must_use]
+    pub fn wake_registrar(&self) -> &Arc<dyn WakeRegistrar> {
+        &self.wake_registrar
     }
 
     /// Get or create the browser session for this conversation's
@@ -515,6 +547,7 @@ fn write_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(PatchTool::default()),
         Arc::new(TmuxRunTool),
         Arc::new(TmuxTool),
+        Arc::new(WaitUntilTool),
     ]
 }
 
@@ -1008,6 +1041,7 @@ mod tests {
         assert!(direct.contains("patch"));
         assert!(direct.contains("tmux_run"));
         assert!(direct.contains("tmux"));
+        assert!(direct.contains("wait_until"));
         assert!(!direct.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(direct.contains(*tool), "Direct missing {tool}");
@@ -1043,6 +1077,7 @@ mod tests {
         assert!(work.contains("patch"));
         assert!(!work.contains("tmux_run"));
         assert!(!work.contains("tmux"));
+        assert!(!work.contains("wait_until"));
         assert!(work.contains("propose_task"));
         assert!(!work.contains("commission_review"));
         assert!(work.contains("spawn_agents"));
@@ -1071,6 +1106,7 @@ mod tests {
         assert!(!explore.contains("bash"));
         assert!(!explore.contains("tmux_run"));
         assert!(!explore.contains("tmux"));
+        assert!(!explore.contains("wait_until"));
         assert!(!explore.contains("commission_review"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(
@@ -1092,6 +1128,7 @@ mod tests {
             !sub_explore.contains("tmux"),
             "sub-agent explore must not have tmux (task 03001)"
         );
+        assert!(!sub_explore.contains("wait_until"));
         assert!(sub_explore.contains("submit_result"));
         assert!(sub_explore.contains("submit_error"));
         assert!(!sub_explore.contains("patch"));
@@ -1123,6 +1160,7 @@ mod tests {
             !sub_work.contains("tmux"),
             "sub-agent work must not have tmux (task 03001)"
         );
+        assert!(!sub_work.contains("wait_until"));
         assert!(sub_work.contains("submit_result"));
         assert!(!sub_work.contains("spawn_agents"));
         assert!(!sub_work.contains("propose_task"));

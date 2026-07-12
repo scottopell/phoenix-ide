@@ -185,11 +185,15 @@ surface SharedConversation {
     @guarantee LiveUpdates
         -- When the conversation has a running runtime, the viewer attaches
         -- to its broadcast channel and receives real-time SSE events for new
-        -- messages and state changes -- the same stream as the owner, filtered
-        -- to exclude sensitive metadata. An idle conversation has no live
-        -- activity to stream; the viewer still receives full history (see
-        -- FullHistory). Attaching never starts a runtime (see
-        -- ReadOnlyViewingHasNoSideEffects).
+        -- messages and public state changes. One share-stream visibility
+        -- capability filters every owner-private event from both the initial
+        -- replay snapshot and live delivery, so future private variants inherit
+        -- the same boundary. It also structurally excludes owner-only wake
+        -- status: the surface neither loads nor emits wake_status_update,
+        -- contract IDs, handle IDs, or deadlines.
+        -- An idle conversation has no live activity to stream; the viewer still
+        -- receives full history (see FullHistory). Attaching never starts a
+        -- runtime (see ReadOnlyViewingHasNoSideEffects).
 
     @guarantee FullHistory
         -- Viewer sees all messages from conversation creation,

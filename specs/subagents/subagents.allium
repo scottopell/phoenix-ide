@@ -25,10 +25,9 @@
 --   - Worktree creation / branch lifecycle (see projects.allium).
 --   - Tool implementations (bash, patch, etc.).
 --
--- Requirement traceability: REQ-SA-001 .. REQ-SA-008, REQ-PROJ-008.
--- (REQ-SA-007 is superseded by REQ-PROJ-008; REQ-SA-008 read_first
---  injection is not implemented in the spawn handler — tracked in
---  requirements.md status.)
+-- Requirement traceability: REQ-SA-001 .. REQ-SA-008, REQ-SA-010,
+-- REQ-PROJ-008.
+-- (REQ-SA-007 is superseded by REQ-PROJ-008.)
 
 use "../bedrock/bedrock.allium" as bedrock
 use "../projects/projects.allium" as projects

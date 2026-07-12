@@ -65,6 +65,40 @@ function dispatch(atom: ConversationAtom, action: SSEAction): ConversationAtom {
 }
 
 describe('conversationReducer', () => {
+  describe('wake status snapshots', () => {
+    const first = {
+      conversation_id: 'conv-1', pending_count: 2,
+      soonest_expiry: '2026-07-10T12:30:00Z', lifecycle_blocked: true,
+      contracts: [],
+    };
+
+    it('replaces the full snapshot rather than merging contracts', () => {
+      let atom = dispatch(createInitialAtom(), {
+        type: 'set_initial_data', conversationId: 'conv-1', conversation: testConversation,
+        messages: [], phase: { type: 'idle' }, contextWindow: { used: 0 },
+      });
+      atom = dispatch(atom, { type: 'sse_wake_status_update', snapshot: first, epoch: 3 });
+      const replacement = {
+        ...first, pending_count: 0, soonest_expiry: null, lifecycle_blocked: false,
+        contracts: [],
+      };
+      atom = dispatch(atom, { type: 'sse_wake_status_update', snapshot: replacement, epoch: 3 });
+      expect(atom.wakeStatus).toBe(replacement);
+      expect(atom.wakeStatus?.pending_count).toBe(0);
+    });
+
+    it('drops a snapshot from a stale connection epoch', () => {
+      const atom = { ...createInitialAtom(), connectionEpoch: 8, wakeStatus: first };
+      const next = dispatch(atom, {
+        type: 'sse_wake_status_update',
+        snapshot: { ...first, pending_count: 0 },
+        epoch: 7,
+      });
+      expect(next).toBe(atom);
+      expect(next.wakeStatus).toBe(first);
+    });
+  });
+
   describe('sse_init', () => {
     it('replaces all state authoritatively', () => {
       const atom = createInitialAtom();

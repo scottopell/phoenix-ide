@@ -1,252 +1,169 @@
 -- allium: 3
 -- wake-contracts.allium
 --
--- Wake Contracts: Behavioural Specification
+-- Wake contracts for bash and tmux terminal waits.
 --
--- Scope: persistent commitments by Phoenix to deliver a synthetic
--- tool result into a specific conversation when a named external
--- condition holds (or when a hard deadline elapses). v1 supports
--- HandleTerminal condition kind only, against bash / tmux pane /
--- subagent handles.
---
--- Includes: contract registration (no conv-state mutation),
---           persistence, wake-router evaluation, is_busy()
---           augmentation, independent multi-contract semantics,
---           four terminal causes (Fired / Expired / Cancelled /
---           Forgotten), restart resync, lifecycle-cascade
---           interaction, continuation inheritance (WorkScope-keyed
---           handles transfer across the boundary; subagent handles
---           are keyed by agent id, independent of WorkScope).
+-- Includes:
+--   - receipt-then-observation registration
+--   - normalized durable contract/inbox model
+--   - exactly-once terminal resolution
+--   - durable inbox with coalesced resume scheduling
+--   - continuation transfer for all pending contracts and unconsumed observations
+--   - explicit cancel without automatic resume scheduling
+--   - lifecycle_blocked distinct from is_busy
+--   - startup reconciliation before live observation
 -- Excludes:
---   - Condition kinds beyond HandleTerminal (deferred)
---   - Cross-conversation wake
---   - Webhook-triggered wake
---   - Compound semantics (wait_all, wait_any)
---   - First-fire-wins / supersede semantics (deliberately rejected;
---     see ADR-006 "Multiple contracts on one conversation resolve independently")
---   - A first-class AwaitingWake conv state (deliberately rejected;
---     see ADR-006 "A new AwaitingWake conversation state" rejected option)
---
--- Requirement traceability: REQ-WAKE-001 through REQ-WAKE-018
--- Dependencies: specs/bedrock/bedrock.allium, specs/bash/bash.allium
+--   - sub-agent wake
+--   - general actor messaging
+--   - non-handle condition kinds
 
 use "../bedrock/bedrock.allium" as bedrock
 use "../bash/bash.allium" as bash
+use "../tmux-integration/tmux-integration.allium" as tmux
 
 ------------------------------------------------------------
 -- Actor Declarations
 ------------------------------------------------------------
 
--- The agent that registers wake contracts. Identity is the
--- conversation; cross-conversation registration MUST return an
--- authorization error (a conversation cannot register a wake on a
--- handle it does not own).
 actor LlmAgent {
     identified_by: bedrock/Conversation
 }
 
-------------------------------------------------------------
--- External Entities
-------------------------------------------------------------
+actor User {
+    identified_by: bedrock/Parent
+}
 
--- A handle the agent has spawned that the wake-router can evaluate
--- terminal state against. Discriminated by HandleKind; the router
--- delegates to the kind-specific evaluator.
-external entity WatchableHandle {
-    kind: HandleKind
-    id: String
+actor WakeObserver {}
+
+actor WakeStartupReconciler {}
+
+actor ConversationRuntime {
+    identified_by: bedrock/Conversation
+}
+
+actor LifecycleManager {
+    identified_by: bedrock/Conversation
+}
+
+actor ContinuationManager {
+    identified_by: bedrock/Conversation
 }
 
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
 
--- The condition the contract fires on. v1 has one variant; future
--- revisions extend this enum without touching the contract row
--- schema (kind discriminator + opaque condition_json blob).
-value Condition {
-    kind: ConditionKind
-    handle: WatchableHandle?     -- present iff kind = handle_terminal
+value BashHandleRef {
+    handle: String
 }
 
--- The payload delivered to the conversation when the contract resolves. The
--- top-level cause is the only persisted cause discriminator. For fired payloads,
--- the watched handle kind is derived from the contract row, not repeated inside
--- terminal_payload.
-value FirePayload {
-    cause: TerminalCause
-    fired: FiredHandlePayload when cause = fired
-    forgotten_reason: ForgottenReason when cause = forgotten
+value TmuxWindowHandleRef {
+    window_id: String
 }
 
-value TerminalPayloadBody {
-    fired: FiredHandlePayload?
+enum WaitHandleKind {
+    bash
+    | tmux_window
 }
 
-value FiredHandlePayload {
-    bash: BashTerminalPayload?
-    tmux: TmuxTerminalPayload?
-    sub_agent: SubAgentTerminalPayload?
+value WaitHandle {
+    kind: WaitHandleKind
+    bash: BashHandleRef? when kind = bash
+    tmux_window: TmuxWindowHandleRef? when kind = tmux_window
 }
 
-value BashTerminalPayload {
-    status: BashTerminalStatus
-    exit_code: Integer?
-    duration_ms: Integer?
-    signal_number: Integer?        -- mirrors bash wait signal metadata when known
-    kill_signal_sent: bash/KillSignal? -- mirrors kill_pending_kernel metadata
+enum ContractStatus {
+    pending
+    | terminal
 }
 
-value TmuxTerminalPayload {
-    terminal_status: TmuxTerminalStatus
-    exit_code: Integer?
-    duration_ms: Integer?
-}
-
-value SubAgentTerminalPayload {
-    task_text: String                 -- spawned task string supplied to the child
-    task_label: String?
-    outcome: SubAgentTerminalOutcome
-    success_result: String            when outcome = success
-    submitted_error: String           when outcome = submitted_error
-    submitted_error_kind: SubAgentErrorKind  when outcome = submitted_error
-    timed_out_message: String         when outcome = timed_out
-    cancelled_reason: String?         when outcome = cancelled
-    turn_limit_partial_text: String?  when outcome = turn_limit_exhausted
-    implicit_success_text: String     when outcome = implicit_success
-    runtime_failure_message: String   when outcome = runtime_failure
-    runtime_failure_kind: SubAgentRuntimeFailureKind  when outcome = runtime_failure
-    context_exhausted_message: String when outcome = context_exhausted
-}
-
-------------------------------------------------------------
--- Enumerations
-------------------------------------------------------------
-
-enum HandleKind {
-    bash | tmux_pane | subagent
-}
-
-enum ConditionKind {
-    handle_terminal
-    -- v2+: regex_in_tmux_pane, file_changed, port_listening, ...
-}
-
--- Terminal cause of every wake contract. Every contract reaches
--- exactly one of these; none can be silently abandoned.
 enum TerminalCause {
-    fired         -- the condition held
-    | expired     -- expires_at passed without the condition holding
-    | cancelled   -- explicit cancel (user, lifecycle cascade)
-    | forgotten   -- underlying handle was destroyed before the
-                  -- condition could be evaluated (e.g., a Phoenix
-                  -- restart that drops an in-memory bash handle, or
-                  -- a hard-delete that tears down a WorkScope with
-                  -- no inheritor)
+    fired
+    | expired
+    | cancelled
+    | forgotten
+}
+
+enum CancellationReason {
+    explicit_cancel
 }
 
 enum ForgottenReason {
-    phoenix_restart
-    | cascade_destroyed_handle
-    | subagent_handle_missing
-    | tmux_handle_missing
+    handle_missing
+    | runtime_unrecoverable_after_restart
 }
 
-enum BashTerminalStatus {
+enum BashObservedStatus {
     exited
     | killed
     | kill_pending_kernel
 }
 
-enum SubAgentErrorKind {
-    network
-    | rate_limit
-    | server_error
-    | auth
-    | invalid_request
-    | invalid_response
-    | content_filter
-    | context_exhausted
-    | timed_out
-    | cancelled
-    | sub_agent_error
-    | usage_limit_reached
-    | server_overloaded
-}
-
-enum SubAgentRuntimeFailureKind {
-    network
-    | rate_limit
-    | server_error
-    | auth
-    | invalid_request
-    | invalid_response
-    | content_filter
-    | sub_agent_error
-    | usage_limit_reached
-    | server_overloaded
-}
-
-enum TmuxTerminalStatus {
-    tmux_run_exit_marker_observed
+enum TmuxObservedStatus {
+    exit_marker_observed
     | window_killed
 }
 
-enum SubAgentTerminalOutcome {
-    success                 -- explicit submit_result
-    | submitted_error       -- explicit submit_error
-    | timed_out             -- child timeout cause preserved durably
-    | cancelled             -- independently observed child cancellation cause preserved durably
-    | turn_limit_exhausted  -- grace-turn hard-stop cause preserved durably
-    | implicit_success      -- text-only implicit completion, if admitted by bedrock
-    | runtime_failure       -- non-retryable LLM/tool/runtime failure
-    | context_exhausted     -- context budget exhausted before terminal submission
+value BashObservedPayload {
+    status: BashObservedStatus
+    exit_code: Integer?
+    duration_ms: Integer?
+    signal_number: Integer?
+    kill_signal_sent: bash/KillSignal?
 }
 
-enum ContractStatus {
-    pending       -- registered, awaiting evaluation
-    | terminal    -- one of the TerminalCause outcomes recorded
+value TmuxObservedPayload {
+    status: TmuxObservedStatus
+    exit_code: Integer?
+    duration_ms: Integer?
 }
 
-------------------------------------------------------------
--- Entities
-------------------------------------------------------------
+enum FiredPayloadKind {
+    bash
+    | tmux_window
+}
 
--- The durable record of a wake commitment. Persisted to SQLite on
--- registration; updated to terminal on resolution. Never silently
--- removed. The contract row is the SINGLE SOURCE OF TRUTH for "is
--- this conversation waiting on something" - there is no conv-state
--- mirror (see ADR-006's rejected AwaitingWake option).
-entity Contract {
-    -- Stable id allocated at registration. Survives Phoenix restart.
-    id: String
+value FiredPayload {
+    kind: FiredPayloadKind
+    bash: BashObservedPayload? when kind = bash
+    tmux_window: TmuxObservedPayload? when kind = tmux_window
+}
 
-    -- The conversation that this contract delivers into on
-    -- resolution. For a WorkScope-keyed handle (bash, tmux), a
-    -- continuation that inherits the WorkScope transfers the watched
-    -- handle to the child and this field is re-keyed to the child
-    -- conversation. A subagent handle is keyed by the sub-agent's own
-    -- agent / child-conversation id (per specs/subagents/), not by
-    -- WorkScope, so a subagent-keyed contract is not re-keyed by
-    -- WorkScope inheritance.
-    conversation: bedrock/Conversation
+value TerminalPayload {
+    cause: TerminalCause
+    fired: FiredPayload? when cause = fired
+    cancellation_reason: CancellationReason? when cause = cancelled
+    forgotten_reason: ForgottenReason? when cause = forgotten
+}
 
-    -- The condition the contract is waiting on.
-    condition: Condition
-
-    -- Hard deadline. Populated at registration; if expires_at <= now
-    -- on a router tick, the contract fires with cause = expired.
+value WakeRegistrationReceipt {
+    contract_id: String
+    handle: WaitHandle
     expires_at: Timestamp
+    registering_tool_use_id: String?
+}
 
-    -- When the agent registered the contract.
-    registered_at: Timestamp
+value WakeRuntimeObservation {
+    contract_id: String
+    receipt: WakeRegistrationReceipt
+    terminal_payload: TerminalPayload
+}
 
-    -- Tool call id of the registering tool invocation. The delivered
-    -- synthetic tool result MUST carry this id so the LLM's
-    -- conversation history threads correctly.
+entity WakeTrackedConversation {
+    conversation: bedrock/Conversation
+    pending_contract_count: Integer
+    registration_open: Boolean
+    lifecycle_blocked: pending_contract_count > 0
+    runtime_busy: conversation.is_busy
+}
+
+entity Contract {
+    id: String
+    owning_conversation: bedrock/Conversation
+    handle: WaitHandle
     registering_tool_use_id: String
-
-    -- Lifecycle status. Set to terminal exactly once.
+    registered_at: Timestamp
+    expires_at: Timestamp
     status: ContractStatus
 
     transitions status {
@@ -254,16 +171,9 @@ entity Contract {
         terminal: terminal
     }
 
-    -- Queryable terminal discriminator columns. These are columns, not JSON paths,
-    -- because metrics group by them.
-    terminal_cause: TerminalCause     when status = terminal
-    forgotten_reason: ForgottenReason when terminal_cause = forgotten
-
-    -- Cause-specific body. Does not repeat terminal_cause or forgotten_reason.
-    terminal_payload: TerminalPayloadBody when status = terminal
-
-    -- When the router resolved the contract.
-    resolved_at: Timestamp            when status = terminal
+    terminal_cause: TerminalCause when status = terminal
+    terminal_payload: TerminalPayload when status = terminal
+    resolved_at: Timestamp when status = terminal
 }
 
 entity BashWakeTailLine {
@@ -278,496 +188,647 @@ entity TmuxWakeTailLine {
     line: String
 }
 
-------------------------------------------------------------
--- Config
-------------------------------------------------------------
+entity WakeInboxItem {
+    id: String
+    conversation: bedrock/Conversation
+    contract: Contract
+    observation: WakeRuntimeObservation
+    enqueued_at: Timestamp
+    delivered_at: Timestamp?
+}
+
+enum ResumeRequestStatus {
+    pending
+    | accepted
+}
+
+entity ResumeRequest {
+    conversation: bedrock/Conversation
+    reason: resume_wake_inbox
+    snapshot_message_id: String
+    status: ResumeRequestStatus
+}
 
 config {
     default_max_wait_seconds: Integer = 600
-    -- Default expires_at offset from registered_at when the caller
-    -- omits max_wait_seconds.
-
     max_max_wait_seconds: Integer = 1800
-    -- Upper bound. max_wait_seconds > this is rejected at
-    -- registration time (REQ-WAKE-007). expires_at is the delivery
-    -- deadline for the wait obligation, not a lifetime guarantee for
-    -- the watched handle.
+}
 
-    router_tick_handle_terminal_ms: Integer = 1000
-    -- Cadence at which the wake_router evaluates handle_terminal
-    -- conditions. Other condition kinds may have different cadences.
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
 
-    forgotten_on_restart_for_kinds: Set<HandleKind> = {bash}
-    -- HandleKinds whose handles never survive Phoenix restart. On restart,
-    -- every pending contract referencing one of these kinds fires forgotten
-    -- with reason = "phoenix_restart". Sub-agent restart handling is conditional:
-    -- persisted terminal children are delivered, while non-terminal child runtimes
-    -- are forgotten because active sub-agent runtimes do not survive restart.
-    -- tmux_pane handles may survive and are re-registered when present.
+-- Helper declarations used by rules and invariants in this file.
+-- They are pure unless the referenced ensure names an effect.
+--
+-- next_contract_id()
+-- next_wake_inbox_id()
+-- handle_owned_by_conversation(handle, conversation)
+-- evidence_at_or_before_deadline(contract, evidence_at)
+-- durable_terminal_evidence_before_deadline(contract)
+-- handle_still_observable(contract)
+-- tmux_evidence_generation_matches_current_server(contract)
+-- runtime_currently_consuming_wake_inbox(conversation)
+-- idle_runtime_available(conversation)
+-- at_most_one_pending_resume_request(conversation, reason)
+-- undelivered_wake_inbox_items_in_deterministic_order(conversation)
+-- wake_inbox_snapshot_for_resume(conversation)
+-- all_pending_contracts_owned_by(conversation)
+-- all_undelivered_wake_items_owned_by(conversation)
+-- no_duplicate_wake_inbox_items_per_contract
+-- no_wake_inbox_item_for_pending_contract
+-- lifecycle_blocked_tracks_pending_contract_count
+-- lifecycle_blocked_can_hold_while_runtime_busy_is_false
+-- registration_requires_open_non_archived_non_terminal_conversation
+-- lifecycle_fence_closes_iff_no_pending_contract
+-- lifecycle_fence_is_durable_and_idempotent
+-- AllChainMemberRegistrationClosed(members)
+-- AllChainMemberRegistrationOpen(members)
+-- ChainCleanupMayBegin(members)
+-- NoChainCleanupBegins(members)
+-- continuation_closes_predecessor_and_opens_successor
+-- resume_requests_require_undelivered_wake_inbox_items
+-- wake_inbox_items_target_current_contract_owner
+-- one_llm_execution_per_conversation
+-- later_committed_items_remain_pending_after_snapshot
+-- pending_resume_has_message_in_owning_conversation_history
+-- accepting_resume_atomically_persists_llm_requesting
+-- duplicate_or_stale_resume_does_not_start_llm_turn
+-- transfer_copies_exact_resume_message_once
+-- startup_retries_pending_resume_requests
 
-    workscope_keyed_kinds: Set<HandleKind> = {bash, tmux_pane}
-    -- HandleKinds whose handles are WorkScope-level resources and so
-    -- transfer to a continuation that inherits the WorkScope. A
-    -- contract on one of these kinds re-keys its conversation to the
-    -- successor at the continuation boundary (REQ-WAKE-012). subagent
-    -- is excluded: a sub-agent is tracked by its own agent /
-    -- child-conversation id (per specs/subagents/), independent of
-    -- the parent's WorkScope, so a subagent-keyed contract is not
-    -- re-keyed by WorkScope inheritance.
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface AgentWakeAccess {
+    facing user: LlmAgent
+
+    context conversation: bedrock/Conversation
+
+    provides:
+        AgentCallsWaitUntil(conversation, handle, requested_max_wait_seconds?, tool_use_id)
+            when conversation.core_status in { idle, busy }
+        AgentConsumesWakeResume(conversation, request)
+            when request.conversation = conversation
+}
+
+surface WakeCancellationSurface {
+    facing user: User
+
+    context conversation: bedrock/Conversation
+
+    provides:
+        CancelWakeRequested(conversation, contract)
+            when contract.owning_conversation = conversation
+                 and contract.status = pending
+}
+
+surface WakeObservationSurface {
+    facing user: WakeObserver
+
+    provides:
+        WakeObservationTick(contract)
+            when contract.status = pending
+        BashTerminalEvidenceObserved(contract, payload, tail_lines, evidence_at)
+            when contract.status = pending
+                 and contract.handle.kind = bash
+        TmuxTerminalEvidenceObserved(contract, payload, tail_lines, evidence_at)
+            when contract.status = pending
+                 and contract.handle.kind = tmux_window
+                 and tmux_evidence_generation_matches_current_server(contract)
+}
+
+surface WakeStartupSurface {
+    facing user: WakeStartupReconciler
+
+    provides:
+        StartupPassBegins(wake_contract_reconciliation)
+}
+
+surface ContinuationWakeTransferSurface {
+    facing user: ContinuationManager
+
+    provides:
+        ContinuationCreatesSuccessor(predecessor, successor)
+}
+
+surface WakeLifecycleSurface {
+    facing user: LifecycleManager
+
+    context conversation: bedrock/Conversation
+
+    provides:
+        LifecycleArchiveRequested(conversation)
+        LifecycleAbandonRequested(conversation)
+        LifecycleMarkMergedRequested(conversation)
+        LifecycleHardDeleteRequested(conversation)
+}
+
+surface WakeResumeSchedulerSurface {
+    facing user: ConversationRuntime
+
+    context conversation: bedrock/Conversation
+
+    exposes:
+        conversation.is_busy
+
+    provides:
+        ResumeRequestConsumed(conversation, request)
+            when request.conversation = conversation
+                 and request.reason = resume_wake_inbox
+}
+
+surface WakeSchedulerEvents {
+    facing user: WakeObserver
+
+    provides:
+        WakeInboxItemCreatedForConversation(conversation)
 }
 
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
 
--- REQ-WAKE-001: registration creates a new Contract row. The
--- conversation state is NOT modified - the conv stays in whatever
--- state it was in (typically Idle).
-rule AgentRegistersWakeContract {
-    when: AgentCallsWaitUntil(conversation, handle, condition, max_wait_seconds, tool_use_id)
+rule RegisterWakeContract {
+    when: AgentCallsWaitUntil(conversation, handle, requested_max_wait_seconds, tool_use_id)
 
-    requires: handle_owned_by(handle, conversation)
-    requires: max_wait_seconds <= config.max_max_wait_seconds
-    requires: max_wait_seconds >= 0
+    requires: handle.kind in {bash, tmux_window}
+    requires: handle_owned_by_conversation(handle, conversation)
+    requires: requested_max_wait_seconds >= 1
+    requires: WakeTrackedConversation{conversation: conversation}.registration_open
+    requires: not conversation.archived
+    requires: conversation.state != terminal
+    requires: requested_max_wait_seconds <= config.max_max_wait_seconds
 
-    let c_id = next_contract_id()
+    let contract_id = next_contract_id()
+    let expires_at = now() + requested_max_wait_seconds
+    let receipt = WakeRegistrationReceipt{
+        contract_id: contract_id,
+        handle: handle,
+        expires_at: expires_at,
+        registering_tool_use_id: tool_use_id
+    }
 
     ensures: Contract.created(
-        id:                       c_id,
-        conversation:             conversation,
-        condition:                condition,
-        expires_at:               now() + max_wait_seconds,
-        registered_at:            now(),
-        registering_tool_use_id:  tool_use_id,
-        status:                   pending
+        id: contract_id,
+        owning_conversation: conversation,
+        handle: handle,
+        registering_tool_use_id: tool_use_id,
+        registered_at: now(),
+        expires_at: expires_at,
+        status: pending
     )
-    ensures: SseEmitted(WakeContractRegistered, c_id)
-
-    @guidance
-        -- Sequence:
-        --   1. Validate authorization (handle ownership) BEFORE
-        --      allocating contract id.
-        --   2. Persist Contract row.
-        --   3. Emit SSE.
-        --
-        -- The conversation state is NOT mutated by this rule. The
-        -- contract row IS the persisted record of "this conv is
-        -- waiting"; is_busy() derives from the contract table
-        -- (REQ-WAKE-004), not from conv state.
-        --
-        -- The tool invocation MUST NOT return a synchronous payload
-        -- to the LLM. The LLM's next invocation is when the contract
-        -- fires (or expires / is cancelled / is forgotten). Returning
-        -- a payload here would create a parallel "I waited then
-        -- resumed" path that defeats the zero-turn-cost guarantee.
+    ensures: AgentReceivesWakeReceipt(receipt)
+    ensures: SseEmitted(WakeContractRegistered, contract_id)
 }
 
--- REQ-WAKE-001: registration rejected because the agent does not own
--- the handle it tried to wake on.
-rule WaitUntilRejectedByAuthorization {
-    when: AgentCallsWaitUntil(conversation, handle, condition, max_wait_seconds, tool_use_id)
+rule RegisterWakeContractWithDefaultTimeout {
+    when: AgentCallsWaitUntil(conversation, handle, omitted, tool_use_id)
 
-    requires: not handle_owned_by(handle, conversation)
+    requires: handle.kind in {bash, tmux_window}
+    requires: handle_owned_by_conversation(handle, conversation)
+    requires: WakeTrackedConversation{conversation: conversation}.registration_open
+    requires: not conversation.archived
+    requires: conversation.state != terminal
 
-    ensures: AgentReceivesError(
-        error: "wake_unauthorized_handle",
-        handle_kind: handle.kind,
-        handle_id: handle.id
+    let contract_id = next_contract_id()
+    let expires_at = now() + config.default_max_wait_seconds
+    let receipt = WakeRegistrationReceipt{
+        contract_id: contract_id,
+        handle: handle,
+        expires_at: expires_at,
+        registering_tool_use_id: tool_use_id
+    }
+
+    ensures: Contract.created(
+        id: contract_id,
+        owning_conversation: conversation,
+        handle: handle,
+        registering_tool_use_id: tool_use_id,
+        registered_at: now(),
+        expires_at: expires_at,
+        status: pending
     )
+    ensures: AgentReceivesWakeReceipt(receipt)
+    ensures: SseEmitted(WakeContractRegistered, contract_id)
 }
 
--- REQ-WAKE-007: registration rejected because max_wait_seconds is
--- out of range.
-rule WaitUntilRejectedByRange {
-    when: AgentCallsWaitUntil(conversation, handle, condition, max_wait_seconds, tool_use_id)
+rule RejectWakeUnsupportedHandleKind {
+    when: AgentCallsWaitUntil(conversation, handle, requested_max_wait_seconds?, tool_use_id)
 
-    requires: max_wait_seconds < 0 or max_wait_seconds > config.max_max_wait_seconds
+    requires: handle.kind not in {bash, tmux_window}
 
-    ensures: AgentReceivesError(
-        error: "wake_max_wait_seconds_out_of_range",
-        max_max_wait_seconds: config.max_max_wait_seconds
-    )
+    ensures: AgentReceivesError(error: "wake_unsupported_handle_kind")
 }
 
--- REQ-WAKE-003: router fires when the underlying condition holds. For durable
--- tmux/sub-agent terminal evidence, the evidence timestamp is compared with the
--- contract deadline so a terminal event recorded before expires_at still fires if
--- the next router tick happens after expires_at. For tmux_run, the condition holds
--- when the Phoenix exit marker is observed in the watched window, not when the
--- tmux window process exits.
--- Other pending contracts on the same conversation are NOT
--- cancelled (REQ-WAKE-010 independent semantics) - they continue to
--- be evaluated and may fire later.
-rule WakeRouterFiresOnConditionHold {
-    when: WakeRouterTick(contract)
+rule RejectWakeUnauthorizedHandle {
+    when: AgentCallsWaitUntil(conversation, handle, requested_max_wait_seconds?, tool_use_id)
+
+    requires: handle.kind in {bash, tmux_window}
+    requires: not handle_owned_by_conversation(handle, conversation)
+
+    ensures: AgentReceivesError(error: "wake_unauthorized_handle")
+}
+
+rule RejectWakeOutOfRangeTimeout {
+    when: AgentCallsWaitUntil(conversation, handle, requested_max_wait_seconds, tool_use_id)
+
+    requires: requested_max_wait_seconds < 1
+              or requested_max_wait_seconds > config.max_max_wait_seconds
+
+    ensures: AgentReceivesError(error: "wake_max_wait_seconds_out_of_range")
+}
+
+rule ResolveBashContractFired {
+    when: BashTerminalEvidenceObserved(contract, payload, tail_lines, evidence_at)
 
     requires: contract.status = pending
-    requires: evaluator_reports_fired(contract.condition)
-    requires: now() < contract.expires_at or evaluator_terminal_evidence_recorded_at(contract.condition) < contract.expires_at
+    requires: contract.handle.kind = bash
+    requires: evidence_at_or_before_deadline(contract, evidence_at)
 
-    let payload = evaluator_payload(contract.condition)
+    let observation = WakeRuntimeObservation{
+        contract_id: contract.id,
+        receipt: WakeRegistrationReceipt{
+            contract_id: contract.id,
+            handle: contract.handle,
+            expires_at: contract.expires_at,
+            registering_tool_use_id: contract.registering_tool_use_id
+        },
+        terminal_payload: TerminalPayload{
+            cause: fired,
+            fired: FiredPayload{kind: bash, bash: payload}
+        }
+    }
 
-    ensures: ContractTransitionsToTerminal(contract, fired, payload)
-    ensures: SyntheticToolResultAppendedToConversation(
-        conversation:   contract.conversation,
-        tool_use_id:    contract.registering_tool_use_id,
-        payload:        payload
+    ensures: contract.status = terminal
+    ensures: contract.terminal_cause = fired
+    ensures: contract.terminal_payload = observation.terminal_payload
+    ensures: contract.resolved_at = now()
+    ensures: WakeInboxItem.created(
+        id: next_wake_inbox_id(),
+        conversation: contract.owning_conversation,
+        contract: contract,
+        observation: observation,
+        enqueued_at: now()
     )
-    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
-    ensures: SseEmitted(WakeContractFired, contract.id)
-
-    @guidance
-        -- Sibling contracts on the same conversation are NOT
-        -- cancelled. Each contract fires independently. This is
-        -- REQ-WAKE-010; the earlier "first-fire-wins, cancel
-        -- siblings" semantics was rejected when removing
-        -- AwaitingWake (it only made sense as a conv-state
-        -- transition).
-        --
-        -- For handle.kind = subagent, payload.fired.sub_agent is populated only
-        -- from a durable child terminal cause: explicit submit_result, explicit
-        -- submit_error, timed_out, cancelled, turn-limit hard-stop fallback,
-        -- implicit completion, runtime failure, or context exhaustion. A missing
-        -- child handle is not a condition-held fire; it follows
-        -- WakeRouterForgetsMissingSubAgentHandle and resolves with cause = forgotten.
-        -- The synthetic tool result is appended to the conv message
-        -- log via the same path as a normal tool result completion.
-        -- The conv's next-LLM-turn trigger is the same path as
-        -- "user just sent a message" or "previous tool just
-        -- returned." No new dispatcher state needed.
+    ensures: BashWakeTailLine.replaced_for(contract, tail_lines)
 }
 
--- REQ-WAKE-011 + REQ-WAKE-017: a missing sub-agent child is forgotten, not a
--- condition-held fire. This preserves the retry/escalation signal that
--- distinguishes missing handles from completed child failures.
-rule WakeRouterForgetsMissingSubAgentHandle {
-    when: WakeRouterTick(contract)
+rule ResolveTmuxContractFired {
+    when: TmuxTerminalEvidenceObserved(contract, payload, tail_lines, evidence_at)
 
     requires: contract.status = pending
-    requires: contract.condition.handle?.kind = subagent
-    requires: not subagent_child_exists(contract.condition.handle?.id)
+    requires: contract.handle.kind = tmux_window
+    requires: evidence_at_or_before_deadline(contract, evidence_at)
 
-    let payload = FirePayload(cause: forgotten, forgotten_reason: subagent_handle_missing)
+    let observation = WakeRuntimeObservation{
+        contract_id: contract.id,
+        receipt: WakeRegistrationReceipt{
+            contract_id: contract.id,
+            handle: contract.handle,
+            expires_at: contract.expires_at,
+            registering_tool_use_id: contract.registering_tool_use_id
+        },
+        terminal_payload: TerminalPayload{
+            cause: fired,
+            fired: FiredPayload{kind: tmux_window, tmux_window: payload}
+        }
+    }
 
-    ensures: ContractTransitionsToTerminal(contract, forgotten, payload)
-    ensures: SyntheticToolResultAppendedToConversation(
-        conversation:   contract.conversation,
-        tool_use_id:    contract.registering_tool_use_id,
-        payload:        payload
+    ensures: contract.status = terminal
+    ensures: contract.terminal_cause = fired
+    ensures: contract.terminal_payload = observation.terminal_payload
+    ensures: contract.resolved_at = now()
+    ensures: WakeInboxItem.created(
+        id: next_wake_inbox_id(),
+        conversation: contract.owning_conversation,
+        contract: contract,
+        observation: observation,
+        enqueued_at: now()
     )
-    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
-    ensures: SseEmitted(WakeContractForgotten, contract.id)
+    ensures: TmuxWakeTailLine.replaced_for(contract, tail_lines)
 }
 
--- REQ-WAKE-011 + REQ-WAKE-018: an absent tmux window/session is forgotten only
--- when no recorded tmux terminal state exists. A killed window or observed
--- tmux_run exit marker fires through evaluator_reports_fired instead.
-rule WakeRouterForgetsMissingTmuxHandle {
-    when: WakeRouterTick(contract)
+rule ResolveContractExpired {
+    when: WakeObservationTick(contract)
 
     requires: contract.status = pending
-    requires: contract.condition.handle?.kind = tmux_pane
-    requires: not tmux_window_exists(contract.condition.handle?.id)
-    requires: not tmux_terminal_state_recorded(contract.condition.handle?.id)
+    requires: now() >= contract.expires_at
+    requires: not durable_terminal_evidence_before_deadline(contract)
+    requires: handle_still_observable(contract)
 
-    let payload = FirePayload(cause: forgotten, forgotten_reason: tmux_handle_missing)
+    let observation = WakeRuntimeObservation{
+        contract_id: contract.id,
+        receipt: WakeRegistrationReceipt{
+            contract_id: contract.id,
+            handle: contract.handle,
+            expires_at: contract.expires_at,
+            registering_tool_use_id: contract.registering_tool_use_id
+        },
+        terminal_payload: TerminalPayload{cause: expired}
+    }
 
-    ensures: ContractTransitionsToTerminal(contract, forgotten, payload)
-    ensures: SyntheticToolResultAppendedToConversation(
-        conversation:   contract.conversation,
-        tool_use_id:    contract.registering_tool_use_id,
-        payload:        payload
+    ensures: contract.status = terminal
+    ensures: contract.terminal_cause = expired
+    ensures: contract.terminal_payload = observation.terminal_payload
+    ensures: contract.resolved_at = now()
+    ensures: WakeInboxItem.created(
+        id: next_wake_inbox_id(),
+        conversation: contract.owning_conversation,
+        contract: contract,
+        observation: observation,
+        enqueued_at: now()
     )
-    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
-    ensures: SseEmitted(WakeContractForgotten, contract.id)
 }
 
--- REQ-WAKE-003 + REQ-WAKE-007: router fires when expires_at has passed without
--- the condition holding and without in-deadline durable terminal evidence.
-rule WakeRouterFiresOnExpiry {
-    when: WakeRouterTick(contract)
+rule ResolveContractForgotten {
+    when: WakeObservationTick(contract)
 
     requires: contract.status = pending
-    requires: contract.expires_at <= now()
-    requires: not in_deadline_terminal_evidence_exists(contract)
+    requires: not handle_still_observable(contract)
+    requires: not durable_terminal_evidence_before_deadline(contract)
 
-    let payload = FirePayload(cause: expired)
+    let observation = WakeRuntimeObservation{
+        contract_id: contract.id,
+        receipt: WakeRegistrationReceipt{
+            contract_id: contract.id,
+            handle: contract.handle,
+            expires_at: contract.expires_at,
+            registering_tool_use_id: contract.registering_tool_use_id
+        },
+        terminal_payload: TerminalPayload{
+            cause: forgotten,
+            forgotten_reason: handle_missing
+        }
+    }
 
-    ensures: ContractTransitionsToTerminal(contract, expired, payload)
-    ensures: SyntheticToolResultAppendedToConversation(
-        conversation:   contract.conversation,
-        tool_use_id:    contract.registering_tool_use_id,
-        payload:        payload
+    ensures: contract.status = terminal
+    ensures: contract.terminal_cause = forgotten
+    ensures: contract.terminal_payload = observation.terminal_payload
+    ensures: contract.resolved_at = now()
+    ensures: WakeInboxItem.created(
+        id: next_wake_inbox_id(),
+        conversation: contract.owning_conversation,
+        contract: contract,
+        observation: observation,
+        enqueued_at: now()
     )
-    ensures: ConversationNextLlmTurnTriggered(contract.conversation)
-    ensures: SseEmitted(WakeContractExpired, contract.id)
-
-    @guidance
-        -- Expiry is generic fallback, not precedence over durable terminal
-        -- evidence. A tmux/sub-agent terminal event recorded before expires_at
-        -- fires even if this router tick runs after expires_at; otherwise a
-        -- continuously running Phoenix would disagree with startup reconciliation.
 }
 
--- REQ-WAKE-008: explicit user cancel (UI button click).
-rule UserCancelsContract {
-    when: UserClicksCancel(contract_id)
+rule CancelWakeContract {
+    when: CancelWakeRequested(conversation, contract)
 
-    requires: Contract{id: contract_id}.status = pending
+    requires: contract.status = pending
+    requires: contract.owning_conversation = conversation
 
-    let payload = FirePayload(cause: cancelled)
+    let observation = WakeRuntimeObservation{
+        contract_id: contract.id,
+        receipt: WakeRegistrationReceipt{
+            contract_id: contract.id,
+            handle: contract.handle,
+            expires_at: contract.expires_at,
+            registering_tool_use_id: contract.registering_tool_use_id
+        },
+        terminal_payload: TerminalPayload{
+            cause: cancelled,
+            cancellation_reason: explicit_cancel
+        }
+    }
 
-    ensures: ContractTransitionsToTerminal(contract_id, cancelled, payload)
-    ensures: SyntheticToolResultAppendedToConversation(
-        conversation:   Contract{id: contract_id}.conversation,
-        tool_use_id:    Contract{id: contract_id}.registering_tool_use_id,
-        payload:        payload
+    ensures: contract.status = terminal
+    ensures: contract.terminal_cause = cancelled
+    ensures: contract.terminal_payload = observation.terminal_payload
+    ensures: contract.resolved_at = now()
+    ensures: WakeInboxItem.created(
+        id: next_wake_inbox_id(),
+        conversation: contract.owning_conversation,
+        contract: contract,
+        observation: observation,
+        enqueued_at: now()
     )
-    ensures: ConversationNextLlmTurnTriggered(
-        Contract{id: contract_id}.conversation
-    )
-    ensures: SseEmitted(WakeContractCancelled, contract_id)
+    ensures: ExplicitCancelDoesNotScheduleResume(conversation, contract)
+    ensures: not ReplacementWakeContractCreatedFor(contract)
 }
 
--- REQ-WAKE-004: lifecycle cascade (archive, hard-delete, abandon,
--- mark-merged) cancels every pending contract on the conversation
--- BEFORE the resource cleanup cascade runs. Because is_busy() now
--- consults the contract table, archive/hard-delete will refuse with
--- 409 if any contract is pending - this rule only runs after the
--- user has explicitly cancelled contracts (or chosen the
--- cancel-and-archive composite action).
-rule LifecycleCascadeCancelsContracts {
-    when: ConversationLifecycleCascadeBegun(conversation)
+rule TransferPendingContractsToContinuation {
+    when: ContinuationCreatesSuccessor(predecessor, successor)
 
-    requires: exists Contract{conversation: conversation, status: pending}
-
-    ensures: AllContractsOnConversationCancelled(
-        conversation,
-        cancelled,
-        before: ResourceCleanupCascadeBegun(conversation)
+    ensures: Contract.reassign_all(
+        from: predecessor,
+        to: successor,
+        rows: all_pending_contracts_owned_by(predecessor)
+            + contracts_referenced_by_unconsumed_wake_items_owned_by(predecessor)
     )
-
-    @guidance
-        -- Lifecycle-driven cancellation runs BEFORE the resource
-        -- cleanup cascade (bash/tmux/browser/projects). Rationale:
-        -- the cascade may destroy the handle the contract was
-        -- waiting on; if the cancel fires after, the contract's
-        -- last-evaluator-run will see a destroyed handle and
-        -- incorrectly fire forgotten instead of cancelled.
-        --
-        -- Order: cancel contracts -> run resource cascade -> delete
-        -- conv row (for hard-delete only).
-        --
-        -- For hard-delete: no synthetic tool result delivery (the
-        -- conv is being deleted). For archive/abandon/mark-merged:
-        -- deliver if conv is still queryable.
-}
-
--- REQ-WAKE-012: a continuation that inherits the WorkScope transfers
--- the contracts whose watched handle is WorkScope-keyed by re-keying
--- their conversation to the child. subagent-keyed contracts are NOT
--- re-keyed by WorkScope inheritance.
-rule ContinuationBoundaryHandlesContracts {
-    when: ConversationContinuationBoundaryReached(parent, child)
-
-    ensures:
-        for contract in pending_contracts_on(parent)
-            where contract.condition.handle?.kind in config.workscope_keyed_kinds:
-            ContractReKeyedToChild(contract, child)
-
-    @guidance
-        -- A bash or tmux handle is a WorkScope-level resource (bash
-        -- per specs/bash/ REQ-BASH-WS-001), so when the child inherits
-        -- the same WorkScope the watched handle transfers to it and
-        -- its contract transfers with it: conversation re-keyed to the
-        -- child, subsequent fires deliver into the child transcript,
-        -- registered_at / expires_at / condition all preserved.
-        --
-        -- A subagent handle is keyed by the sub-agent's own agent /
-        -- child-conversation id (per specs/subagents/), not by the
-        -- parent's WorkScope. A WorkScope-inheriting continuation does
-        -- not make an already-spawned sub-agent a WorkScope-owned
-        -- resource of the successor, so a subagent-keyed contract is
-        -- not re-keyed here; its completion wake stays keyed to the
-        -- sub-agent id it was registered against.
-        --
-        -- Neither case forgets at the boundary: forgotten is reserved
-        -- for a genuinely destroyed handle (WorkScope torn down with
-        -- no inheritor, or a Phoenix restart dropping an in-memory
-        -- bash handle).
-}
-
--- REQ-WAKE-002 + REQ-WAKE-011: restart resync. Startup reconciles persisted
--- wait obligations before normal serving. Durable terminal evidence recorded
--- before expires_at fires first; non-durable and absent handles are forgotten
--- because the target became unknowable at restart; then overdue contracts with no
--- terminal evidence expire. Still-pending durable handles re-register.
-rule PhoenixStartupResyncsContracts {
-    when: PhoenixStartupReachesWakeRouterInit()
-
-    ensures: ForEveryPendingContract(
-        if_tmux_terminal_state_recorded_before_deadline: ContractTransitionsToTerminalAndQueuesDelivery(
-                contract,
-                fired,
-                FirePayload(cause: fired, fired: payload_from_persisted_tmux_terminal(contract))
-            ),
-        else_if_subagent_and_child_terminal_before_deadline: ContractTransitionsToTerminalAndQueuesDelivery(
-                contract,
-                fired,
-                FirePayload(cause: fired, fired: payload_from_persisted_child_terminal(contract))
-            ),
-        else_if_kind_in_set: config.forgotten_on_restart_for_kinds,
-            then: ContractTransitionsToTerminalAndQueuesDelivery(
-                contract,
-                forgotten,
-                FirePayload(cause: forgotten, forgotten_reason: phoenix_restart)
-            ),
-        else_if_tmux_handle_absent_without_recorded_terminal: ContractTransitionsToTerminalAndQueuesDelivery(
-                contract,
-                forgotten,
-                FirePayload(cause: forgotten, forgotten_reason: tmux_handle_missing)
-            ),
-        else_if_subagent_child_missing: ContractTransitionsToTerminalAndQueuesDelivery(
-                contract,
-                forgotten,
-                FirePayload(cause: forgotten, forgotten_reason: subagent_handle_missing)
-            ),
-        else_if_subagent_and_child_not_terminal: ContractTransitionsToTerminalAndQueuesDelivery(
-                contract,
-                forgotten,
-                FirePayload(cause: forgotten, forgotten_reason: phoenix_restart)
-            ),
-        else_if_overdue: ContractTransitionsToTerminalAndQueuesDelivery(
-                contract,
-                expired,
-                FirePayload(cause: expired)
-            ),
-        else: ContractReRegisteredWithRouter(contract)
+    ensures: WakeInboxItem.reassign_all(
+        from: predecessor,
+        to: successor,
+        rows: all_unconsumed_wake_items_owned_by(predecessor)
     )
-
-    @guidance
-        -- Forgotten delivery is queued, not pushed: the conversation
-        -- may not be loaded by any UI client at restart time. On
-        -- first load (or first message), the queued result is
-        -- appended to the conversation history before any further
-        -- LLM turn.
-        --
-        -- Startup resync exists because the contract is durable wait intent, not
-        -- durable handle state. The router must deliver exactly one accountable
-        -- outcome for every accepted contract. Terminal startup branches use
-        -- ContractTransitionsToTerminalAndQueuesDelivery so a restart-resolved
-        -- contract still appends the synthetic tool result and triggers the parent
-        -- LLM turn on first load. A sub-agent child is read before forgetting the
-        -- contract; if tmux or a child sub-agent persisted terminal evidence
-        -- before the deadline, the wake delivers that tagged terminal payload even
-        -- if Phoenix restarts after expires_at. If restart makes the target
-        -- unknowable (bash registry gone, tmux window missing, child row missing,
-        -- non-terminal child runtime gone), forgotten wins over generic expiry.
-        -- Expiry is only for evaluable contracts with no in-deadline terminal
-        -- evidence.
+    ensures: ResumeRequest.reassign_all_pending(
+        from: predecessor,
+        to: successor,
+        copy_message_into_successor_history: true
+    )
+    ensures: transfer_copies_exact_resume_message_once
+    ensures: consumed_terminal_contracts_without_unconsumed_items_remain_owned_by(predecessor)
+    ensures: transferred_items_and_their_contracts_have_same_owner(successor)
+    ensures: WakeTrackedConversation{conversation: predecessor}.registration_open = false
+    ensures: WakeTrackedConversation{conversation: successor}.registration_open = true
+    ensures: continuation_closes_predecessor_and_opens_successor
 }
 
--- REQ-WAKE-004: is_busy() consults the contract table.
-rule IsBusyConsultsContractTable {
-    when: IsBusyEvaluated(conversation)
+rule CoalesceResumeSchedulingWhenIdle {
+    when: WakeInboxItemCreatedForConversation(conversation)
 
-    ensures: IsBusyReturnsTrue(conversation)
-        when count(Contract{conversation: conversation, status: pending}) > 0
+    requires: exists WakeInboxItem{conversation: conversation, delivered_at: null}
+    requires: not runtime_currently_consuming_wake_inbox(conversation)
+    requires: idle_runtime_available(conversation)
 
-    @guidance
-        -- is_busy() in this codebase is the precondition for
-        -- archive/hard-delete/abandon/mark-merged proceeding. By
-        -- making is_busy() return true when pending contracts exist,
-        -- those lifecycle endpoints will reject with 409
-        -- (cancel-first) until contracts are explicitly cancelled
-        -- or have fired. This prevents the silent-cancel-then-
-        -- cascade failure mode.
-        --
-        -- The augmentation is conjunctive with the existing state-
-        -- based check: is_busy(c) = state_says_busy(c) OR
-        -- has_pending_contracts(c).
+    ensures: exists ResumeRequest{
+        conversation: conversation,
+        reason: resume_wake_inbox,
+        status: pending
+    }
+    ensures: at_most_one_pending_resume_request(conversation, resume_wake_inbox)
+}
+
+rule BusyConversationDefersWakeResumeScheduling {
+    when: WakeInboxItemCreatedForConversation(conversation)
+
+    requires: exists WakeInboxItem{conversation: conversation, delivered_at: null}
+    requires: conversation.is_busy
+
+    ensures: not ResumeRequest.created(conversation: conversation, reason: resume_wake_inbox)
+    ensures: not WakeInboxItem.consumed(conversation: conversation)
+    ensures: not runtime_observation_message_created(conversation)
+}
+
+rule DeliverWakeInboxBatch {
+    when: ResumeRequestConsumed(conversation, request)
+
+    requires: exists WakeInboxItem{conversation: conversation, delivered_at: null}
+    requires: not conversation.is_busy
+
+    ensures: ConversationReceivesWakeBatch(
+        conversation: conversation,
+        items: wake_inbox_snapshot_for_resume(conversation)
+    )
+    ensures: MarkWakeInboxItemsDelivered(conversation, wake_inbox_snapshot_for_resume(conversation))
+    ensures: request.status = accepted
+    ensures: accepting_resume_atomically_persists_llm_requesting
+}
+
+rule ArchivedConversationSuppressesWakeResume {
+    when: LifecycleArchiveRequested(conversation)
+
+    ensures: not runtime_observation_message_created_after_archive(conversation)
+    ensures: not WakeResumeAcceptedAfterArchive(conversation)
+    ensures: ResumeRequest.suppress_all_pending(
+        conversation: conversation,
+        reason: conversation_archived
+    )
+}
+
+rule LaterCommittedInboxItemsRemainPending {
+    when: ResumeRequestConsumed(conversation, request)
+
+    requires: exists WakeInboxItem{conversation: conversation, delivered_at: null}
+
+    ensures: later_committed_items_remain_pending_after_snapshot
+}
+
+rule StartupPassReconcilesPendingContracts {
+    when: StartupPassBegins(wake_contract_reconciliation)
+
+    ensures: StartupReconcilesPendingContracts
+    ensures: startup_retries_pending_resume_requests
+}
+
+rule ArchiveAcquiresDurableWakeFence {
+    when: LifecycleArchiveRequested(conversation)
+    requires: not exists Contract{owning_conversation: conversation, status: pending}
+    ensures: WakeTrackedConversation{conversation: conversation}.registration_open = false
+    ensures: lifecycle_fence_is_durable_and_idempotent
+}
+
+rule AbandonAcquiresDurableWakeFence {
+    when: LifecycleAbandonRequested(conversation)
+    requires: not exists Contract{owning_conversation: conversation, status: pending}
+    ensures: WakeTrackedConversation{conversation: conversation}.registration_open = false
+    ensures: lifecycle_fence_is_durable_and_idempotent
+}
+
+rule MarkMergedAcquiresDurableWakeFence {
+    when: LifecycleMarkMergedRequested(conversation)
+    requires: not exists Contract{owning_conversation: conversation, status: pending}
+    ensures: WakeTrackedConversation{conversation: conversation}.registration_open = false
+    ensures: lifecycle_fence_is_durable_and_idempotent
+}
+
+rule HardDeleteAcquiresDurableWakeFence {
+    when: LifecycleHardDeleteRequested(conversation)
+    requires: not exists Contract{owning_conversation: conversation, status: pending}
+    ensures: WakeTrackedConversation{conversation: conversation}.registration_open = false
+    ensures: lifecycle_fence_is_durable_and_idempotent
+}
+
+rule ChainLifecycleAcquiresAllMemberWakeFences {
+    when: ChainLifecycleRequested(members)
+    requires: not exists Contract{owning_conversation: members, status: pending}
+    ensures: AllChainMemberRegistrationClosed(members)
+    ensures: ChainCleanupMayBegin(members)
+}
+
+rule RejectChainLifecycleWhileAnyWakePending {
+    when: ChainLifecycleRequested(members)
+    requires: exists Contract{owning_conversation: members, status: pending}
+    ensures: LifecycleRequestRejected(error: "wake_contract_pending")
+    ensures: AllChainMemberRegistrationOpen(members)
+    ensures: NoChainCleanupBegins(members)
+}
+
+rule RejectRegistrationAfterLifecycleFence {
+    when: AgentCallsWaitUntil(conversation, handle, requested_max_wait_seconds?, tool_use_id)
+
+    requires: not WakeTrackedConversation{conversation: conversation}.registration_open
+
+    ensures: AgentReceivesError(error: "wake_registration_closed")
+}
+
+rule RejectArchiveWhileWakePending {
+    when: LifecycleArchiveRequested(conversation)
+
+    requires: exists Contract{owning_conversation: conversation, status: pending}
+
+    ensures: LifecycleRequestRejected(error: "wake_contract_pending")
+}
+
+rule RejectAbandonWhileWakePending {
+    when: LifecycleAbandonRequested(conversation)
+
+    requires: exists Contract{owning_conversation: conversation, status: pending}
+
+    ensures: LifecycleRequestRejected(error: "wake_contract_pending")
+}
+
+rule RejectMarkMergedWhileWakePending {
+    when: LifecycleMarkMergedRequested(conversation)
+
+    requires: exists Contract{owning_conversation: conversation, status: pending}
+
+    ensures: LifecycleRequestRejected(error: "wake_contract_pending")
+}
+
+rule RejectHardDeleteWhileWakePending {
+    when: LifecycleHardDeleteRequested(conversation)
+
+    requires: exists Contract{owning_conversation: conversation, status: pending}
+
+    ensures: LifecycleRequestRejected(error: "wake_contract_pending")
 }
 
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
 
--- REQ-WAKE-009: every terminal contract's delivery is conversation-
--- scoped to its `conversation` field. The contract is never
--- delivered to any other conversation.
-invariant ContractsFireOnlyTheirConversation {
-    for c in Contract where c.status = terminal:
-        c.conversation != null
-        -- (delivery-target check is enforced by the
-        --  SyntheticToolResultAppendedToConversation event's
-        --  conversation field in every fire/expire/cancel rule
-        --  being always c.conversation.)
+invariant WakeRegistrationAndLifecycleFenceSerialize {
+    registration_requires_open_non_archived_non_terminal_conversation
+    lifecycle_fence_closes_iff_no_pending_contract
 }
 
--- REQ-WAKE-010 + REQ-WAKE-011: every terminal contract has all
--- terminal fields populated.
-invariant TerminalContractsAreFullyPopulated {
-    for c in Contract where c.status = terminal:
-        c.resolved_at != null
-        and c.terminal_payload != null
+invariant TerminalContractHasOneInboxItem {
+    no_duplicate_wake_inbox_items_per_contract
 }
 
--- REQ-WAKE-011: every contract's terminal_cause is one of exactly
--- the four documented causes. Forbids silent abandonment while keeping the cause
--- queryable without JSON extraction.
-invariant TerminalCauseIsOneOfFour {
-    for c in Contract where c.status = terminal:
-        c.terminal_cause = fired
-        or c.terminal_cause = expired
-        or c.terminal_cause = cancelled
-        or c.terminal_cause = forgotten
+invariant PendingContractHasNoInboxItem {
+    no_wake_inbox_item_for_pending_contract
 }
 
-invariant FiredContractsCarryFiredPayloadBody {
-    for c in Contract where c.status = terminal and c.terminal_cause = fired:
-        c.terminal_payload.fired != null
-}
-invariant FiredBashContractsCarryOnlyBashBody {
-    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.condition.handle.kind = bash:
-        c.terminal_payload.fired.bash != null
-        and c.terminal_payload.fired.tmux = null
-        and c.terminal_payload.fired.sub_agent = null
+invariant LifecycleBlockedTracksPendingContracts {
+    lifecycle_blocked_tracks_pending_contract_count
 }
 
-invariant FiredTmuxContractsCarryOnlyTmuxBody {
-    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.condition.handle.kind = tmux_pane:
-        c.terminal_payload.fired.tmux != null
-        and c.terminal_payload.fired.bash = null
-        and c.terminal_payload.fired.sub_agent = null
+invariant LifecycleBlockedIndependentOfRuntimeBusy {
+    lifecycle_blocked_can_hold_while_runtime_busy_is_false
 }
 
-invariant FiredSubAgentContractsCarryOnlySubAgentBody {
-    for c in Contract where c.status = terminal and c.terminal_cause = fired and c.condition.handle.kind = subagent:
-        c.terminal_payload.fired.sub_agent != null
-        and c.terminal_payload.fired.bash = null
-        and c.terminal_payload.fired.tmux = null
+invariant ResumeRequestNeedsUndeliveredInboxItem {
+    resume_requests_require_undelivered_wake_inbox_items
 }
 
-invariant NonFiredTerminalRowsCarryNoFiredBody {
-    for c in Contract where c.status = terminal and c.terminal_cause != fired:
-        c.terminal_payload.fired = null
+invariant InboxItemConversationMatchesContractOwner {
+    wake_inbox_items_target_current_contract_owner
 }
 
-
-invariant ForgottenContractsCarryReason {
-    for c in Contract where c.status = terminal and c.terminal_cause = forgotten:
-        c.forgotten_reason != null
+invariant PendingResumeVisibleInOwningHistory {
+    pending_resume_has_message_in_owning_conversation_history
 }
 
--- REQ-WAKE-007: every pending contract has expires_at strictly in
--- the future at registration time and bounded by
--- max_max_wait_seconds from registered_at.
-invariant ExpiresAtIsBoundedAndFuture {
-    for c in Contract:
-        c.expires_at > c.registered_at
-        and c.expires_at <= c.registered_at + config.max_max_wait_seconds
+invariant DuplicateResumeDoesNotStartTurn {
+    duplicate_or_stale_resume_does_not_start_llm_turn
 }
 
--- (Contract id uniqueness is enforced at the SQLite layer via
---  PRIMARY KEY; not restated as an Allium invariant since the
---  binary-relation form is not expressible in the current grammar.)
+invariant OneLlmExecutionPerConversation {
+    one_llm_execution_per_conversation
+}

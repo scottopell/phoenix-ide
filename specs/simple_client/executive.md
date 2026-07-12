@@ -20,5 +20,6 @@ Single Python file with PEP 723 inline dependencies (httpx, click), runnable via
 | **REQ-CLI-006:** Configuration | ✅ Complete | PHOENIX_API_URL, --api-url, -c, -d |
 | **REQ-CLI-007:** Single File Distribution | ✅ Complete | PEP 723 inline deps, uv run |
 | **REQ-CLI-008:** Model Selection | ✅ Complete | --model for create, --list-models for discovery |
+| **REQ-CLI-009:** Wake Status Inspection | ✅ Complete | Dense human output and lossless JSON snapshot output |
 
-**Progress:** 8 of 8 complete
+**Progress:** 9 of 9 complete

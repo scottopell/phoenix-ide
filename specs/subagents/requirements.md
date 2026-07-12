@@ -172,47 +172,6 @@ directory trees.
 
 ---
 
-### REQ-SA-009: Terminal Handle Identity for Wake Contracts
-
-WHEN a sub-agent is spawned
-THE SYSTEM SHALL expose a stable terminal-wait handle identified by the child
-conversation / agent id
-
-WHEN that handle is watched by a wake contract
-THE SYSTEM SHALL report fired terminal outcomes for every durable child terminal
-cause admitted by bedrock, including successful `submit_result`, `submit_error`,
-wall-clock timeout, independently observed child cancellation, turn-limit
-hard-stop fallback, implicit text completion, non-retryable runtime failure, and
-context exhaustion, and SHALL
-resolve missing child handles through the wake contract's `Forgotten` cause
-
-THE SYSTEM SHALL persist the sub-agent terminal-cause discriminator required to
-distinguish those outcomes durably; coarse success/failure state alone SHALL NOT
-be the source for wake terminal payload reconstruction
-
-WHEN Phoenix restarts while a sub-agent wake contract is pending
-THE SYSTEM SHALL deliver the child conversation's persisted terminal state and its
-durable terminal cause when that cause occurred before the contract deadline,
-expire the wake contract when the child has durable terminal state only after the
-contract deadline, and otherwise treat the sub-agent handle as forgotten because
-active sub-agent runtimes do not survive restart
-
-Existing `spawn_agents` fan-in SHALL remain compatibility sugar. The runtime MAY
-lower that fan-in onto wake contracts internally. Explicit `wait_until` for
-sub-agent handles SHALL be usable only when a parent already has a stable child id
-from another surface; adding a non-blocking `spawn_agents` mode is out of scope
-for v1.
-
-THE sub-agent wake handle SHALL NOT be keyed by the parent's WorkScope and SHALL
-NOT imply parent-to-child continuation or automatic budget extension
-
-**Rationale:** Wake contracts need a stable way to reference sub-agent terminal
-completion without embedding blocking fan-in semantics into every parent state.
-The child conversation / agent id is already the durable sub-agent identity; the
-wake plane reuses it rather than inventing a parallel handle namespace.
-
----
-
 ### REQ-SA-010: Turn-Limit Grace Prompt Integrity
 
 WHEN a Work sub-agent reaches its turn limit and receives its grace turn

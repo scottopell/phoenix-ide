@@ -2,150 +2,113 @@
 
 ## Requirements Summary
 
-Wake contracts let an LLM agent register a persistent, conversation-
-scoped commitment of the shape "wake me when condition X holds, or in
-N seconds, whichever comes first." Today's spawn-and-wait surfaces
-(`bash op=wait`, `tmux capture-pane` polling, `subagent` hardcoded
-block) all consume one full conversation turn per wait window. For a
-3-minute task with the default 30s wait, that's six turns of context
-re-feed, six tool-description re-feeds, and six assistant-message
-round-trips — all to deliver one bit of information (the task
-finished).
+Wake contracts let an LLM agent register a persistent, conversation-scoped
+commitment of the shape "wake me when this bash handle or tmux window reaches a
+terminal outcome, or when this bounded wait expires." The registration call
+returns an immediate receipt after durable persistence. The later terminal fact
+is delivered as a typed Phoenix runtime observation correlated by `contract_id`,
+not as a delayed synthetic tool result.
 
-Wake contracts replace the poll-loop with persistence + an asynchronous router:
-the LLM registers a contract, the conversation stays in `Idle`, and the runtime
-delivers exactly one synthetic terminal result into the conversation when the
-condition fires, expires, is cancelled, or becomes forgotten. The LLM consumes
-zero turns in between. Persistence makes the wait intent durable; it does not make
-every watched handle durable.
+The core plane is durable and normalized: pending contracts, terminal outcomes,
+child tail rows, and unconsumed wake inbox items all survive restart. The wake
+observer and startup reconciler both resolve contracts by the same durable
+protocol: terminal evidence with `evidence_at <= expires_at` wins over expiry;
+otherwise expiry occurs at `now >= expires_at`; explicit cancel produces a
+cancelled observation; and forgotten is reserved for handles Phoenix can no
+longer observe.
 
-V1 supports one condition kind over three concrete handle kinds:
-`HandleTerminal { handle_kind, handle_id }` — fires when a named bash, tmux
-`window_id`, or sub-agent handle reaches a terminal state. For sub-agents, the
-terminal payload covers every durable child terminal cause admitted by bedrock:
-explicit `submit_result`, explicit `submit_error`, timeout, child cancellation,
-turn-limit hard-stop fallback, implicit completion, runtime failure, and context
-exhaustion. Missing child handles resolve as `Forgotten`, not as fired child
-payloads. V1 does not define parent-to-child
-continuation, `NeedMoreBudget`, arbitrary child
-questions, automatic sub-agent budget extension, or a general conversation-actor
-framework.
+Wake ownership is conversation-scoped and continuation-safe. When a continuation
+creates a successor, all pending contracts and all unconsumed wake observations
+transfer to that successor before any later delivery, regardless of WorkScope
+inheritance. Handle survival remains a separate concern.
+
+Wake scheduling is durable. Materializing an inbox snapshot creates its meta-user
+observation and a pending resume outbox row atomically. Busy runtimes and failed
+runtime sends leave that row pending, and startup retries it. Acceptance atomically
+persists `LlmRequesting` and marks the row accepted before LLM dispatch. A
+continuation copies the exact pending observation into successor history and
+rekeys the outbox to that successor-safe message while retaining predecessor
+history. Explicit cancel appends a cancelled observation but does not itself
+create a resume outbox row.
+
+Runtime observability records stable structured fields for registration, terminal
+resolution and latency, reconciliation batches, inbox coalescing, queued/pending
+resume dispatch, atomic outbox acceptance, and startup recovery counts. Logs carry
+handle and cause metadata but omit terminal payloads and output tails.
+
+Pending wake contracts also derive a lifecycle-blocking signal distinct from
+`is_busy`. Archive, abandon, mark-merged, and hard-delete lifecycle actions
+reject or conflict while pending wake obligations remain.
 
 ## Technical Summary
 
-A new `wake_contracts` SQLite table persists every contract with registration
-fields plus terminal accounting fields: `status`, `terminal_cause`,
-`forgotten_reason`, `terminal_payload`, and `resolved_at`. Terminal cause and the
-finite forgotten-reason discriminator are queryable columns for metrics;
-`terminal_payload` stores only the cause-specific body.
-A new background `wake_router` task polls contracts each tick (1s for
-HandleTerminal) and on resolution: marks the row terminal, appends a
-synthetic tool result to the conv message log, triggers the conv's
-next LLM turn, and emits SSE.
+The spec models three durable structures:
+- `Contract` for the obligation and terminal accounting,
+- `WakeInboxItem` for unconsumed runtime observations, and
+- tail child rows for bash/tmux final output snippets.
 
-**No new conversation state.** The conv stays in `Idle` while
-waiting; the contract row is the single source of truth for "is this
-conv waiting on something." The existing `Awaiting*` family of states
-in this codebase exclusively encodes "waiting on the user"
-(`AwaitingTaskApproval`, `AwaitingContinuation`); wake is "waiting on
-the runtime," which is a different category and should not block
-user interaction. `is_busy()` is augmented to return true when the
-conv has at least one pending contract (one extra SQLite count per
-evaluation; lifecycle endpoints already do at least one read).
+The Allium contract now models the user-visible wake payload as a tagged runtime
+observation envelope. Registration receipts contain `contract_id`, handle, and
+`expires_at`, with `registering_tool_use_id` present only as audit metadata.
+Delivered observations are correlated by `contract_id`; they are not attributable
+through delayed tool-result semantics.
 
-The synthetic tool result delivered on fire is byte-shape-identical to the tool
-result the equivalent synchronous wait would have returned when such a
-synchronous surface exists. Bash delivery mirrors `bash op=wait`; tmux delivery
-includes the watched `window_id` terminal status and final captured tail; sub-agent
-delivery uses the structured terminal outcome described above. This makes wake a
-drop-in replacement for polling from the LLM's vantage point: same payload, same
-`tool_use_id` correlation, just zero intervening turns.
+The handle payload shape is structural rather than conventional. `WaitHandle` is
+a tagged variant, so a single wake registration cannot simultaneously contain a
+bash body and a tmux body. Fired payloads are likewise tagged, which keeps bash
+terminal metadata and tmux terminal metadata disjoint by construction.
 
-Wake contracts are conversation-scoped, not WorkScope-scoped: a contract is
-owned by one conversation and delivers its synthetic result there. The handles
-it can watch fall into two keying classes. Bash and tmux handles are
-WorkScope-keyed: when a conversation continues into a successor that inherits
-the same WorkScope, the handle transfers to the successor and a pending contract
-on it re-keys its `conv_id` along with it. A subagent handle is keyed by the
-sub-agent's own agent / child-conversation id (not by WorkScope), so a
-subagent-keyed contract is not transferred by WorkScope inheritance. A contract
-fires `Forgotten` only when its watched handle is genuinely destroyed (a Phoenix
-restart, or a hard-delete with no inheriting scope), not as a routine
-consequence of continuation.
+The Allium file now explicitly declares actors, surfaces, and helper names for
+every externally initiated trigger in scope:
+- `wait_until` registration,
+- explicit cancel,
+- observer ticks and evidence arrival,
+- startup reconciliation,
+- continuation transfer,
+- lifecycle actions, and
+- wake resume consumption.
 
-Mandatory `expires_at` (default 600s, cap 1800s) is the delivery deadline for the
-wait obligation and prevents unbounded commitments. While Phoenix is running, the
-router resolves a pending contract no later than the first tick at or after that
-timestamp. After downtime, restart resync delivers in-deadline durable terminal
-evidence, emits `Forgotten` for handles that became unknowable, expires only
-evaluable contracts with no such evidence, or re-registers still-pending durable
-handles.
-
-The LLM-facing surface is a single unified `wait_until { handle: {
-kind, id }, condition, max_wait_seconds }` tool with a `#[serde(tag
-= "kind")]` enum on the handle discriminator. No per-substrate
-variants (`bash_wait_until`, etc.) — keeps tool-description tax low
-and forward-aligns with the unified `WorkHandle` trait that will
-land separately.
+It also imports the tmux Allium spec alongside bedrock and bash so the bash/tmux
+scope is represented directly in the dependency set.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| REQ-WAKE-001 Registration | Proposed | LLM-facing tool surface; no synchronous payload; no conv state mutation |
-| REQ-WAKE-002 Persistence | Proposed | `wake_contracts` SQLite table + restart resync |
-| REQ-WAKE-003 Router Service | Proposed | Background poll task, 1s tick for HandleTerminal v1 |
-| REQ-WAKE-004 `is_busy()` Derivation | Proposed | Reads contract table; no new state machine variant |
-| REQ-WAKE-005 V1 Condition Kinds | Proposed | HandleTerminal only; regex/file/port/webhook deferred |
-| REQ-WAKE-006 Wake Event Delivery | Proposed | Synthetic tool result; shape-identical to `op=wait` response |
-| REQ-WAKE-007 Mandatory Timeout | Proposed | Default 600s, cap 1800s |
-| REQ-WAKE-008 User Status + Cancel | Proposed | UI/CLI wake status on Idle conv + cancel endpoint |
-| REQ-WAKE-009 Conv-Scoped | Proposed | Not WorkScope-scoped; explicit deconfliction |
-| REQ-WAKE-010 Independent Contracts | Proposed | No auto-cancel on sibling fire |
-| REQ-WAKE-011 Terminal Cause | Proposed | Fired / Expired / Cancelled / Forgotten |
-| REQ-WAKE-012 Continuation Inheritance | Proposed | WorkScope-keyed handles (bash, tmux) transfer; subagent is agent-id-keyed |
-| REQ-WAKE-013 User Messages | Proposed | Conv stays Idle; user messages just work |
-| REQ-WAKE-014 Tool Description | Proposed | Explicit cost model + when-to-use guidance |
-| REQ-WAKE-015 Cost Observability | Proposed | Metrics on registration / fire / forgotten breakdown |
-| REQ-WAKE-016 Unified Tool Surface | Proposed | Single `wait_until` tool, tagged-enum handle discriminator |
-| REQ-WAKE-017 Sub-Agent Terminal Payload | Proposed | Tagged exhaustive sub-agent terminal causes; missing child is Forgotten |
-| REQ-WAKE-018 Handle Identity + Lifecycle | Proposed | Bash/tmux WorkScope-keyed; sub-agent keyed by child conversation / agent id |
-
-**Progress:** 0 of 18 implemented.
+| REQ-WAKE-001 | Specified | Registration returns immediate persisted receipt; later delivery is runtime observation |
+| REQ-WAKE-002 | Specified | Normalized contract, inbox, and tail-row storage model |
+| REQ-WAKE-003 | Specified | Scope limited to bash handles and tmux window handles |
+| REQ-WAKE-004 | Implemented | Continuation transfers contracts, inbox rows, and successor-visible pending resume messages |
+| REQ-WAKE-005 | Implemented | Durable inbox/outbox scheduling with atomic acceptance and restart retry |
+| REQ-WAKE-006 | Specified | Exactly-once terminal resolution transaction |
+| REQ-WAKE-007 | Specified | Evidence-vs-expiry semantics use `evidence_at <= expires_at` and `now >= expires_at` |
+| REQ-WAKE-008 | Specified | Startup reconciliation runs before live serving and uses the same durable rules |
+| REQ-WAKE-009 | Specified | Terminal vocabulary is Fired / Expired / Cancelled / Forgotten |
+| REQ-WAKE-010 | Specified | Explicit cancel appends observation but does not itself schedule an LLM resume |
+| REQ-WAKE-011 | Specified | Lifecycle blocking is separate from busy execution and gates destructive actions |
+| REQ-WAKE-012 | Specified | One LLM at a time; busy arrivals persist; sibling contracts remain independent |
+| REQ-WAKE-013 | Specified | Delivery is typed Phoenix runtime observation, not synthetic tool result |
+| REQ-WAKE-014 | Specified | Registration/cancel authorization follows conversation ownership boundary |
+| REQ-WAKE-015 | Specified | Timeout default is 600s; explicit range is 1..=1800s |
 
 ## Dependencies
 
-- `specs/bash/` REQ-BASH-002 (wait semantics) — REQ-WAKE-006 reuses
-  bash wait response shape for delivery
-- `specs/tmux-integration/` — TmuxPane handle condition kind
-- `specs/subagents/` — SubAgent handle condition kind
-- `specs/bedrock/` REQ-BED-032 (hard-delete cascade) — REQ-WAKE-004
-  is_busy() augmentation joins the cascade's busy-check
+- `specs/bedrock/bedrock.allium` — conversation ownership, busy execution, and continuation context
+- `specs/bash/bash.allium` — bash terminal status and tail semantics mirrored by wake observation
+- `specs/tmux-integration/tmux-integration.allium` — tmux window identity and durable terminal evidence surface
 
-## Related Work
+## Verification
 
-- **`specs/bash/` REQ-BASH-WS-001 / -WS-002** — bash handles are
-  WorkScope-keyed and inherit across a scope-sharing continuation, so
-  REQ-WAKE-012 transfers a bash-keyed contract to the child along with
-  its handle
-- **`specs/subagents/`** — a sub-agent is tracked by its own agent /
-  child-conversation id, so a subagent-keyed contract is keyed
-  independently of the parent's WorkScope (REQ-WAKE-012)
-- **WorkScope foundation** — the resource-cleanup cascade
-  infrastructure this spec extends with cancel-on-lifecycle
-  (REQ-WAKE-004 join)
+- Database tests cover snapshot/outbox creation, atomic acceptance, accepted-row exclusion, and continuation transfer into successor history.
+- State-machine tests cover idle acceptance and duplicate/stale absorption without another turn.
+- Runtime tests cover cancellation-only behavior, busy and send-failure retention, successful scheduling, and retry of persisted pending outbox rows.
+- Runtime helper tests cover stable observability cause mappings, coalesced cause counts, and registered-to-resolved latency derivation.
+- `allium check` / `allium analyse` over the wake, bedrock, bash, and tmux dependency set
+- spec validation lanes via `./dev.py check --lanes allium,spec-shape,spec-anchors`
 
 ## Why This Spec Exists
 
-Phoenix today treats turn-count as free. Every spawn-and-wait flow
-that exceeds `wait_seconds` pays a full LLM round-trip per poll. The
-handle-cap (8) and ring-size (4MB) are explicit budgets in
-`specs/bash/`; turn-count is not budgeted anywhere. Wake contracts
-are the runtime acknowledging that turn-count is a first-class cost
-the same way bytes-in-ring are.
-
-The secondary motivation is correctness: today, if the LLM stops
-polling, an exit reaches no one. The tombstone sits in memory until
-Phoenix restart wipes it. Wake contracts make every spawn-and-wait
-deliver a terminal answer in all cases — `Fired`, `Expired`,
-`Cancelled`, or `Forgotten` — never silently abandoned.
+Wake contracts make "owed later runtime delivery" a first-class durable
+capability instead of a poll loop. The spec exists to define that capability in a
+way that survives restart, preserves conversation ownership across continuation,
+and keeps runtime observations distinct from tool-result attribution.

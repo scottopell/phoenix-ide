@@ -2,6 +2,8 @@
 import type { ErrorPresentation } from "./ErrorPresentation";
 import type { LlmAttemptReason } from "./LlmAttemptReason";
 import type { QuotaDetails } from "./QuotaDetails";
+import type { WakeContractRegistered } from "./WakeContractRegistered";
+import type { WakeStatusSnapshot } from "./WakeStatusSnapshot";
 import type { WorkScopeInventory } from "./WorkScopeInventory";
 
 /**
@@ -62,7 +64,7 @@ pending_events: Array<unknown>,
  * should fall back to DB-only state and wait for the next live
  * event. Q3 resolution in `sse_wire.allium`.
  */
-pending_truncated: boolean, } | { "type": "message", sequence_id: number, 
+pending_truncated: boolean, } | { "type": "wake_status_update", snapshot: WakeStatusSnapshot, } | { "type": "wake_contract_registered", sequence_id: number, registration: WakeContractRegistered, } | { "type": "message", sequence_id: number, 
 /**
  * See the note on `Init.messages` — the message payload is
  * validated against `MessageSchema` and transformed to the UI's

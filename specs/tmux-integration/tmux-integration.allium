@@ -37,6 +37,13 @@
 --
 -- Requirement traceability: REQ-TMUX-001 through REQ-TMUX-014
 -- Dependencies: specs/bedrock/bedrock.allium
+-- Wake contracts (`specs/wake-contracts/`) consume two facts from this spec only:
+--   1. tmux-backed waits are authorized by the same WorkScope ownership model
+--      that governs the conversation's tmux server;
+--   2. terminal delivery is reconstructed from the durable tmux_run evidence
+--      surface (window_id, exit marker / kill facts, and captured tail) defined
+--      here. Registration receipts and queued runtime observation live in the
+--      wake-contracts spec, not here.
 
 use "../bedrock/bedrock.allium" as bedrock
 
@@ -127,6 +134,11 @@ value TmuxRunResponse {
     captured_output: TmuxRunCapturedOutput
 }
 
+-- `window_id` is the durable tmux-backed handle identity exposed to other
+-- Phoenix surfaces. In particular, `specs/wake-contracts/` watches tmux work by
+-- this id rather than by window_name, whose collisions are user-visible and
+-- permitted.
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -200,6 +212,11 @@ entity TmuxServer {
     -- Computed once at entry creation and stable for the entity's lifetime.
     -- (task 03001)
     socket_path: String
+
+    -- Random identity of the live server process bound to socket_path. Fresh
+    -- spawn creates a new value; Phoenix restart recovers it from the live
+    -- server's global environment.
+    generation: String
 }
 
 ------------------------------------------------------------
@@ -459,6 +476,8 @@ rule TmuxRunToolCalled {
         exit_marker_prefix: "[phoenix] process exited with code ",
         keep_open_on_exit: keep_open_on_exit
     )
+    ensures: TmuxRunIdentityBoundToCurrentServer(conversation, generation, window_id)
+    ensures: DurableTerminalEvidenceAcceptedOnlyForGeneration(generation, window_id)
 
     @guidance
         -- Effective file root:
@@ -482,9 +501,21 @@ rule TmuxRunToolCalled {
         -- tmux permits duplicate window names. Window names containing the
         -- id/name delimiter are rejected before the tmux call.
         --
-        -- If keep_open_on_exit=false and readiness waiting is requested,
-        -- Phoenix keeps the window open through observation, then kills it
-        -- after observing the exit marker so completion/output are not lost.
+        -- Every wrapper retains its pane through durable exit observation.
+        -- The observer addresses the run by a stable registry identity rather
+        -- than retaining the WorkScope present at launch. An approval rekey
+        -- atomically retargets that identity, so evidence and cleanup resolve
+        -- against the current scope and the same server generation.
+        --
+        -- Terminal sidecars carry the server generation. A sidecar from an
+        -- older generation (including the pre-generation v1 shape) is removed
+        -- as a cache miss before the live pane is inspected. Kill-pending
+        -- evidence may only finalize against its own generation.
+        --
+        -- If keep_open_on_exit=false, the single terminal observer owns
+        -- cleanup after the evidence commit; persistence failure retains the
+        -- pane for retry. A Phoenix restart leaves the tmux pane available for
+        -- later inspection and reconciliation.
 }
 
 -- REQ-TMUX-014: return_immediately starts the command and returns the first

@@ -20,4 +20,5 @@ pub mod skill_invocation;
 pub mod sm_event;
 pub mod sm_state;
 pub mod tool_wire;
+pub mod wake_contracts;
 pub mod work_scope_inventory;

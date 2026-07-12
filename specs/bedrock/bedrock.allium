@@ -391,11 +391,34 @@ rule LastToolCompletesNoSubAgents {
     requires: conversation.core_status = executing_tools
     requires: conversation.tool_queue.count = 0
     requires: conversation.accumulated_sub_agents.count = 0
+    requires: not tool_round_contains_wake_registration_receipt(conversation, result)
     ensures: conversation.tool_results.add(result)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: ToolRoundCheckpointed(conversation)
     ensures: LlmRequestDispatched(conversation)
+}
+
+rule LastToolCompletesWakeRegistrationRound {
+    when: ToolCompletes(conversation, result)
+    requires: conversation.core_status = executing_tools
+    requires: conversation.tool_queue.count = 0
+    requires: conversation.accumulated_sub_agents.count = 0
+    requires: tool_round_contains_wake_registration_receipt(conversation, result)
+    ensures: conversation.tool_results.add(result)
+    ensures: conversation.core_status = idle
+    ensures: ToolRoundCheckpointed(conversation)
+    ensures: AgentDone(conversation)
+
+    @guidance
+        -- The executor commits the complete receipt-producing tool round while
+        -- retaining the reducer's pre-transition state and registration markers.
+        -- Only a successful checkpoint permits marker consumption and the idle
+        -- transition; checkpoint failure leaves both retryable and emits no idle
+        -- observation or follow-up LLM request. The later wake resume path is
+        -- defined in specs/wake-contracts/:
+        -- registration returns a receipt now; durable runtime observations enqueue
+        -- later delivery obligations that resume the conversation in a future turn.
 }
 
 rule LastToolCompletesWithSubAgents {
@@ -928,6 +951,14 @@ rule UserApprovesTaskCurrentConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
     requires: decision = approved_continue_current
+    @guidance
+        -- Approval first completes retry-safe blocking git promotion. It then
+        -- preflights registry/evidence destinations without mutation, publishes
+        -- destination aliases, moves tmux evidence, and commits mode, cwd, and
+        -- pending wake scope in one transaction. Only after that commit does it
+        -- retire old aliases and expose Work scope in memory. Any failure before
+        -- commit restores old-only aliases/evidence; the transaction leaves mode,
+        -- cwd, and wake contracts unchanged, so the same approval is retryable.
     ensures: conversation.mode = work
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
@@ -1025,6 +1056,12 @@ rule ContinuationSummaryReceived {
     requires: conversation.core_status = awaiting_continuation
     ensures: conversation.parent_status = context_exhausted
     ensures: conversation.continuation_summary = summary
+
+    @guidance
+        -- Continuation inheritance includes every pending wake-contract delivery
+        -- obligation and unconsumed wake observation independently of resource
+        -- ownership inheritance. See specs/wake-contracts/ for the authoritative
+        -- transfer and queued-observation delivery protocol.
 }
 
 rule ContinuationFailed {

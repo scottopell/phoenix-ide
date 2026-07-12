@@ -42,6 +42,7 @@ use super::wire::ChainSseWireEvent;
 use super::AppState;
 use crate::chain_qa::ChainQaError;
 use crate::db::{ChainQaRow, Conversation, DbError};
+use phoenix_db::WakeLifecycleGroupFenceOutcome;
 
 /// Maximum length (in chars) of a user-set chain name. The cap is arbitrary
 /// — short enough that the value comfortably fits as a sidebar label and the
@@ -346,6 +347,36 @@ fn normalize_chain_name(name: Option<&str>) -> Result<Option<String>, AppError> 
     Ok(normalized)
 }
 
+async fn acquire_chain_wake_lifecycle_fence(
+    state: &AppState,
+    member_ids: &[String],
+) -> Result<(), AppError> {
+    match state
+        .db
+        .acquire_wake_lifecycle_fences(member_ids)
+        .await
+        .map_err(db_to_app)?
+    {
+        WakeLifecycleGroupFenceOutcome::Acquired => Ok(()),
+        WakeLifecycleGroupFenceOutcome::PendingContracts {
+            conversation_ids,
+            count,
+        } => Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            format!(
+                "Cannot mutate chain while {count} wake contract(s) are pending for: {}. Cancel them first.",
+                conversation_ids.join(", ")
+            ),
+            "pending_wake_contracts",
+        )))),
+        WakeLifecycleGroupFenceOutcome::MissingConversations { ids } => {
+            Err(AppError::NotFound(format!(
+                "chain member(s) disappeared before lifecycle admission: {}",
+                ids.join(", ")
+            )))
+        }
+    }
+}
+
 /// `POST /api/chains/:rootId/archive` — archive every member of the chain.
 /// Single-member roots are not chains; the per-conversation `/archive`
 /// endpoint owns those.
@@ -388,6 +419,8 @@ pub async fn archive_chain_handler(
             ))));
         }
     }
+
+    acquire_chain_wake_lifecycle_fence(&state, &member_ids).await?;
 
     // TOCTOU note: the busy precheck is best-effort. Same shape as the
     // delete-chain handler — a member can transition to busy after the
@@ -434,6 +467,8 @@ pub async fn delete_chain_handler(
             ))));
         }
     }
+
+    acquire_chain_wake_lifecycle_fence(&state, &member_ids).await?;
 
     // TOCTOU note: the busy precheck is best-effort. A member can transition
     // to busy after this loop and before/during its individual cascade, in

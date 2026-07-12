@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { ConversationPage } from './ConversationPage';
 import { DesktopLayout } from '../components/DesktopLayout';
@@ -7,7 +7,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import { DraftContext } from '../conversation/DraftContext';
 import { ConversationStore } from '../conversation';
 import { DraftStore } from '../conversation/DraftStore';
-import { api, type Conversation, type Message } from '../api';
+import { api, type Conversation, type ConversationState, type Message } from '../api';
 import { ConversationReadinessProvider } from '../contexts/ConversationReadinessContext';
 import { cacheDB } from '../cache';
 
@@ -33,6 +33,7 @@ vi.mock('../api', async () => {
       getWorkScopeInventory: vi.fn(() => Promise.resolve({ bash: [], tmux: null, browser: null })),
       getLlmLanguageSetting: vi.fn(() => Promise.resolve({ language: 'en' })),
       getVersion: vi.fn(() => Promise.resolve({ version: 'test' })),
+      cancelConversation: vi.fn(() => Promise.resolve({ ok: true })),
     },
   };
 });
@@ -127,14 +128,14 @@ const catchUpMessage: Message = {
   created_at: '2024-01-01T00:00:02Z',
 };
 
-function renderPage(conversation: Conversation) {
+function renderPage(conversation: Conversation, phase: ConversationState = { type: 'idle' }) {
   const store = new ConversationStore();
   store.dispatch(conversation.slug, {
     type: 'set_initial_data',
     conversationId: conversation.id,
     conversation,
     messages: [historyMessage],
-    phase: { type: 'idle' },
+    phase,
     contextWindow: { used: 0 },
     transcriptGeneration: conversation.transcript_generation ?? 1,
   });
@@ -200,6 +201,22 @@ describe('ConversationPage archived read-only rendering', () => {
     expect(screen.getByTestId('work-control-bar')).toBeInTheDocument();
     expect(screen.getByTestId('file-tree')).toHaveTextContent('/repo/.phoenix/worktrees/conv-archived');
     expect(screen.getByRole('button', { name: /Work/ })).toBeInTheDocument();
+  });
+
+  it('shows the server cancellation error in a toast', async () => {
+    vi.mocked(api.cancelConversation).mockRejectedValueOnce(
+      new Error('Conversation cancellation was rejected'),
+    );
+    renderPage(
+      makeConversation({ state: { type: 'llm_requesting', attempt: 1 } }),
+      { type: 'llm_requesting', attempt: 1 },
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Conversation cancellation was rejected')).toBeInTheDocument();
+    });
   });
 
   it('keeps the conversation terminal inside mobile conversation chrome', async () => {

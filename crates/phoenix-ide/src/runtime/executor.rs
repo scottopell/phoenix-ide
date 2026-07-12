@@ -1636,6 +1636,8 @@ where
     bash_handles: Arc<crate::tools::BashHandleRegistry>,
     /// Tmux server registry for `ToolContext` (REQ-TMUX-013).
     tmux_registry: Arc<crate::tools::TmuxRegistry>,
+    /// Durable wake registration capability and successful-registration tracker.
+    wake_registrar: Option<Arc<crate::runtime::wake::DbWakeRegistrar>>,
     /// LLM registry for `ToolContext`
     llm_registry: Arc<ModelRegistry>,
     /// Active PTY terminal sessions — passed to `ToolContext` for `read_terminal` tool.
@@ -1756,6 +1758,10 @@ where
     /// result from a completed round is discarded rather than misapplied to the
     /// next round.
     sub_agent_round_gen: u64,
+    /// Tool-use IDs for a checkpointed mixed wake/sub-agent round. Empty in a
+    /// fresh executor; restart reconstructs the same intent from the durable
+    /// trailing tool round and wake registrations before final fan-in resumes.
+    pending_wake_park_tool_use_ids: Vec<String>,
     /// Steering messages queued while the conversation was busy. Delivered
     /// one-at-a-time (FIFO) when the conversation next enters `Idle`.
     /// Loaded from DB at executor startup; persisted back after each enqueue
@@ -1891,6 +1897,7 @@ where
             browser_sessions,
             bash_handles,
             tmux_registry,
+            wake_registrar: None,
             llm_registry,
             terminals,
             event_rx,
@@ -1916,6 +1923,7 @@ where
             handoff_tx: None,
             sub_agent_result_buffer: Vec::new(),
             sub_agent_round_gen: 0,
+            pending_wake_park_tool_use_ids: Vec::new(),
             steering_queue: Vec::new(),
             deadline: None,
             tool_task_handle: None,
@@ -1950,6 +1958,14 @@ where
         tx: mpsc::Sender<super::fork_resolve::ForkCommand>,
     ) -> Self {
         self.fork_cmd_tx = Some(tx);
+        self
+    }
+
+    pub(crate) fn with_wake_registrar(
+        mut self,
+        registrar: Arc<crate::runtime::wake::DbWakeRegistrar>,
+    ) -> Self {
+        self.wake_registrar = Some(registrar);
         self
     }
 
@@ -2682,11 +2698,107 @@ where
     /// Updates state, drains sub-agent buffer if entering `AwaitingSubAgents`,
     /// dispatches effects. Returns any synchronously generated events
     /// (e.g., from `SpawnAgentsComplete`).
+    #[allow(clippy::too_many_lines)]
     async fn apply_transition_result(
         &mut self,
         result: crate::state_machine::transition::TransitionResult,
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
+        let mut effects = result.effects;
+
+        // Wake-registration rounds have an extra commit barrier. The marker is
+        // consumed only after both the tool-round checkpoint and every remaining
+        // parking effect (notably Idle persistence) have committed. A retry can
+        // therefore recognize the same wake round after either write fails.
+        let mut park_after_checkpoint = false;
+        let mut parked_tool_use_ids = Vec::new();
+        let mut mixed_round_park_intent = Vec::new();
+        if matches!(
+            result.new_state,
+            ConvState::LlmRequesting { .. } | ConvState::AwaitingSubAgents { .. }
+        ) {
+            if let Some(checkpoint_index) = effects.iter().position(|effect| {
+                matches!(
+                    effect,
+                    Effect::PersistCheckpoint {
+                        data: CheckpointData::ToolRound { .. }
+                    }
+                )
+            }) {
+                let tool_use_ids = match &effects[checkpoint_index] {
+                    Effect::PersistCheckpoint {
+                        data: CheckpointData::ToolRound { tool_results, .. },
+                    } => tool_results
+                        .iter()
+                        .map(|result| result.tool_use_id.clone())
+                        .collect::<Vec<_>>(),
+                    _ => unreachable!("checkpoint index matched a tool-round checkpoint"),
+                };
+                if let Some(registrar) = self.wake_registrar.clone() {
+                    if registrar.has_round(tool_use_ids.iter().cloned()).await {
+                        if matches!(result.new_state, ConvState::AwaitingSubAgents { .. }) {
+                            // Fan-in remains outstanding. Commit the full tool round and
+                            // retain its typed IDs as the park intent; final fan-in will
+                            // verify those IDs against durable registrations.
+                            mixed_round_park_intent = tool_use_ids;
+                        } else {
+                            let checkpoint = effects.remove(checkpoint_index);
+                            if !self.checkpoint_is_durable(&checkpoint).await? {
+                                self.execute_effect(checkpoint).await?;
+                            }
+                            if registrar
+                                .has_pending_round(
+                                    &self.context.conversation_id,
+                                    tool_use_ids.iter().cloned(),
+                                )
+                                .await?
+                            {
+                                park_after_checkpoint = true;
+                                parked_tool_use_ids = tool_use_ids;
+                                effects.retain(|effect| !matches!(effect, Effect::RequestLlm));
+                            } else {
+                                registrar.consume_round(tool_use_ids.into_iter()).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // The final fan-in edge has no ToolRound checkpoint. Derive the pending
+        // park from the checkpointed round's IDs and durable registrations, then
+        // preserve the state-machine's result/state persistence ordering while
+        // suppressing only the follow-up LLM request.
+        if matches!(result.new_state, ConvState::LlmRequesting { .. })
+            && matches!(self.state, ConvState::AwaitingSubAgents { .. })
+        {
+            let candidate_ids = if self.pending_wake_park_tool_use_ids.is_empty() {
+                let messages = self
+                    .storage
+                    .get_messages(&self.context.conversation_id)
+                    .await?;
+                crate::runtime::recovery::trailing_tool_round_ids(&messages)
+            } else {
+                self.pending_wake_park_tool_use_ids.clone()
+            };
+            if !candidate_ids.is_empty() {
+                let registrar = self
+                    .wake_registrar
+                    .as_ref()
+                    .ok_or_else(|| "mixed wake round lost its registrar".to_string())?;
+                if registrar
+                    .has_pending_round(&self.context.conversation_id, candidate_ids.iter().cloned())
+                    .await?
+                {
+                    park_after_checkpoint = true;
+                    parked_tool_use_ids = candidate_ids;
+                    effects.retain(|effect| !matches!(effect, Effect::RequestLlm));
+                } else {
+                    registrar.consume_round(candidate_ids.into_iter()).await;
+                    self.pending_wake_park_tool_use_ids.clear();
+                }
+            }
+        }
 
         // Update state. Bump the entry timestamp on phase change so every
         // SseEvent::StateChange the executor subsequently emits carries a
@@ -2694,7 +2806,13 @@ where
         // (specs/working-phase-visibility/ REQ-WPV-001). `persist_state_effect`
         // threads this same value into the DB write, so the persisted row and
         // the SSE value match exactly.
-        let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+        let next_state = if park_after_checkpoint {
+            ConvState::Idle
+        } else {
+            result.new_state
+        };
+        let old_state = std::mem::replace(&mut self.state, next_state);
+        let old_state_updated_at = self.state_updated_at;
         // Only stamp a fresh entry time when the phase actually changes.
         // Several events absorb as no-ops (Terminal absorbs unknown events;
         // an empty steering drain re-enters the same state) and reach here
@@ -2715,7 +2833,7 @@ where
             let will_drain_from_idle = matches!(self.state, ConvState::Idle)
                 && !self.steering_queue.is_empty()
                 && !self.context.is_sub_agent;
-            if !will_drain_from_idle {
+            if !will_drain_from_idle && !park_after_checkpoint {
                 if let Some(tx) = &self.state_watcher {
                     let _ = tx.send(self.state.clone());
                 }
@@ -2823,22 +2941,59 @@ where
         // keyed on that effect, not on the source state, so the exclusion stays
         // correct if another `Error -> Idle` edge (that *should* drain) is ever
         // added. Mirrors specs/steering-messages DrainOnIdleEntry's guard.
-        let is_error_dismissal = result.effects.iter().any(|e| {
+        let is_error_dismissal = effects.iter().any(|e| {
             matches!(
                 e,
                 Effect::PersistHiddenSystemMarker { marker, .. }
                     if *marker == crate::state_machine::transition::ERROR_DISMISSED_MARKER
             )
         });
-        if let Some(drain_event) = self.maybe_drain_steering_queue(&old_state, is_error_dismissal) {
-            self.run_effects_with_inline_drain(result.effects, drain_event, &mut generated_events)
-                .await?;
-        } else {
-            for effect in result.effects {
-                if let Some(gen_event) = self.execute_effect(effect).await? {
-                    generated_events.push(gen_event);
+        let effects_result = async {
+            if let Some(drain_event) =
+                self.maybe_drain_steering_queue(&old_state, is_error_dismissal)
+            {
+                self.run_effects_with_inline_drain(effects, drain_event, &mut generated_events)
+                    .await?;
+            } else {
+                for effect in effects {
+                    if let Some(gen_event) = self.execute_effect(effect).await? {
+                        generated_events.push(gen_event);
+                    }
                 }
             }
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = effects_result {
+            if !mixed_round_park_intent.is_empty() {
+                self.pending_wake_park_tool_use_ids = mixed_round_park_intent;
+            }
+            if park_after_checkpoint {
+                self.state = old_state.clone();
+                self.state_updated_at = old_state_updated_at;
+                if let Some(tx) = &self.state_watcher {
+                    let _ = tx.send(old_state.clone());
+                }
+            }
+            return Err(error);
+        }
+
+        if !mixed_round_park_intent.is_empty() {
+            self.pending_wake_park_tool_use_ids = mixed_round_park_intent;
+        }
+
+        if park_after_checkpoint {
+            let registrar = self
+                .wake_registrar
+                .as_ref()
+                .expect("parking requires a wake registrar");
+            // The in-memory marker is an optimization for the live executor;
+            // restart derives intent from the durable checkpoint/contracts, so
+            // absence here is valid.
+            registrar
+                .consume_round(parked_tool_use_ids.into_iter())
+                .await;
+            self.pending_wake_park_tool_use_ids.clear();
         }
 
         // Publish the final state to any live-state observer after all effects
@@ -3806,6 +3961,38 @@ where
 
             Effect::PersistState => self.persist_state_effect(true).await,
 
+            Effect::PersistWakeResumeState { message_id } => {
+                self.storage
+                    .accept_wake_resume_state(
+                        &self.context.conversation_id,
+                        &message_id,
+                        &self.state,
+                        self.state_updated_at,
+                    )
+                    .await?;
+                if let ConvState::LlmRequesting { attempt } = &self.state {
+                    tracing::info!(
+                        conversation_id = %self.context.conversation_id,
+                        message_id = %message_id,
+                        attempt,
+                        "wake resume outbox acceptance persisted"
+                    );
+                } else {
+                    tracing::info!(
+                        conversation_id = %self.context.conversation_id,
+                        message_id = %message_id,
+                        "wake resume outbox acceptance persisted"
+                    );
+                }
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                    sequence_id: seq,
+                    state: self.state.clone(),
+                    presentation_mode: self.state.presentation_mode().to_string(),
+                    state_updated_at: self.state_updated_at,
+                });
+                Ok(None)
+            }
+
             Effect::RequestLlm => self.dispatch_llm_request().await,
 
             Effect::CompleteCreation { job_id, claim } => {
@@ -4722,7 +4909,7 @@ where
         // `WorkScope::Conversation(id)` on both sides instead of diverging to
         // `WorkScope::Worktree(cwd)` on the tool side only.
         let scope_worktree = self.context.work_scope_worktree.clone();
-        let tool_ctx = ToolContext::new(
+        let mut tool_ctx = ToolContext::new(
             cancel_token,
             self.context.conversation_id.clone(),
             self.context.working_dir.clone(),
@@ -4733,6 +4920,9 @@ where
             self.tmux_registry.clone(),
             scope_worktree,
         );
+        if let Some(registrar) = &self.wake_registrar {
+            tool_ctx = tool_ctx.with_wake_capability(tool.id.clone(), registrar.clone());
+        }
 
         let conv_id = self.context.conversation_id.clone();
         let root_conv_id = self.context.root_conversation_id.clone();
@@ -4816,6 +5006,26 @@ where
         ));
 
         Ok(None)
+    }
+
+    /// Return whether an atomic tool-round checkpoint is already durable.
+    ///
+    /// `persist_tool_round` commits all rows in one transaction, so the canonical
+    /// assistant message ID is the commit marker. This makes a parking retry after
+    /// successful checkpoint persistence skip the duplicate insert while still
+    /// running the failed Idle persistence effect.
+    async fn checkpoint_is_durable(&self, effect: &Effect) -> Result<bool, String> {
+        let Effect::PersistCheckpoint {
+            data: CheckpointData::ToolRound {
+                assistant_message, ..
+            },
+        } = effect
+        else {
+            return Ok(false);
+        };
+        self.storage
+            .message_exists(&assistant_message.message_id)
+            .await
     }
 
     /// Persist a checkpoint (assistant message + tool results) atomically.
@@ -5410,76 +5620,111 @@ where
                     task_title: crate::db::NonEmptyString::new(approval_result.task_title.clone())
                         .expect("task_title from task approval must be non-empty"),
                 };
-                storage
-                    .update_conversation_mode(&self.context.conversation_id, &work_mode)
-                    .await?;
-
-                // Legitimate cwd mutation (task 13012, in-place promotion).
-                // For Managed conversations (REQ-PROJ-028): the early Explore
-                // worktree is promoted in place (branch rename, same path), so
-                // this write is a no-op — worktree_path == conv.cwd already.
-                // For legacy Managed conversations whose cwd was the repo root,
-                // this is load-bearing: it moves cwd to the new worktree path.
-                storage
-                    .update_conversation_cwd_recovery_only(
-                        &self.context.conversation_id,
-                        crate::conversation_cwd::validate_conversation_cwd(
-                            &approval_result.worktree_path,
-                        )
-                        .map_err(|e| e.to_string())?
-                        .raw(),
-                    )
-                    .await?;
-                self.context.working_dir = std::path::PathBuf::from(&approval_result.worktree_path);
-
-                // Refresh in-memory mode_context so downstream checks
-                // (e.g. spawn_agents Work-parent guard) observe Work mode
-                // for the rest of this runtime's lifetime. Without this,
-                // mode_context stays the Explore value set at runtime start.
-                self.context.mode_context = Some(ModeContext::Work {
-                    branch_name: approval_result.branch_name.clone(),
-                    base_branch: approval_result.base_branch.clone(),
-                    worktree_path: approval_result.worktree_path.clone(),
-                });
-
-                // Refresh the cached scope-defining worktree so in-runtime tool
-                // calls (bash/tmux/browser) key resources under the same
-                // `WorkScope` the DB-facing inventory/cleanup resolve. Approval
-                // promotes Explore (no worktree -> `WorkScope::Conversation`) to
-                // Work (owns a worktree -> `WorkScope::Worktree`); leaving the
-                // cached value stale would split the two sides until restart.
-                // The post-approval `conv_mode` is Work, whose
-                // `worktree_path()` is the path just created, mirroring how
-                // construction seeds this from `conv_mode.worktree_path()`.
-                //
-                // The scope flips here from `old_scope` (pre-approval) to
-                // `new_scope` (post-approval). Resources opened pre-approval
-                // (bash/browser/tmux) are keyed under `old_scope`; migrate them
-                // to `new_scope` below so the inventory and idle/cleanup paths
-                // resolve them under the same scope the cache now uses.
                 let old_scope = phoenix_core::work_scope::WorkScope::resolve(
                     self.context.conversation_id.clone(),
                     self.context.work_scope_worktree.as_deref(),
                 );
-                self.context.work_scope_worktree =
-                    Some(std::path::PathBuf::from(&approval_result.worktree_path));
+                let new_worktree = std::path::PathBuf::from(&approval_result.worktree_path);
                 let new_scope = phoenix_core::work_scope::WorkScope::resolve(
                     self.context.conversation_id.clone(),
-                    self.context.work_scope_worktree.as_deref(),
+                    Some(&new_worktree),
                 );
+                let validated_cwd = crate::conversation_cwd::validate_conversation_cwd(
+                    &approval_result.worktree_path,
+                )
+                .map_err(|e| e.to_string())?;
 
-                // Migrate WorkScope-keyed resources opened before approval from
-                // the conversation scope to the worktree scope. Each rekey moves
-                // the in-memory lookup key only — the underlying process /
-                // session / server is untouched. A no-op when nothing was opened
-                // pre-approval (the common case) or when the scope did not flip
-                // (a top-level Explore that already owned a worktree).
+                // Preflight every fallible destination before publishing anything.
+                if !self
+                    .bash_handles
+                    .preflight_alias_scope(&old_scope, &new_scope)
+                    .await
+                {
+                    return Err(format!(
+                        "bash scope collision while approving {}",
+                        self.context.conversation_id
+                    ));
+                }
+                self.tmux_registry
+                    .preflight_rekey_scope(&old_scope, &new_scope)
+                    .await
+                    .map_err(|error| error.to_string())?;
+
+                // Publish aliases before durable provenance changes, preserving a
+                // no-missing-alias window for concurrent wake routing.
+                if !self.bash_handles.alias_scope(&old_scope, &new_scope).await {
+                    return Err(format!(
+                        "bash scope collision while approving {}",
+                        self.context.conversation_id
+                    ));
+                }
+                if !self.tmux_registry.alias_scope(&old_scope, &new_scope).await {
+                    self.bash_handles
+                        .rollback_alias_scope(&old_scope, &new_scope)
+                        .await;
+                    return Err(format!(
+                        "tmux scope collision while approving {}",
+                        self.context.conversation_id
+                    ));
+                }
+                if let Err(error) = self
+                    .tmux_registry
+                    .rekey_window_evidence(&old_scope, &new_scope)
+                    .await
+                {
+                    self.tmux_registry
+                        .rollback_alias_scope(&old_scope, &new_scope)
+                        .await;
+                    self.bash_handles
+                        .rollback_alias_scope(&old_scope, &new_scope)
+                        .await;
+                    return Err(error.to_string());
+                }
+
+                if let Err(error) = storage
+                    .commit_approval_scope_transfer(
+                        &self.context.conversation_id,
+                        &work_mode,
+                        validated_cwd.raw(),
+                        &old_scope,
+                        &new_scope,
+                    )
+                    .await
+                {
+                    // Evidence rollback is required, not best-effort: retain the
+                    // aliases until it succeeds so both contract scopes resolve.
+                    self.tmux_registry
+                        .rollback_window_evidence(&old_scope, &new_scope)
+                        .await
+                        .map_err(|rollback| {
+                            format!(
+                                "approval DB commit failed ({error}); evidence rollback failed: {rollback}"
+                            )
+                        })?;
+                    self.tmux_registry
+                        .rollback_alias_scope(&old_scope, &new_scope)
+                        .await;
+                    self.bash_handles
+                        .rollback_alias_scope(&old_scope, &new_scope)
+                        .await;
+                    return Err(error);
+                }
+
+                // Durable commit is now authoritative; retire old aliases and only
+                // then expose the new scope through the runtime context.
                 let bash_moved = self.bash_handles.rekey_scope(&old_scope, &new_scope).await;
                 let browser_moved = self
                     .browser_sessions
                     .rekey_scope(&old_scope, &new_scope)
                     .await;
                 let tmux_moved = self.tmux_registry.rekey_scope(&old_scope, &new_scope).await;
+                self.context.working_dir.clone_from(&new_worktree);
+                self.context.mode_context = Some(ModeContext::Work {
+                    branch_name: approval_result.branch_name.clone(),
+                    base_branch: approval_result.base_branch.clone(),
+                    worktree_path: approval_result.worktree_path.clone(),
+                });
+                self.context.work_scope_worktree = Some(new_worktree);
 
                 // If anything migrated, nudge the work-scope bridge to
                 // re-broadcast `new_scope`'s inventory so the panel reflects the
@@ -10128,6 +10373,287 @@ mod steer_drain_detector_tests {
             rt.active_work_subagents, 0,
             "a late duplicate for an already-drained agent must not decrement again"
         );
+    }
+
+    #[tokio::test]
+    async fn successful_wake_registrations_park_after_full_tool_round_checkpoint() {
+        use crate::runtime::wake::DbWakeRegistrar;
+        use phoenix_core::work_scope::WorkScope;
+        use phoenix_tools::{WakeRegistrar, WakeRegistration, WakeRegistrationTarget};
+
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-wake-park", mk_tool_executing(), vec![]);
+        let db = crate::db::Database::open_in_memory()
+            .await
+            .expect("database");
+        db.create_conversation("conv-wake-park", "conv-wake-park", "/tmp", true, None, None)
+            .await
+            .expect("conversation");
+        let registrar = Arc::new(DbWakeRegistrar::new(db));
+        for id in ["wait-a", "wait-b"] {
+            registrar
+                .register(
+                    WakeRegistration {
+                        conversation_id: "conv-wake-park".to_string(),
+                        tool_use_id: id.to_string(),
+                        work_scope: WorkScope::Conversation("conv-wake-park".to_string()),
+                        target: WakeRegistrationTarget::Bash {
+                            handle_id: format!("bash-{id}"),
+                            initial_terminal_evidence: None,
+                        },
+                        max_wait_seconds: 60,
+                    },
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+                .expect("registration");
+        }
+        rt = rt.with_wake_registrar(registrar);
+        let assistant = AssistantMessage::new(
+            "assistant-wake-round".to_string(),
+            vec![
+                phoenix_llm::ContentBlock::ToolUse {
+                    id: "wait-a".to_string(),
+                    name: "wait_until".to_string(),
+                    input: serde_json::json!({}),
+                },
+                phoenix_llm::ContentBlock::ToolUse {
+                    id: "wait-b".to_string(),
+                    name: "wait_until".to_string(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            None,
+            None,
+        );
+        let checkpoint = CheckpointData::tool_round(
+            assistant,
+            vec![
+                ToolResult::success("wait-a".to_string(), "registered".to_string()),
+                ToolResult::success("wait-b".to_string(), "registered".to_string()),
+            ],
+        )
+        .expect("full tool round");
+        let result = TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::RequestLlm);
+
+        rt.apply_transition_result(result)
+            .await
+            .expect("park transition");
+
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert_eq!(storage.get_all_messages("conv-wake-park").len(), 3);
+        assert_eq!(
+            storage.get_current_state("conv-wake-park"),
+            Some(ConvState::Idle)
+        );
+        assert_eq!(storage.persist_tool_round_attempts(), 1);
+        assert!(
+            rt.llm_task_handle.is_none(),
+            "parking must suppress the follow-up LLM request"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_wake_and_spawn_round_parks_only_after_final_fan_in() {
+        use crate::runtime::wake::DbWakeRegistrar;
+        use phoenix_core::work_scope::WorkScope;
+        use phoenix_tools::{WakeRegistrar, WakeRegistration, WakeRegistrationTarget};
+
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-mixed-wake", mk_tool_executing(), vec![]);
+        let db = crate::db::Database::open_in_memory()
+            .await
+            .expect("database");
+        db.create_conversation("conv-mixed-wake", "mixed", "/tmp", true, None, None)
+            .await
+            .expect("conversation");
+        let registrar = Arc::new(DbWakeRegistrar::new(db));
+        registrar
+            .register(
+                WakeRegistration {
+                    conversation_id: "conv-mixed-wake".to_string(),
+                    tool_use_id: "wait-1".to_string(),
+                    work_scope: WorkScope::Conversation("conv-mixed-wake".to_string()),
+                    target: WakeRegistrationTarget::Bash {
+                        handle_id: "bash-mixed".to_string(),
+                        initial_terminal_evidence: None,
+                    },
+                    max_wait_seconds: 60,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("registration");
+        rt = rt.with_wake_registrar(registrar);
+        let checkpoint = CheckpointData::tool_round(
+            AssistantMessage::new(
+                "assistant-mixed".to_string(),
+                vec![
+                    phoenix_llm::ContentBlock::ToolUse {
+                        id: "wait-1".to_string(),
+                        name: "wait_until".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                    phoenix_llm::ContentBlock::ToolUse {
+                        id: "spawn-1".to_string(),
+                        name: "spawn_agents".to_string(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+                None,
+                None,
+            ),
+            vec![
+                ToolResult::success("wait-1".to_string(), "registered".to_string()),
+                ToolResult::success("spawn-1".to_string(), "spawned".to_string()),
+            ],
+        )
+        .expect("full mixed round");
+        rt.apply_transition_result(
+            TransitionResult::new(mk_awaiting_sub_agents())
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState),
+        )
+        .await
+        .expect("checkpoint mixed round");
+
+        assert!(matches!(rt.state, ConvState::AwaitingSubAgents { .. }));
+        assert_eq!(storage.persist_tool_round_attempts(), 1);
+        assert!(rt.llm_task_handle.is_none());
+
+        rt.apply_transition_result(
+            TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::RequestLlm),
+        )
+        .await
+        .expect("final fan-in parks");
+
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert_eq!(
+            storage.get_current_state("conv-mixed-wake"),
+            Some(ConvState::Idle)
+        );
+        assert!(
+            rt.llm_task_handle.is_none(),
+            "fan-in must suppress RequestLlm"
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn wake_parking_retries_idle_persist_without_repeating_checkpoint() {
+        use crate::runtime::wake::DbWakeRegistrar;
+        use phoenix_core::work_scope::WorkScope;
+        use phoenix_tools::{WakeRegistrar, WakeRegistration, WakeRegistrationTarget};
+
+        let initial_state = mk_tool_executing();
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-wake-retry", initial_state.clone(), vec![]);
+        let db = crate::db::Database::open_in_memory()
+            .await
+            .expect("database");
+        db.create_conversation(
+            "conv-wake-retry",
+            "conv-wake-retry",
+            "/tmp",
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("conversation");
+        let registrar = Arc::new(DbWakeRegistrar::new(db));
+        registrar
+            .register(
+                WakeRegistration {
+                    conversation_id: "conv-wake-retry".to_string(),
+                    tool_use_id: "wait-retry".to_string(),
+                    work_scope: WorkScope::Conversation("conv-wake-retry".to_string()),
+                    target: WakeRegistrationTarget::Bash {
+                        handle_id: "bash-retry".to_string(),
+                        initial_terminal_evidence: None,
+                    },
+                    max_wait_seconds: 60,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect("registration");
+        rt = rt.with_wake_registrar(registrar.clone());
+        let (watch_tx, watch_rx) = watch::channel(initial_state.clone());
+        rt = rt.with_state_watcher(watch_tx);
+        let original_updated_at = rt.state_updated_at;
+        let checkpoint = CheckpointData::tool_round(
+            AssistantMessage::new(
+                "assistant-wake-retry".to_string(),
+                vec![phoenix_llm::ContentBlock::ToolUse {
+                    id: "wait-retry".to_string(),
+                    name: "wait_until".to_string(),
+                    input: serde_json::json!({}),
+                }],
+                None,
+                None,
+            ),
+            vec![ToolResult::success(
+                "wait-retry".to_string(),
+                "registered".to_string(),
+            )],
+        )
+        .expect("full tool round");
+        let transition_result = || {
+            TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+                .with_effect(Effect::PersistCheckpoint {
+                    data: checkpoint.clone(),
+                })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::RequestLlm)
+        };
+
+        storage.fail_next_state_persist();
+        let error = rt
+            .apply_transition_result(transition_result())
+            .await
+            .expect_err("Idle persistence must fail after the checkpoint");
+        assert!(error.contains("injected state persistence failure"));
+        assert_eq!(rt.state, initial_state);
+        assert_eq!(rt.state_updated_at, original_updated_at);
+        assert_eq!(*watch_rx.borrow(), initial_state);
+        assert_eq!(storage.get_all_messages("conv-wake-retry").len(), 2);
+        assert_eq!(storage.persist_tool_round_attempts(), 1);
+        assert_eq!(storage.get_current_state("conv-wake-retry"), None);
+        assert!(
+            registrar
+                .has_round(std::iter::once("wait-retry".to_string()))
+                .await,
+            "failed Idle persistence must leave the registration marker retryable"
+        );
+        assert!(rt.llm_task_handle.is_none());
+
+        rt.apply_transition_result(transition_result())
+            .await
+            .expect("retry must checkpoint and park");
+        assert!(matches!(rt.state, ConvState::Idle));
+        assert!(matches!(*watch_rx.borrow(), ConvState::Idle));
+        assert_eq!(storage.get_all_messages("conv-wake-retry").len(), 2);
+        assert_eq!(
+            storage.persist_tool_round_attempts(),
+            1,
+            "retry must recognize the durable checkpoint instead of duplicating it"
+        );
+        assert_eq!(
+            storage.get_current_state("conv-wake-retry"),
+            Some(ConvState::Idle)
+        );
+        assert!(
+            !registrar
+                .has_round(std::iter::once("wait-retry".to_string()))
+                .await
+        );
+        assert!(rt.llm_task_handle.is_none());
     }
 
     /// Entering `Idle` with an empty queue produces no drain event.

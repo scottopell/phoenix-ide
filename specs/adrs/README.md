@@ -19,6 +19,8 @@ Allium spec exists. Status and verification coverage live in `executive.md`.
 | [005](005_user-tool-invocation-self-service-scope.md) | User tool invocation is limited to self-service tools; director tools deferred | Accepted | REQ-UTI-003, REQ-UTI-006, REQ-IT-002 |
 | [006](006_wake-contracts-are-persisted-conversation-scoped-terminal-waits.md) | Wake contracts are persisted conversation-scoped terminal waits | Accepted | REQ-WAKE-001, REQ-WAKE-002, REQ-WAKE-003, REQ-WAKE-004, REQ-WAKE-005, REQ-WAKE-006, REQ-WAKE-009, REQ-WAKE-010, REQ-WAKE-012, REQ-WAKE-013, REQ-WAKE-016, REQ-WAKE-017, REQ-WAKE-018 |
 | [007](007_conversation-creation-uses-fenced-reconciliation.md) | Conversation creation uses fenced reconciliation | Accepted | REQ-CCR-002, REQ-CCR-003, REQ-CCR-004, REQ-CCR-005, REQ-CCR-007, REQ-CCR-008, REQ-CCR-010 |
+| [008](008_wake-plane-core-uses-registration-receipts-and-durable-runtime-observations.md) | Wake-plane core uses registration receipts and durable runtime observations | Accepted | REQ-WAKE-001, REQ-WAKE-002, REQ-WAKE-003, REQ-WAKE-004, REQ-WAKE-006, REQ-WAKE-008, REQ-WAKE-009, REQ-WAKE-012, REQ-WAKE-013, REQ-WAKE-016, REQ-WAKE-017, REQ-WAKE-018 |
+| [009](009_wake-resume-scheduling-uses-a-durable-acceptance-outbox.md) | Wake-resume scheduling uses a durable acceptance outbox | Accepted | REQ-WAKE-004, REQ-WAKE-005, REQ-WAKE-008, REQ-WAKE-012 |
 
 ## For agents: which decisions bind your task
 
@@ -28,13 +30,13 @@ Consult the relevant ADRs before starting work of each kind.
 | --- | --- |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
-| Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
+| Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006, 007, 008, 009 |
 | Specifying bash command execution / wait-window semantics | 001 |
 | Specifying bash handle state observation or response shaping | 002 |
 | Specifying bash process cleanup, shutdown cleanup, or kill escalation policy | 003 |
 | Specifying inline-terminal history commit, per-command rounds, or user-origin attribution | 004 |
 | Deciding which tools a user may invoke directly (user tool invocation eligibility) | 005 |
-| Specifying wake contracts, async terminal waits, or sub-agent terminal wake delivery | 006 |
+| Specifying wake contracts, async terminal waits, or sub-agent terminal wake delivery | 006, 008, 009 |
 | Specifying durable conversation creation, worker claims, retries, or provisioning cleanup | 007 |
 
 ## Decision dependencies
@@ -47,7 +49,9 @@ ADR-000 (adopt spEARS v2 for new work)
       │  └── ADR-003 (Bash process cleanup uses subreaper plus shutdown kill-tree)
       ├── ADR-005 (User tool invocation is limited to self-service tools)
       │  └── ADR-004 (Inline terminal records per-command bash rounds in shared history — the bash specialization)
-      └── ADR-006 (Wake contracts are persisted conversation-scoped terminal waits)
+      ├── ADR-006 (Wake contracts are persisted conversation-scoped terminal waits)
+      │   └── ADR-008 (Wake-plane core uses registration receipts and durable runtime observations)
+      │       └── ADR-009 (Wake-resume scheduling uses a durable acceptance outbox)
       └── ADR-007 (Conversation creation uses fenced reconciliation)
 ```
 
@@ -62,3 +66,6 @@ ADR-000 (adopt spEARS v2 for new work)
   Never edit an accepted decision to match later reality.
 - **After adding an ADR,** add its row here and update the task-routing table if
   the decision should be consulted for a common kind of work.
+- **Historical integrity:** when a later ADR narrows or corrects part of an older
+  decision, keep the older ADR unchanged and express the new authority via a new
+  row plus the dependency/task-routing updates here.

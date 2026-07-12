@@ -1,5 +1,9 @@
 # Design wake-plane async waits for process and sub-agent handles
 
+Superseded as an implementation-sequencing authority by `tasks/47002-p1-in-progress--implement-wake-plane-core-bash-tmux.md` and ADR-008.
+
+This task remains useful as historical design context for sub-agent terminal-cause shaping, but it is not the current source of truth for wake-plane core delivery semantics or rollout order.
+
 ## Problem
 
 Phoenix currently has several spawn-and-wait flows that either block the parent conversation or require polling:
@@ -36,7 +40,7 @@ Expected behavior:
 4. When the child reaches `submit_result`, `submit_error`, wall-clock timeout, turn-limit terminal behavior, cancellation, or forgotten state, the wake router delivers the terminal result to the parent.
 5. The current sub-agent contract remains largely unchanged: sub-agents are still delegated jobs with terminal results. V1 does not add parent-to-child continuation.
 
-## Proposed scope
+## Historical proposed scope
 
 ### 1. Refine the wake-contracts spec around the two concrete v1 cases
 
@@ -109,7 +113,7 @@ This is not the main wake-plane design, but it should be small enough to land se
 - Do not introduce prompt-only `spawn_agents` knobs such as `execution_bias` as a substitute for wake-plane delivery.
 - Do not support arbitrary child clarification questions in v1.
 
-## Discussion points
+## Historical discussion points
 
 - Whether `spawn_agents` should immediately return sub-agent handles for explicit `wait_until`, or whether existing blocking fan-in should be internally represented as wake contracts first.
 - Exact synthetic message/tool-result shape for sub-agent terminal wakes.

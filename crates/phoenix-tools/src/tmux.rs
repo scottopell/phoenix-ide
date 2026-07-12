@@ -14,7 +14,10 @@ pub mod probe;
 pub mod registry;
 pub mod run;
 
-pub use registry::{TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxServer};
+pub use registry::{
+    TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxServer,
+    TmuxTerminalEvidence, TmuxTerminalStatus, TmuxWindowInspection,
+};
 pub use run::TmuxRunTool;
 
 // `cascade_tmux_on_delete`, `socket_path_for`, `CascadeReport`, and
@@ -54,6 +57,7 @@ struct TmuxInput {
     wait_seconds: Option<u64>,
 }
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl Tool for TmuxTool {
     // clearable: re-queryable read — see specs/stale-tool-results (REQ-STR-002).
@@ -70,8 +74,8 @@ impl Tool for TmuxTool {
         // Template", with the configured byte limit interpolated.
         let max_kb = TMUX_OUTPUT_MAX_BYTES / 1024;
         format!(
-            r#"Invokes tmux against this conversation's dedicated socket. The full tmux CLI
-is available; provide the subcommand + flags as `args`.
+            r#"Invokes tmux against this conversation's dedicated socket. Most non-destructive tmux CLI commands are available; provide the subcommand + flags as `args`.
+Destructive pane/window/session/server commands and command sequences are rejected because they must go through Phoenix's typed lifecycle fencing.
 
 This conversation's tmux server is isolated from every other conversation
 and from any tmux server you may have running on the host: the socket path
@@ -84,10 +88,12 @@ inspectable shell commands. It chooses the current project/worktree directory,
 wraps the command with bash -lc, prints a visible exit marker, and keeps the
 pane inspectable after exit by default.
 
-Use this raw tmux tool for detailed tmux operations: `capture-pane`,
-`send-keys`, `list-windows`, `kill-window`, or lower-level tmux commands.
-Raw tmux is pass-through except for Phoenix's socket/config injection; it does
-not enforce a cwd for newly-created windows or panes.
+Use this raw tmux tool for non-destructive detailed operations such as
+`capture-pane`, `send-keys`, and `list-windows`. Destructive commands
+(`kill-pane`/`killp`, `kill-window`/`killw`, `kill-session`, and `kill-server`)
+and tmux command sequences are rejected; Phoenix-owned cleanup uses a dedicated typed path that
+persists lifecycle evidence. Raw tmux does not enforce a cwd for newly-created
+windows or panes.
 
 Common subcommands:
   new-window -d -n NAME COMMAND     spawn a new window running COMMAND
@@ -95,10 +101,6 @@ Common subcommands:
   capture-pane -p -t NAME -S -2000   read up to 2000 lines of scrollback
                                      for window NAME
   send-keys -t NAME "input" Enter    send input to a window
-  kill-window -t NAME                terminate a window
-  kill-server                        terminate this conversation's tmux server
-                                     (rare; conversation hard-delete does
-                                      this automatically)
 
 Use bash for one-shot non-interactive commands.
 
@@ -142,6 +144,9 @@ fresh server."#
             Ok(p) => p,
             Err(e) => return error_envelope("invalid_input", &format!("invalid tmux input: {e}")),
         };
+        if let Err(message) = validate_generic_args(&parsed.args) {
+            return error_envelope("tmux_destructive_command_forbidden", message);
+        }
 
         let wait_seconds = parsed
             .wait_seconds
@@ -214,6 +219,193 @@ fresh server."#
 
         run_with_timeout(child, wait_seconds, started, ctx).await
     }
+}
+
+// Canonical command names reported by `tmux list-commands` in tmux 3.6a. Tmux
+// resolves a command abbreviation only when it prefixes exactly one canonical
+// name. Keep this list whole: checking destructive names alone would wrongly
+// reject ambiguous prefixes such as `kill-s`.
+const TMUX_COMMAND_NAMES: &[&str] = &[
+    "attach-session",
+    "bind-key",
+    "break-pane",
+    "capture-pane",
+    "choose-buffer",
+    "choose-client",
+    "choose-tree",
+    "clear-history",
+    "clear-prompt-history",
+    "clock-mode",
+    "command-prompt",
+    "confirm-before",
+    "copy-mode",
+    "customize-mode",
+    "delete-buffer",
+    "detach-client",
+    "display-menu",
+    "display-message",
+    "display-popup",
+    "display-panes",
+    "find-window",
+    "has-session",
+    "if-shell",
+    "join-pane",
+    "kill-pane",
+    "kill-server",
+    "kill-session",
+    "kill-window",
+    "last-pane",
+    "last-window",
+    "link-window",
+    "list-buffers",
+    "list-clients",
+    "list-commands",
+    "list-keys",
+    "list-panes",
+    "list-sessions",
+    "list-windows",
+    "load-buffer",
+    "lock-client",
+    "lock-server",
+    "lock-session",
+    "move-pane",
+    "move-window",
+    "new-session",
+    "new-window",
+    "next-layout",
+    "next-window",
+    "paste-buffer",
+    "pipe-pane",
+    "previous-layout",
+    "previous-window",
+    "refresh-client",
+    "rename-session",
+    "rename-window",
+    "resize-pane",
+    "resize-window",
+    "respawn-pane",
+    "respawn-window",
+    "rotate-window",
+    "run-shell",
+    "save-buffer",
+    "select-layout",
+    "select-pane",
+    "select-window",
+    "send-keys",
+    "send-prefix",
+    "server-access",
+    "set-buffer",
+    "set-environment",
+    "set-hook",
+    "set-option",
+    "set-window-option",
+    "show-buffer",
+    "show-environment",
+    "show-hooks",
+    "show-messages",
+    "show-options",
+    "show-prompt-history",
+    "show-window-options",
+    "source-file",
+    "split-window",
+    "start-server",
+    "suspend-client",
+    "swap-pane",
+    "swap-window",
+    "switch-client",
+    "unbind-key",
+    "unlink-window",
+    "wait-for",
+];
+
+const DESTRUCTIVE_TMUX_COMMANDS: &[&str] =
+    &["kill-pane", "kill-server", "kill-session", "kill-window"];
+const DESTRUCTIVE_TMUX_ALIASES: &[&str] = &["killp", "killw"];
+
+fn uniquely_resolved_tmux_command(token: &str) -> Option<&'static str> {
+    let mut matches = TMUX_COMMAND_NAMES
+        .iter()
+        .copied()
+        .filter(|command| command.starts_with(token));
+    let command = matches.next()?;
+    matches.next().is_none().then_some(command)
+}
+
+fn resolves_to_destructive_tmux_command(token: &str) -> bool {
+    DESTRUCTIVE_TMUX_ALIASES.contains(&token)
+        || uniquely_resolved_tmux_command(token)
+            .is_some_and(|command| DESTRUCTIVE_TMUX_COMMANDS.contains(&command))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GenericTmuxCommand<'a> {
+    name: &'a str,
+    arguments: &'a [String],
+}
+
+impl<'a> GenericTmuxCommand<'a> {
+    fn parse(args: &'a [String]) -> Option<Self> {
+        let mut position = 0;
+        while let Some(token) = args.get(position) {
+            if token == "--" {
+                position += 1;
+                break;
+            }
+            if !token.starts_with('-') || token == "-" {
+                break;
+            }
+
+            position += 1;
+            if matches!(token.as_str(), "-f" | "-L" | "-S" | "-T") {
+                position += usize::from(position < args.len());
+            }
+        }
+
+        let name = args.get(position)?.as_str();
+        Some(Self {
+            name,
+            arguments: &args[position + 1..],
+        })
+    }
+
+    fn treats_remaining_argv_as_data(&self) -> bool {
+        // These commands accept free-form trailing strings. Tmux does not reinterpret
+        // their payload as another command merely because it names a command or key.
+        let canonical_name = match self.name {
+            "send" => Some("send-keys"),
+            "run" => Some("run-shell"),
+            "display" => Some("display-message"),
+            name => uniquely_resolved_tmux_command(name),
+        };
+        matches!(
+            canonical_name,
+            Some("send-keys" | "run-shell" | "display-message")
+        )
+    }
+}
+
+fn validate_generic_args(args: &[String]) -> Result<(), &'static str> {
+    let Some(command) = GenericTmuxCommand::parse(args) else {
+        return Ok(());
+    };
+
+    if resolves_to_destructive_tmux_command(command.name.trim_start_matches('\\')) {
+        return Err("destructive tmux commands are not available through the generic tool; Phoenix-owned window cleanup must use the typed lifecycle path");
+    }
+
+    // At the API boundary an argv element containing exactly `;` (or tmux's
+    // escaped spelling `\\;`) is a separator only where the current command's
+    // grammar has finished. Free-form command payloads remain data.
+    if !command.treats_remaining_argv_as_data()
+        && command
+            .arguments
+            .iter()
+            .any(|argument| matches!(argument.as_str(), ";" | "\\;"))
+    {
+        return Err("tmux command sequences are not available through the generic tool; issue one non-destructive command per call");
+    }
+
+    Ok(())
 }
 
 enum RunOutcome {
@@ -442,6 +634,171 @@ mod tests {
     async fn collect_drain_drops_panicked_task_output() {
         let task = tokio::spawn(async { panic!("drain panic test") });
         assert!(collect_drain(task).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn generic_tool_rejects_destructive_aliases_sequences_and_attached_forms() {
+        let tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
+            tmp.path().to_path_buf(),
+            false,
+        ));
+        for args in [
+            json!(["kill-window", "-t", "@1"]),
+            json!(["kill-w", "-t@1"]),
+            json!(["killw", "-t@1"]),
+            json!(["kill-session", "-tmain"]),
+            json!(["kill-ses", "-tmain"]),
+            json!(["kill-server"]),
+            json!(["kill-ser"]),
+            json!(["kill-pane", "-t", "%1"]),
+            json!(["killp", "-t%1"]),
+            json!(["kill-p", "-t%1"]),
+            json!(["kill-pa", "-t%1"]),
+            json!(["kill-pan", "-t%1"]),
+            json!(["\\kill-pane", "-t%1"]),
+            json!(["\\kill-w", "-t@1"]),
+            json!(["list-panes", ";", "kill-pane", "-t%1"]),
+            json!(["list-panes", "\\;", "killp", "-t%1"]),
+            json!(["list-windows", ";", "kill-ser"]),
+            json!(["list-windows", "\\;", "kill-ses", "-tmain"]),
+            json!(["list-windows", "\\;", "kill-window", "-t@1"]),
+        ] {
+            let result = TmuxTool
+                .run(json!({"args": args}), ctx_with_registry(registry.clone()))
+                .await;
+            let value = parse_response(&result);
+            assert_eq!(
+                value["error"], "tmux_destructive_command_forbidden",
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_abbreviation_resolution_matches_tmux_ambiguity_rules() {
+        for command in DESTRUCTIVE_TMUX_COMMANDS {
+            for prefix_len in 1..=command.len() {
+                let prefix = command
+                    .get(..prefix_len)
+                    .expect("tmux canonical command names are ASCII");
+                let uniquely_resolves = TMUX_COMMAND_NAMES
+                    .iter()
+                    .filter(|candidate| candidate.starts_with(prefix))
+                    .count()
+                    == 1;
+                assert_eq!(
+                    resolves_to_destructive_tmux_command(prefix),
+                    uniquely_resolves,
+                    "prefix {prefix:?} of {command:?}"
+                );
+            }
+        }
+
+        // `kill-s` is shared by kill-server and kill-session, so tmux rejects
+        // it as ambiguous. Non-destructive commands and their abbreviations
+        // remain available through the generic tool.
+        for token in ["kill-s", "list-w", "capture-p", "send-k", "new-w"] {
+            assert!(!resolves_to_destructive_tmux_command(token), "{token}");
+        }
+        for token in ["kill-p", "kill-w", "kill-ser", "kill-ses", "killp", "killw"] {
+            assert!(resolves_to_destructive_tmux_command(token), "{token}");
+        }
+    }
+
+    #[test]
+    fn generic_parser_validates_command_positions_without_reparsing_payloads() {
+        for args in [
+            vec!["send-keys", "-t", "@1", "kill-window", "Enter"],
+            vec!["send-keys", "-t", "@1", ";", "Enter"],
+            vec!["send-keys", "-t", "@1", "kill-window; still data", "Enter"],
+            vec!["send-k", "-t", "@1", ";", "Enter"],
+            vec!["run-shell", "printf 'kill-window; still data'"],
+            vec!["display-message", "kill-window; still data"],
+            vec!["list-windows", "-a"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert_eq!(validate_generic_args(&args), Ok(()), "{args:?}");
+        }
+
+        for args in [
+            vec!["kill-window", "-t", "@1"],
+            vec!["list-windows", ";", "kill-window", "-t", "@1"],
+            vec!["-S", "/tmp/other", "kill-window", "-t", "@1"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(validate_generic_args(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_tool_allows_non_destructive_commands_sharing_prefixes() {
+        let tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
+            tmp.path().to_path_buf(),
+            false,
+        ));
+        for args in [
+            json!(["kill-s"]),
+            json!(["list-w", "-a"]),
+            json!(["capture-p", "-p", "-t%1"]),
+        ] {
+            let result = TmuxTool
+                .run(json!({"args": args}), ctx_with_registry(registry.clone()))
+                .await;
+            assert_eq!(
+                parse_response(&result)["error"],
+                "tmux_binary_unavailable",
+                "validation unexpectedly rejected {args}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_tool_cannot_destroy_one_pane_tmux_run_target() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(tmp.path().to_path_buf()));
+        let ctx = ctx_with_registry_for("generic-kill-pane", registry);
+        let started = TmuxRunTool
+            .run(
+                json!({"cmd": "sleep 30", "name": "one-pane-target"}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(started.is_success(), "got: {}", started.output());
+        let window_id = parse_response(&started)["window_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        for command in ["kill-pane", "killp", "kill-p", "kill-pa", "kill-pan"] {
+            let rejected = TmuxTool
+                .run(
+                    json!({"args": [command, format!("-t{window_id}")]}),
+                    ctx.clone(),
+                )
+                .await;
+            assert_eq!(
+                parse_response(&rejected)["error"],
+                "tmux_destructive_command_forbidden",
+                "command {command} was not rejected"
+            );
+        }
+
+        let capture = TmuxTool
+            .run(
+                json!({"args": ["capture-pane", "-p", "-t", window_id]}),
+                ctx,
+            )
+            .await;
+        assert!(
+            capture.is_success(),
+            "target pane was destroyed: {}",
+            capture.output()
+        );
     }
 
     #[tokio::test]

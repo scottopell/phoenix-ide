@@ -105,7 +105,8 @@ publicly.
 
 WHEN a viewer navigates to `/s/{token}` with a valid share token
 THE SYSTEM SHALL display the full conversation history
-AND stream live updates via SSE (new messages, state changes)
+AND stream public live updates via SSE (new messages, state changes)
+AND exclude every owner-private SSE event from both the initial replay snapshot and live delivery
 AND NOT display any input controls, mutation buttons, or settings
 
 WHEN a viewer navigates to `/s/{token}` with an invalid or revoked token

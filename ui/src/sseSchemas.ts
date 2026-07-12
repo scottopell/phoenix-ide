@@ -24,6 +24,9 @@
 
 import * as v from 'valibot';
 import type { ErrorKind as WireErrorKind } from './generated/sse';
+import type { WakeContractStatus as WireWakeContractStatus } from './generated/WakeContractStatus';
+import type { WakeStatusSnapshot } from './generated/WakeStatusSnapshot';
+import type { SseWireEvent } from './generated/SseWireEvent';
 import type { Conversation, Message } from './api';
 // Generated wire types — aliased so we can reuse the short `Sse*Data`
 // names for the transform-output types consumers actually want.
@@ -393,6 +396,66 @@ export const SseRateLimitSnapshotDataSchema = v.looseObject({
   snapshot: QuotaDetailsSchema,
 }) satisfies v.GenericSchema<unknown, WireRateLimitSnapshotData>;
 
+const WakeContractStatusSchema = v.pipe(
+  v.looseObject({
+    id: v.string(),
+    handle: v.variant('kind', [
+      v.looseObject({ kind: v.literal('bash'), id: v.string() }),
+      v.looseObject({ kind: v.literal('tmux_window'), id: v.string() }),
+    ]),
+    registered_at: v.string(),
+    expires_at: v.string(),
+    status: v.picklist(['pending', 'fired', 'cancelled', 'expired', 'forgotten']),
+    cause: v.nullable(v.picklist(['fired', 'cancelled', 'expired', 'forgotten'])),
+    forgotten_reason: v.nullable(v.picklist(['handle_missing', 'runtime_unrecoverable_after_restart'])),
+  }),
+  v.transform((contract): WireWakeContractStatus => contract),
+);
+
+const WakeStatusSnapshotSchema = v.pipe(
+  v.looseObject({
+    conversation_id: v.string(),
+    pending_count: v.number(),
+    soonest_expiry: v.nullable(v.string()),
+    lifecycle_blocked: v.boolean(),
+    contracts: v.array(WakeContractStatusSchema),
+  }),
+  v.transform((snapshot): WakeStatusSnapshot => snapshot),
+);
+
+type WireWakeContractRegisteredData = Omit<
+  Extract<SseWireEvent, { type: 'wake_contract_registered' }>,
+  'type'
+>;
+
+/** Best-effort committed-registration edge. Accepted for wire compatibility but
+ * intentionally does not replace the durable wake snapshot in UI state. */
+export const SseWakeContractRegisteredDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  registration: v.looseObject({
+    conversation_id: v.string(),
+    contract_id: v.string(),
+    handle: v.variant('kind', [
+      v.looseObject({ kind: v.literal('bash'), id: v.string() }),
+      v.looseObject({ kind: v.literal('tmux_window'), id: v.string() }),
+    ]),
+    expires_at: v.string(),
+    registering_tool_use_id: v.nullable(v.string()),
+  }),
+}) satisfies v.GenericSchema<unknown, WireWakeContractRegisteredData>;
+
+type WireWakeStatusUpdateData = Omit<
+  Extract<SseWireEvent, { type: 'wake_status_update' }>,
+  'type'
+>;
+
+/** Durable, complete wake-contract snapshot. Unlike ordered conversation
+ * events, this DB-polled status event has no sequence id; connection epochs
+ * prevent a prior EventSource from replacing the active conversation's view. */
+export const SseWakeStatusUpdateDataSchema = v.looseObject({
+  snapshot: WakeStatusSnapshotSchema,
+}) satisfies v.GenericSchema<unknown, WireWakeStatusUpdateData>;
+
 /** `work_scope_update`: full refreshed `WorkScopeInventory` snapshot pushed
  *  when a bash handle or browser session in the scope changes state
  *  (REQ-WSUI-007). We validate the load-bearing `sequence_id` (the field the
@@ -478,6 +541,10 @@ export type SseBrowserSessionStateData = v.InferOutput<
 export type SseSteerMessageQueuedData = v.InferOutput<typeof SseSteerMessageQueuedDataSchema>;
 export type SseRateLimitSnapshotData = v.InferOutput<typeof SseRateLimitSnapshotDataSchema>;
 export type SseWorkScopeUpdateData = v.InferOutput<typeof SseWorkScopeUpdateDataSchema>;
+export type SseWakeStatusUpdateData = v.InferOutput<typeof SseWakeStatusUpdateDataSchema>;
+export type SseWakeContractRegisteredData = v.InferOutput<
+  typeof SseWakeContractRegisteredDataSchema
+>;
 export type QuotaDetails = v.InferOutput<typeof QuotaDetailsSchema>;
 export type RateLimitWindow = v.InferOutput<typeof RateLimitWindowSchema>;
 export type CreditsSnapshot = v.InferOutput<typeof CreditsSnapshotSchema>;

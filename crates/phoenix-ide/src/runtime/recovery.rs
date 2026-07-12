@@ -35,6 +35,8 @@ pub enum RecoveryReason {
     ErrorDismissed,
     /// Last agent message is `tool_use` only, needs continuation
     InterruptedMidTurn,
+    /// The completed tool round registered a durable wake contract and remains parked
+    ParkedWakeRound,
     /// Too many consecutive auto-continue restarts (liveness bound)
     RestartLoopDetected,
 }
@@ -64,6 +66,46 @@ impl RecoveryDecision {
             reason: RecoveryReason::InterruptedMidTurn,
         }
     }
+}
+
+/// Return the tool-use ids from the trailing complete tool round that recovery
+/// would otherwise auto-continue. An empty result means the history is not a
+/// tool-use-only assistant message followed solely by tool results.
+pub(crate) fn trailing_tool_round_ids(messages: &[Message]) -> Vec<String> {
+    if !messages
+        .last()
+        .is_some_and(|message| matches!(message.message_type, MessageType::Tool))
+    {
+        return Vec::new();
+    }
+    let Some(agent_index) = messages
+        .iter()
+        .rposition(|message| matches!(message.message_type, MessageType::Agent))
+    else {
+        return Vec::new();
+    };
+    if messages[agent_index + 1..]
+        .iter()
+        .any(|message| !matches!(message.message_type, MessageType::Tool))
+    {
+        return Vec::new();
+    }
+    let MessageContent::Agent(blocks) = &messages[agent_index].content else {
+        return Vec::new();
+    };
+    if blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Text { .. }))
+    {
+        return Vec::new();
+    }
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Analyze messages to determine if a conversation needs auto-continuation.
@@ -904,7 +946,9 @@ mod proptests {
                         }
                     }
                 }
-                RecoveryReason::UserQuestionDismissed | RecoveryReason::ErrorDismissed => {
+                RecoveryReason::UserQuestionDismissed
+                | RecoveryReason::ErrorDismissed
+                | RecoveryReason::ParkedWakeRound => {
                     prop_assert!(!decision.needs_auto_continue);
                 }
                 RecoveryReason::InterruptedMidTurn => {

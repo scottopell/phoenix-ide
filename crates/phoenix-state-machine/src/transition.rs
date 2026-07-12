@@ -718,7 +718,9 @@ pub fn transition_core(
 
         (
             CoreState::CancellingTool { .. } | CoreState::CancellingSubAgents { .. },
-            CoreEvent::UserMessage { .. } | CoreEvent::SteerDrainedUserMessages { .. },
+            CoreEvent::UserMessage { .. }
+            | CoreEvent::SteerDrainedUserMessages { .. }
+            | CoreEvent::WakeResume { .. },
         ) => Err(TransitionError::CancellationInProgress),
 
         // LLM Response Processing (REQ-BED-003)
@@ -776,6 +778,31 @@ pub fn transition_core(
             tracing::debug!(
                 state = state.variant_name(),
                 "Absorbing stale UserTriggerContinuation"
+            );
+            Ok(CoreTransitionResult::new(state.clone()))
+        }
+
+        (CoreState::Idle, CoreEvent::WakeResume { message_id, text }) => {
+            if text.is_empty() {
+                return Err(TransitionError::InvalidTransition {
+                    state: state.variant_name(),
+                    event: event.variant_name(),
+                });
+            }
+            Ok(
+                CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
+                    .with_effect(Effect::PersistWakeResumeState {
+                        message_id: message_id.clone(),
+                    })
+                    .with_effect(Effect::notify_state_change())
+                    .with_effect(Effect::RequestLlm),
+            )
+        }
+
+        (state, CoreEvent::WakeResume { .. }) => {
+            tracing::debug!(
+                state = state.variant_name(),
+                "Absorbing duplicate or stale WakeResume"
             );
             Ok(CoreTransitionResult::new(state.clone()))
         }
@@ -1087,6 +1114,7 @@ fn handle_core_tool_complete(
         | CoreEvent::ContinuationResponse { .. }
         | CoreEvent::ContinuationFailed { .. }
         | CoreEvent::UserTriggerContinuation
+        | CoreEvent::WakeResume { .. }
         | CoreEvent::SteerDrainedUserMessages { .. } => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
             event: event.variant_name(),
@@ -5959,6 +5987,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wake_resume_from_idle_requests_llm_with_atomic_accept_effect() {
+        let result = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::WakeResume {
+                message_id: "wake-message".to_string(),
+                text: "wake observation".to_string(),
+            },
+        )
+        .expect("idle wake resume");
+
+        assert_eq!(result.new_state, ConvState::LlmRequesting { attempt: 1 });
+        assert_eq!(result.effects.len(), 3);
+        assert!(matches!(
+            &result.effects[0],
+            Effect::PersistWakeResumeState { message_id } if message_id == "wake-message"
+        ));
+        assert!(matches!(result.effects[1], Effect::NotifyStateChange));
+        assert!(matches!(result.effects[2], Effect::RequestLlm));
+    }
+
+    #[test]
+    fn duplicate_or_stale_wake_resume_does_not_start_another_turn() {
+        for state in [
+            ConvState::LlmRequesting { attempt: 1 },
+            ConvState::AwaitingContinuation {
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            },
+            ConvState::Terminal,
+        ] {
+            let result = transition(
+                &state,
+                &test_context(),
+                Event::WakeResume {
+                    message_id: "wake-message".to_string(),
+                    text: "wake observation".to_string(),
+                },
+            )
+            .expect("stale wake resume is absorbed");
+            assert_eq!(result.new_state, state);
+            assert!(result.effects.is_empty());
+        }
+    }
+
     // ============================================================================
     // SteerDrainedUserMessages transition tests
     // ============================================================================
@@ -6643,6 +6717,7 @@ mod tests {
                 Effect::ExecuteTool { tool } => Some(tool),
                 Effect::PersistMessage { .. }
                 | Effect::PersistState
+                | Effect::PersistWakeResumeState { .. }
                 | Effect::RequestLlm
                 | Effect::CompleteCreation { .. }
                 | Effect::BroadcastAssistantMessage { .. }

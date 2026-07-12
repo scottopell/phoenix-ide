@@ -18,7 +18,7 @@ use super::lifecycle_handlers::{
     dismiss_fork_proposal, list_fork_proposals, mark_merged, reject_commission_review, reject_task,
     request_changes_on_fork_proposal, task_feedback,
 };
-use super::sse::sse_stream;
+use super::sse::{sse_stream, EventVisibility};
 use super::types::{
     AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry,
     CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
@@ -31,7 +31,7 @@ use super::types::{
     ProjectSkillsQuery, ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry,
     SkillsResponse, SuccessResponse, SuggestRequest, SuggestResponse, SystemPromptResponse,
     TaskCountQuery, TaskCountResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
-    ValidateCwdResponse,
+    ValidateCwdResponse, WakeStatusSnapshot,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -141,6 +141,11 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Conversation retrieval (REQ-API-003)
         .route("/api/conversations/:id", get(get_conversation))
+        .route("/api/conversations/:id/wakes", get(get_wake_contracts))
+        .route(
+            "/api/conversations/:id/wakes/:contract_id/cancel",
+            post(cancel_wake_contract),
+        )
         .route(
             "/api/conversations/:id/browser-session",
             delete(stop_conversation_browser_session),
@@ -2791,7 +2796,17 @@ async fn stream_conversation(
         pending_truncated,
     };
 
-    Ok(sse_stream(id, init_event, broadcast_rx))
+    let wake_status = WakeStatusSnapshot::load(&state.db, &id)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(sse_stream(
+        id,
+        init_event,
+        EventVisibility::Authenticated,
+        Some(wake_status),
+        state.db,
+        broadcast_rx,
+    ))
 }
 
 fn is_invalid_runtime_cwd_error(error: &str) -> bool {
@@ -3263,6 +3278,80 @@ async fn cancel_steering_message(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum WakeCancelResponse {
+    Cancelled {
+        contract_id: String,
+    },
+    AlreadyTerminal {
+        contract_id: String,
+        status: phoenix_core::domain::wake_contracts::WakeContractStatus,
+    },
+}
+
+async fn get_wake_contracts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<WakeStatusSnapshot>, AppError> {
+    state
+        .db
+        .get_conversation(&id)
+        .await
+        .map_err(|_| AppError::NotFound(format!("conversation {id}")))?;
+    Ok(Json(
+        WakeStatusSnapshot::load(&state.db, &id)
+            .await
+            .map_err(AppError::Internal)?,
+    ))
+}
+
+async fn cancel_wake_contract(
+    State(state): State<AppState>,
+    Path((id, contract_id)): Path<(String, String)>,
+) -> Result<Json<WakeCancelResponse>, AppError> {
+    let outcome = state
+        .db
+        .cancel_wake_contract_for_conversation(&contract_id, &id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let response = match outcome {
+        phoenix_db::WakeCancelOutcome::Resolved => WakeCancelResponse::Cancelled { contract_id },
+        phoenix_db::WakeCancelOutcome::AlreadyTerminal(status) => {
+            WakeCancelResponse::AlreadyTerminal {
+                contract_id,
+                status,
+            }
+        }
+        phoenix_db::WakeCancelOutcome::NotOwnedOrMissing => {
+            return Err(AppError::NotFound(format!("wake contract {contract_id}")));
+        }
+    };
+    Ok(Json(response))
+}
+
+pub(super) async fn acquire_wake_lifecycle_fence(
+    state: &AppState,
+    id: &str,
+) -> Result<(), AppError> {
+    match state
+        .db
+        .acquire_wake_lifecycle_fence(id)
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?
+    {
+        phoenix_db::WakeLifecycleFenceOutcome::Acquired => Ok(()),
+        phoenix_db::WakeLifecycleFenceOutcome::PendingContracts { count } => {
+            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                format!(
+                    "Cannot mutate conversation while {count} wake contract(s) are pending. Cancel them first."
+                ),
+                "pending_wake_contracts",
+            ))))
+        }
+    }
+}
+
 /// Context continuation worktree transfer (REQ-BED-030).
 ///
 /// Creates a new conversation that inherits the parent's environment
@@ -3542,6 +3631,8 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
             "cancel_first",
         ))));
     }
+
+    acquire_wake_lifecycle_fence(state, id).await?;
 
     run_resource_cleanup_cascade(state, &conv).await?;
 
@@ -3840,6 +3931,8 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
             "cancel_first",
         ))));
     }
+
+    acquire_wake_lifecycle_fence(state, id).await?;
 
     // ForkProposalsRemovedOnOriginDelete (REQ-PROJ-035): dismiss every
     // still-`pending` proposal bound to this origin and clean its deterministic
@@ -6084,7 +6177,14 @@ async fn shared_sse_stream(
         pending_truncated,
     };
 
-    Ok(sse_stream(conversation_id, init_event, broadcast_rx))
+    Ok(sse_stream(
+        conversation_id,
+        init_event,
+        EventVisibility::PublicShare,
+        None,
+        state.db,
+        broadcast_rx,
+    ))
 }
 
 // ============================================================
@@ -6146,6 +6246,173 @@ impl IntoResponse for AppError {
     }
 }
 
+#[cfg(test)]
+mod wake_api_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use phoenix_core::domain::wake_contracts::{
+        WakeContract, WakeContractHandle, WakeContractStatus, WakeInboxCause,
+    };
+
+    pub(super) fn pending_contract(id: &str, conversation_id: &str) -> WakeContract {
+        let registered_at = Utc::now();
+        WakeContract {
+            id: id.to_string(),
+            current_conversation_id: conversation_id.to_string(),
+            registration_work_scope: crate::work_scope::WorkScope::Conversation(
+                conversation_id.to_string(),
+            ),
+            handle: WakeContractHandle::Bash {
+                handle_id: format!("b-{id}"),
+            },
+            registering_tool_use_id: Some(format!("tool-{id}")),
+            registered_at,
+            expires_at: registered_at + Duration::seconds(60),
+            status: WakeContractStatus::Pending,
+            terminal_cause: None,
+            forgotten_reason: None,
+            terminal_payload: None,
+            resolved_at: None,
+        }
+    }
+
+    async fn seed_conversation(state: &AppState, id: &str) {
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .expect("conversation");
+    }
+
+    #[tokio::test]
+    async fn wake_status_is_scoped_to_current_conversation() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        for id in ["status-a", "status-b"] {
+            seed_conversation(&state, id).await;
+        }
+        state
+            .db
+            .insert_wake_contract(&pending_contract("wake-a", "status-a"))
+            .await
+            .expect("contract a");
+        state
+            .db
+            .insert_wake_contract(&pending_contract("wake-b", "status-b"))
+            .await
+            .expect("contract b");
+
+        let Json(response) = get_wake_contracts(State(state), Path("status-a".to_string()))
+            .await
+            .expect("status");
+
+        assert_eq!(response.conversation_id, "status-a");
+        assert_eq!(response.pending_count, 1);
+        assert!(response.lifecycle_blocked);
+        assert_eq!(
+            response.soonest_expiry,
+            Some(response.contracts[0].expires_at)
+        );
+        assert_eq!(response.contracts.len(), 1);
+        assert_eq!(response.contracts[0].id, "wake-a");
+    }
+
+    #[tokio::test]
+    async fn cross_conversation_cancel_is_not_found() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        for id in ["cancel-owner", "cancel-other"] {
+            seed_conversation(&state, id).await;
+        }
+        state
+            .db
+            .insert_wake_contract(&pending_contract("wake-owned", "cancel-owner"))
+            .await
+            .expect("contract");
+
+        let error = cancel_wake_contract(
+            State(state.clone()),
+            Path(("cancel-other".to_string(), "wake-owned".to_string())),
+        )
+        .await
+        .expect_err("cross-conversation cancellation must not reveal the contract");
+        assert!(matches!(error, AppError::NotFound(_)));
+        assert_eq!(
+            state
+                .db
+                .get_wake_contract("wake-owned")
+                .await
+                .expect("read")
+                .expect("contract")
+                .status,
+            WakeContractStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_returns_typed_outcome_and_non_resuming_inbox_item() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        seed_conversation(&state, "cancel-current").await;
+        state
+            .db
+            .insert_wake_contract(&pending_contract("wake-current", "cancel-current"))
+            .await
+            .expect("contract");
+
+        let Json(response) = cancel_wake_contract(
+            State(state.clone()),
+            Path(("cancel-current".to_string(), "wake-current".to_string())),
+        )
+        .await
+        .expect("cancel");
+        assert!(matches!(
+            response,
+            WakeCancelResponse::Cancelled { ref contract_id } if contract_id == "wake-current"
+        ));
+        let inbox = state
+            .db
+            .list_wake_inbox_items_for_conversation("cancel-current")
+            .await
+            .expect("inbox");
+        assert_eq!(inbox.len(), 1);
+        assert!(matches!(
+            inbox[0].cause,
+            WakeInboxCause::Cancelled { auto_resume: false }
+        ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_wake_guard_conflicts_then_passes_after_cancel() {
+        let state = hard_delete_cascade_tests::make_test_state().await;
+        seed_conversation(&state, "guarded").await;
+        state
+            .db
+            .insert_wake_contract(&pending_contract("wake-guarded", "guarded"))
+            .await
+            .expect("contract");
+
+        let error = acquire_wake_lifecycle_fence(&state, "guarded")
+            .await
+            .expect_err("pending wake must block lifecycle");
+        match error {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "pending_wake_contracts");
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+
+        state
+            .db
+            .cancel_wake_contract("wake-guarded")
+            .await
+            .expect("cancel");
+        acquire_wake_lifecycle_fence(&state, "guarded")
+            .await
+            .expect("cancelled wake no longer blocks lifecycle");
+    }
+}
+
+// ============================================================
+// Conversation cwd validation tests
+// ============================================================
 // ============================================================
 // Conversation cwd validation tests
 // ============================================================
@@ -8314,6 +8581,93 @@ pub(crate) mod hard_delete_cascade_tests {
         // Both rows still present.
         assert!(state.db.get_conversation("cb-a").await.is_ok());
         assert!(state.db.get_conversation("cb-b").await.is_ok());
+    }
+
+    async fn assert_chain_pending_wake_refuses_before_cleanup(archive: bool) {
+        let state = make_test_state().await;
+        let ids = if archive {
+            ["wake-archive-a", "wake-archive-b", "wake-archive-c"]
+        } else {
+            ["wake-delete-a", "wake-delete-b", "wake-delete-c"]
+        };
+        build_chain_for_test(&state, &ids).await;
+        for id in ids {
+            let _ = state
+                .runtime
+                .bash_handles()
+                .get_or_create(&crate::work_scope::WorkScope::Conversation(id.to_string()))
+                .await;
+        }
+        state
+            .db
+            .register_wake_contract(
+                &super::wake_api_tests::pending_contract("chain-pending", ids[2]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = if archive {
+            crate::api::chains::archive_chain_handler(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(ids[0].to_string()),
+            )
+            .await
+        } else {
+            crate::api::chains::delete_chain_handler(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(ids[0].to_string()),
+            )
+            .await
+        };
+        match result.expect_err("pending wake must refuse whole chain") {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "pending_wake_contracts");
+            }
+            other => panic!("expected 409, got {other:?}"),
+        }
+
+        for id in ids {
+            let conv = state.db.get_conversation(id).await.expect("row preserved");
+            assert!(!conv.archived, "{id} was archived before admission");
+            assert!(
+                state
+                    .runtime
+                    .bash_handles()
+                    .remove(&crate::work_scope::WorkScope::Conversation(id.to_string()))
+                    .await
+                    .is_some(),
+                "{id} resource was cleaned before admission"
+            );
+        }
+        state
+            .db
+            .cancel_wake_contract("chain-pending")
+            .await
+            .unwrap();
+        for (index, id) in ids.iter().enumerate() {
+            state
+                .db
+                .register_wake_contract(
+                    &super::wake_api_tests::pending_contract(
+                        &format!("still-open-{archive}-{index}"),
+                        id,
+                    ),
+                    None,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{id} fence was partially closed: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_archive_pending_wake_refuses_before_any_cleanup() {
+        assert_chain_pending_wake_refuses_before_cleanup(true).await;
+    }
+
+    #[tokio::test]
+    async fn chain_delete_pending_wake_refuses_before_any_cleanup() {
+        assert_chain_pending_wake_refuses_before_cleanup(false).await;
     }
 
     /// Archive cascade rejects a busy conversation with the same

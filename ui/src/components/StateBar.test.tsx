@@ -89,6 +89,7 @@ function renderStateBar({
   onOpenFiles,
   availableModels,
   onUpgradeModel,
+  wakeStatus,
 }: {
   conversation?: Conversation;
   convState?: ComponentProps<typeof StateBar>['convState'];
@@ -105,6 +106,7 @@ function renderStateBar({
   onOpenFiles?: ComponentProps<typeof StateBar>['onOpenFiles'];
   availableModels?: ComponentProps<typeof StateBar>['availableModels'];
   onUpgradeModel?: ComponentProps<typeof StateBar>['onUpgradeModel'];
+  wakeStatus?: ComponentProps<typeof StateBar>['wakeStatus'];
 } = {}) {
   const props: ComponentProps<typeof StateBar> = {
     conversation,
@@ -123,6 +125,10 @@ function renderStateBar({
   }
   if (onUpgradeModel !== undefined) {
     props.onUpgradeModel = onUpgradeModel;
+  }
+  if (wakeStatus !== undefined) {
+    props.wakeStatus = wakeStatus;
+    props.onWakeError = vi.fn();
   }
   if (continuation) {
     props.continuation = continuation;
@@ -341,6 +347,33 @@ describe('StateBar manual continuation action', () => {
     fireEvent.click(action);
 
     expect(onTriggerContinuation).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps manual continuation available while wake contracts are pending', async () => {
+    renderStateBar({
+      contextWindowUsed: 100_000,
+      modelContextWindow: 1_000_000,
+      continuation: { phase: 'idle', onTrigger: vi.fn() },
+      wakeStatus: {
+        conversation_id: 'conv-1',
+        pending_count: 1,
+        soonest_expiry: '2026-07-10T12:30:00Z',
+        lifecycle_blocked: true,
+        contracts: [{
+          id: 'wake-1',
+          handle: { kind: 'bash', id: 'b-1' },
+          registered_at: '2026-07-10T12:00:00Z',
+          expires_at: '2026-07-10T12:30:00Z',
+          status: 'pending',
+          cause: null,
+          forgotten_reason: null,
+        }],
+      },
+    });
+
+    fireEvent.click(screen.getByText('100k'));
+
+    expect(await screen.findByRole('button', { name: /summarize & continue/i })).toBeEnabled();
   });
 
   it('does not offer manual continuation while the conversation is busy', () => {

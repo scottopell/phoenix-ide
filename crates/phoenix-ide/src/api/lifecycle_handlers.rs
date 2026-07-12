@@ -1,7 +1,7 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 //! Conversation lifecycle HTTP handlers: task approval, abandon, mark-merged.
 
-use super::handlers::{run_resource_cleanup_cascade, AppError};
+use super::handlers::{acquire_wake_lifecycle_fence, run_resource_cleanup_cascade, AppError};
 use super::types::{
     ConflictErrorResponse, ForkDismissResponse, ForkPromoteResponse, ForkProposalListResponse,
     ForkProposalSummary, ForkSpawnResponse, RequestChangesRequest, SuccessResponse,
@@ -441,6 +441,12 @@ pub(crate) async fn abandon_task(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     let repo_root = PathBuf::from(&project.canonical_path);
 
+    // 2a. Capture diff snapshot
+    // Durable lifecycle intent is acquired after all eligibility reads and
+    // before the first side effect. A failed later cleanup/state transition is
+    // retryable, but wake registration remains closed during that retry window.
+    acquire_wake_lifecycle_fence(&state, &id).await?;
+
     // 2a. Capture diff snapshot from worktree BEFORE deleting it (blocking).
     // The 100 KiB cap is enforced by capture_branch_diff via streaming
     // reads — git stdout never fully materialises in memory.
@@ -710,6 +716,7 @@ pub(crate) async fn mark_merged(
     // delete (Work mode only), browser kill. Shared with hard-delete and
     // archive. Only fatal error is a continuation-row lookup failure
     // (returned as 500 so the user can retry).
+    acquire_wake_lifecycle_fence(&state, &id).await?;
     run_resource_cleanup_cascade(&state, &conv).await?;
 
     // 3. Route through state machine -> Terminal

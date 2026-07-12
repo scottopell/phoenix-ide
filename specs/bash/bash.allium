@@ -31,6 +31,12 @@
 --   enforced by the permission seam (specs/permissions/) and is not modelled
 --   as a bash run-path rule here.
 -- Dependencies: specs/bedrock/bedrock.allium
+-- Wake contracts (`specs/wake-contracts/`) consume two facts from this spec only:
+--   1. ownership/authorization is the same WorkScope-keyed lookup used by
+--      peek/wait/kill;
+--   2. bash terminal evidence is the synchronous handle/tombstone surface
+--      defined here. Registration receipts and queued runtime observation live in
+--      the wake-contracts spec, not here.
 
 use "../bedrock/bedrock.allium" as bedrock
 
@@ -1144,6 +1150,11 @@ invariant LiveHandleCapBound {
 -- owning WorkScope; a handle id presented under a different WorkScope is
 -- treated as nonexistent. Conversations that resolve to the same WorkScope
 -- (a continuation chain) share one handle table.
+-- The same scope-keyed ownership test authorizes wake registration for bash
+-- handles: a conversation may register a wake only for handles reachable in this
+-- invariant's lookup domain. The later terminal payload is reconstructed from the
+-- handle/tombstone evidence defined by this spec; wake-contracts models the
+-- receipt/inbox protocol separately.
 invariant HandleWorkScopeScoped {
     for h in Handle:
         h.work_scope != null

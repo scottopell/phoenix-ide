@@ -17,6 +17,7 @@ REQ-CLI-005: SSE Streaming (--poll for fallback)
 REQ-CLI-006: Configuration
 REQ-CLI-007: Single File Distribution (uv run)
 REQ-CLI-008: Model Selection (--model, --list-models)
+REQ-CLI-009: Wake Status Inspection (wake-status)
 """
 
 import base64
@@ -25,6 +26,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import click
 import httpx
@@ -173,6 +175,15 @@ class PhoenixClient:
         resp = self.http.get(f"{self.base_url}/api/projects")
         resp.raise_for_status()
         return resp.json().get('projects', [])
+
+    def get_wake_status(self, conversation_id: str) -> dict:
+        """Get durable wake-contract status for a conversation."""
+        encoded_id = quote(conversation_id, safe='')
+        resp = self.http.get(
+            f"{self.base_url}/api/conversations/{encoded_id}/wakes"
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     def create_conversation(self, cwd: str, text: str, images: list[dict], model: str | None = None) -> dict:
         """Create new conversation with initial message."""
@@ -445,6 +456,56 @@ def format_response(data: dict) -> str:
     return "\n".join(lines)
 
 
+def format_wake_status(snapshot: dict) -> str:
+    """Format one API wake-status snapshot for dense terminal display."""
+    pending_count = snapshot.get('pending_count', 0)
+    soonest_expiry = snapshot.get('soonest_expiry') or '-'
+    lines = [
+        f"Conversation: {snapshot.get('conversation_id', '-')}",
+        f"Pending: {pending_count} | Soonest expiry: {soonest_expiry}",
+    ]
+    contracts = snapshot.get('contracts', [])
+    if not contracts:
+        lines.append("No wake contracts.")
+        return "\n".join(lines)
+
+    lines.append(f"Contracts: {len(contracts)}")
+    for contract in contracts:
+        handle = contract.get('handle') or {}
+        handle_label = f"{handle.get('kind', '-')}:{handle.get('id', '-')}"
+        lines.append(
+            " | ".join([
+                f"- {contract.get('id', '-')}",
+                f"handle={handle_label}",
+                f"expires={contract.get('expires_at', '-')}",
+                f"status={contract.get('status', '-')}",
+                f"terminal_cause={contract.get('cause') or '-'}",
+                f"forgotten={contract.get('forgotten_reason') or '-'}",
+            ])
+        )
+    return "\n".join(lines)
+
+
+@click.command('wake-status')
+@click.argument('conversation_id')
+@click.option('--json-output', '--json', 'as_json', is_flag=True,
+              help='Print the API wake-status snapshot as JSON')
+@click.option('--api-url', default=None,
+              help='API endpoint URL (default: auto-detect from dev.py or PHOENIX_API_URL)')
+@click.option('--password', envvar='PHOENIX_PASSWORD', default=None,
+              help='Password for authenticated access (or set PHOENIX_PASSWORD)')
+def wake_status(conversation_id, as_json, api_url, password):
+    """Show durable wake contracts for CONVERSATION_ID."""
+    resolved_url = api_url or _detect_api_url()
+    client = PhoenixClient(resolved_url, password=password)
+    client.ensure_authenticated()
+    snapshot = client.get_wake_status(conversation_id)
+    if as_json:
+        click.echo(json.dumps(snapshot, indent=2, sort_keys=True))
+    else:
+        click.echo(format_wake_status(snapshot))
+
+
 @click.command()
 @click.argument('message', required=False)
 @click.option('-c', '--conversation', envvar='PHOENIX_CONVERSATION',
@@ -480,6 +541,10 @@ def main(message, conversation, directory, images, model, list_models, list_proj
 
         # List projects
         phoenix-client.py --list-projects
+
+        # Inspect durable wake contracts
+        phoenix-client.py wake-status CONVERSATION_ID
+        phoenix-client.py wake-status CONVERSATION_ID --json
 
         # New conversation with specific model
         phoenix-client.py -m claude-4.5-sonnet "Analyze this project"
@@ -567,7 +632,10 @@ def main(message, conversation, directory, images, model, list_models, list_proj
 
 def main_with_error_handling():
     try:
-        main(standalone_mode=False)
+        if len(sys.argv) > 1 and sys.argv[1] == 'wake-status':
+            wake_status(args=sys.argv[2:], standalone_mode=False)
+        else:
+            main(standalone_mode=False)
     except PhoenixError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)

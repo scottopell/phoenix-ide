@@ -1014,9 +1014,9 @@ function ConversationPageContent() {
     try {
       await api.cancelConversation(conversationId);
     } catch (err) {
-      console.error('Failed to cancel:', err);
+      showError(err instanceof Error ? err.message : 'Failed to cancel');
     }
-  }, [conversationId, atom.phase]);
+  }, [conversationId, atom.phase, showError]);
 
   const handleCancelSteering = useCallback(async (localId: string) => {
     if (!conversationId) return;
@@ -2038,6 +2038,8 @@ function ConversationPageContent() {
         turnRetryContext={atom.turnRetryContext}
         onOpenFiles={isDesktop || !fileRootPath ? undefined : handleOpenFiles}
         prStatusState={prStatusHandle.state}
+        wakeStatus={atom.wakeStatus}
+        onWakeError={showError}
       />
       </RenderProfiler>
       </div>

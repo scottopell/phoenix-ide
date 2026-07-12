@@ -1670,7 +1670,12 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::SlugExists(_)
         | DbError::ConversationAlreadyExists(_)
         | DbError::Serialization(_)
-        | DbError::ForkProposalConflict(_)) => AppError::Internal(other.to_string()),
+        | DbError::ForkProposalConflict(_)
+        | DbError::WakeContractConflict(_)
+        | DbError::WakeContractValidation(_)
+        | DbError::WakeRegistrationClosed(_)
+        | DbError::WakeRegistrationIneligible(_)
+        | DbError::WakeResumeArchived(_)) => AppError::Internal(other.to_string()),
     }
 }
 

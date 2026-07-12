@@ -16,10 +16,12 @@ import {
   type PrStatusResponse,
 } from "../api";
 import type { ConversationPrStatusState } from "../hooks/useConversationPrStatus";
+import type { WakeStatusSnapshot } from '../generated/WakeStatusSnapshot';
 import type { ConnectionState } from "../hooks";
 import { useIsMobile } from "../hooks";
 import { getStateDescription, isAgentWorking } from "../utils";
 import { ContextIndicator } from "./ContextIndicator";
+import { WakeIndicator } from './WakeIndicator';
 import {
   prBadgeClass,
   prBadgeLabel,
@@ -131,6 +133,8 @@ interface StateBarProps {
    *  without this annotation. */
   onOpenFiles?: (() => void) | undefined;
   prStatusState?: ConversationPrStatusState;
+  wakeStatus?: WakeStatusSnapshot | null;
+  onWakeError?: (message: string) => void;
 }
 
 /** Format a context window size in tokens for compact display (e.g. 200k, 1M). */
@@ -267,6 +271,8 @@ export function StateBar({
   turnRetryContext,
   onOpenFiles,
   prStatusState,
+  wakeStatus,
+  onWakeError,
 }: StateBarProps) {
   // `toolExecutingStartedAt` is kept on the prop type for the
   // tool-widget header (which still reads it from the atom). The
@@ -1159,6 +1165,13 @@ export function StateBar({
             <span id="state-dot" className={dotClass}></span>
             <span id="state-text">{stateText}</span>
           </div>
+          {conversation && onWakeError && (
+            <WakeIndicator
+              conversationId={conversation.id}
+              snapshot={wakeStatus ?? null}
+              onError={onWakeError}
+            />
+          )}
           {conversation && contextWindowUsed > 0 && (
             <ContextIndicator
               used={contextWindowUsed}

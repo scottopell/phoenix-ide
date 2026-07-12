@@ -7,6 +7,7 @@
 //! then through `serde_json::to_string`. See `super::wire` for the rationale
 //! and for the ts-rs-driven TS codegen that downstream clients consume.
 
+use super::types::WakeStatusSnapshot;
 use super::wire::SseWireEvent;
 use crate::runtime::SseEvent;
 use axum::http::{HeaderMap, HeaderValue};
@@ -14,13 +15,30 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use std::convert::Infallible;
 use std::time::Duration;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventVisibility {
+    Authenticated,
+    PublicShare,
+}
+
+impl EventVisibility {
+    fn permits(self, event: &SseEvent) -> bool {
+        self == Self::Authenticated || !event.is_private()
+    }
+
+    fn filter_init(self, mut event: SseEvent) -> SseEvent {
+        if let SseEvent::Init { pending_events, .. } = &mut event {
+            pending_events.retain(|pending| self.permits(pending));
+        }
+        event
+    }
+}
 
 /// Stream `init_event` followed by broadcast events to an SSE client.
 ///
-/// On `BroadcastStreamRecvError::Lagged` — the client fell far enough behind
+/// On `broadcast::error::RecvError::Lagged` — the client fell far enough behind
 /// that the `broadcast::channel` overwrote unread entries — this stream ends.
 /// The client's `EventSource` observes the close, its `ConnectionMachine`
 /// reconnects, and the next `init` event pulls in everything that was in
@@ -40,31 +58,24 @@ use tokio_stream::StreamExt;
 pub fn sse_stream(
     conv_id: String,
     init_event: SseEvent,
+    visibility: EventVisibility,
+    wake_status: Option<WakeStatusSnapshot>,
+    db: crate::db::Database,
     broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
 ) -> impl IntoResponse {
-    let init =
-        futures::stream::once(
-            async move { Ok::<Event, Infallible>(sse_event_to_axum(init_event)) },
-        );
+    let init_event = visibility.filter_init(init_event);
+    let init = futures::stream::iter(
+        std::iter::once(Ok::<Event, Infallible>(sse_event_to_axum(init_event)))
+            .chain(wake_status.clone().map(wake_status_to_axum).map(Ok)),
+    );
 
-    let broadcasts = BroadcastStream::new(broadcast_rx)
-        .take_while(move |result| match result {
-            Err(BroadcastStreamRecvError::Lagged(n)) => {
-                tracing::warn!(
-                    conv_id = %conv_id,
-                    lagged_by = n,
-                    "SSE broadcast lagged; closing stream so client reconnects and resyncs"
-                );
-                false
-            }
-            _ => true,
-        })
-        .filter_map(|result| match result {
-            Ok(event) => Some(Ok(sse_event_to_axum(event))),
-            Err(_) => None, // Lagged already closed the stream above
-        });
-
-    let combined = init.chain(broadcasts);
+    let combined = init.chain(live_event_stream(
+        conv_id,
+        visibility,
+        wake_status,
+        db,
+        broadcast_rx,
+    ));
 
     // Typed `ping` event with non-empty data so the browser's EventSource
     // observes it via an explicit listener and the heartbeat watchdog can
@@ -85,8 +96,176 @@ pub fn sse_stream(
     (headers, sse)
 }
 
+#[allow(clippy::too_many_lines)]
+fn live_event_stream(
+    conv_id: String,
+    visibility: EventVisibility,
+    wake_status: Option<WakeStatusSnapshot>,
+    db: crate::db::Database,
+    broadcast_rx: tokio::sync::broadcast::Receiver<SseEvent>,
+) -> impl futures::Stream<Item = Result<Event, Infallible>> {
+    let wake_poll_due_at = tokio::time::Instant::now() + Duration::from_secs(1);
+    futures::stream::unfold(
+        (
+            db,
+            conv_id,
+            visibility,
+            wake_status,
+            broadcast_rx,
+            wake_poll_due_at,
+            0_u8,
+            None,
+        ),
+        |(
+            db,
+            conversation_id,
+            visibility,
+            mut previous,
+            mut broadcast_rx,
+            mut wake_poll_due_at,
+            mut broadcast_batch,
+            pending_broadcast,
+        )| async move {
+            if let Some(event) = pending_broadcast {
+                return Some((
+                    Ok(sse_event_to_axum(event)),
+                    (
+                        db,
+                        conversation_id,
+                        visibility,
+                        previous,
+                        broadcast_rx,
+                        wake_poll_due_at,
+                        broadcast_batch,
+                        None,
+                    ),
+                ));
+            }
+
+            loop {
+                if previous.is_some()
+                    && broadcast_batch >= 32
+                    && tokio::time::Instant::now() >= wake_poll_due_at
+                {
+                    // Observe closure/lag before starting the DB read. A ready event is
+                    // retained so the wake poll cannot lose or delay the broadcast by a
+                    // full interval.
+                    let pending_broadcast = match broadcast_rx.try_recv() {
+                        Ok(event) if !visibility.permits(&event) => None,
+                        Ok(event) => Some(event),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => None,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return None,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                            log_lag(&conversation_id, n);
+                            return None;
+                        }
+                    };
+                    broadcast_batch = 0;
+                    wake_poll_due_at += Duration::from_secs(1);
+                    let next = match WakeStatusSnapshot::load(&db, &conversation_id).await {
+                        Ok(next) => next,
+                        Err(error) => {
+                            tracing::warn!(%conversation_id, %error, "failed to refresh wake SSE status");
+                            continue;
+                        }
+                    };
+                    if previous.as_ref() != Some(&next) {
+                        previous = Some(next.clone());
+                        return Some((
+                            Ok(wake_status_to_axum(next)),
+                            (
+                                db,
+                                conversation_id,
+                                visibility,
+                                previous,
+                                broadcast_rx,
+                                wake_poll_due_at,
+                                broadcast_batch,
+                                pending_broadcast,
+                            ),
+                        ));
+                    }
+                    if let Some(event) = pending_broadcast {
+                        return Some((
+                            Ok(sse_event_to_axum(event)),
+                            (
+                                db,
+                                conversation_id,
+                                visibility,
+                                previous,
+                                broadcast_rx,
+                                wake_poll_due_at,
+                                broadcast_batch,
+                                None,
+                            ),
+                        ));
+                    }
+                }
+
+                if previous.is_none() {
+                    return match broadcast_rx.recv().await {
+                        Ok(event) if !visibility.permits(&event) => continue,
+                        Ok(event) => Some((
+                            Ok(sse_event_to_axum(event)),
+                            (
+                                db,
+                                conversation_id,
+                                visibility,
+                                previous,
+                                broadcast_rx,
+                                wake_poll_due_at,
+                                broadcast_batch,
+                                None,
+                            ),
+                        )),
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            log_lag(&conversation_id, n);
+                            None
+                        }
+                    };
+                }
+
+                tokio::select! {
+                    biased;
+                    received = broadcast_rx.recv() => match received {
+                        Ok(event) if !visibility.permits(&event) => {}
+                        Ok(event) => {
+                            broadcast_batch = broadcast_batch.saturating_add(1);
+                            return Some((Ok(sse_event_to_axum(event)), (db, conversation_id, visibility, previous, broadcast_rx, wake_poll_due_at, broadcast_batch, None)));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            log_lag(&conversation_id, n);
+                            return None;
+                        }
+                    },
+                    () = tokio::time::sleep_until(wake_poll_due_at) => {
+                        broadcast_batch = 32;
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn log_lag(conversation_id: &str, lagged_by: u64) {
+    tracing::warn!(
+        conv_id = %conversation_id,
+        lagged_by,
+        "SSE broadcast lagged; closing stream so client reconnects and resyncs"
+    );
+}
+
+fn wake_status_to_axum(snapshot: WakeStatusSnapshot) -> Event {
+    wire_event_to_axum(&SseWireEvent::WakeStatusUpdate { snapshot })
+}
+
 fn sse_event_to_axum(event: SseEvent) -> Event {
-    let wire: SseWireEvent = event.into();
+    wire_event_to_axum(&event.into())
+}
+
+fn wire_event_to_axum(wire: &SseWireEvent) -> Event {
     let event_type = wire.event_type();
     // SseWireEvent derives Serialize over types that themselves derive
     // Serialize (or carry `serde_json::Value`). `to_string` cannot fail
@@ -155,6 +334,14 @@ mod tests {
                     "pending_truncated": pending_truncated,
                 })
             }
+            SseEvent::WakeContractRegistered {
+                sequence_id,
+                registration,
+            } => json!({
+                "type": "wake_contract_registered",
+                "sequence_id": sequence_id,
+                "registration": registration,
+            }),
             SseEvent::Message { message } => {
                 let sequence_id = message.sequence_id;
                 let message_value = enrich_message_for_api(message);
@@ -555,6 +742,484 @@ mod tests {
         let typed = typed_sse_event_to_value(&event);
         assert_eq!(typed["pending_truncated"], true);
         assert!(typed["pending_events"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parity_wake_contract_registered() {
+        assert_parity(&SseEvent::WakeContractRegistered {
+            sequence_id: 9,
+            registration: phoenix_core::domain::wake_contracts::WakeContractRegistered {
+                conversation_id: "conv-1".to_string(),
+                contract_id: "wake-1".to_string(),
+                handle: phoenix_core::domain::wake_contracts::WakeRegisteredHandle::TmuxWindow {
+                    id: "window-1".to_string(),
+                },
+                expires_at: ts(),
+                registering_tool_use_id: Some("tool-1".to_string()),
+            },
+        });
+    }
+
+    #[test]
+    fn wake_status_update_is_a_typed_full_snapshot() {
+        use crate::api::types::{
+            WakeCause, WakeContractHandle, WakeContractStatus, WakeForgottenReason, WakeStatus,
+        };
+
+        let snapshot = WakeStatusSnapshot {
+            conversation_id: "conv-1".to_string(),
+            pending_count: 1,
+            soonest_expiry: Some(ts()),
+            lifecycle_blocked: true,
+            contracts: vec![WakeContractStatus {
+                id: "wake-1".to_string(),
+                handle: WakeContractHandle::TmuxWindow {
+                    id: "window-1".to_string(),
+                },
+                registered_at: ts(),
+                expires_at: ts(),
+                status: WakeStatus::Forgotten,
+                cause: Some(WakeCause::Forgotten),
+                forgotten_reason: Some(WakeForgottenReason::HandleMissing),
+            }],
+        };
+        let wire = SseWireEvent::WakeStatusUpdate { snapshot };
+        let value = serde_json::to_value(&wire).expect("wake status serializes");
+
+        assert_eq!(wire.event_type(), "wake_status_update");
+        assert_eq!(value["type"], "wake_status_update");
+        assert_eq!(value["snapshot"]["conversation_id"], "conv-1");
+        assert_eq!(value["snapshot"]["pending_count"], 1);
+        assert_eq!(
+            value["snapshot"]["contracts"][0]["handle"]["kind"],
+            "tmux_window"
+        );
+        assert_eq!(
+            value["snapshot"]["contracts"][0]["handle"]["id"],
+            "window-1"
+        );
+        assert_eq!(value["snapshot"]["contracts"][0]["cause"], "forgotten");
+        assert_eq!(
+            value["snapshot"]["contracts"][0]["forgotten_reason"],
+            "handle_missing"
+        );
+    }
+
+    async fn live_stream_fixture(
+        capacity: usize,
+    ) -> (
+        crate::db::Database,
+        tokio::sync::broadcast::Sender<SseEvent>,
+        tokio::sync::broadcast::Receiver<SseEvent>,
+        WakeStatusSnapshot,
+    ) {
+        let db = crate::db::Database::open_in_memory()
+            .await
+            .expect("database");
+        db.create_conversation("live-sse", "live-sse", "/tmp", true, None, None)
+            .await
+            .expect("conversation");
+        let snapshot = WakeStatusSnapshot::load(&db, "live-sse")
+            .await
+            .expect("initial wake status");
+        let (tx, rx) = tokio::sync::broadcast::channel(capacity);
+        (db, tx, rx, snapshot)
+    }
+
+    #[tokio::test]
+    async fn public_share_live_stream_never_polls_or_emits_wake_status() {
+        use chrono::Duration as ChronoDuration;
+        use phoenix_core::domain::wake_contracts::{
+            WakeContract, WakeContractHandle, WakeContractStatus,
+        };
+
+        let (db, tx, rx, _snapshot) = live_stream_fixture(4).await;
+        let registered_at = Utc::now();
+        db.insert_wake_contract(&WakeContract {
+            id: "private-contract-id".to_string(),
+            current_conversation_id: "live-sse".to_string(),
+            registration_work_scope: crate::work_scope::WorkScope::Conversation(
+                "live-sse".to_string(),
+            ),
+            handle: WakeContractHandle::Bash {
+                handle_id: "private-handle-id".to_string(),
+            },
+            registering_tool_use_id: None,
+            registered_at,
+            expires_at: registered_at + ChronoDuration::seconds(60),
+            status: WakeContractStatus::Pending,
+            terminal_cause: None,
+            forgotten_reason: None,
+            terminal_payload: None,
+            resolved_at: None,
+        })
+        .await
+        .expect("wake contract");
+
+        tokio::time::pause();
+        let stream = live_event_stream(
+            "live-sse".to_string(),
+            EventVisibility::PublicShare,
+            None,
+            db,
+            rx,
+        );
+        futures::pin_mut!(stream);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tx.send(SseEvent::Token {
+            sequence_id: 1,
+            text: "public".to_string(),
+            request_id: "request".to_string(),
+        })
+        .expect("broadcast");
+
+        let rendered = format!("{:?}", stream.next().await.expect("event").unwrap());
+        assert!(rendered.contains("public"), "{rendered}");
+        assert!(!rendered.contains("wake_status_update"), "{rendered}");
+        assert!(!rendered.contains("private-contract-id"), "{rendered}");
+        assert!(!rendered.contains("private-handle-id"), "{rendered}");
+    }
+
+    fn wake_registration_event() -> SseEvent {
+        SseEvent::WakeContractRegistered {
+            sequence_id: 7,
+            registration: phoenix_core::domain::wake_contracts::WakeContractRegistered {
+                conversation_id: "live-sse".to_string(),
+                contract_id: "private-contract-id".to_string(),
+                handle: phoenix_core::domain::wake_contracts::WakeRegisteredHandle::Bash {
+                    id: "private-handle-id".to_string(),
+                },
+                expires_at: ts(),
+                registering_tool_use_id: Some("private-tool-use-id".to_string()),
+            },
+        }
+    }
+
+    fn replay_init(visibility: EventVisibility) -> Value {
+        use crate::runtime::SseBroadcaster;
+
+        let broadcaster = SseBroadcaster::new(8, 0);
+        let _rx = broadcaster.subscribe();
+        let _ = broadcaster.send_seq(|sequence_id| {
+            let mut event = wake_registration_event();
+            if let SseEvent::WakeContractRegistered {
+                sequence_id: event_sequence_id,
+                ..
+            } = &mut event
+            {
+                *event_sequence_id = sequence_id;
+            }
+            event
+        });
+        let _ = broadcaster.send_seq(|sequence_id| SseEvent::Token {
+            sequence_id,
+            text: "public-pending-token".to_string(),
+            request_id: "public-request-id".to_string(),
+        });
+        let (pending_anchor_sequence_id, pending_truncated, highest, pending_events) =
+            broadcaster.snapshot_pending();
+        let init = SseEvent::Init {
+            sequence_id: highest,
+            conversation: Box::new(fixture_enriched_conversation()),
+            transcript_generation: 1,
+            messages: Vec::new(),
+            agent_working: true,
+            presentation_mode: "working".to_string(),
+            last_sequence_id: highest,
+            context_window_size: 0,
+            project_name: None,
+            pending_anchor_sequence_id,
+            pending_events,
+            pending_truncated,
+        };
+        typed_sse_event_to_value(&visibility.filter_init(init))
+    }
+
+    #[test]
+    fn public_share_init_filters_private_replay_events() {
+        let raw = replay_init(EventVisibility::PublicShare);
+        let rendered = serde_json::to_string(&raw).expect("raw shared init");
+        let pending = raw["pending_events"].as_array().expect("pending events");
+
+        assert_eq!(pending.len(), 1, "{rendered}");
+        assert_eq!(pending[0]["type"], "token");
+        assert_eq!(pending[0]["text"], "public-pending-token");
+        for private_value in [
+            "wake_contract_registered",
+            "private-contract-id",
+            "private-handle-id",
+            "private-tool-use-id",
+            &ts().to_rfc3339(),
+        ] {
+            assert!(!rendered.contains(private_value), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn authenticated_init_retains_private_replay_events() {
+        let raw = replay_init(EventVisibility::Authenticated);
+        let rendered = serde_json::to_string(&raw).expect("raw authenticated init");
+        let pending = raw["pending_events"].as_array().expect("pending events");
+
+        assert_eq!(pending.len(), 2, "{rendered}");
+        assert_eq!(pending[0]["type"], "wake_contract_registered");
+        assert!(rendered.contains("private-contract-id"), "{rendered}");
+        assert!(rendered.contains("private-handle-id"), "{rendered}");
+        assert_eq!(pending[1]["type"], "token");
+    }
+
+    #[tokio::test]
+    async fn authenticated_live_stream_receives_wake_registration_edge() {
+        let (db, tx, rx, snapshot) = live_stream_fixture(4).await;
+        let stream = live_event_stream(
+            "live-sse".to_string(),
+            EventVisibility::Authenticated,
+            Some(snapshot),
+            db,
+            rx,
+        );
+        futures::pin_mut!(stream);
+        tx.send(wake_registration_event()).expect("broadcast");
+        let rendered = format!("{:?}", stream.next().await.expect("event").unwrap());
+        assert!(rendered.contains("wake_contract_registered"), "{rendered}");
+        assert!(rendered.contains("private-contract-id"), "{rendered}");
+        assert!(rendered.contains("private-handle-id"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn public_live_stream_filters_wake_registration_edge() {
+        let (db, tx, rx, _snapshot) = live_stream_fixture(4).await;
+        let stream = live_event_stream(
+            "live-sse".to_string(),
+            EventVisibility::PublicShare,
+            None,
+            db,
+            rx,
+        );
+        futures::pin_mut!(stream);
+        tx.send(wake_registration_event())
+            .expect("private broadcast");
+        tx.send(SseEvent::Token {
+            sequence_id: 8,
+            text: "public-after-private".to_string(),
+            request_id: "request".to_string(),
+        })
+        .expect("public broadcast");
+        let rendered = format!("{:?}", stream.next().await.expect("event").unwrap());
+        assert!(rendered.contains("public-after-private"), "{rendered}");
+        assert!(!rendered.contains("private-contract-id"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn fast_broadcasts_before_poll_deadline_have_no_forced_wait() {
+        let (db, tx, rx, snapshot) = live_stream_fixture(128).await;
+        tokio::time::pause();
+        let stream = live_event_stream(
+            "live-sse".to_string(),
+            EventVisibility::Authenticated,
+            Some(snapshot),
+            db,
+            rx,
+        );
+        futures::pin_mut!(stream);
+
+        for sequence_id in 1..=100 {
+            tx.send(SseEvent::Token {
+                sequence_id,
+                text: format!("event-{sequence_id}"),
+                request_id: "request".to_string(),
+            })
+            .expect("broadcast");
+        }
+        let before_drain = tokio::time::Instant::now();
+        for sequence_id in 1..=100 {
+            let rendered = format!("{:?}", stream.next().await.expect("event").unwrap());
+            assert!(
+                rendered.contains(&format!("event-{sequence_id}")),
+                "{rendered}"
+            );
+        }
+        assert_eq!(tokio::time::Instant::now(), before_drain);
+    }
+
+    #[tokio::test]
+    async fn live_stream_emits_changed_wake_snapshot() {
+        use chrono::Duration as ChronoDuration;
+        use phoenix_core::domain::wake_contracts::{
+            WakeContract, WakeContractHandle, WakeContractStatus,
+        };
+
+        let (db, _tx, rx, snapshot) = live_stream_fixture(4).await;
+        let registered_at = Utc::now();
+        db.insert_wake_contract(&WakeContract {
+            id: "wake-live".to_string(),
+            current_conversation_id: "live-sse".to_string(),
+            registration_work_scope: crate::work_scope::WorkScope::Conversation(
+                "live-sse".to_string(),
+            ),
+            handle: WakeContractHandle::Bash {
+                handle_id: "bash-live".to_string(),
+            },
+            registering_tool_use_id: Some("tool-live".to_string()),
+            registered_at,
+            expires_at: registered_at + ChronoDuration::seconds(60),
+            status: WakeContractStatus::Pending,
+            terminal_cause: None,
+            forgotten_reason: None,
+            terminal_payload: None,
+            resolved_at: None,
+        })
+        .await
+        .expect("wake contract");
+
+        tokio::time::pause();
+        let stream = live_event_stream(
+            "live-sse".to_string(),
+            EventVisibility::Authenticated,
+            Some(snapshot),
+            db,
+            rx,
+        );
+        futures::pin_mut!(stream);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let event = stream.next().await.expect("changed wake event").unwrap();
+        let rendered = format!("{event:?}");
+        assert!(rendered.contains("wake_status_update"), "{rendered}");
+        assert!(rendered.contains("wake-live"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn ready_broadcasts_do_not_starve_changed_wake_snapshot() {
+        use chrono::Duration as ChronoDuration;
+        use phoenix_core::domain::wake_contracts::{
+            WakeContract, WakeContractHandle, WakeContractStatus,
+        };
+
+        let (db, tx, rx, snapshot) = live_stream_fixture(256).await;
+        let registered_at = Utc::now();
+        db.insert_wake_contract(&WakeContract {
+            id: "wake-fair".to_string(),
+            current_conversation_id: "live-sse".to_string(),
+            registration_work_scope: crate::work_scope::WorkScope::Conversation(
+                "live-sse".to_string(),
+            ),
+            handle: WakeContractHandle::Bash {
+                handle_id: "bash-fair".to_string(),
+            },
+            registering_tool_use_id: None,
+            registered_at,
+            expires_at: registered_at + ChronoDuration::seconds(60),
+            status: WakeContractStatus::Pending,
+            terminal_cause: None,
+            forgotten_reason: None,
+            terminal_payload: None,
+            resolved_at: None,
+        })
+        .await
+        .expect("wake contract");
+
+        tokio::time::pause();
+        let stream = live_event_stream(
+            "live-sse".to_string(),
+            EventVisibility::Authenticated,
+            Some(snapshot),
+            db,
+            rx,
+        );
+        futures::pin_mut!(stream);
+
+        tx.send(SseEvent::Token {
+            sequence_id: 1,
+            text: "busy".to_string(),
+            request_id: "request".to_string(),
+        })
+        .expect("initial broadcast");
+        let initial = stream.next().await.expect("initial live event").unwrap();
+        assert!(!format!("{initial:?}").contains("wake_status_update"));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for sequence_id in 2..=128 {
+            tx.send(SseEvent::Token {
+                sequence_id,
+                text: "busy".to_string(),
+                request_id: "request".to_string(),
+            })
+            .expect("broadcast");
+            let event = stream.next().await.expect("live event").unwrap();
+            if format!("{event:?}").contains("wake_status_update") {
+                return;
+            }
+        }
+        panic!("ready broadcasts starved the overdue wake snapshot");
+    }
+
+    #[tokio::test]
+    async fn broadcast_close_ends_live_stream_despite_wake_ticker() {
+        let (db, tx, rx, snapshot) = live_stream_fixture(4).await;
+        tokio::time::pause();
+        let stream = live_event_stream(
+            "live-sse".to_string(),
+            EventVisibility::Authenticated,
+            Some(snapshot),
+            db,
+            rx,
+        );
+        futures::pin_mut!(stream);
+        drop(tx);
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn broadcast_lag_ends_entire_live_stream_for_reconnect() {
+        let (db, tx, rx, snapshot) = live_stream_fixture(1).await;
+        tx.send(SseEvent::Token {
+            sequence_id: 1,
+            text: "overwritten".to_string(),
+            request_id: "request".to_string(),
+        })
+        .expect("first broadcast");
+        tx.send(SseEvent::Token {
+            sequence_id: 2,
+            text: "latest".to_string(),
+            request_id: "request".to_string(),
+        })
+        .expect("second broadcast");
+        let stream = live_event_stream(
+            "live-sse".to_string(),
+            EventVisibility::Authenticated,
+            Some(snapshot),
+            db,
+            rx,
+        );
+        futures::pin_mut!(stream);
+
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_stream_passes_through_ordinary_broadcasts() {
+        let (db, tx, rx, snapshot) = live_stream_fixture(4).await;
+        let stream = live_event_stream(
+            "live-sse".to_string(),
+            EventVisibility::Authenticated,
+            Some(snapshot),
+            db,
+            rx,
+        );
+        futures::pin_mut!(stream);
+        tx.send(SseEvent::Token {
+            sequence_id: 7,
+            text: "hello".to_string(),
+            request_id: "request".to_string(),
+        })
+        .expect("broadcast");
+
+        let event = stream.next().await.expect("broadcast event").unwrap();
+        let rendered = format!("{event:?}");
+        assert!(rendered.contains("token"), "{rendered}");
+        assert!(rendered.contains("hello"), "{rendered}");
     }
 
     #[test]

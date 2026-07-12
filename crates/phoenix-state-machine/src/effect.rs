@@ -111,6 +111,9 @@ pub enum Effect {
     /// Persist the new state
     PersistState,
 
+    /// Atomically persist `LlmRequesting` and accept a durable wake outbox row.
+    PersistWakeResumeState { message_id: String },
+
     /// Make an LLM request
     RequestLlm,
 

@@ -1,15 +1,21 @@
 # Implement wake contracts v1
 
-Implement the wake-contract runtime described by `specs/wake-contracts/` and ADR-006. This is the central tracker for making async terminal waits real in Phoenix.
+Superseded by `tasks/47002-p1-in-progress--implement-wake-plane-core-bash-tmux.md`.
 
-## Current spec authority
+This task remains `wont-do` as the older all-in-one implementation tracker. It is no longer authoritative for wake-plane delivery semantics, lifecycle behavior, or implementation sequencing.
 
+## Superseding authority
+
+- Implementation tracker: `tasks/47002-p1-in-progress--implement-wake-plane-core-bash-tmux.md`
 - Requirements: `specs/wake-contracts/requirements.md` (`REQ-WAKE-001` through `REQ-WAKE-018`)
 - Behavioral model: `specs/wake-contracts/wake-contracts.allium`
 - Status/current reality: `specs/wake-contracts/executive.md`
-- ADR: `specs/adrs/006_wake-contracts-are-persisted-conversation-scoped-terminal-waits.md`
+- Historical ADR foundation: `specs/adrs/006_wake-contracts-are-persisted-conversation-scoped-terminal-waits.md`
+- Current delivery-protocol ADR: `specs/adrs/008_wake-plane-core-uses-registration-receipts-and-durable-runtime-observations.md`
 
-Treat wake contracts as durable wait intent and a delivery obligation, not as durable process handles. Accepted contracts resolve exactly once while their current conversation remains queryable: `Fired`, `Expired`, `Cancelled`, or `Forgotten`.
+Treat wake contracts as durable wait intent and a delivery obligation, not as durable process handles. Accepted contracts resolve exactly once while their current delivery conversation remains queryable: `Fired`, `Expired`, `Cancelled`, or `Forgotten`.
+
+The rest of this file is preserved as historical planning context only. Where it conflicts with task 47002 or ADR-008, task 47002 / ADR-008 win.
 
 ## V1 scope
 

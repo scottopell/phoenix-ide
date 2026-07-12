@@ -30,6 +30,7 @@ import {
   SseConversationUpdateDataSchema,
   SseAgentDoneDataSchema,
   SseConversationBecameTerminalDataSchema,
+  SseWakeStatusUpdateDataSchema,
   SseErrorDataSchema,
   ChainQaTokenSchema,
   ChainQaCompletedSchema,
@@ -104,6 +105,48 @@ describe('parseEvent', () => {
       expect(() =>
         parseEvent(SseMessageDataSchema, makeEvent('{bad'), 'message', dispatch),
       ).toThrow(/malformed JSON/);
+    });
+  });
+
+  describe('wake_status_update', () => {
+    const validWake = {
+      snapshot: {
+        conversation_id: 'conv-1', pending_count: 1,
+        soonest_expiry: '2026-07-10T12:30:00Z', lifecycle_blocked: true,
+        contracts: [{
+          id: 'wake-1', handle: { kind: 'bash', id: 'b-4' },
+          registered_at: '2026-07-10T12:00:00Z', expires_at: '2026-07-10T12:30:00Z',
+          status: 'pending', cause: null, forgotten_reason: null,
+        }],
+      },
+    };
+
+    it('accepts the generated full snapshot shape', () => {
+      const result = parseEvent(
+        SseWakeStatusUpdateDataSchema, makeEvent(validWake),
+        'wake_status_update', mockDispatch().dispatch,
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.data.snapshot.contracts[0]?.handle.kind).toBe('bash');
+    });
+
+    it('rejects an unknown contract kind', () => {
+      const { dispatch, actions } = mockDispatch();
+      inProdMode(() => {
+        const result = parseEvent(
+          SseWakeStatusUpdateDataSchema,
+          makeEvent({
+            ...validWake,
+            snapshot: {
+              ...validWake.snapshot,
+              contracts: [{ ...validWake.snapshot.contracts[0], handle: { kind: 'timer', id: 'x' } }],
+            },
+          }),
+          'wake_status_update', dispatch,
+        );
+        expect(result.ok).toBe(false);
+      });
+      expect(actions[0]?.type).toBe('sse_error');
     });
   });
 

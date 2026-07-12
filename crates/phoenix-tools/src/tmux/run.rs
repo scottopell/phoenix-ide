@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::invoke::{truncate_pair, TMUX_TOOL_MAX_WAIT_SECONDS};
-use super::TmuxError;
+use super::{TmuxError, TmuxTerminalStatus};
 use crate::{Tool, ToolContext, ToolOutput};
 
 const EXIT_MARKER_PREFIX: &str = "[phoenix] process exited with code ";
@@ -167,8 +167,10 @@ impl Tool for TmuxRunTool {
             Ok(paths) => paths,
             Err(out) => return out,
         };
-        let wait_for_readiness = matches!(readiness, ValidReadiness::WaitForText { .. });
-        let keep_open_for_observation = parsed.keep_open_on_exit || wait_for_readiness;
+        // Every tmux_run pane is retained until its exit marker is durable. For
+        // keep_open=false the terminal observer, rather than the shell wrapper,
+        // owns cleanup after the evidence commit.
+        let keep_open_for_observation = true;
         let target = match start_tmux_window(
             &config_path,
             &socket_path,
@@ -182,10 +184,30 @@ impl Tool for TmuxRunTool {
             Ok(name) => name,
             Err(out) => return out,
         };
+        let run_id = match ctx
+            .tmux_registry()
+            .register_window_start(&ctx.work_scope, &target.window_id)
+            .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                return error_envelope("tmux_evidence_register_failed", &error.to_string())
+            }
+        };
 
         match readiness {
             ValidReadiness::ReturnImmediately => {
-                return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd).await
+                return_immediately_response(
+                    &ctx,
+                    &config_path,
+                    &socket_path,
+                    &target,
+                    &run_id,
+                    &cwd,
+                    cmd,
+                    !parsed.keep_open_on_exit,
+                )
+                .await
             }
             ValidReadiness::WaitForText { text, timeout } => {
                 wait_for_text_response(
@@ -193,6 +215,7 @@ impl Tool for TmuxRunTool {
                     &config_path,
                     &socket_path,
                     &target,
+                    &run_id,
                     &cwd,
                     cmd,
                     &text,
@@ -344,12 +367,16 @@ async fn start_tmux_window(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn return_immediately_response(
+    ctx: &ToolContext,
     config_path: &Path,
     socket_path: &Path,
     target: &TmuxRunTarget,
+    run_id: &crate::tmux::registry::TmuxWindowRunId,
     cwd: &Path,
     cmd: &str,
+    close_after_completion: bool,
 ) -> ToolOutput {
     let observation = observe_window(config_path, socket_path, &target.window_id, None)
         .await
@@ -362,6 +389,19 @@ async fn return_immediately_response(
             exit_code: None,
             readiness_seen: false,
         });
+    if let Err(error) = persist_observation(ctx, target, &observation).await {
+        tracing::error!(%error, window_id = %target.window_id, "tmux_run: terminal observation could not be persisted");
+        return error_envelope("tmux_evidence_persist_failed", &error.to_string());
+    }
+    ensure_terminal_observer(
+        ctx,
+        config_path,
+        socket_path,
+        target,
+        &observation,
+        close_after_completion,
+        run_id,
+    );
     let status = if observation.exit_code.is_some() {
         "exited"
     } else {
@@ -384,6 +424,7 @@ async fn wait_for_text_response(
     config_path: &Path,
     socket_path: &Path,
     target: &TmuxRunTarget,
+    run_id: &crate::tmux::registry::TmuxWindowRunId,
     cwd: &Path,
     cmd: &str,
     text: &str,
@@ -403,6 +444,10 @@ async fn wait_for_text_response(
                 exit_code: None,
                 readiness_seen: false,
             });
+        if let Err(error) = persist_observation(ctx, target, &observation).await {
+            tracing::error!(%error, window_id = %target.window_id, "tmux_run: terminal observation could not be persisted");
+            return error_envelope("tmux_evidence_persist_failed", &error.to_string());
+        }
         let exited = observation.exit_code.is_some();
         let status = if observation.readiness_seen {
             Some("ready")
@@ -414,6 +459,15 @@ async fn wait_for_text_response(
             None
         };
         if let Some(status) = status {
+            ensure_terminal_observer(
+                ctx,
+                config_path,
+                socket_path,
+                target,
+                &observation,
+                close_after_completion,
+                run_id,
+            );
             let response = structured_response(
                 status,
                 target,
@@ -423,9 +477,6 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
-            if close_after_completion && observation.exit_code.is_some() {
-                let _ = kill_window(config_path, socket_path, &target.window_id).await;
-            }
             return response;
         }
         tokio::select! {
@@ -435,6 +486,103 @@ async fn wait_for_text_response(
             () = tokio::time::sleep(READINESS_POLL_INTERVAL) => {}
         }
     }
+}
+
+async fn persist_observation(
+    ctx: &ToolContext,
+    target: &TmuxRunTarget,
+    observation: &RunObservation,
+) -> Result<(), crate::tmux::registry::TmuxError> {
+    if let Some(exit_code) = observation.exit_code {
+        ctx.tmux_registry()
+            .record_window_terminal(
+                &ctx.work_scope,
+                &target.window_id,
+                Some(exit_code),
+                TmuxTerminalStatus::Exited,
+                observation.captured_output.stdout.clone(),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn ensure_terminal_observer(
+    ctx: &ToolContext,
+    config_path: &Path,
+    socket_path: &Path,
+    target: &TmuxRunTarget,
+    observation: &RunObservation,
+    close_after_completion: bool,
+    run_id: &crate::tmux::registry::TmuxWindowRunId,
+) {
+    if ctx
+        .tmux_registry()
+        .claim_terminal_observer(run_id, close_after_completion)
+    {
+        spawn_terminal_observer(
+            ctx.clone(),
+            config_path.to_path_buf(),
+            socket_path.to_path_buf(),
+            target.window_id.clone(),
+            close_after_completion,
+            observation.exit_code.is_some(),
+            run_id.clone(),
+        );
+    }
+}
+
+fn spawn_terminal_observer(
+    ctx: ToolContext,
+    config_path: PathBuf,
+    socket_path: PathBuf,
+    window_id: String,
+    close_after_completion: bool,
+    terminal_already_persisted: bool,
+    run_id: crate::tmux::registry::TmuxWindowRunId,
+) {
+    tokio::spawn(async move {
+        let terminal_already_persisted = terminal_already_persisted;
+        loop {
+            if !terminal_already_persisted {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            match observe_window(&config_path, &socket_path, &window_id, None).await {
+                Ok(observation) if observation.exit_code.is_some() => {
+                    let target = TmuxRunTarget {
+                        window_name: window_id.clone(),
+                        window_id: window_id.clone(),
+                    };
+                    if !terminal_already_persisted {
+                        if let Err(error) = ctx
+                            .tmux_registry()
+                            .record_run_terminal(
+                                &run_id,
+                                observation.exit_code,
+                                observation.captured_output.stdout.clone(),
+                            )
+                            .await
+                        {
+                            tracing::error!(%error, window_id = %target.window_id, "tmux_run: background terminal observation could not be persisted; retaining pane for retry");
+                            continue;
+                        }
+                    }
+                    if close_after_completion {
+                        if let Err(error) = ctx.tmux_registry().cleanup_run_window(&run_id).await {
+                            tracing::debug!(%error, %window_id, "tmux_run: durable exited pane cleanup unavailable");
+                        }
+                    }
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(%error, %window_id, "tmux_run: background observer lost pane capability");
+                    break;
+                }
+            }
+        }
+        ctx.tmux_registry().release_terminal_observer(&run_id);
+    });
 }
 
 #[allow(clippy::result_large_err)]
@@ -508,25 +656,6 @@ async fn run_tmux_cli(
     .await
     .map_err(|_| "tmux subprocess timed out".to_string())?
     .map_err(|e| format!("failed to spawn tmux subprocess: {e}"))
-}
-
-async fn kill_window(config_path: &Path, socket_path: &Path, target: &str) -> Result<(), String> {
-    let output = run_tmux_cli(
-        config_path,
-        socket_path,
-        &[
-            "kill-window".to_string(),
-            "-t".to_string(),
-            target.to_string(),
-        ],
-    )
-    .await?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let (_, stderr, _) = truncate_pair(&output.stdout, &output.stderr);
-        Err(stderr)
-    }
 }
 
 async fn observe_window(
@@ -628,7 +757,7 @@ fn error_envelope(error_id: &str, message: &str) -> ToolOutput {
 mod tests {
     use super::*;
     use crate::tmux::registry::socket_path_for_worktree;
-    use crate::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry};
+    use crate::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry, TmuxWindowInspection};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -768,7 +897,7 @@ mod tests {
         let ctx = ctx(
             "tmux-run-quick-failure",
             cwd_tmp.path().canonicalize().unwrap(),
-            registry,
+            registry.clone(),
             None,
         );
 
@@ -783,7 +912,7 @@ mod tests {
                         "timeout_seconds": 5
                     }
                 }),
-                ctx,
+                ctx.clone(),
             )
             .await;
         assert!(result.is_success(), "got: {}", result.output());
@@ -802,6 +931,22 @@ mod tests {
         );
         assert_eq!(v["captured_output"]["truncated"], false);
 
+        let inspection = registry
+            .inspect_window(&ctx.work_scope, v["window_id"].as_str().unwrap())
+            .await;
+        let Ok(TmuxWindowInspection::Terminal(evidence)) = inspection else {
+            panic!("marker observation must persist terminal evidence");
+        };
+        assert_eq!(evidence.exit_code, Some(7));
+        assert!(evidence.tail.contains("before-failure"));
+
+        let restarted = TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf());
+        assert!(matches!(
+            restarted
+                .inspect_window(&ctx.work_scope, v["window_id"].as_str().unwrap())
+                .await,
+            Ok(TmuxWindowInspection::Terminal(_))
+        ));
         kill_socket(&socket_tmp.path().join("conv-tmux-run-quick-failure.sock")).await;
     }
 
@@ -901,6 +1046,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn return_immediately_retains_until_durable_evidence_then_closes() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let ctx = ctx(
+            "tmux-run-immediate-close",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "printf instant-exit",
+                    "name": "tmux-run-immediate-close",
+                    "keep_open_on_exit": false,
+                    "readiness": { "mode": "return_immediately" }
+                }),
+                ctx.clone(),
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let response = parse_response(&result);
+        assert!(matches!(
+            response["status"].as_str(),
+            Some("started" | "exited")
+        ));
+        let window_id = response["window_id"].as_str().unwrap();
+        let socket = socket_tmp.path().join("conv-tmux-run-immediate-close.sock");
+
+        let restarted = TmuxRegistry::with_socket_dir(socket_tmp.path().to_path_buf());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(TmuxWindowInspection::Terminal(evidence)) =
+                restarted.inspect_window(&ctx.work_scope, window_id).await
+            {
+                assert_eq!(evidence.status, TmuxTerminalStatus::Exited);
+                assert!(evidence.tail.contains("instant-exit"));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restart inspection missed exit evidence"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        loop {
+            let capture = tokio::process::Command::new("tmux")
+                .args([
+                    "-S",
+                    &socket.to_string_lossy(),
+                    "capture-pane",
+                    "-p",
+                    "-t",
+                    window_id,
+                ])
+                .env_remove("TMUX")
+                .status()
+                .await
+                .unwrap();
+            if !capture.success() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "observer did not clean durable pane"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(matches!(
+            restarted.inspect_window(&ctx.work_scope, window_id).await,
+            Ok(TmuxWindowInspection::Terminal(_))
+        ));
+        kill_socket(&socket).await;
+    }
+
+    #[tokio::test]
     async fn wait_for_text_with_keep_closed_observes_then_kills_window() {
         if skip_unless_tmux() {
             return;
@@ -913,7 +1142,7 @@ mod tests {
         let ctx = ctx(
             "tmux-run-close-after-ready",
             cwd_tmp.path().canonicalize().unwrap(),
-            registry,
+            registry.clone(),
             None,
         );
 
@@ -929,7 +1158,7 @@ mod tests {
                         "timeout_seconds": 5
                     }
                 }),
-                ctx,
+                ctx.clone(),
             )
             .await;
         assert!(result.is_success(), "got: {}", result.output());
@@ -940,23 +1169,37 @@ mod tests {
         let sock = socket_tmp
             .path()
             .join("conv-tmux-run-close-after-ready.sock");
-        let capture = tokio::process::Command::new("tmux")
-            .args([
-                "-S",
-                &sock.to_string_lossy(),
-                "capture-pane",
-                "-p",
-                "-t",
-                window_id,
-            ])
-            .env_remove("TMUX")
-            .status()
-            .await
-            .unwrap();
-        assert!(
-            !capture.success(),
-            "window should be killed after observation"
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let capture = tokio::process::Command::new("tmux")
+                .args([
+                    "-S",
+                    &sock.to_string_lossy(),
+                    "capture-pane",
+                    "-p",
+                    "-t",
+                    window_id,
+                ])
+                .env_remove("TMUX")
+                .status()
+                .await
+                .unwrap();
+            if !capture.success() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "window should be killed after observation"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let Ok(TmuxWindowInspection::Terminal(evidence)) =
+            registry.inspect_window(&ctx.work_scope, window_id).await
+        else {
+            panic!("Phoenix-killed window must retain evidence");
+        };
+        assert_eq!(evidence.status, TmuxTerminalStatus::Exited);
+        assert!(evidence.tail.contains("closes-after-ready"));
         kill_socket(&sock).await;
     }
 

@@ -116,6 +116,26 @@ THE SYSTEM SHALL ignore the `--model` flag (model is fixed at creation time)
 
 ---
 
+### REQ-CLI-009: Wake Status Inspection
+
+WHEN a user requests wake status for a conversation identifier
+THE SYSTEM SHALL retrieve the conversation's durable wake-contract snapshot
+AND display the pending count and soonest expiry
+AND display each contract's identifier, handle kind and identifier, expiry, status, terminal cause, and forgotten reason
+
+WHEN machine-readable output is requested
+THE SYSTEM SHALL print the API snapshot as JSON without creating a second semantic representation
+
+WHEN the conversation identifier contains URL-reserved characters
+THE SYSTEM SHALL encode it as one URL path segment
+
+WHEN the API rejects a wake-status request
+THE SYSTEM SHALL exit non-zero with the HTTP status and server-provided detail
+
+**Rationale:** Agents and operators need a compact way to inspect pending and terminal wake delivery state without opening the web UI.
+
+---
+
 ### REQ-CLI-007: Single File Distribution
 
 WHEN client is distributed

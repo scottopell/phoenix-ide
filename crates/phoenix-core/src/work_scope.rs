@@ -59,9 +59,15 @@ impl WorkScope {
     /// because `stable_key` splits on the *first* colon).
     #[must_use]
     pub fn from_stable_key(key: &str) -> Option<Self> {
-        if let Some(path) = key.strip_prefix("worktree:") {
+        if let Some(path) = key
+            .strip_prefix("worktree:")
+            .filter(|value| !value.is_empty())
+        {
             Some(Self::Worktree(path.to_string()))
-        } else if let Some(id) = key.strip_prefix("conversation:") {
+        } else if let Some(id) = key
+            .strip_prefix("conversation:")
+            .filter(|value| !value.is_empty())
+        {
             Some(Self::Conversation(id.to_string()))
         } else if key == "global:" {
             Some(Self::Global)
@@ -136,6 +142,8 @@ mod tests {
     fn from_stable_key_rejects_unknown_namespace() {
         assert_eq!(WorkScope::from_stable_key("bogus:foo"), None);
         assert_eq!(WorkScope::from_stable_key(""), None);
+        assert_eq!(WorkScope::from_stable_key("worktree:"), None);
+        assert_eq!(WorkScope::from_stable_key("conversation:"), None);
         // `global` without the trailing colon is not the singleton key.
         assert_eq!(WorkScope::from_stable_key("global"), None);
     }

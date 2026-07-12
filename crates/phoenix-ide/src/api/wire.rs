@@ -254,6 +254,15 @@ pub enum SseWireEvent {
         /// event. Q3 resolution in `sse_wire.allium`.
         pending_truncated: bool,
     },
+    /// Full replacement of durable wake-contract status for this conversation.
+    WakeStatusUpdate {
+        snapshot: crate::api::types::WakeStatusSnapshot,
+    },
+    /// Private, best-effort live edge emitted after durable wake registration.
+    WakeContractRegistered {
+        sequence_id: i64,
+        registration: phoenix_core::domain::wake_contracts::WakeContractRegistered,
+    },
     /// A newly-persisted message joins the conversation. The envelope
     /// `sequence_id` equals `message.sequence_id` by construction.
     Message {
@@ -400,6 +409,8 @@ impl SseWireEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
             SseWireEvent::Init { .. } => "init",
+            SseWireEvent::WakeStatusUpdate { .. } => "wake_status_update",
+            SseWireEvent::WakeContractRegistered { .. } => "wake_contract_registered",
             SseWireEvent::Message { .. } => "message",
             SseWireEvent::MessageUpdated { .. } => "message_updated",
             SseWireEvent::StateChange { .. } => "state_change",
@@ -449,6 +460,13 @@ impl From<SseEvent> for SseWireEvent {
                 pending_anchor_sequence_id,
                 pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),
                 pending_truncated,
+            },
+            SseEvent::WakeContractRegistered {
+                sequence_id,
+                registration,
+            } => SseWireEvent::WakeContractRegistered {
+                sequence_id,
+                registration,
             },
             SseEvent::Message { message } => {
                 // The envelope `sequence_id` equals `message.sequence_id` —

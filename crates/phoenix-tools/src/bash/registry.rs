@@ -168,6 +168,18 @@ impl WorkScopeHandles {
     }
 }
 
+/// Read-only wake evaluation for a scope-owned bash handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BashHandleInspection {
+    Unknown,
+    Live,
+    Terminal {
+        observed_at: chrono::DateTime<chrono::Utc>,
+        payload: phoenix_core::domain::wake_contracts::WakeBashFiredPayload,
+        tails: Vec<String>,
+    },
+}
+
 /// Signal published when a bash handle in a `WorkScope` changes state
 /// (spawned, transitioned to terminal, or killed). Mirrors the browser
 /// `BrowserSessionLifecycleEvent` shape: it carries only the affected
@@ -308,6 +320,53 @@ impl BashHandleRegistry {
         entry
     }
 
+    /// Verify that publishing `new` as an alias of `old` would not clobber
+    /// an unrelated destination entry. This does not mutate the registry.
+    pub async fn preflight_alias_scope(&self, old: &WorkScope, new: &WorkScope) -> bool {
+        if old == new {
+            return true;
+        }
+        let map = self.inner.read().await;
+        let Some(entry) = map.get(old) else {
+            return true;
+        };
+        map.get(new)
+            .is_none_or(|destination| Arc::ptr_eq(destination, entry))
+    }
+
+    /// Remove only an alias that still points at the same entry as `old`.
+    pub async fn rollback_alias_scope(&self, old: &WorkScope, new: &WorkScope) {
+        if old == new {
+            return;
+        }
+        let mut map = self.inner.write().await;
+        let should_remove = match (map.get(old), map.get(new)) {
+            (Some(old_entry), Some(new_entry)) => Arc::ptr_eq(old_entry, new_entry),
+            _ => false,
+        };
+        if should_remove {
+            map.remove(new);
+        }
+    }
+
+    /// Add `new` as an alias of `old` without removing either lookup key.
+    /// The write lock makes the alias appear atomically to concurrent inspectors.
+    /// A destination collision is surfaced as `false` and leaves both entries intact.
+    pub async fn alias_scope(&self, old: &WorkScope, new: &WorkScope) -> bool {
+        if old == new {
+            return true;
+        }
+        let mut map = self.inner.write().await;
+        let Some(entry) = map.get(old).cloned() else {
+            return true;
+        };
+        if let Some(destination) = map.get(new) {
+            return Arc::ptr_eq(destination, &entry);
+        }
+        map.insert(new.clone(), entry);
+        true
+    }
+
     /// Move a `WorkScope`'s handle table from `old` to `new`.
     ///
     /// Used at an Explore→Work approval, where the conversation's scope flips
@@ -328,14 +387,16 @@ impl BashHandleRegistry {
             return false;
         }
         let mut map = self.inner.write().await;
-        if map.contains_key(new) {
-            if map.contains_key(old) {
-                tracing::warn!(
-                    old = %old,
-                    new = %new,
-                    "bash: refusing to rekey handle table — destination scope already occupied; leaving both entries in place"
-                );
+        if let (Some(old_entry), Some(new_entry)) = (map.get(old), map.get(new)) {
+            if Arc::ptr_eq(old_entry, new_entry) {
+                map.remove(old);
+                return true;
             }
+            tracing::warn!(
+                old = %old,
+                new = %new,
+                "bash: refusing to rekey handle table — destination scope already occupied; leaving both entries in place"
+            );
             return false;
         }
         let Some(entry) = map.remove(old) else {
@@ -356,6 +417,43 @@ impl BashHandleRegistry {
         work_scope: &WorkScope,
     ) -> Option<Arc<RwLock<WorkScopeHandles>>> {
         self.inner.read().await.get(work_scope).cloned()
+    }
+
+    /// Inspect a handle without creating a missing scope table.
+    pub async fn inspect(&self, work_scope: &WorkScope, handle_id: &str) -> BashHandleInspection {
+        use phoenix_core::domain::wake_contracts::{WakeBashFiredPayload, WakeBashObservedStatus};
+
+        let Some(table) = self.get_existing(work_scope).await else {
+            return BashHandleInspection::Unknown;
+        };
+        let Some(handle) = table.read().await.get(&HandleId::new(handle_id)) else {
+            return BashHandleInspection::Unknown;
+        };
+        let state = handle.state().await;
+        match state.as_ref() {
+            super::handle::HandleState::Live(_) => BashHandleInspection::Live,
+            super::handle::HandleState::Tombstoned(tomb) => {
+                let status = match tomb.final_cause {
+                    super::handle::FinalCause::Exited { .. } => WakeBashObservedStatus::Exited,
+                    super::handle::FinalCause::Killed { .. } => WakeBashObservedStatus::Killed,
+                };
+                BashHandleInspection::Terminal {
+                    observed_at: chrono::DateTime::<chrono::Utc>::from(tomb.finished_at),
+                    payload: WakeBashFiredPayload {
+                        status,
+                        exit_code: tomb.exit_code.map(i64::from),
+                        duration_ms: Some(i64::try_from(tomb.duration_ms).unwrap_or(i64::MAX)),
+                        signal_number: tomb.signal_number.map(i64::from),
+                        kill_signal_sent: tomb.kill_signal_sent,
+                    },
+                    tails: tomb
+                        .final_tail
+                        .iter()
+                        .map(|line| String::from_utf8_lossy(&line.bytes).into_owned())
+                        .collect(),
+                }
+            }
+        }
     }
 
     /// Snapshot live process-group ids across ALL work scopes, for the

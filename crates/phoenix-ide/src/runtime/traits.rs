@@ -149,12 +149,32 @@ pub trait StateStore: Send + Sync {
         state_updated_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String>;
 
+    /// Atomically persist an accepting wake state and acknowledge its outbox row.
+    async fn accept_wake_resume_state(
+        &self,
+        conv_id: &str,
+        message_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String>;
+
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String>;
 
     /// Update the conversation mode (e.g., Explore -> Work on task approval)
+    #[allow(dead_code)] // Non-approval mode updates use this narrower operation.
     async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String>;
+
+    /// Atomically persist approval mode/cwd and pending wake scope migration.
+    async fn commit_approval_scope_transfer(
+        &self,
+        conv_id: &str,
+        mode: &ConvMode,
+        cwd: &str,
+        old_scope: &phoenix_core::work_scope::WorkScope,
+        new_scope: &phoenix_core::work_scope::WorkScope,
+    ) -> Result<u64, String>;
 
     /// Get the current conversation mode (used by effect handlers that need
     /// worktree path / branch name, since `ConvContext.mode` only carries the
@@ -433,12 +453,37 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
             .await
     }
 
+    async fn accept_wake_resume_state(
+        &self,
+        conv_id: &str,
+        message_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .accept_wake_resume_state(conv_id, message_id, state, state_updated_at)
+            .await
+    }
+
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         (**self).get_state(conv_id).await
     }
 
     async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
         (**self).update_conversation_mode(conv_id, mode).await
+    }
+
+    async fn commit_approval_scope_transfer(
+        &self,
+        conv_id: &str,
+        mode: &ConvMode,
+        cwd: &str,
+        old_scope: &phoenix_core::work_scope::WorkScope,
+        new_scope: &phoenix_core::work_scope::WorkScope,
+    ) -> Result<u64, String> {
+        (**self)
+            .commit_approval_scope_transfer(conv_id, mode, cwd, old_scope, new_scope)
+            .await
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<ConvMode, String> {
@@ -740,6 +785,19 @@ impl StateStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    async fn accept_wake_resume_state(
+        &self,
+        conv_id: &str,
+        message_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .accept_wake_resume_state(conv_id, message_id, state, state_updated_at)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
         let conv = self
             .db
@@ -752,6 +810,20 @@ impl StateStore for DatabaseStorage {
     async fn update_conversation_mode(&self, conv_id: &str, mode: &ConvMode) -> Result<(), String> {
         self.db
             .update_conversation_mode(conv_id, mode)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn commit_approval_scope_transfer(
+        &self,
+        conv_id: &str,
+        mode: &ConvMode,
+        cwd: &str,
+        old_scope: &phoenix_core::work_scope::WorkScope,
+        new_scope: &phoenix_core::work_scope::WorkScope,
+    ) -> Result<u64, String> {
+        self.db
+            .commit_approval_scope_transfer(conv_id, mode, cwd, old_scope, new_scope)
             .await
             .map_err(|e| e.to_string())
     }

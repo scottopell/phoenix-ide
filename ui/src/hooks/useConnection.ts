@@ -22,6 +22,8 @@ import {
   SseSteerMessageQueuedDataSchema,
   SseRateLimitSnapshotDataSchema,
   SseWorkScopeUpdateDataSchema,
+  SseWakeStatusUpdateDataSchema,
+  SseWakeContractRegisteredDataSchema,
 } from '../sseSchemas';
 import {
   ConnectionState,
@@ -305,6 +307,31 @@ export function useConnection({
             stampedDispatch({
               type: 'sse_init',
               payload,
+            });
+          });
+
+          on('wake_contract_registered', (e) => {
+            // Validate the private edge but keep the durable full snapshot as
+            // the sole UI representation of wake state.
+            parseEvent(
+              SseWakeContractRegisteredDataSchema,
+              e,
+              'wake_contract_registered',
+              stampedDispatch,
+            );
+          });
+
+          on('wake_status_update', (e) => {
+            const res = parseEvent(
+              SseWakeStatusUpdateDataSchema,
+              e,
+              'wake_status_update',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_wake_status_update',
+              snapshot: res.data.snapshot,
             });
           });
 

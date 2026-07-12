@@ -119,6 +119,8 @@ it needs to choose which handle to retire.
 ---
 
 ### REQ-BASH-003: Handle Operations (Peek, Wait, Kill)
+Wake-contract terminal waits for bash handles are specified in `specs/wake-contracts/`. This spec defines the synchronous handle surfaces and the WorkScope ownership facts that wake registration is authorized against; it does not restate wake registration, receipts, inbox delivery, or continuation-resume mechanics.
+
 
 WHEN agent calls `bash(peek=<handle>, ...)`
 THE SYSTEM SHALL return the current state of the handle, including:
@@ -746,6 +748,10 @@ WHEN a handle id owned by one `WorkScope` is presented in a call running under a
 different `WorkScope`
 THE SYSTEM SHALL return `error: "handle_not_found"` (no cross-scope leakage of
 handle existence)
+
+WHEN a wake contract is registered against a bash handle
+THE SYSTEM SHALL authorize that registration using the same `WorkScope`-keyed ownership test that governs peek/wait/kill reachability
+AND SHALL treat the synchronous terminal metadata defined by REQ-BASH-003, REQ-BASH-004, and REQ-BASH-006 as the authoritative bash evidence surface consumed by `specs/wake-contracts/`
 
 **Rationale:** A backgrounded process is a `WorkScope`-level resource, like the
 tmux server and browser session that share its worktree. Conversation-keying

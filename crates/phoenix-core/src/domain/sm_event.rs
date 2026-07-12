@@ -233,6 +233,14 @@ pub enum Event {
         entries: Vec<SteerEntry>,
     },
 
+    /// A durable wake outbox request. The meta-user message already exists;
+    /// accepting this event atomically persists `LlmRequesting` and marks the
+    /// matching outbox row accepted.
+    WakeResume {
+        message_id: String,
+        text: String,
+    },
+
     /// Sent by `RuntimeManager::evict_runtime` (e.g. after a model upgrade)
     /// to cleanly terminate a running runtime that is being replaced.
     /// The executor returns from `run()` immediately on receipt, which drops
@@ -276,6 +284,7 @@ impl Event {
             Event::SteerMessage { .. } => "SteerMessage",
             Event::CancelSteerMessage { .. } => "CancelSteerMessage",
             Event::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
+            Event::WakeResume { .. } => "WakeResume",
             Event::Shutdown => "Shutdown",
         }
     }
@@ -361,6 +370,10 @@ pub enum CoreEvent {
     /// See `specs/steering-messages/` for the queue mechanism.
     SteerDrainedUserMessages {
         entries: Vec<SteerEntry>,
+    },
+    WakeResume {
+        message_id: String,
+        text: String,
     },
 }
 
@@ -545,6 +558,12 @@ impl TryFrom<Event> for ParentEvent {
                     entries,
                 }))
             }
+            Event::WakeResume { message_id, text } => {
+                Ok(ParentEvent::Core(CoreEvent::WakeResume {
+                    message_id,
+                    text,
+                }))
+            }
             // Parent-only events
             Event::TaskApprovalDecided { outcome } => {
                 Ok(ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
@@ -719,6 +738,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::SteerMessage { .. }
             | Event::CancelSteerMessage { .. }
             | Event::SteerDrainedUserMessages { .. }
+            | Event::WakeResume { .. }
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",
@@ -744,6 +764,7 @@ impl CoreEvent {
             CoreEvent::ContinuationResponse { .. } => "ContinuationResponse",
             CoreEvent::ContinuationFailed { .. } => "ContinuationFailed",
             CoreEvent::UserTriggerContinuation => "UserTriggerContinuation",
+            CoreEvent::WakeResume { .. } => "WakeResume",
             CoreEvent::SteerDrainedUserMessages { .. } => "SteerDrainedUserMessages",
         }
     }

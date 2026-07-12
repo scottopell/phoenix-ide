@@ -118,6 +118,7 @@ impl AppState {
             credential_helper.clone(),
         ));
         runtime.start_sub_agent_handler().await;
+        runtime.start_wake_plane().await;
         runtime.start_browser_lifecycle_bridge().await;
         runtime.start_work_scope_bridge().await;
         tokio::spawn(crate::runtime::pr_status_poll::run(runtime.clone()));

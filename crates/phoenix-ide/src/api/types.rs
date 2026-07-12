@@ -208,6 +208,168 @@ pub struct ConversationMessagesAroundResponse {
     pub server_message_tail: Option<i64>,
 }
 
+/// Durable wake-contract state for one conversation.
+///
+/// This is shared by `GET /api/conversations/:id/wakes` and the
+/// `wake_status_update` SSE full-snapshot event. It deliberately exposes only
+/// status/UI fields; terminal payloads and inbox-delivery bookkeeping remain
+/// on their dedicated durable surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct WakeStatusSnapshot {
+    pub conversation_id: String,
+    pub pending_count: usize,
+    pub soonest_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    pub lifecycle_blocked: bool,
+    pub contracts: Vec<WakeContractStatus>,
+}
+
+impl WakeStatusSnapshot {
+    /// Read a complete wake-status replacement from durable database state.
+    pub async fn load(db: &crate::db::Database, conversation_id: &str) -> Result<Self, String> {
+        let contracts = db
+            .list_wake_contracts_for_conversation(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let pending_count = contracts
+            .iter()
+            .filter(|contract| {
+                contract.status == phoenix_core::domain::wake_contracts::WakeContractStatus::Pending
+            })
+            .count();
+        let soonest_expiry = contracts
+            .iter()
+            .filter(|contract| {
+                contract.status == phoenix_core::domain::wake_contracts::WakeContractStatus::Pending
+            })
+            .map(|contract| contract.expires_at)
+            .min();
+        Ok(Self {
+            conversation_id: conversation_id.to_string(),
+            pending_count,
+            soonest_expiry,
+            lifecycle_blocked: pending_count > 0,
+            contracts: contracts
+                .into_iter()
+                .map(WakeContractStatus::from)
+                .collect(),
+        })
+    }
+}
+
+/// Compact contract row carried by [`WakeStatusSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct WakeContractStatus {
+    pub id: String,
+    pub handle: WakeContractHandle,
+    pub registered_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub status: WakeStatus,
+    pub cause: Option<WakeCause>,
+    pub forgotten_reason: Option<WakeForgottenReason>,
+}
+
+impl From<phoenix_core::domain::wake_contracts::WakeContract> for WakeContractStatus {
+    fn from(contract: phoenix_core::domain::wake_contracts::WakeContract) -> Self {
+        Self {
+            id: contract.id,
+            handle: contract.handle.into(),
+            registered_at: contract.registered_at,
+            expires_at: contract.expires_at,
+            status: contract.status.into(),
+            cause: contract.terminal_cause.map(WakeCause::from),
+            forgotten_reason: contract.forgotten_reason.map(WakeForgottenReason::from),
+        }
+    }
+}
+
+/// Tagged handle identity for a wake contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum WakeContractHandle {
+    Bash { id: String },
+    TmuxWindow { id: String },
+}
+
+impl From<phoenix_core::domain::wake_contracts::WakeContractHandle> for WakeContractHandle {
+    fn from(handle: phoenix_core::domain::wake_contracts::WakeContractHandle) -> Self {
+        match handle {
+            phoenix_core::domain::wake_contracts::WakeContractHandle::Bash { handle_id } => {
+                Self::Bash { id: handle_id }
+            }
+            phoenix_core::domain::wake_contracts::WakeContractHandle::TmuxWindow { handle_id } => {
+                Self::TmuxWindow { id: handle_id }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum WakeStatus {
+    Pending,
+    Fired,
+    Cancelled,
+    Expired,
+    Forgotten,
+}
+
+impl From<phoenix_core::domain::wake_contracts::WakeContractStatus> for WakeStatus {
+    fn from(status: phoenix_core::domain::wake_contracts::WakeContractStatus) -> Self {
+        use phoenix_core::domain::wake_contracts::WakeContractStatus as Core;
+        match status {
+            Core::Pending => Self::Pending,
+            Core::Fired => Self::Fired,
+            Core::Cancelled => Self::Cancelled,
+            Core::Expired => Self::Expired,
+            Core::Forgotten => Self::Forgotten,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum WakeCause {
+    Fired,
+    Cancelled,
+    Expired,
+    Forgotten,
+}
+
+impl From<phoenix_core::domain::wake_contracts::WakeTerminalCause> for WakeCause {
+    fn from(cause: phoenix_core::domain::wake_contracts::WakeTerminalCause) -> Self {
+        use phoenix_core::domain::wake_contracts::WakeTerminalCause as Core;
+        match cause {
+            Core::Fired => Self::Fired,
+            Core::Cancelled => Self::Cancelled,
+            Core::Expired => Self::Expired,
+            Core::Forgotten => Self::Forgotten,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub enum WakeForgottenReason {
+    HandleMissing,
+    RuntimeUnrecoverableAfterRestart,
+}
+
+impl From<phoenix_core::domain::wake_contracts::WakeForgottenReason> for WakeForgottenReason {
+    fn from(reason: phoenix_core::domain::wake_contracts::WakeForgottenReason) -> Self {
+        use phoenix_core::domain::wake_contracts::WakeForgottenReason as Core;
+        match reason {
+            Core::HandleMissing => Self::HandleMissing,
+            Core::RuntimeUnrecoverableAfterRestart => Self::RuntimeUnrecoverableAfterRestart,
+        }
+    }
+}
+
 /// Response for chat action
 #[derive(Debug, Serialize)]
 pub struct ChatResponse {

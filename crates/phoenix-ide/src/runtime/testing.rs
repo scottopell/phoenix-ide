@@ -488,6 +488,9 @@ pub struct InMemoryStorage {
     fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
     clear_watermarks: Mutex<HashMap<String, i64>>,
     last_prompt_tokens: Mutex<HashMap<String, i64>>,
+    persist_tool_round_attempts: Mutex<u64>,
+    fail_next_tool_round_persist: Mutex<bool>,
+    fail_next_state_persist: Mutex<bool>,
     // Fault injection for the clearing-assembly failure paths (REQ-STR-007).
     fail_watermark_read: Mutex<bool>,
     fail_watermark_write: Mutex<bool>,
@@ -505,9 +508,24 @@ impl InMemoryStorage {
             fork_proposals: Mutex::new(Vec::new()),
             clear_watermarks: Mutex::new(HashMap::new()),
             last_prompt_tokens: Mutex::new(HashMap::new()),
+            persist_tool_round_attempts: Mutex::new(0),
+            fail_next_tool_round_persist: Mutex::new(false),
+            fail_next_state_persist: Mutex::new(false),
             fail_watermark_read: Mutex::new(false),
             fail_watermark_write: Mutex::new(false),
         }
+    }
+
+    pub fn fail_next_tool_round_persist(&self) {
+        *self.fail_next_tool_round_persist.lock().unwrap() = true;
+    }
+
+    pub fn fail_next_state_persist(&self) {
+        *self.fail_next_state_persist.lock().unwrap() = true;
+    }
+
+    pub fn persist_tool_round_attempts(&self) -> u64 {
+        *self.persist_tool_round_attempts.lock().unwrap()
     }
 
     /// Seed the most-recent-turn prompt size (the clearing pressure signal).
@@ -785,6 +803,13 @@ impl MessageStore for InMemoryStorage {
         assistant: &Message,
         tool_results: &[Message],
     ) -> Result<(), String> {
+        *self.persist_tool_round_attempts.lock().unwrap() += 1;
+        let mut fail = self.fail_next_tool_round_persist.lock().unwrap();
+        if *fail {
+            *fail = false;
+            return Err("injected tool-round checkpoint failure".to_string());
+        }
+        drop(fail);
         let mut messages = self.messages.lock().unwrap();
         let bucket = messages.entry(conv_id.to_string()).or_default();
         bucket.push(assistant.clone());
@@ -805,11 +830,27 @@ impl StateStore for InMemoryStorage {
     ) -> Result<(), String> {
         // In-memory test storage tracks only the state value, not its entry
         // timestamp, so the threaded stamp is intentionally unused here.
+        let mut fail = self.fail_next_state_persist.lock().unwrap();
+        if *fail {
+            *fail = false;
+            return Err("injected state persistence failure".to_string());
+        }
+        drop(fail);
         self.states
             .lock()
             .unwrap()
             .insert(conv_id.to_string(), state.clone());
         Ok(())
+    }
+
+    async fn accept_wake_resume_state(
+        &self,
+        conv_id: &str,
+        _message_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.update_state(conv_id, state, state_updated_at).await
     }
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
@@ -832,6 +873,21 @@ impl StateStore for InMemoryStorage {
             .unwrap()
             .insert(conv_id.to_string(), mode.clone());
         Ok(())
+    }
+
+    async fn commit_approval_scope_transfer(
+        &self,
+        conv_id: &str,
+        mode: &crate::db::ConvMode,
+        _cwd: &str,
+        _old_scope: &phoenix_core::work_scope::WorkScope,
+        _new_scope: &phoenix_core::work_scope::WorkScope,
+    ) -> Result<u64, String> {
+        self.modes
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), mode.clone());
+        Ok(0)
     }
 
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<crate::db::ConvMode, String> {
