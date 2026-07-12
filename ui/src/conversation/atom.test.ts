@@ -124,6 +124,24 @@ describe('conversationReducer', () => {
       expect(next.messages.map((message) => message.sequence_id)).toEqual([40, 50, 51]);
     });
 
+    it('replaces a suffix snapshot when the local transcript generation is unknown', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        messages: [makeMessage(40), makeMessage(50)],
+        transcriptGeneration: null,
+      };
+      const payload = makeInitPayload({
+        messages: [makeMessage(51)],
+        transcriptGeneration: 3,
+        messageSnapshot: 'suffix',
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.messages.map((message) => message.sequence_id)).toEqual([51]);
+      expect(next.transcriptGeneration).toBe(3);
+    });
+
     it('replaces a REST tail when the SSE transcript generation changed', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),

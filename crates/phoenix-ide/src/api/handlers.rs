@@ -2804,6 +2804,13 @@ fn db_message_selection_for_stream(
     last_sequence_id: i64,
     transcript_generation: i64,
 ) -> StreamDbMessageSelection {
+    if query
+        .transcript_generation
+        .is_some_and(|query_generation| query_generation != transcript_generation)
+    {
+        return StreamDbMessageSelection::Full;
+    }
+
     if cursor_replay_served
         && query
             .after_event_sequence
@@ -7735,6 +7742,22 @@ pub(crate) mod hard_delete_cascade_tests {
                 1,
             ),
             StreamDbMessageSelection::None
+        );
+        assert_eq!(
+            db_message_selection_for_stream(
+                true,
+                &StreamConversationQuery {
+                    after_event_sequence: Some(10),
+                    after_sequence: None,
+                    init_mode: None,
+                    after_message_floor: None,
+                    transcript_generation: Some(2),
+                },
+                10,
+                3,
+            ),
+            StreamDbMessageSelection::Full,
+            "a served cursor covering the DB tail cannot omit DB messages when the supplied transcript generation is stale"
         );
         assert_eq!(
             db_message_selection_for_stream(

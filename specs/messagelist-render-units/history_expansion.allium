@@ -67,7 +67,7 @@ surface HistoryExpansionController {
         LoadedTargetRequested(view, command_token, target_message_id)
         DeepLinkTargetChanged(view, target_message_id)
         HistoryLoaded(view, request_token, command_token, view_generation, transcript_generation, target_present)
-        HistoryLoadFailed(view, request_token, view_generation, message)
+        HistoryLoadFailed(view, request_token, view_generation, transcript_generation, message)
         ScrollCommandAcknowledged(view, command_token, view_generation, result)
         ExplicitRetryRequested(view, request_token, snapshot_event_seq)
         StreamingTailAdvanced(view)
@@ -262,11 +262,24 @@ rule MissingDeepLinkTargetTerminatesAttempt {
     ensures: view.active_request = null
 }
 
+rule StaleHistoryFailureCannotMutateView {
+    when: HistoryLoadFailed(view, request_token, view_generation, transcript_generation, _)
+    requires: view.active_request = null
+        or request_token != view.active_request.token
+        or view_generation != view.view_generation
+        or transcript_generation != view.transcript_generation
+    ensures: view.coverage = view.coverage
+    ensures: view.active_request = view.active_request
+    ensures: view.pending_command = view.pending_command
+    ensures: view.failure = view.failure
+}
+
 rule MatchingFailureLeavesTailUsable {
-    when: HistoryLoadFailed(view, request_token, view_generation, message)
+    when: HistoryLoadFailed(view, request_token, view_generation, transcript_generation, message)
     requires: view.active_request != null
     requires: request_token = view.active_request.token
     requires: view_generation = view.view_generation
+    requires: transcript_generation = view.transcript_generation
     ensures: view.coverage = tail
     ensures: view.pending_command = null
     ensures: view.failure = HistoryFailure(
@@ -335,6 +348,7 @@ contract HistoryExpansionSafety {
         -- duplicate, or replace the previously loaded suffix.
 
     @invariant StaleResponsesAndAcknowledgementsHaveNoEffect
-        -- Results not matching the current view generation and active token
-        -- cannot mutate coverage, failure, or positioning obligations.
+        -- Results not matching the current view generation, transcript
+        -- generation, and active token cannot mutate coverage, failure, or
+        -- positioning obligations.
 }

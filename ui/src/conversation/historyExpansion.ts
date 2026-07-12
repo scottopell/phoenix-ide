@@ -39,7 +39,7 @@ export type HistoryScrollCommand =
     };
 
 export type HistoryFailure =
-  | { kind: 'request_failed'; message: string; intent: HistoryIntent }
+  | { kind: 'request_failed'; message: string; intent: HistoryIntent; transcriptGeneration: number }
   | { kind: 'target_not_found'; targetMessageId: string }
   | { kind: 'anchor_not_found'; anchorMessageId: string };
 
@@ -63,7 +63,7 @@ export type HistoryExpansionEvent =
       targetPresent: boolean;
       commandToken: HistoryCommandToken;
     }
-  | { type: 'history_failed'; requestToken: number; view: HistoryView; message: string }
+  | { type: 'history_failed'; requestToken: number; view: HistoryView; transcriptGeneration: number; message: string }
   | {
       type: 'command_acknowledged';
       commandToken: number;
@@ -176,12 +176,22 @@ export function reduceHistoryExpansion(
 
     case 'history_failed': {
       const request = state.activeRequest;
-      if (!request || request.token !== event.requestToken || !sameView(request.view, event.view)) return state;
+      if (!request
+        || request.token !== event.requestToken
+        || !sameView(request.view, event.view)
+        || event.transcriptGeneration !== state.view.transcriptGeneration) {
+        return state;
+      }
       return {
         ...state,
         activeRequest: null,
         pendingCommand: null,
-        failure: { kind: 'request_failed', message: event.message, intent: request.intent },
+        failure: {
+          kind: 'request_failed',
+          message: event.message,
+          intent: request.intent,
+          transcriptGeneration: event.transcriptGeneration,
+        },
       };
     }
 

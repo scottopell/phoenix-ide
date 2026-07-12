@@ -124,6 +124,21 @@ describe('history expansion reducer', () => {
     })).toBe(state);
   });
 
+  it('rejects a failure from the wrong transcript generation and preserves the active request', () => {
+    const currentView = view('a', 1, 2);
+    const state = reduceHistoryExpansion(initialHistoryExpansionState(currentView, true), {
+      type: 'request_started', request: manualRequest(currentView),
+    });
+
+    expect(reduceHistoryExpansion(state, {
+      type: 'history_failed',
+      requestToken: 1,
+      view: currentView,
+      transcriptGeneration: 1,
+      message: 'offline',
+    })).toBe(state);
+  });
+
   it('manual retry is explicit and uses a fresh token', () => {
     const currentView = view('a', 1);
     const first = deepLinkRequest(currentView, 1);
@@ -131,7 +146,7 @@ describe('history expansion reducer', () => {
       type: 'request_started', request: first,
     });
     state = reduceHistoryExpansion(state, {
-      type: 'history_failed', requestToken: 1, view: currentView, message: 'offline',
+      type: 'history_failed', requestToken: 1, view: currentView, transcriptGeneration: currentView.transcriptGeneration, message: 'offline',
     });
     const beforeRetry = state;
     const retry = deepLinkRequest(currentView, 2);
@@ -239,6 +254,7 @@ describe('history expansion reducer', () => {
         kind: 'request_failed' as const,
         message: 'offline',
         intent: { kind: 'deep_link' as const, targetMessageId: 'm1' },
+        transcriptGeneration: currentView.transcriptGeneration,
       },
     };
 
@@ -254,9 +270,14 @@ describe('history expansion reducer', () => {
       type: 'request_started', request,
     });
     state = reduceHistoryExpansion(state, {
-      type: 'history_failed', requestToken: 1, view: currentView, message: 'offline',
+      type: 'history_failed', requestToken: 1, view: currentView, transcriptGeneration: currentView.transcriptGeneration, message: 'offline',
     });
     expect(state).toMatchObject({ coverage: 'tail', activeRequest: null, pendingCommand: null });
-    expect(state.failure).toEqual({ kind: 'request_failed', message: 'offline', intent: request.intent });
+    expect(state.failure).toEqual({
+      kind: 'request_failed',
+      message: 'offline',
+      intent: request.intent,
+      transcriptGeneration: currentView.transcriptGeneration,
+    });
   });
 });

@@ -851,6 +851,8 @@ function ConversationPageContent() {
       snapshotStartedAtEventSeq: eventCursorRef.current,
       intent,
     };
+    const requestTranscriptGeneration = request.view.transcriptGeneration;
+
     dispatchHistoryExpansion({ type: 'request_started', request });
     try {
       const result = await getConversationForRoute(slug);
@@ -868,6 +870,7 @@ function ConversationPageContent() {
           type: 'history_failed',
           requestToken: request.token,
           view: request.view,
+          transcriptGeneration: requestTranscriptGeneration,
           message: 'Conversation changed while loading earlier history',
         });
         return;
@@ -905,6 +908,7 @@ function ConversationPageContent() {
         type: 'history_failed',
         requestToken: request.token,
         view: request.view,
+        transcriptGeneration: requestTranscriptGeneration,
         message: err instanceof Error ? err.message : 'Failed to load earlier history',
       });
     }
