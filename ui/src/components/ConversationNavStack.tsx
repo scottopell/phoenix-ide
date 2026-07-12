@@ -20,7 +20,9 @@ type StackProps = Omit<
  * active index. Renders the nav as a fixed-height strip above the list.
  */
 export const ConversationNavStack = memo(function ConversationNavStack(props: StackProps) {
+  const { onLoadOlderMessages } = props;
   const listRef = useRef<MessageListHandle>(null);
+  const [preservedHistoryAnchorId, setPreservedHistoryAnchorId] = useState<string | null>(null);
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [activeUnitIndex, setActiveUnitIndex] = useState<number | null>(null);
 
@@ -41,6 +43,11 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
     listRef.current?.scrollToUnitIndex(unitIndex);
   }, []);
 
+  const handleLoadOlderMessages = useCallback(() => {
+    setPreservedHistoryAnchorId(listRef.current?.getFirstVisibleMessageId() ?? null);
+    onLoadOlderMessages?.();
+  }, [onLoadOlderMessages]);
+
   return (
     <>
       <ConversationNav
@@ -51,6 +58,8 @@ export const ConversationNavStack = memo(function ConversationNavStack(props: St
       <MessageList
         ref={listRef}
         {...props}
+        onLoadOlderMessages={onLoadOlderMessages ? handleLoadOlderMessages : undefined}
+        preservedHistoryAnchorId={preservedHistoryAnchorId}
         onChaptersChange={handleChaptersChange}
         onVisibleRangeChange={handleVisibleRangeChange}
       />

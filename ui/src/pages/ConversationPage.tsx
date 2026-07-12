@@ -251,6 +251,7 @@ function ConversationPageContent() {
   const [deletingConversation, setDeletingConversation] = useState(false);
   const [hasOlderMessages, setHasOlderMessages] = useState(false);
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const [olderHistoryError, setOlderHistoryError] = useState<string | null>(null);
 
   // File explorer context (shared with desktop panel) — a projection of the
   // unified viewer slot below.
@@ -516,6 +517,7 @@ function ConversationPageContent() {
     setArchiveStatusConfirmedConversationId(null);
     setHasOlderMessages(false);
     setLoadingOlderMessages(false);
+    setOlderHistoryError(null);
 
     const hadAtomData = !!atomRef.current.conversationId;
 
@@ -658,8 +660,7 @@ function ConversationPageContent() {
             const latestWindow = await api.getConversationMessagesLatest(metadata.conversation.id, 50);
             const result = { ...metadata, messages: latestWindow.messages };
             if (!cancelled) {
-              const oldestSequence = result.messages[0]?.sequence_id ?? null;
-              setHasOlderMessages(oldestSequence !== null && oldestSequence > 0);
+              setHasOlderMessages(latestWindow.has_older_messages);
               const replacesDifferentConversation = atomRef.current.conversationId !== null
                 && atomRef.current.conversationId !== result.conversation.id;
               dispatch({
@@ -722,6 +723,7 @@ function ConversationPageContent() {
     if (!slug || !conversationId || loadingOlderMessages) return;
     const requestedConversationId = conversationId;
     setLoadingOlderMessages(true);
+    setOlderHistoryError(null);
     try {
       const snapshotStartedAtEventSeq = eventCursorRef.current;
       const result = await api.getConversationBySlug(slug);
@@ -745,6 +747,9 @@ function ConversationPageContent() {
       await cacheDB.putMessages(result.messages);
     } catch (err) {
       console.warn('Failed to load earlier conversation history:', err);
+      if (atomRef.current.conversationId === requestedConversationId) {
+        setOlderHistoryError(err instanceof Error ? err.message : 'Failed to load earlier history');
+      }
     } finally {
       if (atomRef.current.conversationId === requestedConversationId) {
         setLoadingOlderMessages(false);
@@ -1701,6 +1706,7 @@ function ConversationPageContent() {
         hasOlderMessages={hasOlderMessages}
         onLoadOlderMessages={loadOlderMessages}
         loadingOlderMessages={loadingOlderMessages}
+        olderHistoryError={olderHistoryError}
       />
       </RenderProfiler>
       {atom.uiError && (

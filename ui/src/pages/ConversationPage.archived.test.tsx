@@ -226,12 +226,14 @@ describe('ConversationPage archived read-only rendering', () => {
       tombstones: [],
       transcript_generation: 1,
       server_message_tail: 1,
+      has_older_messages: false,
     });
     vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
       messages: [],
       tombstones: [],
       transcript_generation: 1,
       server_message_tail: 1,
+      has_older_messages: false,
     });
     vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
       conversation: authoritativeConversation,
@@ -280,12 +282,14 @@ describe('ConversationPage archived read-only rendering', () => {
             tombstones: [],
             transcript_generation: 7,
             server_message_tail: 2,
+            has_older_messages: false,
           }
         : {
             messages: [message3, message4],
             tombstones: [],
             transcript_generation: 7,
             server_message_tail: 4,
+            has_older_messages: false,
           }
     ));
     vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
@@ -293,6 +297,7 @@ describe('ConversationPage archived read-only rendering', () => {
       tombstones: [],
       transcript_generation: 7,
       server_message_tail: 4,
+      has_older_messages: false,
     });
     vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
       conversation: cachedConversation,
@@ -324,12 +329,14 @@ describe('ConversationPage archived read-only rendering', () => {
       tombstones: [],
       transcript_generation: 7,
       server_message_tail: 2,
+      has_older_messages: false,
     });
     vi.mocked(api.getConversationMessagesLatest).mockResolvedValue({
       messages: [catchUpMessage],
       tombstones: [],
       transcript_generation: 7,
       server_message_tail: 2,
+      has_older_messages: false,
     });
     vi.mocked(api.getConversationMetaBySlug).mockResolvedValue({
       conversation: cachedConversation,

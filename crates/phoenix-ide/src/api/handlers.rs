@@ -2203,6 +2203,7 @@ fn build_message_slice_response(
     messages: &[crate::db::Message],
     transcript_generation: i64,
     server_message_tail: Option<i64>,
+    has_older_messages: bool,
 ) -> ConversationMessageSliceResponse {
     ConversationMessageSliceResponse {
         messages: messages
@@ -2212,6 +2213,7 @@ fn build_message_slice_response(
         tombstones: vec![],
         transcript_generation: Some(transcript_generation),
         server_message_tail,
+        has_older_messages,
     }
 }
 
@@ -2283,15 +2285,22 @@ async fn get_conversation_messages_latest(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
     let limit = validate_message_history_limit("limit", query.limit, 100)?;
     let db = state.runtime.db();
-    let messages = db
-        .get_latest_messages(&id, limit)
+    let requested_count = usize::try_from(limit)
+        .map_err(|_| AppError::BadRequest("limit is too large for this server".to_string()))?;
+    let mut messages = db
+        .get_latest_messages(&id, limit + 1)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+    let has_older_messages = messages.len() > requested_count;
+    if has_older_messages {
+        messages.remove(0);
+    }
     let server_message_tail = get_server_message_tail(db, &id).await?;
     Ok(Json(build_message_slice_response(
         &messages,
         conversation.transcript_generation,
         server_message_tail,
+        has_older_messages,
     )))
 }
 
@@ -2316,15 +2325,23 @@ async fn get_conversation_messages(
         )),
         (Some(before), None) => {
             let db = state.runtime.db();
-            let messages = db
-                .get_messages_before(&id, before, limit)
+            let requested_count = usize::try_from(limit).map_err(|_| {
+                AppError::BadRequest("limit is too large for this server".to_string())
+            })?;
+            let mut messages = db
+                .get_messages_before(&id, before, limit + 1)
                 .await
                 .map_err(|e| AppError::Internal(e.to_string()))?;
+            let has_older_messages = messages.len() > requested_count;
+            if has_older_messages {
+                messages.remove(0);
+            }
             let server_message_tail = get_server_message_tail(db, &id).await?;
             Ok(Json(build_message_slice_response(
                 &messages,
                 conversation.transcript_generation,
                 server_message_tail,
+                has_older_messages,
             )))
         }
         (None, Some(after)) => {
@@ -2338,6 +2355,7 @@ async fn get_conversation_messages(
                 &messages,
                 conversation.transcript_generation,
                 server_message_tail,
+                false,
             )))
         }
     }

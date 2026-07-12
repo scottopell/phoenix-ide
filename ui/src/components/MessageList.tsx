@@ -1,4 +1,4 @@
-import { memo, useState, useRef, useCallback, useMemo, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { memo, useState, useRef, useCallback, useMemo, useEffect, useLayoutEffect, forwardRef, useImperativeHandle } from 'react';
 import { useDensity } from '../hooks/useDensity';
 import { FindBar, buildConversationSearchProjection, useViewerFindKeyboardShortcut } from './viewer-find';
 import { useFocusScope, useFocusScopeCommands } from '../hooks/useFocusScope';
@@ -82,6 +82,8 @@ interface MessageListProps {
   hasOlderMessages?: boolean | undefined;
   onLoadOlderMessages?: (() => void) | undefined;
   loadingOlderMessages?: boolean | undefined;
+  olderHistoryError?: string | null | undefined;
+  preservedHistoryAnchorId?: string | null | undefined;
 }
 
 /** Imperative surface exposed to the conversation nav strip. MessageList owns
@@ -92,6 +94,7 @@ export interface MessageListHandle {
    *  equals its virtuoso item index) into view and pulse it once mounted. */
   scrollToUnitIndex: (unitIndex: number) => void;
   scrollToMessageId: (messageId: string) => boolean;
+  getFirstVisibleMessageId: () => string | null;
 }
 
 
@@ -334,6 +337,8 @@ function MessageListImpl({
   hasOlderMessages = false,
   onLoadOlderMessages,
   loadingOlderMessages = false,
+  olderHistoryError,
+  preservedHistoryAnchorId,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const findScopeId = `conversation-transcript:${conversationId ?? 'empty'}`;
   const { activeScope } = useFocusScope();
@@ -348,6 +353,7 @@ function MessageListImpl({
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const systemPromptRef = useRef<HTMLPreElement | null>(null);
   const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
+  const firstVisibleUnitIndexRef = useRef(0);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const scrollMachineRef = useRef(initialScrollMachineState(conversationId));
@@ -820,7 +826,23 @@ function MessageListImpl({
     }
   }, [scrollToMessageId, targetMessageId]);
 
-  useImperativeHandle(ref, () => ({ scrollToUnitIndex, scrollToMessageId }), [scrollToMessageId, scrollToUnitIndex]);
+  const getFirstVisibleMessageId = useCallback(() => {
+    const unit = historicalUnits[firstVisibleUnitIndexRef.current];
+    if (!unit) return null;
+    if (unit.kind === 'agent_turn') return unit.agent.message_id;
+    if ('message' in unit && 'message_id' in unit.message) return unit.message.message_id;
+    return null;
+  }, [historicalUnits]);
+
+  useImperativeHandle(
+    ref,
+    () => ({ scrollToUnitIndex, scrollToMessageId, getFirstVisibleMessageId }),
+    [getFirstVisibleMessageId, scrollToMessageId, scrollToUnitIndex],
+  );
+
+  useLayoutEffect(() => {
+    if (preservedHistoryAnchorId) scrollToMessageId(preservedHistoryAnchorId);
+  }, [preservedHistoryAnchorId, scrollToMessageId]);
 
   useEffect(() => {
     scrollerRef.current?.querySelectorAll('.viewer-find-row-match, .viewer-find-row-match--active')
@@ -859,6 +881,7 @@ function MessageListImpl({
   }, [activeScope, findOpen, findScopeId]);
 
   const handleRangeChanged = useCallback((range: ListRange) => {
+    firstVisibleUnitIndexRef.current = range.startIndex;
     onVisibleRangeChange?.(range);
   }, [onVisibleRangeChange]);
 
@@ -911,14 +934,21 @@ function MessageListImpl({
       )}
       <section id="chat-view" className="view active">
         {hasOlderMessages && onLoadOlderMessages && (
-          <button
-            type="button"
-            className="btn-secondary"
-            disabled={loadingOlderMessages}
-            onClick={onLoadOlderMessages}
-          >
-            {loadingOlderMessages ? 'Loading earlier history…' : 'Load earlier history'}
-          </button>
+          <div role={olderHistoryError ? 'alert' : undefined}>
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={loadingOlderMessages}
+              onClick={onLoadOlderMessages}
+            >
+              {loadingOlderMessages
+                ? 'Loading earlier history…'
+                : olderHistoryError
+                  ? 'Retry loading earlier history'
+                  : 'Load earlier history'}
+            </button>
+            {olderHistoryError && <span>Could not load earlier history: {olderHistoryError}</span>}
+          </div>
         )}
         <Virtuoso
           key={conversationId ?? '__empty__'}

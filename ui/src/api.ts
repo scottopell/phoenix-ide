@@ -568,6 +568,7 @@ export interface ConversationMessageSliceResponse {
   tombstones: ConversationMessageTombstone[];
   transcript_generation: number;
   server_message_tail: number | null;
+  has_older_messages: boolean;
 }
 
 export interface ConversationMessageRangeResponse {

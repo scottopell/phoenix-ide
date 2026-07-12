@@ -177,6 +177,7 @@ pub struct ConversationMessageSliceResponse {
     pub tombstones: Vec<serde_json::Value>,
     pub transcript_generation: Option<i64>,
     pub server_message_tail: Option<i64>,
+    pub has_older_messages: bool,
 }
 
 /// Response for exact inclusive range fetches.
