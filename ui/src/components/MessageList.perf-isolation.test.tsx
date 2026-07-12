@@ -56,7 +56,7 @@ vi.mock('./VirtualTranscript', async () => {
       getKey?: (item: T, index: number) => React.Key;
       header?: React.ReactNode;
       empty?: React.ReactNode;
-    }, _ref: React.ForwardedRef<unknown>) => (
+    }) => (
       <div data-testid="mock-virtual-transcript">
         {header}
         {items.length === 0 ? empty : items.map((item, i) => {

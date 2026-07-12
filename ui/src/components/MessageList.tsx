@@ -968,7 +968,7 @@ function MessageListImpl({
 
 
   const itemContent = useCallback(
-    (unit: RenderUnit, _index: number) => (
+    (unit: RenderUnit) => (
       <div
         className="virtual-transcript-row"
         data-render-unit-key={unit.key}
@@ -981,7 +981,7 @@ function MessageListImpl({
   );
 
   const computeItemKey = useCallback(
-    (unit: RenderUnit, _index: number) => unit.key,
+    (unit: RenderUnit) => unit.key,
     [],
   );
 
