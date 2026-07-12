@@ -84,8 +84,12 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
     const committed = useMemo(() => buildSectionItems('committed', committedDiff), [committedDiff]);
     const uncommitted = useMemo(() => buildSectionItems('uncommitted', uncommittedDiff), [uncommittedDiff]);
 
-    const activeFindHeaderKey = activeFindMatch?.kind === 'diff-file-header'
-      ? `${activeFindMatch.itemId}:${activeFindMatch.startColumn}:${activeFindMatch.endColumn}`
+    const activeFindHeaderMatch = activeFindMatch?.kind === 'diff-file-header'
+      ? activeFindMatch
+      : null;
+    const isActiveFindHeaderItem = (itemId: string) => activeFindHeaderMatch?.itemId === itemId;
+    const activeFindHeaderKey = activeFindHeaderMatch
+      ? `${activeFindHeaderMatch.itemId}:${activeFindHeaderMatch.startColumn}:${activeFindHeaderMatch.endColumn}`
       : null;
 
     const items = useMemo<PhoenixDiffItem[]>(() => {
@@ -98,7 +102,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           // Bump the controlled-item version whenever this item's rendered
           // content changes, so Pierre reconciles instead of keeping a stale
           // annotation/flash/header-count record.
-          const sig = `${itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId)}|find:${activeFindHeaderKey?.startsWith(`${it.id}:`) ? activeFindHeaderKey : ''}`;
+          const sig = `${itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId)}|find:${isActiveFindHeaderItem(it.id) ? activeFindHeaderKey : ''}`;
           const prev = vmap.get(it.id);
           const version = prev && prev.sig === sig ? prev.version : (prev?.version ?? 0) + 1;
           if (!prev || prev.sig !== sig) vmap.set(it.id, { sig, version });
@@ -228,13 +232,13 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
       if (!section) return null;
         return (
           <span
-            className={`phoenix-diff-section-badge phoenix-diff-section-badge--${section}${activeFindHeaderKey?.startsWith(`${item.id}:`) ? ' phoenix-diff-section-badge--find-active' : ''}`}
+            className={`phoenix-diff-section-badge phoenix-diff-section-badge--${section}${isActiveFindHeaderItem(item.id) ? ' phoenix-diff-section-badge--find-active' : ''}`}
           >
             {section}
           </span>
         );
 
-    }, [activeFindHeaderKey]);
+    }, [isActiveFindHeaderItem]);
 
     const renderHeaderMetadata = useCallback(
       (item: CodeViewItem<Meta>) => {
@@ -250,7 +254,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
         return (
           <button
             type="button"
-            className={`phoenix-diff-file-note-btn${flash ? ' phoenix-diff-file-note-btn--flash' : ''}${activeFindHeaderKey?.startsWith(`${item.id}:`) ? ' phoenix-diff-file-note-btn--find-active' : ''}`}
+            className={`phoenix-diff-file-note-btn${flash ? ' phoenix-diff-file-note-btn--flash' : ''}${isActiveFindHeaderItem(item.id) ? ' phoenix-diff-file-note-btn--find-active' : ''}`}
             onClick={() => onAnnotateFile(section, filePath)}
             aria-label={`Add file-level note to ${filePath}`}
             title="Add file-level note"
@@ -260,7 +264,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           </button>
         );
       },
-      [notes, highlightedNoteId, activeFindHeaderKey, onAnnotateFile],
+      [notes, highlightedNoteId, isActiveFindHeaderItem, onAnnotateFile],
     );
 
     const renderGutterUtility = useCallback(

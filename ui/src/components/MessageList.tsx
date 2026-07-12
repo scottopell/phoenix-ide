@@ -464,11 +464,17 @@ function MessageListImpl({
     setFindActiveIndex(0);
   }, []);
   const nextFindMatch = useCallback(() => {
-    setFindActiveIndex((index) => findMatches.length === 0 ? 0 : (index + 1) % findMatches.length);
-  }, [findMatches.length]);
+    setFindActiveIndex(() => {
+      if (findMatches.length === 0) return 0;
+      return (normalizedFindIndex + 1) % findMatches.length;
+    });
+  }, [findMatches.length, normalizedFindIndex]);
   const previousFindMatch = useCallback(() => {
-    setFindActiveIndex((index) => findMatches.length === 0 ? 0 : (index - 1 + findMatches.length) % findMatches.length);
-  }, [findMatches.length]);
+    setFindActiveIndex(() => {
+      if (findMatches.length === 0) return 0;
+      return (normalizedFindIndex - 1 + findMatches.length) % findMatches.length;
+    });
+  }, [findMatches.length, normalizedFindIndex]);
 
   // Chapters are derived here, not in a parent, so they share the exact
   // `historicalUnits` array virtuoso renders — a chapter's `unitIndex` is

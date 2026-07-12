@@ -190,6 +190,41 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     });
   });
 
+  it('marks only the exact colon-containing diff header as active', () => {
+    const committed = [
+      'diff --git a/foo b/foo',
+      'index 0000000..1111111 100644',
+      '--- a/foo',
+      '+++ b/foo',
+      '@@ -0,0 +1,1 @@',
+      '+plain file',
+      'diff --git a/foo:bar b/foo:bar',
+      'index 2222222..3333333 100644',
+      '--- a/foo:bar',
+      '+++ b/foo:bar',
+      '@@ -0,0 +1,1 @@',
+      '+colon file',
+    ].join('\n');
+
+    renderDiff(committed, '');
+
+    const fooVersionBefore = itemVersion('committed:foo') ?? 0;
+    const fooBarVersionBefore = itemVersion('committed:foo:bar') ?? 0;
+
+    fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Find in viewer' }), { target: { value: 'foo:bar' } });
+
+    const fooHeader = screen.getByTestId('mock-header-committed:foo');
+    const fooBarHeader = screen.getByTestId('mock-header-committed:foo:bar');
+    expect(fooHeader.querySelector('.phoenix-diff-section-badge--find-active')).toBeNull();
+    expect(fooHeader.querySelector('.phoenix-diff-file-note-btn--find-active')).toBeNull();
+    expect(fooBarHeader.querySelector('.phoenix-diff-section-badge--find-active')).not.toBeNull();
+    expect(fooBarHeader.querySelector('.phoenix-diff-file-note-btn--find-active')).not.toBeNull();
+
+    expect(itemVersion('committed:foo')).toBe(fooVersionBefore);
+    expect((itemVersion('committed:foo:bar') ?? 0)).toBeGreaterThan(fooBarVersionBefore);
+  });
+
   it('decorates matched diff lines with unsafeCSS and clears decorations when the find bar closes', () => {
     renderDiff(COMMITTED, COMMITTED.replaceAll('foo.txt', 'bar.txt'));
     fireEvent.click(screen.getByRole('button', { name: 'Find in diff' }));

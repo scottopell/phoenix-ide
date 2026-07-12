@@ -241,13 +241,14 @@ describe('MessageList', () => {
   });
 
   it('steps from the normalized transcript match index after results shrink', async () => {
-    render(withConvContext(
+    const initialMessages = [
+      { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha one' }] },
+      { ...makeMessage(2, 'agent'), content: [{ type: 'text', text: 'alpha two' }] },
+      { ...makeMessage(3, 'agent'), content: [{ type: 'text', text: 'alpha three' }] },
+    ];
+    const { rerender } = render(withConvContext(
       <MessageList
-        messages={[
-          { ...makeMessage(1, 'agent'), content: [{ type: 'text', text: 'alpha one' }] },
-          { ...makeMessage(2, 'agent'), content: [{ type: 'text', text: 'alpha two' }] },
-          { ...makeMessage(3, 'agent'), content: [{ type: 'text', text: 'alpha three' }] },
-        ]}
+        messages={initialMessages}
         pendingMessages={[]}
         convState={idleState}
         onRetry={vi.fn()}
@@ -265,11 +266,23 @@ describe('MessageList', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText('3 of 3')).toBeInTheDocument();
 
-    fireEvent.change(input, { target: { value: 'three' } });
-    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    rerender(withConvContext(
+      <MessageList
+        messages={initialMessages.slice(0, 2)}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-find-normalized"
+      />,
+    ));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
-    expect(screen.getByText('1 of 1')).toBeInTheDocument();
+    expect(screen.getByText('1 of 2')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Previous' }));
+    expect(screen.getByText('2 of 2')).toBeInTheDocument();
   });
 
   it('searches expanded system prompt text when visible in the transcript header', async () => {
