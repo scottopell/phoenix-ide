@@ -376,6 +376,7 @@ export function reduceScrollMachine(
     case 'interactionStarted':
       if (state.kind === 'mount-rescue') return exitMountRescue(state, FOLLOWING);
       if (state.kind === 'live' && state.follow.kind === 'navigating') {
+        if (state.geometry.atBottom) return confirmTailReturn(state);
         return {
           state: { ...state, follow: { kind: 'navigating', phase: 'user-returning' } },
           effects: [],

@@ -257,6 +257,7 @@ describe('scrollMachine durable follow policy', () => {
 
     let result = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
     expectLiveMode(result.state, 'navigating');
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: false });
 
     result = reduceScrollMachine(result.state, { type: 'interactionStarted' });
     expect(result.state.kind === 'live' && result.state.follow.kind === 'navigating' && result.state.follow.phase).toBe('user-returning');
@@ -287,6 +288,16 @@ describe('scrollMachine durable follow policy', () => {
 
     const result = reduceScrollMachine(state, { type: 'viewportPinnedChanged', atBottom: true });
     expectLiveMode(result.state, 'navigating');
+  });
+
+  it('releases positioned navigation on interaction when geometry is already pinned', () => {
+    let result = reduceScrollMachine(liveFollowing(), { type: 'navigationJumped' });
+    result = reduceScrollMachine(result.state, { type: 'viewportPinnedChanged', atBottom: true });
+    expectLiveMode(result.state, 'navigating');
+
+    result = reduceScrollMachine(result.state, { type: 'interactionStarted' });
+    expectLiveMode(result.state, 'following');
+    expect(result.effects).toEqual([]);
   });
 
   it('navigation ownership survives movement and later height growth without a tail snap', () => {

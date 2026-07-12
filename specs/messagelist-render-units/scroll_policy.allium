@@ -341,11 +341,22 @@ rule LeavingBottomWhileIdleUpdatesGeometry {
     ensures: policy.at_bottom = false
 }
 
-rule NavigationInteractionEnablesManualReturn {
+rule OffBottomNavigationInteractionEnablesManualReturn {
     when: InteractionStarted(policy)
     requires: policy.lifecycle = live
     requires: policy.follow_mode = navigating
+    requires: policy.at_bottom = false
     ensures: policy.navigation_phase = user_returning
+}
+
+rule PinnedNavigationInteractionRestoresFollowing {
+    when: InteractionStarted(policy)
+    requires: policy.lifecycle = live
+    requires: policy.follow_mode = navigating
+    requires: policy.at_bottom = true
+    ensures: policy.follow_mode = following
+    ensures: policy.unread = false
+    ensures: ScrollEffect.created(policy: policy, kind: clear_unread)
 }
 
 rule LeavingBottomDuringTouchIsRemembered {
